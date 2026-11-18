@@ -1,6 +1,6 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-use std::{num::NonZeroU32, pin::Pin};
+use std::{collections::HashSet, num::NonZeroU32, pin::Pin};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -28,9 +28,9 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    CompactBlockRange, QueryError, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
-    address_lookup_to_script_hash, status_from_query_error,
+    CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
@@ -508,6 +508,7 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let mut script_hashes = Vec::with_capacity(addresses.len());
+        let mut distinct_script_hashes = HashSet::with_capacity(addresses.len());
         for address in addresses {
             let address_script_hash = address_lookup_to_script_hash(
                 Some(wallet_proto::AddressLookup {
@@ -516,7 +517,9 @@ where
                 visible_tip_block.chain_epoch.network,
             )
             .map_err(|error| status_from_query_error(&error))?;
-            script_hashes.push(address_script_hash);
+            if distinct_script_hashes.insert(address_script_hash) {
+                script_hashes.push(address_script_hash);
+            }
         }
         let balance = self
             .query_api
@@ -734,9 +737,20 @@ where
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         let mut stream = request.into_inner();
         let mut addresses: Vec<String> = Vec::new();
+        let mut distinct_addresses = HashSet::new();
         while let Some(received) = stream.next().await {
-            let address = received?;
-            addresses.push(address.address);
+            let address = received?.address;
+            if distinct_addresses.insert(address.clone()) {
+                if addresses.len() >= u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
+                    return Err(status_from_query_error(
+                        &QueryError::TransparentBalanceAddressCountExceeded {
+                            requested: addresses.len().saturating_add(1),
+                            maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+                        },
+                    ));
+                }
+                addresses.push(address);
+            }
         }
         self.compat_balance_response(addresses).await
     }

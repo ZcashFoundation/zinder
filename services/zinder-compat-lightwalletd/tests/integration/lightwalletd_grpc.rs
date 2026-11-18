@@ -43,12 +43,13 @@ use zinder_proto::compat::lightwalletd::{
 
 use zinder_query::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, OrderedBroadcaster, QueryError,
-    RawTransaction, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
-    TransparentOutpointSpendStatuses, TreeState, VisibleTipBlock, WalletQueryApi,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream,
+    MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, OrderedBroadcaster, QueryError, RawTransaction,
+    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_store::{
     ArtifactFamily, CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
@@ -3054,6 +3055,89 @@ async fn taddress_balance_reports_the_confirmed_total_to_generated_lightwalletd_
 
         assert_eq!(unary_balance.value_zat, 1_000);
         assert_eq!(unary_balance, stream_balance);
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await??;
+    Ok(())
+}
+
+/// A repeated address counts once against the per-request address cap, so a
+/// request that names one address more times than the cap is still served.
+#[tokio::test]
+async fn taddress_balance_counts_a_repeated_address_once() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+    let address = ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [0x41; 20])
+        .to_string();
+    let repeated_address_count =
+        usize::try_from(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES)?.saturating_add(44);
+
+    let balance = adapter
+        .get_taddress_balance(Request::new(lightwalletd::AddressList {
+            addresses: vec![address; repeated_address_count],
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(balance.value_zat, 0);
+    Ok(())
+}
+
+/// `GetTaddressBalanceStream` rejects the first distinct address over the cap
+/// while the client is still streaming, instead of buffering every address
+/// until the client half-closes.
+#[tokio::test]
+async fn taddress_balance_stream_rejects_an_over_cap_address_before_the_stream_ends()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let adapter = acceptance_adapter(&store_fixture).into_server();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(adapter)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    {
+        let mut client = CompactTxStreamerClient::connect(format!("http://{server_addr}")).await?;
+        let over_cap_count = MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES.saturating_add(1);
+        let distinct_addresses = (0..over_cap_count)
+            .map(|index| {
+                let mut pub_key_hash = [0x41; 20];
+                pub_key_hash[..4].copy_from_slice(&index.to_be_bytes());
+                lightwalletd::Address {
+                    address: ZebraTransparentAddress::from_pub_key_hash(
+                        ZebraNetworkKind::Regtest,
+                        pub_key_hash,
+                    )
+                    .to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        // The stream never half-closes, so only a rejection while receiving
+        // can answer before the timeout.
+        let never_ending_addresses = tokio_stream::StreamExt::chain(
+            tokio_stream::iter(distinct_addresses),
+            tokio_stream::pending(),
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_taddress_balance_stream(never_ending_addresses),
+        )
+        .await
+        .map_err(|_| eyre!("over-cap stream was not rejected before the client half-closed"))?;
+        let status = match outcome {
+            Ok(response) => return Err(eyre!("expected rejection, got {response:?}")),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     let _ = shutdown_tx.send(());

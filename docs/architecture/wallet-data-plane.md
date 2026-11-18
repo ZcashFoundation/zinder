@@ -742,16 +742,20 @@ integrators that need balance, received, and sent totals use
 compatibility runtime answers `GetTaddressBalance` and
 `GetTaddressBalanceStream` from the in-process
 `WalletQueryApi::transparent_address_balance` domain method. That method sums
-the wallet projection's confirmed unspent outputs for up to 256 addresses
-(`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`) at one pinned chain epoch. An
-over-cap list is rejected with `INVALID_ARGUMENT` carrying
-`TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`, and an empty list is rejected
-with `INVALID_ARGUMENT`.
+the wallet projection's confirmed unspent outputs for up to 256 distinct
+addresses (`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`) at one pinned chain
+epoch. A repeated address counts once. An over-cap list is rejected with
+`INVALID_ARGUMENT` carrying `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`, and
+an empty list is rejected with `INVALID_ARGUMENT`.
 
 The compatibility runtime reports the confirmed total as the lightwalletd
 `int64 value_zat`. A total above `i64::MAX` is rejected with `OUT_OF_RANGE`.
 Live mempool state is not part of the balance. `GetTaddressBalanceStream`
 collects the streamed addresses and returns the same value as the unary call.
+It rejects the stream as soon as the 257th distinct address arrives, without
+waiting for the client to finish sending, so a client cannot make the server
+buffer an unbounded address list. lightwalletd bounds the same stream at
+10,000 addresses (GHSA-x4m7-3gpp-xc36).
 
 ## Capability Discovery
 
