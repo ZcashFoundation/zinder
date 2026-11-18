@@ -666,10 +666,14 @@ rebuild on a switch is covered in
 Reader broadcast failover is covered by
 `services/zinder-query/tests/integration/broadcast_failover.rs`: failover
 within a broadcast, the preferred endpoint, the duplicate-after-timeout
-answer, exclusion and its backoff, and verification after a schedule revision
-or an activation crossing, an inconclusive repeat that keeps the earlier
-verification until its grace ends on time, a preference that only a failover
-moves, and the endpoint metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
+answer, exclusion and its backoff, and verification after a schedule revision,
+an activation crossing, or a tip that reaches an activation only the node's
+table schedules, an inconclusive repeat that keeps the earlier verification
+until its grace ends on time, a preference that only a failover moves, and
+the endpoint metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
+The node probe's per-endpoint schedule, with a standby that never answers
+beside verified endpoints, is covered by the `wallet_node_probe_*` unit tests
+in `services/zinder-query/src/wallet_serving_pair_publisher.rs`.
 One live test, `live::broadcast_fallback`, needs only one Regtest node: it puts
 a local TCP proxy to the live node at `[node]` and the live node itself at
 `[node_fallbacks.1]`, verifies both, stops the proxy, and checks that a

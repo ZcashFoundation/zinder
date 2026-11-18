@@ -168,6 +168,59 @@ impl ActivationCrossing {
     }
 }
 
+/// The store's regtest table with NU6.3 moved from height 603 to height 4,
+/// as a node whose table schedules an upgrade earlier than the writer
+/// admitted it would report.
+fn schedule_with_an_earlier_upgrade() -> eyre::Result<NetworkUpgradeActivations> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .map(|activation| NetworkUpgradeActivation {
+                activation_height: if activation.name == "NU6.3" {
+                    BlockHeight::new(4)
+                } else {
+                    activation.activation_height
+                },
+                ..activation.clone()
+            })
+            .collect(),
+    )?)
+}
+
+/// Two regtest serving pairs on either side of height 4, the activation
+/// [`schedule_with_an_earlier_upgrade`] adds.
+///
+/// The writer's schedule activates nothing at height 4, so both pairs share
+/// one verification basis.
+struct EndpointOnlyActivation {
+    /// Serves a tip at height 2, so a broadcast targets height 3.
+    below_slot: WalletServingPairSlot,
+    /// Serves a tip at height 3, so a broadcast targets height 4.
+    at_slot: WalletServingPairSlot,
+    _stores: [WalletServingStoreFixture; 2],
+}
+
+impl EndpointOnlyActivation {
+    fn new() -> eyre::Result<Self> {
+        let schedule = sample_regtest_upgrade_activations();
+        let mut below_store = WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+            &schedule,
+        )?;
+        let mut at_store = WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
+            &schedule,
+        )?;
+        Ok(Self {
+            below_slot: serving_pair_slot(&mut below_store)?,
+            at_slot: serving_pair_slot(&mut at_store)?,
+            _stores: [below_store, at_store],
+        })
+    }
+}
+
 /// Serialized bytes of a transaction this build decodes, with the id the
 /// consensus parser computes for them.
 ///
@@ -595,6 +648,77 @@ async fn endpoint_is_verified_again_when_the_tip_crosses_an_activation() -> eyre
     assert_eq!(node.capability_probe_count(), 1);
     nodes.verify(&crossing.after_slot).await?;
     assert_eq!(node.capability_probe_count(), 2);
+    Ok(())
+}
+
+/// A passed verification ends at an activation only the node's table
+/// schedules.
+///
+/// The writer's schedule revision and the upgrade it activates at the
+/// broadcast height stay the same as the block a broadcast targets reaches
+/// that activation.
+#[tokio::test]
+async fn endpoint_is_verified_again_at_an_activation_only_its_table_schedules() -> eyre::Result<()>
+{
+    let activation = EndpointOnlyActivation::new()?;
+    let node = accepting_node(0x15).with_node_activations(schedule_with_an_earlier_upgrade()?);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    nodes.verify(&activation.below_slot).await?;
+    nodes.verify(&activation.below_slot).await?;
+    nodes
+        .broadcast_transaction(RawTransactionBytes::new([0x15]))
+        .await?;
+    assert_eq!(node.capability_probe_count(), 1);
+
+    let verification = nodes.verify(&activation.at_slot).await;
+
+    assert!(
+        matches!(
+            verification,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ),
+        "unexpected verification: {verification:?}"
+    );
+    assert_eq!(node.capability_probe_count(), 2);
+    assert!(
+        nodes
+            .broadcast_transaction(RawTransactionBytes::new([0x16]))
+            .await
+            .is_err()
+    );
+    assert_eq!(node.call_count(), 1);
+    assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// A wallet broadcast skips an endpoint whose verified table disagrees with
+/// the writer's schedule at the height the broadcast targets.
+///
+/// No verification has run against the pair that reached that height.
+#[tokio::test]
+async fn broadcast_skips_an_endpoint_whose_table_disagrees_at_the_broadcast_height()
+-> eyre::Result<()> {
+    let activation = EndpointOnlyActivation::new()?;
+    let node = accepting_node(0x17).with_node_activations(schedule_with_an_earlier_upgrade()?);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    let query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(activation.at_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+    nodes.verify(&activation.below_slot).await?;
+
+    let outcome = query
+        .broadcast_transaction(RawTransactionBytes::new([0x17]))
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(QueryError::Node(SourceError::NodeUnavailable { .. }))
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(node.call_count(), 0);
+    assert_eq!(node.capability_probe_count(), 1);
     Ok(())
 }
 

@@ -405,10 +405,12 @@ only verified endpoints. Until one passes, every broadcast fails with
 dependency reports the first endpoint's failure as `node_unavailable`
 (failure class `protocol_mismatch` for a table that disagrees, and
 `node_unreachable` for a cookie file the query cannot read yet) or
-`node_capability_missing`. The probe retries every unverified endpoint each
-round. Once an endpoint passes, the probe exercises `tip_id` and upstream
-synchronization health through the first verified endpoint in broadcast
-preference order and publishes `node_unavailable`, `upstream_not_ready`, or
+`node_capability_missing`. The probe retries every unverified endpoint at
+each poll interval, each endpoint on its own schedule, so an endpoint that
+hangs until its request timeout delays no other endpoint. Once an endpoint
+passes, the probe exercises `tip_id` and upstream synchronization health
+through the first verified endpoint in broadcast preference order and
+publishes `node_unavailable`, `upstream_not_ready`, or
 `node_capability_missing` as the dependency's cause. It never changes the
 advertised capability set.
 The serving-pair publisher, node-readiness probe, and
@@ -482,19 +484,28 @@ endpoint refused the transaction for its consensus branch.
 Verification checks an endpoint's activation table through the height after
 the served tip, the block a broadcast transaction targets. A passed
 verification lasts until the serving pair's schedule revision or the network
-upgrade active at that height changes. The probe then verifies every endpoint
-again at once instead of waiting for its next round. When that repeat is
-inconclusive, for example because the node has not received the block that
-crossed the activation, the endpoint keeps its earlier verification for up to
-one minute, logged once as `wallet_node_reverification_inconclusive`, and the
-probe retries every two seconds. After the minute it receives no broadcast,
-even before a retry finishes, and it is unverified. An endpoint that
+upgrade active at that height changes. It also ends when that height reaches
+the first height at which the endpoint's table disagrees with the
+writer-admitted schedule, as for a node that schedules NU7 at 700 while the
+writer schedules it at 703: from then on a broadcast skips the endpoint. In
+each case the probe verifies the endpoint again at once instead of waiting
+for the poll interval. When that repeat is inconclusive, for example because
+the node has not received the block that crossed the activation, the
+endpoint keeps its earlier verification for up to one minute, logged once as
+`wallet_node_reverification_inconclusive`, and the probe retries it every two
+seconds. After the minute it receives no broadcast, even before a retry
+finishes, and it is unverified. An earlier verification whose table disagrees
+at the new height is not kept. An endpoint that
 lacks `sendrawtransaction` or whose activation table disagrees is excluded and
 logged as `wallet_node_excluded`; it is verified again after a backoff that
 starts at 30 seconds and doubles to 5 minutes. An endpoint that cannot be
 verified for any other reason, such as a timeout, a node that has not reached
 the served tip, or another block at the served tip height, is verified again
-on the next round. With more than one endpoint, set `broadcast_timeout_secs`
+at the next poll interval. The probe verifies each endpoint on its own
+schedule, so an endpoint that hangs until its request timeout delays neither
+another endpoint's verification and retries nor the observation that moves
+the preference past a verified endpoint that stopped answering. With more
+than one endpoint, set `broadcast_timeout_secs`
 on every endpoint well below wallet request deadlines, because a broadcast
 moves on only after it expires. Each endpoint takes its own value: a
 `[node_fallbacks.N]` table without `broadcast_timeout_secs` waits for its own

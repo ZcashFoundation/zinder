@@ -1201,12 +1201,15 @@ where
             {
                 return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
             }
-            let _pair = self.capture_pair();
+            let pair = self.capture_pair();
             if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
                 return Err(QueryError::BroadcastTransactionTooLarge {
                     actual: raw_transaction.len(),
                     maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
                 });
+            }
+            if let Some(node_verifications) = &self.node_verifications {
+                node_verifications.track_broadcast_height(&pair);
             }
             self.broadcaster
                 .broadcast_transaction(raw_transaction)

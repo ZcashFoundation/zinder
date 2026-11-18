@@ -105,31 +105,43 @@ has not reached the tip yet. A broadcast reaches only verified endpoints.
 Until one passes, every broadcast fails with `UNAVAILABLE` and
 `NODE_UNAVAILABLE`, and the node dependency reports why under `degraded`.
 Each endpoint's verification is shared by every clone of the broadcaster and
-runs once at a time. Endpoints are verified concurrently on every node-probe
-round until they pass.
+runs once at a time. The node probe verifies each endpoint on its own
+schedule, at every poll interval until it passes. An endpoint that answers
+only when its request times out therefore delays neither another endpoint's
+verification nor the liveness observation of the verified endpoints.
 
 A passed verification holds while the serving pair's schedule revision and the
 network upgrade active at the height after its visible tip stay the same. A
 revision changes only activations above the tip it was admitted at, and the
 tip can later cross one of them, so the node's table was checked only through
-the earlier height. A change of either starts a probe round at once, and every
-endpoint is verified again. An endpoint that answers verification with
+the earlier height. The node's table can also schedule an upgrade at a height
+where the writer's schedule activates nothing, such as NU7 at 700 when the
+writer schedules it at 703. Crossing such a height changes neither the
+revision nor the writer's upgrade at the broadcast height, so a passed
+verification also records the first height above the checked one at which
+the node's table disagrees with the writer's schedule. A broadcast skips the
+endpoint once the height after the visible tip of the pair it captured
+reaches that height. A change of the revision or of the upgrade, or a tip that
+reaches the endpoint's first disagreement, verifies the endpoint again at
+once. An endpoint that answers verification with
 positive evidence, a missing `sendrawtransaction` or a disagreeing table, is
 excluded and verified again after a backoff that starts at 30 seconds and
 doubles to 5 minutes, so a node fixed by its operator returns without a reader
 restart. Any other failure, including a timeout, an unreached tip, or another
 block at the tip height, which a reorg the pair has not published yet also
-produces, leaves the endpoint unverified for the next round.
+produces, leaves the endpoint unverified until its next verification.
 
-The round that starts when the tip crosses an activation often reaches a node
-that has not received that block yet. Such an inconclusive repeat therefore
-keeps the endpoint's earlier verification for up to one minute, and rounds
-repeat every two seconds, or at the poll interval when it is shorter, until
-the endpoint passes, is refused, or the minute ends and it becomes
-unverified. The minute counts from the first inconclusive repeat and ends on
-time, so a broadcast after it skips the endpoint even while a round still
-waits on a node, and a pair that returns to the earlier basis does not renew
-it. Only positive evidence excludes an endpoint at once.
+The verification that runs when the tip crosses an activation often reaches a
+node that has not received that block yet. Such an inconclusive repeat
+therefore keeps the endpoint's earlier verification for up to one minute, and
+the endpoint is verified again every two seconds, or at the poll interval
+when it is shorter, until it passes, is refused, or the minute ends and it
+becomes unverified. The minute counts from the first inconclusive repeat and
+ends on time, so a broadcast after it skips the endpoint even while a
+verification still waits on the node, and a pair that returns to the earlier
+basis does not renew it. An earlier verification whose table disagrees with
+the writer's schedule at the new height is not kept. Only positive evidence
+excludes an endpoint at once.
 
 A broadcast tries the verified endpoints in order, starting at the preferred
 one, which is `[node]` until a failover moves it. It moves to the next
@@ -709,6 +721,13 @@ health-blind until it is.
 
 ## Revision history
 
+- 2026-11-18: The node probe verifies each endpoint on its own schedule, so an
+  endpoint that hangs until its request timeout no longer delays another
+  endpoint's verification or the liveness observation. A passed verification
+  also ends once the height after the tip reaches the first height at which
+  the node's table disagrees with the writer's schedule, even when the
+  writer's schedule activates nothing there, and a broadcast skips the
+  endpoint from that height on.
 - 2026-11-18: Readers broadcast through the ordered node list. An
   `OrderedBroadcaster` replaces `NodeBroadcast`, verifies each endpoint,
   repeats a verification when the schedule revision or the tip's network
