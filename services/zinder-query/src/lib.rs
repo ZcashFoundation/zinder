@@ -1079,8 +1079,8 @@ pub enum QueryError {
     },
 
     /// A tree state at a height without a stored checkpoint needs a
-    /// reconstruction, the query already runs its limit of them, and no slot
-    /// freed within the wait.
+    /// reconstruction, the query already runs its limit of them, and either
+    /// no slot freed within the wait or every waiting place was taken.
     #[error(
         "tree-state reconstruction limit reached: this server already reconstructs {max_concurrent_replays} tree states at once"
     )]
