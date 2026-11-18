@@ -3119,6 +3119,44 @@ async fn taddress_balance_stream_rejects_an_invalid_address_before_the_stream_en
     Ok(())
 }
 
+/// Address history and UTXO lookups refuse an oversized address before
+/// decoding it, so the request cannot spend its time in Base58 decoding.
+#[tokio::test]
+async fn transparent_address_lookups_refuse_an_oversized_address() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+    let oversized_address = "t".repeat(1024 * 1024);
+
+    let txids_code = adapter
+        .get_taddress_txids(Request::new(lightwalletd::TransparentAddressBlockFilter {
+            address: oversized_address.clone(),
+            range: Some(lightwalletd::BlockRange {
+                start: Some(lightwalletd::BlockId {
+                    height: 0,
+                    hash: Vec::new(),
+                }),
+                end: None,
+                pool_types: Vec::new(),
+            }),
+        }))
+        .await
+        .err()
+        .map(|status| status.code());
+    let utxos_code = adapter
+        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
+            addresses: vec![oversized_address],
+            start_height: 0,
+            max_entries: 0,
+        }))
+        .await
+        .err()
+        .map(|status| status.code());
+
+    assert_eq!(txids_code, Some(Code::InvalidArgument));
+    assert_eq!(utxos_code, Some(Code::InvalidArgument));
+    Ok(())
+}
+
 /// Returns the status a never-ending `GetTaddressBalanceStream` gets back.
 ///
 /// Streams `addresses` over a real transport without half-closing, so only a

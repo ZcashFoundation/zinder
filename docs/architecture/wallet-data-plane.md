@@ -756,8 +756,9 @@ It parses each address as it arrives and keeps only its script hash. The
 stream is rejected with `INVALID_ARGUMENT` as soon as an address is invalid or
 the 257th distinct address arrives, without waiting for the client to finish
 sending, so a client cannot make the server buffer an unbounded address list.
-Every address lookup, native and compatible, refuses text longer than 64
-bytes before parsing it; the longest valid transparent encoding is 49. lightwalletd bounds the same stream at
+Every transparent-address lookup, native, compatible, and Explorer, parses
+through `zinder_source::parse_transparent_address`, which refuses text longer
+than 64 bytes before decoding it; the longest valid encoding is 49. lightwalletd bounds the same stream at
 10,000 addresses (GHSA-x4m7-3gpp-xc36).
 
 ## Capability Discovery

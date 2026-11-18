@@ -6,7 +6,6 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
-use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -20,7 +19,9 @@ use zinder_proto::v1::{ops, wallet};
 use zinder_proto::wire::{
     compact_block_message, mempool_entry_message, transparent_outpoint_spend_status_entry_message,
 };
-use zinder_source::transparent_address_matches_network;
+use zinder_source::{
+    TransparentAddressParseError, parse_transparent_address, transparent_address_matches_network,
+};
 
 use crate::{
     BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange, FullBlock,
@@ -347,13 +348,6 @@ pub async fn transparent_outpoint_spend_status_response<Q: WalletQueryApi + ?Siz
     })
 }
 
-/// Upper bound on the text of a transparent address.
-///
-/// A `Base58Check` address is 35 characters and the longest ZIP 320 TEX
-/// encoding (`texregtest1…`) is 49, so this leaves margin without letting a
-/// request reach the parser with an arbitrarily long string.
-const MAX_TRANSPARENT_ADDRESS_TEXT_BYTES: usize = 64;
-
 /// Resolves a `wallet::AddressLookup` oneof to the typed
 /// `TransparentAddressScriptHash`. String addresses are parsed against
 /// `network` and SHA-256-hashed; raw script-hash bytes are taken verbatim.
@@ -379,18 +373,15 @@ pub fn address_lookup_to_script_hash(
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         wallet::address_lookup::Selector::Address(address_text) => {
-            // Base58 decoding is quadratic in the input length, so an
-            // oversized string is refused before it reaches the parser.
-            if address_text.len() > MAX_TRANSPARENT_ADDRESS_TEXT_BYTES {
-                return Err(QueryError::InvalidAddress {
-                    reason: "transparent address is longer than any valid encoding",
-                });
-            }
-            let zebra_address = address_text
-                .parse::<ZebraTransparentAddress>()
-                .map_err(|_| QueryError::InvalidAddress {
-                    reason: "transparent address could not be parsed",
-                })?;
+            let zebra_address = parse_transparent_address(&address_text).map_err(|error| {
+                QueryError::InvalidAddress {
+                    reason: if matches!(error, TransparentAddressParseError::TooLong { .. }) {
+                        "transparent address is longer than any valid encoding"
+                    } else {
+                        "transparent address could not be parsed"
+                    },
+                }
+            })?;
             if !transparent_address_matches_network(zebra_address.network_kind(), network) {
                 return Err(QueryError::InvalidAddress {
                     reason: "transparent address network does not match server network",

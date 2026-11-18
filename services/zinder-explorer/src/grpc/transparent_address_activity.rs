@@ -9,7 +9,6 @@
 
 use prost::Message as _;
 use tonic::{Request, Response, Status};
-use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::{
     decode_address_script_hash, decode_height_key_descending, decode_rpc_block_hash_hex,
     encode_address_script_hash, encode_rpc_transaction_id_hex,
@@ -534,7 +533,7 @@ fn resolve_address_lookup(
             })
         }
         AddressSelector::Address(text) => {
-            let parsed = text.parse::<ZebraTransparentAddress>().map_err(|_| {
+            let parsed = zinder_source::parse_transparent_address(text).map_err(|_| {
                 ExplorerError::invalid_request("transparent address could not be parsed")
             })?;
             if !network_matches(parsed.network_kind(), network) {

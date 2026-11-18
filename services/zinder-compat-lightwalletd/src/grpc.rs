@@ -7,7 +7,6 @@ use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
-use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
@@ -32,7 +31,7 @@ use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
-use zinder_source::transparent_address_matches_network;
+use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
@@ -1583,9 +1582,8 @@ fn transparent_address_tx_history_request(
     visible_tip_height: BlockHeight,
 ) -> Result<TransparentAddressTxIdsInRangeRequest, Status> {
     let address_text = filter.address.as_str();
-    let zebra_address: ZebraTransparentAddress = address_text.parse().map_err(|source| {
-        Status::invalid_argument(format!("transparent address is invalid: {source}"))
-    })?;
+    let zebra_address = parse_transparent_address(address_text)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if !transparent_address_matches_network(zebra_address.network_kind(), network) {
         return Err(Status::invalid_argument(
             "transparent address network does not match server network",
@@ -1636,11 +1634,8 @@ fn transparent_address_unspent_outputs_request(
     network: Network,
     start_height: BlockHeight,
 ) -> Result<TransparentAddressUnspentOutputsRequest, Status> {
-    let transparent_address = address
-        .parse::<ZebraTransparentAddress>()
-        .map_err(|source| {
-            Status::invalid_argument(format!("transparent address is invalid: {source}"))
-        })?;
+    let transparent_address = parse_transparent_address(address)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if !transparent_address_matches_network(transparent_address.network_kind(), network) {
         return Err(Status::invalid_argument(
             "transparent address network does not match server network",

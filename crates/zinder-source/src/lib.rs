@@ -61,7 +61,10 @@ pub use source_transaction::{
     TransactionPublicFactSet, parse_transaction_public_fact_set, parse_transaction_public_facts,
     transaction_component_counts, transaction_public_fact_set_from_parsed,
 };
-pub use transparent_address::transparent_address_matches_network;
+pub use transparent_address::{
+    MAX_TRANSPARENT_ADDRESS_TEXT_BYTES, TransparentAddressParseError, parse_transparent_address,
+    transparent_address_matches_network,
+};
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,
     build_zebra_json_rpc_client, connect_zebra_indexer_channel, is_transport_failure,

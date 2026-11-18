@@ -8,7 +8,60 @@
 //! it instead of carrying their own copies.
 
 use zebra_chain::parameters::NetworkKind as ZebraNetworkKind;
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::Network;
+
+/// Longest transparent-address text [`parse_transparent_address`] decodes.
+///
+/// A `Base58Check` address is 35 characters and the longest ZIP 320 TEX
+/// encoding (`texregtest1…`) is 49, so this leaves margin while keeping
+/// arbitrarily long request strings out of the decoder.
+pub const MAX_TRANSPARENT_ADDRESS_TEXT_BYTES: usize = 64;
+
+/// Why [`parse_transparent_address`] refused its input.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TransparentAddressParseError {
+    /// The text is longer than any valid transparent-address encoding.
+    #[error(
+        "transparent address is {length} bytes, longer than any valid encoding \
+         ({MAX_TRANSPARENT_ADDRESS_TEXT_BYTES} bytes)"
+    )]
+    TooLong {
+        /// Length of the refused text in bytes.
+        length: usize,
+    },
+    /// The text is not a valid transparent-address encoding.
+    #[error("transparent address could not be parsed: {reason}")]
+    Invalid {
+        /// The decoder's description of the failure.
+        reason: String,
+    },
+}
+
+/// Parses transparent-address text from a request.
+///
+/// Every request surface parses through this function. Base58 decoding is
+/// quadratic in the input length, so text longer than
+/// [`MAX_TRANSPARENT_ADDRESS_TEXT_BYTES`] is refused before decoding.
+///
+/// # Errors
+///
+/// Returns [`TransparentAddressParseError::TooLong`] for oversized text and
+/// [`TransparentAddressParseError::Invalid`] for text that does not decode.
+pub fn parse_transparent_address(
+    text: &str,
+) -> Result<ZebraTransparentAddress, TransparentAddressParseError> {
+    if text.len() > MAX_TRANSPARENT_ADDRESS_TEXT_BYTES {
+        return Err(TransparentAddressParseError::TooLong { length: text.len() });
+    }
+    text.parse()
+        .map_err(|source: zebra_chain::serialization::SerializationError| {
+            TransparentAddressParseError::Invalid {
+                reason: source.to_string(),
+            }
+        })
+}
 
 /// Returns true when `address_kind` is compatible with `network`.
 ///
@@ -39,6 +92,29 @@ pub fn transparent_address_matches_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_address_text_is_refused_before_decoding() {
+        let oversized = "t".repeat(MAX_TRANSPARENT_ADDRESS_TEXT_BYTES + 1);
+        assert_eq!(
+            parse_transparent_address(&oversized),
+            Err(TransparentAddressParseError::TooLong {
+                length: MAX_TRANSPARENT_ADDRESS_TEXT_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn valid_address_text_parses_and_garbage_is_invalid() {
+        let encoded =
+            ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Mainnet, [7; 20])
+                .to_string();
+        assert!(parse_transparent_address(&encoded).is_ok());
+        assert!(matches!(
+            parse_transparent_address("t1notanaddress"),
+            Err(TransparentAddressParseError::Invalid { .. })
+        ));
+    }
 
     #[test]
     fn mainnet_address_only_matches_mainnet_network() {
