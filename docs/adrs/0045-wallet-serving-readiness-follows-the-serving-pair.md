@@ -181,13 +181,24 @@ ingest reports `syncing`, because it trails the node or because its mempool
 cannot hydrate. Native query relays the writer's own observations under its
 `ingest_control` dependency: the `upstream_not_ready` that
 `IngestControl.WriterStatus` reports independently of that admission state,
-and the `node_unavailable` of a writer mempool that waits on its node. The
-entrypoint therefore also treats an ingest that reports `syncing` as an
-upstream outage when query's report carries either relay. A relayed
-`node_unavailable` also runs the 24-hour unreachable-node clock, as ingest's
-own `node_unavailable` does, so an ingest stuck in its mempool client still
-restarts eventually. The entrypoint reads only the writer's own observations,
-never query's view of the node, and it reclassifies no other ingest cause.
+and the `node_unavailable` of a writer mempool that refuses while it waits for
+a node snapshot. The entrypoint therefore treats an ingest that reports
+`syncing` as an upstream outage when query's report carries the
+`upstream_not_ready` relay.
+
+The mempool relay is narrower evidence. The writer's mempool also refuses with
+`NODE_UNAVAILABLE` while a canonical writer that trails a reachable node
+catches up, because it certifies a snapshot only at the canonical tip. Ingest
+tells the two cases apart: a trailing writer reports `syncing` with a numeric
+`lag_blocks`, and the mempool gate of a writer that has caught up reports
+`syncing` with `lag_blocks: null`. The entrypoint treats a relayed
+`node_unavailable` as an upstream outage only behind that null lag, and then
+also runs the 24-hour unreachable-node clock, as ingest's own
+`node_unavailable` does, so an ingest stuck in its mempool client still
+restarts eventually. A trailing writer stays on the one-hour unready tolerance
+and the recurrence budgets. The entrypoint reads only the writer's own
+observations, never query's view of the node, and it reclassifies no other
+ingest cause.
 
 The reference Docker Compose topology starts the readers once the ingest
 container has started, instead of once it is healthy. Readers share the ingest

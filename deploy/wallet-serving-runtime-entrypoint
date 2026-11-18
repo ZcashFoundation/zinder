@@ -393,20 +393,30 @@ readiness_cause_is_upstream_outage() {
 # Ingest's own cause hides its node probe while its admission state refuses
 # traffic: while Zebra resyncs, or while only the node's mempool feed fails,
 # ingest reports `syncing` because it trails the node or because its mempool
-# cannot hydrate. Query relays the writer's own node observation as the cause
-# of its `ingest_control` dependency: `upstream_not_ready` when
-# `IngestControl.WriterStatus` reports the node unsynchronized, and
-# `node_unavailable` when the writer's live mempool waits on an unreachable
-# node. Given ingest's cause and the body query just answered, prints that
-# relayed cause when ingest is syncing behind it, and nothing otherwise.
+# cannot hydrate. Query relays the writer's own observations as the cause of
+# its `ingest_control` dependency. `upstream_not_ready` means
+# `IngestControl.WriterStatus` reports the node unsynchronized.
+# `node_unavailable` means the writer's live mempool refuses while it waits for
+# a node snapshot, which also happens while a canonical writer that trails a
+# reachable node catches up. Only a syncing ingest with no known lag, the cause
+# the mempool gate publishes once canonical ingest has caught up, points that
+# refusal at the node; a numeric `lag_blocks` leaves the trailing writer on the
+# ordinary unready tolerance. Given ingest's cause, ingest's body, and the body
+# query just answered, prints the relayed cause when it explains ingest's
+# syncing, and nothing otherwise.
 writer_node_outage_behind_syncing_ingest() {
   [ "$1" = "syncing" ] || return 0
-  case "$2" in
+  case "$3" in
     *'{"input":"ingest_control","dependency_cause":{"upstream_not_ready":'*)
       printf 'upstream_not_ready\n'
       ;;
     *'{"input":"ingest_control","dependency_cause":{"node_unavailable":'*)
-      printf 'node_unavailable\n'
+      case "$2" in
+        *'"cause":{"syncing":{"lag_blocks":null}'*)
+          printf 'node_unavailable\n'
+          ;;
+        *) ;;
+      esac
       ;;
     *) ;;
   esac
@@ -832,6 +842,7 @@ while true; do
   fi
   ingest_report="$probe_report"
   ingest_cause="$probe_cause"
+  ingest_body="$probe_body"
   ingest_upstream_outage="$probe_upstream_outage"
   ingest_node_unreachable="$probe_node_unreachable"
   ingest_unreachable=0
@@ -874,7 +885,8 @@ while true; do
     plane_halted=$((plane_halted | probe_halted))
   fi
 
-  case "$(writer_node_outage_behind_syncing_ingest "$ingest_cause" "$query_body")" in
+  case "$(writer_node_outage_behind_syncing_ingest "$ingest_cause" "$ingest_body" \
+    "$query_body")" in
     upstream_not_ready)
       ingest_upstream_outage=1
       ;;

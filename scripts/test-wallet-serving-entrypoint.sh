@@ -323,32 +323,45 @@ for outage_body in "$ingest_node_unavailable_body" "$ingest_upstream_not_ready_b
 done
 # While Zebra resyncs, or while only the node's mempool feed fails, ingest's
 # admission state reports `syncing` and hides its node probe. Query relays the
-# writer's own node observation under its `ingest_control` dependency, so the
-# serving loop still recognizes the upstream outage, and an unreachable node
-# behind the writer's mempool starts the unreachable-node clock. Neither
-# applies to an unrelated ingest cause or to query's own view of the node.
+# writer's own observations under its `ingest_control` dependency, so the
+# serving loop still recognizes an unsynchronized node behind any syncing
+# ingest. A relayed mempool `node_unavailable` starts the unreachable-node
+# clock only behind the mempool gate's `syncing` with no known lag: a writer
+# that trails a reachable node also keeps its mempool hydrating, and stays on
+# the ordinary unready tolerance. None of this applies to an unrelated ingest
+# cause or to query's own view of the node.
+ingest_mempool_gated_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673,"target_height":4602673}'
+ingest_trailing_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":40}},"current_height":4602633,"target_height":4602673}'
 query_relays_writer_upstream_not_ready_body="$degraded_ready_body"
 query_relays_writer_mempool_node_unavailable_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"ingest_control","dependency_cause":{"node_unavailable":{"failure_class":"stream_disconnected","last_reason":"the live mempool index is hydrating from the node","consecutive_failures":3,"outage_seconds":30}}}]}'
 query_node_not_ready_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"node_source","dependency_cause":{"upstream_not_ready":{"upstream_health":{"source":"zebra_ready_endpoint","reason":"syncing"}}}}]}'
 query_node_unavailable_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"node_source","dependency_cause":{"node_unavailable":{"failure_class":"node_unreachable","last_reason":"connection refused","consecutive_failures":4,"outage_seconds":45}}}]}'
+for ingest_syncing_body in "$ingest_mempool_gated_syncing_body" "$ingest_trailing_syncing_body"; do
+  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing "$ingest_syncing_body" \
+    "$query_relays_writer_upstream_not_ready_body")"
+  [ "$relayed_outage" = "upstream_not_ready" ] \
+    || test_failure "a syncing ingest whose writer reports its node unsynchronized must be an upstream outage, got '$relayed_outage' behind '$ingest_syncing_body'"
+done
 relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
-  "$query_relays_writer_upstream_not_ready_body")"
-[ "$relayed_outage" = "upstream_not_ready" ] \
-  || test_failure "a syncing ingest whose writer reports its node unsynchronized must be an upstream outage, got '$relayed_outage'"
-relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
-  "$query_relays_writer_mempool_node_unavailable_body")"
+  "$ingest_mempool_gated_syncing_body" "$query_relays_writer_mempool_node_unavailable_body")"
 [ "$relayed_outage" = "node_unavailable" ] \
-  || test_failure "a syncing ingest whose writer mempool cannot reach its node must be an unreachable-node outage, got '$relayed_outage'"
+  || test_failure "a caught-up ingest whose writer mempool cannot reach its node must be an unreachable-node outage, got '$relayed_outage'"
+relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+  "$ingest_trailing_syncing_body" "$query_relays_writer_mempool_node_unavailable_body")"
+[ -z "$relayed_outage" ] \
+  || test_failure "a trailing ingest whose mempool waits for canonical ingest must stay on the unready tolerance, got '$relayed_outage'"
 for unrelated_body in "$ready_body" "$query_node_not_ready_body" "$query_node_unavailable_body" \
   "$degraded_lagging_body" ""; do
-  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing "$unrelated_body")"
+  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+    "$ingest_mempool_gated_syncing_body" "$unrelated_body")"
   [ -z "$relayed_outage" ] \
     || test_failure "a syncing ingest is an upstream outage only when its writer reports its node, got '$relayed_outage' from '$unrelated_body'"
 done
 for unrelated_cause in storage_unavailable replica_lagging starting unreachable; do
   for relaying_body in "$query_relays_writer_upstream_not_ready_body" \
     "$query_relays_writer_mempool_node_unavailable_body"; do
-    relayed_outage="$(writer_node_outage_behind_syncing_ingest "$unrelated_cause" "$relaying_body")"
+    relayed_outage="$(writer_node_outage_behind_syncing_ingest "$unrelated_cause" \
+      "$ingest_mempool_gated_syncing_body" "$relaying_body")"
     [ -z "$relayed_outage" ] \
       || test_failure "a writer node outage must not hide ingest's $unrelated_cause, got '$relayed_outage'"
   done

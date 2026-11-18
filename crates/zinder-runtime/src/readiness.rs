@@ -1363,6 +1363,20 @@ mod tests {
         Ok(())
     }
 
+    // `deploy/wallet-serving-runtime-entrypoint` matches this exact text to
+    // tell ingest's mempool gate from a writer that trails its node.
+    #[test]
+    fn syncing_cause_renders_unknown_lag_as_null() -> Result<(), serde_json::Error> {
+        for (lag_blocks, expected) in [
+            (None, r#"{"syncing":{"lag_blocks":null}}"#),
+            (Some(40), r#"{"syncing":{"lag_blocks":40}}"#),
+        ] {
+            let rendered = serde_json::to_string(&ReadinessCause::Syncing { lag_blocks })?;
+            assert_eq!(rendered, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn ingest_phase_serializes_snake_case() -> Result<(), serde_json::Error> {
         for (phase, expected) in [
