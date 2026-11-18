@@ -310,6 +310,23 @@ impl BoundedRequestBody {
         }
     }
 
+    /// Appends `chunk` to the pending bytes.
+    ///
+    /// `BytesMut` grows by doubling, which would let a frame just over half
+    /// the decoding limit hold twice its size. A buffer that must grow is
+    /// instead replaced by one sized for the frame its header declares, or
+    /// for the bytes at hand when they are more.
+    fn buffer(&mut self, chunk: &[u8]) {
+        let needed = self.pending.len().saturating_add(chunk.len());
+        if needed > self.pending.capacity() {
+            let declared = declared_frame_bytes(&self.pending, chunk);
+            let mut grown = BytesMut::with_capacity(needed.max(declared));
+            grown.extend_from_slice(&self.pending);
+            self.pending = grown;
+        }
+        self.pending.extend_from_slice(chunk);
+    }
+
     /// Releases the next complete frame, or reads more of the inner body.
     fn poll_scanning(&mut self, context: &mut Context<'_>) -> Poll<ScanStep> {
         match self.pending_frame() {
@@ -335,7 +352,7 @@ impl BoundedRequestBody {
         let tail = match ready!(Pin::new(&mut self.inner).poll_frame(context)) {
             Some(Ok(frame)) => match frame.into_data() {
                 Ok(chunk) => {
-                    self.pending.extend_from_slice(&chunk);
+                    self.buffer(&chunk);
                     return Poll::Ready(ScanStep::Continue);
                 }
                 Err(trailers) => Tail::Held(Ok(trailers)),
@@ -345,6 +362,28 @@ impl BoundedRequestBody {
         };
         self.state = BodyState::PassThrough(tail);
         Poll::Ready(ScanStep::Continue)
+    }
+}
+
+/// The length of the scannable frame whose header starts `buffered` and
+/// continues into `chunk`, or zero while that header is incomplete or
+/// declares a frame the guard passes through unscanned.
+fn declared_frame_bytes(buffered: &[u8], chunk: &[u8]) -> usize {
+    let mut header = [0_u8; GRPC_FRAME_HEADER_BYTES];
+    let mut header_bytes = buffered.iter().chain(chunk);
+    for byte in &mut header {
+        let Some(&next) = header_bytes.next() else {
+            return 0;
+        };
+        *byte = next;
+    }
+    let mut header = &header[..];
+    let compressed = header.get_u8() != 0;
+    match usize::try_from(header.get_u32()) {
+        Ok(message_bytes) if !compressed && message_bytes <= MAX_DECODING_MESSAGE_BYTES => {
+            GRPC_FRAME_HEADER_BYTES + message_bytes
+        }
+        Ok(_) | Err(_) => 0,
     }
 }
 
@@ -708,6 +747,22 @@ mod tests {
             }
         }
         drained
+    }
+
+    #[test]
+    fn buffering_a_frame_never_reserves_past_its_declared_size() {
+        let frame = grpc_frame(&vec![0; 600_000]);
+        let mut body = BoundedRequestBody::new(TonicBody::empty(), &BALANCE_LIMITS);
+        for chunk in frame.chunks(16 * 1024) {
+            body.buffer(chunk);
+            assert!(
+                body.pending.capacity() <= frame.len(),
+                "{} bytes reserved for a {}-byte frame",
+                body.pending.capacity(),
+                frame.len()
+            );
+        }
+        assert_eq!(body.pending.as_ref(), frame.as_slice());
     }
 
     #[tokio::test]
