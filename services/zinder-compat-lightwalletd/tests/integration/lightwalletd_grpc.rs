@@ -3090,6 +3090,40 @@ async fn taddress_balance_counts_a_repeated_address_once() -> eyre::Result<()> {
 #[tokio::test]
 async fn taddress_balance_stream_rejects_an_over_cap_address_before_the_stream_ends()
 -> eyre::Result<()> {
+    let over_cap_count = MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES.saturating_add(1);
+    let distinct_addresses = (0..over_cap_count)
+        .map(|index| {
+            let mut pub_key_hash = [0x41; 20];
+            pub_key_hash[..4].copy_from_slice(&index.to_be_bytes());
+            ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, pub_key_hash)
+                .to_string()
+        })
+        .collect();
+
+    let status = balance_stream_status_before_half_close(distinct_addresses).await?;
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    Ok(())
+}
+
+/// An invalid address is rejected as it arrives, so a client cannot make the
+/// server hold large unparsed strings while it keeps the stream open.
+#[tokio::test]
+async fn taddress_balance_stream_rejects_an_invalid_address_before_the_stream_ends()
+-> eyre::Result<()> {
+    let oversized_invalid_address = "t".repeat(1024 * 1024);
+
+    let status = balance_stream_status_before_half_close(vec![oversized_invalid_address]).await?;
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    Ok(())
+}
+
+/// Returns the status a never-ending `GetTaddressBalanceStream` gets back.
+///
+/// Streams `addresses` over a real transport without half-closing, so only a
+/// rejection while receiving can answer before the timeout.
+async fn balance_stream_status_before_half_close(addresses: Vec<String>) -> eyre::Result<Status> {
     let store_fixture = acceptance_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
@@ -3104,45 +3138,30 @@ async fn taddress_balance_stream_rejects_an_over_cap_address_before_the_stream_e
             .await
     });
 
-    {
+    let outcome = {
         let mut client = CompactTxStreamerClient::connect(format!("http://{server_addr}")).await?;
-        let over_cap_count = MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES.saturating_add(1);
-        let distinct_addresses = (0..over_cap_count)
-            .map(|index| {
-                let mut pub_key_hash = [0x41; 20];
-                pub_key_hash[..4].copy_from_slice(&index.to_be_bytes());
-                lightwalletd::Address {
-                    address: ZebraTransparentAddress::from_pub_key_hash(
-                        ZebraNetworkKind::Regtest,
-                        pub_key_hash,
-                    )
-                    .to_string(),
-                }
-            })
-            .collect::<Vec<_>>();
-        // The stream never half-closes, so only a rejection while receiving
-        // can answer before the timeout.
         let never_ending_addresses = tokio_stream::StreamExt::chain(
-            tokio_stream::iter(distinct_addresses),
+            tokio_stream::iter(
+                addresses
+                    .into_iter()
+                    .map(|address| lightwalletd::Address { address }),
+            ),
             tokio_stream::pending(),
         );
-
-        let outcome = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.get_taddress_balance_stream(never_ending_addresses),
         )
         .await
-        .map_err(|_| eyre!("over-cap stream was not rejected before the client half-closed"))?;
-        let status = match outcome {
-            Ok(response) => return Err(eyre!("expected rejection, got {response:?}")),
-            Err(status) => status,
-        };
-        assert_eq!(status.code(), Code::InvalidArgument);
-    }
+        .map_err(|_| eyre!("stream was not rejected before the client half-closed"))?
+    };
 
     let _ = shutdown_tx.send(());
     server_handle.await??;
-    Ok(())
+    match outcome {
+        Ok(response) => Err(eyre!("expected rejection, got {response:?}")),
+        Err(status) => Ok(status),
+    }
 }
 
 #[tokio::test]

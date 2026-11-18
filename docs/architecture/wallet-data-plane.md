@@ -752,9 +752,12 @@ The compatibility runtime reports the confirmed total as the lightwalletd
 `int64 value_zat`. A total above `i64::MAX` is rejected with `OUT_OF_RANGE`.
 Live mempool state is not part of the balance. `GetTaddressBalanceStream`
 collects the streamed addresses and returns the same value as the unary call.
-It rejects the stream as soon as the 257th distinct address arrives, without
-waiting for the client to finish sending, so a client cannot make the server
-buffer an unbounded address list. lightwalletd bounds the same stream at
+It parses each address as it arrives and keeps only its script hash. The
+stream is rejected with `INVALID_ARGUMENT` as soon as an address is invalid or
+the 257th distinct address arrives, without waiting for the client to finish
+sending, so a client cannot make the server buffer an unbounded address list.
+Every address lookup, native and compatible, refuses text longer than 64
+bytes before parsing it; the longest valid transparent encoding is 49. lightwalletd bounds the same stream at
 10,000 addresses (GHSA-x4m7-3gpp-xc36).
 
 ## Capability Discovery

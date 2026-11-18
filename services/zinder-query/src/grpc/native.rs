@@ -347,6 +347,13 @@ pub async fn transparent_outpoint_spend_status_response<Q: WalletQueryApi + ?Siz
     })
 }
 
+/// Upper bound on the text of a transparent address.
+///
+/// A `Base58Check` address is 35 characters and the longest ZIP 320 TEX
+/// encoding (`texregtest1…`) is 49, so this leaves margin without letting a
+/// request reach the parser with an arbitrarily long string.
+const MAX_TRANSPARENT_ADDRESS_TEXT_BYTES: usize = 64;
+
 /// Resolves a `wallet::AddressLookup` oneof to the typed
 /// `TransparentAddressScriptHash`. String addresses are parsed against
 /// `network` and SHA-256-hashed; raw script-hash bytes are taken verbatim.
@@ -372,6 +379,13 @@ pub fn address_lookup_to_script_hash(
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         wallet::address_lookup::Selector::Address(address_text) => {
+            // Base58 decoding is quadratic in the input length, so an
+            // oversized string is refused before it reaches the parser.
+            if address_text.len() > MAX_TRANSPARENT_ADDRESS_TEXT_BYTES {
+                return Err(QueryError::InvalidAddress {
+                    reason: "transparent address is longer than any valid encoding",
+                });
+            }
             let zebra_address = address_text
                 .parse::<ZebraTransparentAddress>()
                 .map_err(|_| QueryError::InvalidAddress {
