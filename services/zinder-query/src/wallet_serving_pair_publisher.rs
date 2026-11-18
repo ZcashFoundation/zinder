@@ -1103,7 +1103,9 @@ impl WalletServingPairPublisher {
             candidate_preparations: CandidatePreparationCounts::default(),
         };
         publisher.prepare_candidate_awaiting_schedule(0).await?;
-        publisher.converge_and_publish(0).await?;
+        publisher
+            .converge_and_publish(0, &CancellationToken::new())
+            .await?;
         publisher.record_resource_gauges().await;
         let Some(serving_pair_slot) = publisher.serving_pair_slot.clone() else {
             return Err(WalletServingPairError::PairSlotUnavailable);
@@ -1117,7 +1119,10 @@ impl WalletServingPairPublisher {
     /// A refresh runs every catch-up interval, and at once when a read first
     /// finds a pair missing a table file. Every refresh failure leaves the
     /// current immutable pair untouched and updates readiness with its typed
-    /// cause; it never falls back to a primary store.
+    /// cause; it never falls back to a primary store. `cancel` also stops a
+    /// refresh in progress at its next writer-status read or convergence
+    /// retry, without publishing and without recording a failure; a
+    /// secondary open or catch-up already on the blocking pool finishes first.
     #[must_use = "await the publisher on shutdown so secondary handles close before process exit"]
     pub fn spawn(
         mut self,
@@ -1135,7 +1140,7 @@ impl WalletServingPairPublisher {
                     () = tokio::time::sleep(self.config.catchup_interval) => {}
                     () = missing_table_file_reported(signals.as_deref()) => {}
                 }
-                self.refresh_and_record().await;
+                self.refresh_and_record(&cancel).await;
             }
             serving_runtime_drained.cancelled().await;
             let started_at = Instant::now();
@@ -1156,8 +1161,11 @@ impl WalletServingPairPublisher {
         })
     }
 
-    async fn refresh_and_record(&mut self) {
-        let refreshed = self.refresh_once().await;
+    async fn refresh_and_record(&mut self, shutdown: &CancellationToken) {
+        let refreshed = self.refresh_once(shutdown).await;
+        if shutdown.is_cancelled() {
+            return;
+        }
         self.record_resource_gauges().await;
         let Err(error) = refreshed else {
             return;
@@ -1187,7 +1195,15 @@ impl WalletServingPairPublisher {
         }
     }
 
-    async fn refresh_once(&mut self) -> Result<(), WalletServingPairError> {
+    /// Refreshes the published pair once.
+    ///
+    /// Returns `Ok` without publishing once `shutdown` fires during the
+    /// writer-status read or the candidate's convergence, because a refresh
+    /// abandoned for shutdown is not a failure of the published pair.
+    async fn refresh_once(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<(), WalletServingPairError> {
         let now = Instant::now();
         self.release_expired_pairs(now);
         self.reap_retired_pairs(now).await;
@@ -1197,7 +1213,11 @@ impl WalletServingPairPublisher {
             .ok_or(WalletServingPairError::PairSlotUnavailable)?;
         let active_pair = serving_pair_slot.capture();
         self.adopt_ingest_control_halt(&active_pair);
-        let writer_status = self.writer_status.fetch().await?;
+        let writer_status = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            writer_status = self.writer_status.fetch() => writer_status?,
+        };
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
         // A pair missing a table file is replaced at the writer's fence even
         // when that fence has not moved.
@@ -1217,7 +1237,7 @@ impl WalletServingPairPublisher {
             return Ok(());
         };
         self.prepare_candidate(generation).await?;
-        self.converge_and_publish(generation).await
+        self.converge_and_publish(generation, shutdown).await
     }
 
     /// Publishes the two shared block caches and the number of open
@@ -1607,9 +1627,13 @@ impl WalletServingPairPublisher {
         opened
     }
 
+    /// Converges the candidate in `generation` on the writer's fence and
+    /// publishes it, or returns `Ok` without publishing when `shutdown`
+    /// fires first.
     async fn converge_and_publish(
         &mut self,
         generation: usize,
+        shutdown: &CancellationToken,
     ) -> Result<(), WalletServingPairError> {
         let retry_delay = self
             .config
@@ -1627,19 +1651,15 @@ impl WalletServingPairPublisher {
             generation,
             last_outcome: WalletServingConvergence::ReplicaBehind,
         };
-        let outcome = converge_on_canonical_writer_fence(
-            &mut probe,
-            network,
-            policy,
-            &CancellationToken::new(),
-        )
-        .await;
+        let outcome =
+            converge_on_canonical_writer_fence(&mut probe, network, policy, shutdown).await;
         let last_outcome = probe.last_outcome;
         match outcome {
             Ok(CanonicalFenceConvergence::Converged(attesting_status)) => {
                 self.publish_candidate(generation, &attesting_status).await
             }
-            Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
+            Ok(CanonicalFenceConvergence::Cancelled) => Ok(()),
+            Ok(CanonicalFenceConvergence::Trailing(_))
             | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
                 Err(WalletServingPairError::ConvergenceTimedOut { last_outcome })
             }
@@ -2518,15 +2538,16 @@ mod tests {
     };
 
     use super::{
-        CandidatePreparationCounts, CanonicalFenceRelation, IngestControlObserver,
-        RETAINED_PAIR_WINDOW, SECONDARY_GENERATION_COUNT, SecondaryGenerationState,
-        WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
-        WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
-        candidate_admission_outcome, classify_canonical_writer_fence, classify_pair_admission,
-        error_with_sources, missing_table_file_reported, refresh_failure_is_routine_lag,
-        refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
-        spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
-        wallet_ingest_control_request, wallet_source_writer_fence,
+        CONVERGENCE_RETRY_DELAY_CAP, CandidatePreparationCounts, CanonicalFenceRelation,
+        IngestControlObserver, RETAINED_PAIR_WINDOW, SECONDARY_GENERATION_COUNT,
+        SecondaryGenerationState, WalletServingConvergence, WalletServingPairConfig,
+        WalletServingPairError, WalletServingPairPublisher, WalletServingPairSlot,
+        WalletServingReadiness, candidate_admission_outcome, classify_canonical_writer_fence,
+        classify_pair_admission, error_with_sources, missing_table_file_reported,
+        refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
+        refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
+        spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
+        wallet_source_writer_fence,
     };
     use crate::{
         AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
@@ -3134,7 +3155,7 @@ mod tests {
 
         wait_for_probes(1).await?;
         primaries.admit_schedule_revision()?;
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         wait_for_probes(2).await?;
 
         cancel.cancel();
@@ -4400,7 +4421,7 @@ mod tests {
         assert_eq!(canonical_primary.event_fence(), fence_before);
         control.set_writer_status(writer_status_for_store(&canonical_primary));
 
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let pair = slot.capture();
         let schedule = pair
             .canonical()
@@ -4491,7 +4512,7 @@ mod tests {
         let mut pinned_pairs = vec![slot.capture()];
         for revision in 1..u32::try_from(super::SECONDARY_GENERATION_COUNT)? {
             admit_schedule_revision(revision)?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             let refreshed_pair = slot.capture();
             assert!(
                 !Arc::ptr_eq(
@@ -4505,7 +4526,7 @@ mod tests {
 
         let revision = u32::try_from(super::SECONDARY_GENERATION_COUNT)?;
         admit_schedule_revision(revision)?;
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(
             Arc::ptr_eq(
                 &slot.capture(),
@@ -4515,7 +4536,7 @@ mod tests {
         );
 
         drop(pinned_pairs.remove(0));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let released_slot_pair = slot.capture();
         assert!(!Arc::ptr_eq(
             &released_slot_pair,
@@ -4632,7 +4653,7 @@ mod tests {
             )?)?;
             control.set_writer_status(writer_status_for_store(writer.canonical_primary()?));
             let before = slot.capture();
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             Ok::<_, Box<dyn std::error::Error>>(!Arc::ptr_eq(&before, &slot.capture()))
         };
         // Each read takes its first output and stops, so it holds the pair it
@@ -4920,7 +4941,7 @@ mod tests {
         drop(wallet_reconcile_secondary);
         control.set_writer_status(writer_status_for_store(&canonical_primary));
 
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let pair = slot.capture();
         assert_eq!(pair.canonical_fence(), crossing_fence);
         assert_eq!(pair.wallet_source(), crossing_source);
@@ -5088,7 +5109,7 @@ mod tests {
 
         control.set_available(false);
         let outage = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("refresh must fail during a writer-status outage")?;
@@ -5098,11 +5119,11 @@ mod tests {
         assert_ne!(during_outage.cause.metric_label(), "serving_pair_stale");
 
         control.set_available(true);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert_eq!(readiness.report().cause, unconfirmed);
 
         control.set_writer_status(writer_status_for_store(&canonical_primary));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(readiness.report().is_ready);
 
         // A park, then a restarted writer that has not yet rediscovered it,
@@ -5117,15 +5138,15 @@ mod tests {
             tip_unconfirmed: true,
             ..writer_status_for_store(&canonical_primary)
         });
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         control.set_writer_status(unconfirmed_status);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(matches!(
             readiness.report().cause,
             zinder_runtime::ReadinessCause::ReorgWindowExceeded { .. }
         ));
         control.set_writer_status(writer_status_for_store(&canonical_primary));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(readiness.report().is_ready);
 
         cancel.cancel();
@@ -5215,11 +5236,11 @@ mod tests {
         assert_eq!(bootstrapped.cause, expected_halt);
 
         control.set_writer_status(writer_status_for_store(&canonical_primary));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(readiness.report().is_ready);
 
         control.set_writer_status(parked_status);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let parked = readiness.report();
         assert!(!parked.is_ready);
         assert_eq!(parked.cause, expected_halt);
@@ -5229,7 +5250,7 @@ mod tests {
         cancel.cancel();
         server_task.await??;
         let outage = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("refresh must fail once the writer status endpoint is gone")?;
@@ -5308,7 +5329,7 @@ mod tests {
         assert!(readiness.report().is_ready);
 
         control.set_writer_status(parked_mismatched_status);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let parked = readiness.report();
         assert!(!parked.is_ready);
         assert!(matches!(
@@ -5415,7 +5436,7 @@ mod tests {
             ..writer_status_for_store(&canonical_primary)
         });
         let missing_fence = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("a writer status without a fence must fail the refresh")?;
@@ -5438,7 +5459,7 @@ mod tests {
         assert_eq!(lagging.cause.metric_label(), "replica_lagging");
 
         control.set_writer_status(writer_status_for_store(&canonical_primary));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let recovered = readiness.report();
         assert!(recovered.is_ready, "{recovered:?}");
         assert!(recovered.degraded.is_empty(), "{recovered:?}");
@@ -6039,7 +6060,7 @@ mod tests {
         drop(wallet_reconcile_secondary);
 
         control.set_writer_status(writer_status_for_store(&canonical_primary));
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let refreshed_pair = slot.capture();
         assert!(!Arc::ptr_eq(&old_pair, &refreshed_pair));
         assert_eq!(refreshed_pair.canonical_fence(), append_fence);
@@ -6149,7 +6170,7 @@ mod tests {
         *digest_byte ^= 0xff;
         control.set_writer_status(mutated_status);
         let failure = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("mutated writer fence must fail refresh")?;
@@ -6207,7 +6228,7 @@ mod tests {
         for block in 1..=3 * SECONDARY_GENERATION_COUNT {
             age_out_retained_pairs(&mut publisher, 2);
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(
                 slot.capture().canonical_fence(),
                 fence,
@@ -6250,7 +6271,7 @@ mod tests {
         let latest = primaries.append_block()?;
         assert_ne!(earlier.chain_epoch_id(), latest.chain_epoch_id());
 
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert_eq!(slot.capture().canonical_fence(), latest);
         assert_eq!(
             slot.retained_pair_count(),
@@ -6308,7 +6329,7 @@ mod tests {
 
         for block in 1..SECONDARY_GENERATION_COUNT {
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(slot.capture().canonical_fence(), fence);
             assert_eq!(
                 query.visible_tip_block(Some(pinned.id)).await?.chain_epoch,
@@ -6320,7 +6341,7 @@ mod tests {
         let mut coalesced = Vec::new();
         for block in 1..=2 {
             coalesced.push(primaries.append_block()?);
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert!(
                 Arc::ptr_eq(&slot.capture(), &last_published),
                 "coalesced block {block} must wait for a slot"
@@ -6361,7 +6382,7 @@ mod tests {
             Err(crate::QueryError::ChainEpochPinUnavailable { .. })
         ));
 
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let latest = *coalesced.last().ok_or("the burst must coalesce blocks")?;
         assert_eq!(slot.capture().canonical_fence(), latest);
         assert_eq!(
@@ -6429,7 +6450,9 @@ mod tests {
         assert!(canonical_cache.usage_bytes() > before_first_read);
 
         primaries.append_block()?;
-        publisher.refresh_and_record().await;
+        publisher
+            .refresh_and_record(&CancellationToken::new())
+            .await;
         let second = slot.capture();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(
@@ -6456,7 +6479,9 @@ mod tests {
 
         for _ in 2..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
-            publisher.refresh_and_record().await;
+            publisher
+                .refresh_and_record(&CancellationToken::new())
+                .await;
         }
         assert_eq!(
             publisher.candidate_preparations.cold,
@@ -6572,7 +6597,7 @@ mod tests {
         for block in 1..=spaced_blocks {
             publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(slot.capture().canonical_fence(), fence);
             assert_eq!(
                 publisher.candidate_preparations,
@@ -6584,7 +6609,7 @@ mod tests {
 
         for (block, opened) in [(1, 3), (2, SECONDARY_GENERATION_COUNT)] {
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(slot.capture().canonical_fence(), fence);
             assert_eq!(
                 publisher.candidate_preparations,
@@ -6595,7 +6620,7 @@ mod tests {
         for block in 1..=SECONDARY_GENERATION_COUNT {
             age_out_retained_pairs(&mut publisher, 2);
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(slot.capture().canonical_fence(), fence);
             assert_eq!(
                 publisher.candidate_preparations,
@@ -6623,7 +6648,7 @@ mod tests {
             .await?;
         for _ in 1..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
         }
         assert_eq!(
             publisher.candidate_preparations.cold,
@@ -6634,7 +6659,7 @@ mod tests {
         for block in 1..=2 * SECONDARY_GENERATION_COUNT {
             publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(
                 slot.capture().canonical_fence(),
                 fence,
@@ -6703,7 +6728,7 @@ mod tests {
         for block in 1..=2 * SECONDARY_GENERATION_COUNT {
             age_out_retained_pairs(&mut publisher, 1);
             let fence = primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
             assert_eq!(
                 slot.capture().canonical_fence(),
                 fence,
@@ -6727,7 +6752,7 @@ mod tests {
 
         drop(held);
         let fence = primaries.append_block()?;
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert_eq!(slot.capture().canonical_fence(), fence);
         assert_eq!(
             publisher.published_generation,
@@ -6756,7 +6781,7 @@ mod tests {
         for _ in 0..SECONDARY_GENERATION_COUNT {
             age_out_retained_pairs(&mut publisher, 2);
             primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
         }
         let warmed = publisher.candidate_preparations;
         assert_eq!(
@@ -6770,7 +6795,7 @@ mod tests {
         let fence_before_revision = slot.capture().canonical_fence();
         let extended = primaries.admit_schedule_revision()?;
         age_out_retained_pairs(&mut publisher, 2);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         let revised_pair = slot.capture();
         assert_eq!(revised_pair.canonical_fence(), fence_before_revision);
         assert_eq!(
@@ -6798,7 +6823,7 @@ mod tests {
         *digest_byte ^= 0xff;
         primaries.control.set_writer_status(mutated_status);
         let failure = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("a writer fence the recycled candidate cannot reach must fail refresh")?;
@@ -6814,7 +6839,7 @@ mod tests {
         ));
 
         primaries.publish_writer_status()?;
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert_eq!(slot.capture().canonical_fence(), appended_fence);
         assert!(readiness.report().is_ready);
         assert_eq!(
@@ -6853,13 +6878,13 @@ mod tests {
         // ends, which releases generation 0's pair.
         for _ in 1..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
-            publisher.refresh_once().await?;
+            publisher.refresh_once(&CancellationToken::new()).await?;
         }
         age_out_retained_pairs(&mut publisher, 2);
 
         let fence = primaries.append_block()?;
         let failure = publisher
-            .refresh_once()
+            .refresh_once(&CancellationToken::new())
             .await
             .err()
             .ok_or("a shared generation must not become a candidate")?;
@@ -6875,7 +6900,7 @@ mod tests {
         );
 
         drop(shared_canonical);
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert_eq!(slot.capture().canonical_fence(), fence);
         assert_eq!(publisher.published_generation, Some(0));
         assert_eq!(
@@ -6888,6 +6913,94 @@ mod tests {
 
         drop(slot);
         drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// Shutdown stops a refresh that is still converging, long before the
+    /// convergence bounds expire, and the publisher still closes its
+    /// secondaries once the serving runtime drains.
+    ///
+    /// The writer reports a fence one event past the store, so every
+    /// convergence round finds the candidate behind; 255 rounds 100 ms apart
+    /// would hold the refresh for over 25 seconds. The abandoned refresh is
+    /// neither counted nor logged as a refresh failure. The test runtime has
+    /// one thread, so the local recorder and log capture see the publisher.
+    #[tokio::test]
+    async fn shutdown_stops_a_refresh_that_is_still_converging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const CONVERGENCE_ROUNDS: &str =
+            "zinder_wallet_serving_pair_publisher_convergence_total{outcome=\"replica_behind\"}";
+        const TEARDOWNS: &str =
+            "zinder_wallet_serving_pair_publisher_teardown_duration_seconds_count{status=\"ok\"}";
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let primaries = AdvancingPrimaries::start().await?;
+        let config = WalletServingPairConfig {
+            catchup_interval: CONVERGENCE_RETRY_DELAY_CAP,
+            convergence_timeout: Duration::from_hours(1),
+            convergence_attempts: std::num::NonZeroU8::MAX,
+            ..primaries.serving_pair_config()?
+        };
+        let (publisher, slot) = primaries
+            .bootstrap_publisher_with(zinder_runtime::Readiness::default(), config)
+            .await?;
+        let mut ahead = writer_status_for_store(primaries.canonical_primary()?);
+        let writer_fence = ahead
+            .fence
+            .as_mut()
+            .ok_or("writer status must carry a fence")?;
+        writer_fence.chain_epoch_id += 1;
+        writer_fence.event_sequence += 1;
+        primaries.control.set_writer_status(ahead);
+        let log_capture = LogCapture::install_for_target("zinder::wallet_serving");
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+
+        let rounds = || -> u64 {
+            rendered_metrics
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix(CONVERGENCE_ROUNDS)?.strip_prefix(' '))
+                .and_then(|count| count.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while rounds() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let rounds_after_cancel = rounds();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            rounds(),
+            rounds_after_cancel,
+            "convergence must stop once shutdown begins"
+        );
+        assert!(
+            !publisher_task.is_finished(),
+            "the publisher must keep its secondaries until the serving runtime drains"
+        );
+
+        serving_runtime_drained.cancel();
+        tokio::time::timeout(Duration::from_secs(5), publisher_task).await??;
+        let exposition = rendered_metrics.render();
+        assert_eq!(gauge_sample(&exposition, TEARDOWNS), Some(1.0));
+        assert!(
+            !exposition.contains("zinder_wallet_serving_pair_publisher_refresh_total"),
+            "an abandoned refresh is not a refresh failure"
+        );
+        assert!(
+            log_capture.events().iter().all(|event| {
+                event.field("event") != Some("wallet_serving_pair_publisher_refresh_failed")
+            }),
+            "an abandoned refresh must not log a refresh failure"
+        );
+        drop((log_capture, slot));
         primaries.shutdown().await
     }
 
@@ -7078,7 +7191,7 @@ mod tests {
             ErrorReason::StorageUnavailable
         );
         assert!(!pair.has_missing_table_file());
-        publisher.refresh_once().await?;
+        publisher.refresh_once(&CancellationToken::new()).await?;
         assert!(Arc::ptr_eq(&slot.capture(), &pair));
         assert_eq!(
             publisher.candidate_preparations,
@@ -7983,13 +8096,29 @@ mod tests {
         {
             let config = WalletServingPairConfig {
                 catchup_interval,
-                ..wallet_serving_pair_config(
-                    self.temporary.path().join("canonical-primary"),
-                    self.temporary.path().join("canonical-secondaries"),
-                    self.temporary.path().join("wallet-primary"),
-                    self.temporary.path().join("wallet-secondaries"),
-                )?
+                ..self.serving_pair_config()?
             };
+            self.bootstrap_publisher_with(readiness, config).await
+        }
+
+        /// The default publisher configuration over these primaries.
+        fn serving_pair_config(
+            &self,
+        ) -> Result<WalletServingPairConfig, Box<dyn std::error::Error>> {
+            wallet_serving_pair_config(
+                self.temporary.path().join("canonical-primary"),
+                self.temporary.path().join("canonical-secondaries"),
+                self.temporary.path().join("wallet-primary"),
+                self.temporary.path().join("wallet-secondaries"),
+            )
+        }
+
+        async fn bootstrap_publisher_with(
+            &self,
+            readiness: zinder_runtime::Readiness,
+            config: WalletServingPairConfig,
+        ) -> Result<(WalletServingPairPublisher, WalletServingPairSlot), Box<dyn std::error::Error>>
+        {
             Ok(
                 WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                     config,

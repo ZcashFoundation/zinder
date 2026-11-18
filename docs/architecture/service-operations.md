@@ -463,8 +463,16 @@ with `UNAVAILABLE`, `ErrorReason = SERVICE_NOT_READY`, and readiness cause
 `shutting_down`. Event streams never end on their own, so without this the
 graceful gRPC drain would wait for them indefinitely. The drain is also bounded
 at 10 seconds, after which calls still open are abandoned, and the readiness
-probes stop without waiting for a node or ingest-control request in flight, so
-query exits within the wallet-serving supervisor's 20-second grace window.
+probes stop without waiting for a node or ingest-control request in flight.
+
+The serving-pair publisher stops when termination is requested, while the
+drain runs. A refresh in progress ends at its next writer-status read or
+convergence retry without publishing, and it is neither counted nor logged as
+a refresh failure. A secondary open or catch-up already running finishes
+first. Once the drain ends, query closes the publisher's secondaries and
+exits. No timer bounds that remaining RocksDB work: it has the rest of the
+wallet-serving supervisor's 20-second grace window, and the supervisor reports
+a process that still holds a RocksDB instance open when the window expires.
 
 When the shared traffic gate is closed, which only the serving pair, a parked
 writer, or shutdown can cause, new gRPC calls return
@@ -624,8 +632,11 @@ calls do not end when termination is requested, so a graceful drain waits for
 each range to finish, which a client that reads slowly can delay for as long
 as it keeps reading. The drain is therefore bounded at 10 seconds, as native
 query's is, and calls still open then are abandoned, logged as
-`compat_server_drain_timed_out`. Compatibility then exits within the
-wallet-serving supervisor's 20-second grace window.
+`compat_server_drain_timed_out`. In wallet mode, the serving-pair publisher
+stops during the drain and closes its secondaries after it, as
+[native query's does](#native-wallet-query), with the same limit: no timer
+bounds that RocksDB work within the wallet-serving supervisor's 20-second
+grace window.
 
 ### Explorer
 
