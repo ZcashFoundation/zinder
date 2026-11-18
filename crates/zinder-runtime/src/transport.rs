@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Endpoint;
+use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use crate::auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
@@ -55,7 +55,7 @@ pub async fn connect_zinder_grpc(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
 ) -> Result<AuthenticatedChannel, BearerTokenConnectError> {
-    let endpoint = Endpoint::from_shared(endpoint.to_owned())
+    let endpoint = zinder_grpc_endpoint(endpoint)
         .map_err(BearerTokenConnectError::InvalidEndpoint)?
         .http2_keep_alive_interval(ZINDER_GRPC_HTTP2_KEEPALIVE_INTERVAL)
         .keep_alive_while_idle(true)
@@ -67,6 +67,16 @@ pub async fn connect_zinder_grpc(
         .map_err(BearerTokenConnectError::Transport)?;
     let interceptor = BearerTokenClientInterceptor::new(bearer_token)?;
     Ok(InterceptedService::new(channel, interceptor))
+}
+
+/// Parses `endpoint`, with TLS verified against the platform's trusted roots
+/// when its scheme is `https`. An `http` endpoint stays plaintext HTTP/2.
+fn zinder_grpc_endpoint(endpoint: &str) -> Result<Endpoint, tonic::transport::Error> {
+    let parsed = Endpoint::from_shared(endpoint.to_owned())?;
+    if parsed.uri().scheme_str() == Some("https") {
+        return parsed.tls_config(ClientTlsConfig::new().with_enabled_roots());
+    }
+    Ok(parsed)
 }
 
 /// The single failure mode [`validate_zinder_grpc_endpoint`] can raise.
@@ -87,4 +97,48 @@ pub fn validate_zinder_grpc_endpoint(addr: &str) -> Result<(), InvalidZinderGrpc
     Endpoint::from_shared(addr.to_owned())
         .map(|_| ())
         .map_err(|source| InvalidZinderGrpcEndpoint(source.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use std::time::Duration;
+
+    use tokio::{io::AsyncReadExt as _, net::TcpListener};
+
+    use super::zinder_grpc_endpoint;
+
+    /// First byte of a TLS handshake record.
+    const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+    /// Connects to a listener that records the first byte the client sends.
+    async fn first_byte_sent(scheme: &str) -> Result<u8, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = zinder_grpc_endpoint(&format!("{scheme}://{}", listener.local_addr()?))?
+            .connect_timeout(Duration::from_secs(5));
+        let client = tokio::spawn(async move { endpoint.connect().await });
+        let (mut socket, _) = listener.accept().await?;
+        let mut first = [0_u8; 1];
+        socket.read_exact(&mut first).await?;
+        drop(socket);
+        client.abort();
+        Ok(first[0])
+    }
+
+    #[tokio::test]
+    async fn https_endpoints_open_with_a_tls_handshake() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(first_byte_sent("https").await?, TLS_HANDSHAKE_RECORD);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_endpoints_stay_plaintext_http2() -> Result<(), Box<dyn std::error::Error>> {
+        // The HTTP/2 connection preface starts with "PRI".
+        assert_eq!(first_byte_sent("http").await?, b'P');
+        Ok(())
+    }
 }

@@ -52,7 +52,7 @@ workspace = true
 [dev-dependencies]
 eyre.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
 zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
