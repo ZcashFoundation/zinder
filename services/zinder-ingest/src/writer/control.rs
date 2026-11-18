@@ -44,7 +44,8 @@ use zinder_store::{
     RocksDbResourceBudget, StreamCursorTokenV1,
 };
 
-/// Bounded number of RPCs that may wait while the follower is preparing source work.
+/// Bounded number of RPCs that may wait for the follower to receive them, and
+/// of writes it holds while it waits on the node.
 pub const CANONICAL_CONTROL_COMMAND_CAPACITY: usize = 64;
 const CANONICAL_CONTROL_MAX_PAGE_EVENTS: u32 = 1_024;
 
@@ -675,20 +676,99 @@ pub(crate) enum TipConfirmation {
 /// `WriterStatus` reports `tip_unconfirmed` until the follower confirms its
 /// visible tip, so wallet-serving readers do not attest a persisted fence the
 /// node may have abandoned while the writer was down.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the exhaustive owner-command dispatch keeps every primary mutation on one auditable queue"
-)]
 pub(crate) fn apply_following_canonical_control_command(
     store: &mut RocksDbCanonicalStore,
     command: CanonicalControlCommand,
     tip_confirmation: TipConfirmation,
 ) -> CanonicalControlScheduling {
-    let scheduling = if matches!(&command, CanonicalControlCommand::PruneMempoolEvents { .. }) {
-        CanonicalControlScheduling::YieldToCanonical
-    } else {
-        CanonicalControlScheduling::ContinueDraining
+    let command = match answer_canonical_control_read(store, command, tip_confirmation) {
+        CanonicalControlRead::Answered => return CanonicalControlScheduling::ContinueDraining,
+        CanonicalControlRead::Write(command) => command,
     };
+    match command {
+        CanonicalControlCommand::AppendMempoolEvent {
+            event,
+            observed_at,
+            reply,
+        } => {
+            append_mempool_event(store, event, observed_at, reply);
+        }
+        CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
+            append_mempool_events(store, events, reply);
+        }
+        CanonicalControlCommand::PruneMempoolEvents {
+            now,
+            retention,
+            budget,
+            reply,
+        } => {
+            prune_mempool_events(store, now, retention, budget, reply);
+            return CanonicalControlScheduling::YieldToCanonical;
+        }
+        CanonicalControlCommand::CreateOwnerCheckpoint {
+            candidate_id,
+            target,
+            expected_fence,
+            reply,
+        } => {
+            send_control_response(
+                reply,
+                create_owner_checkpoint_physical_response(
+                    store,
+                    candidate_id,
+                    target,
+                    &expected_fence,
+                ),
+            );
+        }
+        CanonicalControlCommand::AcquireLease { lease, reply } => {
+            send_control_response(reply, acquire_lease_response(store, &lease));
+        }
+        CanonicalControlCommand::RenewLease { lease, reply } => {
+            send_control_response(reply, renew_lease_response(store, &lease));
+        }
+        CanonicalControlCommand::ReleaseLease { lease, reply } => {
+            send_control_response(reply, release_lease_response(store, &lease));
+        }
+        // `answer_canonical_control_read` answered these above.
+        CanonicalControlCommand::WriterStatus { .. }
+        | CanonicalControlCommand::ChainEpoch { .. }
+        | CanonicalControlCommand::IngestEventPage { .. }
+        | CanonicalControlCommand::MempoolEventPage { .. }
+        | CanonicalControlCommand::ResolveMempoolEventStart { .. }
+        | CanonicalControlCommand::BeginMempoolSnapshot { .. }
+        | CanonicalControlCommand::EncodeMempoolSnapshotNextCursor { .. }
+        | CanonicalControlCommand::EventPage { .. }
+        | CanonicalControlCommand::OwnerCheckpointReadmission { .. } => {}
+    }
+    CanonicalControlScheduling::ContinueDraining
+}
+
+/// What [`answer_canonical_control_read`] did with one command.
+#[must_use]
+pub(crate) enum CanonicalControlRead {
+    /// The command only reads the primary and has been answered.
+    Answered,
+    /// The command writes the primary and has not been applied.
+    Write(CanonicalControlCommand),
+}
+
+/// Answers `command` from a shared borrow of the primary when it only reads,
+/// and hands back every command that writes.
+///
+/// The follower answers reads this way while it waits on the node, ahead of
+/// writes it received earlier and has not applied. That order is safe because
+/// nothing observes a write before its reply: every caller awaits the reply
+/// before it acts, and the live mempool owner publishes an index change only
+/// after its durable append replies. The owner also sends each mempool read
+/// and write under one gate, so a snapshot anchor or stream start never
+/// overtakes the owner's own pending append. A read answered first therefore
+/// sees the state before the pending write, which no caller has seen past.
+pub(crate) fn answer_canonical_control_read(
+    store: &RocksDbCanonicalStore,
+    command: CanonicalControlCommand,
+    tip_confirmation: TipConfirmation,
+) -> CanonicalControlRead {
     match command {
         CanonicalControlCommand::WriterStatus { reply } => {
             send_control_response(
@@ -708,16 +788,6 @@ pub(crate) fn apply_following_canonical_control_command(
             reply,
         } => {
             read_ingest_event_page(store, from_cursor.as_deref(), max_events, reply);
-        }
-        CanonicalControlCommand::AppendMempoolEvent {
-            event,
-            observed_at,
-            reply,
-        } => {
-            append_mempool_event(store, event, observed_at, reply);
-        }
-        CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
-            append_mempool_events(store, events, reply);
         }
         CanonicalControlCommand::MempoolEventPage {
             from_cursor,
@@ -744,32 +814,8 @@ pub(crate) fn apply_following_canonical_control_command(
                 reply,
             );
         }
-        CanonicalControlCommand::PruneMempoolEvents {
-            now,
-            retention,
-            budget,
-            reply,
-        } => {
-            prune_mempool_events(store, now, retention, budget, reply);
-        }
         CanonicalControlCommand::EventPage { request, reply } => {
             send_control_response(reply, event_page_response(store, &request));
-        }
-        CanonicalControlCommand::CreateOwnerCheckpoint {
-            candidate_id,
-            target,
-            expected_fence,
-            reply,
-        } => {
-            send_control_response(
-                reply,
-                create_owner_checkpoint_physical_response(
-                    store,
-                    candidate_id,
-                    target,
-                    &expected_fence,
-                ),
-            );
         }
         CanonicalControlCommand::OwnerCheckpointReadmission { target, reply } => {
             send_control_response(
@@ -779,17 +825,17 @@ pub(crate) fn apply_following_canonical_control_command(
                     .map_err(|error| map_store_error(&error)),
             );
         }
-        CanonicalControlCommand::AcquireLease { lease, reply } => {
-            send_control_response(reply, acquire_lease_response(store, &lease));
-        }
-        CanonicalControlCommand::RenewLease { lease, reply } => {
-            send_control_response(reply, renew_lease_response(store, &lease));
-        }
-        CanonicalControlCommand::ReleaseLease { lease, reply } => {
-            send_control_response(reply, release_lease_response(store, &lease));
+        write @ (CanonicalControlCommand::AppendMempoolEvent { .. }
+        | CanonicalControlCommand::AppendMempoolEvents { .. }
+        | CanonicalControlCommand::PruneMempoolEvents { .. }
+        | CanonicalControlCommand::CreateOwnerCheckpoint { .. }
+        | CanonicalControlCommand::AcquireLease { .. }
+        | CanonicalControlCommand::RenewLease { .. }
+        | CanonicalControlCommand::ReleaseLease { .. }) => {
+            return CanonicalControlRead::Write(write);
         }
     }
-    scheduling
+    CanonicalControlRead::Answered
 }
 
 /// Typed halt a canonical writer parked on a reorg deeper than its window

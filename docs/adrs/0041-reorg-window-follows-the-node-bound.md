@@ -256,10 +256,14 @@ operators would still need to raise it as observed reorgs grow.
   reader whose last status before the restart was a confirmed exact
   attestation keeps that attestation while every writer-status call fails,
   for example before the control server binds or while calls time out
-  because the follow loop serves commands only between iterations and fork
-  discovery is running. It then reports `serving_pair_stale` and admits
-  traffic until the staleness ceiling (300 seconds by default) after its last
-  pre-restart attestation, the same grace it gives any writer outage.
+  because the follower already holds a full queue of 64 writes. It then
+  reports `serving_pair_stale` and admits traffic until the staleness ceiling
+  (300 seconds by default) after its last pre-restart attestation, the same
+  grace it gives any writer outage. Calls made while the follower waits on
+  the node, including during fork discovery, do not fail: the follower answers
+  them at once with `tip_unconfirmed` set, so the reader reports
+  `canonical_tip_unconfirmed`
+  ([Chain ingestion](../architecture/chain-ingestion.md#control-commands-while-following)).
 
 - The settled tip trails the visible tip by up to 1000 blocks. Surfaces that
   report finality from the settled tip report it later than before.
@@ -319,6 +323,9 @@ operators would still need to raise it as observed reorgs grow.
 
 ## Revision history
 
+- 2026-11-18: The canonical writer answers writer status while it waits on the
+  node, including during fork discovery, so the Consequences no longer list
+  fork discovery among the times writer-status calls fail.
 - 2026-11-17: Zebra 7.1.0 finalizes blocks early under index pressure. The
   window stays 1000 blocks as the node's upper bound, and the Context, the
   node-behind case, and the Consequences describe the shallower reorgs and the
