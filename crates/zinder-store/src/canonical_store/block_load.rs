@@ -3,7 +3,10 @@ mod codec;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    time::Instant,
 };
+
+use metrics::Histogram;
 
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
 use zinder_core::{
@@ -44,6 +47,10 @@ use super::{
 
 pub(super) const CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const REVERSE_INDEX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
+    "zinder_store_canonical_block_load_stage_duration_seconds";
+const BLOCK_LOAD_FINISH_DURATION_METRIC: &str =
+    "zinder_store_canonical_block_load_finish_duration_seconds";
 
 /// All source-derived values for one block in a fresh canonical construction.
 ///
@@ -206,6 +213,38 @@ struct CanonicalBlockSstStager<'options> {
     transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
     sequence: Option<BlockSequence>,
     predecessor_checkpoint_logical_bytes: u64,
+    stage_timers: BlockStageTimers,
+}
+
+/// Per-block durations of the serial store stage, resolved once per load.
+struct BlockStageTimers {
+    validate: Histogram,
+    sequence: Histogram,
+    write: Histogram,
+}
+
+impl BlockStageTimers {
+    fn register() -> Self {
+        Self {
+            validate: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "validate"),
+            sequence: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "sequence"),
+            write: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "write"),
+        }
+    }
+}
+
+/// Runs one once-per-load finish step for `family` and records the duration
+/// of a successful step.
+fn timed_finish_step<T, E>(
+    step: &'static str,
+    family: &'static str,
+    finish: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started_at = Instant::now();
+    let finished = finish()?;
+    metrics::histogram!(BLOCK_LOAD_FINISH_DURATION_METRIC, "step" => step, "family" => family)
+        .record(started_at.elapsed());
+    Ok(finished)
 }
 
 impl<'options> CanonicalBlockSstStager<'options> {
@@ -251,11 +290,17 @@ impl<'options> CanonicalBlockSstStager<'options> {
             config,
             sequence: None,
             predecessor_checkpoint_logical_bytes,
+            stage_timers: BlockStageTimers::register(),
         })
     }
 
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+        let started_at = Instant::now();
         validate_build_block(self.config.workload, self.config.build_plan, &block)?;
+        let validated_at = Instant::now();
+        self.stage_timers
+            .validate
+            .record(validated_at.duration_since(started_at));
         let row = BlockSequenceRow::from_block(&block)?;
         if let Some(sequence) = &mut self.sequence {
             sequence.append(row)?;
@@ -266,6 +311,10 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .map_err(|_| CanonicalStoreError::block_load_sequence("reorg window exceeds usize"))?;
             self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
         }
+        let sequenced_at = Instant::now();
+        self.stage_timers
+            .sequence
+            .record(sequenced_at.duration_since(validated_at));
         write_build_block(
             block,
             &mut self.header_writer,
@@ -277,7 +326,9 @@ impl<'options> CanonicalBlockSstStager<'options> {
             &mut self.block_final_note_commitment_roots_writer,
             &mut self.block_hash_sorter,
             &mut self.transaction_location_sorter,
-        )
+        )?;
+        self.stage_timers.write.record(sequenced_at.elapsed());
+        Ok(())
     }
 
     fn finish(self) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
@@ -286,22 +337,48 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 "a canonical block load must contain at least one block",
             )
         })?;
+        let options = self.config.options;
+        let sst_target_logical_bytes = self.config.sst_target_logical_bytes;
         let artifacts = CanonicalBlockSstArtifacts {
-            header: self.header_writer.finish()?,
-            block_hash: self
-                .block_hash_sorter
-                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
-            replay: self.replay_writer.finish()?,
-            compact: self.compact_writer.finish()?,
-            transaction_location: self
-                .transaction_location_sorter
-                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
-            transaction_blob: self.transaction_blob_writer.finish()?,
-            block_blob: self.block_blob_writer.finish()?,
-            tree_state_checkpoint: self.tree_state_checkpoint_writer.finish()?,
-            block_final_note_commitment_roots: self
-                .block_final_note_commitment_roots_writer
-                .finish()?,
+            header: timed_finish_step("sst_finish", BLOCK_HEADER_COLUMN_FAMILY, || {
+                self.header_writer.finish()
+            })?,
+            block_hash: timed_finish_step("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY, || {
+                self.block_hash_sorter
+                    .finish::<32>(options, sst_target_logical_bytes)
+            })?,
+            replay: timed_finish_step("sst_finish", BLOCK_REPLAY_COLUMN_FAMILY, || {
+                self.replay_writer.finish()
+            })?,
+            compact: timed_finish_step("sst_finish", COMPACT_BLOCK_COLUMN_FAMILY, || {
+                self.compact_writer.finish()
+            })?,
+            transaction_location: timed_finish_step(
+                "sort_merge",
+                TRANSACTION_LOCATION_COLUMN_FAMILY,
+                || {
+                    self.transaction_location_sorter
+                        .finish::<32>(options, sst_target_logical_bytes)
+                },
+            )?,
+            transaction_blob: timed_finish_step(
+                "sst_finish",
+                TRANSACTION_BLOB_COLUMN_FAMILY,
+                || self.transaction_blob_writer.finish(),
+            )?,
+            block_blob: timed_finish_step("sst_finish", BLOCK_BLOB_COLUMN_FAMILY, || {
+                self.block_blob_writer.finish()
+            })?,
+            tree_state_checkpoint: timed_finish_step(
+                "sst_finish",
+                TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+                || self.tree_state_checkpoint_writer.finish(),
+            )?,
+            block_final_note_commitment_roots: timed_finish_step(
+                "sst_finish",
+                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+                || self.block_final_note_commitment_roots_writer.finish(),
+            )?,
         };
         prepare_canonical_block_load(
             sequence,
@@ -508,11 +585,13 @@ pub(super) fn ingest_canonical_block_ssts(
         options.set_snapshot_consistency(true);
         options.set_allow_global_seqno(false);
         options.set_allow_blocking_flush(false);
-        db.ingest_external_file_cf_opts(&column_family, &options, family.paths)
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "canonical block-family external SST ingestion",
-                source,
-            })?;
+        timed_finish_step("ingest", family.name, || {
+            db.ingest_external_file_cf_opts(&column_family, &options, family.paths)
+        })
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "canonical block-family external SST ingestion",
+            source,
+        })?;
         staged_ssts.extend(family.staged_ssts);
     }
     Ok(IngestedCanonicalBlockLoad {

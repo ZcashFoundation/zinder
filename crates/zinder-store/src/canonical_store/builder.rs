@@ -430,6 +430,7 @@ mod tests {
             BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
             CANONICAL_DATA_COLUMN_FAMILIES, CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
             COMPACT_BLOCK_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
         },
     };
     use crate::{
@@ -513,6 +514,67 @@ mod tests {
         assert_eq!(evidence.block_blob_count, 0);
         assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(0, 0, 0));
         assert_eq!(evidence.tree_state_checkpoint_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_load_blocks_times_every_block_stage_and_family_finish_step()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let mut store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
+        let mut blocks = vec![
+            Ok::<_, std::io::Error>(canonical_build_block(
+                BlockHeight::new(1),
+                [1; 32],
+                Network::ZcashTestnet.genesis_hash().as_bytes(),
+            )),
+            Ok(canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32])),
+        ];
+        if let Some(Ok(tip)) = blocks.last_mut() {
+            add_tree_state_checkpoint(tip)?;
+        }
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let recorder_handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || store.bulk_load_blocks(blocks))?;
+
+        let rendered = recorder_handle.render();
+        for stage in ["validate", "sequence", "write"] {
+            let series = format!(
+                "zinder_store_canonical_block_load_stage_duration_seconds_count{{stage=\"{stage}\"}} 2"
+            );
+            assert!(
+                rendered.lines().any(|line| line == series),
+                "missing {series}"
+            );
+        }
+        let finish_series = |step: &str, family: &str| {
+            format!(
+                "zinder_store_canonical_block_load_finish_duration_seconds_count{{step=\"{step}\",family=\"{family}\"}} 1"
+            )
+        };
+        for (step, family) in [
+            ("sst_finish", BLOCK_HEADER_COLUMN_FAMILY),
+            ("sst_finish", COMPACT_BLOCK_COLUMN_FAMILY),
+            ("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY),
+            ("sort_merge", TRANSACTION_LOCATION_COLUMN_FAMILY),
+            ("ingest", BLOCK_HEADER_COLUMN_FAMILY),
+            ("ingest", BLOCK_HASH_INDEX_COLUMN_FAMILY),
+        ] {
+            let series = finish_series(step, family);
+            assert!(
+                rendered.lines().any(|line| line == series),
+                "missing {series}"
+            );
+        }
+        // A family that staged no rows has nothing to ingest.
+        assert!(
+            !rendered.contains(&format!(
+                "step=\"ingest\",family=\"{TRANSACTION_LOCATION_COLUMN_FAMILY}\""
+            )),
+            "an empty family must not record an ingest"
+        );
         Ok(())
     }
 

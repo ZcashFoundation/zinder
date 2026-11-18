@@ -25,7 +25,9 @@ use crate::{
     CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
     follow_canonical_tip, follow_canonical_tip_with_control,
 };
-use construction::{load_fresh_canonical_until_cancelled, record_construction_cancelled};
+use construction::{
+    load_fresh_canonical_until_cancelled, record_construction_cancelled, record_construction_phase,
+};
 
 pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
     match retention {
@@ -465,6 +467,7 @@ where
     readiness.publish_admission(
         ReadinessState::syncing(None, None, None).with_phase(IngestPhase::BulkCatchup),
     );
+    let range_started_at = std::time::Instant::now();
     let Some(construction_range) = cancel
         .run_until_cancelled(resolve_construction_range(
             source,
@@ -477,6 +480,7 @@ where
         return Err(CanonicalWriterError::Cancelled);
     };
     let (build_plan, settled_tip, observed_tip) = construction_range?;
+    record_construction_phase("construction_range", range_started_at);
     readiness.publish_admission(
         ReadinessState::syncing(
             Some(u64::from(observed_tip.height.value().saturating_sub(
@@ -548,12 +552,14 @@ async fn publish_constructed_baseline(
     cancel: &CancellationToken,
 ) -> Result<zinder_store::CanonicalEventFence, CanonicalWriterError> {
     let publication = tokio::task::spawn_blocking(move || {
+        let started_at = std::time::Instant::now();
         let validated = loaded.builder.prepare_trusted_fresh_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
             settled_tip,
             UnixTimestampMillis::now(),
         ))?;
         let staged_ready = validated.publish_baseline(publication)?;
+        record_construction_phase("publication", started_at);
         Ok::<_, CanonicalStoreError>(staged_ready.event_fence())
     });
     let published = publication.await;

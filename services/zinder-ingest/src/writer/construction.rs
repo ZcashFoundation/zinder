@@ -6,13 +6,14 @@ pub(crate) mod watermark;
 use std::{
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{
     Stream, StreamExt,
     stream::{self, BoxStream},
 };
+use metrics::Histogram;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -58,6 +59,16 @@ const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * MIB;
 const MIN_PIPELINE_MEMORY_WATERMARK_BYTES: u64 = 128 * MIB;
 const PIPELINE_MEMORY_BUDGET_DIVISOR: u64 = 64;
 const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
+const CONSTRUCTION_PHASE_DURATION_METRIC: &str =
+    "zinder_ingest_canonical_construction_phase_duration_seconds";
+const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
+    "zinder_ingest_canonical_block_load_stage_duration_seconds";
+
+/// Records how long one completed construction phase took.
+pub(crate) fn record_construction_phase(phase: &'static str, started_at: Instant) {
+    metrics::histogram!(CONSTRUCTION_PHASE_DURATION_METRIC, "phase" => phase)
+        .record(started_at.elapsed());
+}
 
 /// Shared source-fetch and block-preparation limits for canonical ingestion.
 ///
@@ -408,6 +419,7 @@ async fn load_fresh_canonical_blocks_until_cancelled<Source>(
 where
     Source: NodeSource + Clone,
 {
+    let started_at = Instant::now();
     register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
     validate_construction_identity(&build_plan, config)?;
@@ -421,7 +433,7 @@ where
         config,
         raw_blob_policy_for_retention(builder.raw_blob_retention()),
     );
-    drive_block_loader(
+    let outcome = drive_block_loader(
         builder,
         prepared_blocks,
         BlockLoaderSettings {
@@ -430,7 +442,9 @@ where
             cancel: cancel.clone(),
         },
     )
-    .await
+    .await?;
+    record_construction_phase("block_load", started_at);
+    Ok(outcome)
 }
 
 /// Authenticates the final fixed tip and loads the subtree roots derived from
@@ -443,6 +457,7 @@ pub async fn load_fresh_canonical_source_families<Source>(
 where
     Source: NodeSource,
 {
+    let started_at = Instant::now();
     let CanonicalBlockLoadOutcome {
         mut builder,
         evidence: block_evidence,
@@ -486,6 +501,7 @@ where
         }
     }
     let subtree_root_evidence = builder.load_subtree_roots(derived_subtree_roots)?;
+    record_construction_phase("source_families", started_at);
     Ok(CanonicalSourceLoadOutcome {
         builder,
         block_evidence,
@@ -851,6 +867,7 @@ where
             workload,
             build_tip_height,
             cancel: loader_cancel,
+            stage_timers: BlockLoaderStageTimers::register(workload),
         };
         let evidence = builder
             .bulk_load_blocks(&mut build_blocks)
@@ -912,6 +929,39 @@ struct CanonicalBuildBlockReceiver {
     workload: CanonicalStoreWorkload,
     build_tip_height: BlockHeight,
     cancel: CancellationToken,
+    stage_timers: BlockLoaderStageTimers,
+}
+
+/// Per-block durations of the serial loader, resolved once per construction.
+///
+/// The stages do not overlap. `receive_wait` is time the loader spent idle
+/// waiting for a prepared block, so a high share means the source or
+/// preparation, not the loader, bounds construction. Every stage named
+/// `tree_hashing_*` is commitment-tree hashing, so their sum is the serial
+/// hashing cost.
+struct BlockLoaderStageTimers {
+    receive_wait: Histogram,
+    commitment_extract: Histogram,
+    tree_hashing_append: Histogram,
+    position: Histogram,
+    tree_hashing_checkpoint: Histogram,
+    /// Present only for the explorer workload, the one that derives final roots.
+    tree_hashing_final_roots: Option<Histogram>,
+}
+
+impl BlockLoaderStageTimers {
+    fn register(workload: CanonicalStoreWorkload) -> Self {
+        let stage = |stage: &'static str| metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => stage);
+        Self {
+            receive_wait: stage("receive_wait"),
+            commitment_extract: stage("commitment_extract"),
+            tree_hashing_append: stage("tree_hashing_append"),
+            position: stage("position"),
+            tree_hashing_checkpoint: stage("tree_hashing_checkpoint"),
+            tree_hashing_final_roots: (workload == CanonicalStoreWorkload::Explorer)
+                .then(|| stage("tree_hashing_final_roots")),
+        }
+    }
 }
 
 impl Iterator for CanonicalBuildBlockReceiver {
@@ -925,10 +975,16 @@ impl Iterator for CanonicalBuildBlockReceiver {
         self.active_memory_permit = None;
         // A cancelled producer drops its sender, so a closed channel must not
         // read as a complete stream and start SST finalization.
+        let wait_started_at = Instant::now();
         let received = self
             .receiver
             .blocking_recv()
             .filter(|_| !self.cancel.is_cancelled());
+        if matches!(received, Some(Ok(_))) {
+            self.stage_timers
+                .receive_wait
+                .record(wait_started_at.elapsed());
+        }
         let Some(received) = received else {
             return self
                 .cancel
@@ -952,22 +1008,8 @@ impl CanonicalBuildBlockReceiver {
         let height = prepared.facts.block_header.height;
         let block_hash = prepared.facts.block_header.block_hash;
         let block_time_seconds = prepared.partial_compact_block.time();
-        let commitments = compact_block_commitments(&prepared)?;
-        self.commitment_tree_accumulator
-            .append_block_commitments(
-                height,
-                &commitments.sapling,
-                &commitments.orchard,
-                &commitments.ironwood,
-            )
-            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
-        self.derived_subtree_roots.extend(
-            self.commitment_tree_accumulator
-                .completed_subtree_roots()
-                .iter()
-                .copied()
-                .map(CanonicalBuildSubtreeRoot::from),
-        );
+        self.append_to_commitment_trees(&prepared)?;
+        let tree_appended_at = Instant::now();
         let positioned =
             position_canonical_block(prepared, &mut self.running_tree_sizes).map_err(|source| {
                 CanonicalConstructionError::Source {
@@ -982,6 +1024,10 @@ impl CanonicalBuildBlockReceiver {
                 accumulated,
             });
         }
+        let positioned_at = Instant::now();
+        self.stage_timers
+            .position
+            .record(positioned_at.duration_since(tree_appended_at));
         let checkpoint_required = height == self.build_tip_height
             || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
         // Only the build-tip checkpoint is later compared with the node's tree
@@ -1000,19 +1046,71 @@ impl CanonicalBuildBlockReceiver {
             })
             .transpose()
             .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
-        let block_final_note_commitment_roots = (self.workload == CanonicalStoreWorkload::Explorer)
-            .then(|| {
-                self.commitment_tree_accumulator
-                    .final_note_commitment_roots(block_hash)
-            })
-            .filter(|roots| {
-                roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some()
-            });
+        if checkpoint_required {
+            self.stage_timers
+                .tree_hashing_checkpoint
+                .record(positioned_at.elapsed());
+        }
+        let block_final_note_commitment_roots = self.block_final_note_commitment_roots(block_hash);
         Ok(canonical_build_block(
             positioned,
             tree_state_checkpoint,
             block_final_note_commitment_roots,
         ))
+    }
+
+    /// Appends the block's note commitments to the trees and collects the
+    /// subtree roots the block completes.
+    fn append_to_commitment_trees(
+        &mut self,
+        prepared: &PreparedCanonicalBlock,
+    ) -> Result<(), CanonicalConstructionError> {
+        let height = prepared.facts.block_header.height;
+        let started_at = Instant::now();
+        let commitments = compact_block_commitments(prepared)?;
+        let extracted_at = Instant::now();
+        self.stage_timers
+            .commitment_extract
+            .record(extracted_at.duration_since(started_at));
+        self.commitment_tree_accumulator
+            .append_block_commitments(
+                height,
+                &commitments.sapling,
+                &commitments.orchard,
+                &commitments.ironwood,
+            )
+            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
+        self.derived_subtree_roots.extend(
+            self.commitment_tree_accumulator
+                .completed_subtree_roots()
+                .iter()
+                .copied()
+                .map(CanonicalBuildSubtreeRoot::from),
+        );
+        self.stage_timers
+            .tree_hashing_append
+            .record(extracted_at.elapsed());
+        Ok(())
+    }
+
+    /// Derives the explorer workload's per-block final roots, omitting a
+    /// block before any pool activates.
+    fn block_final_note_commitment_roots(
+        &mut self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Option<zinder_core::BlockFinalNoteCommitmentRoots> {
+        if self.workload != CanonicalStoreWorkload::Explorer {
+            return None;
+        }
+        let started_at = Instant::now();
+        let roots = self
+            .commitment_tree_accumulator
+            .final_note_commitment_roots(block_hash);
+        if let Some(timer) = &self.stage_timers.tree_hashing_final_roots {
+            timer.record(started_at.elapsed());
+        }
+        (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
+            .then_some(roots)
     }
 }
 
