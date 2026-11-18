@@ -35,7 +35,7 @@ use zinder_query::{
 };
 use zinder_store::ArtifactFamily;
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
 };
 
@@ -286,9 +286,7 @@ async fn query_server_proves_pinned_absence_and_flags_an_untyped_mempool_miss() 
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        MockTransactionBroadcaster::broadcast_disabled(),
         admitted_ingest_control,
-        activations,
     );
     let endpoint = spawn_service(
         WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default()).into_server(),

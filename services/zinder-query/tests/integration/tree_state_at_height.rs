@@ -37,8 +37,8 @@ use zinder_core::{
 use zinder_proto::capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2;
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError};
 use zinder_testkit::{
@@ -66,7 +66,7 @@ async fn tree_state_around_checkpoints_and_activations_matches_the_trees_its_com
     .map(BlockHeight::new);
     let expected = commitment_tree_checkpoints(&chain, &activations, &probed_heights)?;
     let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
-    let served = NodelessQuery::over(writer.into_serving_store_fixture()?, &activations).await?;
+    let served = NodelessQuery::over(writer.into_serving_store_fixture()?).await?;
 
     assert!(
         served
@@ -108,7 +108,7 @@ async fn tree_state_at_a_checkpointed_store_replays_from_its_history_floor() -> 
         &CanonicalBaseline::new(&chain).with_history_floor(floor_height),
         &activations,
     )?;
-    let served = NodelessQuery::over(writer.into_serving_store_fixture()?, &activations).await?;
+    let served = NodelessQuery::over(writer.into_serving_store_fixture()?).await?;
 
     for below_floor in [1, 100, floor_height.value() - 1] {
         let status = served
@@ -156,7 +156,7 @@ async fn tree_state_after_a_live_replacement_serves_the_replacement_chain() -> e
             displaced.block_id.height.value()
         );
     }
-    let served = NodelessQuery::over(writer.into_serving_store_fixture()?, &activations).await?;
+    let served = NodelessQuery::over(writer.into_serving_store_fixture()?).await?;
 
     for checkpoint in &expected {
         served.assert_tree_state(checkpoint).await?;
@@ -185,7 +185,7 @@ async fn tree_state_without_its_history_predecessor_checkpoint_reports_damaged_s
         Arc::new(canonical),
         Arc::new(wallet),
     )?));
-    let served = NodelessQuery::over_slot(slot, store_fixture, &activations).await?;
+    let served = NodelessQuery::over_slot(slot, store_fixture).await?;
 
     for seedless in [1, 2] {
         let status = served
@@ -235,36 +235,30 @@ fn gap_activations() -> eyre::Result<NetworkUpgradeActivations> {
 /// A native query whose node advertises nothing it can serve and counts
 /// every call it receives.
 struct NodelessQuery {
-    adapter: WalletQueryGrpcAdapter<WalletServingQuery<UnreachableNode, AdmittedIngestControl>>,
+    adapter: WalletQueryGrpcAdapter<
+        WalletServingQuery<Option<NodeBroadcast<UnreachableNode>>, AdmittedIngestControl>,
+    >,
     node: UnreachableNode,
     _store_fixture: WalletServingStoreFixture,
     ingest_control_fixture: IngestControlFixture,
 }
 
 impl NodelessQuery {
-    async fn over(
-        mut store_fixture: WalletServingStoreFixture,
-        activations: &NetworkUpgradeActivations,
-    ) -> eyre::Result<Self> {
+    async fn over(mut store_fixture: WalletServingStoreFixture) -> eyre::Result<Self> {
         let slot = crate::common::serving_pair_slot(&mut store_fixture)?;
-        Self::over_slot(slot, store_fixture, activations).await
+        Self::over_slot(slot, store_fixture).await
     }
 
     /// Serves `slot`, whose readers `store_fixture` keeps the paths of.
     async fn over_slot(
         slot: WalletServingPairSlot,
         store_fixture: WalletServingStoreFixture,
-        activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
         let node = UnreachableNode::new()?;
         let (ingest_control, ingest_control_fixture) =
             crate::common::admitted_ingest_control_fixture().await?;
-        let query = WalletServingQuery::from_admitted_native_sources(
-            slot,
-            node.clone(),
-            ingest_control,
-            Arc::new(activations.clone()),
-        )?;
+        let query = WalletServingQuery::from_admitted_native_serving_pair(slot, ingest_control)
+            .with_node_broadcast(Some(NodeBroadcast::new(node.clone())));
         Ok(Self {
             adapter: WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default()),
             node,

@@ -305,9 +305,7 @@ async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()
         crate::common::admitted_ingest_control_fixture().await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
-        (),
         ingest_control,
-        activations,
     );
     let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
     let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
@@ -549,9 +547,7 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
         crate::common::admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
-        (),
         ingest_control,
-        activations,
     );
     let requested = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_add(1);
     let requested_count = usize::try_from(requested)?;
@@ -604,9 +600,7 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
         crate::common::admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
-        (),
         ingest_control,
-        activations,
     );
     let adapter = zinder_query::WalletQueryGrpcAdapter::new(
         query.clone(),

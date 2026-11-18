@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -14,8 +13,7 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    BlockHeight, BlockId, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    RemoteChainIndex, RemoteOpenOptions, TransactionBroadcastOutcome, TransactionId,
+    BlockHeight, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
@@ -24,81 +22,25 @@ use zinder_query::{
     AdmittedIngestControl, CanonicalReader, WalletEndpointMetadata, WalletProjectionReader,
     WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
-use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
-};
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, IngestControlFixture, MockTransactionBroadcaster,
-    WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 const PARITY_TREE_STATE_PAYLOAD: &[u8] =
     br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{"finalState":"000000"}},"orchard":{"commitments":{"finalState":"111111"}}}"#;
 
-type TransparentAddressAdapter =
-    LightwalletdGrpcAdapter<WalletServingQuery<MockTransactionBroadcaster>>;
+type TransparentAddressAdapter = LightwalletdGrpcAdapter<WalletServingQuery<()>>;
 
 struct TransparentAddressServingFixture {
     store_fixture: WalletServingStoreFixture,
-    activations: Arc<NetworkUpgradeActivations>,
     address: String,
     block_height: BlockHeight,
     transaction_id: TransactionId,
     script_pub_key: Vec<u8>,
     value_zat: i64,
     raw_transaction_bytes: Vec<u8>,
-}
-
-#[derive(Clone)]
-struct ParityNodeSource {
-    capabilities: NodeCapabilities,
-    tip: BlockId,
-}
-
-impl ParityNodeSource {
-    fn from_chain(chain_fixture: &ChainFixture) -> eyre::Result<Self> {
-        let tip_block = chain_fixture
-            .blocks()
-            .last()
-            .ok_or_else(|| eyre::eyre!("parity node source requires a non-empty chain"))?;
-
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::TipId,
-                NodeCapability::TreeState,
-                NodeCapability::OpenRpcDiscovery,
-            ])?,
-            tip: BlockId::new(tip_block.height, tip_block.hash),
-        })
-    }
-}
-
-#[async_trait]
-impl NodeSource for ParityNodeSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
-    async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        Err(SourceError::NodeCapabilityMissing {
-            capability: NodeCapability::BestChainBlocks,
-        })
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TransactionBroadcaster for ParityNodeSource {
-    async fn broadcast_transaction(
-        &self,
-        _raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastOutcome, SourceError> {
-        Err(SourceError::TransactionBroadcastDisabled)
-    }
 }
 
 mod explorers;
@@ -147,12 +89,13 @@ fn build_transparent_address_serving_fixture() -> eyre::Result<TransparentAddres
             block_height,
             block_hash,
         ));
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
+    let store_fixture = WalletServingStoreFixture::from_chain(
+        &chain_fixture,
+        &sample_regtest_upgrade_activations(),
+    )?;
 
     Ok(TransparentAddressServingFixture {
         store_fixture,
-        activations,
         address: address_text,
         block_height,
         transaction_id,
@@ -171,11 +114,7 @@ fn build_transparent_address_adapter(
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
-    let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot,
-        MockTransactionBroadcaster::broadcast_disabled(),
-        Arc::clone(&fixture.activations),
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot);
     LightwalletdGrpcAdapter::from_admitted_compatibility_query(query).map_err(Into::into)
 }
 
@@ -197,10 +136,10 @@ fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBl
 }
 
 async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<RemoteChainIndex> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let node_source = ParityNodeSource::from_chain(chain_fixture)?;
-    let mut store_fixture =
-        WalletServingStoreFixture::from_chain(chain_fixture, activations.as_ref())?;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(
+        chain_fixture,
+        &sample_regtest_upgrade_activations(),
+    )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
         Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
@@ -214,12 +153,10 @@ async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<R
         Network::ZcashRegtest,
     )
     .await?;
-    let wallet_query = WalletServingQuery::from_admitted_native_sources(
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         serving_pair_slot,
-        node_source,
         admitted_ingest_control,
-        activations,
-    )?;
+    );
     let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

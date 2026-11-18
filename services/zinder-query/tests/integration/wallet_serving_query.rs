@@ -37,18 +37,16 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let reactor_gate = Arc::new(ReactorGate::default());
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+        WalletServingReadPair::new(
             Arc::new(GatedCanonicalReader {
                 canonical_reader,
                 reactor_gate: Arc::clone(&reactor_gate),
                 read_span_probe: Arc::default(),
             }) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?)),
-        (),
-        Arc::clone(&activations),
-    );
+        )?,
+    )));
 
     // The runtime is single-threaded, so this task only runs while the store
     // read is off the reactor.
@@ -78,18 +76,16 @@ async fn wallet_serving_reads_run_inside_the_request_span() -> eyre::Result<()> 
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let read_span_probe = Arc::new(ReadSpanProbe::default());
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+        WalletServingReadPair::new(
             Arc::new(GatedCanonicalReader {
                 canonical_reader,
                 reactor_gate: Arc::default(),
                 read_span_probe: Arc::clone(&read_span_probe),
             }) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?)),
-        (),
-        Arc::clone(&activations),
-    );
+        )?,
+    )));
 
     query
         .visible_tip_block(None)
@@ -108,14 +104,12 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
         activations.as_ref(),
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+        WalletServingReadPair::new(
             Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?)),
-        (),
-        Arc::clone(&activations),
-    );
+        )?,
+    )));
 
     let over_cap = query
         .compact_blocks_in_range(

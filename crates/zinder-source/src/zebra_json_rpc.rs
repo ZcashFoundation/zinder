@@ -28,10 +28,10 @@ use zinder_core::{
 };
 
 use crate::{
-    CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
-    NodeSource, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
-    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
+    BroadcastNodeProbe, CookieSource, CookieSourceError, NodeAuth, NodeCapabilities,
+    NodeCapability, NodeHealthConfig, NodeSource, ResilientClient, SourceBlock, SourceChainCursor,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
@@ -385,10 +385,10 @@ impl ZebraJsonRpcSource {
     /// Convenience wrapper that calls
     /// [`Self::fetch_network_upgrade_activations`], wraps the result in an
     /// [`Arc`], and emits a structured `network_upgrade_activations_discovered`
-    /// log event tagged with `target`. The four service binaries
-    /// (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`,
-    /// `zinder-explorer`) share this one entry point so the discovery event
-    /// shape stays consistent across the workspace.
+    /// log event tagged with `target`. The canonical writer and the storage
+    /// benchmarks share this one entry point so the discovery event shape
+    /// stays consistent. Readers never call it: they adopt the schedule the
+    /// canonical writer admitted.
     pub async fn discover_network_upgrade_activations(
         &self,
         target: &'static str,
@@ -1310,6 +1310,19 @@ impl ZebraJsonRpcSource {
             Some(estimated),
             progress,
         ))
+    }
+}
+
+#[async_trait]
+impl BroadcastNodeProbe for ZebraJsonRpcSource {
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        Self::probe_capabilities(self).await
+    }
+
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
+        Self::fetch_network_upgrade_activations(self).await
     }
 }
 

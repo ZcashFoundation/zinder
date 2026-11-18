@@ -38,7 +38,9 @@ pub(super) struct QueryConfig {
     pub(super) allow_public_bind: bool,
     pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(super) pair_convergence_attempts: NonZeroU8,
-    pub(super) node: NodeTarget,
+    /// Node endpoint transaction broadcast reaches, or `None` for a
+    /// storage-only query.
+    pub(super) node: Option<NodeTarget>,
 }
 
 /// Command-line overrides for the native wallet-query command.
@@ -200,7 +202,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     )?)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
-    let node = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
+    let node = NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
 
     Ok(QueryConfig {
         network,
@@ -302,7 +304,8 @@ struct QueryConfigToml {
     wallet: WalletToml,
     ingest_control: IngestControlReaderToml,
     query: QueryToml,
-    node: NodeToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<NodeToml>,
 }
 
 impl QueryConfigToml {
@@ -326,7 +329,7 @@ impl QueryConfigToml {
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
             },
-            node: NodeToml::from_node_target(&config.node),
+            node: config.node.as_ref().map(NodeToml::from_node_target),
         }
     }
 }

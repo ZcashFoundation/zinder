@@ -13,15 +13,11 @@
 )]
 
 use std::sync::Arc;
-use zinder_core::{BlockHeight, BlockId, Network};
+use zinder_core::Network;
 
-use async_trait::async_trait;
-use zinder_core::{RawTransactionBytes, TransactionBroadcastOutcome};
 use zinder_query::{
-    AdmittedIngestControl, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-};
-use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
+    AdmittedIngestControl, NodeBroadcast, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
@@ -63,11 +59,7 @@ pub fn serving_query_over(
 pub fn serving_query_from(
     mut store_fixture: WalletServingStoreFixture,
 ) -> eyre::Result<(WalletServingQuery<()>, WalletServingStoreFixture)> {
-    let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot(&mut store_fixture)?,
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot(&mut store_fixture)?);
     Ok((query, store_fixture))
 }
 
@@ -99,9 +91,7 @@ pub async fn native_serving_query_from(
     let (ingest_control, ingest_control_fixture) = admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         serving_pair_slot(&mut store_fixture)?,
-        (),
         ingest_control,
-        Arc::new(sample_regtest_upgrade_activations()),
     );
     Ok((query, store_fixture, ingest_control_fixture))
 }
@@ -114,81 +104,24 @@ pub fn serving_query_after_live_append(
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture =
         WalletServingStoreFixture::from_chain_after_live_append(chain, &activations)?;
-    let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot(&mut store_fixture)?,
-        (),
-        activations,
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot(&mut store_fixture)?);
     Ok((query, store_fixture))
 }
 
-/// Builds the release serving query over `chain` with a probed node source.
-pub fn probed_serving_query_over(
+/// Release serving query that broadcasts through a verified node double.
+pub type NodeBroadcastQuery = WalletServingQuery<Option<NodeBroadcast<MockTransactionBroadcaster>>>;
+
+/// Builds the release serving query over `chain` with `broadcaster` as its
+/// node, verified against the served pair.
+pub async fn verified_node_query_over(
     chain: &ChainFixture,
-    node: ProbedNode,
-) -> eyre::Result<(WalletServingQuery<ProbedNode>, WalletServingStoreFixture)> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
-    let query = WalletServingQuery::from_probed_node_source(
-        serving_pair_slot(&mut store_fixture)?,
-        node,
-        activations,
-    )?;
-    Ok((query, store_fixture))
-}
-
-/// Probed node double that delegates broadcasts to a
-/// [`MockTransactionBroadcaster`].
-#[derive(Clone)]
-pub struct ProbedNode {
-    capabilities: NodeCapabilities,
-    tip: BlockId,
     broadcaster: MockTransactionBroadcaster,
-}
-
-impl ProbedNode {
-    /// Advertises transaction broadcast and forwards it to `broadcaster`.
-    pub fn with_broadcaster(
-        tip: BlockId,
-        broadcaster: MockTransactionBroadcaster,
-    ) -> eyre::Result<Self> {
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::OpenRpcDiscovery,
-                NodeCapability::TipId,
-                NodeCapability::TransactionBroadcast,
-            ])?,
-            tip,
-            broadcaster,
-        })
-    }
-}
-
-#[async_trait]
-impl NodeSource for ProbedNode {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
-    async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        Err(SourceError::NodeUnavailable {
-            reason: "probed query test node does not serve blocks".to_owned(),
-        })
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TransactionBroadcaster for ProbedNode {
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastOutcome, SourceError> {
-        self.broadcaster
-            .broadcast_transaction(raw_transaction)
-            .await
-    }
+) -> eyre::Result<(NodeBroadcastQuery, WalletServingStoreFixture)> {
+    let activations = sample_regtest_upgrade_activations();
+    let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.with_node_activations(activations));
+    node.verify(&slot).await?;
+    let query = WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
+    Ok((query, store_fixture))
 }

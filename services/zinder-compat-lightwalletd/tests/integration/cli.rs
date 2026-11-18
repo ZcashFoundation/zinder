@@ -166,6 +166,47 @@ fn compact_blocks_rejects_explicit_wallet_configuration() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Compact-block serving never contacts a node, so a node setting from the
+/// file, the command line, or the environment is a configuration error.
+#[test]
+fn compact_blocks_rejects_node_configuration() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compact-blocks-store");
+    let secondary_path = temporary.path().join("compact-blocks-secondary");
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+    )?;
+    let file_with_node = temporary.path().join("compact-blocks-node.toml");
+    fs::write(
+        &file_with_node,
+        format!(
+            "{}\n[node]\nrequest_timeout_secs = 30\n",
+            compact_blocks_config_toml(&storage_path, &secondary_path)?
+        ),
+    )?;
+
+    let from_file = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&file_with_node)?])
+        .output()?;
+    let from_cli = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .args(["--node-json-rpc-addr", "http://127.0.0.1:29232"])
+        .output()?;
+    let from_environment = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__AUTH__METHOD", "cookie")
+        .output()?;
+
+    for output in [from_file, from_cli, from_environment] {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("does not accept node settings"), "{stderr}");
+    }
+    Ok(())
+}
+
 #[test]
 fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
     let temporary = tempdir()?;

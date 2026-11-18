@@ -30,6 +30,7 @@ use zinder_store::{
 mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
+mod node_broadcast;
 mod serving_read;
 mod transparent_unspent_output_stream;
 mod tree_state_replay_limit;
@@ -57,6 +58,7 @@ pub use ingest_control::{
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
+pub use node_broadcast::NodeBroadcast;
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
@@ -81,12 +83,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
 
-    /// Returns the diagnostic capability snapshot from the exact upstream
-    /// source handle installed in this query, when one exists.
+    /// Returns the diagnostic capability snapshot of the node endpoint this
+    /// query broadcasts through, once that endpoint passed first-contact
+    /// verification.
     fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities>;
 
-    /// Returns the network-upgrade activation table advertised by the
-    /// configured upstream node.
+    /// Returns the network-upgrade activation table the canonical writer
+    /// admitted with the current serving pair.
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError>;
 
     /// Reads chain-wide value-pool totals from the exact admitted upstream

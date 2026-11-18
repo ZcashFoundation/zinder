@@ -3,8 +3,6 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::sync::Arc;
-
 use eyre::{Result, eyre};
 use zinder_core::{BlockHeight, BlockSelector, Network, TxStatus};
 use zinder_query::{WalletQueryApi, WalletServingQuery};
@@ -34,8 +32,7 @@ async fn deep_chain_serves_every_block_and_transactions_by_id() -> Result<()> {
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
     let live = live_serving_pair(&env, &activations, tip_height).await?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(live.slot);
     let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
     assert_eq!(chain_epoch.network, env.network());
     assert_eq!(chain_epoch.visible_tip_height, tip_height);

@@ -5,35 +5,123 @@
 
 use eyre::eyre;
 use zinder_core::{
-    BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES,
-    Network, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
+    BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
+    BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
-use zinder_query::{QueryError, WalletQueryApi, WalletServingQuery};
+use zinder_query::{NodeBroadcast, QueryError, WalletQueryApi, WalletServingQuery};
 use zinder_source::SourceError;
-use zinder_testkit::{ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture};
+use zinder_testkit::{
+    ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
+};
 
-use crate::common::{ProbedNode, probed_serving_query_over, serving_query_over};
+use crate::common::{
+    NodeBroadcastQuery, serving_pair_slot, serving_query_over, verified_node_query_over,
+};
 
-/// Builds the release serving query whose probed node admits broadcast and
-/// forwards it to `broadcaster`.
-fn broadcasting_query(
+/// Builds the release serving query whose verified node forwards broadcasts
+/// to `broadcaster`.
+async fn broadcasting_query(
     broadcaster: MockTransactionBroadcaster,
-) -> eyre::Result<(WalletServingQuery<ProbedNode>, WalletServingStoreFixture)> {
+) -> eyre::Result<(NodeBroadcastQuery, WalletServingStoreFixture)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let tip = chain
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
-    let node = ProbedNode::with_broadcaster(BlockId::new(tip.height, tip.hash), broadcaster)?;
-    probed_serving_query_over(&chain, node)
+    verified_node_query_over(&chain, broadcaster).await
+}
+
+/// A reader starts without contacting its node, so a broadcast that arrives
+/// before the node's first-contact verification fails without sending the
+/// transaction anywhere.
+#[tokio::test]
+async fn broadcast_before_node_verification_fails_without_sending() -> eyre::Result<()> {
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    assert!(
+        wallet_query
+            .native_endpoint_capabilities()
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    );
+    assert!(wallet_query.upstream_node_capabilities().is_none());
+    let error = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an unverified node must not receive a broadcast"))?;
+    assert!(
+        matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
+        "unexpected unverified-node error: {error:?}"
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+
+    node.verify(&slot).await?;
+    assert!(wallet_query.upstream_node_capabilities().is_some());
+    wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await?;
+    assert_eq!(broadcaster.call_count(), 1);
+    Ok(())
+}
+
+/// A node whose activation table differs from the writer-admitted schedule
+/// through the served tip is on another network or fork, so verification
+/// refuses it and it never receives a transaction.
+#[tokio::test]
+async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre::Result<()> {
+    let mainnet_shaped = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .map(|activation| NetworkUpgradeActivation {
+                activation_height: BlockHeight::new(419_200),
+                ..activation.clone()
+            })
+            .collect(),
+    )?;
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(mainnet_shaped);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refusal = node
+        .verify(&slot)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a node on another chain must fail verification"))?;
+    assert!(
+        matches!(refusal, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected verification refusal: {refusal:?}"
+    );
+    assert!(
+        wallet_query
+            .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+            .await
+            .is_err()
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+    Ok(())
 }
 
 #[tokio::test]
 async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([7; 32]);
     let mock_broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
 
     let broadcast_outcome = wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
@@ -90,7 +178,8 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
     for expected_broadcast_outcome in cases {
         let (wallet_query, _store_fixture) = broadcasting_query(
             MockTransactionBroadcaster::returning(expected_broadcast_outcome.clone()),
-        )?;
+        )
+        .await?;
 
         let broadcast_outcome = wallet_query
             .broadcast_transaction(RawTransactionBytes::new([0x02]))
@@ -106,7 +195,7 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
 async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() -> eyre::Result<()>
 {
     let mock_broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([1; 32]));
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
     let oversized = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES + 1]);
 
     let error = match wallet_query.broadcast_transaction(oversized).await {
@@ -133,7 +222,7 @@ async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() 
 async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([6; 32]);
     let mock_broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
     let at_bound = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES]);
 
     let broadcast_outcome = wallet_query.broadcast_transaction(at_bound.clone()).await?;
@@ -151,7 +240,8 @@ async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()
 async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre::Result<()> {
     let (wallet_query, _store_fixture) = broadcasting_query(
         MockTransactionBroadcaster::node_unavailable("node is offline"),
-    )?;
+    )
+    .await?;
 
     let error = match wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x03]))
@@ -176,7 +266,7 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
 async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([9; 32]);
     let (wallet_query, _store_fixture) =
-        broadcasting_query(MockTransactionBroadcaster::accepted(transaction_id))?;
+        broadcasting_query(MockTransactionBroadcaster::accepted(transaction_id)).await?;
     let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
     let broadcast_outcome = wallet_query

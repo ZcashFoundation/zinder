@@ -37,7 +37,7 @@ use zinder_query::{
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
 };
 
@@ -61,9 +61,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        MockTransactionBroadcaster::broadcast_disabled(),
         admitted_ingest_control,
-        activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
@@ -133,9 +131,7 @@ async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        MockTransactionBroadcaster::broadcast_disabled(),
         admitted_ingest_control,
-        activations,
     );
     let readiness = zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(2)));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default())
@@ -210,9 +206,7 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         serving_pair_slot,
-        (),
         admitted_ingest_control,
-        activations,
     );
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
@@ -289,9 +283,7 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         admitted_ingest_control,
-        activations,
     );
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
@@ -464,9 +456,7 @@ async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> e
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         admitted_ingest_control,
-        activations,
     );
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,

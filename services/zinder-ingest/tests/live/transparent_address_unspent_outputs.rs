@@ -16,8 +16,6 @@
 //! [`TRANSPARENT_BROADCAST_TEST_SEED`] (see `live::mempool_broadcast_cycle`).
 //! The exact address is logged by the test on startup.
 
-use std::sync::Arc;
-
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt as _;
@@ -59,8 +57,7 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
     let live = live_serving_pair(&env, &activations, tip_height).await?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(live.slot);
     let mut hasher = Sha256::new();
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());

@@ -221,6 +221,24 @@ pub trait NodeSource: Send + Sync + 'static {
     }
 }
 
+/// Identity a wallet reader reads from a node endpoint before it broadcasts
+/// transactions through that endpoint.
+///
+/// A reader that starts without contacting its node verifies the endpoint on
+/// first contact instead: the advertised methods must include transaction
+/// broadcast, and the activation table must agree with the schedule the
+/// reader serves.
+#[async_trait]
+pub trait BroadcastNodeProbe: Send + Sync + 'static {
+    /// Lists the methods the endpoint advertises.
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError>;
+
+    /// Reads the endpoint's network-upgrade activation table.
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError>;
+}
+
 /// Node-backed transaction broadcast boundary.
 #[async_trait]
 pub trait TransactionBroadcaster: Send + Sync + 'static {

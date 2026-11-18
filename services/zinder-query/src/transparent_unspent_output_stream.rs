@@ -489,8 +489,7 @@ mod tests {
                 Arc::new(wallet),
             )?);
             let slot = WalletServingPairSlot::new(Arc::clone(&pair));
-            let query =
-                WalletServingQuery::from_serving_pair_slot(slot.clone(), (), Arc::new(activations));
+            let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
             Ok(Self {
                 pair,
                 slot,

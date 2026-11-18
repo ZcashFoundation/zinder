@@ -88,12 +88,8 @@ pub(crate) async fn serve_live_wallet_endpoint(env: &LiveTestEnv) -> Result<Live
     let ingest_control = IngestControlFixture::spawn(network).await?;
     let admitted_ingest_control =
         AdmittedIngestControl::connect(ingest_control.endpoint(), None, network).await?;
-    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
-        slot,
-        (),
-        admitted_ingest_control,
-        activations,
-    );
+    let wallet_query =
+        WalletServingQuery::from_admitted_native_serving_pair(slot, admitted_ingest_control);
     let adapter = WalletQueryGrpcAdapter::new(
         wallet_query,
         WalletEndpointMetadata {

@@ -27,10 +27,7 @@
 //! The shielded test also signs a transparent-to-Ironwood shielding spend
 //! with a real Halo2 proof, so the node must have activated NU6.3.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use eyre::{Result, eyre};
 use serde::Deserialize;
@@ -39,7 +36,7 @@ use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
     TransactionBroadcastOutcome, TransactionId, UnixTimestampMillis,
 };
-use zinder_query::{WalletQueryApi as _, WalletServingQuery};
+use zinder_query::{NodeBroadcast, WalletQueryApi as _, WalletServingQuery};
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
     NodeSource, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
@@ -208,8 +205,10 @@ async fn shielded_outputs_are_indexed_after_mining() -> Result<()> {
         source,
         store_fixture: _store_fixture,
     } = live_serving_pair(&env, &activations, tip).await?;
+    let node = NodeBroadcast::new(source);
+    node.verify(&slot).await?;
     let wallet_query =
-        WalletServingQuery::from_probed_node_source(slot, source, Arc::clone(&activations))?;
+        WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
     let compact = wallet_query.compact_block_at(mined_height, None).await?;
     let shielding_transaction = compact
         .compact_block

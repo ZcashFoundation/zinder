@@ -38,11 +38,11 @@ use zinder_store::{
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
+    ChainFixture, FixtureTransactionRows, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
 };
 
-type WalletServingAdapter = LightwalletdGrpcAdapter<WalletServingQuery<MockTransactionBroadcaster>>;
+type WalletServingAdapter = LightwalletdGrpcAdapter<WalletServingQuery<()>>;
 
 #[tokio::test]
 #[allow(
@@ -137,7 +137,7 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
         ));
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
 
     let all_request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![primary_address_text.clone()],
@@ -201,9 +201,9 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
     Ok(())
 }
 
-/// A runtime that discovered the pre-NU7 node table serves the writer-admitted
-/// NU7 schedule: NU7 is the next pending upgrade below its activation height
-/// and the active branch from that height on.
+/// A store built with the pre-NU7 table serves the NU7 schedule its writer
+/// admitted later: NU7 is the next pending upgrade below its activation
+/// height and the active branch from that height on.
 #[tokio::test]
 async fn lightd_info_reports_the_writer_admitted_upgrade_across_its_activation() -> eyre::Result<()>
 {
@@ -232,8 +232,7 @@ async fn lightd_info_reports_the_writer_admitted_upgrade_across_its_activation()
             &startup_activations,
             &admitted_activations,
         )?;
-        let adapter =
-            build_wallet_serving_adapter(&mut store_fixture, Arc::clone(&startup_activations))?;
+        let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
         let info = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty {}))
             .await?
@@ -263,7 +262,7 @@ async fn admitted_transparent_support_stays_immutable_through_readiness_recovery
         .extend_blocks(1);
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
     let readiness = Readiness::new(ReadinessState::ready(Some(1)));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -333,11 +332,8 @@ async fn unretained_transactions_reject_compatibility_before_listener_binding() 
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
     )?);
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(serving_pair),
-        MockTransactionBroadcaster::broadcast_disabled(),
-        activations.clone(),
-    );
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(serving_pair));
     let reservation = TcpListener::bind("127.0.0.1:0").await?;
     let address = reservation.local_addr()?;
     drop(reservation);
@@ -413,7 +409,7 @@ async fn production_pair_drains_both_transparent_history_rpcs_across_native_page
     }
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
     let request = transparent_history_filter(address_text, 2, 2);
 
     let deprecated = adapter
@@ -487,7 +483,7 @@ async fn taddress_history_resolves_open_and_oversized_ends_at_the_tip_like_light
     }
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
     let both_blocks = vec![
         (1, history_transaction_bytes(1)),
         (2, history_transaction_bytes(2)),
@@ -554,8 +550,8 @@ async fn taddress_history_resolves_open_and_oversized_ends_at_the_tip_like_light
 async fn address_utxos_with_zero_max_entries_return_every_utxo_like_lightwalletd()
 -> eyre::Result<()> {
     let utxo_count = 1_001_u32;
-    let (mut store_fixture, activations, address_text) = many_utxo_fixture(0x34, utxo_count)?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let (mut store_fixture, address_text) = many_utxo_fixture(0x34, utxo_count)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address_text],
         start_height: 0,
@@ -592,17 +588,14 @@ async fn address_utxos_with_zero_max_entries_return_every_utxo_like_lightwalletd
 async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> eyre::Result<()> {
     let utxo_count = 1_001_u32;
     let response_limit = NonZeroU32::MIN.saturating_add(999);
-    let (mut store_fixture, activations, address_text) = many_utxo_fixture(0x35, utxo_count)?;
+    let (mut store_fixture, address_text) = many_utxo_fixture(0x35, utxo_count)?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
     )?);
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(serving_pair),
-        MockTransactionBroadcaster::broadcast_disabled(),
-        activations,
-    );
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(serving_pair));
     let adapter = LightwalletdGrpcAdapter::with_response_limits(
         query,
         LightwalletdResponseLimits {
@@ -745,7 +738,6 @@ async fn production_pair_seeks_transparent_address_ranges_past_a_large_prefix() 
     let adapter = build_wallet_serving_adapter_from_readers(
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
-        activations,
     )?;
     let history = collect_stream(
         adapter
@@ -798,8 +790,7 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
             missing_transaction_id: transaction_id,
         });
     let wallet_reader: Arc<dyn WalletProjectionReader> = Arc::new(wallet_reader);
-    let adapter =
-        build_wallet_serving_adapter_from_readers(canonical_reader, wallet_reader, activations)?;
+    let adapter = build_wallet_serving_adapter_from_readers(canonical_reader, wallet_reader)?;
     let request = transparent_history_filter(address_text, 1, 1);
 
     let deprecated_status = first_stream_error(
@@ -835,7 +826,7 @@ async fn production_pair_get_block_range_outside_retained_history_keeps_lightwal
         .extend_blocks(3);
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
 
     let cases = [
         ("start above visible tip", 4_u64, 5_u64, Code::OutOfRange),
@@ -885,28 +876,18 @@ async fn first_block_range_status(
 
 fn build_wallet_serving_adapter(
     store_fixture: &mut WalletServingStoreFixture,
-    activations: Arc<zinder_core::NetworkUpgradeActivations>,
 ) -> eyre::Result<WalletServingAdapter> {
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    build_wallet_serving_adapter_from_readers(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
-        activations,
-    )
+    build_wallet_serving_adapter_from_readers(Arc::new(canonical_reader), Arc::new(wallet_reader))
 }
 
 fn build_wallet_serving_adapter_from_readers(
     canonical_reader: Arc<dyn CanonicalReader>,
     wallet_reader: Arc<dyn WalletProjectionReader>,
-    activations: Arc<zinder_core::NetworkUpgradeActivations>,
 ) -> eyre::Result<WalletServingAdapter> {
     let serving_pair = Arc::new(WalletServingReadPair::new(canonical_reader, wallet_reader)?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
-    let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot,
-        MockTransactionBroadcaster::broadcast_disabled(),
-        activations,
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot);
     LightwalletdGrpcAdapter::from_admitted_compatibility_query(query).map_err(Into::into)
 }
 
@@ -941,11 +922,7 @@ fn pre_nu7_activations() -> eyre::Result<NetworkUpgradeActivations> {
 fn many_utxo_fixture(
     address_byte: u8,
     utxo_count: u32,
-) -> eyre::Result<(
-    WalletServingStoreFixture,
-    Arc<NetworkUpgradeActivations>,
-    String,
-)> {
+) -> eyre::Result<(WalletServingStoreFixture, String)> {
     let address = transparent_address(address_byte);
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
@@ -976,9 +953,9 @@ fn many_utxo_fixture(
                 block_two.hash,
             ));
     }
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
-    Ok((store_fixture, activations, address.to_string()))
+    let store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    Ok((store_fixture, address.to_string()))
 }
 
 fn u32_to_usize(count: u32) -> usize {

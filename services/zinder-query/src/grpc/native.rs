@@ -138,7 +138,7 @@ pub fn build_wallet_server_info(
     }
 }
 
-fn build_node_capabilities_descriptor(
+pub(crate) fn build_node_capabilities_descriptor(
     upstream: Option<&UpstreamNodeCapabilities>,
 ) -> wallet::NodeCapabilitiesDescriptor {
     upstream.map_or_else(
@@ -870,7 +870,6 @@ mod server_info_tests {
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
-            NodeCapabilities::default(),
             &admitted_ingest_control,
         );
         let mut upstream = UpstreamNodeCapabilities::from_probed(NodeCapabilities::new([
@@ -915,7 +914,6 @@ mod server_info_tests {
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
-            NodeCapabilities::default(),
             &admitted_ingest_control,
         );
         let descriptor = build_wallet_server_info(metadata, &capabilities, None);
@@ -946,7 +944,6 @@ mod server_info_tests {
         .await?;
         let transactions = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
-            NodeCapabilities::default(),
             &admitted_ingest_control,
         );
         for always_supported in [
@@ -973,15 +970,11 @@ mod server_info_tests {
             assert!(!transactions.contains(structurally_absent));
         }
 
-        let probed_node = NodeCapabilities::new([
-            NodeCapability::OpenRpcDiscovery,
-            NodeCapability::TransactionBroadcast,
-        ])?;
         let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::All,
-            probed_node,
             &admitted_ingest_control,
-        );
+        )
+        .with_node_broadcast();
         for evidence_backed in [
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,

@@ -197,7 +197,7 @@ struct LightwalletdRawConfig {
     wallet: Option<WalletSection>,
     ingest_control: IngestControlSection,
     compat: CompatSection,
-    node: NodeSection,
+    node: Option<NodeSection>,
     security: SecuritySection,
 }
 
@@ -227,6 +227,12 @@ fn resolve_lightwalletd_config(
     if matches!(serving, CompatServing::CompactBlocks) && wallet.is_some() {
         return Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"",
+        )
+        .into());
+    }
+    if matches!(serving, CompatServing::CompactBlocks) && config.node.is_some() {
+        return Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node section and every ZINDER_NODE__* variable, or select compat.serving = \"wallet\"",
         )
         .into());
     }
@@ -274,8 +280,8 @@ fn resolve_lightwalletd_config(
     )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let broadcaster =
-        NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
+    let broadcaster = NodeTarget::resolve_optional(network, config.node.unwrap_or_default())
+        .map_err(ConfigError::from)?;
 
     Ok(LightwalletdConfig {
         network,

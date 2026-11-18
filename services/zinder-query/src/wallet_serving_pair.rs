@@ -261,6 +261,10 @@ pub enum WalletServingAdmissionError {
     /// The visible canonical epoch disagreed with the canonical READY fence.
     #[error("canonical READY epoch does not match its admitted event fence")]
     CanonicalFenceMismatch,
+    /// The canonical reader carries no writer-admitted network-upgrade
+    /// schedule, so the pair has no activation table to serve.
+    #[error("canonical reader carries no writer-admitted network-upgrade schedule")]
+    NetworkUpgradeScheduleNotAdmitted,
     /// The wallet READY identity did not exactly match canonical state.
     #[error("wallet READY evidence does not match the canonical fence and settlement boundary")]
     WalletSourceMismatch {
@@ -501,8 +505,10 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
 /// One immutable canonical and wallet reader pair at the exact same source.
 ///
 /// Pair construction validates network, epoch, event cursor, visible tip,
-/// sequence digest, and settled tip. Callers can safely hold an `Arc` to this
-/// pair for an entire request while a different generation catches up.
+/// sequence digest, and settled tip, and requires the canonical writer's
+/// admitted network-upgrade schedule, which is the pair's activation table.
+/// Callers can safely hold an `Arc` to this pair for an entire request while
+/// a different generation catches up.
 ///
 /// A held pair keeps its secondary generation open. A read that spans many
 /// bounded steps checks between them whether the publisher has revoked reads
@@ -517,6 +523,7 @@ pub struct WalletServingReadPair {
     wallet: Arc<dyn WalletProjectionReader>,
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
+    network_upgrade_activations: NetworkUpgradeActivations,
     reads_revoked: CancellationToken,
     table_file_missing: AtomicBool,
 }
@@ -529,11 +536,20 @@ impl WalletServingReadPair {
     ) -> Result<Self, QueryError> {
         Self::validate_readers(canonical.as_ref(), wallet.as_ref())
             .map_err(|error| pair_admission_query_error(&error))?;
+        let network_upgrade_activations = canonical
+            .network_upgrade_schedule()
+            .map(|schedule| schedule.activations().clone())
+            .ok_or_else(|| {
+                pair_admission_query_error(
+                    &WalletServingAdmissionError::NetworkUpgradeScheduleNotAdmitted,
+                )
+            })?;
         Ok(Self {
             canonical_fence: canonical.event_fence(),
             wallet_source: WalletCanonicalSourceIdentity::from_ready_evidence(
                 wallet.ready_evidence(),
             ),
+            network_upgrade_activations,
             canonical,
             wallet,
             reads_revoked: CancellationToken::new(),
@@ -555,6 +571,9 @@ impl WalletServingReadPair {
                 canonical: canonical.network(),
                 wallet: wallet.network(),
             });
+        }
+        if canonical.network_upgrade_schedule().is_none() {
+            return Err(WalletServingAdmissionError::NetworkUpgradeScheduleNotAdmitted);
         }
         let canonical_fence = canonical.event_fence();
         let canonical_epoch = canonical
@@ -615,6 +634,13 @@ impl WalletServingReadPair {
     #[must_use]
     pub const fn wallet_source(&self) -> WalletCanonicalSourceIdentity {
         self.wallet_source
+    }
+
+    /// Returns the network-upgrade activation table the canonical writer
+    /// admitted with this pair's fence.
+    #[must_use]
+    pub const fn network_upgrade_activations(&self) -> &NetworkUpgradeActivations {
+        &self.network_upgrade_activations
     }
 
     /// Tells the reads still holding this pair to stop, returning `true` the

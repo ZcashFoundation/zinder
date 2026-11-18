@@ -21,8 +21,8 @@ mod compact_block_serving;
 mod config;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use zinder_query::{
-    AdmittedIngestControl, WalletQueryApi, WalletServingPairConfig, WalletServingPairPublisher,
-    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
+    AdmittedIngestControl, NodeBroadcast, WalletServingPairConfig, WalletServingPairPublisher,
+    WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 
@@ -140,7 +140,7 @@ async fn run_runtime(cli: Cli) -> ExitCode {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "lightwalletd bootstrap composes the readiness, ops, store, broadcaster, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
+    reason = "lightwalletd bootstrap composes the readiness, ops, store, node broadcast, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
 )]
 async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
@@ -208,43 +208,11 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     };
     let start_api_phase = StartupPhase::StartApi.start();
 
-    let connect_node_phase = StartupPhase::ConnectNode.start();
-    let broadcaster = match build_broadcaster(lightwalletd_config.broadcaster.as_ref(), true) {
-        Ok(broadcaster) => broadcaster,
+    let node_broadcast = match build_node_broadcast(lightwalletd_config.broadcaster.as_ref()) {
+        Ok(node_broadcast) => node_broadcast,
         Err(error) => {
-            connect_node_phase.fail(&error);
             start_api_phase.fail(&error);
             return Err(error);
-        }
-    };
-    let Some(broadcaster_source) = broadcaster.as_ref() else {
-        let wrapped = LightwalletdConfigError::Source(Box::new(
-            zinder_source::SourceError::SourceProtocolMismatch {
-                reason: "[node] section is required so GetLightdInfo can serve a \
-                         node-discovered consensus branch id",
-            },
-        ));
-        connect_node_phase.fail(&wrapped);
-        start_api_phase.fail(&wrapped);
-        return Err(wrapped);
-    };
-    broadcaster_source
-        .probe_capabilities()
-        .await
-        .map_err(|source_error| LightwalletdConfigError::Source(Box::new(source_error)))?;
-    let network_upgrade_activations = match broadcaster_source
-        .discover_network_upgrade_activations("zinder-compat-lightwalletd")
-        .await
-    {
-        Ok(activations) => {
-            connect_node_phase.complete();
-            activations
-        }
-        Err(source_error) => {
-            let wrapped = LightwalletdConfigError::Source(Box::new(source_error));
-            connect_node_phase.fail(&wrapped);
-            start_api_phase.fail(&wrapped);
-            return Err(wrapped);
         }
     };
     let open_storage_phase = StartupPhase::OpenStorage.start();
@@ -256,7 +224,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
                 wallet_primary_path,
                 wallet_secondary_root,
                 network: lightwalletd_config.network,
-                network_upgrade_activations: Arc::clone(&network_upgrade_activations),
                 expected_raw_blob_retention: lightwalletd_config
                     .storage
                     .expected_raw_blob_retention,
@@ -287,12 +254,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let wallet_query = zinder_query::WalletServingQuery::from_probed_node_source(
-        serving_pair_slot.clone(),
-        broadcaster_source.clone(),
-        network_upgrade_activations.clone(),
-    )?;
-    let native_endpoint_capabilities = wallet_query.native_endpoint_capabilities().clone();
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
+        .with_node_broadcast(node_broadcast.clone());
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
@@ -309,8 +272,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
-        broadcaster_source.clone(),
-        &native_endpoint_capabilities,
+        node_broadcast,
+        serving_pair_slot,
         serving_readiness.clone(),
         lightwalletd_config
             .broadcaster
@@ -321,7 +284,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
                 |health| health.poll_interval,
             ),
         cancel.clone(),
-    )?;
+    );
     // Health and serving-pair refresh observe the same ingest control plane, so
     // they intentionally share one configured freshness cadence.
     let ingest_control_readiness_handle = spawn_wallet_ingest_control_readiness_probe(
@@ -505,35 +468,12 @@ async fn run_compact_blocks(
     let readiness = Readiness::default();
     let serving_readiness = compact_block_serving::CompactServingReadiness::new(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();
-    let connect_node_phase = StartupPhase::ConnectNode.start();
-    let broadcaster = build_broadcaster(lightwalletd_config.broadcaster.as_ref(), false)?;
-    let Some(broadcaster_source) = broadcaster.as_ref() else {
-        let error = LightwalletdConfigError::Source(Box::new(
-            zinder_source::SourceError::SourceProtocolMismatch {
-                reason: "[node] section is required so compact-blocks GetLightdInfo can serve node identity",
-            },
-        ));
-        connect_node_phase.fail(&error);
-        start_api_phase.fail(&error);
-        return Err(error);
-    };
-    broadcaster_source
-        .probe_capabilities()
-        .await
-        .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?;
-    let activations = broadcaster_source
-        .discover_network_upgrade_activations("zinder-compat-lightwalletd")
-        .await
-        .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?;
-    connect_node_phase.complete();
-
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let (publisher, slot) = compact_block_serving::CompactBlockPublisher::bootstrap(
         compact_block_serving::CompactBlockServingConfig {
             canonical_primary_path: lightwalletd_config.storage.path.clone(),
             canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
             network: lightwalletd_config.network,
-            activations: Arc::clone(&activations),
             raw_blob_retention: lightwalletd_config.storage.expected_raw_blob_retention,
             reorg_policy: lightwalletd_config.canonical_reorg_policy,
             resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
@@ -553,7 +493,7 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
-    let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot, activations)
+    let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         );
@@ -629,11 +569,12 @@ async fn run_compact_blocks(
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
-fn build_broadcaster(
-    broadcaster_target: Option<&NodeTarget>,
-    announce_broadcast: bool,
-) -> Result<Option<ZebraJsonRpcSource>, LightwalletdConfigError> {
-    let Some(broadcaster_target) = broadcaster_target else {
+/// Builds the broadcast endpoint from `[node]` without contacting the node,
+/// or `None` when no node is configured.
+fn build_node_broadcast(
+    node_target: Option<&NodeTarget>,
+) -> Result<Option<NodeBroadcast<ZebraJsonRpcSource>>, LightwalletdConfigError> {
+    let Some(node_target) = node_target else {
         tracing::info!(
             target: "zinder::compat_lightwalletd",
             event = "transaction_broadcast_disabled",
@@ -643,27 +584,25 @@ fn build_broadcaster(
     };
 
     let source = ZebraJsonRpcSource::with_options(
-        broadcaster_target.network,
-        broadcaster_target.json_rpc_addr.clone(),
-        broadcaster_target.node_auth.clone(),
+        node_target.network,
+        node_target.json_rpc_addr.clone(),
+        node_target.node_auth.clone(),
         ZebraJsonRpcSourceOptions {
-            request_timeout: broadcaster_target.request_timeout,
-            max_response_bytes: broadcaster_target.max_response_bytes,
-            broadcast_timeout: broadcaster_target.broadcast_timeout,
+            request_timeout: node_target.request_timeout,
+            max_response_bytes: node_target.max_response_bytes,
+            broadcast_timeout: node_target.broadcast_timeout,
         },
     )
     .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?
-    .with_health_config(broadcaster_target.health.clone());
+    .with_health_config(node_target.health.clone());
 
-    if announce_broadcast {
-        tracing::info!(
-            target: "zinder::compat_lightwalletd",
-            event = "transaction_broadcast_enabled",
-            json_rpc_addr = %broadcaster_target.json_rpc_addr,
-            "transaction broadcast enabled via Zebra JSON-RPC"
-        );
-    }
-    Ok(Some(source))
+    tracing::info!(
+        target: "zinder::compat_lightwalletd",
+        event = "transaction_broadcast_enabled",
+        json_rpc_addr = %node_target.json_rpc_addr,
+        "transaction broadcast enabled via node JSON-RPC once the node passes first-contact verification"
+    );
+    Ok(Some(NodeBroadcast::new(source)))
 }
 
 fn emit_runtime_error(error: &LightwalletdConfigError) -> ExitCode {

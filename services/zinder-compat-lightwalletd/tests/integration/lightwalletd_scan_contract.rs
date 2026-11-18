@@ -186,14 +186,9 @@ fn lightwalletd_scan_store_fixture() -> eyre::Result<ScanStore> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
-        )?)),
-        (),
-        activations,
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+        WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+    )));
     Ok(ScanStore {
         query,
         _store_fixture: store_fixture,

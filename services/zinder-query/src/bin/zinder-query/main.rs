@@ -1,17 +1,16 @@
 //! Zinder native wallet-query gRPC server entry point.
 
 use std::{
-    future::Future, net::SocketAddr, path::PathBuf, pin::Pin, process::ExitCode, sync::Arc,
-    time::Duration,
+    future::Future, net::SocketAddr, path::PathBuf, pin::Pin, process::ExitCode, time::Duration,
 };
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
-    WalletServingPairConfig, WalletServingPairPublisher, WalletServingQuery,
-    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
+    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryApi,
+    WalletQueryGrpcAdapter, WalletServingPairConfig, WalletServingPairPublisher,
+    WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
@@ -85,7 +84,7 @@ struct Cli {
     /// Operational HTTP endpoint listen address for health and metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
-    /// Zebra JSON-RPC address used to discover the canonical activation table.
+    /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
 }
@@ -166,28 +165,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error.into());
         }
     };
-    let connect_node_phase = StartupPhase::ConnectNode.start();
-    let source = ZebraJsonRpcSource::with_options(
-        query_config.node.network,
-        query_config.node.json_rpc_addr.clone(),
-        query_config.node.node_auth.clone(),
-        ZebraJsonRpcSourceOptions {
-            request_timeout: query_config.node.request_timeout,
-            max_response_bytes: query_config.node.max_response_bytes,
-            broadcast_timeout: query_config.node.broadcast_timeout,
-        },
-    )
-    .map_err(|error| QueryConfigError::Source(Box::new(error)))?
-    .with_health_config(query_config.node.health.clone());
-    source
-        .probe_capabilities()
-        .await
-        .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
-    let network_upgrade_activations = source
-        .discover_network_upgrade_activations("zinder-query")
-        .await
-        .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
-    connect_node_phase.complete();
+    let node_broadcast = build_node_broadcast(query_config.node.as_ref())?;
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let (pair_publisher, pair_slot) =
@@ -198,7 +176,6 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
                 wallet_primary_path: query_config.wallet_primary_path.clone(),
                 wallet_secondary_root: query_config.wallet_secondary_root.clone(),
                 network: query_config.network,
-                network_upgrade_activations: Arc::clone(&network_upgrade_activations),
                 expected_raw_blob_retention: query_config.storage.expected_raw_blob_retention,
                 canonical_reorg_policy: query_config.canonical_reorg_policy,
                 canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
@@ -223,12 +200,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .value();
     open_storage_phase.complete();
 
-    let query = WalletServingQuery::from_admitted_native_sources(
-        pair_slot,
-        source.clone(),
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        pair_slot.clone(),
         ingest_control.clone(),
-        Arc::clone(&network_upgrade_activations),
-    )?;
+    )
+    .with_node_broadcast(node_broadcast.clone());
     let endpoint_metadata = WalletEndpointMetadata {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         service_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -258,15 +234,19 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1()?;
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
-        source,
-        &native_endpoint_capabilities,
+        node_broadcast,
+        pair_slot,
         serving_readiness.clone(),
-        query_config.node.health.as_ref().map_or_else(
-            || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
-            |health| health.poll_interval,
-        ),
+        query_config
+            .node
+            .as_ref()
+            .and_then(|node| node.health.as_ref())
+            .map_or_else(
+                || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
+                |health| health.poll_interval,
+            ),
         cancel.clone(),
-    )?;
+    );
     // Health and serving-pair refresh observe the same ingest control plane, so
     // they intentionally share one configured freshness cadence.
     let ingest_control_health_poll_interval = query_config.storage.secondary_catchup_interval;
@@ -316,6 +296,34 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         },
     )
     .await
+}
+
+/// Builds the broadcast endpoint from `[node]` without contacting the node,
+/// or `None` when no node is configured.
+fn build_node_broadcast(
+    node: Option<&zinder_source::NodeTarget>,
+) -> Result<Option<NodeBroadcast<ZebraJsonRpcSource>>, QueryConfigError> {
+    let Some(node) = node else {
+        tracing::info!(
+            target: "zinder::query",
+            event = "transaction_broadcast_disabled",
+            "transaction broadcast disabled because [node] is not configured"
+        );
+        return Ok(None);
+    };
+    let source = ZebraJsonRpcSource::with_options(
+        node.network,
+        node.json_rpc_addr.clone(),
+        node.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: node.request_timeout,
+            max_response_bytes: node.max_response_bytes,
+            broadcast_timeout: node.broadcast_timeout,
+        },
+    )
+    .map_err(|error| QueryConfigError::Source(Box::new(error)))?
+    .with_health_config(node.health.clone());
+    Ok(Some(NodeBroadcast::new(source)))
 }
 
 struct QueryBackgroundTasks {
