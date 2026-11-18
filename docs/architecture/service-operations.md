@@ -1310,13 +1310,23 @@ the cap. Graceful shutdown waits for in-flight HTTP requests and does not wait
 for upgraded connections, which the owning handler closes.
 
 The connection cap is a global ceiling that protects file descriptors and
-tasks, not a per-client limit. A client that opens many connections can fill the
-Cipherscan cap and refuse other clients until its connections time out, so a
-public deployment still belongs behind an operator-controlled proxy that limits
-connections per client and applies its own timeouts. The cap is deliberately
-small on the operational endpoint, which serves only scrapers and probes, so it
-cannot compete with the gRPC listener and the stores for file descriptors. The
-bounds are constants, not configuration.
+tasks, not a per-client limit. An idle HTTP connection closes after 10 seconds,
+but nothing bounds how long a connection stays open while its client keeps
+sending requests. A `WebSocket` session has no idle bound at all: it stays open,
+holding its slot, for as long as the client keeps reading, even if it never
+sends anything. A client that opens many connections or `WebSocket` sessions
+can therefore fill the Cipherscan cap and refuse other clients for as long as
+it keeps them open, so a public deployment still belongs behind an
+operator-controlled proxy that limits connections per client and applies its
+own timeouts.
+
+The cap is deliberately small on the operational endpoint, which serves only
+scrapers and probes, so it cannot compete with the gRPC listener and the
+stores for file descriptors. Any client that can reach the endpoint can
+therefore fill its 64 connections and make health probes and metric scrapes
+fail. Keep `ops.listen_addr` on loopback, its default, or on a private network
+that only the orchestrator and the metrics scraper can reach, and never expose
+it to the internet. The bounds are constants, not configuration.
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only
