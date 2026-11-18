@@ -30,9 +30,9 @@ time. A stray `cargo test` therefore never contacts a node. The PostgreSQL
 test is `#[ignore]`d for the same reason.
 
 The T4 parity tier checks the request and error shapes that consumers depend
-on: lightwalletd clients, Zallet, lightwalletd operators, and explorers. It
-does not prove that a real SDK or wallet works. Live parity against a
-reference lightwalletd is a T3 test, described in
+on: lightwalletd clients, Zallet, lightwalletd operators, and explorers. Real
+wallets are checked as [External wallets](#external-wallets) describes. Live
+parity against a reference lightwalletd is a T3 test, described in
 [Parity against a reference lightwalletd](#parity-against-a-reference-lightwalletd).
 
 ## Default validation gate
@@ -412,7 +412,8 @@ running.
 This run covers parsing, canonical construction, wallet projection, and
 serving reads for version-5 and version-6 blocks before, at, and after NU7.
 It includes a transparent-to-Ironwood shielding spend with a real Halo2 proof
-(`shielded_outputs_are_indexed_after_mining`). It does not cover:
+(`shielded_outputs_are_indexed_after_mining`). These areas are outside this
+run:
 
 - Zakura's Sapling and Orchard pools. A captured fixture covers a Zakura
   Orchard spend; see [Capturing node fixtures](capturing-node-fixtures.md).
@@ -422,11 +423,11 @@ It includes a transparent-to-Ironwood shielding spend with a real Halo2 proof
 - NU7 on Testnet or Mainnet, production capacity, reorgs deeper than the
   reorg window, and restarts of the Zinder runtimes.
 
-Node endpoint failover has no two-node live test, because the local Regtest
-nodes do not peer with each other. Integration tests in
+Integration tests in
 `services/zinder-ingest/tests/integration/node_failover.rs` and
-`services/zinder-query/tests/integration/broadcast_failover.rs` cover it with
-simulated sources. `live::broadcast_fallback` needs one Regtest node: it puts a
+`services/zinder-query/tests/integration/broadcast_failover.rs` cover node
+endpoint failover with simulated sources, because the local Regtest nodes do
+not peer with each other. `live::broadcast_fallback` needs one Regtest node: it puts a
 proxy to the node at `[node]` and the node itself at `[node_fallbacks.1]`,
 stops the proxy, and checks that a broadcast moves to the fallback with cause
 `node_unreachable`.

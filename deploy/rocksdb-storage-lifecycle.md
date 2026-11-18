@@ -6,10 +6,10 @@ reports the two times separately, then cold-opens both stores and checks that
 the wallet store has reached the same canonical chain event. It is a
 maintainer procedure.
 
-The harness does not certify continuous following, reorg recovery, query
-serving, or lightwalletd compatibility. The canonical runtime tracer in the
-[testing runbook](../docs/runbooks/testing.md) covers the real `zinder-ingest`
-composition, following, and restart.
+The harness measures construction. Continuous following, reorg recovery,
+query serving, and lightwalletd compatibility are outside its scope. The
+canonical runtime tracer in the [testing runbook](../docs/runbooks/testing.md)
+covers the real `zinder-ingest` composition, following, and restart.
 
 ## Prerequisites
 
@@ -46,8 +46,8 @@ ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH="$PWD/.tmp/rocksdb-storage-lifecycle-smok
   scripts/run-rocksdb-storage-lifecycle.sh
 ```
 
-A smoke result is functional evidence only. It does not predict a current-tip
-run.
+A smoke result shows that the code path works. Measure to the current tip for
+timing.
 
 ## Measure to the current tip
 

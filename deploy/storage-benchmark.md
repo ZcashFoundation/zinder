@@ -7,9 +7,9 @@ stores for Zinder's canonical replay records. Both arms run from one immutable
 ordered sequence digest, and writes a completion marker only after that check
 passes. This is a maintainer procedure.
 
-The reports cover only this replay-record round trip. They do not measure
-canonical construction, compact blocks, tree positions, chain events, reorgs,
-the wallet store, or query serving. PostgreSQL is not a Zinder storage backend,
+The reports measure this replay-record round trip. Canonical construction,
+compact blocks, tree positions, chain events, reorgs, the wallet store, and
+query serving are outside their scope. PostgreSQL is not a Zinder storage backend,
 and neither deployment depends on this environment.
 
 ## Profiles

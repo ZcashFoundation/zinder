@@ -26,8 +26,10 @@ Compose deployment. Metric names and alerts are described in
 7. Writes a readiness report and an evidence directory, and leaves
    everything running so you can inspect the dashboards.
 
-The smoke does not test restore, because Zinder has no restore. Its report
-records restore as `blocked`.
+The readiness report records restore as `blocked`, because Zinder recovers
+by rebuilding from the node, as
+[Service operations](../docs/architecture/service-operations.md#recovery)
+describes.
 
 ## Prerequisites
 

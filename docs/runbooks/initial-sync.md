@@ -9,7 +9,7 @@ from genesis into the canonical store. `zinder-projector` then derives the
 wallet store from it. The readers, `zinder-query` and
 `zinder-compat-lightwalletd`, serve traffic only after both stores exist.
 
-On Mainnet the first sync takes many hours.
+Plan many hours for the first sync on Mainnet.
 [Deploying Zinder](deploying.md#what-you-need) gives the measured times and
 disk.
 
@@ -17,8 +17,9 @@ disk.
 
 - The node is an archive node on the right network and has finished its own
   sync. Ingest refuses a pruned node.
-- The canonical and wallet storage paths are empty or absent. Zinder does not
-  migrate a store built with an incompatible identity or schema in place.
+- The canonical and wallet storage paths are empty or absent. To replace a
+  store built with an incompatible identity or schema, build a new one into
+  empty paths.
 - `ZINDER_PROJECTOR_BUILD_OWNER_HEX` (`projector.build_owner_hex`) has a
   value that stays the same across restarts.
 
@@ -50,7 +51,7 @@ does not mean the process is ready for traffic.
 | Canonical construction | ingest | Fixes a target tip, loads every block up to it into `<canonical>.building`, then publishes and moves it to the canonical path | `syncing`, `phase` `bulk_catchup`, `target_height` set to the fixed tip | `zinder_ingest_source_segment_connected_blocks_total` rises; `<canonical>.building` grows. Logs `canonical_fresh_construction_started`, then `canonical_fresh_construction_ready` |
 | Canonical catch-up | ingest | Follows the blocks the node produced during construction and loads the node's mempool | `syncing` until the lag is at most `ingest.follow.lag_threshold_blocks` (default 1) and the first mempool snapshot is complete | `zinder_ingest_canonical_tip_height` rises and `zinder_ingest_canonical_lag_blocks` falls |
 | Wallet build start | projector | Opens its canonical secondary, waits until it matches the writer exactly, and takes its build leases | `syncing`; `replica_lagging` or `writer_status_unavailable` after each `projector.fence_convergence_timeout_seconds` attempt | It retries and does not exit |
-| Wallet construction | projector | Builds the wallet store from the canonical store, spilling sorted data to `<wallet>.projection-load-staging` | `syncing`, `target_height` set to the canonical tip | No progress metric. The staging directory grows. Logs `wallet_projection_construction_complete` with `build_seconds` when done |
+| Wallet construction | projector | Builds the wallet store from the canonical store, spilling sorted data to `<wallet>.projection-load-staging` | `syncing`, `target_height` set to the canonical tip | The staging directory grows. Logs `wallet_projection_construction_complete` with `build_seconds` when done |
 | Wallet catch-up | projector | Applies canonical blocks committed during the build, then follows | `syncing` until the wallet matches the canonical tip | `current_height` approaches `target_height` |
 | Serving admission | query, compat | Opens matching canonical and wallet secondaries and checks that they describe the same chain | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | Compose allows each reader five minutes to become `ready` |
 
@@ -71,8 +72,8 @@ internet, see [Exposing over TLS](exposing-over-tls.md).
 
 ## Restarts during the first sync
 
-A restart during construction does not resume it. What survives depends on
-what was published before the process stopped:
+A restart during construction starts that construction over. What survives
+depends on what was published before the process stopped:
 
 | Stopped while | On restart |
 | --- | --- |
@@ -90,10 +91,11 @@ interrupted: finalizing the store files and publication. On a long chain,
 finalization can outlast the supervisor's grace period, and the kill that
 follows counts as a crash.
 
-The first sync does not fail over to `[node_fallbacks.N]` endpoints. Ingest
-retries a failed node request a bounded number of times. If the node stays
-unavailable longer, ingest exits and canonical construction starts over. The
-restart begins on the first endpoint that passes its checks.
+During the first sync, ingest reads from the endpoint it started on and does
+not switch to a `[node_fallbacks.N]` endpoint. Ingest retries a failed node
+request a bounded number of times. If the node stays unavailable longer,
+ingest exits and canonical construction starts over. The restart begins on
+the first endpoint that passes its checks.
 
 Do not move, edit, or delete staging directories by hand. Each runtime
 removes its own unpublished staging on the next start.

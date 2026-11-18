@@ -4,7 +4,7 @@ Status: Accepted
 
 | Topology | Role | Status |
 | --- | --- | --- |
-| `rocksdb-single-host` | Self-hosters and small deployments | Implemented, supported, and the only topology Zinder advertises. |
+| `rocksdb-single-host` | Self-hosters and small deployments | Implemented, supported, and advertised. |
 | `postgres-horizontal` | Hosted fleets | Decided. Not implemented, not certified, and not advertised. |
 
 The PostgreSQL arm of `zinder-bench` is a diagnostic benchmark. It is not a deployment mode.
@@ -23,7 +23,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 2. **Stores carry their identity.** Each store records its domain, exact schema version, network, and immutable parameters. A wallet store also binds the canonical source and position it projects. An opener fails without mutation when identity or version differs. Zinder never adopts an unknown non-empty directory, and a reader never upgrades a primary store.
 3. **One topology per deployment.** All stores of one deployment use the same engine. Parity between topologies is promised only on the public wallet contracts: native `WalletQuery` and lightwalletd compatibility.
 4. **`rocksdb-single-host` is the supported topology.** The canonical and wallet primaries live on one host filesystem, each with one owner. Readers open secondaries with process-unique metadata paths ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). Private, authenticated control APIs coordinate fences, leases, mempool state, and recovery.
-5. **A backup is a coherent pair.** A canonical checkpoint alone is not a wallet-serving backup. A restore authenticates the canonical fence and wallet digest together, restores both into fresh paths, and passes wallet-serving admission before traffic. Independently timed directory copies are not a backup. Capture is implemented; restore is not, so rebuilding is the only restore today ([Service operations](../architecture/service-operations.md#recovery)).
+5. **A backup is a coherent pair.** A canonical checkpoint alone is not a wallet-serving backup. A restore authenticates the canonical fence and wallet digest together, restores both into fresh paths, and passes wallet-serving admission before traffic. Independently timed directory copies are not a backup. Zinder implements capture and has no restore command. Recovery rebuilds the stores ([Service operations](../architecture/service-operations.md#recovery)).
 6. **`postgres-horizontal` is the decided topology for hosted fleets.** Its objective is operability: stateless, replaceable Zinder processes, readers that upgrade without downtime, and recovery from a lost host in minutes. The objective does not rest on a measured load limit of `rocksdb-single-host`. Its first form is deliberately small:
    - Canonical and wallet data live in one database per network, in separate schemas, so one snapshot covers both.
    - Readers query the primary only. Replica reads come later, if the primary's read capacity limits serving.
@@ -33,7 +33,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
    - One set of binaries carries both engines, and configuration selects the topology.
 7. **A benchmark gate precedes PostgreSQL build work.** On Mainnet-shaped data, all four must hold: a block commits in under 2 seconds while readers run; long block-range streaming reaches at least half of RocksDB's rate per reader; a from-scratch Mainnet build of canonical and wallet data finishes in under 48 hours; and the PostgreSQL canonical and wallet data are less than twice the size of the RocksDB stores built from the same data. A missed threshold sends that part of the design back for rework.
 8. **Reads become engine-neutral first.** Read interfaces with RocksDB behind them and a conformance suite for both engines ship before any PostgreSQL reader. Writers keep engine-specific code. Slice 1 then adds a PostgreSQL canonical writer behind stateless lightwalletd-compatible servers, and slice 2 adds wallet projection and native queries. `postgres-horizontal` becomes certified and advertised at the end of slice 2. Writer standby and the Explorer follow.
-9. **Every release declares an upgrade class.** The classes are compatible, additive schema change, projection layout change, and canonical layout change. During a compatible or additive upgrade, the old and new releases must each read and write correctly against the same schema and each other's rows. A layout change builds the new layout beside the old one and keeps the old one for 7 days for rollback. The release workflow does not carry the class yet, and no upgrade command or migration job exists.
+9. **Every release declares an upgrade class.** The classes are compatible, additive schema change, projection layout change, and canonical layout change. During a compatible or additive upgrade, the old and new releases must each read and write correctly against the same schema and each other's rows. A layout change builds the new layout beside the old one and keeps the old one for 7 days for rollback. The release workflow does not record the class, and Zinder has no upgrade command or migration job.
 
 ## Consequences
 

@@ -47,7 +47,7 @@ stop the debate from being repeated.
 | [0008](0008-consensus-parameters-from-the-node.md) | Consensus parameters from the node | Network-upgrade parameters come from the running node and are admitted by the canonical writer. |
 | [0009](0009-ingest-lifecycle-and-construction.md) | Ingest lifecycle and construction | One ingest process builds the store, then follows the tip. |
 | [0010](0010-reorg-window-and-displaced-blocks.md) | Reorg window and displaced blocks | The reorg window matches the node's finalization bound, and the writer archives displaced blocks. |
-| [0011](0011-ingest-control-transport-security.md) | Ingest control transport security | Ingest control uses a bearer token, not built-in TLS. |
+| [0011](0011-ingest-control-transport-security.md) | Ingest control transport security | Ingest control authenticates with a bearer token, and the operator provides TLS. |
 | [0012](0012-mempool-topology-and-retention.md) | Mempool topology and retention | Ingest owns the one live mempool, and readers proxy it. |
 | [0013](0013-chain-event-streams.md) | Chain event streams | Event streams start at an explicit position and resume across reorgs. |
 | [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Wallets read one consumer-neutral data plane from stored artifacts. |

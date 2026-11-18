@@ -1,13 +1,12 @@
 # Use cases
 
-This page helps you decide whether Zinder fits your product. Each section names
-a kind of consumer, what Zinder gives it, what you must enable, and when a
-simpler option is enough. For a feature-by-feature table against Zebra, Zakura,
-ztreamer, Zingod, and Go lightwalletd, see the
-[indexer comparison](reference/indexer-comparison.md).
+This page shows what Zinder gives each kind of consumer and what you enable for
+it. For a feature-by-feature table beside Zebra, Zakura, ztreamer, Zingod, and
+Go lightwalletd, see the [indexer comparison](reference/indexer-comparison.md).
 
-In every case, Zinder serves public chain data only. Keys, note scanning,
-transaction building, and signing stay in your application.
+In every case, Zinder serves public chain data from the node you configure. The
+node validates consensus, and Zinder trusts what it reports. Keys, note
+scanning, transaction building, and signing stay in your application.
 
 ## At a glance
 
@@ -25,18 +24,13 @@ transaction building, and signing stay in your application.
 Point the wallet's existing `CompactTxStreamer` client at
 `zinder-compat-lightwalletd`. No client change is needed. Zinder serves compact
 blocks, tree states, and transparent address data from its own store, so
-wallets keep syncing while the node is down. `Ping` is off unless you enable
-it, and `GetAddressUtxos` and address history have Zinder-specific limits. The
+wallets keep syncing while the node is down. `Ping` is off by default, and
+`GetAddressUtxos` and address history apply Zinder-specific limits. The
 [lightwalletd compatibility reference](reference/lightwalletd-compatibility.md)
 lists each method.
 
-Protocol compatibility is not a support claim for a named wallet. Zinder
-supports a wallet release only after that release passes end-to-end
+Zinder supports a named wallet release once that release passes end-to-end
 certification.
-
-**A simpler option is enough when** lightwalletd wallets are your only
-consumer and you want the smallest footprint. Go lightwalletd, Zingod, and
-ztreamer serve the same protocol with less disk.
 
 ## Wallets and backends built for Zinder
 
@@ -49,7 +43,7 @@ The native API adds what the lightwalletd protocol cannot express:
 - **Typed errors.** Most failures carry a stable reason, and each reason maps
   to a documented retry rule. A client knows whether to retry, restart at a
   newer snapshot, or stop. A few transport-level rejections, such as listener
-  overload, carry only a gRPC status code.
+  overload, carry a gRPC status code without a reason.
 - **Capability discovery.** `ServerInfo` lists exactly what a deployment can
   serve, so a client checks before it relies on a method.
 
@@ -70,12 +64,10 @@ one, and to check transparent outputs and their spend status. Zinder provides:
   range, and the spend status of up to 1,024 outpoints per call.
 - **Mempool snapshots and events** for unconfirmed payments.
 
-Shielded payments still need your own scanning, because Zinder never sees a
-viewing key. [Chain events](architecture/chain-events.md) and the
+Your application detects shielded payments by scanning compact blocks with its
+own viewing keys, which Zinder never sees.
+[Chain events](architecture/chain-events.md) and the
 [wallet data plane](architecture/wallet-data-plane.md) describe these contracts.
-
-**A simpler option is enough when** you can poll the node's JSON-RPC and
-reconcile reorgs yourself.
 
 ## Block explorers
 
@@ -85,13 +77,9 @@ summaries, and value-pool flows. It answers a shielded address with a typed
 refusal and never scans shielded data.
 
 The Explorer is off by default. Turning it on makes ingest build a second,
-rebuildable store of explorer views, which adds disk and build time. Some
-aggregate methods report no data in this release. The
-[Explorer plane](architecture/explorer-plane.md) explains how to enable it and
-lists the known gaps.
-
-**A simpler option is enough when** your explorer only looks up blocks,
-transactions, and addresses. Zebra and Zakura answer those from node RPC.
+rebuildable store of explorer views, which needs its own disk and build time.
+The [Explorer plane](architecture/explorer-plane.md) explains how to enable it,
+what it needs, and what each method returns.
 
 ## Faucets and transaction senders
 
@@ -101,8 +89,8 @@ accepted, duplicate, or rejected with a reason, and moves to the next
 configured node when the first is unreachable. `Transaction` reports whether a
 transaction is mined, in the mempool, or proven absent at one snapshot.
 
-Zinder does not serve block templates or accept mined blocks. A miner or a
-mining faucet needs the node's RPC for that.
+Block templates and mined-block submission stay with the node. A miner or a
+mining faucet uses the node's RPC for them.
 
 ## Several consumers from one deployment
 
@@ -111,15 +99,6 @@ lightwalletd wallet, a native backend, and an explorer read the same index
 through separate processes. Each product sees the same chain at the same
 snapshot, and you operate one index instead of one per product.
 
-## What Zinder does not do
-
-- It does not validate consensus. It trusts the node you configure.
-- It does not hold keys, scan for notes, or compute shielded balances.
-- It does not run on a pruned node, across several hosts, or from a snapshot.
-  Every deployment builds its stores from an archive node. A multi-host
-  topology is decided but not implemented; see
-  [ADR-0004](adrs/0004-storage-and-deployment-topologies.md).
-- It does not terminate TLS or authenticate wallet clients. You run a proxy for
-  that. See [exposing over TLS](runbooks/exposing-over-tls.md).
-
-To run it, start with [Deploying Zinder](runbooks/deploying.md).
+To run it, start with [Deploying Zinder](runbooks/deploying.md). It lists what
+a deployment needs and what to put in front of the listeners before you expose
+them.

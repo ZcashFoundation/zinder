@@ -1,7 +1,7 @@
 # Service operations
 
 This page explains how Zinder runtimes start and stop, what you must keep
-private, what you can recover from today, and which deployment shapes are
+private, how a deployment recovers, and which deployment shapes are
 supported. It is for operators planning a deployment and for contributors
 changing runtime lifecycle code. Readiness causes are listed in
 [Readiness](../reference/readiness.md), and metrics in
@@ -32,7 +32,7 @@ entry event and an exit event under the `zinder::startup` target, with `phase`,
 Only ingest contacts a node during startup. The projector, `zinder-query`,
 and `zinder-compat-lightwalletd` open storage with the network-upgrade
 schedule that ingest admitted. They therefore start while the node is down or
-before it has written its cookie file. Ingest cannot start without a node.
+before it has written its cookie file. Ingest needs a reachable node to start.
 
 ### Startup order
 
@@ -50,7 +50,7 @@ publish its first serving pair, so it fails before it listens. The
 single-volume entrypoint therefore starts neither reader while the projector
 reports that park.
 
-A restart during a first sync does not resume; see
+A restart during a first sync starts the interrupted build over; see
 [Initial sync](../runbooks/initial-sync.md#restarts-during-the-first-sync).
 
 ### Shutdown
@@ -79,38 +79,41 @@ kernel while the process is idle. [ADR-0005](../adrs/0005-bounded-process-memory
 
 ## Security boundary
 
-Zinder protects chain data integrity. It does not protect its listeners from
-the network. Every Zinder listener is plaintext. You are responsible for
-three things:
+Zinder protects the integrity of the chain data it stores and serves.
+Transport security belongs to the proxy in front of it. Every Zinder listener
+serves plaintext, and your proxy terminates TLS and enforces authentication,
+rate limits, and quotas. Certificate provisioning, rotation, and client
+policy therefore stay in your proxy, as
+[ADR-0011](../adrs/0011-ingest-control-transport-security.md) records. Before
+you expose a deployment, do three things:
 
-1. **Put the wallet listeners behind your own proxy.** The native wallet gRPC
+1. **Put the wallet listeners behind your proxy.** The native wallet gRPC
    listener (`zinder-query`), the lightwalletd listener
-   (`zinder-compat-lightwalletd`), and the Cipherscan REST adapter have no TLS
-   and no client authentication. The Explorer listener has no TLS and can
-   require only one shared bearer token (`explorer.bearer_token_path`). Your
-   proxy terminates TLS and enforces authentication, rate limits, and quotas.
+   (`zinder-compat-lightwalletd`), and the Cipherscan REST adapter serve
+   plaintext without client authentication. The Explorer listener serves
+   plaintext and can require one shared bearer token
+   (`explorer.bearer_token_path`).
    [Exposing over TLS](../runbooks/exposing-over-tls.md) shows one setup.
 2. **Keep the operational endpoint private.** `/healthz`, `/readyz`, and
-   `/metrics` have no authentication. The endpoint also accepts only 64
+   `/metrics` serve without authentication. The endpoint accepts at most 64
    connections, so any client that reaches it can make your health probes
    and metric scrapes fail. Bind `ops.listen_addr` to loopback or to a
-   private network that only your orchestrator and metrics scraper reach.
+   private network that your orchestrator and metrics scraper alone reach.
 3. **Keep the control endpoints private.** The ingest control endpoint serves
    writer status, chain events, and the mempool to readers. Ingest refuses a
    non-loopback `ingest_control.listen_addr` without
-   `ingest_control.bearer_token_path`, but the token travels in plaintext.
-   Keep the endpoint on loopback, as the reference topology does. The
-   projector control endpoint accepts only a loopback address and always
-   requires a bearer token.
+   `ingest_control.bearer_token_path`. The token travels in plaintext, so keep
+   the endpoint on loopback, as the reference topology does. The projector
+   control endpoint binds to loopback and always requires a bearer token.
 
 Zinder refuses to bind any listener to `0.0.0.0`, `::`, or a public address
 unless you set `security.allow_public_bind = true`. Loopback and private
-ranges are always allowed. Setting the flag logs a warning; it adds no
-protection.
+ranges are always allowed. Setting the flag logs a warning. The flag permits
+the bind, and the protection comes from your proxy and network.
 
 Zinder's own listener bounds, listed in
 [Configuration](../reference/configuration.md#listener-and-request-limits),
-are not per client, so your proxy must enforce per-client limits.
+count all clients together, so enforce per-client limits in your proxy.
 
 Bearer tokens are read from files. Configuration output, such as
 `--print-config`, shows redaction markers in place of secrets, and errors
@@ -121,8 +124,9 @@ user information, query, and fragment with `[REDACTED]`.
 
 Each runtime image runs its one binary as UID and GID 10001 on a
 digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base. The image has no
-shell, package manager, or HTTP client. The single-volume images keep a
-Debian base with a shell, because their entrypoint scripts need one.
+shell, package manager, or HTTP client. The
+single-volume images keep a Debian base with a shell, because their
+entrypoint scripts need one.
 [ADR-0022](../adrs/0022-release-artifacts.md) records why.
 
 The Zebra and Zakura images also run as UID 10001 and write the node's RPC
@@ -159,34 +163,34 @@ shows.
 ## Recovery
 
 Node failures, ingest outages shorter than the serving staleness ceiling, and
-ordinary restarts recover on their own, except that a first sync starts over.
-Causes that need an operator, with what to do, are in
+ordinary restarts recover on their own. A restart during a first sync starts
+that build over. Causes that need an operator, with what to do, are in
 [Readiness](../reference/readiness.md#readiness-causes).
 
-### Rebuilding is the only restore
+### Restore by rebuilding
 
-Zinder has no restore today. A rebuild means a fresh first sync: start a new
-deployment on empty storage, let ingest and the projector build from the
-node, move traffic once its readers report ready, and then retire the old
-deployment. A Mainnet first sync takes many hours; see
+Zinder restores a deployment by rebuilding it from the node. A rebuild is a
+fresh first sync: start a new deployment on empty storage, let ingest and the
+projector build from the node, move traffic once its readers report ready,
+and then retire the old deployment. A Mainnet first sync takes many hours; see
 [Deploying](../runbooks/deploying.md) for measured times. Plan for that time
 in your recovery objective.
 
 The projector's private control API can capture a state bundle. A bundle
 holds a canonical checkpoint and a wallet checkpoint bound to the same
-canonical position, with a manifest. No shipped command restores a bundle or
-moves it to another host. Do not treat bundles as backups yet.
+canonical position, with a manifest. Recover by rebuilding, not from a
+bundle.
 
-A filesystem copy of the canonical and wallet directories is not a backup
-either. Copies taken at different moments describe different chain states,
+Do not use a filesystem copy of the canonical and wallet directories as a
+backup. Copies taken at different moments describe different chain states,
 and a running store changes while you copy it.
 
 ## Supported deployments
 
-Zinder supports one host. Ingest is the only writer of the canonical store,
-and the projector is the only writer of the wallet store. Every reader opens
-read-only copies of those stores on the same filesystem. There are no read
-replicas on other hosts, no snapshot bootstrap, and no shared database.
+A Zinder deployment runs on one host. Ingest is the only writer of the
+canonical store, and the projector is the only writer of the wallet store.
+Every reader opens read-only copies of those stores on the same filesystem.
+Each deployment builds its stores from its own node.
 [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why.
 
 [Deploying Zinder](../runbooks/deploying.md#choose-a-deployment) lists the
@@ -196,10 +200,9 @@ deployments and when to pick each.
 `deploy/release-single-volume-images.json` lists the single-volume images.
 The Cipherscan adapter and PostgreSQL are not release artifacts.
 
-Releases also publish the runtime binaries. The repository ships no systemd
-units for them and does not test running them outside Docker.
-[Deploying on a VM](../runbooks/deploying-on-a-vm.md) lists what such a
-deployment must reproduce.
+Releases also publish the runtime binaries. The images are the tested way to
+run them. To run the binaries under your own service manager, reproduce what
+[Deploying on a VM](../runbooks/deploying-on-a-vm.md) lists.
 
 ### More than one reader on a host
 
@@ -208,6 +211,5 @@ process over the same stores on one host. Each process needs its own
 `storage.secondary_path`, and its own `wallet.secondary_path` when it reads
 the wallet store, because a secondary's metadata directory belongs to one
 process. Each also needs its own listen and
-ops addresses. The shipped deployments run one of each, and no layout with
-several copies of a reader is shipped or tested. Processes on another host
-cannot open the stores.
+ops addresses. The shipped deployments run one of each. Every reader process
+runs on the host that holds the stores.
