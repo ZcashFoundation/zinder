@@ -178,6 +178,8 @@ These reads come from the wallet store that `zinder-projector` writes. Its histo
 
 The server reads the set in pages of 1,024 outputs and reads the next page only when the client has taken the previous one. It holds at most three pages per stream. A client that stops reading stalls the storage reads. Cancelling the stream releases them. A stream ends without an error only after the address's last output.
 
+In-process callers that open many of these streams for one request, such as the lightwalletd adapter merging the addresses of one `GetAddressUtxos` call, use `WalletQueryApi::transparent_address_unspent_outputs_on_demand`. It returns the same outputs in the same order at the same pinned epoch, but reads nothing until the stream is first polled and never reads ahead: it reads the next page only when the caller has taken every output of the previous one. Pages start at 16 outputs and double up to 1,024 as the caller consumes them, so such a stream holds at most the page its caller is reading, and a stream not yet polled holds none.
+
 ### Transaction history
 
 `TransparentAddressTxIdsInRange(address, start_height, end_height, max_entries, from_cursor)` streams the transactions that touch an address within an inclusive height range, in ascending mined order: a `ChainView` header, then one `TransparentAddressTxId` per transaction.

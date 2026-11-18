@@ -1011,6 +1011,31 @@ where
         .await
     }
 
+    async fn transparent_address_unspent_outputs_on_demand(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        // The pair validated its epoch when it was admitted, so opening the
+        // stream reads no storage. A separate operation keeps these cheap
+        // opens out of the eager open's latency series.
+        serving_read::record(
+            "transparent_address_unspent_outputs_on_demand",
+            None,
+            async {
+                let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+                let chain_epoch = Self::pinned(pair.chain_epoch(), at_epoch_id)?;
+                Ok(TransparentAddressUnspentOutputs::spawn_on_demand(
+                    self.serving_pair_slot.clone(),
+                    pair,
+                    &request,
+                    chain_epoch,
+                ))
+            },
+        )
+        .await
+    }
+
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,

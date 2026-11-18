@@ -275,6 +275,28 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
 
+    /// Streams the outputs [`Self::transparent_address_unspent_outputs`]
+    /// streams, in the same order and at the same pinned epoch, reading
+    /// storage only on demand.
+    ///
+    /// The stream reads nothing until it is first polled and never reads
+    /// ahead: it reads a page only when the caller polls it with no output
+    /// left. Pages start at 16 outputs and double up to
+    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`] as the caller consumes
+    /// them, so a caller that merges many of these streams holds at most one
+    /// page per stream. Use it when one request opens many streams at once.
+    ///
+    /// The default opens the eager stream, so an implementation that wraps
+    /// another must forward this method to keep its reads on demand.
+    async fn transparent_address_unspent_outputs_on_demand(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        self.transparent_address_unspent_outputs(request, at_epoch_id)
+            .await
+    }
+
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts.
     ///
