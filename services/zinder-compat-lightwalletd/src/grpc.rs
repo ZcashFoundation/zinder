@@ -1,13 +1,12 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-use std::{num::NonZeroU32, pin::Pin};
+use std::{collections::HashSet, num::NonZeroU32, pin::Pin};
 
 use serde_json::Value;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
-use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
@@ -28,11 +27,11 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    CompactBlockRange, QueryError, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
-    address_lookup_to_script_hash, status_from_query_error,
+    CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
-use zinder_source::transparent_address_matches_network;
+use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
@@ -497,27 +496,12 @@ where
     /// confirmed total and rejects a total above the `int64` wire ceiling.
     async fn compat_balance_response(
         &self,
-        addresses: Vec<String>,
+        script_hashes: Vec<TransparentAddressScriptHash>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
-        if addresses.is_empty() {
+        if script_hashes.is_empty() {
             return Err(Status::invalid_argument("addresses list must not be empty"));
         }
-        let visible_tip_block = self
-            .query_api
-            .visible_tip_block(None)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        let mut script_hashes = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            let address_script_hash = address_lookup_to_script_hash(
-                Some(wallet_proto::AddressLookup {
-                    selector: Some(address_lookup::Selector::Address(address)),
-                }),
-                visible_tip_block.chain_epoch.network,
-            )
-            .map_err(|error| status_from_query_error(&error))?;
-            script_hashes.push(address_script_hash);
-        }
+        let visible_tip_block = self.compat_visible_tip_block().await?;
         let balance = self
             .query_api
             .transparent_address_balance(script_hashes, Some(visible_tip_block.chain_epoch.id))
@@ -526,6 +510,59 @@ where
         let value_zat = lightwalletd_balance_value_zat(balance)?;
         Ok(Response::new(lightwalletd::Balance { value_zat }))
     }
+
+    async fn compat_visible_tip_block(&self) -> Result<zinder_query::VisibleTipBlock, Status> {
+        self.query_api
+            .visible_tip_block(None)
+            .await
+            .map_err(|error| status_from_query_error(&error))
+    }
+}
+
+/// The distinct script hashes of one balance request, in request order.
+///
+/// A request may repeat an address, so it is counted once; the request is
+/// refused at the first distinct address over
+/// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`], before anything past the cap
+/// is stored.
+#[derive(Default)]
+struct DistinctBalanceAddresses {
+    script_hashes: Vec<TransparentAddressScriptHash>,
+    seen: HashSet<TransparentAddressScriptHash>,
+}
+
+impl DistinctBalanceAddresses {
+    fn admit(&mut self, script_hash: TransparentAddressScriptHash) -> Result<(), Status> {
+        if self.seen.contains(&script_hash) {
+            return Ok(());
+        }
+        if self.script_hashes.len() >= u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
+            return Err(status_from_query_error(
+                &QueryError::TransparentBalanceAddressCountExceeded {
+                    requested: self.script_hashes.len().saturating_add(1),
+                    maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+                },
+            ));
+        }
+        self.seen.insert(script_hash);
+        self.script_hashes.push(script_hash);
+        Ok(())
+    }
+}
+
+/// Parses a streamed or listed lightwalletd address into its script hash on
+/// `network`, so callers keep 32 bytes per address instead of the raw string.
+fn compat_address_script_hash(
+    address: String,
+    network: Network,
+) -> Result<TransparentAddressScriptHash, Status> {
+    address_lookup_to_script_hash(
+        Some(wallet_proto::AddressLookup {
+            selector: Some(address_lookup::Selector::Address(address)),
+        }),
+        network,
+    )
+    .map_err(|error| status_from_query_error(&error))
 }
 
 fn lightwalletd_balance_value_zat(
@@ -725,7 +762,13 @@ where
         request: Request<lightwalletd::AddressList>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         let addresses = request.into_inner().addresses;
-        self.compat_balance_response(addresses).await
+        let network = self.compat_visible_tip_block().await?.chain_epoch.network;
+        let mut balance_addresses = DistinctBalanceAddresses::default();
+        for address in addresses {
+            balance_addresses.admit(compat_address_script_hash(address, network)?)?;
+        }
+        self.compat_balance_response(balance_addresses.script_hashes)
+            .await
     }
 
     async fn get_taddress_balance_stream(
@@ -733,12 +776,15 @@ where
         request: Request<tonic::Streaming<lightwalletd::Address>>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         let mut stream = request.into_inner();
-        let mut addresses: Vec<String> = Vec::new();
+        // The network is fixed for the runtime, so reading it here pins no
+        // epoch for the duration of the client's stream.
+        let network = self.compat_visible_tip_block().await?.chain_epoch.network;
+        let mut balance_addresses = DistinctBalanceAddresses::default();
         while let Some(received) = stream.next().await {
-            let address = received?;
-            addresses.push(address.address);
+            balance_addresses.admit(compat_address_script_hash(received?.address, network)?)?;
         }
-        self.compat_balance_response(addresses).await
+        self.compat_balance_response(balance_addresses.script_hashes)
+            .await
     }
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
@@ -1553,9 +1599,8 @@ fn transparent_address_tx_history_request(
     visible_tip_height: BlockHeight,
 ) -> Result<TransparentAddressTxIdsInRangeRequest, Status> {
     let address_text = filter.address.as_str();
-    let zebra_address: ZebraTransparentAddress = address_text.parse().map_err(|source| {
-        Status::invalid_argument(format!("transparent address is invalid: {source}"))
-    })?;
+    let zebra_address = parse_transparent_address(address_text)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if !transparent_address_matches_network(zebra_address.network_kind(), network) {
         return Err(Status::invalid_argument(
             "transparent address network does not match server network",
@@ -1606,11 +1651,8 @@ fn transparent_address_unspent_outputs_request(
     network: Network,
     start_height: BlockHeight,
 ) -> Result<TransparentAddressUnspentOutputsRequest, Status> {
-    let transparent_address = address
-        .parse::<ZebraTransparentAddress>()
-        .map_err(|source| {
-            Status::invalid_argument(format!("transparent address is invalid: {source}"))
-        })?;
+    let transparent_address = parse_transparent_address(address)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if !transparent_address_matches_network(transparent_address.network_kind(), network) {
         return Err(Status::invalid_argument(
             "transparent address network does not match server network",
