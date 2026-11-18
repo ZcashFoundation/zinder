@@ -298,7 +298,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Per-call timeout (seconds) applied only to `sendrawtransaction`. When \
-                      unset, the global `request_timeout_secs` applies instead. Recommended: 7.",
+                      unset, the global `request_timeout_secs` applies instead. Recommended: 7. \
+                      With fallback endpoints, a broadcast moves to the next endpoint only after \
+                      this timeout, so keep it well below wallet request deadlines.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ADDR",
@@ -382,7 +384,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 \
                       with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` \
                       counterpart. `zinder-ingest` switches to a fallback when its active endpoint \
-                      fails; the readers validate the list and do not use it yet.",
+                      fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast \
+                      through the next verified endpoint when one is unreachable. `zinder-explorer` \
+                      validates the list and reads only `[node]`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR",

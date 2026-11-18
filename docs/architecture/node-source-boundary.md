@@ -120,18 +120,23 @@ compatibility reject both `[node]` and the list.
 `NodeSet` holds the list and implements `NodeSource` by delegating every call
 to its active endpoint, so code written against one node is unchanged.
 `NodeSet::connect(primary, fallbacks)` builds every endpoint's
-`ZebraJsonRpcSource`. Ingest builds its endpoints this way; the readers still
-build one `ZebraJsonRpcSource` from `[node]`. Only the `NodeSetSwitch` returned
-with the set changes the active endpoint, and `NodeSet::mempool_source` follows
-the active endpoint's mempool: a switch ends the open event stream with one
+`ZebraJsonRpcSource`; ingest and the broadcasting readers build their
+endpoints this way. Only the `NodeSetSwitch` returned with the set changes the
+active endpoint, and `NodeSet::mempool_source` follows the active endpoint's
+mempool: a switch ends the open event stream with one
 `MempoolStreamUnavailable` item, and fails a stream that is still opening with
 the same error, so the consumer rebuilds its snapshot from the new endpoint as
 after any stream failure, even when the previous endpoint stalls.
 
-Only ingest switches, and only between follow iterations; see
+Ingest switches its chain reads only between follow iterations; see
 [Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
-and [ADR-0013](../adrs/0013-source-failure-recovery-topology.md). The readers
-validate the list and keep reading `[node]`.
+and [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
+`zinder-query` and wallet-mode compatibility use the list only to broadcast:
+their `OrderedBroadcaster` holds a `NodeSet` whose active endpoint is the one a
+broadcast tries first, and moves it to the endpoint that answered; see
+[ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md).
+A reader uses only the JSON-RPC and `[node.health]` fields of each entry.
+`zinder-explorer` validates the list and reads only `[node]`.
 
 ## Implementations and runtime selection
 
@@ -200,15 +205,16 @@ capabilities produce typed failures rather than version-based guesses.
 Ingest is the only runtime that needs its node to start. Query and
 lightwalletd compatibility use a node only to broadcast transactions, accept a
 pruned node, and start without contacting it; the projector and compact-blocks
-compatibility use no node at all. A reader wraps its configured endpoint in a
-`NodeBroadcast` and verifies it on first contact through the source's
-`BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`, the
-`getblockchaininfo` activation table must agree with the serving pair's
+compatibility use no node at all. A reader wraps its ordered endpoints in an
+`OrderedBroadcaster` and verifies each one on first contact through the
+source's `BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`,
+the `getblockchaininfo` activation table must agree with the serving pair's
 writer-admitted schedule through the visible tip, and the node's best chain
 must hold the pair's visible tip block, read with `getblockhash`. A broadcast
-before that verification passes fails with `NodeUnavailable` and sends
-nothing, so a transaction never reaches a node on another network or chain.
-A reader also starts before its node writes a cookie file, as described under
+reaches only verified endpoints. While none is verified it fails with
+`NodeUnavailable` and sends nothing, so a transaction never reaches a node on
+another network or chain. A reader also starts before any of its nodes writes
+a cookie file, as described under
 [Authentication and health](#authentication-and-health).
 
 Some nodes refuse historical reads permanently. A Zakura node built by

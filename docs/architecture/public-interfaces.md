@@ -25,7 +25,7 @@ and wire contracts that actually carry versions.
 | `WalletProjectionReader` | Immutable wallet side of an admitted serving pair |
 | `WalletServingReadPair` | Canonical and wallet readers proven to describe one exact fence |
 | `WalletServingQuery` | `WalletQueryApi` implementation over an atomically replaceable serving pair, shared by native and compatibility runtimes |
-| `NodeBroadcast` | The configured node endpoint a wallet query broadcasts through, verified on first contact against the serving pair's writer-admitted schedule and visible tip block before any transaction reaches it |
+| `OrderedBroadcaster` | The ordered node endpoints a wallet query broadcasts through. Each endpoint is verified on first contact against the serving pair's writer-admitted schedule and visible tip block before any transaction reaches it, and a broadcast moves to the next verified endpoint when one is unreachable or refuses its consensus branch; see [ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md) |
 | `BroadcastNodeProbe` | Source seam for that verification: the endpoint's advertised methods, its activation table, and whether its best chain holds a block |
 | `WalletServingPairPublisher` | Serving-runtime owner that catches up, admits, and publishes process-local serving pairs |
 | `MaterializedViewConsumer` | Explorer materialized-view consumer that applies retained canonical events |
@@ -254,10 +254,12 @@ environment names start with `ZINDER_NODE_FALLBACKS__<N>__` where `[node]`'s
 start with `ZINDER_NODE__`, as in `ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR`. Positions are table keys, never a
 TOML array of tables, so a file and the environment merge field by field.
 `zinder-ingest`, `zinder-query`, wallet-mode `zinder-compat-lightwalletd`,
-and `zinder-explorer` accept the list; only ingest switches between its
-endpoints today, as
+and `zinder-explorer` accept the list. Ingest switches its chain reads between
+the endpoints, as
 [Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
-describes.
+describes. Query and wallet-mode compatibility broadcast through them in order
+and move past an endpoint that is unreachable or refuses the transaction's
+consensus branch. Explorer reads only `[node]`.
 
 ```toml
 [node]
@@ -326,12 +328,12 @@ variable.
 | `ZINDER_NODE__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.cookie` | Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks. (sensitive; redacted) |
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses. |
-| `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
+| `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. With fallback endpoints, a broadcast moves to the next endpoint only after this timeout, so keep it well below wallet request deadlines. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. Compatibility with `compat.serving = "compact-blocks"` rejects every node setting. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify their broadcast node on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
-| `ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `any ZINDER_NODE_FALLBACKS__<N>__* is set` | `node_fallbacks.<N>.json_rpc_addr` | JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` counterpart. `zinder-ingest` switches to a fallback when its active endpoint fails; the readers validate the list and do not use it yet. |
+| `ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `any ZINDER_NODE_FALLBACKS__<N>__* is set` | `node_fallbacks.<N>.json_rpc_addr` | JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` counterpart. `zinder-ingest` switches to a fallback when its active endpoint fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast through the next verified endpoint when one is unreachable. `zinder-explorer` validates the list and reads only `[node]`. |
 | `ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_grpc_addr` | Same as `ZINDER_NODE__INDEXER_GRPC_ADDR`, for fallback endpoint `<N>`. After a switch, ingest follows the mempool of the new endpoint through it. |
 | `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.ca_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
 | `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node_fallbacks.<N>.indexer_tls.client_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
@@ -473,10 +475,12 @@ same set; operators cannot select a profile or override individual support
 claims. `wallet.broadcast.transaction_v1` is the one capability that follows
 configuration rather than probed evidence: it is advertised exactly when a node
 endpoint is configured, because readers start without contacting their node.
-Until that endpoint passes first-contact verification, a broadcast fails with
-`UNAVAILABLE` and `NODE_UNAVAILABLE`, and `WalletServerInfo.node` stays empty.
-Once it passes, `WalletServerInfo.node` lists the capabilities the verified
-endpoint advertised. The static capability registry owns identifiers and method
+Until one of the configured endpoints passes first-contact verification, and
+whenever every verified endpoint is unreachable, a broadcast fails with
+`UNAVAILABLE` and `NODE_UNAVAILABLE`, and while no endpoint is verified
+`WalletServerInfo.node` stays empty. Otherwise `WalletServerInfo.node` lists
+the capabilities that the first verified endpoint, in broadcast preference
+order, advertised. The static capability registry owns identifiers and method
 associations, but does not select a runtime subset.
 
 Capability names describe semantics, not implementation. Do not expose

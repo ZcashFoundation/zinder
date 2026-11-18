@@ -102,6 +102,15 @@ from the fallback until the fallback fails or ingest restarts. Restarting the
 node ingest reads from interrupts ingest like any node outage, and ingest
 switches only to an endpoint whose table still equals the admitted one.
 
+Query and wallet-mode compatibility keep broadcasting through every node
+during the sequence. Their verification compares a node's table with the
+admitted one only through the served tip, so a node that adds an upgrade above
+the tip still qualifies. When the writer admits the new table, they verify
+every endpoint again. A node still on the old release once the upgrade
+activates refuses transactions for the new consensus branch, so broadcasts
+move on to the next endpoint, and the node is excluded once the served tip
+passes the activation height, until it is upgraded.
+
 ## If ingest refuses the table
 
 Ingest leaves the store unchanged when it refuses a table.

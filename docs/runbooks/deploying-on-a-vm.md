@@ -307,8 +307,14 @@ the fallback until the fallback fails or ingest restarts, and a restart starts
 at `[node]` again. Both nodes must advertise the same network-upgrade table;
 see [Upgrading the node](upgrading-the-node.md#with-a-fallback-node).
 
-Only ingest switches. Query and compatibility validate the list but still
-broadcast through `[node]`.
+Query and compatibility broadcast through the same list. They verify each
+endpoint before sending it a transaction, try `[node]` first, and move to the
+next verified endpoint when one is unreachable. The endpoint that answered
+stays preferred. `docker compose logs zinder-query` shows `wallet_node_verified`
+or `wallet_node_excluded` for each position and `broadcast_endpoint_switched`
+when the preferred endpoint changes. Keep `broadcast_timeout_secs` (7 seconds
+in the shipped configuration) well below wallet request deadlines, because a
+broadcast moves on only after it expires.
 
 ### Attach an explorer consumer
 

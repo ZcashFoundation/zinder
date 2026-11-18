@@ -230,8 +230,9 @@ takes the same `*_PATH` or `*_PEM` variables under its position, such as
 `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`; the entrypoint writes
 those files as `node-fallback-1-client-key.pem` beside the `[node]` files.
 
-Ingest and query receive the list. Query validates it and keeps broadcasting
-through `[node]`; the projector reads no node list. Ingest's `/readyz` reports
+Ingest and query receive the list. Query broadcasts through `[node]` and then
+each verified fallback, moving on when an endpoint is unreachable; the
+projector reads no node list. Ingest's `/readyz` reports
 `active_node.position` once a fallback is configured.
 
 ## Deploy on Railway

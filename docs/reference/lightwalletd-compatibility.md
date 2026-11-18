@@ -159,11 +159,16 @@ every `ZINDER_NODE__*` variable, and every `ZINDER_NODE_FALLBACKS__*` variable
 at startup. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
 
-Wallet serving uses `[node]` only for `SendTransaction`. It starts without
-contacting the node and verifies the node on first contact, as
+Wallet serving uses `[node]` and the `[node_fallbacks.N]` endpoints only for
+`SendTransaction`. It starts without contacting any node and verifies each
+endpoint on first contact, as
 [ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md)
-describes. Until that verification passes, `SendTransaction` fails with
-`UNAVAILABLE` and sends nothing. Without `[node]`, `SendTransaction` is
+describes. Until one passes, `SendTransaction` fails with `UNAVAILABLE` and
+sends nothing. A send moves to the next verified endpoint when one is
+unreachable or rejects the consensus branch. When an earlier endpoint was
+unreachable, a later duplicate or queued answer returns `errorCode` 0 with the
+transaction id instead of -27 or -25, because the unreachable endpoint may
+have accepted the transaction. Without `[node]`, `SendTransaction` is
 unsupported.
 
 A compact-blocks `GetBlockRange` stream holds a canonical generation only
