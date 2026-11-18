@@ -56,9 +56,9 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
         let _ = reactor_progressed.send(());
     });
 
-    let visible_tip_block = query.visible_tip_block(None).await?;
+    let compact_block = query.compact_block_at(BlockHeight::new(2), None).await?;
 
-    assert_eq!(visible_tip_block.height, BlockHeight::new(2));
+    assert_eq!(compact_block.compact_block.height(), BlockHeight::new(2));
     assert!(
         reactor_gate.observed_reactor_progress(),
         "the canonical read held the reactor for its whole duration"
@@ -88,7 +88,7 @@ async fn wallet_serving_reads_run_inside_the_request_span() -> eyre::Result<()> 
     )));
 
     query
-        .visible_tip_block(None)
+        .compact_block_at(BlockHeight::new(2), None)
         .instrument(tracing::info_span!("wallet_request"))
         .await?;
 

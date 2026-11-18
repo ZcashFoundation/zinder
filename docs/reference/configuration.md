@@ -381,6 +381,7 @@ has a bound.
 | Transparent balance, lightwalletd only | 256 distinct addresses | `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`; an empty list is a plain `INVALID_ARGUMENT` |
 | Raw transaction for broadcast | 2,000,000 bytes | `BROADCAST_TRANSACTION_TOO_LARGE` |
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
+| Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `RESOURCE_EXHAUSTED`, no reason |
 | Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to `query.tree_state_replay_wait_ms` in `zinder-query` and 2 s in `zinder-compat-lightwalletd`, with at most two waiting per slot | `TREE_STATE_REPLAY_LIMIT_REACHED` |
 
 The broadcast budget covers native `BroadcastTransaction` and lightwalletd

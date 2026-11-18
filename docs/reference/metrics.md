@@ -275,6 +275,7 @@ broadcast, so it exports none of those series.
 | `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
 | `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild spent reading and replaying compact blocks. |
+| `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native `CompactBlocksInRange` streams refused because 100 were already open. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
 
 `height_band` is the first height of the read's 250,000-block band, such as

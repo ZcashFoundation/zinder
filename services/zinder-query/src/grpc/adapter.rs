@@ -43,6 +43,9 @@ use crate::{
 };
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
+use super::compact_block_stream_limit::{
+    CompactBlockStreamLimit, DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS,
+};
 use super::native::{
     TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
     block_header_by_selector_response, block_id_by_selector_response,
@@ -50,8 +53,8 @@ use super::native::{
     build_node_capabilities_descriptor, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info,
-    chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_chunks,
-    full_block_response, latest_tree_state_checkpoint_response,
+    chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_header,
+    compact_blocks_in_range_item, full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
     transaction_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
@@ -168,6 +171,7 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     server_info: wallet::WalletServerInfo,
     traffic_readiness: Option<Readiness>,
     shutdown: Option<CancellationToken>,
+    compact_block_streams: CompactBlockStreamLimit,
 }
 
 impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
@@ -185,7 +189,21 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
             server_info,
             traffic_readiness: None,
             shutdown: None,
+            compact_block_streams: CompactBlockStreamLimit::new(
+                DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS,
+            ),
         }
+    }
+
+    /// Serves at most `max_streams` `CompactBlocksInRange` streams at once,
+    /// and refuses the rest with `RESOURCE_EXHAUSTED`.
+    ///
+    /// The default is
+    /// [`DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS`](crate::DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS).
+    #[must_use]
+    pub fn with_max_concurrent_compact_block_streams(mut self, max_streams: NonZeroU32) -> Self {
+        self.compact_block_streams = CompactBlockStreamLimit::new(max_streams);
+        self
     }
 
     /// Shares the readiness behind the traffic gate with open chain-event
@@ -425,15 +443,36 @@ where
             BlockHeight::new(request.end_height),
         );
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
+        // Only a valid range takes a slot. The query rejects any other range
+        // before it reads, and records that rejection with its own error.
+        let stream_slot =
+            if crate::validate_block_range(block_range, crate::DEFAULT_MAX_COMPACT_BLOCK_RANGE)
+                .is_ok()
+            {
+                Some(self.compact_block_streams.try_open()?)
+            } else {
+                None
+            };
 
-        let compact_block_range = self
+        let compact_block_stream = self
             .query_api
-            .compact_blocks_in_range(block_range, at_epoch)
+            .compact_block_stream(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chunks = compact_blocks_in_range_chunks(compact_block_range).map(Ok);
+        let header = stream::once(Ok(compact_blocks_in_range_header(
+            compact_block_stream.chain_epoch,
+        )));
+        // The slot lives in the item closure, so it frees when the stream
+        // ends or the client drops it. A dropped stream's reader stops at its
+        // next send, so it can outlive the slot by one byte-capped read.
+        let items = ReceiverStream::new(compact_block_stream.blocks).map(move |block| {
+            let _stream_slot = &stream_slot;
+            block
+                .map(|compact_block| compact_blocks_in_range_item(&compact_block))
+                .map_err(|error| status_from_query_error(&error))
+        });
 
-        Ok(self.server_stream(Box::pin(stream::iter(chunks))))
+        Ok(self.server_stream(Box::pin(header.chain(items))))
     }
 
     async fn full_blocks_in_range(

@@ -26,7 +26,7 @@ A replaced epoch stays readable for one minute after a newer one replaces it, ho
 
 A retained epoch still answers after a reorg replaces its blocks, because a pin promises that epoch's view, not the current best chain.
 
-`TransparentAddressUnspentOutputs` and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
+`TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
 A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds.
 
@@ -58,7 +58,7 @@ The service advertises a method's capability string only when this deployment ca
 
 ## Compact blocks
 
-`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`).
+`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range of at most 1,000 blocks: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED`; retry after a short delay.
 
 Ingest builds compact blocks when it commits a block. Query never fetches a block from the node or builds one on demand.
 

@@ -41,17 +41,19 @@ mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
 pub use grpc::{
-    TransactionStatusLookup, WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata,
-    WalletQueryGrpcAdapter, address_lookup_to_script_hash, block_header_by_selector_response,
+    DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS, TransactionStatusLookup,
+    WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
     build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
-    compact_block_response, compact_blocks_in_range_chunks, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    status_from_query_error, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
+    compact_block_response, compact_blocks_in_range_header, compact_blocks_in_range_item,
+    full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outpoint_spend_status_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{
     AdmittedIngestControl, IngestControlAdmissionError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
@@ -145,6 +147,36 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Streams compact block artifacts for an inclusive height range under
+    /// one chain epoch.
+    ///
+    /// Validation and errors are those of [`Self::compact_blocks_in_range`],
+    /// and they surface as the returned error, before any block is
+    /// delivered. Blocks arrive ascending and contiguous; a store failure
+    /// after the first block ends the stream with one terminal `Err`.
+    ///
+    /// The default reads the whole range with
+    /// [`Self::compact_blocks_in_range`] and queues every block.
+    async fn compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        let compact_block_range = self
+            .compact_blocks_in_range(block_range, at_epoch_id)
+            .await?;
+        let (blocks, receiver) = mpsc::channel(compact_block_range.compact_blocks.len().max(1));
+        for compact_block in compact_block_range.compact_blocks {
+            if blocks.try_send(Ok(compact_block)).is_err() {
+                break;
+            }
+        }
+        Ok(CompactBlockStream {
+            chain_epoch: compact_block_range.chain_epoch,
+            blocks: receiver,
+        })
+    }
 
     /// Reads compact block artifacts from one end of an inclusive height
     /// range, up to a byte budget.
@@ -348,6 +380,16 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 /// Default maximum compact-block count returned by one range call.
 pub const DEFAULT_MAX_COMPACT_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
+/// Stored compact-block bytes one read of a compact-block stream keeps.
+///
+/// Each read stops before the block that would take its stored bytes past
+/// this budget, and always keeps one block, so a stream holds about one
+/// budget of blocks plus its channel no matter how wide its range is.
+pub const COMPACT_BLOCK_STREAM_SUB_READ_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bounded depth, in blocks, of the compact-block stream channel.
+pub const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
+
 /// Default maximum full-block count returned by one range call.
 ///
 /// Sized to one wallet initial-scan batch so a 1000-block window is a single
@@ -414,6 +456,7 @@ pub fn describe_request_metrics() {
          by status. Used to monitor request fan-out and page sizing."
     );
     tree_state_replay_limit::describe_metrics();
+    grpc::describe_compact_block_stream_metrics();
     broadcast_byte_budget::describe_metrics();
 }
 
@@ -626,6 +669,21 @@ pub struct FullBlockStream {
     pub chain_epoch: ChainEpoch,
     /// Ascending block blobs, then optionally one terminal error.
     pub blocks: mpsc::Receiver<Result<BlockBlobArtifact, QueryError>>,
+}
+
+/// Demand-driven compact-block range stream bound to one chain epoch.
+///
+/// [`chain_epoch`](Self::chain_epoch) is resolved once and describes every
+/// delivered block. [`blocks`](Self::blocks) yields compact blocks in
+/// ascending, contiguous height order until the range is exhausted; a store
+/// failure arrives as a terminal `Err` after the blocks already delivered,
+/// and dropping the receiver stops the backing producer.
+#[derive(Debug)]
+pub struct CompactBlockStream {
+    /// Chain epoch every delivered block is read under.
+    pub chain_epoch: ChainEpoch,
+    /// Ascending compact blocks, then optionally one terminal error.
+    pub blocks: mpsc::Receiver<Result<CompactBlockArtifact, QueryError>>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by

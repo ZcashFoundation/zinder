@@ -570,6 +570,7 @@ pub struct WalletServingReadPair {
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
     network_upgrade_activations: NetworkUpgradeActivations,
+    chain_epoch: ChainEpoch,
     reads_revoked: CancellationToken,
     table_file_missing: AtomicBool,
 }
@@ -580,7 +581,7 @@ impl WalletServingReadPair {
         canonical: Arc<dyn CanonicalReader>,
         wallet: Arc<dyn WalletProjectionReader>,
     ) -> Result<Self, QueryError> {
-        Self::validate_readers(canonical.as_ref(), wallet.as_ref())
+        let chain_epoch = Self::validated_chain_epoch(canonical.as_ref(), wallet.as_ref())
             .map_err(|error| pair_admission_query_error(&error))?;
         let network_upgrade_activations = canonical
             .network_upgrade_schedule()
@@ -596,6 +597,7 @@ impl WalletServingReadPair {
                 wallet.ready_evidence(),
             ),
             network_upgrade_activations,
+            chain_epoch,
             canonical,
             wallet,
             reads_revoked: CancellationToken::new(),
@@ -612,6 +614,15 @@ impl WalletServingReadPair {
         canonical: &(dyn CanonicalReader + 'static),
         wallet: &(dyn WalletProjectionReader + 'static),
     ) -> Result<(), WalletServingAdmissionError> {
+        Self::validated_chain_epoch(canonical, wallet).map(drop)
+    }
+
+    /// Validates the readers as [`Self::validate_readers`] does and returns
+    /// the canonical epoch they agree on.
+    fn validated_chain_epoch(
+        canonical: &(dyn CanonicalReader + 'static),
+        wallet: &(dyn WalletProjectionReader + 'static),
+    ) -> Result<ChainEpoch, WalletServingAdmissionError> {
         if canonical.network() != wallet.network() {
             return Err(WalletServingAdmissionError::NetworkMismatch {
                 canonical: canonical.network(),
@@ -655,7 +666,7 @@ impl WalletServingReadPair {
                 wallet: Box::new(wallet_source),
             });
         }
-        Ok(())
+        Ok(canonical_epoch)
     }
 
     /// Returns the canonical reader frozen for this pair's entire lifetime.
@@ -687,6 +698,13 @@ impl WalletServingReadPair {
     #[must_use]
     pub const fn network_upgrade_activations(&self) -> &NetworkUpgradeActivations {
         &self.network_upgrade_activations
+    }
+
+    /// Returns the canonical epoch this pair serves, read and validated
+    /// against both readers when the pair was admitted.
+    #[must_use]
+    pub const fn chain_epoch(&self) -> ChainEpoch {
+        self.chain_epoch
     }
 
     /// Tells the reads still holding this pair to stop, returning `true` the
