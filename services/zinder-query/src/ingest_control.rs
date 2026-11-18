@@ -18,9 +18,7 @@ use zinder_proto::{
     },
     status_for_reason,
     v1::ingest::{
-        CanonicalWriterStatusRequest, ServerInfoRequest, WriterStatusRequest,
-        canonical_control_client::CanonicalControlClient,
-        ingest_control_client::IngestControlClient,
+        ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
     },
     v1::{
         ops::{ErrorReason, ReorgWindowExceededDetail, UpstreamNotReadyDetail},
@@ -168,27 +166,6 @@ impl AdmittedIngestControl {
             Err(status) => return Err(IngestControlHealthError::MempoolSnapshotRpc(status)),
         };
         validate_snapshot_observation(&writer_epoch, &snapshot, self.network_name)
-    }
-
-    /// Whether `CanonicalControl.WriterStatus` shows a writer of the admitted
-    /// network that follows its node with a confirmed tip.
-    ///
-    /// This is the status on which [`WriterAttestation`] clears a halt it
-    /// remembers. A failed call confirms nothing.
-    ///
-    /// [`WriterAttestation`]: zinder_runtime::WriterAttestation
-    pub(crate) async fn confirms_following_writer(&self) -> bool {
-        CanonicalControlClient::new(self.channel.clone())
-            .writer_status(wallet_ingest_control_request(
-                CanonicalWriterStatusRequest {},
-            ))
-            .await
-            .is_ok_and(|response| {
-                let status = response.get_ref();
-                status.network_name == self.network_name
-                    && status.reorg_window_exceeded.is_none()
-                    && !status.tip_unconfirmed
-            })
     }
 }
 

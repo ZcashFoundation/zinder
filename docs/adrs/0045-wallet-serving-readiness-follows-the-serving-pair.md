@@ -71,13 +71,18 @@ follow it. A halt is the runtime's own cause and is never a degraded entry.
 Each input still owns only its own slot, so no probe can clear another probe's
 observation.
 
-Because an ingest-control failure no longer refuses traffic, native query's
-ingest-control probe keeps a halt it observed through later failures and
-through answers without the halt. It clears the halt only when
-`CanonicalControl.WriterStatus` shows a writer that follows its node with a
-confirmed tip, the evidence on which the serving-pair publisher clears the
-halt it remembers. A control outage therefore cannot reopen traffic on a halt
-that the publisher has not seen yet.
+Because an ingest-control failure no longer refuses traffic, a halt that
+native query's ingest-control probe observes stays published through every
+later probe observation, including control failures and answers without the
+halt. The probe never clears it. The serving-pair publisher adopts the halt on
+its next refresh as if it had read it from `CanonicalControl.WriterStatus`: it
+withdraws its staleness allowance and refuses traffic on its pair. It clears
+the halt only on a writer status read after the adoption that shows a writer
+following its node with a confirmed tip, and the same refresh validates the
+pair's fence against that status before it publishes a state that admits
+traffic. A control outage or a writer repair therefore cannot reopen traffic
+on a pair that the recovered writer does not attest, even when the publisher
+never saw the halt itself.
 
 When the canonical writer reports `upstream_not_ready` in
 `IngestControl.WriterStatus`, native query relays that observation, with the

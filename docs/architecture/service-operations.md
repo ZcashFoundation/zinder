@@ -358,14 +358,17 @@ status. The serving-pair publisher reads the same halt from
 `CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
 which has no ingest-control probe, refuses traffic in both serving modes.
 
-The probe keeps publishing a halt it observed until
-`CanonicalControl.WriterStatus` shows a writer that follows its node with a
-confirmed tip, the same evidence on which the publisher clears a halt it
-remembers. A later probe failure, or a writer restarted on its frozen fence
-that answers without the halt, therefore cannot reopen traffic, even when the
-publisher never saw the halt and still admits traffic on a stale pair. The
-health probe intentionally shares the configured serving-pair refresh cadence
-because both observe the same control plane.
+A halt the probe observes stays published through every later probe
+observation, including a probe failure or a writer restarted on its frozen
+fence that answers without the halt; the probe never clears it. The
+serving-pair publisher takes the halt over on its next refresh, withdraws the
+pair's staleness allowance, and clears the halt only on a writer status read
+after that, from a writer that follows its node with a confirmed tip. The same
+refresh validates the pair's fence against that status before it admits
+traffic again, so a publisher that never saw the halt cannot reopen traffic on
+a pair the recovered writer does not attest. The health probe intentionally
+shares the configured serving-pair refresh cadence because both observe the
+same control plane.
 
 Losing ingest control entirely also stops pair refresh, because the publisher
 reads `CanonicalControl.WriterStatus` through the same channel. The pair then
