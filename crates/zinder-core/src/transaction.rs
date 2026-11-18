@@ -98,6 +98,10 @@ impl RawTransactionBytes {
 #[non_exhaustive]
 pub enum TransactionBroadcastOutcome {
     /// The node accepted the transaction for mempool admission or relay.
+    ///
+    /// A broadcaster that moves past an unreachable endpoint, which may have
+    /// accepted the transaction, also reports a later endpoint's duplicate
+    /// or queued answer as accepted.
     Accepted(BroadcastAccepted),
     /// The node reported the transaction was already known.
     Duplicate(BroadcastDuplicate),
@@ -121,7 +125,9 @@ pub enum TransactionBroadcastOutcome {
 /// Accepted transaction broadcast details.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BroadcastAccepted {
-    /// Transaction identifier reported by the node.
+    /// Transaction identifier reported by the node, or computed from the
+    /// submitted bytes when a duplicate or queued answer that followed an
+    /// unreachable endpoint is reported as accepted.
     pub transaction_id: TransactionId,
 }
 

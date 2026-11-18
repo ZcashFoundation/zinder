@@ -770,10 +770,15 @@ pub struct BroadcastTransactionRequest {
     pub raw_transaction: ::prost::alloc::vec::Vec<u8>,
 }
 /// Accepted transaction broadcast details.
+///
+/// A query that fails over past an unreachable node endpoint, which may have
+/// accepted the transaction, reports a later endpoint's duplicate or queued
+/// answer as accepted.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastAccepted {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
-    /// characters) reported by the node.
+    /// characters) reported by the node, or computed from the submitted bytes
+    /// when a duplicate or queued answer is reported as accepted.
     /// Reference: Zcash protocol spec term `\rpcByteOrder`.
     #[prost(string, tag = "1")]
     pub transaction_id: ::prost::alloc::string::String,
@@ -1010,13 +1015,14 @@ pub struct WalletServerInfo {
     /// settled prefix (settled_tip_height) once it is buried at least this deep.
     #[prost(uint32, tag = "4")]
     pub reorg_window_blocks: u32,
-    /// Capabilities of the broadcast node endpoint. Empty until the endpoint
-    /// passes first-contact verification, and when no node is configured.
+    /// Capabilities of the first verified broadcast node endpoint, in broadcast
+    /// preference order. Empty while no endpoint has passed first-contact
+    /// verification, and when no node is configured.
     #[prost(message, optional, tag = "8")]
     pub node: ::core::option::Option<NodeCapabilitiesDescriptor>,
 }
-/// Broadcast node endpoint capability descriptor. Empty until the endpoint
-/// passes first-contact verification, and when no node is configured.
+/// Broadcast node endpoint capability descriptor. Empty while no endpoint has
+/// passed first-contact verification, and when no node is configured.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeCapabilitiesDescriptor {
     /// Node-reported semantic version, when available.
