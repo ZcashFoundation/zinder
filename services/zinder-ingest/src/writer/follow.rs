@@ -2050,6 +2050,41 @@ mod tests {
         assert!(fresh_observation.is_some());
     }
 
+    /// Withdrawing an already withdrawn certification never cancels canonical
+    /// preparation.
+    ///
+    /// A mempool source that keeps failing to reconnect withdraws on every
+    /// attempt, and the node request in flight must be allowed to fail for
+    /// the node failover to count it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_withdrawals_do_not_interrupt_inflight_preparation() {
+        let (signal, gate) = mempool_ready_channel();
+        let mut hydration_changes = Some(gate.clone());
+        let (_readiness, composed) = writer_readiness(
+            ReadinessState::syncing(None, Some(100), None).with_phase(IngestPhase::FollowingTip),
+        );
+        let (preparation_sender, preparation_receiver) = tokio::sync::oneshot::channel::<u8>();
+
+        let (preparation_outcome, ()) = tokio::join!(
+            await_follow_preparation_or_mempool_change(
+                preparation_receiver,
+                &mut hydration_changes,
+                Some(&gate),
+                &composed,
+                block_id(100, 1),
+            ),
+            async {
+                for _ in 0..3 {
+                    signal.withdraw_certification();
+                    tokio::task::yield_now().await;
+                }
+                let _ = preparation_sender.send(7);
+            },
+        );
+
+        assert_eq!(preparation_outcome, Some(Ok(7)));
+    }
+
     #[test]
     fn hydration_withdrawal_preserves_canonical_non_ready_authority() {
         let (_signal, gate) = mempool_ready_channel();

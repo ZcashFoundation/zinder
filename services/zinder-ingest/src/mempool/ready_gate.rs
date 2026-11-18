@@ -139,8 +139,13 @@ impl MempoolReadySignal {
     }
 
     /// Withdraws the gate while no source generation can serve.
+    ///
+    /// Withdrawing a certification that is already withdrawn does not wake
+    /// the gate: a source that keeps failing to reconnect must not keep
+    /// cancelling the canonical follower's in-flight node requests.
     pub fn withdraw_certification(&self) {
-        let _ = self.certified_source_tip.send_replace(None);
+        self.certified_source_tip
+            .send_if_modified(|certified_source_tip| certified_source_tip.take().is_some());
     }
 
     /// Resolves once the canonical writer parks and halts the owner.
