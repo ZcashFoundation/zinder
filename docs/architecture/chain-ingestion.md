@@ -214,7 +214,7 @@ reorg depth, and internal invariant failures terminate the writer.
 With `[node_fallbacks.N]` endpoints configured, ingest reads through the active
 endpoint of the ordered node list ([Node source boundary §Ordered node
 list](node-source-boundary.md#ordered-node-list)). The rules are recorded in
-[ADR-0013](../adrs/0013-source-failure-recovery-topology.md) Decision 7.
+[ADR-0013](../adrs/0013-source-failure-recovery-topology.md) Decision 8.
 
 At startup, every endpoint is checked concurrently: required capabilities,
 activation table, and genesis block. The first admitted endpoint in position

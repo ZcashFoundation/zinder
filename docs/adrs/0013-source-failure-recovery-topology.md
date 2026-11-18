@@ -52,7 +52,7 @@ provide operators with the actionable reason and recovery cadence.
 
 ## Revision history
 
+- 2026-11-18: Ingest switches between the endpoints of the ordered node list (Decision 8), and Decision 6 now states that the follower makes one attempt per call.
 - 2026-11-17: Wallet-serving readers no longer drain readiness on a source
   failure. They report it as a degraded dependency and fail only node-backed
   requests ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
-- 2026-11-18: Ingest switches between the endpoints of the ordered node list (Decision 8), and Decision 6 now states that the follower makes one attempt per call.

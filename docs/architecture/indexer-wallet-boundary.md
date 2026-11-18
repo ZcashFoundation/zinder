@@ -75,7 +75,7 @@ This boundary also preserves shielded privacy. Zinder serves compact chain artif
 
 ## Operational boundary
 
-Zinder's release topology is a single operator backed by one upstream Zebra node. `zinder-ingest` is the only canonical writer, `zinder-projector` is the only wallet-projection writer, and `zinder-query` plus `zinder-compat-lightwalletd` independently serve admitted canonical and wallet-projection secondaries. Native clients call the `WalletQuery` runtime; existing lightwalletd clients call the compatibility runtime. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
+Zinder's release topology is a single operator backed by a Zebra or Zakura node, with optional [fallback node endpoints](chain-ingestion.md#node-endpoint-failover). `zinder-ingest` is the only canonical writer, `zinder-projector` is the only wallet-projection writer, and `zinder-query` plus `zinder-compat-lightwalletd` independently serve admitted canonical and wallet-projection secondaries. Native clients call the `WalletQuery` runtime; existing lightwalletd clients call the compatibility runtime. Readers either see the previous `ChainEpoch` or the newly committed epoch, never a half-committed batch.
 
 Zinder does not provide tenant isolation, terminate public TLS, authenticate callers, or enforce per-client rate limits. Operators place an appropriate proxy or private network boundary in front of externally reachable services. Cross-host RocksDB secondaries are also outside the recommended topology; remote consumers should use gRPC.
 

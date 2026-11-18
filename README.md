@@ -32,7 +32,7 @@ needs node-owned data. See
 [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for
 the detailed comparison.
 
-The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
+The deployment target is single-operator self-hosting backed by a Zebra or Zakura node, with optional [fallback node endpoints](docs/architecture/chain-ingestion.md#node-endpoint-failover). Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
 
 ## Quickstart
 

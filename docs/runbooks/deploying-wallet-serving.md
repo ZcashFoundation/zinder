@@ -696,8 +696,9 @@ Watch for that event, and see
 
 The Explorer reads only these variables:
 
-- `ZINDER_NETWORK__*` and `ZINDER_NODE__*`, which it shares with the
-  wallet-serving processes.
+- `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, and `ZINDER_NODE_FALLBACKS__*`, which
+  it shares with the wallet-serving processes. The Explorer validates the
+  fallback list but reads only `[node]`.
 - `ZINDER_EXPLORER__*`, such as `ZINDER_EXPLORER__BEARER_TOKEN_PATH`. The
   entrypoint delivers these variables to the Explorer alone.
 
