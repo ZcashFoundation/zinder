@@ -15,7 +15,7 @@ use axum::{
 use eyre::{Result, eyre};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,8 @@ use zinder_runtime::{HttpListenerLimits, serve_http};
 
 const HEADER_TIMEOUT: Duration = Duration::from_millis(300);
 const GIVE_UP_AFTER: Duration = Duration::from_secs(3);
+/// Larger than any loopback socket buffer the kernel will autotune.
+const BIG_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const GET_HELLO: &[u8] = b"GET /hello HTTP/1.1\r\nHost: zinder\r\n\r\n";
 
 struct TestServer {
@@ -34,7 +36,8 @@ struct TestServer {
 fn short_limits() -> HttpListenerLimits {
     HttpListenerLimits {
         header_read_timeout: HEADER_TIMEOUT,
-        request_body_idle_timeout: HEADER_TIMEOUT,
+        request_body_read_timeout: HEADER_TIMEOUT,
+        write_stall_timeout: HEADER_TIMEOUT,
         max_connections: 64,
         max_request_body_bytes: 1024,
     }
@@ -58,6 +61,7 @@ async fn start(limits: HttpListenerLimits) -> Result<TestServer> {
             "/length",
             post(|body: Bytes| async move { body.len().to_string() }),
         )
+        .route("/big", get(|| async { vec![b'x'; BIG_RESPONSE_BYTES] }))
         .route("/ws", get(echo_websocket));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
@@ -231,6 +235,128 @@ async fn stalled_request_body_fails_instead_of_holding_the_request() -> Result<(
 
     assert!(!response.starts_with(b"HTTP/1.1 200"));
     Ok(())
+}
+
+#[tokio::test]
+async fn slowly_dripped_request_body_fails_at_the_absolute_deadline() -> Result<()> {
+    let server = start(HttpListenerLimits {
+        max_connections: 1,
+        ..short_limits()
+    })
+    .await?;
+    let mut stream = TcpStream::connect(server.listen_addr).await?;
+    stream
+        .write_all(b"POST /length HTTP/1.1\r\nHost: zinder\r\nContent-Length: 1000\r\n\r\n")
+        .await?;
+
+    // One byte every two thirds of the deadline never lets a per-frame idle
+    // timeout fire, but the absolute deadline still ends the request.
+    let started = Instant::now();
+    let mut chunk = [0_u8; 512];
+    let mut response = Vec::new();
+    loop {
+        if started.elapsed() > GIVE_UP_AFTER {
+            return Err(eyre!(
+                "server let a dripped request body outlive its deadline"
+            ));
+        }
+        tokio::select! {
+            read = stream.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&chunk[..read]);
+                    break;
+                }
+            },
+            () = tokio::time::sleep(HEADER_TIMEOUT * 2 / 3) => {
+                if stream.write_all(b"a").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(!response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    drop(stream);
+
+    get_hello_when_slot_frees(&server).await
+}
+
+/// Retries a plain `GET` until the server serves it, so a slot freed
+/// asynchronously by a closed connection is awaited rather than raced.
+async fn get_hello_when_slot_frees(server: &TestServer) -> Result<()> {
+    let deadline = Instant::now() + GIVE_UP_AFTER;
+    loop {
+        let mut probe = TcpStream::connect(server.listen_addr).await?;
+        probe.write_all(GET_HELLO).await?;
+        if read_until(&mut probe, b"hello").await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(eyre!("connection slot was not released"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_that_never_reads_a_response_is_disconnected() -> Result<()> {
+    let server = start(HttpListenerLimits {
+        header_read_timeout: Duration::from_secs(30),
+        max_connections: 1,
+        ..short_limits()
+    })
+    .await?;
+    let socket = TcpSocket::new_v4()?;
+    socket.set_recv_buffer_size(4096)?;
+    let mut stream = socket.connect(server.listen_addr).await?;
+    stream
+        .write_all(b"GET /big HTTP/1.1\r\nHost: zinder\r\n\r\n")
+        .await?;
+
+    // Never read. The server must give up on the stalled write by itself, which
+    // frees the only slot for a well-behaved client.
+    let started = Instant::now();
+    loop {
+        let mut other = TcpStream::connect(server.listen_addr).await?;
+        other.write_all(GET_HELLO).await?;
+        if read_until(&mut other, b"hello").await.is_ok() {
+            break;
+        }
+        if started.elapsed() > GIVE_UP_AFTER {
+            return Err(eyre!("a client that never reads held the only slot"));
+        }
+    }
+    drop(stream);
+    Ok(())
+}
+
+#[tokio::test]
+async fn upgraded_websocket_holds_its_connection_slot_until_it_closes() -> Result<()> {
+    let server = start(HttpListenerLimits {
+        header_read_timeout: Duration::from_secs(30),
+        max_connections: 1,
+        ..short_limits()
+    })
+    .await?;
+    let mut websocket = TcpStream::connect(server.listen_addr).await?;
+    websocket
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: zinder\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+    read_until(&mut websocket, b"\r\n\r\n").await?;
+
+    let mut refused = TcpStream::connect(server.listen_addr).await?;
+    refused.write_all(GET_HELLO).await?;
+    let mut received = Vec::new();
+    drop(tokio::time::timeout(GIVE_UP_AFTER, refused.read_to_end(&mut received)).await);
+    assert!(
+        received.is_empty(),
+        "upgraded connection did not hold its slot"
+    );
+
+    drop(websocket);
+    get_hello_when_slot_frees(&server).await
 }
 
 #[tokio::test]

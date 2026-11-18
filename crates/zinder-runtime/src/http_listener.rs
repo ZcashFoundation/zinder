@@ -5,22 +5,29 @@
 //! or sends request headers one byte at a time, holds that connection and its
 //! task indefinitely. [`serve_http`] replaces it with a hyper HTTP/1 server
 //! that bounds how long a connection may take to deliver request headers,
-//! how long a request body may stall, how many connections are open at once,
+//! how long a request body may take to arrive, how long a write may stall
+//! behind a client that stops reading, how many connections are open at once,
 //! and how large a request body may be. Connections upgraded to `WebSocket`
-//! leave the HTTP deadlines behind once the upgrade completes.
+//! leave the head and body deadlines behind once the upgrade completes, keep
+//! the write stall bound, and keep their connection slot until the socket
+//! closes.
+
+mod connection_io;
+mod request_body_deadline;
 
 use std::{convert::Infallible, future::Future, io, sync::Arc, time::Duration};
 
 use axum::{Router, body::Body, extract::DefaultBodyLimit};
+use connection_io::ConnectionIo;
 use hyper::{body::Incoming, server::conn::http1};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
+use request_body_deadline::RequestBodyDeadline;
 use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::ServiceExt;
-use tower_http::timeout::TimeoutBody;
 
 /// Longest a connection may take to deliver a complete request head.
 ///
@@ -28,13 +35,21 @@ use tower_http::timeout::TimeoutBody;
 /// requests, because hyper restarts the header timer for every request head.
 pub const DEFAULT_HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest a request body may go without delivering the next frame.
-pub const DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest a request body may take to arrive in full, counted from the moment
+/// its request head is parsed.
+///
+/// The deadline is absolute. Progress does not extend it, so a client that
+/// drips one byte at a time cannot hold a request open.
+pub const DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest a write may stay blocked behind a client that is not reading.
+pub const DEFAULT_HTTP_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default cap on concurrently open connections.
 ///
 /// The cap protects file descriptors and tasks. It is not a request rate
-/// limit, and a connection upgraded to `WebSocket` keeps its slot.
+/// limit. A connection upgraded to `WebSocket` keeps its slot until the socket
+/// closes.
 pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 2048;
 
 /// Default cap on a request body, matching axum's own extractor default.
@@ -49,8 +64,11 @@ pub struct HttpListenerLimits {
     /// Longest a connection may take to deliver a complete request head, and
     /// the longest an idle keep-alive connection survives.
     pub header_read_timeout: Duration,
-    /// Longest a request body may stall before the request fails.
-    pub request_body_idle_timeout: Duration,
+    /// Longest a request body may take to arrive in full before the request fails.
+    pub request_body_read_timeout: Duration,
+    /// Longest a write may stay blocked behind a client that is not reading
+    /// before the connection is closed.
+    pub write_stall_timeout: Duration,
     /// Connections beyond this count are closed as soon as they are accepted.
     pub max_connections: usize,
     /// Largest request body that axum body extractors accept.
@@ -61,7 +79,8 @@ impl Default for HttpListenerLimits {
     fn default() -> Self {
         Self {
             header_read_timeout: DEFAULT_HTTP_HEADER_READ_TIMEOUT,
-            request_body_idle_timeout: DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT,
+            request_body_read_timeout: DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+            write_stall_timeout: DEFAULT_HTTP_WRITE_STALL_TIMEOUT,
             max_connections: DEFAULT_HTTP_MAX_CONNECTIONS,
             max_request_body_bytes: DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES,
         }
@@ -73,12 +92,17 @@ impl Default for HttpListenerLimits {
 /// Behaves like `axum::serve(listener, router).with_graceful_shutdown(shutdown)`
 /// with the bounds in `limits` applied. Once `shutdown` completes, the
 /// listener stops accepting, idle connections close, and the call returns after
-/// every in-flight connection has finished. `WebSocket` upgrades stay enabled,
-/// and an upgraded connection ends when its own handler ends.
+/// every in-flight HTTP request has finished. `WebSocket` upgrades stay enabled.
+/// An upgraded connection ends when its own handler ends, and shutdown does not
+/// wait for it.
 ///
 /// The listener speaks HTTP/1 only. No Zinder client uses cleartext HTTP/2,
 /// and the HTTP/1 connection type is the one that bounds an idle connection
 /// that has not yet sent a byte.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the connection owns its concurrency slot and must stay alive across the select"
+)]
 pub async fn serve_http<Shutdown>(
     listener: TcpListener,
     router: Router,
@@ -92,8 +116,7 @@ where
     let mut builder = http1::Builder::new();
     builder
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout)
-        .keep_alive(true);
+        .header_read_timeout(limits.header_read_timeout);
 
     let connection_slots = Arc::new(Semaphore::new(limits.max_connections));
     let connections = TaskTracker::new();
@@ -131,10 +154,9 @@ where
             continue;
         };
 
-        let service = hyper_service(&router, limits.request_body_idle_timeout);
-        let connection = builder
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades();
+        let service = hyper_service(&router, limits.request_body_read_timeout);
+        let io = ConnectionIo::new(TokioIo::new(stream), limits.write_stall_timeout, slot);
+        let connection = builder.serve_connection(io, service).with_upgrades();
         let drain = drain.clone();
         connections.spawn(async move {
             let mut connection = std::pin::pin!(connection);
@@ -158,7 +180,6 @@ where
                     }
                 }
             }
-            drop(slot);
         });
     }
 
@@ -169,11 +190,11 @@ where
     Ok(())
 }
 
-/// Adapts the router to hyper, failing any request body that stalls for
-/// longer than `body_idle_timeout` between frames.
+/// Adapts the router to hyper, failing any request body that is not fully
+/// received within `body_read_timeout` of its request head.
 fn hyper_service(
     router: &Router,
-    body_idle_timeout: Duration,
+    body_read_timeout: Duration,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = axum::response::Response,
@@ -183,7 +204,7 @@ fn hyper_service(
 + use<> {
     TowerToHyperService::new(router.clone().map_request(
         move |request: hyper::Request<Incoming>| {
-            request.map(|body| Body::new(TimeoutBody::new(body_idle_timeout, body)))
+            request.map(|body| Body::new(RequestBodyDeadline::new(body, body_read_timeout)))
         },
     ))
 }

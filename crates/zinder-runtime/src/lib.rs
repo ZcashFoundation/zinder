@@ -85,8 +85,8 @@ pub use env_var_docs::{
 };
 pub use http_listener::{
     DEFAULT_HTTP_HEADER_READ_TIMEOUT, DEFAULT_HTTP_MAX_CONNECTIONS,
-    DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT,
-    HttpListenerLimits, serve_http,
+    DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+    DEFAULT_HTTP_WRITE_STALL_TIMEOUT, HttpListenerLimits, serve_http,
 };
 pub use logging::{TracingSubscriberError, install_tracing_subscriber};
 pub use memory_budget::{

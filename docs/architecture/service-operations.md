@@ -1287,15 +1287,25 @@ its task indefinitely. The listener applies these fixed bounds:
 | Bound | Value | Effect |
 | --- | --- | --- |
 | Request head | 10 seconds | A connection that has not delivered a complete request head in time is closed. The same deadline closes a keep-alive connection that stays idle between requests. |
-| Request body stall | 30 seconds | A request body that delivers no frame for this long fails the request. |
-| Concurrent connections | 2048 | Connections over the cap are closed as soon as they are accepted, and a slot frees when its connection ends. |
+| Request body | 30 seconds in total | A request body that is not fully received within 30 seconds of its request head fails the request. Progress does not extend the deadline, so a client that sends one byte at a time cannot hold the request. |
+| Response write stall | 30 seconds | A connection whose write stays blocked for 30 seconds because the client is not reading is closed, including a pipelining client that never reads and a `WebSocket` client that stops reading. |
+| Concurrent connections | 2048 (64 on the operational endpoint) | Connections over the cap are closed as soon as they are accepted, and a slot frees when its socket closes. |
 | Request body size | 2 MiB (4 KiB on the operational endpoint) | Larger bodies are rejected with HTTP 413 by axum body extractors. |
 
-`WebSocket` upgrades stay enabled. An upgraded connection leaves the HTTP
-deadlines behind and holds its connection slot until its own handler ends. The
-listener does not bound how long a client takes to read a response, so a public
-deployment still belongs behind an operator-controlled proxy with its own
-timeouts. The bounds are constants, not configuration.
+`WebSocket` upgrades stay enabled. An upgraded connection leaves the request
+head and body deadlines behind but keeps the write stall bound, and it holds its
+connection slot until the socket closes, so `WebSocket` sessions count against
+the cap. Graceful shutdown waits for in-flight HTTP requests and does not wait
+for upgraded connections, which the owning handler closes.
+
+The connection cap is a global ceiling that protects file descriptors and
+tasks, not a per-client limit. A client that opens many connections can fill the
+Cipherscan cap and refuse other clients until its connections time out, so a
+public deployment still belongs behind an operator-controlled proxy that limits
+connections per client and applies its own timeouts. The cap is deliberately
+small on the operational endpoint, which serves only scrapers and probes, so it
+cannot compete with the gRPC listener and the stores for file descriptors. The
+bounds are constants, not configuration.
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only
