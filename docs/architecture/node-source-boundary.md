@@ -110,14 +110,17 @@ merge field by field; a TOML array of tables is refused, because the loader
 would replace the whole array as soon as one environment variable named an
 entry. `zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, and
 `zinder-explorer` accept the list, and `--print-config` renders it with
-credentials redacted. `zinder-projector` reads no node list.
+credentials redacted. Compatibility accepts it only with
+`compat.serving = "wallet"`. `zinder-projector` and compact-blocks
+compatibility reject both `[node]` and the list.
 
 `NodeSet` holds the list and implements `NodeSource` by delegating every call
 to its active endpoint, so code written against one node is unchanged.
 `NodeSet::connect(primary, fallbacks)` builds every endpoint's
-`ZebraJsonRpcSource`. Only the `NodeSetSwitch` returned with the set changes
-the active endpoint, and `NodeSet::mempool_source` follows the active
-endpoint's mempool: a switch ends the open event stream with one
+`ZebraJsonRpcSource`. Ingest builds its endpoints this way; the readers still
+build one `ZebraJsonRpcSource` from `[node]`. Only the `NodeSetSwitch` returned
+with the set changes the active endpoint, and `NodeSet::mempool_source` follows
+the active endpoint's mempool: a switch ends the open event stream with one
 `MempoolStreamUnavailable` item, so the consumer rebuilds its snapshot from the
 new endpoint as after any stream failure.
 
