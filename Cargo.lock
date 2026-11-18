@@ -5952,6 +5952,7 @@ dependencies = [
  "config",
  "eyre",
  "hex",
+ "parking_lot",
  "prost",
  "serde",
  "serde_json",

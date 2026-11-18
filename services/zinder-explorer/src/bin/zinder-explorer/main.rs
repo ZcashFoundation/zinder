@@ -1,7 +1,6 @@
 //! Zinder explorer-plane gRPC server entry point.
 
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
-use zinder_core::NetworkUpgradeActivations;
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
@@ -165,7 +164,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
                     cancel.clone(),
                 )
             });
-    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store).await;
+    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store);
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
@@ -437,44 +436,7 @@ const fn materialized_view_catchup_failure_cause(
     }
 }
 
-/// Fetches the node-advertised network-upgrade activation table.
-///
-/// Feeds the `NetworkUpgradeStatus` handler. Returns `None` when no `[node]`
-/// section is configured or the upstream fetch fails; the adapter then serves
-/// an empty table.
-async fn fetch_network_upgrade_activations(
-    explorer_config: &ExplorerConfig,
-) -> Option<Arc<NetworkUpgradeActivations>> {
-    let node = explorer_config.node.as_ref()?;
-    let source = match build_zebra_json_rpc_source(node) {
-        Ok(source) => source,
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::explorer",
-                event = "network_upgrade_activations_source_build_failed",
-                error = %error,
-                "could not build node source for network-upgrade activations; \
-                 NetworkUpgradeStatus serves an empty table"
-            );
-            return None;
-        }
-    };
-    match source.fetch_network_upgrade_activations().await {
-        Ok(activations) => Some(Arc::new(activations)),
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::explorer",
-                event = "network_upgrade_activations_fetch_failed",
-                error = %error,
-                "could not fetch network-upgrade activations from the node; \
-                 NetworkUpgradeStatus serves an empty table"
-            );
-            None
-        }
-    }
-}
-
-async fn build_grpc_adapter(
+fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     materialized_view_store: Option<MaterializedViewStore>,
 ) -> ExplorerQueryGrpcAdapter {
@@ -486,9 +448,6 @@ async fn build_grpc_adapter(
         .with_prevout_resolution_online(has_materialized_view_store);
     if let Some(materialized_view_store) = materialized_view_store {
         grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);
-    }
-    if let Some(activations) = fetch_network_upgrade_activations(explorer_config).await {
-        grpc_adapter = grpc_adapter.with_network_upgrade_activations(activations);
     }
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
