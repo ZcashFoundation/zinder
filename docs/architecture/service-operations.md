@@ -1085,7 +1085,11 @@ endpoint that can take over. That last event repeats at most once per standby
 evaluation the monitor records, not on every follow iteration. At startup,
 `mempool_source_selected` reports each endpoint's `position` and mempool
 `backend`, `streaming` or `polling`. These events name endpoints by position,
-never by URL, because an address can embed credentials.
+never by URL, because an address can embed credentials. Events that do carry
+an endpoint URL, such as `canonical_writer_started`,
+`upstream_health_probe_started`, and `upstream_health_endpoint_unreachable`,
+replace its user information, query, and fragment with `[REDACTED]`, as
+`--print-config` does.
 
 Explorer view replay logs `materialized_view_replay_volume_space_low` once
 when the free-space guard pauses replay and

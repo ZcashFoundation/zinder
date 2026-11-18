@@ -1117,8 +1117,9 @@ fn log_canonical_writer_start(
         event = "canonical_writer_started",
         network = encode_zinder_native_chain_name(command_config.runtime_config.node.network),
         storage_path = %writer_config.storage_path.display(),
-        json_rpc_addr =
-            node_target_at(command_config, active_node_position).json_rpc_addr.as_str(),
+        json_rpc_addr = %zinder_source::redact_endpoint_url(
+            &node_target_at(command_config, active_node_position).json_rpc_addr
+        ),
         node_endpoints = command_config
             .runtime_config
             .node_fallbacks
@@ -1434,12 +1435,14 @@ fn spawn_upstream_health_probe_for(
     let active_health_addr = node_target_at(command_config, active_node_position)
         .health
         .as_ref()
-        .map(|health| health.addr.as_str());
+        .map(|health| zinder_source::redact_endpoint_url(&health.addr));
     tracing::info!(
         target: "zinder::ingest",
         event = "upstream_health_probe_started",
         active_node_position,
-        addr = active_health_addr.unwrap_or("json_rpc_verification_progress"),
+        addr = active_health_addr
+            .as_deref()
+            .unwrap_or("json_rpc_verification_progress"),
         follows_active_endpoint = nodes.has_fallbacks(),
         poll_interval_ms = u64::try_from(health_config.poll_interval.as_millis())
             .unwrap_or(u64::MAX),
