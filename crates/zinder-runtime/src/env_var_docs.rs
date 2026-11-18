@@ -1604,6 +1604,55 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       it. Defaults to 2147483648.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__ENABLED",
+        toml_path: "ingest.tree_state_densification.enabled",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Whether ingest fills settled history built by a first sync with stored \
+                      tree-state checkpoints in the background, so a tree-state read there \
+                      needs no replay. Runs only with `ingest_control.listen_addr` set. \
+                      Defaults to `true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
+        toml_path: "ingest.tree_state_densification.selection",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Which settled blocks receive a stored tree-state checkpoint: \
+                      `every-block`, or `commitment-budget` for the first block after each \
+                      `commitment_budget` note commitments. Defaults to `every-block`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",
+        toml_path: "ingest.tree_state_densification.commitment_budget",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Note commitments, over every pool, between two stored tree-state \
+                      checkpoints under `selection = \"commitment-budget\"`. Must be greater \
+                      than zero and is refused with any other selection. Defaults to 1024.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__WORKERS",
+        toml_path: "ingest.tree_state_densification.workers",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Settled 100-block strides densified at once, each on one CPU. Must be \
+                      greater than zero. Defaults to 2.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__MAX_ROWS_PER_SECOND",
+        toml_path: "ingest.tree_state_densification.max_rows_per_second",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Ceiling on densified tree-state checkpoint rows written per second. \
+                      Must be greater than zero. Defaults to 4000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",
         toml_path: "ingest.run_overrides.target_height",
         used_by: &["zinder-ingest"],

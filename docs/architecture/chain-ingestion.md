@@ -148,6 +148,42 @@ While it waits on the node, the follower still answers read-only control
 commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
 (up to 64) and apply when the wait ends.
 
+### Tree-state densification
+
+A first sync stores a tree-state checkpoint only every 100 blocks, so a
+tree-state read between two of them replays stored blocks. Once ingest follows
+the tip, and Explorer views have caught up when they are enabled, a background
+pass fills settled history with stored checkpoints. By default it stores one
+for every block, which makes a tree-state read at any settled height a stored
+read; `ingest.tree_state_densification.selection = "commitment-budget"` stores
+one each time `commitment_budget` note commitments have accumulated instead.
+Live following already stores one per block, so only history from a first sync
+needs the pass.
+
+The pass works one stride at a time, from one stored checkpoint to the next
+multiple of 100. It replays the stride's compact blocks from the first
+checkpoint with the checks a tree-state rebuild applies, and accepts the result
+only when the replay reproduces the stored checkpoint that ends the stride byte
+for byte. The writer then adds the stride's rows in one batch between live
+commits, after checking that the stride ends at or below the settled tip, that
+both stored checkpoints are unchanged, and that a row already stored at one of
+its heights holds the same bytes. A stride that fails a check is not written:
+ingest logs `tree_state_densification_integrity_failure`, counts it, and reads
+there keep replaying.
+
+Only settled history is densified, so no reorg reaches a densified row. A
+stride commits whole or not at all. When ingest starts, the pass checks every
+gap between stored checkpoints in each settled stride and queues the strides
+that do not satisfy the selection, so it resumes after a restart, or after a
+change to a stricter selection, without a progress record. Later scans check
+only strides that settled since. The writer commits through its command queue,
+so the pass runs only when `ingest_control.listen_addr` is set, as it is for
+wallet serving. `ingest.tree_state_densification.workers` bounds the CPU it
+uses and `max_rows_per_second` its write rate. Progress is reported by the
+`zinder_ingest_tree_state_densification_*` metrics in
+[Metrics](../reference/metrics.md). A canonical rebuild returns history to the
+100-block cadence until the pass runs again.
+
 ## Node endpoint failover
 
 You can list fallback nodes after `[node]` as `[node_fallbacks.1]`,

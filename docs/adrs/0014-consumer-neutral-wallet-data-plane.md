@@ -19,6 +19,8 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 5. **Optional payload fields use explicit presence.** A field that a deployment may be unable to fill is a proto3 `optional` scalar or a `repeated` field. Absence is never encoded as zero or empty bytes. When absence has more than one cause that a reader would act on differently, the message carries a companion status enum. A named capability string says the field is filled on this deployment.
 6. **Capabilities follow evidence.** A capability for an optional field is advertised only when the deployment can fill it, judged from persisted facts. Raw-block and raw-transaction capabilities follow the raw-blob retention the store recorded at construction. Completeness capabilities for materialized views require verified coverage up to the view tip. A runtime advertises one capability set through every discovery surface.
 
+7. **Settled tree states are stored, not replayed.** By default ingest stores a tree-state checkpoint for every settled block. Construction writes one every 100 blocks, so once the writer follows the tip a background pass fills the rest of settled history ([Chain ingestion](../architecture/chain-ingestion.md#tree-state-densification)). The pass anchors each 100-block stride on two checkpoints construction already stored and checked, and writes a stride only when replaying it from the first reproduces the second byte for byte. Replay remains the answer for a height the pass has not reached. A deployment may select checkpoints by commitment budget instead of every block, which trades storage for a bounded replay.
+
 [Wallet data plane](../architecture/wallet-data-plane.md) describes what each method returns. [Capabilities](../reference/capabilities.md) lists the capability strings.
 
 ## Consequences
@@ -28,7 +30,11 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - Missing history becomes a deployment or readiness failure, not a hidden query fallback.
 - A running reader keeps serving tree state, blocks, and transparent reads while the node is down ([ADR-0016](0016-wallet-serving-readiness.md)).
 - Serving stores are larger and slower to build than near-tip stores. Local tests use disposable stores instead of a near-tip construction.
-- A tree-state read between checkpoints replays at most 99 stored blocks.
+- A tree-state read at a densified height is a stored read. It still re-derives each pool's root to check the stored row, about 2.5 ms of hashing, and takes no replay slot. A read the pass has not reached replays at most 99 stored blocks, which costs up to several seconds in the dense 2022 range.
+- Storing every settled block's tree state costs about 2.4 GB uncompressed for Mainnet history, estimated from the row encoding at Mainnet tree sizes and not yet measured. Live following already adds one row per block. The 1,024-commitment budget would add about 0.13 GB instead and keep replays of up to 1,024 commitments.
+- The pass costs one replay of every commitment in constructed history plus two root derivations per pool for each row it writes, an estimated 4 to 5 CPU-hours on Mainnet that the workers spread over a few hours of background work. Its writes are small batches between live commits.
+- The stored rows are as trustworthy as the cadence checkpoints they reproduce: construction derives those from the blocks it loads and checks its build-tip tree state against the node. The stride check proves that the stored blocks replay from one stored checkpoint to the next. It does not compare intermediate rows with the node, so a stride whose stored blocks and both checkpoints were all altered consistently would pass, as it would for the read-side replay today.
+- A canonical rebuild returns history to the 100-block cadence until the pass runs again. Writing every row during construction instead would add a root derivation per pool to each block on the serial loader, which a later construction change may take on together with parallel hashing.
 - Adding an optional field touches the proto, the capability registry and its tests, and the handler that fills it, in one change.
 - Consumers branch on field presence and on `ServerInfo` capabilities, never on sentinel values.
 
@@ -38,5 +44,7 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - **A per-wallet coverage profile.** It recreates the app-specific design this decision avoids.
 - **Bounded-history serving stores.** Narrowing coverage needs proven demand. The first stable profile favors correct wallet behavior.
 - **Answer `GetTreeState` by proxying the node, as lightwalletd does.** Tree-state reads would then fail during node outages.
-- **Store a tree-state frontier for every block.** It adds a row per block, needs a rebuild, and saves at most 99 blocks of replay per read.
+- **Keep replaying between 100-block checkpoints.** Wallet engines that fetch blocks in byte-sized pieces ask for a tree state at nearly every piece boundary, so on a constructed store almost every such request replays, and replay runs one request per CPU. The replay slots, not the block streams, then bound how many wallets can restore at once.
+- **Store tree nodes once and assemble any tree state from them.** It answers without hashing and stores less than a row per block, but it needs a storage-layout break, a rebuild, new reorg handling that truncates nodes above a fork, and a different per-request check. A later storage break may revisit it if measured sizes call for it.
+- **Store checkpoints only at the heights wallet SDKs ship as birthdays.** It helps only the first request of a restore.
 - **Sentinel values for absent fields.** A consumer cannot tell "unresolved" from a real zero fee or balance.

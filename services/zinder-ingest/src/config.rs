@@ -16,9 +16,9 @@ use zinder_ingest::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
     CanonicalRunOverrides, DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES,
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig,
-    MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig, RawBlobPolicy,
-    container_memory_budget_bytes,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DEFAULT_TREE_STATE_COMMITMENT_BUDGET, IngestError,
+    IngestRuntimeConfig, MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig,
+    RawBlobPolicy, TreeStateDensificationConfig, container_memory_budget_bytes,
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
@@ -33,6 +33,7 @@ use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
     MempoolSourceAdmissionLimits, NodeFallbackSections, NodeSection, NodeTarget,
 };
+use zinder_store::TreeStateCheckpointSelection;
 
 use crate::cli::parse::{parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks};
 
@@ -59,6 +60,7 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
     pub(crate) retention: ResolvedRetention,
+    pub(crate) tree_state_densification: TreeStateDensificationConfig,
 }
 
 /// Coverage policy applied to the [`CanonicalRunOverrides`] bootstrap path.
@@ -323,6 +325,26 @@ struct IngestSection {
     follow: IngestFollowSection,
     /// One-shot `run_overrides` for the ingest run.
     run_overrides: IngestRunOverridesSection,
+    /// Background densification of settled tree-state checkpoints.
+    tree_state_densification: IngestTreeStateDensificationSection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestTreeStateDensificationSection {
+    enabled: Option<bool>,
+    selection: Option<TreeStateSelectionName>,
+    commitment_budget: Option<u32>,
+    workers: Option<u32>,
+    max_rows_per_second: Option<u32>,
+}
+
+/// Configured name of a tree-state checkpoint selection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TreeStateSelectionName {
+    EveryBlock,
+    CommitmentBudget,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -602,6 +624,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         checkpoint_staging_root: ingest_control_checkpoint_staging_root,
     } = resolve_ingest_control_writer(config.ingest_control)?;
     let retention = resolve_retention(config.retention)?;
+    let tree_state_densification =
+        resolve_tree_state_densification(config.ingest.tree_state_densification)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
     guard_optional_serving_bind(
@@ -669,6 +693,50 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ops_listen_addr,
         allow_public_bind,
         retention,
+        tree_state_densification,
+    })
+}
+
+fn resolve_tree_state_densification(
+    section: IngestTreeStateDensificationSection,
+) -> Result<TreeStateDensificationConfig, ConfigError> {
+    let defaults = TreeStateDensificationConfig::default();
+    let nonzero = |configured: Option<u32>, default: NonZeroU32, field: &str| {
+        configured.map_or(Ok(default), |configured| {
+            NonZeroU32::new(configured)
+                .ok_or_else(|| ConfigError::invalid(format!("{field} must be greater than zero")))
+        })
+    };
+    let selection = match (section.selection, section.commitment_budget) {
+        (None | Some(TreeStateSelectionName::EveryBlock), None) => {
+            TreeStateCheckpointSelection::EveryBlock
+        }
+        (None | Some(TreeStateSelectionName::EveryBlock), Some(_)) => {
+            return Err(ConfigError::invalid(
+                "ingest.tree_state_densification.commitment_budget applies only to selection = \"commitment-budget\"",
+            ));
+        }
+        (Some(TreeStateSelectionName::CommitmentBudget), budget) => {
+            TreeStateCheckpointSelection::CommitmentBudget(nonzero(
+                budget,
+                NonZeroU32::new(DEFAULT_TREE_STATE_COMMITMENT_BUDGET).unwrap_or(NonZeroU32::MIN),
+                "ingest.tree_state_densification.commitment_budget",
+            )?)
+        }
+    };
+    Ok(TreeStateDensificationConfig {
+        enabled: section.enabled.unwrap_or(defaults.enabled),
+        selection,
+        workers: nonzero(
+            section.workers,
+            defaults.workers,
+            "ingest.tree_state_densification.workers",
+        )?,
+        max_rows_per_second: nonzero(
+            section.max_rows_per_second,
+            defaults.max_rows_per_second,
+            "ingest.tree_state_densification.max_rows_per_second",
+        )?,
     })
 }
 
@@ -819,6 +887,9 @@ impl RedactedIngestConfigToml {
                         .map(BlockHeight::value),
                     coverage: config.coverage,
                 },
+                tree_state_densification: IngestTreeStateDensificationToml::from_resolved(
+                    config.tree_state_densification,
+                ),
             },
             ingest_control: IngestControlWriterToml::from_resolved(
                 config.ingest_control_listen_addr,
@@ -844,6 +915,37 @@ struct IngestToml {
     mempool: IngestMempoolToml,
     follow: IngestFollowToml,
     run_overrides: IngestRunOverridesToml,
+    tree_state_densification: IngestTreeStateDensificationToml,
+}
+
+#[derive(Serialize)]
+struct IngestTreeStateDensificationToml {
+    enabled: bool,
+    selection: TreeStateSelectionName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commitment_budget: Option<u32>,
+    workers: u32,
+    max_rows_per_second: u32,
+}
+
+impl IngestTreeStateDensificationToml {
+    fn from_resolved(config: TreeStateDensificationConfig) -> Self {
+        let (selection, commitment_budget) = match config.selection {
+            TreeStateCheckpointSelection::CommitmentBudget(budget) => {
+                (TreeStateSelectionName::CommitmentBudget, Some(budget.get()))
+            }
+            TreeStateCheckpointSelection::EveryBlock | _ => {
+                (TreeStateSelectionName::EveryBlock, None)
+            }
+        };
+        Self {
+            enabled: config.enabled,
+            selection,
+            commitment_budget,
+            workers: config.workers.get(),
+            max_rows_per_second: config.max_rows_per_second.get(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -913,6 +1015,81 @@ mod tests {
             None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn tree_state_densification_defaults_to_every_block_and_accepts_a_budget() {
+        assert_eq!(
+            resolve_tree_state_densification(IngestTreeStateDensificationSection::default()).ok(),
+            Some(TreeStateDensificationConfig::default())
+        );
+        let budgeted = resolve_tree_state_densification(IngestTreeStateDensificationSection {
+            selection: Some(TreeStateSelectionName::CommitmentBudget),
+            commitment_budget: Some(2_048),
+            workers: Some(4),
+            ..IngestTreeStateDensificationSection::default()
+        });
+        assert!(matches!(
+            budgeted,
+            Ok(TreeStateDensificationConfig {
+                selection: zinder_store::TreeStateCheckpointSelection::CommitmentBudget(budget),
+                workers,
+                ..
+            }) if budget.get() == 2_048 && workers.get() == 4
+        ));
+        let default_budget =
+            resolve_tree_state_densification(IngestTreeStateDensificationSection {
+                selection: Some(TreeStateSelectionName::CommitmentBudget),
+                ..IngestTreeStateDensificationSection::default()
+            });
+        assert!(matches!(
+            default_budget,
+            Ok(TreeStateDensificationConfig {
+                selection: zinder_store::TreeStateCheckpointSelection::CommitmentBudget(budget),
+                ..
+            }) if budget.get() == 1_024
+        ));
+    }
+
+    #[test]
+    fn tree_state_densification_rejects_zero_limits_and_a_stray_budget() {
+        for (section, field) in [
+            (
+                IngestTreeStateDensificationSection {
+                    workers: Some(0),
+                    ..IngestTreeStateDensificationSection::default()
+                },
+                "ingest.tree_state_densification.workers",
+            ),
+            (
+                IngestTreeStateDensificationSection {
+                    max_rows_per_second: Some(0),
+                    ..IngestTreeStateDensificationSection::default()
+                },
+                "ingest.tree_state_densification.max_rows_per_second",
+            ),
+            (
+                IngestTreeStateDensificationSection {
+                    selection: Some(TreeStateSelectionName::CommitmentBudget),
+                    commitment_budget: Some(0),
+                    ..IngestTreeStateDensificationSection::default()
+                },
+                "ingest.tree_state_densification.commitment_budget",
+            ),
+            (
+                IngestTreeStateDensificationSection {
+                    commitment_budget: Some(1_024),
+                    ..IngestTreeStateDensificationSection::default()
+                },
+                "ingest.tree_state_densification.commitment_budget",
+            ),
+        ] {
+            let error = resolve_tree_state_densification(section)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(error.contains(field), "{field}: {error}");
+        }
     }
 
     #[test]

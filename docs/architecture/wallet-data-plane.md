@@ -91,7 +91,7 @@ Full blocks exist only when ingest writes block blobs, which requires `storage.r
 
 `TreeStateAtHeight(height, at_epoch_id)` returns the Sapling, Orchard, and Ironwood note commitment tree states after the block at exactly `height`. The response height always equals the requested height. The server never asks the node.
 
-Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at the tip where that sync ends, and at every block it appends afterwards. A height with a checkpoint is read directly. Any other height is rebuilt from the nearest checkpoint below it and the stored compact blocks in between, which replays at most 99 blocks.
+Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at the tip where that sync ends, and at every block it appends afterwards. While following, it fills settled history from the first sync with a checkpoint for every block, as [Chain ingestion](chain-ingestion.md#tree-state-densification) describes. A height with a checkpoint is read directly. Any other height is rebuilt from the nearest checkpoint below it and the stored compact blocks in between, which replays at most 99 blocks.
 
 | Condition | Status and reason |
 | --- | --- |

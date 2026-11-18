@@ -25,12 +25,12 @@ use zinder_ingest::{
     MaterializedViewReplayConfig, MaterializedViewTailer, MempoolReadySignal,
     MempoolRetentionSettings, NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor,
     NodeFailover, NodeFailoverPolicy, NodeSourceKind, ReplayPrevoutCaches,
-    TransactionComponentBackfillConfig, TransactionComponentBackfillContext, VolumeSpaceGuard,
-    admit_canonical_store, canonical_control_channel, check_single_endpoint_genesis,
-    classify_phase, follow_admitted_canonical_store, mempool_ready_channel,
-    missing_required_capability, open_primary_materialized_view_store, run_live_mempool_owner,
-    run_mempool_retention, seed_backfill_owned_consumer_cursors,
-    spawn_conventional_fee_distribution_backfill_task,
+    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
+    TreeStateDensificationContext, VolumeSpaceGuard, admit_canonical_store,
+    canonical_control_channel, check_single_endpoint_genesis, classify_phase,
+    follow_admitted_canonical_store, mempool_ready_channel, missing_required_capability,
+    open_primary_materialized_view_store, run_live_mempool_owner, run_mempool_retention,
+    seed_backfill_owned_consumer_cursors, spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_node_endpoint_monitor, spawn_runtime_memory_metrics_task,
     spawn_transaction_component_backfill_task, spawn_undo_index_pruning_task,
@@ -315,6 +315,14 @@ async fn run_ingest(
         "resolved Explorer views configuration"
     );
     let volume_space_guard = materialized_view_plane.volume_space_guard.clone();
+    let canonical_reorg_policy = materialized_view_plane.reorg_policy;
+    // Without views no replay ever reports catching up, so historical work
+    // waits only for the writer to follow the tip.
+    let historical_work_gate = if command_config.explorer_views {
+        HistoricalWorkGate::new(writer_readiness.clone())
+    } else {
+        HistoricalWorkGate::without_materialized_views(writer_readiness.clone())
+    };
     let mut worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config,
@@ -330,7 +338,7 @@ async fn run_ingest(
         materialized_view_plane: tokio::spawn(run_materialized_view_plane(
             materialized_view_plane,
             readiness.clone(),
-            HistoricalWorkGate::new(writer_readiness.clone()),
+            historical_work_gate.clone(),
             worker_cancel.clone(),
         )),
         replay_budget_metrics: command_config.explorer_views.then(|| {
@@ -342,6 +350,7 @@ async fn run_ingest(
                 worker_cancel.clone(),
             )
         }),
+        tree_state_densification: None,
     };
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
@@ -356,6 +365,20 @@ async fn run_ingest(
         &control_server_cancel,
         &mut writer_config,
     );
+    worker_tasks.tree_state_densification = canonical_control_tasks
+        .densification_writer
+        .take()
+        .map(|writer| {
+            zinder_ingest::spawn_tree_state_densification_task(
+                tree_state_densification_context(
+                    &command_config,
+                    Arc::clone(&network_upgrade_activations),
+                    canonical_reorg_policy,
+                    (writer, historical_work_gate),
+                ),
+                worker_cancel.clone(),
+            )
+        });
     log_canonical_writer_start(&command_config, &writer_config);
     let admission = Box::pin(supervise_canonical_writer(
         admit_canonical_store(
@@ -424,6 +447,8 @@ type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
 struct CanonicalControlTasks {
     server: Option<CanonicalControlServer>,
     commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
+    /// Command handle the tree-state densification pass commits through.
+    densification_writer: Option<CanonicalControlHandle>,
     pending_mempool: Option<PendingMempoolTasks>,
     mempool_owner: Option<JoinHandle<()>>,
     mempool_retention: Option<JoinHandle<()>>,
@@ -473,8 +498,10 @@ fn spawn_canonical_control_tasks(
     server_cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
+    let densification_enabled = command_config.tree_state_densification.enabled;
     if let Some(listen_addr) = command_config.ingest_control_listen_addr {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
+        let densification_writer = densification_enabled.then(|| canonical_control_handle.clone());
         let mempool = command_config.runtime_config.mempool;
         let mempool_owner =
             LiveMempoolOwner::with_reconciliation_batch_target_raw_transaction_bytes(
@@ -535,20 +562,37 @@ fn spawn_canonical_control_tasks(
         CanonicalControlTasks {
             server: Some(canonical_control_server),
             commands: Some(canonical_control_commands),
+            densification_writer,
             pending_mempool: Some(pending_mempool),
             mempool_owner: None,
             mempool_retention: None,
             server_completed: false,
         }
     } else {
-        CanonicalControlTasks {
-            server: None,
-            commands: None,
-            pending_mempool: None,
-            mempool_owner: None,
-            mempool_retention: None,
-            server_completed: false,
-        }
+        control_tasks_without_listener(densification_enabled)
+    }
+}
+
+/// Control tasks for a writer no other process reaches.
+///
+/// Tree-state densification commits through the writer's command queue, which
+/// exists only with a control listener, so it does not run here.
+fn control_tasks_without_listener(densification_enabled: bool) -> CanonicalControlTasks {
+    if densification_enabled {
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "tree_state_densification_unavailable",
+            "tree-state densification needs ingest_control.listen_addr, so it does not run"
+        );
+    }
+    CanonicalControlTasks {
+        server: None,
+        commands: None,
+        densification_writer: None,
+        pending_mempool: None,
+        mempool_owner: None,
+        mempool_retention: None,
+        server_completed: false,
     }
 }
 
@@ -718,6 +762,7 @@ struct IngestWorkerTaskHandles {
     node_endpoint_monitor: Option<JoinHandle<()>>,
     materialized_view_plane: JoinHandle<()>,
     replay_budget_metrics: Option<JoinHandle<()>>,
+    tree_state_densification: Option<JoinHandle<()>>,
 }
 
 async fn shutdown_ingest_worker_tasks(
@@ -750,6 +795,46 @@ async fn shutdown_ingest_worker_tasks(
             replay_budget_metrics,
         )
         .await;
+    }
+    if let Some(tree_state_densification) = worker_tasks.tree_state_densification {
+        await_worker_task("tree_state_densification", tree_state_densification).await;
+    }
+}
+
+const TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX: &str = ".tree-state-densification-secondary";
+/// The pass reads each stride once, so its secondary needs only a small block
+/// cache beside the writer's own. Open files stay at the canonical budget,
+/// as for the other ingest secondaries.
+const TREE_STATE_DENSIFICATION_BLOCK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn densification_secondary_budget(canonical: RocksDbResourceBudget) -> RocksDbResourceBudget {
+    let mut budget = canonical;
+    budget.block_cache_bytes = canonical
+        .block_cache_bytes
+        .min(TREE_STATE_DENSIFICATION_BLOCK_CACHE_BYTES);
+    budget
+}
+
+fn tree_state_densification_context(
+    command_config: &IngestCommandConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    reorg_policy: CanonicalReorgPolicy,
+    (writer, gate): (CanonicalControlHandle, HistoricalWorkGate),
+) -> TreeStateDensificationContext<CanonicalControlHandle> {
+    let runtime_config = &command_config.runtime_config;
+    let mut secondary_path = OsString::from(runtime_config.storage_path.as_os_str());
+    secondary_path.push(TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX);
+    TreeStateDensificationContext {
+        canonical_primary_path: runtime_config.storage_path.clone(),
+        secondary_path: PathBuf::from(secondary_path),
+        network_upgrade_activations,
+        workload: CanonicalStoreWorkload::Wallet,
+        raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
+        reorg_policy,
+        resource_budget: densification_secondary_budget(runtime_config.canonical_rocksdb_budget),
+        writer,
+        gate,
+        config: command_config.tree_state_densification,
     }
 }
 
@@ -2046,6 +2131,7 @@ source = "zebra-json-rpc"
                 Result<(), tonic::transport::Error>,
             >())),
             commands: None,
+            densification_writer: None,
             pending_mempool: None,
             mempool_owner: Some(tokio::spawn(std::future::pending())),
             mempool_retention: Some(mempool_retention),

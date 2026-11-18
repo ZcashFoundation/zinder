@@ -112,7 +112,13 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_source_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of ingest's node requests. |
 | `zinder_ingest_source_retry_total` | counter | `operation` | Node requests retried within one call. |
 | `zinder_ingest_source_fetch_active` | gauge | `operation` | Node fetches in flight. |
-| `zinder_ingest_historical_work_gate_open` | gauge | | 1 when ingest follows the tip and Explorer views have caught up, so backfills may run. |
+| `zinder_ingest_historical_work_gate_open` | gauge | | 1 when ingest follows the tip and, if Explorer views are enabled, they have caught up, so backfills and tree-state densification may run. |
+| `zinder_ingest_tree_state_densification_strides_total` | counter | `outcome` | Settled 100-block strides the densification pass finished: `densified` when the writer committed it, even with no rows left to add, or `integrity_failure` when its stored blocks or checkpoints are damaged or do not replay to each other. Any `integrity_failure` is store damage; the pass skips that stride until ingest restarts. |
+| `zinder_ingest_tree_state_densification_remaining_strides` | gauge | | Strides the last scan found that the pass has not finished yet. |
+| `zinder_ingest_tree_state_densification_rows_written_total` | counter | | Tree-state checkpoint rows the pass wrote. |
+| `zinder_ingest_tree_state_densification_replayed_commitments_total` | counter | | Note commitments the pass appended while replaying strides. |
+| `zinder_ingest_tree_state_densification_stride_duration_seconds` | histogram | | Time to replay one stride. |
+| `zinder_ingest_tree_state_densification_retries_total` | counter | | Steps the pass retried after a store or writer error. |
 | `zinder_explorer_views_admitted` | gauge | | 1 when ingest admitted its Explorer view store. |
 | `zinder_ingest_raw_blob_disabled_total` | counter | `table` | Rows stored without raw bytes under the raw-blob policy. |
 
