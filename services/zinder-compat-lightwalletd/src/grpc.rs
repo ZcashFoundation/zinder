@@ -67,6 +67,13 @@ const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
+/// Most distinct transactions one `GetMempoolStream` sends between tip changes.
+///
+/// The stream remembers each id it sent so it can skip repeats, and that set
+/// only resets when the stream closes on a tip change. The bound keeps a
+/// stalled tip from growing it without limit; it is far above what a Zcash
+/// mempool turns over in one block interval.
+const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
 
 /// Response bounds for [`LightwalletdGrpcAdapter`].
 ///
@@ -878,14 +885,12 @@ where
         let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
             stream::StreamExt::filter_map(event_stream, added_mempool_entry),
         );
-        let mut delivered_transaction_ids = HashSet::new();
-        let raw_transaction_stream =
-            stream::StreamExt::filter_map(entry_stream, move |entry_outcome| match entry_outcome {
-                Ok(entry) => delivered_transaction_ids
-                    .insert(entry.transaction_id())
-                    .then(|| Ok(mempool_raw_transaction(&entry))),
-                Err(status) => Some(Err(status)),
-            });
+        let raw_transaction_stream = each_once_up_to(
+            entry_stream,
+            zinder_core::MempoolEntry::transaction_id,
+            MAX_MEMPOOL_STREAM_TRANSACTIONS,
+        )
+        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
 
         let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
             if let Some(watcher) = self.tip_change_watcher.clone() {
@@ -1960,6 +1965,48 @@ where
     tokio_stream::wrappers::ReceiverStream::new(output_receiver)
 }
 
+/// Passes each item whose `key` it has not yielded before, and errors are
+/// passed through unchanged.
+///
+/// After `max_distinct` distinct keys, the next new key ends the stream with
+/// `UNAVAILABLE`, which lightwalletd clients retry, instead of letting the
+/// seen set grow or letting a repeat through.
+fn each_once_up_to<S, T, K>(
+    streamed: S,
+    key: impl Fn(&T) -> K + Send + 'static,
+    max_distinct: usize,
+) -> impl tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static,
+    T: Send + 'static,
+    K: Eq + std::hash::Hash + Send + 'static,
+{
+    let mut seen = HashSet::new();
+    let mut exhausted = false;
+    stream::StreamExt::filter_map(streamed, move |outcome| {
+        if exhausted {
+            return None;
+        }
+        match outcome {
+            Ok(streamed) => {
+                let streamed_key = key(&streamed);
+                if seen.contains(&streamed_key) {
+                    return None;
+                }
+                if seen.len() >= max_distinct {
+                    exhausted = true;
+                    return Some(Err(Status::unavailable(format!(
+                        "stream sent {max_distinct} distinct transactions without a tip change; reconnect"
+                    ))));
+                }
+                seen.insert(streamed_key);
+                Some(Ok(streamed))
+            }
+            Err(status) => Some(Err(status)),
+        }
+    })
+}
+
 /// Streams live-mempool entries page by page, starting with the
 /// already-fetched first page and fetching later pages only as the consumer
 /// pulls, so the walk never materializes the whole mempool.
@@ -2111,6 +2158,19 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[tokio::test]
+    async fn each_once_up_to_skips_repeats_and_ends_unavailable_past_the_bound() {
+        let streamed = tokio_stream::iter([1, 2, 1, 2, 3, 4].map(Ok::<u8, Status>));
+        let outcomes: Vec<Result<u8, Status>> =
+            each_once_up_to(streamed, |id: &u8| *id, 2).collect().await;
+
+        let codes: Vec<Result<u8, tonic::Code>> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.map_err(|status| status.code()))
+            .collect();
+        assert_eq!(codes, vec![Ok(1), Ok(2), Err(tonic::Code::Unavailable)]);
     }
 
     #[test]
