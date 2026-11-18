@@ -12,7 +12,7 @@ use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
-use zinder_source::{NodeSource, SourceFailureClass};
+use zinder_source::{NodeSource, SourceError, SourceFailureClass};
 
 use super::{
     CandidateEvaluation, EndpointAdmission, EndpointExclusion, FailoverShared, FenceTips,
@@ -139,7 +139,7 @@ where
 {
     if active {
         Observation::ActiveHealth {
-            ready: health_of(endpoint).await,
+            ready: readiness_of(endpoint).await.ok(),
         }
     } else {
         evaluate_candidate(shared, endpoint, admitted_activations, fence).await
@@ -190,20 +190,21 @@ where
     true
 }
 
-/// Returns the endpoint's readiness, or `None` when it did not answer.
+/// Returns whether the endpoint reports ready, or the error when it did not
+/// answer.
 ///
 /// An endpoint without a readiness signal counts as ready: the tip checks
 /// still require it to hold ingest's chain.
-pub(super) async fn health_of<Endpoint>(endpoint: &Endpoint) -> Option<bool>
+pub(super) async fn readiness_of<Endpoint>(endpoint: &Endpoint) -> Result<bool, SourceError>
 where
-    Endpoint: NodeSource,
+    Endpoint: NodeSource + ?Sized,
 {
     match endpoint.poll_upstream_health().await {
-        Ok(snapshot) => Some(snapshot.ready_for_queries),
+        Ok(snapshot) => Ok(snapshot.ready_for_queries),
         Err(error) if error.upstream_classification() == SourceFailureClass::CapabilityMissing => {
-            Some(true)
+            Ok(true)
         }
-        Err(_) => None,
+        Err(error) => Err(error),
     }
 }
 
@@ -240,12 +241,13 @@ where
         EndpointAdmission::Excluded(exclusion) => {
             return ineligible(IneligibleReason::Refused(exclusion));
         }
+        EndpointAdmission::Ineligible(reason) => return ineligible(reason),
         EndpointAdmission::Unreachable(_) | EndpointAdmission::Deferred => return unreachable,
     }
-    match health_of(endpoint).await {
-        Some(true) => {}
-        Some(false) => return ineligible(IneligibleReason::NotReady),
-        None => return unreachable,
+    match readiness_of(endpoint).await {
+        Ok(true) => {}
+        Ok(false) => return ineligible(IneligibleReason::NotReady),
+        Err(_) => return unreachable,
     }
     let Some(fence) = fence else {
         return Observation::Standby {
@@ -269,43 +271,43 @@ where
         Err(ChainStandingError::DivergedAtOrBelowSettlement) => {
             ineligible(IneligibleReason::DivergedAtOrBelowSettlement)
         }
-        Err(ChainStandingError::Unreachable) => unreachable,
+        Err(ChainStandingError::Unreachable(_)) => unreachable,
     }
 }
 
-enum ChainStandingError {
+pub(super) enum ChainStandingError {
     DivergedAtOrBelowSettlement,
-    Unreachable,
+    Unreachable(SourceError),
 }
 
 /// Returns `Some(false)` when the endpoint holds ingest's visible tip,
 /// `Some(true)` when it shares the settled tip but not the visible tip, and
 /// `None` when its tip is below ingest's.
-async fn chain_standing<Endpoint>(
+pub(super) async fn chain_standing<Endpoint>(
     endpoint: &Endpoint,
     fence: FenceTips,
 ) -> Result<Option<bool>, ChainStandingError>
 where
-    Endpoint: NodeSource,
+    Endpoint: NodeSource + ?Sized,
 {
     let tip = endpoint
         .tip_id()
         .await
-        .map_err(|_| ChainStandingError::Unreachable)?;
+        .map_err(ChainStandingError::Unreachable)?;
     if tip.height < fence.local_tip.height {
         return Ok(None);
     }
     let at_local_tip = endpoint
         .fetch_block_at(fence.local_tip.height)
         .await
-        .map_err(|_| ChainStandingError::Unreachable)?;
+        .map_err(ChainStandingError::Unreachable)?;
     if at_local_tip.hash == fence.local_tip.hash {
         return Ok(Some(false));
     }
     let at_settled_tip = endpoint
         .fetch_block_at(fence.settled_tip.height)
         .await
-        .map_err(|_| ChainStandingError::Unreachable)?;
+        .map_err(ChainStandingError::Unreachable)?;
     if at_settled_tip.hash == fence.settled_tip.hash {
         Ok(Some(true))
     } else {

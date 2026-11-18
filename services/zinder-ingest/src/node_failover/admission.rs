@@ -10,6 +10,11 @@ use zinder_source::{
 };
 use zinder_store::CanonicalReadyStoreSummary;
 
+use super::{
+    FenceTips, IneligibleReason,
+    monitor::{ChainStandingError, chain_standing, readiness_of},
+};
+
 /// Capabilities every node endpoint ingest reads from must advertise.
 pub const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
@@ -87,6 +92,11 @@ pub enum EndpointAdmission {
     Unreachable(SourceError),
     /// The endpoint answered with evidence that it cannot serve this store.
     Excluded(EndpointExclusion),
+    /// A fallback that passed every endpoint check cannot start ingest on
+    /// the store now, for example because its chain differs from the store's
+    /// at or below the settled tip. The endpoint is evaluated again while
+    /// ingest runs.
+    Ineligible(IneligibleReason),
     /// The endpoint was still being checked when a lower position was
     /// admitted. The standby monitor checks it, its genesis block included.
     Deferred,
@@ -144,6 +154,39 @@ impl EndpointAdmission {
         }
     }
 
+    /// Checks that a fallback admitted by [`Self::check`] could take over
+    /// the READY `store` as a switch target could: it reports ready, its tip
+    /// is at or above the store's visible tip, and it holds the visible tip
+    /// or, on another branch above the settled tip, the settled tip.
+    ///
+    /// A fallback that fails is never followed, because a chain that differs
+    /// at or below the settled tip would park the writer.
+    async fn check_takeover<Source>(
+        self,
+        endpoint: &Source,
+        store: &CanonicalReadyStoreSummary,
+    ) -> Self
+    where
+        Source: NodeSource + ?Sized,
+    {
+        let Self::Admitted(admitted) = self else {
+            return self;
+        };
+        match readiness_of(endpoint).await {
+            Ok(true) => {}
+            Ok(false) => return Self::Ineligible(IneligibleReason::NotReady),
+            Err(error) => return Self::Unreachable(error),
+        }
+        match chain_standing(endpoint, FenceTips::of_store(store)).await {
+            Ok(Some(_)) => Self::Admitted(admitted),
+            Ok(None) => Self::Ineligible(IneligibleReason::Lagging),
+            Err(ChainStandingError::DivergedAtOrBelowSettlement) => {
+                Self::Ineligible(IneligibleReason::DivergedAtOrBelowSettlement)
+            }
+            Err(ChainStandingError::Unreachable(error)) => Self::Unreachable(error),
+        }
+    }
+
     /// Stable label of the verdict.
     #[must_use]
     pub const fn label(&self) -> &'static str {
@@ -151,6 +194,7 @@ impl EndpointAdmission {
             Self::Admitted(_) => "admitted",
             Self::Unreachable(_) => "unreachable",
             Self::Excluded(exclusion) => exclusion.label(),
+            Self::Ineligible(reason) => reason.label(),
             Self::Deferred => "deferred",
         }
     }
@@ -205,10 +249,12 @@ impl NodeEndpointAdmissions {
         let mut checks = nodes
             .endpoints()
             .map(|(position, endpoint)| async move {
-                (
-                    position,
-                    EndpointAdmission::check(endpoint, Some(genesis_hash)).await,
-                )
+                let verdict = EndpointAdmission::check(endpoint, Some(genesis_hash)).await;
+                let verdict = match store {
+                    Some(store) if position > 0 => verdict.check_takeover(endpoint, store).await,
+                    Some(_) | None => verdict,
+                };
+                (position, verdict)
             })
             .collect::<FuturesUnordered<_>>();
         let mut decided = std::iter::repeat_with(|| None)
@@ -314,6 +360,7 @@ fn settled_active_position(decided: &[Option<EndpointAdmission>]) -> Option<usiz
             Some(
                 EndpointAdmission::Unreachable(_)
                 | EndpointAdmission::Excluded(_)
+                | EndpointAdmission::Ineligible(_)
                 | EndpointAdmission::Deferred,
             ) => {}
         }
@@ -347,6 +394,9 @@ fn summarize(verdicts: &[EndpointAdmission]) -> String {
             }
             EndpointAdmission::Excluded(exclusion) => {
                 format!("position {position}: excluded ({exclusion})")
+            }
+            EndpointAdmission::Ineligible(reason) => {
+                format!("position {position}: ineligible ({})", reason.label())
             }
             EndpointAdmission::Deferred => format!("position {position}: deferred"),
         })

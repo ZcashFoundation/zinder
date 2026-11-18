@@ -6,7 +6,7 @@ use rust_rocksdb::{
     Options, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 use zinder_core::{
-    CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
+    BlockId, CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
 };
 
@@ -36,7 +36,7 @@ use super::{
         MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY,
         MempoolEventRetentionProgress, validate_mempool_lifecycle_admission,
     },
-    publication::validate_ready_publication,
+    publication::{read_chain_epoch_tips, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
 };
 
@@ -48,9 +48,24 @@ use super::{
 pub struct CanonicalReadyStoreSummary {
     admitted_activations: Option<NetworkUpgradeActivations>,
     construction_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    visible_tip: BlockId,
+    settled_tip: BlockId,
 }
 
 impl CanonicalReadyStoreSummary {
+    /// Returns the visible tip of the store's READY fence.
+    #[must_use]
+    pub const fn visible_tip(&self) -> BlockId {
+        self.visible_tip
+    }
+
+    /// Returns the settled tip of the visible chain epoch, below which a
+    /// reorg is beyond the store's window.
+    #[must_use]
+    pub const fn settled_tip(&self) -> BlockId {
+        self.settled_tip
+    }
+
     /// Returns whether `activations` is exactly the table the store follows:
     /// its latest writer-admitted schedule revision or, before the first
     /// revision, the table it was constructed with.
@@ -846,8 +861,15 @@ impl RocksDbCanonicalStore {
             })?
             .ok_or_else(|| CanonicalStoreError::admission(path, "store identity is absent"))?;
         let control = decode_store_control(path, &encoded_control)?;
-        if !matches!(control.build_state, CanonicalStoreBuildState::Ready(_)) {
+        let CanonicalStoreBuildState::Ready(ready_evidence) = control.build_state else {
             return Ok(None);
+        };
+        let (visible_tip, settled_tip) = read_chain_epoch_tips(&db, ready_evidence.visible_epoch)?;
+        if visible_tip != ready_evidence.visible_tip {
+            return Err(CanonicalStoreError::admission(
+                path,
+                "visible chain epoch does not match the READY fence",
+            ));
         }
         Ok(Some(CanonicalReadyStoreSummary {
             admitted_activations: read_admitted_schedule(&db, path, &control)?
@@ -855,6 +877,8 @@ impl RocksDbCanonicalStore {
             construction_activations_fingerprint: control
                 .build_plan
                 .network_upgrade_activations_fingerprint(),
+            visible_tip,
+            settled_tip,
         }))
     }
 

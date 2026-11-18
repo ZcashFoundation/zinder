@@ -904,6 +904,58 @@ async fn startup_refuses_a_fallback_that_would_admit_the_first_schedule_revision
     Ok(())
 }
 
+/// With a READY store, a fallback starts ingest only when it could take over
+/// as a switch target, so startup never follows a fork below settlement.
+///
+/// A fallback that differs from the store at or below the settled tip, lags
+/// the visible tip, or reports not ready is skipped, not excluded, and the
+/// next one that qualifies starts ingest.
+#[tokio::test]
+async fn startup_skips_a_fallback_that_could_not_take_over_the_store() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory: directory,
+    } = published_store().await?;
+    drop(store);
+    let store_summary = read_ready_store_summary(&directory.path().join("canonical"))?
+        .ok_or("the store is READY")?;
+    assert_eq!(store_summary.visible_tip(), block_id(&blocks, 2)?);
+    assert_eq!(store_summary.settled_tip(), block_id(&blocks, 1)?);
+    let unreachable_primary = FailoverEndpoint::serving(&blocks, 4)?;
+    unreachable_primary.set_unreachable(true);
+    let forked_below_settlement =
+        FailoverEndpoint::serving(&forked_parseable_chain(&blocks, 1, 4, 53)?, 4)?;
+    let lagging = FailoverEndpoint::serving(&blocks, 1)?;
+    let syncing = FailoverEndpoint::serving(&blocks, 4)?;
+    syncing.set_ready(false);
+    let holding = FailoverEndpoint::serving(&blocks, 4)?;
+    let (nodes, _switch) = NodeSet::new(
+        unreachable_primary,
+        [forked_below_settlement, lagging, syncing, holding],
+    );
+
+    let admissions =
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, Some(&store_summary)).await?;
+    let labels = admissions
+        .verdicts()
+        .map(|(_, verdict)| verdict.label())
+        .collect::<Vec<_>>();
+
+    assert_eq!(admissions.active_position(), 4);
+    assert_eq!(
+        labels,
+        [
+            "unreachable",
+            IneligibleReason::DivergedAtOrBelowSettlement.label(),
+            IneligibleReason::Lagging.label(),
+            IneligibleReason::NotReady.label(),
+            "admitted",
+        ]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn startup_fails_when_no_endpoint_is_admitted() -> TestResult {
     let blocks = parseable_multi_block_chain()?;

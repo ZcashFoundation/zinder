@@ -231,7 +231,11 @@ the same way, so only `[node]` can bring a new table; the comparison
 waits until every lower position has a verdict, so a fallback that already
 advertises the table `[node]` brings stays a standby. An endpoint that times out,
 fails a call, or does not report its storage mode is unreachable
-(`node_endpoint_unreachable`) and is evaluated again. When no endpoint is
+(`node_endpoint_unreachable`) and is evaluated again. With a READY store, a
+fallback must also qualify as a switch target would: report ready, have a tip
+at or above the store's visible tip, and hold the visible tip or the settled
+tip. Otherwise it is skipped (`node_endpoint_skipped`) and evaluated again, so
+startup never follows a chain that differs at or below the settled tip. When no endpoint is
 admitted, startup fails with the readiness `[node]` alone would have reported.
 A single-endpoint deployment keeps its startup checks unchanged and runs no
 genesis check.

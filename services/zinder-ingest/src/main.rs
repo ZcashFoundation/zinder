@@ -1369,6 +1369,13 @@ fn log_endpoint_admissions(admissions: &NodeEndpointAdmissions) {
                 detail = %exclusion,
                 "node endpoint is excluded until ingest restarts"
             ),
+            EndpointAdmission::Ineligible(reason) => tracing::warn!(
+                target: "zinder::ingest",
+                event = "node_endpoint_skipped",
+                position,
+                reason = reason.label(),
+                "node endpoint cannot start ingest on the store now; it is evaluated again while ingest runs"
+            ),
             EndpointAdmission::Deferred => tracing::info!(
                 target: "zinder::ingest",
                 event = "node_endpoint_deferred",

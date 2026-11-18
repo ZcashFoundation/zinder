@@ -353,6 +353,15 @@ struct FenceTips {
     settled_tip: BlockId,
 }
 
+impl FenceTips {
+    const fn of_store(store: &zinder_store::CanonicalReadyStoreSummary) -> Self {
+        Self {
+            local_tip: store.visible_tip(),
+            settled_tip: store.settled_tip(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ValuePoolCapabilities {
     chain_value_pools: bool,
@@ -417,6 +426,7 @@ impl EndpointRecord {
                 (None, NodeEndpointState::Pending)
             }
             EndpointAdmission::Unreachable(_) => (None, NodeEndpointState::Unreachable),
+            EndpointAdmission::Ineligible(reason) => (None, NodeEndpointState::Ineligible(*reason)),
         };
         Self {
             excluded,
@@ -514,10 +524,8 @@ where
             return false;
         };
         let check = async {
-            match monitor::health_of(endpoint).await {
-                Some(true) => {}
-                Some(false) => return Ok(Some(IneligibleReason::NotReady.label())),
-                None => return Ok(Some("unreachable")),
+            if !monitor::readiness_of(endpoint).await? {
+                return Ok(Some(IneligibleReason::NotReady.label()));
             }
             let tip = endpoint.tip_id().await?;
             if tip.height < fence.local_tip.height {
