@@ -23,6 +23,8 @@ and wire contracts that actually carry versions.
 | `WalletProjectionReader` | Immutable wallet side of an admitted serving pair |
 | `WalletServingReadPair` | Canonical and wallet readers proven to describe one exact fence |
 | `WalletServingQuery` | `WalletQueryApi` implementation over an atomically replaceable serving pair, shared by native and compatibility runtimes |
+| `NodeBroadcast` | The configured node endpoint a wallet query broadcasts through, verified on first contact against the serving pair's writer-admitted schedule before any transaction reaches it |
+| `BroadcastNodeProbe` | Source seam for that verification: the endpoint's advertised methods and its activation table |
 | `WalletServingPairPublisher` | Serving-runtime owner that catches up, admits, and publishes process-local serving pairs |
 | `MaterializedViewConsumer` | Explorer materialized-view consumer that applies retained canonical events |
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
@@ -223,7 +225,11 @@ validated before storage opens or listeners bind.
 Release configuration is grouped by owner:
 
 - `[network]`, `[node]`, `[node.auth]`, `[node.indexer_tls]`, `[ops]`, and
-  `[security]` are shared sections;
+  `[security]` are shared sections. Ingest requires `[node]`. Query and
+  wallet-mode compatibility accept it only for transaction broadcast and
+  start without contacting the node; without it they serve storage only.
+  Explorer accepts it for the upstream-tip probe. The projector and
+  compact-blocks compatibility reject it;
 - `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
   `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
   `[ingest_control]` configure the canonical writer;
@@ -291,8 +297,8 @@ variable.
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
-| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. Compatibility with `compat.serving = "compact-blocks"` runs no node probe and ignores every `node.health` setting. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
-| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to refresh the node dependency their readiness reports; compact-blocks compatibility ignores it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
+| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. Compatibility with `compat.serving = "compact-blocks"` rejects every node setting. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
+| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify their broadcast node on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
 | `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to disable the endpoint entirely. |
@@ -335,7 +341,7 @@ variable.
 | `ZINDER_QUERY__REORG_WINDOW_BLOCKS` | zinder-query | Optional | `query.reorg_window_blocks` | Exact canonical replacement-depth identity expected by native query. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
-| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet settings, and no canonical or legacy aliases are accepted. |
+| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS` | zinder-compat-lightwalletd | Optional | `compat.pair_convergence_attempts` | Maximum bounded attempts to converge and admit compatibility's wallet-serving pair or compact-serving canonical secondary. Must be in 1..=64; defaults to 12. |
 | `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; defaults to 100. |
@@ -416,7 +422,13 @@ For native wallet serving, the admitted query derives and privately owns one
 immutable `NativeWalletEndpointCapabilities` set after storage and provider
 admission. Native `WalletServerInfo` and the operational endpoint receive that
 same set; operators cannot select a profile or override individual support
-claims. The static capability registry owns identifiers and method
+claims. `wallet.broadcast.transaction_v1` is the one capability that follows
+configuration rather than probed evidence: it is advertised exactly when a node
+endpoint is configured, because readers start without contacting their node.
+Until that endpoint passes first-contact verification, a broadcast fails with
+`UNAVAILABLE` and `NODE_UNAVAILABLE`, and `WalletServerInfo.node` stays empty.
+Once it passes, `WalletServerInfo.node` lists the capabilities the verified
+endpoint advertised. The static capability registry owns identifiers and method
 associations, but does not select a runtime subset.
 
 Capability names describe semantics, not implementation. Do not expose

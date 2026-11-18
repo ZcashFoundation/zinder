@@ -67,9 +67,10 @@ upgrade table, so it needs neither schedule admission nor a store rebuild.
    `network_upgrade_schedule_revision`. The first admission records revision 1;
    later admissions increment it only when the table changed.
 5. Start the readers in dependency order: `zinder-projector`, `zinder-query`,
-   then `zinder-compat-lightwalletd` and Explorer. A reader started before
-   ingest finishes admission refuses to open the store; restart it after
-   ingest is ready.
+   then `zinder-compat-lightwalletd` and Explorer. Readers take the table from
+   the store, not from the node, so they need no node to start. A reader
+   started before a store's first admission waits for it within its
+   convergence bound; restart it if it gave up before ingest was ready.
 6. Confirm that `WalletQuery.NetworkUpgradeActivations` returns the new table,
    including the new upgrade's branch ID and height.
 
@@ -86,9 +87,17 @@ Ingest leaves the store unchanged when it refuses a table.
 | `adds an activation at or below canonical tip` | The new upgrade activates at or below the store's tip. For example, a Testnet store with blocks at 4,465,026 or above was built from a chain without NU7. | Rebuild the store or restore a bundle whose tip is below the activation height. |
 | `differs from admitted schedule revision` | The node's table changes an activation the store has already crossed. | Restore the node's earlier activations for those heights, then restart ingest. |
 
-A reader reports `restart the canonical writer so it admits the node's schedule`
-when its node advertises a newer table than the store has admitted. Start or
-restart ingest first, then restart the reader.
+A reader whose storage open ends with `has no writer-admitted network-upgrade
+schedule yet` started against a store that ingest has never opened. Start
+ingest, then restart the reader.
+
+Query and compatibility check their broadcast node's table against the
+admitted schedule when they first reach it. A node whose table disagrees at or
+below the served tip, for example a node left on another network, never
+receives a transaction: `/readyz` lists `node_source` under `degraded` with
+`node_unavailable` and failure class `protocol_mismatch`, and every broadcast
+fails with `NODE_UNAVAILABLE`. Point the reader at a node on the store's chain;
+the reader verifies it again on its next probe round without a restart.
 
 ## Related
 

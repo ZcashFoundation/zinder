@@ -215,6 +215,9 @@ wait for a healthy projector. Query and compatibility wait only for the ingest
 container to start, not for it to be healthy, because they share its network
 namespace and keep serving through a node outage that leaves ingest
 unhealthy. Query and compatibility receive five-minute startup grace periods.
+The projector has no node settings, and query and compatibility do not
+contact the node to start: they reach it only to broadcast transactions,
+after checking on first contact that it serves the store's chain.
 
 ### Attach a Zakura node
 

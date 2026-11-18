@@ -83,13 +83,38 @@ one pair before reading. Test and library callers cannot mutate the slot or
 install a replacement that bypasses retention, fence, or source-identity
 admission.
 
-The release query admits one probed `NodeSource` and installs that same source
-as its transaction broadcaster. Transaction broadcast is the only node-backed
-capability: it requires the probed broadcast feature, the concrete
-broadcaster, and `TipId`, which is the liveness prerequisite. Tree state at
-any height is served from the serving pair, so
+Transaction broadcast is the only node-backed capability. Tree state at any
+height is served from the serving pair, so
 `wallet.read.tree_state_at_height_v2` needs no node evidence and is always
-advertised. The release
+advertised. A reader starts without contacting its node, so broadcast evidence
+cannot be collected before composition. The release query instead installs
+the operator's configured node endpoint as a `NodeBroadcast`, and
+`wallet.broadcast.transaction_v1` is advertised exactly when a node endpoint
+is configured. A query without a node serves storage only and omits the
+capability.
+
+The configured endpoint is verified on first contact, in the background,
+before any transaction reaches it. `rpc.discover` must list
+`sendrawtransaction`, and the node's `getblockchaininfo` activation table must
+agree with the serving pair's writer-admitted schedule through the visible
+tip. That table is specific to one network and chain, so it rejects a node on
+another network or fork. Until verification passes, every broadcast fails with
+`UNAVAILABLE` and `NODE_UNAVAILABLE`, and the node dependency reports why
+under `degraded`. Verification is shared by every clone of the endpoint, runs
+once at a time, retries on every node-probe round until it passes, and then
+holds for the process lifetime.
+
+Advertising broadcast from configuration keeps the capability set fixed for
+the process, which every discovery surface and `zinder-client` consumer relies
+on: a client that read `ServerInfo` before the node answered never loses a
+capability that becomes usable later. The alternative, advertising broadcast
+only after verification, would change the published set once at runtime and
+leave clients that cached the earlier set without broadcast. A misconfigured
+endpoint is therefore advertised but fails every broadcast with the retryable
+`NODE_UNAVAILABLE`, and the operator sees it as a degraded node dependency
+rather than as a missing capability. `ServerInfo.node` stays empty until the
+endpoint passes verification and then reports the capabilities the verified
+endpoint advertised. The release
 query also admits one `AdmittedIngestControl` before opening storage or binding
 traffic. Admission opens an authenticated channel once, calls `ServerInfo`,
 and requires the exact `zinder-ingest` service identity, network, contract
@@ -144,16 +169,19 @@ Capability discovery is not a health check. Pair publication and replica lag
 may change readiness, and provider health may degrade a dependency, but none of
 them rewrites the endpoint contract.
 
-`WalletServingReadiness` retains pair state, admitted-node state, and
-ingest-control health independently. The pair state alone decides readiness.
-Node and ingest-control health are dependencies that the shared operational
-and gRPC readiness handle reports under `degraded`, except that a parked
-writer's halt reported through ingest control refuses traffic. Shutdown
-dominates later writes.
-The node liveness task runs only when the query advertises a node-backed
-capability, and uses `tip_id` plus upstream synchronization health through the
-exact admitted source; it never repeats capability discovery or
-mutates the cached structural feature set. The ingest-control task calls
+`WalletServingReadiness` retains pair state, node state, and ingest-control
+health independently. The pair state alone decides readiness. Node and
+ingest-control health are dependencies that the shared operational and gRPC
+readiness handle reports under `degraded`, except that a parked writer's halt
+reported through ingest control refuses traffic. Shutdown dominates later
+writes.
+The node task runs only when a node endpoint is configured. While the endpoint
+is unverified, each round runs its first-contact verification and reports a
+failure as `node_unavailable`, with the failure class `protocol_mismatch` for
+an activation table that disagrees, or as `node_capability_missing`. A
+verified endpoint is then observed through `tip_id` plus upstream
+synchronization health; the task never changes the advertised capability
+set. The ingest-control task calls
 `WriterStatus` and `MempoolSnapshot(max_entries = 1)` through the admitted
 channel and validates coherent network and tip evidence. On failure it
 publishes `ingest_control_unavailable` as the dependency's cause, or relays
@@ -602,6 +630,13 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-18: Readers start without contacting their node. Transaction
+  broadcast is advertised when a node endpoint is configured, instead of after
+  a startup probe of `OpenRpcDiscovery`, `TransactionBroadcast`, and `TipId`.
+  The endpoint is verified on first contact in the background against the
+  serving pair's writer-admitted schedule, and every broadcast fails with
+  `NODE_UNAVAILABLE` until it passes. `ServerInfo.node` reports the verified
+  endpoint, and a query without a node serves storage only.
 - 2026-11-17: Readiness follows the serving pair. Node-source and
   ingest-control health degrade the readiness report and fail only the
   requests that call them, instead of refusing every request with

@@ -34,17 +34,20 @@ executed by the process that owns that primary.
 
 Source-node access is capability-specific:
 
-- `zinder-ingest` owns chain selection, block acquisition, and mempool
-  ingestion.
-- `zinder-projector` may discover network activation parameters needed to
-  validate canonical identity; it does not fetch projection rows from the node.
-- `zinder-query` may broadcast transactions and discover consensus
-  activations. It does not use the node as a fallback for indexed chain
-  history, and it serves tree state at any height from stored checkpoints and
-  compact blocks.
-- `zinder-compat-lightwalletd` may broadcast transactions and discover
-  consensus activations. It does not use the node as a fallback for indexed
-  chain history, and it serves `GetTreeState` from storage through the query.
+- `zinder-ingest` owns chain selection, block acquisition, mempool ingestion,
+  and discovery of the network-upgrade activations it admits into the store.
+  It is the only runtime that needs its node to start.
+- `zinder-projector` uses no node. It reads the activation schedule the
+  canonical writer admitted.
+- `zinder-query` may broadcast transactions through a node it verifies on
+  first contact, and starts without contacting it. It reads activations from
+  the writer-admitted schedule, does not use the node as a fallback for
+  indexed chain history, and serves tree state at any height from stored
+  checkpoints and compact blocks.
+- `zinder-compat-lightwalletd` may broadcast transactions in wallet mode, as
+  the query does, and uses no node in compact-blocks mode. It does not use the
+  node as a fallback for indexed chain history, and it serves `GetTreeState`
+  from storage through the query.
 
 ## Storage ownership
 

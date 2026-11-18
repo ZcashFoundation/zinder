@@ -32,8 +32,8 @@ gate calls `/readyz` before each compatibility request, so it closed the
 public route. The single-host entrypoint counted an ingest `node_unavailable`
 or `upstream_not_ready` toward its restart budgets and restarted the container
 after at most an hour of contiguous outage, or sooner when the node flapped.
-A restart during a node outage turns it into a full outage, because ingest and
-the readers need the node to start.
+A restart during a node outage turns it into a full outage, because ingest
+needs the node to start.
 
 Explorer and the Cipherscan adapter already keep serving through upstream
 outages, for the same reason: reflecting an upstream outage in readiness
@@ -235,10 +235,11 @@ ingest.
 - Wallet-mode compatibility starts only against an ingest endpoint that passes
   `AdmittedIngestControl`, so, like native query, it fails at startup against
   an ingest of another network or contract revision.
-- A reader restart during a node outage still fails, because the readers probe
-  the node at startup and ingest needs the node to open its store and confirm
-  its tip. Apart from compatibility's ingest-control admission, this decision
-  does not change startup.
+- Readers start without contacting the node
+  ([ADR-0039](0039-writer-admitted-network-upgrade-schedules.md#readers)), so a
+  reader restart during a node outage serves again once its pair converges.
+  An ingest restart during the outage still refuses the readers, because
+  ingest needs the node to open its store and confirm its tip.
 
 ## Alternatives considered
 
@@ -264,3 +265,9 @@ ingest.
 - **Keep readiness conjunctive.** Rejected for the reasons in
   [Context](#context): it refuses every stored read without making any request
   succeed.
+
+## Revision history
+
+- 2026-11-18: Readers no longer need the node to start, so a reader restart
+  during a node outage keeps serving. Only an ingest restart still turns a
+  node outage into a full outage.
