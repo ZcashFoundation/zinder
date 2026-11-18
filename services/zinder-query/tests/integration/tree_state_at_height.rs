@@ -9,6 +9,12 @@
 //! most heights are reconstructed from the nearest checkpoint and the stored
 //! compact blocks. The expected trees come from appending every block's note
 //! commitments from genesis, independent of any stored checkpoint.
+//!
+//! The tests probe the heights beside each checkpoint, pool activation, and
+//! replaced range: the first height above a seed, the longest replay below a
+//! checkpoint, and replays that cross an activation. Heights between them take
+//! the same replay path, so probing them would only add cost: each probe
+//! derives every pool's root, which takes milliseconds in a debug build.
 
 use std::sync::{
     Arc,
@@ -42,14 +48,18 @@ const ORCHARD_ACTIVATION_HEIGHT: u32 = 37;
 const IRONWOOD_ACTIVATION_HEIGHT: u32 = 150;
 
 #[tokio::test]
-async fn tree_state_at_every_retained_height_matches_the_trees_its_compact_blocks_build()
+async fn tree_state_around_checkpoints_and_activations_matches_the_trees_its_compact_blocks_build()
 -> eyre::Result<()> {
     let activations = gap_activations()?;
     let chain = with_note_commitments(
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(230),
         &activations,
     )?;
-    let expected = commitment_tree_checkpoints(&chain, &activations)?;
+    let probed_heights = [
+        1, 2, 36, 37, 38, 99, 100, 101, 149, 150, 151, 199, 200, 201, 229, 230,
+    ]
+    .map(BlockHeight::new);
+    let expected = commitment_tree_checkpoints(&chain, &activations, &probed_heights)?;
     let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
     let served = NodelessQuery::over(writer.into_serving_store_fixture()?, &activations).await?;
 
@@ -86,7 +96,9 @@ async fn tree_state_at_a_checkpointed_store_replays_from_its_history_floor() -> 
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(260),
         &activations,
     )?;
-    let expected = commitment_tree_checkpoints(&chain, &activations)?;
+    let probed_heights =
+        [130, 131, 132, 149, 150, 151, 199, 200, 201, 259, 260].map(BlockHeight::new);
+    let expected = commitment_tree_checkpoints(&chain, &activations, &probed_heights)?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_history_floor(floor_height),
         &activations,
@@ -101,10 +113,7 @@ async fn tree_state_at_a_checkpointed_store_replays_from_its_history_floor() -> 
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(reason(&status), "BLOCK_NOT_IN_BEST_CHAIN");
     }
-    for checkpoint in expected
-        .iter()
-        .filter(|checkpoint| checkpoint.block_id.height >= floor_height)
-    {
+    for checkpoint in &expected {
         served.assert_tree_state(checkpoint).await?;
     }
     assert_eq!(served.node_calls(), 0);
@@ -126,13 +135,15 @@ async fn tree_state_after_a_live_replacement_serves_the_replacement_chain() -> e
         &activations,
     )?;
     writer.replace_live_blocks(&replacement, first_replaced_height)?;
-    let expected = commitment_tree_checkpoints(&replacement, &activations)?;
-    let displaced = commitment_tree_checkpoints(&original, &activations)?;
-    for (displaced, replacing) in displaced
-        .iter()
-        .zip(&expected)
-        .filter(|(displaced, _)| displaced.block_id.height >= first_replaced_height)
-    {
+    let probed_heights = [
+        1, 99, 100, 101, 119, 120, 121, 130, 131, 132, 149, 150, 151, 154, 155,
+    ]
+    .map(BlockHeight::new);
+    let expected = commitment_tree_checkpoints(&replacement, &activations, &probed_heights)?;
+    let replaced_heights = [131, 132, 149, 150].map(BlockHeight::new);
+    let displaced = commitment_tree_checkpoints(&original, &activations, &replaced_heights)?;
+    let replacing = commitment_tree_checkpoints(&replacement, &activations, &replaced_heights)?;
+    for (displaced, replacing) in displaced.iter().zip(&replacing) {
         assert_ne!(
             displaced.frontiers,
             replacing.frontiers,

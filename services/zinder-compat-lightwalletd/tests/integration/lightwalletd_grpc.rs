@@ -2423,7 +2423,8 @@ async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node(
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(150),
         &activations,
     )?;
-    let expected = commitment_tree_checkpoints(&chain, &activations)?;
+    let probed_heights = [1, 2, 57, 99, 100, 101, 149, 150].map(BlockHeight::new);
+    let expected = commitment_tree_checkpoints(&chain, &activations, &probed_heights)?;
     let tip = chain
         .blocks()
         .last()
@@ -2435,10 +2436,8 @@ async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node(
     )?;
     let adapter = acceptance_adapter(&store_fixture);
 
-    for height in [1_u32, 2, 57, 99, 100, 101, 149, 150] {
-        let checkpoint = expected
-            .get(usize::try_from(height - 1)?)
-            .ok_or_else(|| eyre!("no expected tree state at height {height}"))?;
+    for checkpoint in &expected {
+        let height = checkpoint.block_id.height.value();
         let tree_state = adapter
             .get_tree_state(Request::new(lightwalletd::BlockId {
                 height: u64::from(height),

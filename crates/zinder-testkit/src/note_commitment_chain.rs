@@ -7,8 +7,10 @@
 //! production-store fixture built from such a chain derives each checkpoint
 //! from those commitments, so a reader that replays compact blocks from a
 //! checkpoint must reach the same trees. [`commitment_tree_checkpoints`]
-//! derives the expected trees independently, one block at a time from
-//! genesis.
+//! derives the expected trees at chosen heights independently, one block at a
+//! time from genesis.
+
+use std::collections::BTreeMap;
 
 use eyre::{Result, ensure, eyre};
 use zinder_core::{
@@ -110,27 +112,37 @@ pub fn with_note_commitments(
     Ok(annotated)
 }
 
-/// Derives the commitment-tree checkpoint after every block of `chain`.
+/// Derives the commitment-tree checkpoint after the block of `chain` at each
+/// of `heights`, in the order given.
 ///
 /// The trees start empty at genesis and append each compact block's note
 /// commitments in wire order, so the result does not depend on any stored
-/// checkpoint. Entry `i` is the checkpoint after the block at height `i + 1`.
+/// checkpoint. Only the requested heights are encoded: encoding a checkpoint
+/// derives every pool's root, which costs far more than appending a block.
 ///
 /// # Errors
 ///
 /// Returns an error when a compact block's commitments cannot be appended or
-/// do not reach the tree sizes its chain metadata records.
+/// do not reach the tree sizes its chain metadata records, or when `chain` has
+/// no block at one of `heights`.
 pub fn commitment_tree_checkpoints(
     chain: &ChainFixture,
     activations: &NetworkUpgradeActivations,
+    heights: &[BlockHeight],
 ) -> Result<Vec<CommitmentTreeCheckpoint>> {
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
         BlockHeight::new(0),
         &CommitmentTreeFrontiers::default(),
         activations,
     )?;
-    let mut checkpoints = Vec::new();
+    let Some(last_height) = heights.iter().max().copied() else {
+        return Ok(Vec::new());
+    };
+    let mut checkpoints = BTreeMap::new();
     for compact_block in chain.compact_block_artifacts() {
+        if compact_block.height() > last_height {
+            break;
+        }
         let mut sapling = Vec::new();
         let mut orchard = Vec::new();
         let mut ironwood = Vec::new();
@@ -174,13 +186,26 @@ pub fn commitment_tree_checkpoints(
             "compact block {} records tree sizes its commitments do not reach",
             compact_block.height().value()
         );
-        checkpoints.push(CommitmentTreeCheckpoint::new(
-            BlockId::new(compact_block.height(), compact_block.block_hash()),
-            compact_block.time(),
-            accumulator.validated_frontiers()?,
-        ));
+        if heights.contains(&compact_block.height()) {
+            checkpoints.insert(
+                compact_block.height(),
+                CommitmentTreeCheckpoint::new(
+                    BlockId::new(compact_block.height(), compact_block.block_hash()),
+                    compact_block.time(),
+                    accumulator.validated_frontiers()?,
+                ),
+            );
+        }
     }
-    Ok(checkpoints)
+    heights
+        .iter()
+        .map(|height| {
+            checkpoints
+                .get(height)
+                .cloned()
+                .ok_or_else(|| eyre!("chain fixture has no block at height {}", height.value()))
+        })
+        .collect()
 }
 
 /// Note commitments one block adds to each pool.
