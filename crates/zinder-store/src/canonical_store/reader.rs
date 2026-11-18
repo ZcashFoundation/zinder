@@ -5,16 +5,15 @@ use std::mem::size_of;
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CompactBlockArtifact, Network, NetworkUpgradeActivations, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-    UnixTimestampMillis,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
+    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore,
     block_load::{
         BLOCK_HEADER_VALUE_LEN, decode_tree_state_checkpoint, encode_block_position,
@@ -1059,7 +1058,10 @@ fn decode_chain_epoch(
         visible_tip_hash: BlockHash::from_bytes(read_array(encoded, 5)?),
         settled_tip_height: BlockHeight::new(read_u32_le(encoded, 37)?),
         settled_tip_hash: BlockHash::from_bytes(read_array(encoded, 41)?),
-        artifact_schema_version: ArtifactSchemaVersion::new(CANONICAL_STORE_SCHEMA_VERSION),
+        // The epoch row stores no version, so an epoch reports the artifact
+        // schema version of this binary, the value `ServerInfo` reports, not
+        // the store layout version.
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(
             read_u32_le(encoded, 73)?,
             read_u32_le(encoded, 77)?,
@@ -1148,7 +1150,38 @@ fn read_array<const LENGTH: usize>(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+    use zinder_core::BlockHeight;
+
     use super::{BOUNDED_COMPACT_BLOCK_BATCH_SIZE, bounded_batch_len};
+    use crate::{
+        CURRENT_ARTIFACT_SCHEMA_VERSION, canonical_store::live_replacement_tests::published_store,
+    };
+
+    /// A canonical epoch names the artifact schema its artifacts use, the
+    /// version `ServerInfo` reports, not the store's own layout version.
+    #[test]
+    fn a_chain_epoch_carries_the_artifact_schema_version() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store = published_store(
+            &temporary.path().join("canonical"),
+            2,
+            BlockHeight::new(5),
+            BlockHeight::new(5),
+        )?;
+        let visible = store.chain_epoch()?;
+
+        assert_eq!(
+            visible.artifact_schema_version,
+            CURRENT_ARTIFACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store.chain_epoch_at(visible.id)?.artifact_schema_version,
+            CURRENT_ARTIFACT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_bounded_batch_fits_the_budget_left_at_the_largest_row_read() {

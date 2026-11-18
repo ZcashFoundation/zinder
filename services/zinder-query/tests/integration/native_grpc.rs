@@ -1816,3 +1816,36 @@ async fn spawn_ingest_control_server(
 
     Ok((listen_addr, cancel, server))
 }
+
+/// Every served chain epoch names the artifact schema version that
+/// `ServerInfo` reports, so a client can compare the two.
+#[tokio::test]
+async fn served_chain_epochs_report_the_server_info_artifact_schema_version() -> eyre::Result<()> {
+    let (grpc_adapter, _store_fixture, _ingest_control_fixture) = native_adapter().await?;
+
+    let server_info =
+        WalletQueryService::server_info(&grpc_adapter, Request::new(wallet::ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or_else(|| eyre!("native ServerInfo omitted its descriptor"))?;
+    let served_epoch = WalletQueryService::visible_tip_block(
+        &grpc_adapter,
+        Request::new(wallet::VisibleTipBlockRequest { at_epoch_id: None }),
+    )
+    .await?
+    .into_inner()
+    .chain_view
+    .and_then(|chain_view| chain_view.chain_epoch)
+    .ok_or_else(|| eyre!("missing response chain epoch"))?;
+
+    assert_eq!(
+        served_epoch.artifact_schema_version,
+        server_info.schema_version
+    );
+    assert_eq!(
+        server_info.schema_version,
+        u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value())
+    );
+    Ok(())
+}
