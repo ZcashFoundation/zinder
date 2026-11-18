@@ -1,3 +1,4 @@
+mod broadcast_fallback;
 mod canonical_construction;
 mod cli;
 mod deep_chain;

@@ -58,7 +58,7 @@ pub use ingest_control::{
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
-pub use node_broadcast::NodeBroadcast;
+pub use node_broadcast::OrderedBroadcaster;
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
@@ -83,10 +83,11 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
 
-    /// Returns the diagnostic capability snapshot of the node endpoint this
-    /// query broadcasts through, once that endpoint passed first-contact
+    /// Returns the diagnostic capability snapshot of the first verified node
+    /// endpoint, in broadcast preference order, that this query broadcasts
+    /// through, or `None` while no endpoint has passed first-contact
     /// verification.
-    fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities>;
+    fn upstream_node_capabilities(&self) -> Option<UpstreamNodeCapabilities>;
 
     /// Returns the network-upgrade activation table the canonical writer
     /// admitted with the current serving pair.

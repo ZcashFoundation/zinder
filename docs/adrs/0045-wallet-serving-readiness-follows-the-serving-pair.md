@@ -213,12 +213,15 @@ ingest.
   compact-block sync, block and transaction reads, transparent address reads,
   subtree roots, tree state at any height, chain events, and
   `GetLightdInfo`.
-- Broadcast fails per request while the node is unavailable. It is the only
-  wallet-serving request that calls the node, so a wallet that is catching up
-  keeps scanning through a node outage.
-- A load balancer keeps routing to a reader whose broadcasts fail. With several
-  readers on different nodes, nothing steers a broadcast to a healthy node
-  until reader failover exists.
+- Broadcast fails per request while no node endpoint of the reader is
+  available. It is the only wallet-serving request that calls the node, so a
+  wallet that is catching up keeps scanning through a node outage.
+- A reader moves a broadcast past an unreachable endpoint of its ordered node
+  list ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)),
+  so a reader with a reachable verified fallback keeps broadcasting through a
+  `[node]` outage. A load balancer still keeps routing to a reader whose
+  broadcasts fail because none of its endpoints answers, and nothing steers a
+  broadcast between readers.
 - A wallet that applies the ZIP 203 default expiry delta of 40 blocks to a
   served tip that is more than about 40 blocks behind the network builds a
   transaction that the network rejects as expired. The served-epoch age alert
@@ -268,6 +271,9 @@ ingest.
 
 ## Revision history
 
+- 2026-11-18: A reader moves a broadcast past an unreachable endpoint of its
+  ordered node list, so the broadcast consequence covers only the case where
+  none of its endpoints answers.
 - 2026-11-18: Readers no longer need the node to start, so a reader restart
   during a node outage keeps serving. Only an ingest restart still turns a
   node outage into a full outage.

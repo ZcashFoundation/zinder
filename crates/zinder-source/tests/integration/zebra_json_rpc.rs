@@ -2649,3 +2649,78 @@ async fn holds_block_above_the_node_tip_is_block_unavailable() -> eyre::Result<(
     );
     Ok(())
 }
+
+fn broadcast_source(
+    json_rpc_addr: &str,
+    broadcast_timeout: Option<Duration>,
+) -> Result<ZebraJsonRpcSource, SourceError> {
+    ZebraJsonRpcSource::with_options(
+        Network::ZcashRegtest,
+        json_rpc_addr,
+        NodeAuth::None,
+        zinder_source::ZebraJsonRpcSourceOptions {
+            request_timeout: Duration::from_secs(30),
+            max_response_bytes: NonZeroU64::MIN.saturating_add((1 << 20) - 1),
+            broadcast_timeout,
+        },
+    )
+}
+
+/// A node that accepts the connection and never answers holds a broadcast
+/// only until `broadcast_timeout`, and the failure is classified as an
+/// unreachable node, which a reader's broadcast fails over on.
+#[tokio::test]
+async fn broadcast_to_a_hung_node_times_out_as_node_unreachable() -> eyre::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let held_connections = tokio::spawn(async move {
+        let mut open_connections = Vec::new();
+        while let Ok((connection, _)) = listener.accept().await {
+            open_connections.push(connection);
+        }
+        open_connections.len()
+    });
+    let source = broadcast_source(
+        &format!("http://{address}"),
+        Some(Duration::from_millis(200)),
+    )?;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        source.broadcast_transaction(RawTransactionBytes::new([0x01])),
+    )
+    .await?;
+    held_connections.abort();
+
+    let error = outcome
+        .err()
+        .ok_or_else(|| eyre!("a broadcast to a hung node must fail"))?;
+    assert_eq!(
+        error.upstream_classification(),
+        SourceFailureClass::NodeUnreachable,
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}
+
+/// A stopped node refuses the connection, which is also an unreachable node.
+#[tokio::test]
+async fn broadcast_to_a_refusing_node_fails_as_node_unreachable() -> eyre::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let source = broadcast_source(&format!("http://{address}"), Some(Duration::from_secs(5)))?;
+
+    let error = source
+        .broadcast_transaction(RawTransactionBytes::new([0x01]))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a broadcast to a stopped node must fail"))?;
+
+    assert_eq!(
+        error.upstream_classification(),
+        SourceFailureClass::NodeUnreachable,
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}

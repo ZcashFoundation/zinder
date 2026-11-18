@@ -39,8 +39,10 @@ Source-node access is capability-specific:
   It is the only runtime that needs its node to start.
 - `zinder-projector` uses no node. It reads the activation schedule the
   canonical writer admitted.
-- `zinder-query` may broadcast transactions through a node it verifies on
-  first contact, and starts without contacting it. It reads activations from
+- `zinder-query` may broadcast transactions through an ordered list of node
+  endpoints, `[node]` and then each `[node_fallbacks.N]`. It verifies each
+  endpoint on first contact, starts without contacting any of them, and moves
+  a broadcast past an unreachable endpoint. It reads activations from
   the writer-admitted schedule, does not use the node as a fallback for
   indexed chain history, and serves tree state at any height from stored
   checkpoints and compact blocks.

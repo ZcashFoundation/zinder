@@ -7,7 +7,7 @@ use eyre::{Result, eyre};
 use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange};
-use zinder_query::{NodeBroadcast, WalletQueryApi, WalletServingQuery};
+use zinder_query::{OrderedBroadcaster, WalletQueryApi, WalletServingQuery};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
@@ -41,7 +41,7 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
     let live = live_serving_pair(&env, &activations, tip_height).await?;
-    let node = NodeBroadcast::new(live.source);
+    let node = OrderedBroadcaster::new(live.source, []);
     node.verify(&live.slot).await?;
     let wallet_query =
         WalletServingQuery::from_serving_pair_slot(live.slot).with_node_broadcast(Some(node));

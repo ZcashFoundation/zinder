@@ -42,7 +42,7 @@ composition and admission, from concrete evidence:
 - the serving pair's authenticated persisted `RawBlobRetention` and projection
   evidence;
 - the methods implemented by the production query;
-- the configured node endpoint behind the concrete `NodeBroadcast`; and
+- the configured node endpoints behind the concrete `OrderedBroadcaster`; and
 - any authenticated ingest-control dependencies whose methods the native
   adapter exposes.
 
@@ -87,24 +87,91 @@ height is served from the serving pair, so
 `wallet.read.tree_state_at_height_v2` needs no node evidence and is always
 advertised. A reader starts without contacting its node, so broadcast evidence
 cannot be collected before composition. The release query instead installs
-the operator's configured node endpoint as a `NodeBroadcast`, and
+the operator's ordered node endpoints, `[node]` and then each
+`[node_fallbacks.N]`, as an `OrderedBroadcaster`, and
 `wallet.broadcast.transaction_v1` is advertised exactly when a node endpoint
 is configured. A query without a node serves storage only and omits the
 capability.
 
-The configured endpoint is verified on first contact, in the background,
+Each configured endpoint is verified on first contact, in the background,
 before any transaction reaches it. `rpc.discover` must list
 `sendrawtransaction`, the node's `getblockchaininfo` activation table must
-agree with the serving pair's writer-admitted schedule through the visible
-tip, and `getblockhash` at the visible tip height must return the pair's tip
-hash. The table check rejects a node on another network. The block check
+agree with the serving pair's writer-admitted schedule through the height
+after the visible tip, which is the block a broadcast transaction targets, and
+`getblockhash` at the visible tip height must return the pair's tip hash. The table check rejects a node on another network. The block check
 rejects a node on another chain with the same schedule, such as a second
 regtest or a custom testnet with the same activation heights, and a node that
-has not reached the tip yet. Until verification passes, every broadcast fails with
-`UNAVAILABLE` and `NODE_UNAVAILABLE`, and the node dependency reports why
-under `degraded`. Verification is shared by every clone of the endpoint, runs
-once at a time, retries on every node-probe round until it passes, and then
-holds for the process lifetime.
+has not reached the tip yet. A broadcast reaches only verified endpoints.
+Until one passes, every broadcast fails with `UNAVAILABLE` and
+`NODE_UNAVAILABLE`, and the node dependency reports why under `degraded`.
+Each endpoint's verification is shared by every clone of the broadcaster and
+runs once at a time. The node probe verifies each endpoint on its own
+schedule, at every poll interval until it passes. An endpoint that answers
+only when its request times out therefore delays neither another endpoint's
+verification nor the liveness observation of the verified endpoints.
+
+A passed verification holds while the serving pair's schedule revision and the
+network upgrade active at the height after its visible tip stay the same. A
+revision changes only activations above the tip it was admitted at, and the
+tip can later cross one of them, so the node's table was checked only through
+the earlier height. The node's table can also schedule an upgrade at a height
+where the writer's schedule activates nothing, such as NU7 at 700 when the
+writer schedules it at 703. Crossing such a height changes neither the
+revision nor the writer's upgrade at the broadcast height, so a passed
+verification also records the first height above the checked one at which
+the node's table disagrees with the writer's schedule. A broadcast skips the
+endpoint once the height after the visible tip reaches that height. That
+height comes from the pair of the newest chain epoch that a broadcast or a
+verification has captured, so a request still holding an older pair cannot
+lower it. A change of the revision or of the upgrade, or a tip that
+reaches the endpoint's first disagreement, verifies the endpoint again at
+once. An endpoint that answers verification with
+positive evidence, a missing `sendrawtransaction` or a disagreeing table, is
+excluded and verified again after a backoff that starts at 30 seconds and
+doubles to 5 minutes, so a node fixed by its operator returns without a reader
+restart. Any other failure, including a timeout, an unreached tip, or another
+block at the tip height, which a reorg the pair has not published yet also
+produces, leaves the endpoint unverified until its next verification.
+
+The verification that runs when the tip crosses an activation often reaches a
+node that has not received that block yet. Such an inconclusive repeat
+therefore keeps the endpoint's earlier verification for up to one minute, and
+the endpoint is verified again every two seconds, or at the poll interval
+when it is shorter, until it passes, is refused, or the minute ends and it
+becomes unverified. The minute counts from the first inconclusive repeat and
+ends on time, so a broadcast after it skips the endpoint even while a
+verification still waits on the node, and a pair that returns to the earlier
+basis does not renew it. An earlier verification whose table disagrees with
+the writer's schedule at the new height is not kept. Only positive evidence
+excludes an endpoint at once.
+
+A broadcast tries the verified endpoints in order, starting at the preferred
+one, which is `[node]` until a failover moves it. It moves to the next
+endpoint when one fails with `node_unreachable`, which includes the expiry of
+its broadcast timeout, or rejects the transaction with `BadConsensusBranch`, as
+a node left on an older release after an upgrade activates does. Resending is
+safe because the bytes are identical. Every other answer, accepted or refused,
+ends the broadcast. When the broadcast moved past an endpoint for one of those
+two causes, the endpoint that answered becomes the preferred one. Skipping an
+endpoint that is not verified or is excluded moves nothing, so `[node]` keeps
+its place when another endpoint finishes verification first at startup. The
+preference is sticky, with no timed failback: verified endpoints are
+equivalent for broadcast, because the network propagates the transaction, and
+stickiness limits a hung endpoint's timeout to the broadcasts that reached it
+before another endpoint answered. When every endpoint rejects the consensus
+branch, the transaction itself is wrong, so the rejection is returned and the
+preference stays. When every verified endpoint is unreachable, the broadcast
+fails with `NODE_UNAVAILABLE` and readiness is unchanged.
+
+An unreachable endpoint may have accepted the transaction before it failed.
+When an earlier endpoint in the same broadcast was unreachable, a later
+`Duplicate` or `Queued` answer is therefore reported as `Accepted`, with the
+transaction id computed from the submitted bytes. Lightwalletd compatibility
+maps `Duplicate` to error code -27 and `Queued` to -25, and wallets read any
+nonzero code as a failed send. Bytes this build cannot decode keep the node's
+answer. For the same reason, a broadcast that no endpoint answered fails with
+the unreachable endpoint's `NODE_UNAVAILABLE`, which a wallet retries, even
+when another endpoint rejected the transaction with `BadConsensusBranch`.
 
 Advertising broadcast from configuration keeps the capability set fixed for
 the process, which every discovery surface and `zinder-client` consumer relies
@@ -114,9 +181,10 @@ only after verification, would change the published set once at runtime and
 leave clients that cached the earlier set without broadcast. A misconfigured
 endpoint is therefore advertised but fails every broadcast with the retryable
 `NODE_UNAVAILABLE`, and the operator sees it as a degraded node dependency
-rather than as a missing capability. `ServerInfo.node` stays empty until the
-endpoint passes verification and then reports the capabilities the verified
-endpoint advertised. The release
+rather than as a missing capability. `ServerInfo.node` stays empty while no
+endpoint has passed verification and otherwise reports the capabilities that
+the first verified endpoint, in broadcast preference order, advertised. The
+release
 query also admits one `AdmittedIngestControl` before opening storage or binding
 traffic. Admission opens an authenticated channel once, calls `ServerInfo`,
 and requires the exact `zinder-ingest` service identity, network, contract
@@ -177,13 +245,19 @@ ingest-control health are dependencies that the shared operational and gRPC
 readiness handle reports under `degraded`, except that a parked writer's halt
 reported through ingest control refuses traffic. Shutdown dominates later
 writes.
-The node task runs only when a node endpoint is configured. While the endpoint
-is unverified, each round runs its first-contact verification and reports a
-failure as `node_unavailable`, with the failure class `protocol_mismatch` for
-an activation table that disagrees, or as `node_capability_missing`. A
-verified endpoint is then observed through `tip_id` plus upstream
-synchronization health; the task never changes the advertised capability
-set. The ingest-control task calls
+The node task runs only when a node endpoint is configured. Each round
+verifies every endpoint that needs it. While no endpoint is verified, it
+reports the first endpoint's failure as `node_unavailable`, with the failure
+class `protocol_mismatch` for an activation table that disagrees, or as
+`node_capability_missing`. The verified endpoints are then observed in
+broadcast preference order through `tip_id` plus upstream synchronization
+health. An endpoint that fails with `node_unreachable` is passed over, and when
+a later one answers, it becomes the preferred endpoint, as a broadcast that
+failed over would make it. An idle reader whose preferred endpoint stops
+therefore stays ready, its next broadcast pays no timeout, and
+`ServerInfo.node` describes the endpoint that answers. The node dependency
+degrades only when no verified endpoint answers. The task never changes the
+advertised capability set. The ingest-control task calls
 `WriterStatus` and `MempoolSnapshot(max_entries = 1)` through the admitted
 channel and validates coherent network and tip evidence. On failure it
 publishes `ingest_control_unavailable` as the dependency's cause, or relays
@@ -630,8 +704,48 @@ broken link.
 Aliases keep obsolete names and constructors available for new code. The
 controlled consumer cutover uses the current contract without shims.
 
+### Exclude an endpoint after a consensus-branch rejection
+
+A wallet can submit a transaction built for the wrong branch, which every
+endpoint rejects with `BadConsensusBranch`. Excluding or re-verifying an
+endpoint on that rejection would let any client take broadcast offline. The
+node-side cause, a node on an older release past an activation, is caught
+instead by the verification that repeats when the network upgrade at the
+height after the tip changes.
+
+### Order broadcast endpoints by node health
+
+Polling every endpoint's synchronization health to choose the first one would
+skip a reachable node that is still syncing, whose refusal Zinder cannot yet
+tell apart from a transaction rejection. The exact refusal Zebra and Zakura
+return in that state is not captured, so the ordering stays sticky and
+health-blind until it is.
+
 ## Revision history
 
+- 2026-11-18: The node probe verifies each endpoint on its own schedule, so an
+  endpoint that hangs until its request timeout no longer delays another
+  endpoint's verification or the liveness observation. A passed verification
+  also ends once the height after the tip reaches the first height at which
+  the node's table disagrees with the writer's schedule, even when the
+  writer's schedule activates nothing there, and a broadcast skips the
+  endpoint from that height on.
+- 2026-11-18: Readers broadcast through the ordered node list. An
+  `OrderedBroadcaster` replaces `NodeBroadcast`, verifies each endpoint,
+  repeats a verification when the schedule revision or the tip's network
+  upgrade changes, excludes an endpoint with positive evidence for a doubling
+  backoff, moves within a broadcast past an unreachable endpoint or a
+  `BadConsensusBranch` rejection, and keeps the endpoint that answered
+  preferred. A duplicate or queued answer after an unreachable endpoint is
+  reported as accepted. `ServerInfo.node` reports the first verified endpoint
+  in preference order.
+- 2026-11-18: The table check covers the height after the visible tip, the
+  block a broadcast targets. Only a failover past an unreachable endpoint or a
+  `BadConsensusBranch` rejection moves the preference, and the node probe
+  moves it past an unreachable verified endpoint too. An inconclusive repeat
+  of a verification keeps the earlier one for up to one minute. A broadcast
+  no endpoint answered fails as unreachable when any endpoint was
+  unreachable.
 - 2026-11-18: Readers start without contacting their node. Transaction
   broadcast is advertised when a node endpoint is configured, instead of after
   a startup probe of `OpenRpcDiscovery`, `TransactionBroadcast`, and `TipId`.

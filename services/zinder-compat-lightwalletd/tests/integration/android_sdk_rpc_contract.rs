@@ -28,7 +28,7 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::{
-    NodeBroadcast, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    OrderedBroadcaster, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventEnvelope, RawBlobRetention};
 use zinder_testkit::{
@@ -125,7 +125,7 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let broadcaster = MockTransactionBroadcaster::accepted(accepted_transaction_id)
         .with_node_activations(activations.as_ref().clone());
     let slot = WalletServingPairSlot::new(serving_pair);
-    let node = NodeBroadcast::new(broadcaster.clone());
+    let node = OrderedBroadcaster::new(broadcaster.clone(), []);
     node.verify(&slot).await?;
     let query = WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?

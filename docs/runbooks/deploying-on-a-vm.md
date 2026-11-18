@@ -290,7 +290,9 @@ ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
 ```
 
 The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
-query, and compatibility. An empty `INDEXER_GRPC_ADDR` polls the fallback's
+query, and compatibility. As with `[node]`, query and compatibility start while
+the fallback cookie is unreadable, and broadcast through the fallback once they
+can read it and it passes verification. An empty `INDEXER_GRPC_ADDR` polls the fallback's
 mempool after a switch, as for `[node]`; to stream it over TLS, add the
 `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*_PATH` variables to `zinder-ingest`
 the way the indexer TLS overlay sets the `[node]` ones.
@@ -307,8 +309,19 @@ the fallback until the fallback fails or ingest restarts, and a restart starts
 at `[node]` again. Both nodes must advertise the same network-upgrade table;
 see [Upgrading the node](upgrading-the-node.md#with-a-fallback-node).
 
-Only ingest switches. Query and compatibility validate the list but still
-broadcast through `[node]`.
+Query and compatibility broadcast through the same list. They verify each
+endpoint before sending it a transaction, try `[node]` first, and move to the
+next verified endpoint when one is unreachable. The endpoint that answered
+after such a move stays preferred, and the node probe moves the preference the
+same way when the preferred endpoint stops answering. `docker compose logs
+zinder-query` shows `wallet_node_verified` or `wallet_node_excluded` for each
+position and `broadcast_endpoint_switched` when the preferred endpoint
+changes. Keep every endpoint's `broadcast_timeout_secs` well below wallet
+request deadlines, because a broadcast moves on only after it expires. Each
+endpoint takes its own value, and an endpoint without one waits for its own
+`request_timeout_secs` instead. The shipped configuration sets 7 seconds for
+`[node]`, and the overlay sets `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS`
+to 7 unless the env file overrides it.
 
 ### Attach an explorer consumer
 

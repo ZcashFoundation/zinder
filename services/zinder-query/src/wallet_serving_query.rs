@@ -39,13 +39,13 @@ use crate::{
     AdmittedIngestControl, ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents,
     CompactBlock, CompactBlockRange, DEFAULT_MAX_COMPACT_BLOCK_RANGE, DEFAULT_MAX_FULL_BLOCK_RANGE,
     FULL_BLOCK_STREAM_CHANNEL_CAPACITY, FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock,
-    FullBlockStream, NativeWalletEndpointCapabilities, NodeBroadcast, QueryError, RawTransaction,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
-    WalletServingPairSlot, WalletServingReadPair,
-    node_broadcast::NodeVerification,
+    FullBlockStream, NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError,
+    RawTransaction, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
+    WalletProjectionReader, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
+    node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
     validate_block_range, validate_subtree_root_range,
@@ -397,7 +397,7 @@ pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     native_ingest: NativeIngest,
     tree_state_replays: TreeStateReplayLimit,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
-    node_verification: Option<NodeVerification>,
+    node_verifications: Option<EndpointVerifications>,
 }
 
 impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcaster, NativeIngest> {
@@ -435,7 +435,7 @@ impl WalletServingQuery<()> {
             broadcaster: (),
             native_ingest: (),
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            node_verification: None,
+            node_verifications: None,
         }
     }
 }
@@ -464,7 +464,7 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
             broadcaster: (),
             native_ingest: ingest_control,
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            node_verification: None,
+            node_verifications: None,
         }
     }
 }
@@ -476,29 +476,30 @@ impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
 }
 
 impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
-    /// Broadcasts transactions through `node`, the operator's configured node
-    /// endpoint, or keeps the query storage-only when `node` is `None`.
+    /// Broadcasts transactions through `nodes`, the operator's ordered node
+    /// endpoints, or keeps the query storage-only when `nodes` is `None`.
     ///
-    /// With a node, the query advertises transaction broadcast from now on,
-    /// for the life of the process, without contacting the node. A broadcast
+    /// With nodes, the query advertises transaction broadcast from now on,
+    /// for the life of the process, without contacting any node. A broadcast
     /// fails with [`QueryError::Node`] carrying
-    /// [`zinder_source::SourceError::NodeUnavailable`] until the endpoint
-    /// passes [`NodeBroadcast::verify`], and only then reaches the node.
-    /// `ServerInfo` reports the verified endpoint's capabilities.
+    /// [`zinder_source::SourceError::NodeUnavailable`] until an endpoint
+    /// passes [`OrderedBroadcaster::verify`], and only verified endpoints
+    /// receive it. `ServerInfo` reports the capabilities of the first
+    /// verified endpoint in broadcast preference order.
     #[must_use]
     pub fn with_node_broadcast<Source>(
         self,
-        node: Option<NodeBroadcast<Source>>,
-    ) -> WalletServingQuery<Option<NodeBroadcast<Source>>, NativeIngest> {
-        let native_endpoint_capabilities = if node.is_some() {
+        nodes: Option<OrderedBroadcaster<Source>>,
+    ) -> WalletServingQuery<Option<OrderedBroadcaster<Source>>, NativeIngest> {
+        let native_endpoint_capabilities = if nodes.is_some() {
             self.native_endpoint_capabilities.with_node_broadcast()
         } else {
             self.native_endpoint_capabilities
         };
         WalletServingQuery {
             serving_pair_slot: self.serving_pair_slot,
-            node_verification: node.as_ref().map(NodeBroadcast::verification),
-            broadcaster: node,
+            node_verifications: nodes.as_ref().map(OrderedBroadcaster::verifications),
+            broadcaster: nodes,
             native_ingest: self.native_ingest,
             tree_state_replays: self.tree_state_replays,
             native_endpoint_capabilities,
@@ -593,10 +594,10 @@ where
         &self.native_endpoint_capabilities
     }
 
-    fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
-        self.node_verification
+    fn upstream_node_capabilities(&self) -> Option<UpstreamNodeCapabilities> {
+        self.node_verifications
             .as_ref()
-            .and_then(NodeVerification::verified_capabilities)
+            .and_then(EndpointVerifications::verified_capabilities)
     }
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
@@ -1200,12 +1201,15 @@ where
             {
                 return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
             }
-            let _pair = self.capture_pair();
+            let pair = self.capture_pair();
             if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
                 return Err(QueryError::BroadcastTransactionTooLarge {
                     actual: raw_transaction.len(),
                     maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
                 });
+            }
+            if let Some(node_verifications) = &self.node_verifications {
+                node_verifications.track_broadcast_height(&pair);
             }
             self.broadcaster
                 .broadcast_transaction(raw_transaction)

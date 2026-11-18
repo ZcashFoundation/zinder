@@ -36,7 +36,7 @@ use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
     TransactionBroadcastOutcome, TransactionId, UnixTimestampMillis,
 };
-use zinder_query::{NodeBroadcast, WalletQueryApi as _, WalletServingQuery};
+use zinder_query::{OrderedBroadcaster, WalletQueryApi as _, WalletServingQuery};
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
     NodeSource, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
@@ -205,7 +205,7 @@ async fn shielded_outputs_are_indexed_after_mining() -> Result<()> {
         source,
         store_fixture: _store_fixture,
     } = live_serving_pair(&env, &activations, tip).await?;
-    let node = NodeBroadcast::new(source);
+    let node = OrderedBroadcaster::new(source, []);
     node.verify(&slot).await?;
     let wallet_query =
         WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));

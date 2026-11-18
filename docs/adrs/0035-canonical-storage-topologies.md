@@ -539,9 +539,9 @@ Compose and Railway. The command's name and the parts of it that apply to
   Ingest fails over across `[node]` and `[node_fallbacks.N]`, which may mix
   Zebra and Zakura nodes
   ([ADR-0013](0013-source-failure-recovery-topology.md) Decision 8), in every
-  topology and without PostgreSQL. Reader node failover, for the query and
-  compatibility readers that each depend on one node today, is tracked
-  separately.
+  topology and without PostgreSQL. Query and wallet-mode compatibility
+  broadcast through the same ordered list
+  ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 
 ## Rejected alternatives
 
@@ -688,6 +688,9 @@ Measured behavior of `rocksdb-single-host` that still informs operators:
 
 ## Revision history
 
+- 2026-11-18: Node redundancy notes that readers broadcast through the
+  ordered node list
+  ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 - 2026-11-18: Node redundancy describes ingest failover across the ordered
   node list ([ADR-0013](0013-source-failure-recovery-topology.md)) instead of
   future work.

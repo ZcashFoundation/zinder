@@ -67,8 +67,8 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) pair_convergence_attempts: NonZeroU8,
     pub(crate) max_concurrent_block_range_streams: NonZeroU32,
     pub(crate) broadcaster: Option<NodeTarget>,
-    /// Fallback endpoints after `broadcaster`. Compatibility reads them but
-    /// does not use them yet; compact-blocks serving never does.
+    /// Endpoints wallet-mode broadcast tries after `broadcaster`, in position
+    /// order. Compact-blocks serving refuses them.
     pub(crate) node_fallbacks: Vec<NodeTarget>,
 }
 

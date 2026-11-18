@@ -36,9 +36,10 @@ use std::{
 };
 
 use crate::{
-    AdmittedIngestControl, CanonicalReader, NodeBroadcast, WalletProjectionReader,
+    AdmittedIngestControl, CanonicalReader, OrderedBroadcaster, WalletProjectionReader,
     WalletServingAdmissionError, WalletServingReadPair,
     ingest_control::wallet_ingest_control_request,
+    node_broadcast::{STALE_VERIFICATION_RETRY, VerificationBasis},
 };
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -69,7 +70,10 @@ use zinder_runtime::{
     connect_zinder_grpc, converge_on_canonical_writer_fence,
     writer_attests_network_upgrade_schedule,
 };
-use zinder_source::{BroadcastNodeProbe, NodeSource, SourceError, UpstreamHealthSnapshot};
+use zinder_source::{
+    BroadcastNodeProbe, NodeCapability, NodeSource, SourceError, SourceFailureClass,
+    UpstreamHealthSnapshot,
+};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
@@ -618,19 +622,31 @@ impl IngestControlObserver {
     }
 }
 
-/// Starts the verification and liveness probe for the node endpoint a wallet
-/// query broadcasts through.
+/// Starts the verification and liveness probe for the node endpoints a
+/// wallet query broadcasts through.
 ///
-/// While the endpoint is unverified, each round runs its first-contact
-/// verification against the pair `serving_pair_slot` serves, so a node that
-/// is down or on another chain when the reader starts is verified once it
-/// recovers. A verified endpoint is then observed through `tip_id` and
-/// upstream sync health. Every failure degrades the node-source dependency;
-/// it never closes the traffic gate, and each broadcast fails on its own.
-/// Without a node endpoint, the dependency reports ready and the task only
-/// waits for cancellation.
+/// Each endpoint is verified on its own schedule against the pair
+/// `serving_pair_slot` serves, as [`OrderedBroadcaster::verify`] describes,
+/// so an endpoint that is down or on another chain when the reader starts is
+/// verified once it recovers, and an endpoint that answers only when its
+/// request times out delays neither another endpoint's verification nor the
+/// liveness observation. An endpoint is verified again every
+/// `poll_interval`, every two seconds while a repeated verification stays
+/// inconclusive, and at once when a publication changes the pair's schedule
+/// revision or the network upgrade at the height after its tip, or brings
+/// that height to one at which the endpoint's table disagrees with the
+/// writer-admitted schedule. The verified endpoints are observed every
+/// `poll_interval`, and as soon as an endpoint's verification outcome
+/// changes, in broadcast preference order through `tip_id` and upstream sync
+/// health, moving past an unreachable one. When an endpoint after an
+/// unreachable one answers, it becomes the preferred endpoint, as a
+/// broadcast that failed over would make it. Every failure degrades the
+/// node-source dependency; it never closes the traffic gate, and each
+/// broadcast fails on its own. Without node endpoints, the dependency
+/// reports ready and the task only waits for cancellation.
+#[must_use]
 pub fn spawn_wallet_node_readiness_probe<Source>(
-    node: Option<NodeBroadcast<Source>>,
+    nodes: Option<OrderedBroadcaster<Source>>,
     serving_pair_slot: WalletServingPairSlot,
     readiness: WalletServingReadiness,
     poll_interval: Duration,
@@ -639,7 +655,7 @@ pub fn spawn_wallet_node_readiness_probe<Source>(
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
-    let Some(node) = node else {
+    let Some(nodes) = nodes else {
         readiness.publish_node_source_cause(ReadinessCause::Ready);
         return tokio::spawn(async move {
             cancel.cancelled().await;
@@ -647,93 +663,205 @@ where
     };
 
     tokio::spawn(async move {
-        let mut outage = None;
-        let mut verification_logged = None;
-        loop {
-            let observation = tokio::select! {
-                () = cancel.cancelled() => break,
-                observation = observe_wallet_node(
-                    &node,
-                    &serving_pair_slot,
-                    &mut verification_logged,
-                ) => observation,
-            };
-            match observation {
-                Ok(snapshot) if snapshot.ready_for_queries => {
-                    outage = None;
-                    readiness.publish_node_source_cause(ReadinessCause::Ready);
-                }
-                Ok(snapshot) => {
-                    outage = None;
-                    readiness.publish_node_source_cause(ReadinessCause::UpstreamNotReady(
-                        upstream_not_ready_detail(snapshot),
-                    ));
-                }
-                Err(SourceError::NodeCapabilityMissing { capability }) => {
-                    outage = None;
-                    readiness.publish_node_source_cause(ReadinessCause::NodeCapabilityMissing {
-                        capability: capability.name(),
-                    });
-                }
-                Err(error) => {
-                    let continued = WalletNodeOutage::continue_with(
-                        outage.as_ref(),
-                        error.upstream_classification().label(),
-                        &error.to_string(),
-                    );
-                    readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
-                        continued.detail.clone(),
-                    ));
-                    outage = Some(continued);
-                }
-            }
-
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(poll_interval) => {}
-            }
+        let probe = WalletNodeProbe {
+            outcomes: watch::Sender::new(vec![None; nodes.endpoint_count()]),
+            nodes,
+            serving_pair_slot,
+            poll_interval,
+        };
+        let verification = futures_util::future::join_all(
+            (0..probe.nodes.endpoint_count()).map(|position| probe.keep_verified(position)),
+        );
+        tokio::select! {
+            () = cancel.cancelled() => {}
+            _ = futures_util::future::join(verification, probe.observe_liveness(&readiness)) => {}
         }
     })
 }
 
-/// Verifies `node` unless it already passed, then observes its liveness.
-///
-/// `verification_logged` remembers whether the last verification outcome
-/// logged was a pass, so each transition is logged once.
-async fn observe_wallet_node<Source>(
-    node: &NodeBroadcast<Source>,
-    serving_pair_slot: &WalletServingPairSlot,
-    verification_logged: &mut Option<bool>,
-) -> Result<UpstreamHealthSnapshot, SourceError>
+/// The node endpoints one readiness probe verifies and observes.
+struct WalletNodeProbe<Source> {
+    nodes: OrderedBroadcaster<Source>,
+    serving_pair_slot: WalletServingPairSlot,
+    poll_interval: Duration,
+    /// The latest verification outcome of each endpoint, in position order,
+    /// or `None` before its first verification ends.
+    outcomes: watch::Sender<Vec<Option<Result<(), NodeFailure>>>>,
+}
+
+impl<Source> WalletNodeProbe<Source>
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
-    if node.verified_capabilities().is_none() {
-        match node.verify(serving_pair_slot).await {
-            Ok(_) => {
-                tracing::info!(
-                    target: "zinder::wallet_serving",
-                    event = "wallet_node_verified",
-                    "node endpoint passed first-contact verification; transaction broadcast reaches it"
-                );
-                *verification_logged = Some(true);
-            }
-            Err(error) => {
-                if *verification_logged != Some(false) {
-                    tracing::warn!(
-                        target: "zinder::wallet_serving",
-                        event = "wallet_node_verification_failed",
-                        failure_class = error.upstream_classification().label(),
-                        error = %error,
-                        "node endpoint has not passed first-contact verification; transaction broadcast fails until it does"
-                    );
-                    *verification_logged = Some(false);
-                }
-                return Err(error);
+    /// Verifies the endpoint at `position` whenever its verification is
+    /// due, without waiting on any other endpoint.
+    async fn keep_verified(&self, position: usize) {
+        let mut publications = self.serving_pair_slot.signals.publication.subscribe();
+        loop {
+            let basis = VerificationBasis::of(&self.serving_pair_slot.capture());
+            let outcome = self
+                .nodes
+                .verify_endpoint(position, &self.serving_pair_slot)
+                .await
+                .map_err(|error| NodeFailure::from(&error));
+            self.outcomes.send_if_modified(|outcomes| {
+                outcomes.get_mut(position).is_some_and(|latest| {
+                    let changed = latest.as_ref() != Some(&outcome);
+                    *latest = Some(outcome);
+                    changed
+                })
+            });
+            let next_round = if self.nodes.awaits_reverification(position) {
+                self.poll_interval.min(STALE_VERIFICATION_RETRY)
+            } else {
+                self.poll_interval
+            };
+            tokio::select! {
+                () = tokio::time::sleep(next_round) => {}
+                () = self.verification_ended(position, basis, &mut publications) => {}
             }
         }
     }
-    probe_wallet_node_readiness(node.source()).await
+
+    /// Returns once a publication ends what the last verification of the
+    /// endpoint at `position`, made against `basis`, established, or never
+    /// if the slot stops publishing.
+    async fn verification_ended(
+        &self,
+        position: usize,
+        basis: VerificationBasis,
+        publications: &mut watch::Receiver<()>,
+    ) {
+        while publications.changed().await.is_ok() {
+            let pair = self.serving_pair_slot.capture();
+            if self.nodes.verification_ended_by(position, basis, &pair) {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// Publishes the node dependency every `poll_interval` and whenever an
+    /// endpoint's verification outcome changes.
+    async fn observe_liveness(&self, readiness: &WalletServingReadiness) {
+        let mut outage = None;
+        let mut outcomes = self.outcomes.subscribe();
+        loop {
+            if let Some(observation) = self.observe().await {
+                publish_wallet_node_observation(readiness, observation, &mut outage);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(self.poll_interval) => {}
+                Ok(()) = outcomes.changed() => {}
+            }
+        }
+    }
+
+    /// Observes the liveness of the first verified endpoint in broadcast
+    /// preference order that is reachable, or reports why none is verified.
+    ///
+    /// Returns `None` while no endpoint is verified and no verification has
+    /// ended yet.
+    async fn observe(&self) -> Option<Result<UpstreamHealthSnapshot, NodeFailure>> {
+        let mut unreachable = None;
+        for (position, source) in self.nodes.verified_endpoints() {
+            match probe_wallet_node_readiness(source).await {
+                Err(error)
+                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                {
+                    unreachable = Some(error);
+                }
+                observation => {
+                    if unreachable.is_some() {
+                        self.nodes.prefer_after_unreachable(position);
+                    }
+                    return Some(observation.map_err(|error| NodeFailure::from(&error)));
+                }
+            }
+        }
+        unreachable.map_or_else(
+            || self.verification_failure().map(Err),
+            |error| Some(Err(NodeFailure::from(&error))),
+        )
+    }
+
+    /// Returns the failure of the first endpoint in broadcast preference
+    /// order whose last verification failed, or `None` before any
+    /// verification ends.
+    fn verification_failure(&self) -> Option<NodeFailure> {
+        let outcomes = self.outcomes.borrow();
+        if outcomes.iter().all(Option::is_none) {
+            return None;
+        }
+        let failure = self
+            .nodes
+            .preference_order()
+            .find_map(|position| outcomes.get(position)?.as_ref()?.as_ref().err().cloned());
+        drop(outcomes);
+        Some(failure.unwrap_or_else(|| {
+            NodeFailure::from(&SourceError::NodeUnavailable {
+                reason: "no node endpoint holds a first-contact verification".to_owned(),
+            })
+        }))
+    }
+}
+
+/// Why the node dependency is degraded, as the readiness report shows it.
+#[derive(Clone, Debug, PartialEq)]
+enum NodeFailure {
+    CapabilityMissing(NodeCapability),
+    Unavailable {
+        failure_class: &'static str,
+        reason: String,
+    },
+}
+
+impl From<&SourceError> for NodeFailure {
+    fn from(error: &SourceError) -> Self {
+        if let SourceError::NodeCapabilityMissing { capability } = error {
+            return Self::CapabilityMissing(*capability);
+        }
+        Self::Unavailable {
+            failure_class: error.upstream_classification().label(),
+            reason: error.to_string(),
+        }
+    }
+}
+
+fn publish_wallet_node_observation(
+    readiness: &WalletServingReadiness,
+    observation: Result<UpstreamHealthSnapshot, NodeFailure>,
+    outage: &mut Option<WalletNodeOutage>,
+) {
+    match observation {
+        Ok(snapshot) if snapshot.ready_for_queries => {
+            *outage = None;
+            readiness.publish_node_source_cause(ReadinessCause::Ready);
+        }
+        Ok(snapshot) => {
+            *outage = None;
+            readiness.publish_node_source_cause(ReadinessCause::UpstreamNotReady(
+                upstream_not_ready_detail(snapshot),
+            ));
+        }
+        Err(NodeFailure::CapabilityMissing(capability)) => {
+            *outage = None;
+            readiness.publish_node_source_cause(ReadinessCause::NodeCapabilityMissing {
+                capability: capability.name(),
+            });
+        }
+        Err(NodeFailure::Unavailable {
+            failure_class,
+            reason,
+        }) => {
+            let continued =
+                WalletNodeOutage::continue_with(outage.as_ref(), failure_class, &reason);
+            readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
+                continued.detail.clone(),
+            ));
+            *outage = Some(continued);
+        }
+    }
 }
 
 async fn probe_wallet_node_readiness(
@@ -2553,7 +2681,7 @@ mod tests {
         let source = MutableHealthSource::new()?;
         let (slot, _store) = regtest_serving_pair_slot()?;
         let capabilities = WalletServingQuery::from_serving_pair_slot(slot.clone())
-            .with_node_broadcast(Some(crate::NodeBroadcast::new(source.clone())))
+            .with_node_broadcast(Some(crate::OrderedBroadcaster::new(source.clone(), [])))
             .native_endpoint_capabilities()
             .clone();
         let admitted_capabilities = capabilities.clone();
@@ -2563,7 +2691,7 @@ mod tests {
         readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
-            Some(crate::NodeBroadcast::new(source.clone())),
+            Some(crate::OrderedBroadcaster::new(source.clone(), [])),
             slot,
             readiness,
             Duration::from_millis(5),
@@ -2656,7 +2784,7 @@ mod tests {
         let source = MutableHealthSource::new()?;
         source.available.store(false, Ordering::SeqCst);
         let (slot, _store) = regtest_serving_pair_slot()?;
-        let node = crate::NodeBroadcast::new(source.clone());
+        let node = crate::OrderedBroadcaster::new(source.clone(), []);
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
             .with_node_broadcast(Some(node.clone()));
         assert!(
@@ -2705,6 +2833,315 @@ mod tests {
         Ok(())
     }
 
+    /// A primary endpoint that never answers leaves broadcast to the
+    /// fallback.
+    ///
+    /// The probe verifies and observes the fallback, the node dependency
+    /// reports ready, and a broadcast reaches only the fallback. The primary
+    /// stays preferred, so it is used again once it is verified.
+    #[tokio::test]
+    async fn wallet_node_probe_verifies_a_fallback_while_the_primary_is_down()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        primary.available.store(false, Ordering::SeqCst);
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [fallback.clone()]);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert!(query.upstream_node_capabilities().is_some());
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(primary.broadcast_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            nodes.preferred_position(),
+            0,
+            "skipping an unverified primary does not move the preference"
+        );
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// A verified primary that goes down while broadcast is idle leaves the
+    /// node dependency ready while a verified fallback answers.
+    ///
+    /// The probe moves the preference to the fallback, so the next broadcast
+    /// and `ServerInfo.node` use it without waiting for a broadcast timeout.
+    #[tokio::test]
+    async fn wallet_node_probe_moves_past_a_verified_primary_that_goes_down()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [fallback.clone()]);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert_eq!(nodes.preferred_position(), 0);
+        primary.available.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while nodes.preferred_position() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert!(query.upstream_node_capabilities().is_some());
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(primary.broadcast_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// A standby that never answers its verification delays neither the
+    /// liveness observation of the verified endpoints nor the move past a
+    /// verified one that goes down.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_node_probe_moves_past_a_dead_endpoint_while_a_standby_hangs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let standby = MutableHealthSource::new()?;
+        standby.stalled.store(true, Ordering::SeqCst);
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes =
+            crate::OrderedBroadcaster::new(primary.clone(), [standby.clone(), fallback.clone()]);
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot,
+            readiness,
+            Duration::from_secs(1),
+            cancel.clone(),
+        );
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        primary.available.store(false, Ordering::SeqCst);
+        wait_until(|| nodes.preferred_position() == 2).await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert_eq!(standby.capability_probes.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// An endpoint left verified against an earlier basis is checked again
+    /// every two seconds while a standby never answers.
+    ///
+    /// Once the endpoint recovers from an outage that began as the tip
+    /// crossed an activation, it is verified against the new basis and keeps
+    /// receiving broadcasts after the earlier verification's grace would have
+    /// ended.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_node_probe_reverifies_a_recovering_endpoint_while_a_standby_hangs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let standby = MutableHealthSource::new()?;
+        standby.stalled.store(true, Ordering::SeqCst);
+        // NU6.1 and NU6.2 activate at height 3, which a broadcast targets
+        // once the tip reaches height 2.
+        let (below, _below_store) = regtest_serving_pair(1)?;
+        let (crossed, _crossed_store) = regtest_serving_pair(2)?;
+        let slot = WalletServingPairSlot::new(below);
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [standby.clone()]);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(
+            zinder_runtime::Readiness::default(),
+        );
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot.clone(),
+            readiness,
+            Duration::from_secs(30),
+            cancel.clone(),
+        );
+        wait_until(|| nodes.verified_capabilities().is_some()).await?;
+
+        primary.available.store(false, Ordering::SeqCst);
+        let _released = slot.publish(crossed, tokio::time::Instant::now());
+        wait_until(|| nodes.awaits_reverification(0)).await?;
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        primary.available.store(true, Ordering::SeqCst);
+        wait_until(|| !nodes.awaits_reverification(0)).await?;
+        tokio::time::sleep(Duration::from_mins(1)).await;
+
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(primary.broadcast_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(standby.capability_probes.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// A tip that reaches an activation only the endpoint's table schedules
+    /// ends the endpoint's verification, though the writer's schedule and the
+    /// upgrade it activates at the broadcast height stay the same.
+    ///
+    /// A broadcast skips the endpoint at once, and the probe verifies it
+    /// again without waiting for its poll interval and excludes it.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_node_probe_excludes_an_endpoint_at_an_activation_only_it_schedules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = MutableHealthSource::new()?;
+        source.node_activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            sample_regtest_upgrade_activations()
+                .activations()
+                .iter()
+                .map(|activation| NetworkUpgradeActivation {
+                    activation_height: if activation.name == "NU6.3" {
+                        BlockHeight::new(4)
+                    } else {
+                        activation.activation_height
+                    },
+                    ..activation.clone()
+                })
+                .collect(),
+        )?;
+        let (below, _below_store) = regtest_serving_pair(2)?;
+        let (crossed, _crossed_store) = regtest_serving_pair(3)?;
+        assert_eq!(
+            crate::node_broadcast::VerificationBasis::of(&below),
+            crate::node_broadcast::VerificationBasis::of(&crossed)
+        );
+        let slot = WalletServingPairSlot::new(below);
+        let nodes = crate::OrderedBroadcaster::new(source.clone(), []);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot.clone(),
+            readiness,
+            Duration::from_hours(1),
+            cancel.clone(),
+        );
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+
+        let _released = slot.publish(crossed, tokio::time::Instant::now());
+        let refused = query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::QueryError::Node(SourceError::NodeUnavailable { .. }))
+            ),
+            "unexpected broadcast outcome: {refused:?}"
+        );
+        assert_eq!(source.broadcast_attempts.load(Ordering::SeqCst), 1);
+        wait_for_report(&runtime, |report| {
+            matches!(
+                report.degraded.as_slice(),
+                [zinder_runtime::ReadinessDependency {
+                    input: zinder_runtime::ReadinessInput::NodeSource,
+                    cause: zinder_runtime::ReadinessCause::NodeUnavailable(detail),
+                }] if detail.failure_class == "protocol_mismatch"
+            )
+        })
+        .await?;
+        assert_eq!(source.capability_probes.load(Ordering::SeqCst), 2);
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// A schedule revision starts a probe round at once, so the endpoint is
+    /// verified against the new schedule without waiting for the poll
+    /// interval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wallet_node_probe_verifies_again_as_soon_as_the_schedule_is_revised()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let mut source = MutableHealthSource::new()?;
+        source.node_activations = primaries.activations.clone();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(
+            zinder_runtime::Readiness::default(),
+        );
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(crate::OrderedBroadcaster::new(source.clone(), [])),
+            slot,
+            readiness,
+            Duration::from_hours(1),
+            cancel.clone(),
+        );
+        let wait_for_probes = async |count: usize| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while source.capability_probes.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        };
+
+        wait_for_probes(1).await?;
+        primaries.admit_schedule_revision()?;
+        publisher.refresh_once().await?;
+        wait_for_probes(2).await?;
+
+        cancel.cancel();
+        handle.await?;
+        primaries.shutdown().await
+    }
+
     /// A node whose activation table disagrees with the writer-admitted
     /// schedule is on another network, so it never receives a
     /// transaction.
@@ -2724,7 +3161,7 @@ mod tests {
                 .collect(),
         )?;
         let (slot, _store) = regtest_serving_pair_slot()?;
-        let node = crate::NodeBroadcast::new(source.clone());
+        let node = crate::OrderedBroadcaster::new(source.clone(), []);
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
             .with_node_broadcast(Some(node.clone()));
         let runtime = zinder_runtime::Readiness::default();
@@ -2775,7 +3212,7 @@ mod tests {
         let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
-            Some(crate::NodeBroadcast::new(source.clone())),
+            Some(crate::OrderedBroadcaster::new(source.clone(), [])),
             slot,
             readiness,
             Duration::from_millis(5),
@@ -3313,7 +3750,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let slot = WalletServingPairSlot::new(pair);
-        let node = crate::NodeBroadcast::new(source.clone());
+        let node = crate::OrderedBroadcaster::new(source.clone(), []);
         let query = WalletServingQuery::from_admitted_native_serving_pair(
             slot.clone(),
             ingest_control.clone(),
@@ -3458,6 +3895,7 @@ mod tests {
         stalled: Arc<AtomicBool>,
         stalled_request_started: Arc<tokio::sync::Notify>,
         broadcast_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        capability_probes: Arc<std::sync::atomic::AtomicUsize>,
         capabilities: NodeCapabilities,
         node_activations: NetworkUpgradeActivations,
         holds_tip: bool,
@@ -3479,6 +3917,7 @@ mod tests {
                 stalled: Arc::new(AtomicBool::new(false)),
                 stalled_request_started: Arc::new(tokio::sync::Notify::new()),
                 broadcast_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                capability_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 capabilities,
                 node_activations: sample_regtest_upgrade_activations(),
                 holds_tip: true,
@@ -3495,6 +3934,7 @@ mod tests {
     #[async_trait]
     impl zinder_source::BroadcastNodeProbe for MutableHealthSource {
         async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+            self.capability_probes.fetch_add(1, Ordering::SeqCst);
             if self.stalled.load(Ordering::SeqCst) {
                 self.stalled_request_started.notify_one();
                 std::future::pending::<()>().await;
@@ -7090,14 +7530,37 @@ mod tests {
     /// regtest schedule. The fixture owns the store directory.
     fn regtest_serving_pair_slot()
     -> Result<(WalletServingPairSlot, WalletServingStoreFixture), Box<dyn std::error::Error>> {
+        let (pair, store) = regtest_serving_pair(1)?;
+        Ok((WalletServingPairSlot::new(pair), store))
+    }
+
+    /// A regtest pair whose visible tip is at height `block_count`.
+    fn regtest_serving_pair(
+        block_count: u32,
+    ) -> Result<
+        (Arc<crate::WalletServingReadPair>, WalletServingStoreFixture),
+        Box<dyn std::error::Error>,
+    > {
         let chain = ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
-            .extend_blocks(1);
+            .extend_blocks(block_count);
         let mut store =
             WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = crate::WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?;
-        Ok((WalletServingPairSlot::new(Arc::new(pair)), store))
+        Ok((Arc::new(pair), store))
+    }
+
+    /// Waits up to three seconds for `condition`.
+    async fn wait_until(
+        condition: impl Fn() -> bool + Send + Sync,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
     }
 
     fn writer_status(source: WalletCanonicalSourceIdentity) -> CanonicalWriterStatusResponse {

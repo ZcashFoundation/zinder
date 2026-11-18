@@ -175,10 +175,15 @@ At connect time, call `ServerInfo` and check:
 3. Every capability the consumer requires is present in `capabilities`.
 
 `wallet.broadcast.transaction_v1` means the operator configured a node for
-broadcast. The query starts without contacting that node and verifies it on
-first contact, so a broadcast can fail with the retryable `NODE_UNAVAILABLE`
-until the node answers, as it does during any node outage. `node` in
-`ServerInfo` stays empty until that verification passes.
+broadcast. The operator can configure an ordered list of node endpoints, and
+the query sends a transaction to the first verified one in its preference
+order, moving to the next when one is unreachable. The query starts without
+contacting those nodes and verifies each on first contact, so a broadcast can
+fail with the retryable `NODE_UNAVAILABLE` until one answers, as it does
+during any outage of every endpoint. `node` in `ServerInfo` stays empty until
+an endpoint passes verification, and then describes the first verified
+endpoint in preference order. That endpoint can change while the query runs,
+so read `node` from a fresh `ServerInfo` instead of caching it.
 
 The release `zinder-query` composition admits one authenticated
 `IngestControl` identity before opening storage or binding traffic. Admission

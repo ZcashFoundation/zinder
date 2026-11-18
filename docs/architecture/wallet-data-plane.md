@@ -781,8 +781,8 @@ Transaction broadcast is a network operation, not a canonical chain commit.
 
 `zinder-query` may expose transaction broadcast because wallets expect a single endpoint. This is wallet operation parity, not part of the minimum read-only shielded sync surface. The broadcast path must:
 
-- Forward the raw transaction to a configured network or upstream node path.
-- Advertise `wallet.broadcast.transaction_v1` only after the configured source probe reports `transaction_broadcast`.
+- Forward the raw transaction to a configured upstream node endpoint that passed first-contact verification, trying `[node]` and then each `[node_fallbacks.N]` endpoint as [ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md) describes.
+- Advertise `wallet.broadcast.transaction_v1` exactly when a node endpoint is configured.
 - Return `TransactionBroadcastOutcome` with accepted, duplicate, invalid-encoding, queued, rejected, or unknown outcomes.
 - Avoid writing canonical chain state.
 - Rely on ingestion to observe the transaction later in mempool or block data.

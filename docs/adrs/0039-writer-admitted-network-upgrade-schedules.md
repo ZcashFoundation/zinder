@@ -168,7 +168,8 @@ responses carry the admitted table, revision, and V1 fingerprint.
   ingest only waits.
 - Readers no longer compare a node's table with the store when they open. A
   reader that broadcasts transactions instead verifies its node's table
-  against the admitted schedule through the served tip on first contact,
+  against the admitted schedule through the height after the served tip on
+  first contact,
   before any transaction reaches the node
   ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 

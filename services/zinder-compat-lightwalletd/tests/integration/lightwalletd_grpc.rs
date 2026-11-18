@@ -17,7 +17,8 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status, transport::Server};
 use zebra_chain::{
-    parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
+    parameters::NetworkKind as ZebraNetworkKind, serialization::ZcashDeserializeInto as _,
+    transparent::Address as ZebraTransparentAddress,
 };
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
@@ -42,7 +43,7 @@ use zinder_proto::compat::lightwalletd::{
 
 use zinder_query::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, NodeBroadcast, QueryError,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, OrderedBroadcaster, QueryError,
     RawTransaction, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
     TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
@@ -903,7 +904,8 @@ async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() ->
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(FORK_HEIGHT - 5)),
         &sample_regtest_upgrade_activations(),
     )?;
-    let before_reorg = AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, None)?;
+    let before_reorg =
+        AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, Vec::new())?;
     let sent_epoch = before_reorg
         .query()
         .visible_tip_block(None)
@@ -2041,7 +2043,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner.native_endpoint_capabilities()
     }
 
-    fn upstream_node_capabilities(&self) -> Option<&zinder_query::UpstreamNodeCapabilities> {
+    fn upstream_node_capabilities(&self) -> Option<zinder_query::UpstreamNodeCapabilities> {
         self.inner.upstream_node_capabilities()
     }
 
@@ -2422,7 +2424,7 @@ async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node(
     let store_fixture = AcceptanceStore::from_store_fixture(
         CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?
             .into_serving_store_fixture()?,
-        None,
+        Vec::new(),
     )?;
     let adapter = acceptance_adapter(&store_fixture);
 
@@ -2930,6 +2932,57 @@ async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Resul
     assert_eq!(response.error_message, "missing-input");
 
     Ok(())
+}
+
+/// The first node may have accepted the transaction before its broadcast
+/// timeout, so the fallback's duplicate answer is a success.
+///
+/// Wallets treat a nonzero `errorCode` as a failed send, so the response
+/// carries code 0 and the transaction id computed from the submitted bytes.
+#[tokio::test]
+async fn send_transaction_reports_a_duplicate_after_a_node_timeout_as_sent() -> eyre::Result<()> {
+    let raw_transaction = sapling_transaction_without_effects();
+    let parsed: zebra_chain::transaction::Transaction =
+        raw_transaction.as_slice().zcash_deserialize_into()?;
+    let (adapter, _store_fixture) = ordered_broadcasting_acceptance_adapter(vec![
+        MockTransactionBroadcaster::node_unavailable("sendrawtransaction timed out after 5000ms"),
+        MockTransactionBroadcaster::returning(TransactionBroadcastOutcome::Duplicate(
+            BroadcastDuplicate {
+                error_code: Some(-27),
+                message: "transaction already exists in mempool".to_owned(),
+            },
+        )),
+    ])
+    .await?;
+
+    let response = adapter
+        .send_transaction(Request::new(lightwalletd::RawTransaction {
+            data: raw_transaction,
+            height: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.error_code, 0);
+    assert_eq!(
+        response.error_message,
+        zinder_core::wire::encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+            parsed.hash().0
+        ))
+    );
+    Ok(())
+}
+
+/// A version 4 (Sapling) transaction with no inputs, outputs, or shielded
+/// data, which the consensus parser decodes.
+fn sapling_transaction_without_effects() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0x8000_0004_u32.to_le_bytes());
+    bytes.extend_from_slice(&0x892f_2085_u32.to_le_bytes());
+    // No transparent inputs or outputs, lock time and expiry height zero,
+    // a zero Sapling value balance, and no spends, outputs, or JoinSplits.
+    bytes.extend_from_slice(&[0; 2 + 8 + 8 + 3]);
+    bytes
 }
 
 #[tokio::test]
@@ -3495,7 +3548,8 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
         hash: transaction_id.as_bytes().to_vec(),
     };
 
-    let before_reorg = AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, None)?;
+    let before_reorg =
+        AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, Vec::new())?;
     let served = acceptance_adapter(&before_reorg)
         .get_transaction(Request::new(transaction_filter()))
         .await?
@@ -3652,46 +3706,49 @@ where
 }
 /// Serves the writer's final fence through the compatibility composition.
 fn acceptance_store_from_writer(writer: CanonicalWriterFixture) -> eyre::Result<AcceptanceStore> {
-    AcceptanceStore::from_store_fixture(writer.into_serving_store_fixture()?, None)
+    AcceptanceStore::from_store_fixture(writer.into_serving_store_fixture()?, Vec::new())
 }
 
 /// Compatibility query that broadcasts through a node double, when one is
 /// configured.
-type AcceptanceQuery = WalletServingQuery<Option<NodeBroadcast<MockTransactionBroadcaster>>>;
+type AcceptanceQuery = WalletServingQuery<Option<OrderedBroadcaster<MockTransactionBroadcaster>>>;
 
 /// Exact production serving pair queried through the compatibility query.
 struct AcceptanceStore {
     query: AcceptanceQuery,
     slot: WalletServingPairSlot,
-    node: Option<NodeBroadcast<MockTransactionBroadcaster>>,
+    node: Option<OrderedBroadcaster<MockTransactionBroadcaster>>,
     _store_fixture: WalletServingStoreFixture,
 }
 
 impl AcceptanceStore {
+    /// Serves `chain`, broadcasting through `nodes` in order, or storage only
+    /// when `nodes` is empty.
     fn from_chain(
         chain: &ChainFixture,
-        node: Option<MockTransactionBroadcaster>,
+        nodes: Vec<MockTransactionBroadcaster>,
     ) -> eyre::Result<Self> {
         Self::from_store_fixture(
             WalletServingStoreFixture::from_chain(chain, &sample_regtest_upgrade_activations())?,
-            node,
+            nodes,
         )
     }
 
     fn from_store_fixture(
         mut store_fixture: WalletServingStoreFixture,
-        node: Option<MockTransactionBroadcaster>,
+        nodes: Vec<MockTransactionBroadcaster>,
     ) -> eyre::Result<Self> {
         let (canonical, wallet) = store_fixture.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
             Arc::new(canonical),
             Arc::new(wallet),
         )?));
-        let node = node.map(|broadcaster| {
-            NodeBroadcast::new(
-                broadcaster.with_node_activations(sample_regtest_upgrade_activations()),
-            )
+        let mut nodes = nodes.into_iter().map(|broadcaster| {
+            broadcaster.with_node_activations(sample_regtest_upgrade_activations())
         });
+        let node = nodes
+            .next()
+            .map(|primary| OrderedBroadcaster::new(primary, nodes));
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
             .with_node_broadcast(node.clone());
         Ok(Self {
@@ -3723,7 +3780,7 @@ fn acceptance_adapter(store_fixture: &AcceptanceStore) -> LightwalletdGrpcAdapte
 }
 
 fn acceptance_store_from_chain(chain: &ChainFixture) -> eyre::Result<AcceptanceStore> {
-    AcceptanceStore::from_chain(chain, None)
+    AcceptanceStore::from_chain(chain, Vec::new())
 }
 
 /// Builds a compatibility adapter whose verified node forwards broadcasts
@@ -3731,8 +3788,16 @@ fn acceptance_store_from_chain(chain: &ChainFixture) -> eyre::Result<AcceptanceS
 async fn broadcasting_acceptance_adapter(
     broadcaster: MockTransactionBroadcaster,
 ) -> eyre::Result<(LightwalletdGrpcAdapter<AcceptanceQuery>, AcceptanceStore)> {
+    ordered_broadcasting_acceptance_adapter(vec![broadcaster]).await
+}
+
+/// Builds a compatibility adapter that broadcasts through `nodes` in order,
+/// every one verified.
+async fn ordered_broadcasting_acceptance_adapter(
+    nodes: Vec<MockTransactionBroadcaster>,
+) -> eyre::Result<(LightwalletdGrpcAdapter<AcceptanceQuery>, AcceptanceStore)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let store_fixture = AcceptanceStore::from_chain(&chain, Some(broadcaster))?;
+    let store_fixture = AcceptanceStore::from_chain(&chain, nodes)?;
     store_fixture.verify_node().await?;
     Ok((acceptance_adapter(&store_fixture), store_fixture))
 }

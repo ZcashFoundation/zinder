@@ -23,7 +23,7 @@ provide operators with the actionable reason and recovery cadence.
 4. **Source errors describe observations.** `SourceFailureClass` (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) is the operator-facing label returned by `SourceError::upstream_classification()`.
 5. **Readiness carries operator detail.** `ReadinessCause::NodeUnavailable` carries `NodeUnavailableDetail` with `{ failure_class, last_reason, consecutive_failures, outage_seconds }`. `/readyz`, the proto report, and `zinder_readiness_node_failure_class{class=...}` surface that detail.
 6. **Per-call retry handles narrow transport classes.** `retry_source_request` retries only `NodeUnreachable` and `StreamDisconnected` failures during fresh construction. The canonical follower makes one attempt per call; other source failures, and every follow-mode failure, return to the loop, which re-observes upstream state before issuing dependent requests.
-7. **Only the writer drains on a source failure.** Wallet-serving readers report their node probe's `node_unavailable` or `upstream_not_ready`, and the writer's `upstream_not_ready` relayed through ingest control, as degraded dependencies with the same detail. They keep serving stored reads, and a node-backed request fails on its own with `NODE_UNAVAILABLE` ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
+7. **Only the writer drains on a source failure.** Wallet-serving readers report their node probe's `node_unavailable` or `upstream_not_ready`, and the writer's `upstream_not_ready` relayed through ingest control, as degraded dependencies with the same detail. They keep serving stored reads, and a node-backed request fails on its own with `NODE_UNAVAILABLE` ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)). A reader's broadcast moves past an unreachable endpoint of the ordered node list within the request, and fails only when every verified endpoint is unreachable ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 8. **Ingest owns the node endpoint switch.** When `[node_fallbacks.N]` endpoints are configured, the canonical follower reads through the active endpoint of a `NodeSet`, `[node]` being position 0. It switches only between follow iterations, so every read that prepares one block reaches one endpoint:
    - after `NodeFailoverPolicy::transport_failures_before_switch` (3) consecutive recoveries of one class, `node_unreachable` or `stream_disconnected`, counted per class;
    - or at the top of an iteration, after the active endpoint has reported not ready for `upstream_not_ready_before_switch` (300 seconds), which outlasts the brief synchronization flaps nodes report.
@@ -52,6 +52,7 @@ provide operators with the actionable reason and recovery cadence.
 
 ## Revision history
 
+- 2026-11-18: A reader's broadcast moves between the endpoints of the ordered node list within a request (Decision 7).
 - 2026-11-18: Ingest switches between the endpoints of the ordered node list (Decision 8), and Decision 6 now states that the follower makes one attempt per call.
 - 2026-11-17: Wallet-serving readers no longer drain readiness on a source
   failure. They report it as a degraded dependency and fail only node-backed
