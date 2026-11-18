@@ -181,7 +181,14 @@ Both methods return the confirmed balance, the sum of unspent outputs, of up to 
 
 Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent output at or above `startHeight`, and a positive value returns at most that many, oldest first. Within one block, Zinder orders rows by transaction id and output index, where Zebra uses block position; this matters only when `maxEntries` splits a block.
 
-One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. A request that would return more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
+A request that lists an address more than once gets that address's rows once for each listing, as lightwalletd returns them.
+
+One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
+
+- `GetAddressUtxos` reads every row before it answers, so a request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
+- `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. Any other failure after the first row also ends the stream with its status after the rows already sent, such as `CHAIN_EPOCH_PIN_UNAVAILABLE` for a client still reading one minute after a new block replaces the request's epoch. A wallet must treat a stream that ends with an error as incomplete and must not add up its rows.
+
+Both methods read each distinct address once, at one chain epoch, and merge the addresses' outputs in response order as they send them. Each address is read in pages that start at 16 outputs and double only as its rows are sent, so a request holds at most about twice the rows it has sent plus 18 outputs for each distinct address. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
 
 The protocol has no lossless way to page past the cap. A single block with more matching outputs than the cap always fails with `RESOURCE_EXHAUSTED`.
 

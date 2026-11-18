@@ -584,9 +584,11 @@ async fn address_utxos_with_zero_max_entries_return_every_utxo_like_lightwalletd
     Ok(())
 }
 
-/// A response bound fails the request instead of dropping UTXOs. A positive
-/// `maxEntries` within the bound keeps lightwalletd's truncation to the oldest
-/// rows in chain order.
+/// A response bound fails the request instead of dropping UTXOs.
+///
+/// The list fails before it returns any row. The stream sends the rows within
+/// the bound and then fails. A positive `maxEntries` within the bound keeps
+/// lightwalletd's truncation to the oldest rows in chain order.
 #[tokio::test]
 async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> eyre::Result<()> {
     let utxo_count = 1_001_u32;
@@ -621,14 +623,21 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
                 eyre::eyre!("maxEntries {max_entries} must exceed the response limit")
             })?;
         assert_eq!(list_status.code(), Code::ResourceExhausted);
-        let stream_status = adapter
-            .get_address_utxos_stream(Request::new(request(max_entries)))
-            .await
-            .err()
-            .ok_or_else(|| {
-                eyre::eyre!("maxEntries {max_entries} must exceed the response limit")
-            })?;
-        assert_eq!(stream_status.code(), Code::ResourceExhausted);
+        // The stream sends rows as it merges them, so it sends the rows within
+        // the bound and then fails rather than ending as if complete.
+        let (streamed, stream_status) = drain_until_error(
+            adapter
+                .get_address_utxos_stream(Request::new(request(max_entries)))
+                .await?
+                .into_inner(),
+        )
+        .await;
+        assert_eq!(streamed.len(), u32_to_usize(response_limit.get()));
+        assert_eq!(
+            stream_status.map(|status| status.code()),
+            Some(Code::ResourceExhausted),
+            "maxEntries {max_entries} must exceed the response limit"
+        );
     }
 
     let truncated = adapter
@@ -699,6 +708,166 @@ async fn taddress_history_streams_and_reads_each_transaction_once() -> eyre::Res
             blob_reads.load(Ordering::SeqCst),
             u32_to_usize(HISTORY),
             "each transaction's bytes must be read once"
+        );
+    }
+    Ok(())
+}
+
+/// Outputs one on-demand per-address stream reads in its first page.
+const ON_DEMAND_FIRST_PAGE_OUTPUTS: usize = 16;
+
+/// A request that lists one busy address many times reads that address once
+/// and holds about one small page of its outputs, whatever `maxEntries` asks
+/// for and however many times the address is listed.
+#[tokio::test]
+async fn address_utxos_read_a_busy_address_listed_many_times_once() -> eyre::Result<()> {
+    const LISTINGS: usize = 1_000;
+    let response_limit = NonZeroU32::MIN.saturating_add(9_999);
+    let (mut store_fixture, address_text) = many_utxo_fixture(0x51, 100)?;
+    let (adapter, outputs_read) = counting_utxo_adapter(&mut store_fixture, Some(response_limit))?;
+    let request = |max_entries| lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address_text.clone(); LISTINGS],
+        start_height: 0,
+        max_entries,
+    };
+
+    // Each listing repeats each output, so the first 500 rows are copies of
+    // the address's first output.
+    for streamed in [false, true] {
+        outputs_read.store(0, Ordering::SeqCst);
+        let rows = if streamed {
+            collect_stream(
+                adapter
+                    .get_address_utxos_stream(Request::new(request(500)))
+                    .await?
+                    .into_inner(),
+            )
+            .await?
+        } else {
+            adapter
+                .get_address_utxos(Request::new(request(500)))
+                .await?
+                .into_inner()
+                .address_utxos
+        };
+        assert_eq!(rows.len(), 500);
+        let first_output = history_transaction_id(0).as_bytes().to_vec();
+        assert!(rows.iter().all(|row| row.txid == first_output));
+        assert!(
+            outputs_read.load(Ordering::SeqCst) <= ON_DEMAND_FIRST_PAGE_OUTPUTS,
+            "a repeated address must be read once, one small page at a time; read {}",
+            outputs_read.load(Ordering::SeqCst)
+        );
+    }
+
+    // Without `maxEntries`, the 10,001st copy exceeds the response limit.
+    outputs_read.store(0, Ordering::SeqCst);
+    let refused = adapter
+        .get_address_utxos(Request::new(request(0)))
+        .await
+        .err()
+        .map(|status| status.code());
+    assert_eq!(refused, Some(Code::ResourceExhausted));
+    assert!(
+        outputs_read.load(Ordering::SeqCst) <= ON_DEMAND_FIRST_PAGE_OUTPUTS,
+        "the refused request read {} outputs",
+        outputs_read.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+/// A request reads no output past the last row it sends, and validates every
+/// address before it reads any.
+#[tokio::test]
+async fn address_utxos_read_nothing_they_do_not_send() -> eyre::Result<()> {
+    let (mut store_fixture, address_text) = many_utxo_fixture(0x52, 100)?;
+    let (adapter, outputs_read) = counting_utxo_adapter(&mut store_fixture, None)?;
+
+    // The 16th row ends the first page, so the response needs no second one.
+    let rows = adapter
+        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
+            addresses: vec![address_text.clone()],
+            start_height: 0,
+            max_entries: u32::try_from(ON_DEMAND_FIRST_PAGE_OUTPUTS)?,
+        }))
+        .await?
+        .into_inner()
+        .address_utxos;
+    assert_eq!(rows.len(), ON_DEMAND_FIRST_PAGE_OUTPUTS);
+    assert_eq!(
+        outputs_read.swap(0, Ordering::SeqCst),
+        ON_DEMAND_FIRST_PAGE_OUTPUTS
+    );
+
+    let status = adapter
+        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
+            addresses: vec![address_text, "not-an-address".to_owned()],
+            start_height: 0,
+            max_entries: 0,
+        }))
+        .await
+        .err()
+        .map(|status| status.code());
+    assert_eq!(status, Some(Code::InvalidArgument));
+    assert_eq!(
+        outputs_read.load(Ordering::SeqCst),
+        0,
+        "an invalid address must be refused before any address is read"
+    );
+    Ok(())
+}
+
+/// A request that lists many addresses holds a bounded number of outputs.
+///
+/// Before any row is sent it holds the next output of each address, read a
+/// small page at a time, rather than every address's outputs up to
+/// `maxEntries`.
+#[tokio::test]
+async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::Result<()> {
+    const ADDRESSES: u32 = 60;
+    const OUTPUTS_PER_ADDRESS: u32 = 60;
+    const MAX_ENTRIES: u32 = 30;
+    let (mut store_fixture, addresses) =
+        busy_addresses_fixture(0x60, ADDRESSES, OUTPUTS_PER_ADDRESS)?;
+    let (adapter, outputs_read) = counting_utxo_adapter(&mut store_fixture, None)?;
+    let request = lightwalletd::GetAddressUtxosArg {
+        addresses,
+        start_height: 0,
+        max_entries: MAX_ENTRIES,
+    };
+
+    let list = adapter
+        .get_address_utxos(Request::new(request.clone()))
+        .await?
+        .into_inner()
+        .address_utxos;
+    let list_outputs_read = outputs_read.swap(0, Ordering::SeqCst);
+    let streamed = collect_stream(
+        adapter
+            .get_address_utxos_stream(Request::new(request))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    let stream_outputs_read = outputs_read.load(Ordering::SeqCst);
+
+    // The first address holds the lowest transaction ids at the one height.
+    let expected: Vec<_> = (0..MAX_ENTRIES)
+        .map(|index| history_transaction_id(index).as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        list.iter().map(|row| row.txid.clone()).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(list, streamed);
+    // Each address reads its first small page, and the address that supplies
+    // the rows reads pages that at most double what it sent.
+    let bound = u32_to_usize(2 * MAX_ENTRIES)
+        + u32_to_usize(ADDRESSES) * (ON_DEMAND_FIRST_PAGE_OUTPUTS + 2);
+    for outputs in [list_outputs_read, stream_outputs_read] {
+        assert!(
+            outputs <= bound,
+            "read {outputs} outputs, more than the bound of {bound}"
         );
     }
     Ok(())
@@ -1127,6 +1296,92 @@ fn pre_nu7_activations() -> eyre::Result<NetworkUpgradeActivations> {
     )?)
 }
 
+/// Builds a compatibility adapter over `store_fixture` whose wallet reader
+/// counts the unspent outputs it reads, with `response_limit` as its UTXO
+/// response bound when one is given.
+fn counting_utxo_adapter(
+    store_fixture: &mut WalletServingStoreFixture,
+    response_limit: Option<NonZeroU32>,
+) -> eyre::Result<(WalletServingAdapter, Arc<AtomicUsize>)> {
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let outputs_read = Arc::new(AtomicUsize::new(0));
+    let wallet_reader: Arc<dyn WalletProjectionReader> = Arc::new(CountingWalletReader {
+        wallet_reader,
+        unspent_outputs_read: Arc::clone(&outputs_read),
+    });
+    let adapter = match response_limit {
+        None => {
+            build_wallet_serving_adapter_from_readers(Arc::new(canonical_reader), wallet_reader)?
+        }
+        Some(max_address_utxos) => {
+            let serving_pair = Arc::new(WalletServingReadPair::new(
+                Arc::new(canonical_reader),
+                wallet_reader,
+            )?);
+            LightwalletdGrpcAdapter::with_response_limits(
+                WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+                    serving_pair,
+                )),
+                LightwalletdResponseLimits {
+                    max_address_utxos,
+                    ..LightwalletdResponseLimits::default()
+                },
+            )
+        }
+    };
+    Ok((adapter, outputs_read))
+}
+
+/// Builds a store where `address_count` addresses each hold `utxo_count` UTXOs.
+///
+/// Every output is at height 2, one per transaction, with transaction ids
+/// ascending from the first address's outputs to the last's.
+fn busy_addresses_fixture(
+    first_address_byte: u8,
+    address_count: u32,
+    utxo_count: u32,
+) -> eyre::Result<(WalletServingStoreFixture, Vec<String>)> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let block_two = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre::eyre!("UTXO fixture must include block 2"))?
+        .clone();
+    let mut chain = chain;
+    let mut addresses = Vec::new();
+    for address_offset in 0..address_count {
+        let address =
+            transparent_address(first_address_byte.wrapping_add(u8::try_from(address_offset)?));
+        let script = address.script().as_raw_bytes().to_vec();
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+        for output in 0..utxo_count {
+            let index = address_offset * utxo_count + output;
+            let transaction_id = history_transaction_id(index);
+            chain = chain
+                .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+                    transaction_id,
+                    block_two.height,
+                    block_two.hash,
+                    index,
+                    history_transaction_bytes(index),
+                ))
+                .with_address_output_index(TransparentUnspentOutput::new(
+                    address_script_hash,
+                    script.clone(),
+                    TransparentOutPoint::new(transaction_id, 0),
+                    1,
+                    block_two.height,
+                    block_two.hash,
+                ));
+        }
+        addresses.push(address.to_string());
+    }
+    let store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    Ok((store_fixture, addresses))
+}
+
 /// Builds a wallet-serving store whose address holds `utxo_count` UTXOs at
 /// height 2, one per transaction, in transaction-index order.
 fn many_utxo_fixture(
@@ -1239,6 +1494,22 @@ where
     Ok(items)
 }
 
+/// Drains `stream` and returns the items it sent and the status it ended
+/// with, if it failed.
+async fn drain_until_error<T, Stream>(mut stream: Stream) -> (Vec<T>, Option<tonic::Status>)
+where
+    Stream: tonic::codegen::tokio_stream::Stream<Item = Result<T, tonic::Status>> + Unpin,
+{
+    let mut items = Vec::new();
+    while let Some(received) = stream.next().await {
+        match received {
+            Ok(message) => items.push(message),
+            Err(status) => return (items, Some(status)),
+        }
+    }
+    (items, None)
+}
+
 async fn first_stream_error<T, Stream>(mut stream: Stream) -> eyre::Result<tonic::Status>
 where
     Stream: tonic::codegen::tokio_stream::Stream<Item = Result<T, tonic::Status>> + Unpin,
@@ -1247,6 +1518,122 @@ where
         Some(Err(status)) => Ok(status),
         Some(Ok(_)) => Err(eyre::eyre!("expected stream error, received an item")),
         None => Err(eyre::eyre!("expected stream error, stream ended")),
+    }
+}
+
+/// A wallet reader that counts the unspent outputs its pages return.
+struct CountingWalletReader {
+    wallet_reader: zinder_wallet_rocksdb::RocksDbWalletSecondary,
+    unspent_outputs_read: Arc<AtomicUsize>,
+}
+
+impl WalletProjectionReader for CountingWalletReader {
+    fn network(&self) -> Network {
+        self.wallet_reader.network()
+    }
+
+    fn ready_evidence(&self) -> &zinder_wallet_projection::WalletProjectionReadyEvidence {
+        self.wallet_reader.ready_evidence()
+    }
+
+    fn address_unspent_outputs_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        after: Option<zinder_wallet_projection::WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<
+        zinder_wallet_rocksdb::WalletAddressUnspentOutputsPage,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        let page = self.wallet_reader.address_unspent_outputs_page(
+            address_script_hash,
+            after,
+            page_size,
+        )?;
+        self.unspent_outputs_read
+            .fetch_add(page.outputs.len(), Ordering::SeqCst);
+        Ok(page)
+    }
+
+    fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<zinder_wallet_projection::WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<
+        zinder_wallet_rocksdb::WalletAddressUnspentOutputsPage,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        let page = self
+            .wallet_reader
+            .address_unspent_outputs_page_from_height(
+                address_script_hash,
+                start_height,
+                after,
+                page_size,
+            )?;
+        self.unspent_outputs_read
+            .fetch_add(page.outputs.len(), Ordering::SeqCst);
+        Ok(page)
+    }
+
+    fn address_transaction_history_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        after: Option<zinder_wallet_projection::WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<
+        zinder_wallet_rocksdb::WalletAddressTransactionHistoryPage,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        self.wallet_reader
+            .address_transaction_history_page(address_script_hash, after, page_size)
+    }
+
+    fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
+        after: Option<zinder_wallet_projection::WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<
+        zinder_wallet_rocksdb::WalletAddressTransactionHistoryPage,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        self.wallet_reader.address_transaction_history_range_page(
+            address_script_hash,
+            height_range,
+            after,
+            page_size,
+        )
+    }
+
+    fn address_balance(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+    ) -> Result<u64, zinder_wallet_rocksdb::RocksDbWalletError> {
+        self.wallet_reader.address_balance(address_script_hash)
+    }
+
+    fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<
+        Option<zinder_wallet_projection::WalletUnspentOutput>,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        self.wallet_reader.find_unspent_output(outpoint)
+    }
+
+    fn find_spent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<
+        Option<zinder_wallet_projection::WalletSpentOutput>,
+        zinder_wallet_rocksdb::RocksDbWalletError,
+    > {
+        self.wallet_reader.find_spent_output(outpoint)
     }
 }
 

@@ -1,6 +1,12 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-use std::{collections::HashSet, num::NonZeroU32, pin::Pin, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
+    num::NonZeroU32,
+    pin::Pin,
+    time::Duration,
+};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -27,9 +33,9 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     ArtifactKey, CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError,
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
-    TreeState, WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash,
-    status_from_query_error,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
@@ -72,6 +78,8 @@ const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Transactions a `GetTaddressTransactions` or `GetTaddressTxids` response
 /// reads ahead of its client.
 const TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY: usize = 8;
+/// Rows a `GetAddressUtxosStream` response merges ahead of its client.
+const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
@@ -381,12 +389,22 @@ where
         Ok(compact_block)
     }
 
-    async fn address_utxos(
+    /// Opens the merge of every requested address's unspent outputs at the
+    /// visible chain epoch, and reads the first output of each, so a request
+    /// that cannot be served fails before any row is sent.
+    ///
+    /// Each distinct address is read once, however often the request lists
+    /// it, and its rows are sent once for each listing.
+    async fn address_utxo_merge(
         &self,
         request: lightwalletd::GetAddressUtxosArg,
-    ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
+    ) -> Result<AddressUtxoMerge, Status> {
+        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
+        let max_entries =
+            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
+        let mut merge = AddressUtxoMerge::new(max_entries, response_limit);
         if request.addresses.is_empty() {
-            return Ok(Vec::new());
+            return Ok(merge);
         }
 
         let start_height = u32::try_from(request.start_height)
@@ -396,60 +414,41 @@ where
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
-        let max_entries =
-            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
-        // Each address streams its outputs in response order, so it can
-        // contribute at most its first `maxEntries` outputs. Without a
-        // `maxEntries` at or below the response limit, a request that matched
-        // more outputs than one response returns fails, so the read stops
-        // there instead of reading the rest of a large address.
-        let address_output_cap = max_entries.filter(|max_entries| *max_entries <= response_limit);
-        let mut replies = Vec::new();
-
+        let mut listings: Vec<(String, usize)> = Vec::new();
+        let mut positions = HashMap::new();
         for address in request.addresses {
-            let query_request = transparent_address_unspent_outputs_request(
-                &address,
-                visible_tip_block.chain_epoch.network,
-                BlockHeight::new(start_height),
-            )?;
-            let mut address_utxos = self
+            if let Some(&position) = positions.get(&address) {
+                if let Some((_, copies)) = listings.get_mut(position) {
+                    *copies += 1;
+                }
+                continue;
+            }
+            positions.insert(address.clone(), listings.len());
+            listings.push((address, 1));
+        }
+        let listings = listings
+            .into_iter()
+            .map(|(address, copies)| {
+                transparent_address_unspent_outputs_request(
+                    &address,
+                    visible_tip_block.chain_epoch.network,
+                    BlockHeight::new(start_height),
+                )
+                .map(|query_request| (address, copies, query_request))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        for (address, copies, query_request) in listings {
+            let outputs = self
                 .query_api
-                .transparent_address_unspent_outputs(
+                .transparent_address_unspent_outputs_on_demand(
                     query_request,
                     Some(visible_tip_block.chain_epoch.id),
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            let mut address_output_count = 0;
-            while let Some(utxo) = address_utxos.next().await {
-                let utxo = utxo.map_err(|error| status_from_query_error(&error))?;
-                replies.push(lightwalletd_address_utxo(&address, &utxo)?);
-                address_output_count += 1;
-                match address_output_cap {
-                    Some(cap) if address_output_count == cap => break,
-                    None if replies.len() > response_limit => {
-                        return Err(address_utxo_limit_exceeded(response_limit));
-                    }
-                    Some(_) | None => {}
-                }
-            }
+            merge.add_address(address, copies, outputs).await?;
         }
-
-        replies.sort_by(|left, right| {
-            left.height
-                .cmp(&right.height)
-                .then_with(|| left.txid.cmp(&right.txid))
-                .then_with(|| left.index.cmp(&right.index))
-                .then_with(|| left.address.cmp(&right.address))
-        });
-        if let Some(max_entries) = max_entries {
-            replies.truncate(max_entries);
-        }
-        if replies.len() > response_limit {
-            return Err(address_utxo_limit_exceeded(response_limit));
-        }
-        Ok(replies)
+        Ok(merge)
     }
 
     /// Answers a `GetTransaction` whose canonical read missed from the live
@@ -1002,7 +1001,11 @@ where
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
-        let replies = self.address_utxos(request.into_inner()).await?;
+        let mut merge = self.address_utxo_merge(request.into_inner()).await?;
+        let mut replies = Vec::new();
+        while let Some(reply) = merge.next().await {
+            replies.push(reply?);
+        }
         Ok(Response::new(lightwalletd::GetAddressUtxosReplyList {
             address_utxos: replies,
         }))
@@ -1014,8 +1017,11 @@ where
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        let replies = self.address_utxos(request.into_inner()).await?;
-        Ok(Response::new(stream_items(replies)))
+        let merge = self.address_utxo_merge(request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            merge,
+            ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     async fn get_lightd_info(
@@ -1166,6 +1172,187 @@ where
                 return Some(Err(status));
             }
         }
+    }
+}
+
+/// The unspent outputs of several addresses, merged into the order of one
+/// lightwalletd UTXO response: height, txid, output index, then address.
+///
+/// Each address's stream is already in that order for its own outputs, so
+/// the merge holds only the next output of each address. The streams read
+/// on demand at the one chain epoch the request resolved, a small page at a
+/// time, so the outputs held stay within about twice the rows sent plus a
+/// small page for each distinct address.
+struct AddressUtxoMerge {
+    addresses: Vec<MergedAddress>,
+    next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
+    /// The row being sent once for each listing of its address, and how many
+    /// copies remain.
+    repeating: Option<(lightwalletd::GetAddressUtxosReply, usize)>,
+    /// The address whose last row was taken and whose next output is read
+    /// only when the response needs another row, so a response never reads
+    /// past the last row it sends.
+    awaiting_next_output: Option<usize>,
+    max_entries: Option<usize>,
+    response_limit: usize,
+    sent: usize,
+    ended: bool,
+}
+
+/// One distinct address of an [`AddressUtxoMerge`].
+struct MergedAddress {
+    address: String,
+    /// How many times the request lists the address.
+    copies: usize,
+    outputs: TransparentAddressUnspentOutputs,
+}
+
+/// The next output of one address in an [`AddressUtxoMerge`].
+struct NextAddressUtxo {
+    reply: lightwalletd::GetAddressUtxosReply,
+    address_position: usize,
+}
+
+impl NextAddressUtxo {
+    fn order_key(&self) -> (u64, &[u8], i32, &str, usize) {
+        (
+            self.reply.height,
+            self.reply.txid.as_slice(),
+            self.reply.index,
+            self.reply.address.as_str(),
+            self.address_position,
+        )
+    }
+}
+
+impl PartialEq for NextAddressUtxo {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_key() == other.order_key()
+    }
+}
+
+impl Eq for NextAddressUtxo {}
+
+impl PartialOrd for NextAddressUtxo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NextAddressUtxo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+
+impl AddressUtxoMerge {
+    const fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
+        Self {
+            addresses: Vec::new(),
+            next_outputs: BinaryHeap::new(),
+            repeating: None,
+            awaiting_next_output: None,
+            max_entries,
+            response_limit,
+            sent: 0,
+            ended: false,
+        }
+    }
+
+    /// Adds one distinct address, listed `copies` times, and reads its first
+    /// output.
+    async fn add_address(
+        &mut self,
+        address: String,
+        copies: usize,
+        outputs: TransparentAddressUnspentOutputs,
+    ) -> Result<(), Status> {
+        self.addresses.push(MergedAddress {
+            address,
+            copies,
+            outputs,
+        });
+        self.read_next_output(self.addresses.len() - 1).await
+    }
+
+    async fn read_next_output(&mut self, address_position: usize) -> Result<(), Status> {
+        let Some(merged) = self.addresses.get_mut(address_position) else {
+            return Ok(());
+        };
+        match merged.outputs.next().await {
+            Some(Ok(utxo)) => {
+                let reply = lightwalletd_address_utxo(&merged.address, &utxo)?;
+                self.next_outputs.push(Reverse(NextAddressUtxo {
+                    reply,
+                    address_position,
+                }));
+                Ok(())
+            }
+            Some(Err(error)) => Err(status_from_query_error(&error)),
+            None => Ok(()),
+        }
+    }
+
+    /// Reads the next output of the address whose last row was taken, once
+    /// every copy of that row has been sent.
+    async fn read_awaited_output(&mut self) -> Result<(), Status> {
+        if self.repeating.is_some() {
+            return Ok(());
+        }
+        match self.awaiting_next_output.take() {
+            Some(address_position) => self.read_next_output(address_position).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Takes the next row to send: another copy of the row being repeated,
+    /// or the lowest next output.
+    fn take_next_row(&mut self) -> Option<lightwalletd::GetAddressUtxosReply> {
+        if self.repeating.is_none() {
+            let Reverse(next_output) = self.next_outputs.pop()?;
+            let copies = self
+                .addresses
+                .get(next_output.address_position)
+                .map_or(1, |merged| merged.copies);
+            self.awaiting_next_output = Some(next_output.address_position);
+            self.repeating = Some((next_output.reply, copies));
+        }
+        let (reply, copies) = self.repeating.take()?;
+        if copies > 1 {
+            self.repeating = Some((reply.clone(), copies - 1));
+        }
+        Some(reply)
+    }
+}
+
+impl ResponseSource for AddressUtxoMerge {
+    type Message = lightwalletd::GetAddressUtxosReply;
+
+    /// Sends at most `maxEntries` rows. Without a `maxEntries` within the
+    /// response limit, a row past the limit fails the response with
+    /// `RESOURCE_EXHAUSTED` instead of ending it as if it were complete.
+    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        if self.ended
+            || self
+                .max_entries
+                .is_some_and(|max_entries| self.sent >= max_entries)
+        {
+            return None;
+        }
+        if let Err(status) = self.read_awaited_output().await {
+            self.ended = true;
+            return Some(Err(status));
+        }
+        if self.repeating.is_none() && self.next_outputs.is_empty() {
+            return None;
+        }
+        if self.sent >= self.response_limit {
+            self.ended = true;
+            return Some(Err(address_utxo_limit_exceeded(self.response_limit)));
+        }
+        let row = self.take_next_row()?;
+        self.sent += 1;
+        Some(Ok(row))
     }
 }
 

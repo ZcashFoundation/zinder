@@ -2436,6 +2436,17 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
             .await
     }
 
+    async fn transparent_address_unspent_outputs_on_demand(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_address_unspent_outputs_on_demand(request, at_epoch_id)
+            .await
+    }
+
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
