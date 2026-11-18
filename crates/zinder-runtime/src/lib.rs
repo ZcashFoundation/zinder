@@ -15,7 +15,8 @@
 //!   uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
-//!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`].
+//!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
+//!   which rejects an invalid `RUST_LOG` with [`TracingSubscriberError`].
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -36,6 +37,7 @@ mod composed_readiness;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
+mod logging;
 mod memory_budget;
 mod metrics;
 mod ops_endpoint;
@@ -71,6 +73,7 @@ pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
     render_environment_variable_table,
 };
+pub use logging::{TracingSubscriberError, install_tracing_subscriber};
 pub use memory_budget::{
     canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
     container_memory_budget_bytes,
@@ -202,22 +205,6 @@ async fn await_terminating_signal() {
 #[cfg(not(unix))]
 async fn await_terminating_signal() {
     let _ = tokio::signal::ctrl_c().await;
-}
-
-/// Installs the standard Zinder tracing subscriber as the global default.
-///
-/// Reads `RUST_LOG` if present, defaults to `info`, writes to stderr, and
-/// includes target labels. Idempotent in practice because tracing rejects
-/// repeated `init()` calls; binaries should call it once at startup.
-pub fn install_tracing_subscriber() {
-    use tracing_subscriber::{EnvFilter, fmt};
-
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .init();
 }
 
 /// Verifies the host CPU provides every instruction-set feature this binary

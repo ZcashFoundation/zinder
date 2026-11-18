@@ -294,6 +294,13 @@ each process only the `ZINDER_*` variables its binary accepts, as
 [Wallet-serving deployment](../runbooks/deploying-wallet-serving.md#service-configuration)
 describes.
 
+`RUST_LOG` is the one non-`ZINDER_*` variable every binary reads. It selects
+the log filter rather than a configuration field, so it has no TOML field and
+no row in the table below. Unset or blank means `info`, and a value that does
+not parse fails startup, as
+[Service operations §Structured logs](service-operations.md#structured-logs)
+describes.
+
 The service's `--print-config` output is the authoritative field and default
 inventory for its current binary. It must show explicit redaction markers for
 secrets and raw authorization material. Examples under `deploy/config/` must

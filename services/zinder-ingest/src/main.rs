@@ -33,8 +33,9 @@ use zinder_ingest::{
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
     ComposedReadiness, ConfigError, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
-    ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
-    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
+    ReadinessState, RuntimeService, StartupPhase, TracingSubscriberError,
+    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
 use zinder_source::{
     MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
@@ -167,7 +168,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_tracing_subscriber();
+    if let Err(error) = install_tracing_subscriber() {
+        return emit_tracing_subscriber_error(&error);
+    }
 
     if !host_cpu_meets_compiled_baseline() {
         return ExitCode::FAILURE;
@@ -1499,6 +1502,15 @@ async fn run_runtime(cli: Cli) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => emit_runtime_error(&error),
     }
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "no tracing subscriber is installed, so stderr is the only channel left"
+)]
+fn emit_tracing_subscriber_error(error: &TracingSubscriberError) -> ExitCode {
+    eprintln!("{}: {error}", env!("CARGO_BIN_NAME"));
+    ExitCode::FAILURE
 }
 
 fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {

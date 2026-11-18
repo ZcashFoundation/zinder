@@ -266,6 +266,32 @@ fn startup_fails_before_connecting_when_the_indexer_ca_file_is_missing()
 }
 
 #[test]
+fn startup_fails_before_opening_storage_when_rust_log_is_invalid() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("invalid-rust-log-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--config", path_str(&config_path)?])
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("RUST_LOG", "zinder=bogus")
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("zinder-ingest: RUST_LOG=\"zinder=bogus\" is not a valid log filter"),
+        "{stderr}"
+    );
+    assert!(
+        !storage_path.exists(),
+        "startup opened storage before failing"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("ingest-print-store");

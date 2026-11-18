@@ -108,7 +108,7 @@ These are optional:
 | `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | Seconds canonical construction may take before the container stops. Defaults to `10800` (three hours). See [Construction deadlines](#construction-deadlines). |
 | `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | Seconds wallet construction may take before the container stops. Defaults to `7200` (two hours). See [Construction deadlines](#construction-deadlines). |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment, including by upgrading to this default, raises the stores in place and irreversibly; capture a state bundle first if you need a rollback path. Lowering it requires a rebuild. |
-| `RUST_LOG` | Log filter, such as `info,zinder=info`. |
+| `RUST_LOG` | Log filter, such as `info,zinder=info`. Defaults to `info`. A value that does not parse stops the container at startup; see [Structured logs](../architecture/service-operations.md#structured-logs). |
 | `INGEST_CONTROL_BEARER_TOKEN` | Ingest-control bearer secret. Generated at boot when unset. |
 | `CHECKPOINT_BEARER_TOKEN` | Checkpoint bearer secret. Generated at boot when unset. |
 
