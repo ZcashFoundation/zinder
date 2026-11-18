@@ -43,7 +43,7 @@ bash "$validator" \
   --target zinder-canonical-runtime
 
 expect_rejected \
-  "the native-only wallet-serving target as production" \
+  "the single-volume wallet-serving target as production" \
   --deployment-class production \
   --target zinder-wallet-serving
 expect_rejected \
@@ -972,6 +972,28 @@ expect_rejected_because \
   'release admission rejected: every per-service release image must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$shell_less_single_volume_dockerfile"
+
+compat_less_wallet_serving_dockerfile="$temporary_directory/compat-less-wallet-serving.Dockerfile"
+sed '/^FROM zinder-runtime-base AS zinder-wallet-serving$/,/^ENTRYPOINT /{/^COPY --from=zinder-binaries-selected \/zinder-binaries\/zinder-compat-lightwalletd /d}' \
+  "$repository_root/deploy/Dockerfile" > "$compat_less_wallet_serving_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$compat_less_wallet_serving_dockerfile" \
+  && fail "the fixture did not remove the wallet-serving compatibility binary"
+expect_rejected_because \
+  "a Dockerfile whose wallet-serving image omits the lightwalletd compatibility binary" \
+  'release admission rejected: the zinder-wallet-serving image must carry exactly' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$compat_less_wallet_serving_dockerfile"
+
+closed_compat_port_dockerfile="$temporary_directory/closed-compat-port.Dockerfile"
+sed 's/^EXPOSE 9067 9102 9106$/EXPOSE 9102 9106/' \
+  "$repository_root/deploy/Dockerfile" > "$closed_compat_port_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$closed_compat_port_dockerfile" \
+  && fail "the fixture did not remove the wallet-serving compatibility port"
+expect_rejected_because \
+  "a Dockerfile whose wallet-serving image does not expose the compatibility port" \
+  'release admission rejected: the zinder-wallet-serving image must carry exactly' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$closed_compat_port_dockerfile"
 
 unpinned_distroless_dockerfile="$temporary_directory/unpinned-distroless.Dockerfile"
 # The variable reference is the literal Dockerfile text being rewritten.

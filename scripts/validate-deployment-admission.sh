@@ -944,6 +944,26 @@ EOF
     exit 1
   fi
 
+  # The wallet-serving image is the one image a lightwalletd operator pulls, so
+  # it carries both wallet readers and exposes the compatibility port.
+  wallet_serving_body="$(dockerfile_stage_body zinder-wallet-serving)"
+  wallet_serving_binaries="$(
+    sed -n 's#^COPY --from=zinder-binaries-selected /zinder-binaries/\(zinder-[a-z-]*\) /usr/local/bin/\1$#\1#p' \
+      <<< "$wallet_serving_body" | sort | tr '\n' ' '
+  )"
+  if [[ "$wallet_serving_binaries" != "zinder-compat-lightwalletd zinder-ingest zinder-projector zinder-query " ]] \
+    || ! grep -Fqx 'COPY deploy/config/wallet-serving/compat-lightwalletd.toml /etc/zinder/compat-lightwalletd.toml' \
+      <<< "$wallet_serving_body" \
+    || ! grep -Eqx 'EXPOSE( [0-9]+)* 9067( [0-9]+)*' <<< "$wallet_serving_body"; then
+    cat >&2 <<'EOF'
+release admission rejected: the zinder-wallet-serving image must carry exactly
+zinder-ingest, zinder-projector, zinder-query, and zinder-compat-lightwalletd,
+bake its compatibility config, and expose port 9067, matching the packages its
+release image evidence requires.
+EOF
+    exit 1
+  fi
+
   compile_job="$(release_job_body compile)"
   reproduction_job="$(release_job_body reproduce)"
   comparison_job="$(release_job_body compare-binaries)"

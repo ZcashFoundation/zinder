@@ -124,7 +124,7 @@ describe_image() {
       documentation_path=docs/runbooks/deploying-on-railway.md
       ;;
     zinder-wallet-serving)
-      image_description="Zinder ingest, wallet projector, and native WalletQuery supervised together on one volume."
+      image_description="Zinder ingest, wallet projector, native WalletQuery, and lightwalletd compatibility supervised together on one volume."
       documentation_path=docs/runbooks/deploying-wallet-serving.md
       ;;
     zinder-wallet-serving-explorer)
