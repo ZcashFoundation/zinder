@@ -632,9 +632,12 @@ async fn unreachable_endpoint_outweighs_a_consensus_branch_rejection() -> eyre::
 
 /// An endpoint skipped only because it is not verified yet, as `[node]` is
 /// when the fallback's verification finishes first at startup, keeps its
-/// place as the preferred endpoint.
+/// place as the preferred endpoint and records no switch.
 #[tokio::test]
 async fn skipping_an_unverified_endpoint_keeps_the_preference() -> eyre::Result<()> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let primary = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0xcc; 32]));
     let fallback = accepting_node(0xdd);
     let endpoints = Endpoints::unverified(vec![primary.clone(), fallback.clone()])?;
@@ -653,6 +656,11 @@ async fn skipping_an_unverified_endpoint_keeps_the_preference() -> eyre::Result<
         .await?;
     assert_eq!(primary.call_count(), 1);
     assert_eq!(fallback.call_count(), 1);
+    let rendered = recorded_metrics.render();
+    assert!(
+        !rendered.contains("zinder_wallet_broadcast_endpoint_switches_total"),
+        "skipping an unverified endpoint must not count a switch:\n{rendered}"
+    );
     Ok(())
 }
 

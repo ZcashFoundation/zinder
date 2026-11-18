@@ -687,8 +687,8 @@ Query and wallet-mode compatibility export, labeled by endpoint position:
   `verified`, `unverified`, and `excluded`.
 - `zinder_wallet_broadcast_endpoint_switches_total{from_position,to_position,cause}`:
   changes of the preferred endpoint, where `cause` is how the broadcast passed
-  over the previously preferred endpoint: `node_unreachable`,
-  `bad_consensus_branch`, or `unverified`. Each is also logged as
+  over the previously preferred endpoint: `node_unreachable` or
+  `bad_consensus_branch`. Each is also logged as
   `broadcast_endpoint_switched`.
 
 ### Explorer view replay
