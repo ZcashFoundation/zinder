@@ -120,8 +120,10 @@ writer schedules it at 703. Crossing such a height changes neither the
 revision nor the writer's upgrade at the broadcast height, so a passed
 verification also records the first height above the checked one at which
 the node's table disagrees with the writer's schedule. A broadcast skips the
-endpoint once the height after the visible tip of the pair it captured
-reaches that height. A change of the revision or of the upgrade, or a tip that
+endpoint once the height after the visible tip reaches that height. That
+height comes from the pair of the newest chain epoch that a broadcast or a
+verification has captured, so a request still holding an older pair cannot
+lower it. A change of the revision or of the upgrade, or a tip that
 reaches the endpoint's first disagreement, verifies the endpoint again at
 once. An endpoint that answers verification with
 positive evidence, a missing `sendrawtransaction` or a disagreeing table, is

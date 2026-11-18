@@ -197,7 +197,8 @@ fn schedule_with_an_earlier_upgrade() -> eyre::Result<NetworkUpgradeActivations>
 struct EndpointOnlyActivation {
     /// Serves a tip at height 2, so a broadcast targets height 3.
     below_slot: WalletServingPairSlot,
-    /// Serves a tip at height 3, so a broadcast targets height 4.
+    /// Serves a tip at height 3, so a broadcast targets height 4, in the
+    /// chain epoch after the one `below_slot` serves.
     at_slot: WalletServingPairSlot,
     _stores: [WalletServingStoreFixture; 2],
 }
@@ -209,7 +210,7 @@ impl EndpointOnlyActivation {
             &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
             &schedule,
         )?;
-        let mut at_store = WalletServingStoreFixture::from_chain(
+        let mut at_store = WalletServingStoreFixture::from_chain_after_live_append(
             &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
             &schedule,
         )?;
@@ -715,6 +716,42 @@ async fn broadcast_skips_an_endpoint_whose_table_disagrees_at_the_broadcast_heig
             outcome,
             Err(QueryError::Node(SourceError::NodeUnavailable { .. }))
         ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(node.call_count(), 0);
+    assert_eq!(node.capability_probe_count(), 1);
+    Ok(())
+}
+
+/// An older pair captured late does not replace the broadcast height of a
+/// newer one.
+///
+/// A verification captures the older pair after a wallet broadcast captured
+/// the newer one, and a later broadcast still skips the endpoint whose table
+/// disagrees at the newer pair's broadcast height.
+#[tokio::test]
+async fn older_pair_captured_later_keeps_skipping_the_disagreeing_endpoint() -> eyre::Result<()> {
+    let activation = EndpointOnlyActivation::new()?;
+    let node = accepting_node(0x18).with_node_activations(schedule_with_an_earlier_upgrade()?);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    let query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(activation.at_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+    nodes.verify(&activation.below_slot).await?;
+    assert!(
+        query
+            .broadcast_transaction(RawTransactionBytes::new([0x18]))
+            .await
+            .is_err()
+    );
+
+    nodes.verify(&activation.below_slot).await?;
+    let outcome = nodes
+        .broadcast_transaction(RawTransactionBytes::new([0x19]))
+        .await;
+
+    assert!(
+        matches!(outcome, Err(SourceError::NodeUnavailable { .. })),
         "unexpected outcome: {outcome:?}"
     );
     assert_eq!(node.call_count(), 0);

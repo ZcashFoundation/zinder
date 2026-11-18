@@ -1,13 +1,7 @@
 //! Transaction broadcast through the ordered node list, with every endpoint
 //! verified on first contact.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -19,8 +13,8 @@ use tokio::{
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
     BlockHeight, BlockId, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason,
-    ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes, TransactionBroadcastOutcome,
-    TransactionId,
+    ChainEpochId, ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     BroadcastNodeProbe, NodeCapability, NodeSet, NodeSetSwitch, NodeTarget, SourceError,
@@ -125,7 +119,7 @@ impl<Source> OrderedBroadcaster<Source> {
                 .map(EndpointVerification::new)
                 .collect(),
             preferred: nodes.subscribe_switches(),
-            broadcast_height: Arc::new(AtomicU32::new(0)),
+            broadcast_height: Arc::new(parking_lot::Mutex::new(None)),
         };
         Self {
             inner: Arc::new(OrderedBroadcasterInner {
@@ -511,9 +505,9 @@ fn record_attempt(position: usize, outcome: &Result<TransactionBroadcastOutcome,
 pub(crate) struct EndpointVerifications {
     endpoints: Arc<[EndpointVerification]>,
     preferred: watch::Receiver<usize>,
-    /// The height a broadcast targets under the latest serving pair that a
-    /// verification or a wallet broadcast captured.
-    broadcast_height: Arc<AtomicU32>,
+    /// The height a broadcast targets under the serving pair of the newest
+    /// chain epoch that a verification or a wallet broadcast captured.
+    broadcast_height: Arc<parking_lot::Mutex<Option<EpochBroadcastHeight>>>,
 }
 
 impl EndpointVerifications {
@@ -544,23 +538,33 @@ impl EndpointVerifications {
     /// the writer-admitted schedule at the height a broadcast targets under
     /// `pair`.
     pub(crate) fn track_broadcast_height(&self, pair: &WalletServingReadPair) {
-        self.track(broadcast_height(pair));
+        self.track(EpochBroadcastHeight::of(pair));
     }
 
-    fn track(&self, broadcast_height: BlockHeight) {
-        self.broadcast_height
-            .store(broadcast_height.value(), Ordering::Relaxed);
+    /// Tracks `captured` unless a pair of a newer chain epoch was tracked, so
+    /// a caller that captured an older pair cannot replace the height of a
+    /// newer one.
+    fn track(&self, captured: EpochBroadcastHeight) {
+        let mut tracked = self.broadcast_height.lock();
+        if tracked.is_none_or(|tracked| tracked.chain_epoch_id <= captured.chain_epoch_id) {
+            *tracked = Some(captured);
+        }
     }
 
     fn tracked_broadcast_height(&self) -> BlockHeight {
-        BlockHeight::new(self.broadcast_height.load(Ordering::Relaxed))
+        self.broadcast_height
+            .lock()
+            .map_or(BlockHeight::new(0), |tracked| tracked.broadcast_height)
     }
 
     /// Captures the evidence a verification checks against and tracks its
     /// broadcast height.
     fn target(&self, pair_slot: &WalletServingPairSlot) -> VerificationTarget {
         let target = VerificationTarget::capture(pair_slot);
-        self.track(target.broadcast_height);
+        self.track(EpochBroadcastHeight {
+            chain_epoch_id: target.chain_epoch_id,
+            broadcast_height: target.broadcast_height,
+        });
         target
     }
 }
@@ -909,12 +913,30 @@ fn broadcast_height(pair: &WalletServingReadPair) -> BlockHeight {
     tip_height.next().unwrap_or(tip_height)
 }
 
+/// The height a broadcast targets under one serving pair, with the chain
+/// epoch that orders the pair among the others.
+#[derive(Clone, Copy)]
+struct EpochBroadcastHeight {
+    chain_epoch_id: ChainEpochId,
+    broadcast_height: BlockHeight,
+}
+
+impl EpochBroadcastHeight {
+    fn of(pair: &WalletServingReadPair) -> Self {
+        Self {
+            chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
+            broadcast_height: broadcast_height(pair),
+        }
+    }
+}
+
 /// The serving-pair evidence one verification checks endpoints against,
 /// captured without retaining the pair across node calls.
 struct VerificationTarget {
     basis: VerificationBasis,
     admitted_activations: NetworkUpgradeActivations,
     broadcast_height: BlockHeight,
+    chain_epoch_id: ChainEpochId,
     visible_tip: BlockId,
 }
 
@@ -925,6 +947,7 @@ impl VerificationTarget {
             basis: VerificationBasis::of(&pair),
             admitted_activations: pair.network_upgrade_activations().clone(),
             broadcast_height: broadcast_height(&pair),
+            chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
             visible_tip: pair.canonical_fence().visible_tip(),
         }
     }
