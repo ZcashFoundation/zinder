@@ -53,6 +53,11 @@ pub struct MempoolReadyGate {
     writer_halt: watch::Sender<Option<ParkedWriterHalt>>,
     /// When the certified source tip and the canonical tip began to disagree.
     tip_disagreement_since: Arc<Mutex<Option<Instant>>>,
+    /// Set by a node endpoint switch to a receiver that has seen the
+    /// certification in force at the switch. That certification describes
+    /// the previous endpoint's mempool, so the gate admits no tip until the
+    /// owner certifies or withdraws again.
+    superseded_certification: Arc<Mutex<Option<watch::Receiver<Option<BlockId>>>>>,
 }
 
 impl MempoolReadyGate {
@@ -64,11 +69,37 @@ impl MempoolReadyGate {
     /// could leave ingest readiness permanently admitted.
     #[must_use]
     pub fn certified_source_tip(&self) -> Option<BlockId> {
+        if self.certification_superseded() {
+            return None;
+        }
         self.certified_source_tip
             .has_changed()
             .is_ok()
             .then(|| *self.certified_source_tip.borrow())
             .flatten()
+    }
+
+    /// Stops admitting the certification in force, which the owner made from
+    /// the previous node endpoint's mempool, until the owner certifies or
+    /// withdraws again.
+    ///
+    /// The switch also ends the owner's open source stream, but the owner may
+    /// process that only after the follower has observed the new endpoint.
+    pub(crate) fn supersede_certification(&self) {
+        let mut seen = self.certified_source_tip.clone();
+        seen.mark_unchanged();
+        *self.superseded_certification.lock() = Some(seen);
+    }
+
+    fn certification_superseded(&self) -> bool {
+        let mut superseded_certification = self.superseded_certification.lock();
+        let superseded = superseded_certification
+            .as_ref()
+            .is_some_and(|seen| !seen.has_changed().unwrap_or(false));
+        if !superseded {
+            *superseded_certification = None;
+        }
+        superseded
     }
 
     /// Returns whether the serving source generation admits the supplied
@@ -179,6 +210,7 @@ pub fn mempool_ready_channel() -> (MempoolReadySignal, MempoolReadyGate) {
             certified_source_tip: rx,
             writer_halt: halt_tx,
             tip_disagreement_since: Arc::new(Mutex::new(None)),
+            superseded_certification: Arc::new(Mutex::new(None)),
         },
     )
 }
@@ -234,6 +266,22 @@ mod tests {
         signal.certify_source_tip(certified_tip);
         signal.withdraw_certification();
         assert!(!gate.admits_canonical_tip(certified_tip));
+    }
+
+    #[test]
+    fn a_superseded_certification_admits_no_tip_until_the_owner_certifies_again() {
+        let (signal, gate) = mempool_ready_channel();
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip);
+
+        gate.supersede_certification();
+
+        assert_eq!(gate.certified_source_tip(), None);
+        assert!(!gate.admits_canonical_tip(certified_tip));
+        signal.withdraw_certification();
+        assert!(!gate.admits_canonical_tip(certified_tip));
+        signal.certify_source_tip(certified_tip);
+        assert!(gate.admits_canonical_tip(certified_tip));
     }
 
     #[test]

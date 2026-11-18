@@ -257,10 +257,11 @@ A switch to a standby keeps the visible tip confirmed, because the final check
 found that block on the new endpoint, so wallet-serving readers keep serving
 even when the new endpoint's first iteration fails. A switch to a diverged
 standby resets tip confirmation until the replacement commits, so readers see
-`tip_unconfirmed` meanwhile. Either switch skips the recovery backoff and ends
-the live mempool stream, so the owner withdraws certification and rebuilds from
-the new endpoint; ingest readiness stays withdrawn until that snapshot is
-certified.
+`tip_unconfirmed` meanwhile. Either switch skips the recovery backoff, stops
+admitting the mempool certification made from the previous endpoint, and ends
+the live mempool stream, so the owner rebuilds from the new endpoint; ingest
+readiness stays withdrawn until the owner certifies a snapshot after the
+switch, even when it is still busy with the previous endpoint.
 There is no timed failback. The next switch walks positions from 0 again, and a
 restart starts at position 0. Fresh construction does not switch: a node
 failure there exits, and the restart admits the first reachable endpoint.

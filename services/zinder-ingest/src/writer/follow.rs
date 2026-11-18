@@ -169,6 +169,28 @@ where
         })
     }
 
+    /// Prepares the follower to read from the endpoint a switch made active,
+    /// and returns the tip confirmation that holds there.
+    ///
+    /// The mempool generation certified before the switch hydrated from the
+    /// previous endpoint, so ingest readiness waits until the owner certifies
+    /// one from the new endpoint.
+    fn after_endpoint_switch(
+        &self,
+        switch: &NodeEndpointSwitch,
+        canonical_tip: BlockId,
+    ) -> TipConfirmation {
+        if let Some(mempool_ready_gate) = self.config.mempool_ready_gate.as_ref() {
+            mempool_ready_gate.supersede_certification();
+            withdraw_follow_readiness_for_mempool_hydration(
+                self.readiness,
+                canonical_tip,
+                Some(mempool_ready_gate),
+            );
+        }
+        tip_confirmation_after_switch(switch)
+    }
+
     fn commit_append(
         &self,
         store: RocksDbCanonicalStore,
@@ -578,7 +600,8 @@ where
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
             if let Some(switch) = node_failover.switch_after_unready().await {
                 source_outage = None;
-                tip_confirmation = tip_confirmation_after_switch(&switch);
+                tip_confirmation =
+                    follower.after_endpoint_switch(&switch, store.event_fence().visible_tip());
                 continue;
             }
         }
@@ -647,7 +670,8 @@ where
                     SourceRecovery::Switched(switch) => {
                         // Failures on the new endpoint start a new outage.
                         source_outage = None;
-                        tip_confirmation = tip_confirmation_after_switch(&switch);
+                        tip_confirmation = follower
+                            .after_endpoint_switch(&switch, store.event_fence().visible_tip());
                     }
                 }
                 continue;

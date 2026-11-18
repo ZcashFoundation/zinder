@@ -1865,12 +1865,12 @@ async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_bl
     let recorder = PrometheusBuilder::new().build_recorder();
     let recorded_metrics = recorder.handle();
     let _local_recorder = metrics::set_default_local_recorder(&recorder);
-    append_sibling_after_one_recovery(
+    Box::pin(append_sibling_after_one_recovery(
         switch,
         &source,
         "tree-state hash disagrees with the fetched block hash",
         &recorded_metrics,
-    )
+    ))
     .await
 }
 
@@ -1885,12 +1885,12 @@ async fn hash_keyed_tree_state_refusal_after_a_best_chain_switch_appends_the_new
     let recorder = PrometheusBuilder::new().build_recorder();
     let recorded_metrics = recorder.handle();
     let _local_recorder = metrics::set_default_local_recorder(&recorder);
-    append_sibling_after_one_recovery(
+    Box::pin(append_sibling_after_one_recovery(
         switch,
         &source,
         "the requested block is not in the main chain",
         &recorded_metrics,
-    )
+    ))
     .await
 }
 

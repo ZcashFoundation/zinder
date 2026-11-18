@@ -24,10 +24,10 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, EndpointAdmission, EndpointExclusion,
-    FailoverReadiness, IneligibleReason, NodeEndpointAdmissions, NodeEndpointState, NodeFailover,
-    NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES, follow_canonical_tip,
-    follow_canonical_tip_with_control, spawn_node_endpoint_monitor,
-    spawn_upstream_health_probe_task,
+    FailoverReadiness, IneligibleReason, MempoolReadyGate, NodeEndpointAdmissions,
+    NodeEndpointState, NodeFailover, NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES,
+    follow_canonical_tip, follow_canonical_tip_with_control, mempool_ready_channel,
+    spawn_node_endpoint_monitor, spawn_upstream_health_probe_task,
 };
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{
@@ -355,6 +355,14 @@ impl StartedFailover {
     }
 
     fn follower(&self, target_height: u32) -> CanonicalFollower<'_, NodeSet<FailoverEndpoint>> {
+        self.follower_with_mempool_gate(target_height, None)
+    }
+
+    fn follower_with_mempool_gate(
+        &self,
+        target_height: u32,
+        mempool_ready_gate: Option<MempoolReadyGate>,
+    ) -> CanonicalFollower<'_, NodeSet<FailoverEndpoint>> {
         CanonicalFollower::new(
             &self.nodes,
             Arc::clone(&self.activations),
@@ -365,7 +373,7 @@ impl StartedFailover {
                 target_height: Some(BlockHeight::new(target_height)),
                 event_retention_window: None,
                 event_retention_check_interval: Duration::from_secs(1),
-                mempool_ready_gate: None,
+                mempool_ready_gate,
                 max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
                 node_failover: Some(self.failover.clone()),
             },
@@ -959,6 +967,51 @@ async fn a_switch_resets_the_gated_node_source_input_to_starting() -> TestResult
         composed.input_cause(ReadinessInput::NodeSource),
         Some(ReadinessCause::Starting)
     ));
+    Ok(())
+}
+
+/// A switch withholds ingest readiness until the mempool owner certifies a
+/// generation from the new endpoint, even before the owner has processed the
+/// end of the previous endpoint's stream.
+#[tokio::test]
+async fn a_switch_withholds_readiness_until_the_new_endpoint_mempool_is_certified() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let failing_primary = primary.clone();
+    let started =
+        StartedFailover::start(vec![primary, fallback], FailoverRun::to_height(4)).await?;
+    failing_primary.set_unreachable(true);
+    let (mempool_signal, mempool_gate) = mempool_ready_channel();
+    // The owner certified `[node]`'s mempool and has not yet seen the switch.
+    mempool_signal.certify_source_tip(block_id(&blocks, 2)?);
+
+    let follow_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        Box::pin(follow_canonical_tip(
+            store,
+            started.follower_with_mempool_gate(4, Some(mempool_gate.clone())),
+        )),
+    )
+    .await;
+    let FailoverOutcomeHandles {
+        failover,
+        readiness,
+        ..
+    } = started.stop().await?;
+    let store = follow_outcome??;
+
+    assert_eq!(failover.active_position(), 1);
+    let visible_tip = store.event_fence().visible_tip();
+    assert_eq!(visible_tip, block_id(&blocks, 4)?);
+    assert!(!readiness.report().is_ready);
+    assert!(!mempool_gate.admits_canonical_tip(visible_tip));
+    mempool_signal.certify_source_tip(visible_tip);
+    assert!(mempool_gate.admits_canonical_tip(visible_tip));
     Ok(())
 }
 
