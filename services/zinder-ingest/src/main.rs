@@ -466,6 +466,8 @@ fn spawn_canonical_control_tasks(
                 mempool.reconciliation_batch_target_raw_transaction_bytes,
             );
         let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
+        let mempool_ready_signal =
+            mempool_ready_signal.following_node_endpoints(nodes.subscribe_switches());
         writer_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
         let mempool_source = nodes.mempool_source(mempool.source_admission_limits);
         let mempool_retention = MempoolEventRetentionConfig::new(

@@ -1170,8 +1170,11 @@ async fn a_switch_resets_the_gated_node_source_input_to_starting() -> TestResult
 }
 
 /// A switch withholds ingest readiness until the mempool owner certifies a
-/// generation from the new endpoint, even before the owner has processed the
-/// end of the previous endpoint's stream.
+/// generation from the new endpoint.
+///
+/// That holds before the owner has processed the end of the previous
+/// endpoint's stream, and when the owner finishes reconciling a snapshot from
+/// the previous endpoint after the switch.
 #[tokio::test]
 async fn a_switch_withholds_readiness_until_the_new_endpoint_mempool_is_certified() -> TestResult {
     let PublishedStore {
@@ -1186,8 +1189,15 @@ async fn a_switch_withholds_readiness_until_the_new_endpoint_mempool_is_certifie
         StartedFailover::start(vec![primary, fallback], FailoverRun::to_height(4)).await?;
     failing_primary.set_unreachable(true);
     let (mempool_signal, mempool_gate) = mempool_ready_channel();
+    let mempool_signal =
+        mempool_signal.following_node_endpoints(started.nodes.subscribe_switches());
     // The owner certified `[node]`'s mempool and has not yet seen the switch.
-    mempool_signal.certify_source_tip(block_id(&blocks, 2)?);
+    mempool_signal.certify_source_tip(
+        block_id(&blocks, 2)?,
+        mempool_signal.observe_node_endpoint(),
+    );
+    // Another `[node]` snapshot is still being reconciled across the switch.
+    let observed_before_switch = mempool_signal.observe_node_endpoint();
 
     let follow_outcome = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1209,7 +1219,9 @@ async fn a_switch_withholds_readiness_until_the_new_endpoint_mempool_is_certifie
     assert_eq!(visible_tip, block_id(&blocks, 4)?);
     assert!(!readiness.report().is_ready);
     assert!(!mempool_gate.admits_canonical_tip(visible_tip));
-    mempool_signal.certify_source_tip(visible_tip);
+    mempool_signal.certify_source_tip(visible_tip, observed_before_switch);
+    assert!(!mempool_gate.admits_canonical_tip(visible_tip));
+    mempool_signal.certify_source_tip(visible_tip, mempool_signal.observe_node_endpoint());
     assert!(mempool_gate.admits_canonical_tip(visible_tip));
     Ok(())
 }

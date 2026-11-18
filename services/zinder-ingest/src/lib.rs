@@ -46,8 +46,8 @@ pub use memory_pressure::{
 pub use mempool::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolReadyGate,
-    MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, build_mempool_entry,
-    mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
+    MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, ObservedNodeEndpoint,
+    build_mempool_entry, mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
 };
 pub use node_failover::{
     AdmittedEndpoint, EndpointAdmission, EndpointExclusion, FailoverReadiness, IneligibleReason,

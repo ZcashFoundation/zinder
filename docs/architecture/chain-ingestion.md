@@ -273,9 +273,13 @@ even when the new endpoint's first iteration fails. A switch to a diverged
 standby resets tip confirmation until the replacement commits, so readers see
 `tip_unconfirmed` meanwhile. Either switch skips the recovery backoff, stops
 admitting the mempool certification made from the previous endpoint, and ends
-the live mempool stream, so the owner rebuilds from the new endpoint; ingest
-readiness stays withdrawn until the owner certifies a snapshot after the
-switch, even when it is still busy with the previous endpoint.
+the live mempool stream, so the owner rebuilds from the new endpoint. Each
+certification records the active endpoint the owner observed before it last
+found its source stream open, and the gate admits it only while that endpoint
+is still active. Ingest readiness therefore stays withdrawn until the owner
+certifies a snapshot from the new endpoint, even when the owner is still busy
+with the previous endpoint or finishes certifying one of its snapshots after
+the switch.
 Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
 the writer bounds every node call by the longest timeout in the list, so a call
 to a fallback slower than `[node]` is not cut short after a switch.

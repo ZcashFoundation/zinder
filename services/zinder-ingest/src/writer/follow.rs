@@ -174,16 +174,15 @@ where
     /// Prepares the follower to read from the endpoint a switch made active,
     /// and returns the tip confirmation that holds there.
     ///
-    /// The mempool generation certified before the switch hydrated from the
-    /// previous endpoint, so ingest readiness waits until the owner certifies
-    /// one from the new endpoint.
+    /// The mempool gate no longer admits a certification made from the
+    /// previous endpoint, so ingest readiness is withdrawn until the owner
+    /// certifies a generation from the new endpoint.
     fn after_endpoint_switch(
         &self,
         switch: &NodeEndpointSwitch,
         canonical_tip: BlockId,
     ) -> TipConfirmation {
         if let Some(mempool_ready_gate) = self.config.mempool_ready_gate.as_ref() {
-            mempool_ready_gate.supersede_certification();
             withdraw_follow_readiness_for_mempool_hydration(
                 self.readiness,
                 canonical_tip,
@@ -1954,7 +1953,7 @@ mod tests {
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
         let after_marker = gate_canonical_readiness_on_mempool_hydration(
             canonical_syncing,
             canonical_tip,
@@ -1988,7 +1987,7 @@ mod tests {
 
         // A block arrives: canonical ingest commits it before the owner
         // certifies the replacement generation at the same tip.
-        signal.certify_source_tip(block_id(99, 1));
+        signal.certify_source_tip(block_id(99, 1), signal.observe_node_endpoint());
         let during_tip_transition = gate_canonical_readiness_on_mempool_hydration(
             canonical_ready.clone(),
             canonical_tip,
@@ -1999,7 +1998,7 @@ mod tests {
             "block arrival must not withdraw ingest readiness"
         );
 
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
         let after_current_marker = gate_canonical_readiness_on_mempool_hydration(
             canonical_ready,
             canonical_tip,
@@ -2014,7 +2013,7 @@ mod tests {
         let (signal, gate) = mempool_ready_channel();
         let mut hydration_changes = Some(gate.clone());
         let canonical_tip = block_id(100, 1);
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
         assert!(wait_for_mempool_hydration_change(&mut hydration_changes).await);
         let (readiness, composed) = writer_readiness(
             ReadinessState::ready_with_target(Some(100), Some(100))
@@ -2050,7 +2049,7 @@ mod tests {
         assert_eq!(withdrawn.target_height, Some(100));
         assert_eq!(withdrawn.phase, Some(IngestPhase::FollowingTip));
 
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
         let interrupted_by_rehydration = await_follow_preparation_or_mempool_change(
             std::future::ready(()),
             &mut hydration_changes,
@@ -2137,7 +2136,7 @@ mod tests {
         let (signal, gate) = mempool_ready_channel();
         let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
         let canonical_tip = block_id(100, 1);
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
 
         let (withdraw_sender, withdraw_receiver) = tokio::sync::oneshot::channel();
         let mut hydration_changes = Some(gate.clone());
@@ -2175,7 +2174,7 @@ mod tests {
             let _ = rehydration_sender.send(woke_for_hydration_change);
         });
         tokio::task::yield_now().await;
-        signal.certify_source_tip(canonical_tip);
+        signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), rehydration_receiver)
                 .await
