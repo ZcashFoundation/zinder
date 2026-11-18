@@ -382,14 +382,16 @@ query without it serves storage only, advertises no broadcast, runs no node
 probe, and never degrades its node-source dependency. Any node setting counts
 as `[node]`, so a section, `ZINDER_NODE__*` variable, or override without
 `node.json_rpc_addr` fails configuration. A query with `[node]`
-advertises broadcast and starts without contacting the node. Its node probe
+advertises broadcast and starts without contacting the node, even before the
+node writes its cookie file. Its node probe
 first verifies the endpoint: `rpc.discover` must list `sendrawtransaction`,
 the node's activation table must agree with the serving pair's writer-admitted
 schedule through the visible tip, and the node's best chain must hold the
 pair's visible tip block. Until that passes, every broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE` without sending the transaction, and the
 dependency reports `node_unavailable` (failure class `protocol_mismatch` for a
-table that disagrees) or `node_capability_missing`. The probe retries the
+table that disagrees, and `node_unreachable` for a cookie file the query cannot
+read yet) or `node_capability_missing`. The probe retries the
 verification every round. Once it passes, the probe exercises `tip_id` and
 upstream synchronization health through the same endpoint and publishes
 `node_unavailable`, `upstream_not_ready`, or `node_capability_missing` as the
@@ -520,10 +522,10 @@ connect node, admit ingest control, check schema, recover state, open storage,
 start API, and ready. Phase duration and failure are metrics and structured
 logs. Only ingest connects to the node at startup. Query, compatibility, and
 the projector open storage on the schedule the canonical writer admitted, so
-they start while the node is down. A store whose writer has not admitted a
-schedule yet delays their storage open within its convergence bound. Native
-query and wallet-mode compatibility count each such round as
-`outcome="writer_schedule_not_admitted"` in
+they start while the node is down or before it writes its cookie file. A store
+whose writer has not admitted a schedule yet delays their storage open within
+its convergence bound. Native query and wallet-mode compatibility count each
+such round as `outcome="writer_schedule_not_admitted"` in
 `zinder_wallet_serving_pair_publisher_convergence_total`.
 
 On termination, a runtime sets `shutting_down`, stops accepting new traffic,

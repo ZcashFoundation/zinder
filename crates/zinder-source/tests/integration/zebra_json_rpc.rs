@@ -417,6 +417,65 @@ async fn cookie_refusal_reconnects_with_the_rotated_cookie() -> eyre::Result<()>
     Ok(())
 }
 
+/// A source built before its node wrote the cookie file waits for the file.
+///
+/// Construction succeeds, each request fails without reaching the node until
+/// the file holds credentials, and the next request then carries them.
+#[tokio::test]
+async fn cookie_file_written_after_construction_is_read_on_the_next_request() -> eyre::Result<()> {
+    const AUTHORIZATION: &str = "Basic X19jb29raWVfXzphZnRlci1zdGFydA==";
+
+    let server = JsonRpcTestServer::start([
+        method("getblockchaininfo").reply(RpcReply::result(json!({ "upgrades": {} })))
+    ])?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::cookie_file(&cookie_path),
+        Duration::from_secs(5),
+    )?;
+
+    let missing = source.fetch_network_upgrade_activations().await.err();
+    std::fs::write(&cookie_path, "\n")?;
+    let empty = source.fetch_network_upgrade_activations().await.err();
+    assert!(
+        server.requests()?.is_empty(),
+        "no request reaches the node before its cookie file holds credentials"
+    );
+    std::fs::write(&cookie_path, "__cookie__:after-start")?;
+    source.fetch_network_upgrade_activations().await?;
+
+    for (error, reason) in [
+        (missing, "cookie source could not be read"),
+        (empty, "cookie credentials are empty"),
+    ] {
+        assert!(
+            matches!(&error, Some(SourceError::NodeUnavailable { reason: actual }) if actual.contains(reason)),
+            "expected a node-unavailable cookie failure naming {reason:?}, got {error:?}"
+        );
+    }
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].authorization.as_deref(), Some(AUTHORIZATION));
+    Ok(())
+}
+
+/// Inline cookie credentials come from configuration, so empty ones still
+/// fail construction instead of being awaited like a cookie file.
+#[test]
+fn empty_inline_cookie_fails_construction() {
+    let outcome = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        "http://127.0.0.1:1",
+        NodeAuth::cookie_inline(String::new()),
+        Duration::from_secs(5),
+    );
+
+    assert!(matches!(outcome, Err(SourceError::NodeUnavailable { .. })));
+}
+
 #[tokio::test]
 async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("getbestblockheightandhash")

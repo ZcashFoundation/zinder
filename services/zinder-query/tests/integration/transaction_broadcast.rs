@@ -3,19 +3,23 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use std::time::Duration;
+
 use eyre::eyre;
+use serde_json::json;
 use zinder_core::{
-    BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
+    BlockHash, BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
+    BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES,
+    Network, NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
     TransactionBroadcastOutcome, TransactionId,
+    wire::{encode_branch_id_hex, encode_rpc_block_hash_hex},
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_query::{NodeBroadcast, QueryError, WalletQueryApi, WalletServingQuery};
-use zinder_source::SourceError;
+use zinder_source::{NodeAuth, SourceError, ZebraJsonRpcSource};
 use zinder_testkit::{
-    ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    ChainFixture, JsonRpcTestServer, MockTransactionBroadcaster, RpcReply,
+    WalletServingStoreFixture, method, sample_regtest_upgrade_activations,
 };
 
 use crate::common::{
@@ -150,6 +154,127 @@ async fn node_with_the_same_schedule_on_another_chain_fails_verification() -> ey
             .is_err()
     );
     assert!(broadcaster.captured_calls().is_empty());
+    Ok(())
+}
+
+/// The sample regtest upgrades with one upgrade per height, so a node table
+/// compares equal whatever order its `upgrades` object lists them in.
+fn one_upgrade_per_height() -> eyre::Result<NetworkUpgradeActivations> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(|(activation, height)| NetworkUpgradeActivation {
+                activation_height: BlockHeight::new(height),
+                ..activation.clone()
+            })
+            .collect(),
+    )?)
+}
+
+/// Starts a node double that passes first-contact verification once for a
+/// pair serving `schedule` with `tip_hash` at its tip, then accepts one
+/// broadcast.
+fn verifiable_node(
+    schedule: &NetworkUpgradeActivations,
+    tip_hash: BlockHash,
+) -> eyre::Result<JsonRpcTestServer> {
+    let upgrades: serde_json::Map<String, serde_json::Value> = schedule
+        .activations()
+        .iter()
+        .map(|activation| {
+            (
+                encode_branch_id_hex(activation.branch_id),
+                json!({
+                    "name": activation.name,
+                    "activationheight": activation.activation_height.value(),
+                    "status": "active",
+                }),
+            )
+        })
+        .collect();
+    JsonRpcTestServer::start([
+        method("rpc.discover").reply(RpcReply::result(json!({
+            "openrpc": "1.3.2",
+            "methods": [{"name": "rpc.discover"}, {"name": "sendrawtransaction"}],
+        }))),
+        method("getblockchaininfo").reply(RpcReply::result(json!({ "upgrades": upgrades }))),
+        method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(tip_hash)))),
+        method("sendrawtransaction").reply(RpcReply::result(json!(
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ))),
+    ])
+}
+
+/// A reader with cookie authentication can start before its node writes the
+/// cookie file.
+///
+/// Verification and broadcast fail as node-unavailable without contacting
+/// the node until the file appears. Verification then passes, and broadcast
+/// reaches the node with the cookie credentials.
+#[tokio::test]
+async fn node_cookie_written_after_startup_is_verified_once_it_appears() -> eyre::Result<()> {
+    const AUTHORIZATION: &str = "Basic X19jb29raWVfXzpub2RlLXN0YXJ0ZWQ=";
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip_hash = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?
+        .hash;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let server = verifiable_node(&schedule, tip_hash)?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    let node = NodeBroadcast::new(ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::cookie_file(&cookie_path),
+        Duration::from_secs(5),
+    )?);
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refused_broadcast = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await
+        .err();
+    let refused_verification = node.verify(&slot).await.err();
+    assert!(
+        matches!(
+            refused_broadcast,
+            Some(QueryError::Node(SourceError::NodeUnavailable { .. }))
+        ),
+        "unexpected broadcast outcome before the cookie exists: {refused_broadcast:?}"
+    );
+    assert!(
+        matches!(&refused_verification, Some(SourceError::NodeUnavailable { reason }) if reason.contains("cookie")),
+        "unexpected verification outcome before the cookie exists: {refused_verification:?}"
+    );
+    assert!(server.requests()?.is_empty());
+
+    std::fs::write(&cookie_path, "__cookie__:node-started")?;
+    node.verify(&slot).await?;
+    let broadcast_outcome = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await?;
+
+    assert_eq!(
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
+            transaction_id: TransactionId::from_bytes([0x11; 32]),
+        })
+    );
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some(AUTHORIZATION)),
+        "{requests:?}"
+    );
     Ok(())
 }
 

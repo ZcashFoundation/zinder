@@ -633,3 +633,49 @@ impl From<Cli> for LightwalletdConfigOverrides {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::Network;
+    use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
+
+    use super::*;
+
+    fn node_target(json_rpc_addr: &str, node_auth: NodeAuth) -> NodeTarget {
+        NodeTarget::new(
+            Network::ZcashRegtest,
+            json_rpc_addr.to_owned(),
+            node_auth,
+            Duration::from_secs(5),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        )
+    }
+
+    /// The node writes its cookie file when it starts, so a compatibility
+    /// server that starts first keeps an unverified broadcast endpoint
+    /// instead of exiting.
+    #[test]
+    fn a_missing_node_cookie_file_leaves_broadcast_unverified()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cookie_dir = tempfile::tempdir()?;
+        let node = node_target(
+            "http://127.0.0.1:1",
+            NodeAuth::cookie_file(cookie_dir.path().join(".cookie")),
+        );
+
+        let node_broadcast = build_node_broadcast(Some(&node))?;
+
+        assert!(node_broadcast.is_some_and(|node| node.verified_capabilities().is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_node_address_fails_startup() {
+        let node = node_target("not a node address", NodeAuth::None);
+
+        assert!(matches!(
+            build_node_broadcast(Some(&node)),
+            Err(LightwalletdConfigError::Source(_))
+        ));
+    }
+}

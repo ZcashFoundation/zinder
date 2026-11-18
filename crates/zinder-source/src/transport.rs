@@ -393,6 +393,17 @@ where
         self.state.inner.load_full()
     }
 
+    /// Installs `fresh` as the inner client and clears the failure counter.
+    ///
+    /// For an adapter that knows its client is unusable before any call
+    /// fails, such as one built before its credentials existed.
+    pub(crate) fn replace(&self, fresh: C) {
+        self.state.inner.store(Arc::new(fresh));
+        self.state
+            .consecutive_transport_failures
+            .store(0, Ordering::Relaxed);
+    }
+
     /// Folds the result of one RPC call into the failure counter.
     ///
     /// On `Ok` the counter resets. On `Err` the counter only advances

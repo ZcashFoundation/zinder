@@ -161,6 +161,8 @@ writer-admitted schedule through the visible tip, and the node's best chain
 must hold the pair's visible tip block, read with `getblockhash`. A broadcast
 before that verification passes fails with `NodeUnavailable` and sends
 nothing, so a transaction never reaches a node on another network or chain.
+A reader also starts before its node writes a cookie file, as described under
+[Authentication and health](#authentication-and-health).
 
 Some nodes refuse historical reads permanently. A Zakura node built by
 verified-commitment-trees fast sync never writes per-height trees or subtree
@@ -212,6 +214,16 @@ consecutive failures of that class rebuild the JSON-RPC client, and the
 rebuild reads a cookie file again, so ingest recovers after a node restart
 rotates its cookie. Basic credentials and an inline cookie do not change on a
 rebuild, so their refusal continues until `node.auth` is corrected.
+
+Building a source reads no cookie file it cannot read yet. The node writes the
+file when it starts, so a missing, unreadable, or empty file leaves the source
+waiting for it: each request reads the file first and, until it holds
+credentials, fails with `NodeUnavailable` without reaching the node. A reader
+therefore starts before its node, and its first-contact verification passes
+once the file appears. Ingest's startup capability probe fails on the same
+error, so ingest still exits when it starts without a readable cookie. Empty
+inline cookie credentials and a `node.json_rpc_addr` that is not a usable URL
+come from configuration and still fail at startup.
 
 ## Indexer transport security
 

@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -35,7 +36,7 @@ use crate::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
-    ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash, encode_rpc_block_hash,
+    ZEBRA_REBUILD_THRESHOLD, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition, zebra_ready_endpoint::ZebraReadyClient,
 };
@@ -134,11 +135,63 @@ const ZEBRA_JSON_RPC_PEER_LABEL: &str = "zebra_json_rpc";
 pub struct ZebraJsonRpcSource {
     network: Network,
     client: ResilientClient<HttpClient>,
+    awaited_cookie: Option<Arc<AwaitedCookie>>,
     max_response_bytes: NonZeroU64,
     broadcast_timeout: Option<Duration>,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
     health_config: Option<NodeHealthConfig>,
     ready_http_client: Option<ZebraReadyClient>,
+}
+
+/// What a [`ZebraJsonRpcSource`] needs to build its JSON-RPC client.
+struct JsonRpcClientSettings {
+    json_rpc_addr: String,
+    node_auth: NodeAuth,
+    request_timeout: Duration,
+    max_response_bytes: NonZeroU64,
+}
+
+impl JsonRpcClientSettings {
+    fn client_with(&self, headers: HeaderMap) -> Result<HttpClient, ZebraTransportError> {
+        crate::transport::build_zebra_json_rpc_client(
+            &self.json_rpc_addr,
+            self.request_timeout,
+            self.max_response_bytes,
+            headers,
+        )
+    }
+
+    fn authorized_client(&self) -> Result<HttpClient, SourceError> {
+        let headers = derive_authorization_headers(&self.node_auth)?;
+        self.client_with(headers)
+            .map_err(|error| SourceError::NodeUnavailable {
+                reason: error.to_string(),
+            })
+    }
+
+    const fn reads_cookie_file(&self) -> bool {
+        matches!(self.node_auth, NodeAuth::Cookie(CookieSource::File(_)))
+    }
+}
+
+/// A cookie file that could not be read when the source was built.
+///
+/// Zebra writes its cookie file when it starts, so a process that starts
+/// before its node finds none. Until the file is read, each request reads it
+/// first and fails with [`SourceError::NodeUnavailable`] without contacting
+/// the node.
+struct AwaitedCookie {
+    client_settings: Arc<JsonRpcClientSettings>,
+    read: AtomicBool,
+}
+
+impl AwaitedCookie {
+    fn new(client_settings: &Arc<JsonRpcClientSettings>) -> Arc<Self> {
+        Arc::new(Self {
+            client_settings: Arc::clone(client_settings),
+            read: AtomicBool::new(false),
+        })
+    }
 }
 
 /// Runtime options for [`ZebraJsonRpcSource`].
@@ -476,47 +529,60 @@ impl ZebraJsonRpcSource {
     }
 
     /// Creates a Zebra JSON-RPC source with explicit runtime options.
+    ///
+    /// Construction does not contact the node. A cookie file that is missing
+    /// or empty does not fail it either, because the node writes the file
+    /// when it starts: until the file can be read, each request fails with
+    /// [`SourceError::NodeUnavailable`] without reaching the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::NodeUnavailable`] when `json_rpc_addr` cannot
+    /// be used or inline cookie credentials are empty.
     pub fn with_options(
         network: Network,
         json_rpc_addr: impl Into<String>,
         node_auth: NodeAuth,
         options: ZebraJsonRpcSourceOptions,
     ) -> Result<Self, SourceError> {
-        let json_rpc_addr: String = json_rpc_addr.into();
-        let request_timeout = options.request_timeout;
         let max_response_bytes = options.max_response_bytes;
         let broadcast_timeout = options.broadcast_timeout;
-
-        let initial_headers = derive_authorization_headers(&node_auth)?;
-        let initial_client = crate::transport::build_zebra_json_rpc_client(
-            &json_rpc_addr,
-            request_timeout,
+        let client_settings = Arc::new(JsonRpcClientSettings {
+            json_rpc_addr: json_rpc_addr.into(),
+            node_auth,
+            request_timeout: options.request_timeout,
             max_response_bytes,
-            initial_headers,
-        )
-        .map_err(|error| SourceError::NodeUnavailable {
-            reason: error.to_string(),
-        })?;
+        });
 
-        let rebuilder_addr = json_rpc_addr;
-        let rebuilder_auth = node_auth;
+        let (initial_headers, awaited_cookie) =
+            match derive_authorization_headers(&client_settings.node_auth) {
+                Ok(headers) => (headers, None),
+                // Inline credentials come from configuration, so only a
+                // cookie file is awaited.
+                Err(_) if client_settings.reads_cookie_file() => {
+                    (HeaderMap::new(), Some(AwaitedCookie::new(&client_settings)))
+                }
+                Err(error) => return Err(error),
+            };
+        let initial_client = client_settings
+            .client_with(initial_headers)
+            .map_err(|error| SourceError::NodeUnavailable {
+                reason: error.to_string(),
+            })?;
+
+        let rebuilder_settings = Arc::clone(&client_settings);
         let client = ResilientClient::new(
             initial_client,
             ZEBRA_JSON_RPC_PEER_LABEL,
             ZEBRA_REBUILD_THRESHOLD,
             move || {
-                let addr = rebuilder_addr.clone();
-                let auth = rebuilder_auth.clone();
+                let settings = Arc::clone(&rebuilder_settings);
                 async move {
-                    let headers = derive_authorization_headers(&auth).map_err(|error| {
-                        crate::transport::ZebraTransportError::ClientBuildFailed(error.to_string())
-                    })?;
-                    crate::transport::build_zebra_json_rpc_client(
-                        &addr,
-                        request_timeout,
-                        max_response_bytes,
-                        headers,
-                    )
+                    let headers =
+                        derive_authorization_headers(&settings.node_auth).map_err(|error| {
+                            ZebraTransportError::ClientBuildFailed(error.to_string())
+                        })?;
+                    settings.client_with(headers)
                 }
             },
         );
@@ -524,6 +590,7 @@ impl ZebraJsonRpcSource {
         Ok(Self {
             network,
             client,
+            awaited_cookie,
             max_response_bytes,
             broadcast_timeout,
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
@@ -555,6 +622,21 @@ impl ZebraJsonRpcSource {
         self
     }
 
+    /// Returns the client for the next request.
+    ///
+    /// While a cookie file awaited since construction is unread, this reads
+    /// it first and fails when it is still missing or empty.
+    fn request_client(&self) -> Result<Arc<HttpClient>, SourceError> {
+        if let Some(awaited) = &self.awaited_cookie
+            && !awaited.read.load(Ordering::Acquire)
+        {
+            self.client
+                .replace(awaited.client_settings.authorized_client()?);
+            awaited.read.store(true, Ordering::Release);
+        }
+        Ok(self.client.snapshot())
+    }
+
     async fn call_typed<Response>(
         &self,
         method: &'static str,
@@ -566,8 +648,7 @@ impl ZebraJsonRpcSource {
     {
         let started_at = Instant::now();
         let client_result = self
-            .client
-            .snapshot()
+            .request_client()?
             .request::<Response, _>(method, params)
             .await;
         self.client.record_outcome(&jsonrpsee_transport_signal(
@@ -683,7 +764,7 @@ impl ZebraJsonRpcSource {
                 .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
         }
 
-        let batch_result = self.client.snapshot().batch_request::<Value>(batch).await;
+        let batch_result = self.request_client()?.batch_request::<Value>(batch).await;
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &batch_result,
             "batch_getblock",
@@ -780,8 +861,7 @@ impl ZebraJsonRpcSource {
 
         let started_at = Instant::now();
         let response = self
-            .client
-            .snapshot()
+            .request_client()?
             .request::<Value, _>("getrawtransaction", params)
             .await;
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
@@ -851,8 +931,7 @@ impl ZebraJsonRpcSource {
 
         let started_at = Instant::now();
         let response = self
-            .client
-            .snapshot()
+            .request_client()?
             .request::<String, _>("getrawtransaction", params)
             .await;
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
@@ -1357,7 +1436,7 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
         let started_at = Instant::now();
-        let client_snapshot = self.client.snapshot();
+        let client_snapshot = self.request_client()?;
         let broadcast_fut = client_snapshot.request::<String, _>("sendrawtransaction", params);
 
         let response = if let Some(timeout_duration) = self.broadcast_timeout {
@@ -1829,8 +1908,9 @@ fn openrpc_method_names(openrpc_response: &Value) -> Vec<&str> {
 /// Re-reads cookie credentials (when applicable) and assembles the
 /// `authorization` header used by every JSON-RPC call.
 ///
-/// Called once at construction and again from the
-/// [`ResilientClient`] rebuilder closure. Re-reading on rebuild is
+/// Called at construction, before requests while a cookie file awaited since
+/// construction is unread, and from the [`ResilientClient`] rebuilder
+/// closure. Re-reading on rebuild is
 /// load-bearing: Zebra rotates the cookie file on restart, so a
 /// rebuilder that captured headers once at startup would replay a stale
 /// credential and every newly-built client would hit 401 forever. The
