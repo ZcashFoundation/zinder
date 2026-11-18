@@ -78,8 +78,9 @@ describes, and count it twice, because in this container the variable also
 sizes the projector's wallet writer cache. The remainder covers
 allocator overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
-That terminates the whole container, and the restart resumes construction from
-the last durable fence only to be killed again.
+That terminates the whole container. The restart discards the unpublished
+canonical or wallet build and constructs it again from the start
+([Initial sync](initial-sync.md)), only to be killed again.
 
 Set these variables on the service (node addresses shown for Railway's
 private network; substitute your host's):
