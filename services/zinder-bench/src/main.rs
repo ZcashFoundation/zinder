@@ -33,6 +33,7 @@ mod rocksdb_storage_lifecycle;
 mod rocksdb_tip_replay;
 mod rocksdb_tree_state_replay;
 mod rocksdb_wallet_rebuild;
+mod wallet_load;
 
 use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
 use rocksdb_canonical_fixture_replay::{
@@ -49,6 +50,7 @@ use rocksdb_tip_replay::{
 };
 use rocksdb_tree_state_replay::{RocksDbTreeStateReplayArgs, run_rocksdb_tree_state_replay};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
+use wallet_load::{LightwalletdWalletLoadArgs, run_lightwalletd_wallet_load};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -113,6 +115,9 @@ enum Command {
     /// Replay a deep reorg at the tip through production following and the wallet transition.
     #[command(name = "rocksdb-tip-reorg")]
     RocksDbTipReorg(RocksDbTipReorgArgs),
+    /// Drive wallet-shaped sync load at a running lightwalletd-compatible endpoint.
+    #[command(name = "lightwalletd-wallet-load")]
+    LightwalletdWalletLoad(LightwalletdWalletLoadArgs),
 }
 
 #[derive(Args)]
@@ -310,6 +315,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbTipReplay(args) => run_rocksdb_tip_replay(args).await,
         Command::CompareTipReplayReports(args) => run_compare_tip_replay_reports(&args),
         Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
+        Command::LightwalletdWalletLoad(args) => {
+            let output = run_lightwalletd_wallet_load(args).await?;
+            emit_report(&output.report, output.report_path.as_deref())
+        }
     }
 }
 
@@ -633,6 +642,33 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbTreeStateReplay(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn lightwalletd_wallet_load_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let load = |workload: &str| {
+            Cli::try_parse_from([
+                "zinder-bench",
+                "lightwalletd-wallet-load",
+                "--endpoint",
+                "https://wallet.example:443",
+                "--workload",
+                workload,
+                "--wallets",
+                "20",
+                "--from-height",
+                "3424811",
+            ])
+        };
+
+        for workload in ["slipstream", "vizor", "classic-sdk"] {
+            assert!(matches!(
+                load(workload)?.command,
+                Command::LightwalletdWalletLoad(_)
+            ));
+        }
+        assert!(load("zingo").is_err());
         Ok(())
     }
 

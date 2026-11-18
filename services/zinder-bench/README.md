@@ -7,7 +7,8 @@ trips: one sorted external SST ingestion for `RocksDB` and binary `COPY` with
 deferred index construction for PostgreSQL. It also replays captured tip blocks
 through the production canonical follower and wallet transition to measure
 per-block cost, and replays a deep reorg at the tip to measure one wallet
-transition against its logical-byte ceiling.
+transition against its logical-byte ceiling. Separately, it drives
+wallet-shaped sync load at a running lightwalletd-compatible endpoint.
 
 The captured fixture is the common input for every fixture-driven command.
 Canonical storage arms create fresh candidate storage and compare every
@@ -670,6 +671,87 @@ counted in `stored_checkpoint_anchors_skipped`. Each anchor records its seed
 checkpoint, the replayed blocks and note commitments, and its cold and warm
 seconds. `cold_seconds` and `warm_seconds` summarize the anchors as
 nearest-rank p50, p90, and p99 and the maximum.
+
+## 7. Drive wallet-shaped load at an endpoint
+
+`lightwalletd-wallet-load` syncs a height range from a running
+lightwalletd-compatible endpoint the way a real wallet engine does, for many
+simulated wallets at once. The endpoint can be `zinder-compat-lightwalletd`, Go
+lightwalletd, or any other `CompactTxStreamer` server, over `http://` or, through
+a TLS proxy such as the Caddy front of the wallet image, over `https://` with
+the host's trusted roots. Run the same command against each server to compare
+them under the same load.
+
+```bash
+zinder-bench lightwalletd-wallet-load \
+  --endpoint https://wallet.example:443 \
+  --workload slipstream \
+  --wallets 20 \
+  --from-height 3424811 \
+  --target-label "zinder 0.18.0, 8 vCPU" \
+  --report ./reports/slipstream-20.json
+```
+
+`--from-height` is the first block each wallet syncs. A restored wallet starts
+one block above the checkpoint it was restored from, so `3424811` puts the
+first tree-state request on the Android SDK checkpoint at 3,424,810, 10 blocks
+off Zinder's 100-block checkpoint cadence. `--to-height` defaults to the
+endpoint's latest block. `--wallet-start-interval-millis` staggers wallet
+starts.
+
+Each `--workload` follows one engine's request pattern, as read from its
+source:
+
+- `slipstream`: the Rust engine in the ZODL Android and iOS apps, with Android
+  defaults and a direct connection. It asks for the tree state below the range,
+  then runs 4 block workers, each on its own connection. The first request is
+  a 64-block probe. Later requests are sized to 16 MiB at the density received
+  so far, at most 10,000 blocks. Each 8 MiB piece of a stream (`--split-bytes`)
+  except the range's last asks for the tree state at its last block. A failed
+  request resumes from its next block on a fresh connection after 0.25, 0.5,
+  and 1 seconds, and a failed tree state is retried after 1 and 3 seconds. Once
+  the blocks are in, the wallet fetches `--transactions-per-wallet`
+  transactions from them, 8 at a time.
+- `vizor`: the Vizor wallet. Each batch streams its blocks with a pool filter
+  naming Sapling, Orchard, and Ironwood and asks for the tree state below its
+  first block at the same time. After each batch arrives, up to 4 more download
+  ahead. Batches are sized by `--vizor-profile`: `mobile` (11.3 MB, at most
+  1,000 blocks) or `desktop` (31 MB, at most 10,000 blocks), or by
+  `--batch-byte-budget`. A queued batch that fails fast is retried after 1 and
+  4 seconds and then downloaded again in line; a failed in-line batch restarts
+  the sync after 2, 4, and 8 seconds.
+- `classic-sdk`: the classic Zcash Android SDK `CompactBlockProcessor`. One
+  connection downloads serial 1,000-block batches (100 where a batch touches
+  heights 1,710,000 to 2,050,000), each after the tree state below its first
+  block, with an empty pool filter. Each call gets 5 attempts.
+
+The report, `lightwalletd-wallet-load`, records the endpoint's `GetLightdInfo`
+identity, the workload's constants, and, over all wallets:
+
+- `rpcs`: for each method, requests by client-observed status, latency of
+  successful calls, and for `GetBlockRange` the time to first block. A
+  `connect` entry counts the connections wallets opened. A status is a gRPC
+  status name, `client_timeout`, `client_cancelled` for a call the wallet
+  dropped, `connect_failed`, `out_of_sequence`, or `incomplete_stream`.
+- `time_to_first_block_seconds` and `wallet_sync_seconds` per wallet,
+  `blocks_per_second` and `bytes_per_second` over the run, `retries`, and the
+  status that ended each failed wallet, or `client_task_failed` for a wallet
+  whose task panicked. Bytes are the protobuf-encoded size of the received
+  blocks, not bytes on the wire.
+- `tree_state_heights`: how many requested heights sit on Zinder's 100-block
+  checkpoint stride, and each other height's offset from it. Below the
+  first-sync tip, that offset is the number of blocks Zinder replays. Above
+  it, every block has a stored checkpoint and nothing is replayed.
+
+The simulated wallets do not scan, so each asks for its next blocks as soon as
+the last ones arrive: the load is the most an engine of that shape sends, not
+an average. They also omit what a sync does besides blocks and tree states:
+`GetSubtreeRoots`, transparent address queries, mempool streams, and tip polls.
+Vizor sizes batches from compiled Mainnet tree sizes; the simulated wallet
+uses the density it has received, so its first batch is 10 blocks.
+Connections open through Zinder's gRPC client transport, which gives up on a
+connection after 10 seconds and sends HTTP/2 keep-alive pings every 30
+seconds.
 
 ## Report fields
 

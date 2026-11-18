@@ -694,6 +694,7 @@ after the others finish.
 | How fast are reads against a real node? | `read_endpoint_latency_baseline` on Regtest, with `--no-capture` | Prints one `live_latency_baseline` line with microsecond timings. Nothing is asserted; compare the line across changes. |
 | What does each block cost the writer and projector at the tip? | `zinder-bench rocksdb-tip-replay` | Follow [section 4 of the zinder-bench README](../../services/zinder-bench/README.md#4-measure-per-block-cost-at-the-tip). |
 | Does a deep reorg fit the wallet transition limit? | `zinder-bench rocksdb-tip-reorg` | Follow [section 5 of the zinder-bench README](../../services/zinder-bench/README.md#5-measure-a-deep-reorg-at-the-tip). |
+| How does a wallet endpoint hold up while many wallets sync? | `zinder-bench lightwalletd-wallet-load` | Follow [section 7 of the zinder-bench README](../../services/zinder-bench/README.md#7-drive-wallet-shaped-load-at-an-endpoint). |
 | How long, and how much memory and disk, does a full build take? | `scripts/run-rocksdb-storage-lifecycle.sh` | Follow [RocksDB storage lifecycle](../../deploy/rocksdb-storage-lifecycle.md). |
 
 ### Canonical runtime tracer
