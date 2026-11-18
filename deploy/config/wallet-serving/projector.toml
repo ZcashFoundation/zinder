@@ -1,10 +1,7 @@
 # Wallet projector configuration for the Railway wallet-serving container.
-# Set ZINDER_PROJECTOR__BUILD_OWNER_HEX on the Railway service; network, node
-# endpoint, and node authentication come from ZINDER_* variables too.
-
-[node]
-request_timeout_secs = 30
-max_response_bytes = 67108864
+# Set ZINDER_PROJECTOR__BUILD_OWNER_HEX on the Railway service; the network
+# comes from ZINDER_* variables too. The projector reads the activation table
+# the canonical writer admitted and never contacts the node.
 
 [storage]
 canonical_path = "/var/lib/zinder/canonical"

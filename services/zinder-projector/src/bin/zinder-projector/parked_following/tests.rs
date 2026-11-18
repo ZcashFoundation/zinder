@@ -40,7 +40,6 @@ use zinder_runtime::{
     AuthenticatedChannel, BearerToken, Readiness, ReadinessCause, ReadinessReport,
     ResolvedProjectorControl, connect_zinder_grpc, expected_writer_fence,
 };
-use zinder_source::{NodeAuth, NodeTarget};
 use zinder_store::{
     CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
@@ -515,16 +514,50 @@ fn park_config(
             bearer_token: Some(BearerToken::from_str(PROJECTOR_CONTROL_TOKEN)?),
             checkpoint_staging_root: root.join("checkpoint-staging"),
         },
-        node: NodeTarget::new(
-            Network::ZcashRegtest,
-            "http://127.0.0.1:1".to_owned(),
-            NodeAuth::None,
-            Duration::from_secs(1),
-            NonZeroU64::MIN,
-        ),
         ops_listen_addr: None,
         allow_public_bind: false,
     })
+}
+
+/// The projector brings no activation table of its own: it opens its
+/// canonical secondary once the writer admits the store's first schedule,
+/// and fails typed when the writer never does within the deadline.
+#[tokio::test]
+async fn the_canonical_secondary_waits_for_the_writers_first_schedule_admission() -> TestResult {
+    let root = TempDir::new()?;
+    let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?;
+    let (mut writer, _) = baseline_writer(&root.path().join("canonical"), reorg_policy)?;
+    let mut config = park_config(root.path(), "http://127.0.0.1:1", "127.0.0.1:1".parse()?)?;
+    config.fence_convergence_timeout = Duration::from_millis(200);
+    let cancel = CancellationToken::new();
+
+    let refused = crate::open_canonical_secondary(&config, reorg_policy, &cancel).await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::config::ProjectorError::CanonicalStore(
+                zinder_store::CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. }
+            ))
+        ),
+        "a store without an admitted schedule must stay refused"
+    );
+
+    config.fence_convergence_timeout = Duration::from_secs(10);
+    let admit = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        writer.admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())
+    };
+    let (opened, admitted) = tokio::join!(
+        crate::open_canonical_secondary(&config, reorg_policy, &cancel),
+        admit
+    );
+    admitted?;
+    let secondary = opened?.ok_or("the open must not report cancellation")?;
+    assert_eq!(
+        secondary.network_upgrade_activations(),
+        Some(&zinder_testkit::sample_regtest_upgrade_activations())
+    );
+    Ok(())
 }
 
 async fn bind_loopback() -> Result<Option<tokio::net::TcpListener>, std::io::Error> {

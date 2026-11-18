@@ -6,22 +6,12 @@ use zinder_testkit::EnvVarContractProbe;
 
 const BINARY: &str = "zinder-projector";
 
-// `[ingest_control]` and `[node]` are shared section types; the projector
-// only dials the control endpoint, and uses `[node]` for the activation-table
-// fetch without health probing or the indexer stream.
+// `[ingest_control]` is a shared section type; the projector only dials the
+// control endpoint.
 const ACCEPTED_BUT_UNCONSUMED: &[&str] = &[
     "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
     "ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT",
     "ZINDER_INGEST_CONTROL__LISTEN_ADDR",
-    "ZINDER_NODE__HEALTH__ADDR",
-    "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
-    "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
-    "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
-    "ZINDER_NODE__INDEXER_GRPC_ADDR",
-    "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
-    "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",
 ];
 
 fn documented_variables() -> impl Iterator<Item = &'static str> {

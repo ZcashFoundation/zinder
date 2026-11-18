@@ -122,14 +122,19 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.json_rpc_addr",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::Required,
+        requirement: Requirement::ConditionalOn(
+            "running zinder-ingest, or broadcasting transactions from a reader",
+        ),
         sensitive: false,
-        description: "Upstream Zebra JSON-RPC URL the service connects to. Optional for \
+        description: "Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` \
+                      and wallet-mode `zinder-compat-lightwalletd` broadcast transactions \
+                      through it and start without contacting it; without it they serve \
+                      storage only and advertise no broadcast. Compact-blocks compatibility \
+                      rejects every `ZINDER_NODE__*` variable. Optional for \
                       `zinder-explorer`: without it the upstream-observation probe stays \
                       off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
     },
@@ -190,7 +195,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.method",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -204,7 +208,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.username",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -218,7 +221,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.password",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -232,7 +234,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.path",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -246,7 +247,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.cookie",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -262,7 +262,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.request_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -276,7 +275,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.max_response_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -293,7 +291,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.broadcast_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",

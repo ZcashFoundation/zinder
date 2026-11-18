@@ -615,7 +615,7 @@ assert_received_by() {
 }
 
 assert_received_by ZINDER_NETWORK__NAME zinder-ingest zinder-projector zinder-query
-assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-projector zinder-query
+assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query
 assert_received_by ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES \
   zinder-ingest zinder-projector zinder-query
 assert_received_by ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES zinder-ingest

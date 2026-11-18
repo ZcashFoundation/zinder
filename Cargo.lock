@@ -6065,7 +6065,6 @@ dependencies = [
  "zinder-proto",
  "zinder-rocksdb-bulk-load",
  "zinder-runtime",
- "zinder-source",
  "zinder-store",
  "zinder-testkit",
  "zinder-wallet-projection",
