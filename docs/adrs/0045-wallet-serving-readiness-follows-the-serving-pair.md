@@ -147,6 +147,16 @@ reports `node_unavailable` for 24 hours ends the container, so an ingest stuck
 in its own node client still restarts eventually. The container healthcheck is unchanged, because query now answers
 200 through the outage.
 
+Ingest's own cause hides its node probe while its admission state refuses
+traffic. While Zebra resyncs, ingest reports `syncing`, because it trails the
+node or because its mempool cannot hydrate. `IngestControl.WriterStatus`
+reports the writer's node observation independently of that admission state,
+and native query relays it as the `upstream_not_ready` cause of its
+`ingest_control` dependency. The entrypoint therefore also treats an ingest
+that reports `syncing` as an upstream outage when query's report carries that
+relay. It reads only the writer's own observation, never query's view of the
+node, and it reclassifies no other ingest cause.
+
 The reference Docker Compose topology starts the readers once the ingest
 container has started, instead of once it is healthy. Readers share the ingest
 container's network namespace, which needs only a started container. The first
@@ -199,7 +209,7 @@ ingest.
 - **Never restart the container on an ingest node outage.** Rejected. An ingest
   stuck in its own node client, with a healthy node, would then never restart.
   Restarting only when query's own node probe reports the node healthy would
-  separate the two cases, but it ties the entrypoint to query's degraded list.
+  separate the two cases, but it ties the restart to query's view of the node.
   A 24-hour bound on `node_unavailable` handles both without that coupling.
 - **Bound `upstream_not_ready` the same way.** Rejected. A node that answers
   with its sync state rules out a stuck node client, so a restart during a

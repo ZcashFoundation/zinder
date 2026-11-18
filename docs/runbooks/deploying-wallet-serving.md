@@ -460,8 +460,12 @@ A node outage is tolerated much longer. While ingest reports
 `node_unavailable` or `upstream_not_ready`, query keeps serving the stored
 chain, and a restart cannot help: ingest needs the node to start, so the
 restarted container would serve nothing. The supervisor keeps the outage out of
-the one-hour tolerance and the recurrence budgets below. An `upstream_not_ready`
-node answers, so a resync of any length never restarts the container. An
+the one-hour tolerance and the recurrence budgets below. While Zebra resyncs,
+ingest can report `syncing` instead, because it trails the node or its mempool
+cannot hydrate. The supervisor treats that as the same outage when query's
+`/readyz` lists `ingest_control` with `upstream_not_ready`, which is the
+writer's own observation of its node. An `upstream_not_ready` node answers, so
+a resync of any length never restarts the container. An
 unreachable node is logged once when the outage begins and once when it ends,
 and terminates the container only after it has lasted 24 hours, in case ingest
 is stuck in its own node client.

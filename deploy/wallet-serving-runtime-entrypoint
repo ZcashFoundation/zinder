@@ -390,6 +390,25 @@ readiness_cause_is_upstream_outage() {
   esac
 }
 
+# Ingest's own cause hides its node probe while its admission state refuses
+# traffic: while Zebra resyncs, ingest reports `syncing` because it trails the
+# node or because its mempool cannot hydrate. Query relays the writer's own
+# node observation, which `IngestControl.WriterStatus` reports independently of
+# that admission state, as its `ingest_control` dependency. Given ingest's
+# cause and the body query just answered, succeeds when ingest is syncing
+# behind a node that the writer reports is not synchronized.
+ingest_syncs_behind_unsynchronized_node() {
+  [ "$1" = "syncing" ] || return 1
+  case "$2" in
+    *'{"input":"ingest_control","dependency_cause":{"upstream_not_ready":'*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Query publishes a pair only once the wallet reaches the canonical fence, so
 # behind a parked projector its refusal is the park's. Given whether the
 # projector is parked, succeeds when the query plane just probed answered
@@ -809,6 +828,8 @@ while true; do
     ingest_ready=1
   fi
   ingest_report="$probe_report"
+  ingest_cause="$probe_cause"
+  ingest_upstream_outage="$probe_upstream_outage"
   ingest_unreachable=0
   if [ -z "$probe_http_status" ]; then
     ingest_unreachable=1
@@ -823,9 +844,6 @@ while true; do
   ingest_node_unreachable_since_epoch="$1"
   if [ "$2" -eq 1 ]; then
     fail "zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
-  fi
-  if [ "$probe_upstream_outage" -eq 1 ]; then
-    ingest_ready=1
   fi
 
   projector_ready=0
@@ -842,6 +860,7 @@ while true; do
 
   query_ready=0
   query_unreachable=0
+  query_body=""
   if [ -z "$query_pid" ]; then
     require_projector_park_for_stopped_query "$projector_parked" \
       "$projector_unreachable" "$projector_report"
@@ -854,10 +873,18 @@ while true; do
       query_ready=1
     fi
     query_report="$probe_report"
+    query_body="$probe_body"
     if [ -z "$probe_http_status" ]; then
       query_unreachable=1
     fi
     plane_halted=$((plane_halted | probe_halted))
+  fi
+
+  if ingest_syncs_behind_unsynchronized_node "$ingest_cause" "$query_body"; then
+    ingest_upstream_outage=1
+  fi
+  if [ "$ingest_upstream_outage" -eq 1 ]; then
+    ingest_ready=1
   fi
 
   if [ "$plane_halted" -eq 1 ] && [ "$writer_halt_reported" -eq 0 ]; then
