@@ -22,8 +22,9 @@
 //!   which rejects an invalid `RUST_LOG` with [`TracingSubscriberError`].
 //! - The gRPC server builder every public listener serves with
 //!   ([`public_grpc_server`]), which bounds streams per connection, pings
-//!   idle connections, and limits how many requests the process receives at
-//!   once ([`GrpcReceiveLimitLayer`]), and the gRPC reflection service those
+//!   idle connections, limits how many requests the process receives at
+//!   once ([`GrpcReceiveLimitLayer`]), and ends responses whose client stops
+//!   reading them ([`GrpcSendStallLayer`]), and the gRPC reflection service those
 //!   listeners serve ([`public_grpc_reflection`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
@@ -106,9 +107,10 @@ pub use ops_endpoint::{
     spawn_ops_endpoint_for,
 };
 pub use public_grpc_server::{
-    DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, GrpcReceiveLimit,
-    GrpcReceiveLimitLayer, GrpcReceiveLimits, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
-    PublicGrpcServer, public_grpc_reflection, public_grpc_server, public_grpc_server_with,
+    DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+    GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
+    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PublicGrpcServer, public_grpc_reflection,
+    public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,

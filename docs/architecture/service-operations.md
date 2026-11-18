@@ -1131,6 +1131,9 @@ requests they receive at once
 - `zinder_grpc_request_receive_evictions_total{pool}` counts requests cancelled
   with `UNAVAILABLE` because a full pool gave their slot to a request from a
   connection holding fewer slots.
+- `zinder_grpc_response_send_stalls_total` counts responses ended with
+  `DEADLINE_EXCEEDED` because their client stopped reading them for
+  60 seconds.
 
 `pool` is `request` for unary and server-streaming calls and `client_stream`
 for client-streaming and bidirectional calls, including gRPC reflection.
@@ -1140,6 +1143,8 @@ gives the oldest slot of the connection holding the most to a request from a
 connection holding fewer, so one connection cannot lock others out. Clients
 spread over many connections still can, so limit connections per client
 address at the edge.
+Send stalls that keep rising point at clients that open response streams and
+stop reading them.
 
 ### RocksDB
 

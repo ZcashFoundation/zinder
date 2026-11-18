@@ -9,7 +9,9 @@
 //! - an HTTP/2 keepalive ping after a minute without a frame, closing the
 //!   connection when the ping goes unanswered for 20 seconds; and
 //! - a server-wide bound on requests whose message is still arriving
-//!   ([`GrpcReceiveLimitLayer`]).
+//!   ([`GrpcReceiveLimitLayer`]); and
+//! - an end to any response whose client stops reading it
+//!   ([`GrpcSendStallLayer`]).
 //!
 //! tonic reads a whole request message into memory before the handler runs,
 //! and the per-connection stream limit does not bound how many messages the
@@ -22,6 +24,7 @@
 
 mod message_boundaries;
 mod receive_slots;
+mod send_stall;
 
 use std::{
     future::Future,
@@ -52,6 +55,7 @@ use tower::{
     layer::util::{Identity, Stack},
 };
 
+pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 use self::{
     message_boundaries::MessageBoundaries,
     receive_slots::{ReceiveSlot, ReceiveSlots},
@@ -81,6 +85,10 @@ pub const DEFAULT_GRPC_RECEIVE_SLOTS: NonZeroUsize = NonZeroUsize::MIN.saturatin
 /// may go without sending a whole message.
 pub const DEFAULT_GRPC_RECEIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Time a response may wait for its client to read it before the server
+/// ends the stream, matching lightwalletd's stream send timeout.
+pub const DEFAULT_GRPC_SEND_STALL_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// Methods whose client sends a stream of messages.
 ///
 /// A unit test checks this list against every service descriptor that a
@@ -94,31 +102,40 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
 const RECEIVE_REFUSALS_METRIC: &str = "zinder_grpc_request_receive_refusals_total";
 const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_total";
 const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
+const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
 
 /// The tonic server type that [`public_grpc_server`] returns.
-pub type PublicGrpcServer = Server<Stack<GrpcReceiveLimitLayer, Identity>>;
+pub type PublicGrpcServer =
+    Server<Stack<GrpcReceiveLimitLayer, Stack<GrpcSendStallLayer, Identity>>>;
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
-/// default receive limits.
+/// default receive limits and send stall timeout.
 ///
 /// Add services and serve as with [`tonic::transport::Server::builder`].
 #[must_use]
 pub fn public_grpc_server() -> PublicGrpcServer {
-    public_grpc_server_with(GrpcReceiveLimits::default())
+    public_grpc_server_with(
+        GrpcReceiveLimits::default(),
+        DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+    )
 }
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
-/// given receive limits.
+/// given receive limits and send stall timeout.
 ///
 /// Production listeners use [`public_grpc_server`]. This form exists so
 /// tests can exercise the limits with small values.
 #[must_use]
-pub fn public_grpc_server_with(limits: GrpcReceiveLimits) -> PublicGrpcServer {
-    describe_receive_limit_metrics();
+pub fn public_grpc_server_with(
+    limits: GrpcReceiveLimits,
+    send_stall_timeout: Duration,
+) -> PublicGrpcServer {
+    describe_limit_metrics();
     Server::builder()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+        .layer(GrpcSendStallLayer::new(send_stall_timeout))
         .layer(GrpcReceiveLimitLayer::new(limits))
 }
 
@@ -137,7 +154,7 @@ pub fn public_grpc_reflection(
         .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES))
 }
 
-fn describe_receive_limit_metrics() {
+fn describe_limit_metrics() {
     metrics::describe_counter!(
         RECEIVE_REFUSALS_METRIC,
         metrics::Unit::Count,
@@ -155,6 +172,12 @@ fn describe_receive_limit_metrics() {
         metrics::Unit::Count,
         "gRPC requests cancelled with UNAVAILABLE because a full pool gave their slot to a \
          request from a connection holding fewer slots. Label: pool (request|client_stream)."
+    );
+    metrics::describe_counter!(
+        SEND_STALLS_METRIC,
+        metrics::Unit::Count,
+        "gRPC responses ended with DEADLINE_EXCEEDED because their client stopped reading \
+         them for the send stall timeout."
     );
 }
 

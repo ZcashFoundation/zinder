@@ -642,6 +642,7 @@ can meet these fixed limits:
 | Client-streaming and bidirectional calls open, process-wide | 32 | `UNAVAILABLE` |
 | Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
 | Time a client stream may go without completing a message | 20 s | `DEADLINE_EXCEEDED` |
+| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` |
 
 A unary or server-streaming call holds its receive slot only until its
 request has arrived, so long-lived response streams such as `ChainEvents`,
@@ -649,7 +650,10 @@ request has arrived, so long-lived response streams such as `ChainEvents`,
 request from a connection holding fewer slots takes the oldest slot of the
 connection holding the most, and the request that loses it fails with
 `UNAVAILABLE`. `UNAVAILABLE` from a full pool carries no `ErrorInfo`; retry
-with backoff.
+with backoff. A response stream, unary response, or gRPC reflection answer
+that the client stops reading, by withholding HTTP/2 flow-control window, ends
+after 60 seconds. A response still waiting for the server to produce its next
+message is not affected.
 [ADR-0019](../adrs/0019-transport-policy-ownership.md#public-grpc-listeners)
 records the policy and its gaps.
 

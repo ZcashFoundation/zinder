@@ -46,6 +46,10 @@ const REFLECTION_INFO_PATH: &str = "/grpc.reflection.v1.ServerReflection/ServerR
 /// Bound on each wait in these tests; every expected outcome arrives well within it.
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 const SHORT_RECEIVE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Send stall timeout for every test server. Responses the tests read are
+/// never held that long, so it also shows a response waiting on the server
+/// is not taken for a stalled client.
+const SHORT_SEND_STALL_TIMEOUT: Duration = Duration::from_millis(300);
 /// Time for a request started on loopback to reach the server and claim or
 /// be refused a slot.
 const CLAIM_SETTLE: Duration = Duration::from_millis(300);
@@ -76,10 +80,13 @@ async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(
-        public_grpc_server_with(GrpcReceiveLimits::new(slots, receive_timeout))
-            .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
-            .add_service(reflection)
-            .serve_with_incoming(TcpListenerStream::new(listener)),
+        public_grpc_server_with(
+            GrpcReceiveLimits::new(slots, receive_timeout),
+            SHORT_SEND_STALL_TIMEOUT,
+        )
+        .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
+        .add_service(reflection)
+        .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     let channel = Endpoint::new(format!("http://{address}"))?
         .connect()
@@ -314,6 +321,72 @@ async fn an_idle_reflection_stream_is_cancelled_and_returns_its_slot() -> Result
     within_wait_limit(next.next())
         .await?
         .ok_or_else(|| eyre!("reflection ended before answering"))??;
+    drop(sender);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slot() -> Result<()> {
+    let server = serve(1, Duration::from_secs(30)).await?;
+    // A small stream window and a large connection window: the stalled
+    // stream cannot take the connection's window from the probes below.
+    let channel = Endpoint::new(format!("http://{}", server.address))?
+        .initial_stream_window_size(Some(64 * 1024))
+        .initial_connection_window_size(Some(16 * 1024 * 1024))
+        .connect()
+        .await?;
+    let (sender, receiver) = mpsc::channel(4);
+    let mut stalled = ServerReflectionClient::new(channel.clone())
+        .server_reflection_info(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    // Reflection echoes the host twice in each answer, so three answers
+    // overflow the stream window, reflection's one-message channel, and
+    // the message its task is sending. The client never reads them.
+    for _ in 0..3 {
+        sender
+            .send(ServerReflectionRequest {
+                host: "x".repeat(256 * 1024),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            })
+            .await?;
+    }
+
+    // The stalled stream holds the only client-stream slot until the server
+    // ends it. A probe on the same connection cannot evict it.
+    wait_until("the stalled reflection stream returns its slot", || {
+        let channel = channel.clone();
+        async move {
+            match ServerReflectionClient::new(channel)
+                .server_reflection_info(tokio_stream::once(list_services()))
+                .await
+            {
+                Ok(probe) => probe
+                    .into_inner()
+                    .next()
+                    .await
+                    .is_some_and(|reply| reply.is_ok()),
+                Err(_) => false,
+            }
+        }
+    })
+    .await?;
+
+    // Reading again delivers what the transport already held, then the
+    // stream ends with DEADLINE_EXCEEDED instead of further answers.
+    let mut answers = 0;
+    let ended_with = loop {
+        match within_wait_limit(stalled.next()).await? {
+            Some(Ok(_)) => answers += 1,
+            Some(Err(status)) => break Some(status),
+            None => break None,
+        }
+    };
+    assert!(answers < 3, "the stalled stream delivered every answer");
+    assert_eq!(
+        ended_with.map(|status| status.code()),
+        Some(Code::DeadlineExceeded)
+    );
     drop(sender);
     Ok(())
 }

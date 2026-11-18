@@ -529,6 +529,11 @@ The bound is fixed and shared with native query and Explorer
   counts refusals, `zinder_grpc_request_receive_evictions_total{pool}` counts
   evictions, and `zinder_grpc_request_receive_timeouts_total{pool}` counts
   timeouts.
+- A response the client stops reading for 60 seconds, by withholding HTTP/2
+  flow-control window, ends with `DEADLINE_EXCEEDED`. This covers
+  `GetBlockRange`, the mempool streams, and gRPC reflection, and matches
+  lightwalletd's stream send timeout.
+  `zinder_grpc_response_send_stalls_total` counts these.
 
 One connection that opens many streams therefore cannot lock other clients
 out, but clients spread over many connections still can keep a pool full.

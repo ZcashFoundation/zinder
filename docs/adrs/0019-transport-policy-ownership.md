@@ -297,6 +297,7 @@ which owns one policy for all three:
 - An HTTP/2 keepalive ping after one minute without a frame from the client.
   A ping unanswered for 20 seconds closes the connection.
 - A process-wide bound on requests being received, `GrpcReceiveLimitLayer`.
+- An end to any response whose client stops reading it, `GrpcSendStallLayer`.
 
 tonic reads a whole request message into memory before the handler runs. The
 per-connection stream limit does not bound how many messages the process reads
@@ -331,6 +332,24 @@ a connection already holding as many slots as any other is refused. A request
 on a transport that reports no remote address counts as a connection of its
 own. `zinder_grpc_request_receive_evictions_total{pool}` counts evictions.
 
+hyper asks a response body for its next frame only after the client's HTTP/2
+flow-control window has room for the previous one. A client that answers
+keepalive pings but never sends `WINDOW_UPDATE` therefore parks the response,
+and whatever produces it, with no end: gRPC reflection's task blocks on its
+one-message channel while holding the request stream, its client-stream slot,
+and several echoed messages, where neither the receive timeout nor eviction can
+reach it. The send stall layer ends such a response. It hands each data chunk
+to hyper in pieces of at most 64 KiB, and a watchdog task drops the handler's
+response body once hyper has held a piece for 60 seconds without asking for
+the next. Dropping the body cancels the handler the way a client cancellation
+does, which frees its task, slot, and buffers. A client that later resumes
+reading receives `DEADLINE_EXCEEDED`. A response waiting for the server to
+produce its next message is not stalled, because hyper keeps asking for it.
+The bound covers every response, including lightwalletd `GetBlockRange` and
+the mempool streams, so it follows lightwalletd's stream send timeout, which
+also uses 60 seconds. `zinder_grpc_response_send_stalls_total` counts the
+responses it ends.
+
 Every Zinder gRPC server also decodes at most `MAX_DECODING_MESSAGE_BYTES`
 (2 MiB) per request message. Public listeners build gRPC reflection with
 `zinder_runtime::public_grpc_reflection`, which applies the same bound instead
@@ -344,7 +363,7 @@ The values are constants, not configuration. Precedent is lightwalletd's fix
 for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, message
 size, and eviction rule.
 
-The policy leaves three gaps:
+The policy leaves four gaps:
 
 - Clients spread over many connections can still keep a pool full, because
   each connection then holds no more slots than a new one would. Limit
@@ -354,6 +373,10 @@ The policy leaves three gaps:
   file descriptor until the client closes it.
 - Each connection can buffer up to hyper's 1 MiB connection window of request
   data before the receive limit reads or refuses it.
+- A response the send stall layer ends keeps its HTTP/2 stream, and the one
+  piece hyper holds for it, until the client reads, resets the stream, or
+  closes the connection, because hyper waits for flow-control window before
+  it asks the body again. Graceful shutdown waits for such a stream too.
 
 ### Observability
 
