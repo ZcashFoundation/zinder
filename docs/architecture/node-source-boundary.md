@@ -169,8 +169,9 @@ classed `capability_missing`:
 A subtree refusal that may resolve once the node passes its last checkpoint
 stays `SubtreeRootsUnavailable`, classed `upstream_view_changed`. The match is
 on the node's error text, so a reworded refusal falls back to the transient
-classes rather than to a wrong answer. Query reports all three permanent errors
-as the non-retryable `NODE_CAPABILITY_MISSING`.
+classes rather than to a wrong answer. Only ingest makes these reads. Query
+serves tree states, block bodies, and subtree roots from the store, so none of
+the three reaches a query client.
 
 Source errors describe the upstream observation. `SourceFailureClass` groups
 them for writer recovery and readiness:
