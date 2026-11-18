@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
+    HttpListenerLimits, Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
     TracingSubscriberError, cancel_on_terminating_signal, connect_zinder_grpc,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    install_tracing_subscriber, serve_http, spawn_ops_endpoint_for,
 };
 
 mod config;
@@ -171,9 +171,13 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         "Cipherscan-compatible REST adapter started"
     );
 
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(drain_readiness_on_cancel(cancel.clone(), readiness))
-        .await;
+    let serve_result = serve_http(
+        listener,
+        app,
+        HttpListenerLimits::default(),
+        drain_readiness_on_cancel(cancel.clone(), readiness),
+    )
+    .await;
     adapter.shutdown_realtime().await;
 
     tracing::info!(

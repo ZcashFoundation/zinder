@@ -9,6 +9,10 @@ Every Zinder runtime exposes the same operational HTTP contract through
 | `/readyz` | Typed traffic readiness for the runtime's owned contract. |
 | `/metrics` | Prometheus metrics with bounded label sets. |
 
+Both the operational endpoint and the Cipherscan REST adapter serve HTTP/1
+through the bounded listener described under [HTTP listener
+limits](#http-listener-limits).
+
 Health does not imply readiness. A writer may be alive while synchronizing or
 recovering its source, and a reader may be alive while its secondaries cannot
 form an exact serving pair.
@@ -1270,6 +1274,28 @@ connections or requests per client address
 ([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)). Behind a
 proxy, the server sees the proxy's upstream connections, so the proxy must
 enforce per-client limits.
+
+### HTTP listener limits
+
+`zinder-runtime` serves every axum router, the operational endpoint and the
+Cipherscan REST adapter, through one HTTP/1 listener (`serve_http`) instead of
+`axum::serve`, which installs no hyper timer and so leaves hyper's header read
+timeout disabled. A client that opens a connection and sends nothing, or sends
+request headers a few bytes at a time, would otherwise hold a connection and
+its task indefinitely. The listener applies these fixed bounds:
+
+| Bound | Value | Effect |
+| --- | --- | --- |
+| Request head | 10 seconds | A connection that has not delivered a complete request head in time is closed. The same deadline closes a keep-alive connection that stays idle between requests. |
+| Request body stall | 30 seconds | A request body that delivers no frame for this long fails the request. |
+| Concurrent connections | 2048 | Connections over the cap are closed as soon as they are accepted, and a slot frees when its connection ends. |
+| Request body size | 2 MiB (4 KiB on the operational endpoint) | Larger bodies are rejected with HTTP 413 by axum body extractors. |
+
+`WebSocket` upgrades stay enabled. An upgraded connection leaves the HTTP
+deadlines behind and holds its connection slot until its own handler ends. The
+listener does not bound how long a client takes to read a response, so a public
+deployment still belongs behind an operator-controlled proxy with its own
+timeouts. The bounds are constants, not configuration.
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only

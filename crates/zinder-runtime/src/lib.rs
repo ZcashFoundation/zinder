@@ -7,6 +7,9 @@
 //!   [`ComposedReadiness`] precedence shared by multi-input runtimes.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
+//! - The bounded HTTP/1 listener ([`serve_http`], [`HttpListenerLimits`]) that
+//!   serves every axum router, so header, body, idle, and connection limits
+//!   are applied in one place.
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
 //!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
@@ -42,6 +45,7 @@ mod composed_readiness;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
+mod http_listener;
 mod logging;
 mod memory_budget;
 mod metrics;
@@ -78,6 +82,11 @@ pub use config::{
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
     render_environment_variable_table,
+};
+pub use http_listener::{
+    DEFAULT_HTTP_HEADER_READ_TIMEOUT, DEFAULT_HTTP_MAX_CONNECTIONS,
+    DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_IDLE_TIMEOUT,
+    HttpListenerLimits, serve_http,
 };
 pub use logging::{TracingSubscriberError, install_tracing_subscriber};
 pub use memory_budget::{
