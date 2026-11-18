@@ -361,7 +361,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let tree_state_status = match WalletQueryService::tree_state_at_height(
         &grpc_adapter,
         Request::new(wallet::TreeStateAtHeightRequest {
-            height: 1,
+            height: 99,
             at_epoch_id: None,
         }),
     )
@@ -383,7 +383,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
         Err(status) => status,
     };
 
-    assert_eq!(tree_state_status.code(), Code::FailedPrecondition);
+    assert_eq!(tree_state_status.code(), Code::NotFound);
     assert_eq!(missing_block_status.code(), Code::NotFound);
 
     Ok(())

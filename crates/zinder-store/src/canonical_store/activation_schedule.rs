@@ -28,6 +28,47 @@ const MAX_ACTIVATION_NAME_BYTES: usize = 1024;
 const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCHEDULE_REVISIONS: u64 = 4096;
 
+/// Reports whether `activations` is the table a store admits.
+///
+/// That is its latest writer-admitted schedule revision when one exists, and
+/// otherwise the construction table its build plan fingerprints.
+pub(super) fn admits_activation_table(
+    build_plan: &super::CanonicalStoreBuildPlan,
+    schedule: Option<&CanonicalActivationSchedule>,
+    activations: &NetworkUpgradeActivations,
+) -> bool {
+    if activations.network() != build_plan.network() {
+        return false;
+    }
+    schedule.map_or_else(
+        || {
+            activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+                == build_plan.network_upgrade_activations_fingerprint()
+        },
+        |schedule| activations == schedule.activations(),
+    )
+}
+
+/// Reports whether `activations` agrees with the table a store admits at
+/// every height through `height`.
+///
+/// This is the reader admission rule applied to one height instead of the
+/// visible tip: a node-observed table that only adds or moves activations
+/// above `height` serves reads through `height` before the writer admits it.
+/// Without a writer-admitted revision, the table must equal the construction
+/// table, as at reader admission.
+pub(super) fn admits_activation_table_through(
+    build_plan: &super::CanonicalStoreBuildPlan,
+    schedule: Option<&CanonicalActivationSchedule>,
+    activations: &NetworkUpgradeActivations,
+    height: zinder_core::BlockHeight,
+) -> bool {
+    schedule.map_or_else(
+        || admits_activation_table(build_plan, None, activations),
+        |schedule| activations.preserves_through(schedule.activations(), height),
+    )
+}
+
 /// One authenticated, writer-admitted network-upgrade schedule revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalActivationSchedule {

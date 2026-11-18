@@ -520,26 +520,13 @@ fn seeded_accumulator(
     anchor: BlockHeight,
 ) -> Result<CommitmentTreeAccumulator, IngestError> {
     let checkpoint = secondary
-        .tree_state_checkpoint_at_or_before(anchor)?
+        .tree_state_checkpoint_at(anchor, activations)?
         .ok_or(IngestError::CommitmentTreeCheckpointMissing { height: anchor })?;
-    let checkpoint_height = checkpoint.block_id.height;
-    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-        checkpoint_height,
-        &checkpoint.frontiers,
-        activations,
-    )
-    .map_err(|source| IngestError::CommitmentTreeState {
-        height: checkpoint_height,
-        source,
-    })?;
-    let gap = checkpoint_height.next().map_or_else(
-        || BlockHeightRange::empty_at(anchor),
-        |start| BlockHeightRange::inclusive(start, anchor),
-    );
-    for compact_block in secondary.compact_blocks_in_range(gap)? {
-        append_compact_block(&mut accumulator, &compact_block)?;
-    }
-    Ok(accumulator)
+    CommitmentTreeAccumulator::from_validated_frontiers(anchor, &checkpoint.frontiers, activations)
+        .map_err(|source| IngestError::CommitmentTreeState {
+            height: anchor,
+            source,
+        })
 }
 
 fn append_compact_block(

@@ -10,8 +10,8 @@ each serve process-owned immutable readers admitted at one exact fence.
 | --- | --- | --- |
 | `zinder-ingest` | Zebra chain and mempool sources, canonical construction and following, reorg authority, canonical events, canonical leases, checkpoint coordination, live mempool state, materialized-view construction and following | Wallet rows, wallet-store promotion, or public wallet traffic |
 | `zinder-projector` | Wallet construction, projection build leases, continuous canonical-event following, wallet reorg reconciliation, wallet-store primary | Canonical writes, chain selection, public wallet traffic, or compatibility translation |
-| `zinder-query` | Canonical and wallet secondary generations, wallet-serving admission, native `WalletQuery` gRPC, transaction broadcast, and sparse tree-state fill | Either primary store, projection construction, compatibility translation, or mixed-generation responses |
-| `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses (a chunked `GetBlockRange` stream is a sequence of single-generation reads joined by a hash link) |
+| `zinder-query` | Canonical and wallet secondary generations, wallet-serving admission, native `WalletQuery` gRPC, transaction broadcast, and tree-state reconstruction from stored compact blocks | Either primary store, projection construction, compatibility translation, or mixed-generation responses |
+| `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, and tree-state reconstruction from stored compact blocks | Either primary store, projection construction, or mixed-generation responses (a chunked `GetBlockRange` stream is a sequence of single-generation reads joined by a hash link) |
 
 `zinder-explorer` and `zinder-compat-cipherscan` are optional workspace
 services, and the checked single-host composition does not start them. The
@@ -38,12 +38,13 @@ Source-node access is capability-specific:
   ingestion.
 - `zinder-projector` may discover network activation parameters needed to
   validate canonical identity; it does not fetch projection rows from the node.
-- `zinder-query` may broadcast transactions, discover consensus activations,
-  and fill tree state explicitly delegated upstream by the native contract. It
-  does not use the node as a fallback for indexed chain history.
-- `zinder-compat-lightwalletd` may broadcast transactions, discover consensus
-  activations, and fill tree state that the query contract explicitly delegates
-  upstream. It does not use the node as a fallback for indexed chain history.
+- `zinder-query` may broadcast transactions and discover consensus
+  activations. It does not use the node as a fallback for indexed chain
+  history, and it serves tree state at any height from stored checkpoints and
+  compact blocks.
+- `zinder-compat-lightwalletd` may broadcast transactions and discover
+  consensus activations. It does not use the node as a fallback for indexed
+  chain history, and it serves `GetTreeState` from storage through the query.
 
 ## Storage ownership
 

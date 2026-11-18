@@ -107,7 +107,8 @@ same node never succeeds:
 - While following, a tree-state read inside the band reports
   `node_unavailable` with that class and retries on the 10-second
   operator-action backoff.
-- Native query returns the non-retryable `NODE_CAPABILITY_MISSING`.
+- Native query and lightwalletd compatibility read tree states from the
+  store, never from the node, so the band does not reach their clients.
 
 Use a node synchronized without fast sync, or one that serves the band from
 its historical frontier artifact.

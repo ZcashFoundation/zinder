@@ -72,7 +72,7 @@ This avoids two problems:
 
 If a requested compact block is outside the store's retained history, `zinder-query` returns `ArtifactUnavailable` for the compact-block family and the first absent height. A range read that reaches above the visible tip or below the retained floor therefore reports the same `NOT_FOUND` outcome as the single-block read. A compact block missing inside retained history is store damage: the range read fails closed as a canonical storage error (`UNAVAILABLE` with `STORAGE_UNAVAILABLE`) so operators see the integrity failure. `zinder-query` does not fetch the block from the upstream node and build a one-off response.
 
-The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each unary response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
+The native wallet protocol slices expose latest block metadata, compact block ranges, tree-state reads at any retained height, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each unary response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
 A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. A pinned read either resolves that epoch or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when no retained serving pair answers it; [Query Consistency](#query-consistency) defines how long a replaced epoch stays retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
 
@@ -143,8 +143,9 @@ fetch history from the upstream node. Changing a non-empty store to `All`
 requires a rebuilt store and blue-green cutover.
 
 Tree-state storage keeps typed commitment-tree checkpoints: the validated
-frontier of each shielded pool at every 100-block cadence height, at the latest
-committed tip, and, for checkpointed history, at the history predecessor. Reads
+frontier of each shielded pool at every 100-block cadence height and at the
+build tip of construction, at every block live following appends, and, for
+checkpointed history, at the history predecessor. Reads
 derive the tree-state payload, one `commitments.finalState` per pool, from
 those frontiers; the store does not keep an upstream node's JSON. A
 checkpointed store therefore serves its floor's tree state although it retains
@@ -153,17 +154,39 @@ build retains at least one block and checkpoints its tip.
 
 The native read surface is
 `tree_state_at(height, at_epoch_id)` and `latest_tree_state_checkpoint(at_epoch_id)`.
-`tree_state_at` serves the tree state at exactly `height`: a stored checkpoint
-when one exists there, otherwise a cache-fill from the configured upstream node
-(mirroring lightwalletd's `GetTreeState`), so the returned height always equals
-the requested height. The fill is the one query path permitted to contact an
-upstream node, gated on an explicitly supplied source (see ADR-0005). An
-endpoint advertises `wallet.read.tree_state_at_height_v2` only after probing a
-node that supports tree-state fills. Without one, `tree_state_at` fails with
-that missing-capability precondition, and `latest_tree_state_checkpoint` still
-serves the stored tip checkpoint. Lightwalletd compatibility returns a
-`TreeState` response for `GetLatestTreeState`; `GetTreeState(BlockID)` is a clean
-passthrough to `tree_state_at` and serves any height the upstream can answer.
+`tree_state_at` serves the tree state at exactly `height`, so the returned
+height always equals the requested height, and never contacts the node (see
+ADR-0005). A stored checkpoint at `height` is served as stored. Any other
+retained height is reconstructed inside the pinned read: the trees are seeded
+from the nearest checkpoint below `height`, and the note commitments of each
+stored compact block up to `height` are appended one block at a time. Live
+following stores a checkpoint for every block, so only construction-built
+history is reconstructed, and a reconstruction replays at most 99 blocks.
+Every endpoint advertises `wallet.read.tree_state_at_height_v2`.
+
+The outcomes are typed:
+
+- A height above the visible tip or below the history predecessor returns
+  `BLOCK_NOT_IN_BEST_CHAIN` (`NOT_FOUND`).
+- A replayed block that does not extend the block below it, does not reach the
+  tree sizes its compact block records, or does not end at the canonical
+  header, and a missing compact block inside retained history, are store
+  damage and fail as a canonical storage error (`UNAVAILABLE` with
+  `STORAGE_UNAVAILABLE`), never as a wrong tree state.
+- A reconstruction seeds only from a checkpoint no lower than the newest
+  multiple of 100 at or below `height`, or the history predecessor when that
+  is newer, because every store holds those checkpoints. A missing one is
+  store damage with the same status, so a lost checkpoint never stretches a
+  read into a longer replay.
+- Each query runs at most one reconstruction per available CPU at once. A
+  request that needs one while every slot is taken fails at once with
+  `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`; a height with a
+  stored checkpoint is never refused this way.
+
+`latest_tree_state_checkpoint` serves the newest checkpoint at or below the
+visible tip. Lightwalletd compatibility returns a `TreeState` response for
+`GetLatestTreeState`; `GetTreeState(BlockID)` is a passthrough to
+`tree_state_at` for any height at or below the visible tip.
 
 Subtree roots are also wallet-sync artifacts. Query and compatibility services
 must serve them from epoch-bound indexed state and must distinguish a valid empty
@@ -969,9 +992,9 @@ Every range or list endpoint defines:
 
 The release native compact-block range API rejects requests above the fixed
 1,000-block `DEFAULT_MAX_COMPACT_BLOCK_RANGE` before opening a reader.
-Visible-tip reads use the epoch-bound pair directly. Tree-state reads first use
-the same pinned pair, then fill a missing exact-height checkpoint through the
-admitted upstream tree-state provider for the already-resolved canonical block.
+Visible-tip reads use the epoch-bound pair directly. Tree-state reads use the
+same pinned pair for the checkpoint lookup and any reconstruction, so a
+concurrent reorg cannot mix two chains into one tree state.
 Batched storage reads remain bounded by the range limit; native gRPC streams
 one compact block per message instead of packing the whole range into a single
 response.

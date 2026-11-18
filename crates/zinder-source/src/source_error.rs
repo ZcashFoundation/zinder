@@ -87,15 +87,6 @@ pub enum SourceError {
         byte_count: usize,
     },
 
-    /// A final note-commitment root did not have the expected JSON shape.
-    #[error("{protocol:?} final note-commitment root is malformed: {reason}")]
-    MalformedFinalNoteCommitmentRoot {
-        /// Shielded protocol whose root was malformed.
-        protocol: zinder_core::ShieldedProtocol,
-        /// Expected JSON shape that was violated.
-        reason: &'static str,
-    },
-
     /// A final note-commitment root was not valid hex.
     #[error("{protocol:?} final note-commitment root is not valid hex")]
     InvalidFinalNoteCommitmentRootHex {
@@ -571,7 +562,6 @@ impl SourceError {
             | Self::InvalidTransactionIdLength { .. }
             | Self::InvalidSubtreeRootHex { .. }
             | Self::InvalidSubtreeRootLength { .. }
-            | Self::MalformedFinalNoteCommitmentRoot { .. }
             | Self::InvalidFinalNoteCommitmentRootHex { .. }
             | Self::InvalidFinalNoteCommitmentRootLength { .. }
             | Self::MalformedCommitmentTreeFrontier { .. }

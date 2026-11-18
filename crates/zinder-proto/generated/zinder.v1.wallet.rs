@@ -637,7 +637,9 @@ pub mod compact_blocks_in_range_chunk {
 pub struct TreeStateAtHeightRequest {
     /// Exact block height to return the tree state for. The response height
     /// always equals this value: the server serves a stored checkpoint when one
-    /// exists at this height, otherwise it fills from the configured upstream node.
+    /// exists at this height, and otherwise reconstructs it from the nearest
+    /// stored checkpoint below it and the stored compact blocks in between. The
+    /// server never contacts an upstream node to answer.
     #[prost(uint32, tag = "1")]
     pub height: u32,
     /// Optional chain-epoch id that must be used to answer the request. When
@@ -2094,7 +2096,10 @@ pub mod wallet_query_client {
             self.inner.unary(req, path, codec).await
         }
         /// Return the tree state at one exact block height. Served from a stored
-        /// checkpoint when present, otherwise filled from the configured upstream node.
+        /// checkpoint when present, otherwise reconstructed from stored compact
+        /// blocks. A reconstruction refused because the server already runs its
+        /// limit of concurrent reconstructions fails with RESOURCE_EXHAUSTED and
+        /// `TREE_STATE_REPLAY_LIMIT_REACHED`.
         pub async fn tree_state_at_height(
             &mut self,
             request: impl tonic::IntoRequest<super::TreeStateAtHeightRequest>,
@@ -2599,7 +2604,10 @@ pub mod wallet_query_server {
             tonic::Status,
         >;
         /// Return the tree state at one exact block height. Served from a stored
-        /// checkpoint when present, otherwise filled from the configured upstream node.
+        /// checkpoint when present, otherwise reconstructed from stored compact
+        /// blocks. A reconstruction refused because the server already runs its
+        /// limit of concurrent reconstructions fails with RESOURCE_EXHAUSTED and
+        /// `TREE_STATE_REPLAY_LIMIT_REACHED`.
         async fn tree_state_at_height(
             &self,
             request: tonic::Request<super::TreeStateAtHeightRequest>,

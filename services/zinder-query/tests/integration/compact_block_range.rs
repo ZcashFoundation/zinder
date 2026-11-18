@@ -21,17 +21,13 @@ use zinder_query::{
     compact_blocks_in_range_chunks, latest_tree_state_checkpoint_response, subtree_roots_response,
     tree_state_at_response, visible_tip_block_response,
 };
-use zinder_source::{SourceError, SourceTreeState};
 use zinder_store::{ArtifactFamily, CanonicalBuildSubtreeRoot, RawBlobRetention};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
     completed_subtree_frontier, sample_regtest_upgrade_activations,
 };
 
-use crate::common::{
-    ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_from,
-    serving_query_over,
-};
+use crate::common::{serving_query_after_live_append, serving_query_from, serving_query_over};
 
 /// Tree-state payload the release store derives from a checkpoint whose
 /// commitment-tree frontiers are all empty.
@@ -90,19 +86,7 @@ async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin()
     let tip = chain
         .block_at(BlockHeight::new(2))
         .ok_or_else(|| eyre!("fixture must contain height 2"))?;
-    let tip_id = BlockId::new(tip.height, tip.hash);
-    let node = ProbedNode::with_tree_state(
-        tip_id,
-        SourceTreeState::new(tip_id, tip.block_time_seconds, b"{}".to_vec()),
-    )?;
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture =
-        WalletServingStoreFixture::from_chain_after_live_append(&chain, &activations)?;
-    let wallet_query = WalletServingQuery::from_probed_node_source(
-        crate::common::serving_pair_slot(&mut store_fixture)?,
-        node.clone(),
-        activations,
-    )?;
+    let (wallet_query, _store_fixture) = serving_query_after_live_append(&chain)?;
     let current_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
     assert!(current_epoch.settled_tip_height < tip.height);
 
@@ -118,11 +102,6 @@ async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin()
     assert!(
         payload.get("sapling").is_some(),
         "the live-appended checkpoint must carry the active Sapling frontier, got {payload}"
-    );
-    assert_eq!(
-        node.tree_state_fetch_count(),
-        0,
-        "a canonical tip checkpoint must not consult the node"
     );
     Ok(())
 }
@@ -259,12 +238,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     let tip = chain
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture must contain height 1"))?;
-    let tip_id = BlockId::new(tip.height, tip.hash);
-    let node = ProbedNode::with_tree_state(
-        tip_id,
-        SourceTreeState::new(tip_id, tip.block_time_seconds, b"node".to_vec()),
-    )?;
-    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
     let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
     let response = tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await?;
@@ -286,7 +260,6 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
         decoded_response.payload_bytes,
         EMPTY_FRONTIER_TREE_STATE_PAYLOAD
     );
-    assert_eq!(node.tree_state_fetch_count(), 0);
 
     Ok(())
 }
@@ -312,70 +285,6 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
         decoded_response.payload_bytes,
         EMPTY_FRONTIER_TREE_STATE_PAYLOAD
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn sparse_tree_state_rejects_upstream_time_that_disagrees_with_canonical_header()
--> eyre::Result<()> {
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let sparse = chain
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
-    let block_id = BlockId::new(sparse.height, sparse.hash);
-    let node = ProbedNode::with_tree_state(
-        block_id,
-        SourceTreeState::new(
-            block_id,
-            sparse.block_time_seconds.saturating_add(1),
-            br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec(),
-        ),
-    )?;
-    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
-
-    let error = match wallet_query.tree_state_at(block_id.height, None).await {
-        Ok(tree_state) => {
-            return Err(eyre!(
-                "conflicting upstream time must fail closed, got {tree_state:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::Node(SourceError::SourceProtocolMismatch {
-            reason: "tree-state source time does not match the canonical block"
-        })
-    ));
-    assert_eq!(node.tree_state_fetch_count(), 1);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn sparse_tree_state_uses_canonical_identity_and_time_with_frontier_only_payload()
--> eyre::Result<()> {
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let sparse = chain
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
-    let block_id = BlockId::new(sparse.height, sparse.hash);
-    let payload = br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec();
-    let node = ProbedNode::with_tree_state(
-        block_id,
-        SourceTreeState::new(block_id, sparse.block_time_seconds, payload.clone()),
-    )?;
-    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
-
-    let tree_state = wallet_query.tree_state_at(block_id.height, None).await?;
-
-    assert_eq!(tree_state.height, block_id.height);
-    assert_eq!(tree_state.block_hash, block_id.hash);
-    assert_eq!(tree_state.block_time_seconds, sparse.block_time_seconds);
-    assert_eq!(tree_state.payload_bytes, payload);
-    assert_eq!(node.tree_state_fetch_count(), 1);
 
     Ok(())
 }

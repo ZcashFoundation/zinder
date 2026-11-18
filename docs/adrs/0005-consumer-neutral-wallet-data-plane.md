@@ -49,7 +49,7 @@ Serving coverage fails closed:
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
 - An existing or staged READY store is rejected when its immutable retained-history floor is later than the floor required by the current invocation. Following cannot repair omitted history; operators must rebuild the canonical and wallet stores.
 - A serving store settles only outside the configured reorg window: construction publishes its settled tip `ingest.reorg_window_blocks` below the construction tip, and the canonical follower ingests the replaceable suffix.
-- Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
+- Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes. `tree_state_at(height)` answers every retained height from stored artifacts: the stored checkpoint at that height, or a reconstruction from the nearest checkpoint below it and the stored compact blocks in between (see tree state at any height under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
 ### Compatibility and native surfaces
@@ -94,7 +94,7 @@ The fresh-construction coverage floor is intentionally conservative. A future pr
 
 Upstream-node fallback is rejected. It would blur the source of truth, make readiness lie, and turn query services into partial node proxies. Repair tools may use upstream nodes to rebuild canonical artifacts, but public query methods read stored artifacts only.
 
-Tree-state-at-height carve-out: `tree_state_at(height)` may fill from the configured upstream node on a cache-miss, mirroring lightwalletd's `GetTreeState` (which itself proxies `z_gettreestate` to the node). Zinder stores only sparse tree-state checkpoints (one per 100 blocks plus batch ends) because it delegates all commitment-tree math to the node; a wallet running the canonical `zcash_client_backend` scan loop needs the tree state at exact range boundaries that rarely land on a stored checkpoint. The fill is gated on an explicitly supplied source (the same `ZebraJsonRpcSource` snapshot ADR-0004 already permits for broadcast), is read-only against the store, and returns the exact requested height. This does not blur the source of truth: the node is the source of truth for tree state, and the stored checkpoints are a warm cache in front of it. Without a configured source the read serves only stored checkpoint heights and returns `ArtifactUnavailable` for the gaps.
+Tree state at any height: a wallet running the canonical `zcash_client_backend` scan loop needs the tree state at exact range boundaries, which rarely land on a construction checkpoint. Construction stores a checkpoint every 100 blocks and at its build tip, and live following stores one for every block. `tree_state_at(height)` serves a stored checkpoint when one exists and otherwise seeds the commitment trees from the nearest checkpoint below the height and appends the note commitments of each stored compact block up to it. That is the derivation construction and live following check against the node's tree state before they store a block, so the result equals what the node reports for any block the store holds. Each replayed block must extend the one below it and reach the tree sizes its compact block records; a reconstruction that fails a check is store damage, not a reason to ask the node. A reconstruction replays at most 99 blocks, and each query runs at most one per available CPU at once; a request beyond that limit fails with `RESOURCE_EXHAUSTED` rather than queueing. Lightwalletd answers `GetTreeState` by proxying `z_gettreestate`; Zinder does not, so answering a tree-state read never calls the node. When transaction broadcast is not configured, the node is not a readiness input, so tree-state reads keep working while the node is unavailable. When broadcast is advertised, a node outage drains readiness, which refuses every request, tree-state reads included. Storing a frontier for every block was rejected: it costs about 2 GB on mainnet, needs a rebuild, and saves at most 99 blocks of replay.
 
 ## Out of Scope
 
@@ -103,3 +103,10 @@ Tree-state-at-height carve-out: `tree_state_at(height)` may fill from the config
 - Public by-address shielded queries.
 - Mempool UTXO completeness; the mempool surface owns mempool indexing.
 - Cross-host read-replica architecture.
+
+## Revision history
+
+- 2026-11-17: `tree_state_at(height)` no longer fills from the upstream node.
+  A height without a stored checkpoint is reconstructed from the nearest
+  checkpoint below it and the stored compact blocks, under a per-query limit
+  on concurrent reconstructions.

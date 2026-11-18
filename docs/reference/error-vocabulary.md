@@ -83,7 +83,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted wallet endpoint does not expose the capability required by this operation | `type=ENDPOINT_CAPABILITY_UNAVAILABLE, subject=<capability>` |
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
-| `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires, or permanently refuses the requested historical data (for example, tree states below a fast-synced node's checkpoint, or a stored block body a damaged node cannot reassemble); the operator must reconfigure or replace the node | — |
+| `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires. On the wire this comes only from transaction broadcast, the one request the query forwards to the node; the operator must reconfigure or replace the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
 | `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup or a `TransparentOutpointSpendStatus` request that missed cannot prove an absence; query a store with complete history. An unpinned transaction lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
 
@@ -108,6 +108,14 @@ Persistent or upstream data could not be decoded. Retry disposition: **NonRetrya
 | --- | --- |
 | `COMPACT_BLOCK_PAYLOAD_MALFORMED` | A persisted compact block failed to deserialize |
 | `ARTIFACT_CORRUPT` | A persisted artifact's checksum or shape is invalid, or a federated response carried an unusable value (for example a missing outpoint or an out-of-range Zatoshi amount) |
+
+### `RESOURCE_EXHAUSTED` family
+
+The server is already running its limit of a bounded kind of work. Retry disposition: **RetryAfterBackoff**.
+
+| Reason | What it means |
+| --- | --- |
+| `TREE_STATE_REPLAY_LIMIT_REACHED` | `WalletQuery.TreeStateAtHeight` named a height without a stored checkpoint, and the query already reconstructs one tree state per available CPU from stored compact blocks. A height with a stored checkpoint is never refused this way |
 
 ### `UNAVAILABLE` family
 

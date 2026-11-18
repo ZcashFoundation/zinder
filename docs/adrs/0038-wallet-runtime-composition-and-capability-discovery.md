@@ -42,8 +42,8 @@ composition and admission, from concrete evidence:
 - the serving pair's authenticated persisted `RawBlobRetention` and projection
   evidence;
 - the methods implemented by the production query;
-- admitted upstream-node capabilities and the concrete tree-state and
-  broadcaster dependencies; and
+- admitted upstream-node capabilities and the concrete broadcaster
+  dependency; and
 - any authenticated ingest-control dependencies whose methods the native
   adapter exposes.
 
@@ -83,10 +83,13 @@ one pair before reading. Test and library callers cannot mutate the slot or
 install a replacement that bypasses retention, fence, or source-identity
 admission.
 
-The release query admits one probed `NodeSource` and installs clones of that
-same source as its tree-state and broadcast providers. A
-node-backed capability requires the corresponding probed node feature, the
-concrete provider, and `TipId`, which is the liveness prerequisite. The release
+The release query admits one probed `NodeSource` and installs that same source
+as its transaction broadcaster. Transaction broadcast is the only node-backed
+capability: it requires the probed broadcast feature, the concrete
+broadcaster, and `TipId`, which is the liveness prerequisite. Tree state at
+any height is served from the serving pair, so
+`wallet.read.tree_state_at_height_v2` needs no node evidence and is always
+advertised. The release
 query also admits one `AdmittedIngestControl` before opening storage or binding
 traffic. Admission opens an authenticated channel once, calls `ServerInfo`,
 and requires the exact `zinder-ingest` service identity, network, contract
@@ -137,8 +140,9 @@ and replica lag may change readiness but never rewrite the endpoint contract.
 `WalletServingReadiness` retains pair state, admitted-node state, and
 ingest-control health independently and projects their conjunction into the
 shared operational and gRPC readiness handle. Shutdown dominates later writes.
-The node liveness task uses `tip_id` plus upstream synchronization health
-through the exact admitted source; it never repeats capability discovery or
+The node liveness task runs only when the query advertises a node-backed
+capability, and uses `tip_id` plus upstream synchronization health through the
+exact admitted source; it never repeats capability discovery or
 mutates the cached structural feature set. The ingest-control task calls
 `WriterStatus` and `MempoolSnapshot(max_entries = 1)` through the admitted
 channel, validates coherent network and tip evidence, and publishes
@@ -587,6 +591,12 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: Tree state at any height is served from the serving pair,
+  reconstructed from stored compact blocks between checkpoints, so
+  `wallet.read.tree_state_at_height_v2` is advertised without node evidence.
+  Transaction broadcast is the only node-backed capability, so a node that
+  advertises tree state but not broadcast no longer starts the node liveness
+  task.
 - 2026-11-17: The serving generations of a process share one block cache per
   store, sized by the configured `block_cache_bytes`, instead of opening a
   cache of that size each.

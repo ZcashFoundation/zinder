@@ -27,8 +27,7 @@ use zinder_query::{
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
-    TransactionBroadcaster, TreeStateUpstream,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
@@ -47,9 +46,7 @@ async fn native_and_operations_surfaces_advertise_the_same_admitted_capabilities
             Vec::new(),
         ),
         fetch_count: Arc::new(AtomicUsize::new(0)),
-        tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
         broadcast_count: Arc::new(AtomicUsize::new(0)),
-        tree_state: None,
         broadcast_outcome: None,
     };
     let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
@@ -136,9 +133,7 @@ async fn openrpc_value_pool_method_is_not_sufficient_native_admission_evidence()
             vec![ChainValuePool::new("sapling", true, Some(42))],
         ),
         fetch_count: Arc::clone(&fetch_count),
-        tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
         broadcast_count: Arc::new(AtomicUsize::new(0)),
-        tree_state: None,
         broadcast_outcome: None,
     };
     let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
@@ -186,9 +181,7 @@ async fn absent_node_value_pool_capability_is_omitted_and_rejected_before_fetch(
             Vec::new(),
         ),
         fetch_count: Arc::clone(&fetch_count),
-        tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
         broadcast_count: Arc::new(AtomicUsize::new(0)),
-        tree_state: None,
         broadcast_outcome: None,
     };
     let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
@@ -220,16 +213,14 @@ async fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Res
     let source = ProbedValuePoolSource {
         capabilities: NodeCapabilities::new([
             NodeCapability::OpenRpcDiscovery,
-            NodeCapability::TreeState,
+            NodeCapability::TransactionBroadcast,
         ])?,
         value_pools: ChainValuePools::new(
             BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x77; 32])),
             Vec::new(),
         ),
         fetch_count: Arc::new(AtomicUsize::new(0)),
-        tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
         broadcast_count: Arc::new(AtomicUsize::new(0)),
-        tree_state: None,
         broadcast_outcome: None,
     };
 
@@ -248,8 +239,42 @@ async fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Res
     Ok(())
 }
 
+/// A node's tree-state capability is not node-backed evidence: tree state is
+/// served from storage, so composition does not demand a liveness probe.
 #[tokio::test]
-async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -> eyre::Result<()> {
+async fn tree_state_capability_alone_does_not_make_the_query_node_backed() -> eyre::Result<()> {
+    let source = ProbedValuePoolSource {
+        capabilities: NodeCapabilities::new([
+            NodeCapability::OpenRpcDiscovery,
+            NodeCapability::TreeState,
+        ])?,
+        value_pools: ChainValuePools::new(
+            BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x77; 32])),
+            Vec::new(),
+        ),
+        fetch_count: Arc::new(AtomicUsize::new(0)),
+        broadcast_count: Arc::new(AtomicUsize::new(0)),
+        broadcast_outcome: None,
+    };
+
+    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+
+    assert!(
+        query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
+    );
+    assert!(
+        !query
+            .native_endpoint_capabilities()
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn probed_broadcast_is_advertised_and_invokable_beside_stored_tree_state() -> eyre::Result<()>
+{
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -258,25 +283,17 @@ async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("fixture must contain height 1"))?;
     let block_id = BlockId::new(fixture_block.height, fixture_block.hash);
-    let tree_state_fetch_count = Arc::new(AtomicUsize::new(0));
     let broadcast_count = Arc::new(AtomicUsize::new(0));
     let accepted_transaction_id = TransactionId::from_bytes([0x55; 32]);
     let source = ProbedValuePoolSource {
         capabilities: NodeCapabilities::new([
             NodeCapability::OpenRpcDiscovery,
             NodeCapability::TipId,
-            NodeCapability::TreeState,
             NodeCapability::TransactionBroadcast,
         ])?,
         value_pools: ChainValuePools::new(block_id, Vec::new()),
         fetch_count: Arc::new(AtomicUsize::new(0)),
-        tree_state_fetch_count: Arc::clone(&tree_state_fetch_count),
         broadcast_count: Arc::clone(&broadcast_count),
-        tree_state: Some(SourceTreeState::new(
-            block_id,
-            fixture_block.block_time_seconds,
-            br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec(),
-        )),
         broadcast_outcome: Some(TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
             transaction_id: accepted_transaction_id,
         })),
@@ -301,6 +318,10 @@ async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -
     .await?
     .into_inner();
     assert_eq!(tree_state.height, block_id.height.value());
+    assert_eq!(
+        tree_state.block_hash,
+        zinder_core::wire::encode_rpc_block_hash_hex(block_id.hash)
+    );
     let broadcast = WalletQueryService::broadcast_transaction(
         &adapter,
         Request::new(wallet::BroadcastTransactionRequest {
@@ -318,7 +339,6 @@ async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -
         )) if transaction_id
             == zinder_core::wire::encode_rpc_transaction_id_hex(accepted_transaction_id)
     ));
-    assert_eq!(tree_state_fetch_count.load(Ordering::SeqCst), 1);
     assert_eq!(broadcast_count.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -350,9 +370,7 @@ async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::R
                 Vec::new(),
             ),
             fetch_count: Arc::new(AtomicUsize::new(0)),
-            tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
             broadcast_count: Arc::new(AtomicUsize::new(0)),
-            tree_state: None,
             broadcast_outcome: Some(TransactionBroadcastOutcome::Rejected(BroadcastRejected {
                 kind,
                 error_code: Some(-25),
@@ -383,9 +401,8 @@ async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::R
 }
 
 #[tokio::test]
-async fn absent_tree_and_broadcast_capabilities_reject_without_invoking_the_source()
+async fn absent_broadcast_capability_rejects_without_invoking_the_source_and_keeps_tree_state()
 -> eyre::Result<()> {
-    let tree_state_fetch_count = Arc::new(AtomicUsize::new(0));
     let broadcast_count = Arc::new(AtomicUsize::new(0));
     let source = ProbedValuePoolSource {
         capabilities: NodeCapabilities::new([NodeCapability::OpenRpcDiscovery])?,
@@ -394,25 +411,25 @@ async fn absent_tree_and_broadcast_capabilities_reject_without_invoking_the_sour
             Vec::new(),
         ),
         fetch_count: Arc::new(AtomicUsize::new(0)),
-        tree_state_fetch_count: Arc::clone(&tree_state_fetch_count),
         broadcast_count: Arc::clone(&broadcast_count),
-        tree_state: None,
         broadcast_outcome: None,
     };
     let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
 
-    for capability in [
-        WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
-        WALLET_BROADCAST_TRANSACTION_V1,
-    ] {
-        assert!(!query.native_endpoint_capabilities().contains(capability));
-    }
-    assert!(matches!(
-        query.tree_state_at(BlockHeight::new(1), None).await,
-        Err(zinder_query::QueryError::EndpointCapabilityUnavailable {
-            capability: WALLET_READ_TREE_STATE_AT_HEIGHT_V2
-        })
-    ));
+    assert!(
+        query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
+    );
+    assert!(
+        !query
+            .native_endpoint_capabilities()
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    );
+    assert_eq!(
+        query.tree_state_at(BlockHeight::new(1), None).await?.height,
+        BlockHeight::new(1)
+    );
     assert!(matches!(
         query
             .broadcast_transaction(RawTransactionBytes::new(vec![1]))
@@ -421,7 +438,6 @@ async fn absent_tree_and_broadcast_capabilities_reject_without_invoking_the_sour
             capability: WALLET_BROADCAST_TRANSACTION_V1
         })
     ));
-    assert_eq!(tree_state_fetch_count.load(Ordering::SeqCst), 0);
     assert_eq!(broadcast_count.load(Ordering::SeqCst), 0);
     Ok(())
 }
@@ -471,9 +487,7 @@ struct ProbedValuePoolSource {
     capabilities: NodeCapabilities,
     value_pools: ChainValuePools,
     fetch_count: Arc<AtomicUsize>,
-    tree_state_fetch_count: Arc<AtomicUsize>,
     broadcast_count: Arc<AtomicUsize>,
-    tree_state: Option<SourceTreeState>,
     broadcast_outcome: Option<TransactionBroadcastOutcome>,
 }
 
@@ -496,21 +510,6 @@ impl NodeSource for ProbedValuePoolSource {
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
         Ok(self.value_pools.clone())
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for ProbedValuePoolSource {
-    async fn fetch_tree_state_for_block(
-        &self,
-        _block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        self.tree_state_fetch_count.fetch_add(1, Ordering::SeqCst);
-        self.tree_state
-            .clone()
-            .ok_or(SourceError::NodeCapabilityMissing {
-                capability: NodeCapability::TreeState,
-            })
     }
 }
 

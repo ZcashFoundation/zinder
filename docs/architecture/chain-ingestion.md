@@ -64,6 +64,14 @@ computation for each pool that changed since the previous checkpoint. The
 node's tree state for the build tip is requested by the tip's hash. If that
 block has left the node's best chain, construction stops and publishes nothing.
 
+Readers serve the tree state at every other retained height from the same
+derivation. The canonical reader seeds an accumulator from the nearest
+checkpoint below the height and appends each stored compact block's note
+commitments up to it, checking parent links and the tree sizes each compact
+block records. Live following stores a checkpoint for every block it appends,
+so only construction-built history is reconstructed, at most 99 blocks at a
+time. See [Wallet data plane](wallet-data-plane.md) for the read contract.
+
 The loader also derives the root of every subtree that a loaded block
 completes, and construction stores those derived roots. Construction reads the
 completed ranges with `z_getsubtreesbyindex` before it requests the build

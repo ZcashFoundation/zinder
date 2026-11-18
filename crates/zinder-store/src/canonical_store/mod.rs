@@ -29,6 +29,9 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod subtree_load;
+mod tree_state_replay;
+#[cfg(test)]
+mod tree_state_replay_tests;
 mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};

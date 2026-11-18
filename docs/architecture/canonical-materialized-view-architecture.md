@@ -151,9 +151,8 @@ pair answers reads pinned to its epoch for a bounded window; see
 [Wallet data plane §Query Consistency](wallet-data-plane.md#query-consistency).
 
 The lightwalletd adapter translates `CompactTxStreamer` requests onto this Rust
-query contract. Node-backed transaction broadcast and sparse tree-state fill are
-explicit edge capabilities; they never change canonical or wallet-store
-ownership.
+query contract. Node-backed transaction broadcast is an explicit edge
+capability; it never changes canonical or wallet-store ownership.
 
 ## Explorer materialized views
 

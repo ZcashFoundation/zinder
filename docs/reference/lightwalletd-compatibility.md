@@ -205,6 +205,30 @@ identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
 modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
 served.
 
+## Tree state status codes
+
+In wallet serving, `GetTreeState` answers every retained height from storage
+and never contacts the node. A height with a stored checkpoint is read
+directly. Any other height is rebuilt from the nearest stored checkpoint below
+it and the stored compact blocks up to it. lightwalletd instead asks its node
+for every height.
+
+| Request | Status |
+| --- | --- |
+| Height above the visible tip | `INVALID_ARGUMENT`, as lightwalletd returns |
+| Height below the store's history predecessor | `NOT_FOUND` with reason `BLOCK_NOT_IN_BEST_CHAIN` |
+| A checkpoint the rebuild seeds from is missing, or stored history between it and the height is damaged | `UNAVAILABLE` with reason `STORAGE_UNAVAILABLE` |
+| Rebuild requested while the process already runs one rebuild per available CPU | `RESOURCE_EXHAUSTED` with reason `TREE_STATE_REPLAY_LIMIT_REACHED` |
+
+A height with a stored checkpoint is never refused this way. Retry a refused
+request later.
+`zinder_query_tree_state_replay_refusals_total` counts refusals. lightwalletd
+sets no such limit, and how clients handle `RESOURCE_EXHAUSTED` on this method
+is not verified.
+
+Compact-block serving returns `UNIMPLEMENTED` for `GetTreeState`, as
+[Runtime serving selection](#runtime-serving-selection) describes.
+
 ## Block range consistency
 
 `GetBlockRange` in both serving modes, and `GetBlockRangeNullifiers` in wallet

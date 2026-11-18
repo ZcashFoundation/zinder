@@ -52,6 +52,7 @@ pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
+pub mod note_commitment_chain;
 pub mod orchard_test_key;
 pub mod process_crash;
 pub mod runtime_allocator;
@@ -85,6 +86,7 @@ pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
 pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
 };
+pub use note_commitment_chain::{commitment_tree_checkpoints, with_note_commitments};
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
 pub use runtime_allocator::check_binary_allocates_through_jemalloc;
 pub use transparent_signer::{

@@ -191,6 +191,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::TransactionNotFound,
         WireErrorReason::CanonicalHistoryUnavailable,
         WireErrorReason::TransparentOutpointCountOutOfRange,
+        WireErrorReason::TreeStateReplayLimitReached,
     ];
 
     for reason in reasons {

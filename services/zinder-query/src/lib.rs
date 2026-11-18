@@ -2,8 +2,8 @@
 //!
 //! This crate serves indexed artifacts from an admitted wallet-serving pair
 //! through [`WalletServingQuery`] without mutating canonical storage or using
-//! upstream nodes as a fallback for indexed history. Upstream access is limited to explicitly delegated sparse
-//! tree-state fill and transaction broadcast.
+//! upstream nodes as a fallback for indexed history. Transaction broadcast is
+//! the only operation that contacts an upstream node.
 
 use std::{num::NonZeroU32, time::Instant};
 
@@ -32,6 +32,7 @@ mod ingest_control;
 mod native_wallet_endpoint_capabilities;
 mod serving_read;
 mod transparent_unspent_output_stream;
+mod tree_state_replay_limit;
 mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
@@ -285,8 +286,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads the tree state at exactly `height`.
     ///
     /// Served from a stored checkpoint when one exists at `height`, otherwise
-    /// filled from the configured upstream node. The returned height always
+    /// rebuilt from the nearest stored checkpoint below it and the stored
+    /// compact blocks, without contacting the node. The returned height always
     /// equals `height`.
+    ///
+    /// A height above the visible tip or below retained history fails with
+    /// [`QueryError::BlockNotInBestChain`]. A rebuild requested while the
+    /// query already runs its limit of them fails with
+    /// [`QueryError::TreeStateReplayLimitReached`].
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -388,8 +395,8 @@ const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
 /// Call once at startup, after `install_metrics_recorder` returns and before
 /// the gRPC server records its first request. Delegates the RPC metric pair
 /// to [`zinder_runtime::describe_rpc_metrics`] so every Zinder service
-/// shares one description template; the compact-block-range histogram is
-/// `WalletQuery`-specific and stays registered here.
+/// shares one description template; the compact-block-range and tree-state
+/// rebuild metrics are `WalletQuery`-specific and stay registered here.
 pub fn describe_request_metrics() {
     zinder_runtime::describe_rpc_metrics(QUERY_RPC_METRICS, "WalletQuery");
     metrics::describe_histogram!(
@@ -398,6 +405,7 @@ pub fn describe_request_metrics() {
         "Number of blocks returned by a single CompactBlockRange response, labelled \
          by status. Used to monitor request fan-out and page sizing."
     );
+    tree_state_replay_limit::describe_metrics();
 }
 
 pub(crate) fn record_wallet_query_outcome<Response>(
@@ -460,6 +468,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
+        Some(QueryError::TreeStateReplayLimitReached { .. }) => "tree_state_replay_limit_reached",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -970,6 +979,16 @@ pub enum QueryError {
         capability: &'static str,
     },
 
+    /// A tree state at a height without a stored checkpoint needs a
+    /// reconstruction, and the query already runs its limit of them.
+    #[error(
+        "tree-state reconstruction limit reached: this server already reconstructs {max_concurrent_replays} tree states at once"
+    )]
+    TreeStateReplayLimitReached {
+        /// Most reconstructions the query runs at once.
+        max_concurrent_replays: NonZeroU32,
+    },
+
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
     #[error("query read task failed: {reason}")]
     BlockingTaskFailed {
@@ -1092,6 +1111,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedBlockSelector { .. } => ErrorReason::UnsupportedBlockSelector,
             Self::UnsupportedTransactionStatus { .. } => ErrorReason::UnsupportedTransactionStatus,
             Self::UnsupportedWalletEncoding { .. } => ErrorReason::UnsupportedWalletEncoding,
+            Self::TreeStateReplayLimitReached { .. } => ErrorReason::TreeStateReplayLimitReached,
             Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
@@ -1228,6 +1248,9 @@ mod error_reason_tests {
             QueryError::EndpointCapabilityUnavailable {
                 capability: "probe",
             },
+            QueryError::TreeStateReplayLimitReached {
+                max_concurrent_replays: NonZeroU32::MIN,
+            },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
@@ -1262,6 +1285,19 @@ mod error_reason_tests {
             Some(BlockHeight::new(101))
         );
         Ok(())
+    }
+
+    #[test]
+    fn tree_state_replay_refusal_is_resource_exhausted_on_the_wire() {
+        let status = crate::status_from_query_error(&QueryError::TreeStateReplayLimitReached {
+            max_concurrent_replays: NonZeroU32::MIN,
+        });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("TREE_STATE_REPLAY_LIMIT_REACHED".to_owned())
+        );
     }
 
     #[test]

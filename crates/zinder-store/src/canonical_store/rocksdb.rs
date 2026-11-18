@@ -771,15 +771,10 @@ impl RocksDbCanonicalStore {
         &self,
         activations: &NetworkUpgradeActivations,
     ) -> bool {
-        if activations.network() != self.network() {
-            return false;
-        }
-        self.activation_schedule.as_ref().map_or_else(
-            || {
-                activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
-                    == self.network_upgrade_activations_fingerprint()
-            },
-            |schedule| activations == schedule.activations(),
+        super::activation_schedule::admits_activation_table(
+            &self.build_plan,
+            self.activation_schedule.as_ref(),
+            activations,
         )
     }
 

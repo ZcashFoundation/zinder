@@ -434,9 +434,10 @@ the following against the node:
   and the Ironwood tree holds notes. Only Ironwood is required, because
   Zakura's Sapling and Orchard trees stay empty on this schedule; the mining
   script checks all three on Zebra.
-- Served tree states match `z_gettreestate` at the activation heights, on both
-  sides of NU7, and at every stored checkpoint, whose frontiers Zinder computes
-  itself.
+- Served tree states match `z_gettreestate` at every height through the tip.
+  Construction stores a checkpoint only every 100 blocks, so most heights,
+  including the activation heights and both sides of NU7, are reconstructed
+  from stored compact blocks without contacting the node.
 - Subtree roots match `z_getsubtreesbyindex`.
 
 To check the rejection across the native wire contract, set

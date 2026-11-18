@@ -4,7 +4,7 @@
 //! depends on. Parity here means "Zinder serves the consumer-expected shape",
 //! not byte-equivalence with every implementation detail of another indexer.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::net::TcpListener;
@@ -25,8 +25,7 @@ use zinder_query::{
     WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
-    TransactionBroadcaster, TreeStateUpstream,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
@@ -55,7 +54,6 @@ struct TransparentAddressServingFixture {
 struct ParityNodeSource {
     capabilities: NodeCapabilities,
     tip: BlockId,
-    block_time_seconds_by_id: Arc<HashMap<BlockId, u32>>,
 }
 
 impl ParityNodeSource {
@@ -64,16 +62,6 @@ impl ParityNodeSource {
             .blocks()
             .last()
             .ok_or_else(|| eyre::eyre!("parity node source requires a non-empty chain"))?;
-        let block_time_seconds_by_id = chain_fixture
-            .blocks()
-            .iter()
-            .map(|block| {
-                (
-                    BlockId::new(block.height, block.hash),
-                    block.block_time_seconds,
-                )
-            })
-            .collect();
 
         Ok(Self {
             capabilities: NodeCapabilities::new([
@@ -82,7 +70,6 @@ impl ParityNodeSource {
                 NodeCapability::OpenRpcDiscovery,
             ])?,
             tip: BlockId::new(tip_block.height, tip_block.hash),
-            block_time_seconds_by_id: Arc::new(block_time_seconds_by_id),
         })
     }
 }
@@ -101,30 +88,6 @@ impl NodeSource for ParityNodeSource {
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for ParityNodeSource {
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        let block_time_seconds = self
-            .block_time_seconds_by_id
-            .get(&block_id)
-            .copied()
-            .ok_or_else(|| SourceError::NodeUnavailable {
-                reason: format!(
-                    "parity fixture has no canonical block at height {}",
-                    block_id.height.value()
-                ),
-            })?;
-        Ok(SourceTreeState::new(
-            block_id,
-            block_time_seconds,
-            PARITY_TREE_STATE_PAYLOAD,
-        ))
     }
 }
 

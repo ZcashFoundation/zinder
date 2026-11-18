@@ -23,9 +23,9 @@ use zinder_core::{
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_TRANSACTION_BY_ID_V2,
 };
-use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
+use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster};
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, ChainEventHistoryRequest,
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
@@ -44,8 +44,9 @@ use crate::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
     UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
-    WalletServingPairSlot, WalletServingReadPair, serving_read, validate_block_range,
-    validate_subtree_root_range,
+    WalletServingPairSlot, WalletServingReadPair, serving_read,
+    tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
+    validate_block_range, validate_subtree_root_range,
 };
 
 const TRANSPARENT_HISTORY_CURSOR_MAGIC: [u8; 4] = *b"zth1";
@@ -396,13 +397,18 @@ mod tests {
 /// store read on the blocking pool. The secondaries use direct I/O, so a cache
 /// miss is a synchronous `pread`; keeping one on a reactor thread would stall
 /// the ops listener and the gRPC connection drivers sharing that runtime.
+///
+/// A tree state at a height without a stored checkpoint is reconstructed from
+/// stored compact blocks. The query and its clones run at most one such
+/// reconstruction per available CPU at once and refuse the rest with
+/// [`QueryError::TreeStateReplayLimitReached`].
 #[derive(Clone)]
 pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     serving_pair_slot: WalletServingPairSlot,
     broadcaster: Broadcaster,
     native_ingest: NativeIngest,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
+    tree_state_replays: TreeStateReplayLimit,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
     upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
 }
@@ -414,7 +420,6 @@ impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcast
             .debug_struct("WalletServingQuery")
             .field("canonical_fence", &pair.canonical_fence())
             .field("wallet_fence", &pair.wallet_source())
-            .field("tree_state_upstream", &self.tree_state_upstream.is_some())
             .field(
                 "native_endpoint_capabilities",
                 &self.native_endpoint_capabilities,
@@ -446,7 +451,7 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
             broadcaster,
             native_ingest: (),
             network_upgrade_activations,
-            tree_state_upstream: None,
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
             native_endpoint_capabilities,
             upstream_node_capabilities: None,
         }
@@ -477,7 +482,7 @@ impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
             broadcaster,
             native_ingest: ingest_control,
             network_upgrade_activations,
-            tree_state_upstream: None,
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
             native_endpoint_capabilities,
             upstream_node_capabilities: None,
         }
@@ -567,7 +572,7 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
 
 impl<Source> WalletServingQuery<Source>
 where
-    Source: Clone + NodeSource + TransactionBroadcaster + TreeStateUpstream,
+    Source: NodeSource + TransactionBroadcaster,
 {
     /// Builds the shared exact-pair query from one probed node source.
     ///
@@ -601,14 +606,12 @@ where
                 },
             ));
         }
-        let shared_source = Arc::new(source.clone());
-        let tree_state_upstream: Arc<dyn TreeStateUpstream> = shared_source;
         Ok(Self {
             serving_pair_slot,
             broadcaster: source,
             native_ingest: (),
             network_upgrade_activations,
-            tree_state_upstream: Some(tree_state_upstream),
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
             native_endpoint_capabilities,
             upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
                 node_capabilities,
@@ -619,7 +622,7 @@ where
 
 impl<Source> WalletServingQuery<Source, AdmittedIngestControl>
 where
-    Source: Clone + NodeSource + TransactionBroadcaster + TreeStateUpstream,
+    Source: NodeSource + TransactionBroadcaster,
 {
     /// Builds the native release query from its exact admitted sources.
     pub fn from_admitted_native_sources(
@@ -652,14 +655,12 @@ where
                 },
             ));
         }
-        let shared_source = Arc::new(source.clone());
-        let tree_state_upstream: Arc<dyn TreeStateUpstream> = shared_source;
         Ok(Self {
             serving_pair_slot,
             broadcaster: source,
             native_ingest: ingest_control,
             network_upgrade_activations,
-            tree_state_upstream: Some(tree_state_upstream),
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
             native_endpoint_capabilities,
             upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
                 node_capabilities,
@@ -1136,75 +1137,34 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        serving_read::record("tree_state_at", None, async {
-            if !self
-                .native_endpoint_capabilities
-                .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
+        let discovered_activations = Arc::clone(&self.network_upgrade_activations);
+        let replays = self.tree_state_replays.clone();
+        serving_read::run("tree_state_at", self.pin(at_epoch_id), move |pair| {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if height > chain_epoch.visible_tip_height {
+                return Err(QueryError::BlockNotInBestChain);
+            }
+            let canonical = pair.canonical();
+            let nearest = canonical.tree_state_checkpoint_at_or_before(height)?;
+            if let Some(stored) = &nearest
+                && stored.block_id.height == height
             {
-                return Err(unavailable(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
+                return tree_state_from_checkpoint(chain_epoch, stored);
             }
-            let resolved = serving_read::read_at(self.pin(at_epoch_id), move |pair| {
-                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let checkpoint = pair
-                    .canonical()
-                    .tree_state_checkpoint_at_or_before(height)?;
-                if let Some(checkpoint) =
-                    checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
-                {
-                    return tree_state_from_checkpoint(chain_epoch, &checkpoint)
-                        .map(ResolvedTreeState::Checkpoint);
-                }
-                let block_header = pair
-                    .canonical()
-                    .block_header_at(height)?
-                    .ok_or(QueryError::BlockNotInBestChain)?;
-                let block_time_seconds = u32::try_from(block_header.block_time).map_err(|_| {
-                    QueryError::ArtifactCorrupt {
-                        family: ArtifactFamily::BlockHeader,
-                        reason: "canonical block time is outside the u32 range".to_owned(),
-                    }
-                })?;
-                Ok(ResolvedTreeState::UpstreamFill {
-                    chain_epoch,
-                    block_id: BlockId::new(height, block_header.block_hash),
-                    block_time_seconds,
-                })
-            })
-            .await?;
-            let (chain_epoch, block_id, block_time_seconds) = match resolved {
-                ResolvedTreeState::Checkpoint(tree_state) => return Ok(tree_state),
-                ResolvedTreeState::UpstreamFill {
-                    chain_epoch,
-                    block_id,
-                    block_time_seconds,
-                } => (chain_epoch, block_id, block_time_seconds),
-            };
-            let upstream = self
-                .tree_state_upstream
-                .as_ref()
-                .ok_or_else(|| artifact_unavailable(ArtifactFamily::TreeState, height))?;
-            let source = upstream.fetch_tree_state_for_block(block_id).await?;
-            if source.block_id != block_id {
-                return Err(QueryError::Node(
-                    zinder_source::SourceError::SourceProtocolMismatch {
-                        reason: "tree-state source identity does not match the canonical block",
-                    },
-                ));
+            // Without a seed the canonical reader replays nothing: it answers
+            // a height below the history predecessor as absent and a missing
+            // seed as store damage, so only a seeded read takes a slot.
+            let _replay_slot = nearest.as_ref().map(|_| replays.try_admit()).transpose()?;
+            let checkpoint = canonical
+                .tree_state_checkpoint_at(
+                    height,
+                    admitted_activations(&pair, &discovered_activations),
+                )?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            if let Some(seed) = nearest {
+                record_replayed_blocks(height.value().saturating_sub(seed.block_id.height.value()));
             }
-            if source.block_time_seconds != block_time_seconds {
-                return Err(QueryError::Node(
-                    zinder_source::SourceError::SourceProtocolMismatch {
-                        reason: "tree-state source time does not match the canonical block",
-                    },
-                ));
-            }
-            Ok(TreeState {
-                chain_epoch,
-                height,
-                block_hash: block_id.hash,
-                block_time_seconds,
-                payload_bytes: source.payload_bytes,
-            })
+            tree_state_from_checkpoint(chain_epoch, &checkpoint)
         })
         .await
     }
@@ -1522,24 +1482,6 @@ fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryErr
     }
 }
 
-/// Outcome of the canonical half of a tree-state read.
-///
-/// A sparse height resolves its payload from the node, so the canonical reads
-/// that identify the block finish before the request leaves the blocking pool.
-enum ResolvedTreeState {
-    /// The canonical store held a checkpoint at the exact requested height.
-    Checkpoint(TreeState),
-    /// The block is canonical but its payload must come from the node.
-    UpstreamFill {
-        /// Epoch the canonical reads were pinned to.
-        chain_epoch: ChainEpoch,
-        /// Canonical identity the node response must match.
-        block_id: BlockId,
-        /// Canonical block time the node response must match.
-        block_time_seconds: u32,
-    },
-}
-
 fn tree_state_from_checkpoint(
     chain_epoch: ChainEpoch,
     checkpoint: &zinder_core::CommitmentTreeCheckpoint,
@@ -1702,5 +1644,62 @@ mod full_block_range_tests {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tree_state_replay_limit_tests {
+    use std::{error::Error, num::NonZeroU32, sync::Arc};
+
+    use zinder_core::{BlockHeight, Network};
+    use zinder_testkit::{
+        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    };
+
+    use crate::{
+        QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+        WalletServingReadPair, tree_state_replay_limit::TreeStateReplayLimit,
+    };
+
+    /// A saturated limit refuses reconstructions but still serves a stored
+    /// checkpoint, and admits reconstructions again once a slot frees.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saturated_replay_limit_refuses_only_reconstructed_heights()
+    -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let mut query = WalletServingQuery::from_serving_pair_slot(
+            WalletServingPairSlot::new(pair),
+            (),
+            Arc::new(activations),
+        );
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN);
+        let reconstructed = BlockHeight::new(2);
+        let checkpointed_tip = BlockHeight::new(3);
+
+        let held_slot = query.tree_state_replays.try_admit()?;
+        assert!(matches!(
+            query.tree_state_at(reconstructed, None).await,
+            Err(QueryError::TreeStateReplayLimitReached {
+                max_concurrent_replays
+            }) if max_concurrent_replays == NonZeroU32::MIN
+        ));
+        assert_eq!(
+            query.tree_state_at(checkpointed_tip, None).await?.height,
+            checkpointed_tip
+        );
+
+        drop(held_slot);
+        assert_eq!(
+            query.tree_state_at(reconstructed, None).await?.height,
+            reconstructed
+        );
+        Ok(())
     }
 }

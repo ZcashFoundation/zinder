@@ -1092,8 +1092,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// `at_epoch_id = None` resolves to the live tip; `Some(id)` pins the
     /// read to that chain epoch. The returned artifact's height always equals
-    /// `height`. `RemoteChainIndex` asks the query plane, which may fill a
-    /// non-checkpoint height from its configured upstream node.
+    /// `height`.
+    ///
+    /// `RemoteChainIndex` asks the query plane, which serves a stored
+    /// checkpoint when one exists at `height` and otherwise rebuilds the tree
+    /// state from the nearest stored checkpoint below it and the stored compact
+    /// blocks, without contacting a node. A server that is already running its
+    /// limit of rebuilds refuses the request with
+    /// [`ErrorReason::TreeStateReplayLimitReached`](crate::ErrorReason::TreeStateReplayLimitReached)
+    /// and [`RetryPolicy::RetryWithBackoff`](crate::RetryPolicy::RetryWithBackoff).
     ///
     /// # Examples
     ///

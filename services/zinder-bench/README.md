@@ -634,6 +634,43 @@ An admitted run ends with the wallet at the branch tip. Check it against a
 cold rebuild as you would a tip replay: run with `--keep-scratch`, then
 rebuild a wallet from the kept canonical store with `rocksdb-wallet-rebuild`.
 
+## 6. Measure tree-state reconstruction at wallet anchors
+
+`TreeStateAtHeight` and lightwalletd `GetTreeState` answer a height without a
+stored checkpoint by replaying stored compact blocks from the checkpoint below
+it. Construction checkpoints every 100 blocks, and a wallet that scans in
+100-block rounds anchors one block below each boundary, at `k * 100 - 1`, so
+every such request replays the full 99-block stride. Measure that case on a
+READY canonical store, such as one built with
+`rocksdb-canonical-fixture-replay`:
+
+```bash
+zinder-bench rocksdb-tree-state-replay \
+  --fixture ./fixtures/mainnet-1710k-1850k \
+  --canonical-store ./candidate/canonical \
+  --secondary-root ./candidate/tree-state-secondary \
+  --software-revision "$(git rev-parse --short HEAD)" \
+  --from-height 1710000 \
+  --to-height 1850000 \
+  --max-anchors 128 \
+  --report ./reports/tree-state-replay.json
+```
+
+The command opens the store through an admitted secondary, reconstructs the
+tree state at up to `--max-anchors` anchors spread evenly over the window, and
+writes a `rocksdb-tree-state-replay` report. Each anchor is reconstructed twice
+in a row before the next one: first cold, then warm from the block cache the
+first replay filled. Measuring the warm replay at once keeps later anchors from
+evicting an earlier anchor's blocks when the sampled ranges exceed the
+secondary's 128 MiB block cache. `--from-height` and `--to-height` default to
+the retained range; the example window covers the 2022 Sapling output spam,
+the densest history a reconstruction replays. Anchors that hold a stored
+checkpoint, as every live-followed block does, need no reconstruction and are
+counted in `stored_checkpoint_anchors_skipped`. Each anchor records its seed
+checkpoint, the replayed blocks and note commitments, and its cold and warm
+seconds. `cold_seconds` and `warm_seconds` summarize the anchors as
+nearest-rank p50, p90, and p99 and the maximum.
+
 ## Report fields
 
 - `contract_identity`: exact benchmark report contract identity. The current identity is

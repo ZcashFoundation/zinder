@@ -91,6 +91,7 @@ define_error_reasons! {
     TransactionNotFound => "TRANSACTION_NOT_FOUND",
     CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
     TransparentOutpointCountOutOfRange => "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
+    TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -153,6 +154,7 @@ mod tests {
             WireErrorReason::TransactionNotFound,
             WireErrorReason::CanonicalHistoryUnavailable,
             WireErrorReason::TransparentOutpointCountOutOfRange,
+            WireErrorReason::TreeStateReplayLimitReached,
         ];
 
         for generated in generated_reasons {

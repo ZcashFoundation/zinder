@@ -14,8 +14,8 @@ memory boundary that configuration does not express.
 
 Tree-state reads have the same issue in the storage contract. Storing
 `z_gettreestate` for every block puts arbitrary per-height archival in the
-canonical hot path even though the wallet-facing requirement is latest or
-checkpoint tree state.
+canonical hot path, even though the tree state at any height can be derived
+from an earlier checkpoint and the stored compact blocks.
 
 ## Decision
 
@@ -32,9 +32,9 @@ source fetch of bounded connected segments
 The source boundary is `SourceChainSegmentLimits { cursor,
 max_connected_blocks, target_response_bytes, max_response_bytes }`.
 `NodeSource::fetch_chain_segment` fetches raw block bytes only. Tree state is a
-separate source call, `fetch_tree_state_for_block(block_id)`, and JSON-RPC
-adapters reject a tree-state response whose height or hash does not match the
-requested block.
+separate source call, `fetch_chain_checkpoint(height)` or
+`fetch_chain_checkpoint_for_block(block_id)`, and the JSON-RPC adapter rejects
+a tree-state response whose height or hash does not match the request.
 
 Fresh canonical construction consumes one `CanonicalPipelineLimits` value.
 The runtime resolves it from the container memory budget, logical CPU count,
@@ -73,23 +73,23 @@ temporarily take the watermark over its admission limit; no more work is
 admitted until retained bytes fall below the limit. Config validation still
 requires enough room for the initial maximum-sized probe.
 
-Canonical storage writes tree state only at checkpoints, not at every block.
-Missing tree-state source capability does not block canonical construction,
-but the wallet tree-state capabilities are unavailable until checkpoint rows
-exist.
+Construction writes a tree-state checkpoint every 100 blocks and at its build
+tip, not at every block. It requires the node's tree-state capability, because
+it checks its build tip against the node's tree state. Live following writes a
+checkpoint for every block it appends.
 
-The native wallet API exposes checkpoint-oriented reads:
+The native wallet API serves tree state at any retained height:
 
-- `tree_state_checkpoint_at_or_before(max_height, at_epoch)`
-- `latest_tree_state_checkpoint(at_epoch)`
+- `TreeStateAtHeight` (`wallet.read.tree_state_at_height_v2`) returns the
+  stored checkpoint at the height, or reconstructs it from the nearest
+  checkpoint below and the stored compact blocks in between.
+- `LatestTreeStateCheckpoint` (`wallet.read.latest_tree_state_checkpoint_v2`)
+  returns the newest checkpoint at or below the visible tip.
 
-The advertised capabilities are `wallet.read.tree_state_checkpoint_v1` and
-`wallet.read.latest_tree_state_checkpoint_v1`.
-
-Lightwalletd compatibility stays explicit: `GetLatestTreeState` returns the
-latest checkpoint, and `GetTreeState(BlockID)` returns a tree state only when
-the requested height is an exact stored checkpoint. Non-checkpoint heights
-return `NOT_FOUND`.
+Neither read contacts the node. Lightwalletd compatibility maps
+`GetTreeState(BlockID)` onto `TreeStateAtHeight` and `GetLatestTreeState` onto
+`LatestTreeStateCheckpoint`; `GetTreeState` refuses a height above the visible
+tip with `INVALID_ARGUMENT`, as lightwalletd does.
 
 ## Consequences
 
@@ -97,8 +97,9 @@ Operators tune budgets in the units that bound throughput and memory, not by
 guessing which chain height happens to be dense. Network upgrades can change
 density without requiring per-height code patches.
 
-Native clients read latest or checkpoint tree state. The native API does not
-serve arbitrary per-height tree state.
+Native clients read the tree state at any retained height. A height between
+checkpoints costs a replay of at most 99 stored compact blocks, which each
+query bounds to one concurrent reconstruction per available CPU.
 
 The canonical construction vocabulary is `CanonicalPipelineLimits` and
 `block_prepare_concurrency`. `materialized_view_replay_*` names are reserved for the async
@@ -130,3 +131,10 @@ storage-lifecycle certification resolve the same resource profile. The closed
 lifecycle command does not accept independent source or prepare tuning flags;
 its report validator recomputes the expected profile from the recorded CPU,
 memory, and node response limits.
+
+## Revision history
+
+- 2026-11-17: Tree state at a height between checkpoints is reconstructed
+  from the nearest checkpoint below and the stored compact blocks, so
+  `TreeStateAtHeight` and `GetTreeState` serve every retained height without
+  the node. The checkpoint cadence is unchanged.

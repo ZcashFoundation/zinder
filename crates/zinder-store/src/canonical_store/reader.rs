@@ -7,8 +7,9 @@ use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, UnixTimestampMillis,
+    CompactBlockArtifact, Network, NetworkUpgradeActivations, SubtreeRootArtifact,
+    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
+    UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
@@ -36,12 +37,17 @@ const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
 const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
 
-trait CanonicalServingRead {
+pub(super) trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
     fn serving_network(&self) -> Network;
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence;
     fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage;
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool;
 }
 
 impl CanonicalServingRead for RocksDbCanonicalStore {
@@ -64,6 +70,19 @@ impl CanonicalServingRead for RocksDbCanonicalStore {
     fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
         self.subtree_root_coverage
     }
+
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool {
+        super::activation_schedule::admits_activation_table_through(
+            &self.build_plan,
+            self.activation_schedule.as_ref(),
+            activations,
+            height,
+        )
+    }
 }
 
 impl CanonicalServingRead for RocksDbCanonicalSecondary {
@@ -85,6 +104,19 @@ impl CanonicalServingRead for RocksDbCanonicalSecondary {
 
     fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
         self.subtree_root_coverage
+    }
+
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool {
+        super::activation_schedule::admits_activation_table_through(
+            &self.build_plan,
+            self.activation_schedule.as_ref(),
+            activations,
+            height,
+        )
     }
 }
 
@@ -244,6 +276,45 @@ macro_rules! impl_canonical_typed_reads {
                 read_tree_state_checkpoint_at_or_before(self, height)
             }
 
+            /// Reads the commitment-tree checkpoint after the canonical block
+            /// at `height`, reconstructing it when no checkpoint is stored
+            /// there.
+            ///
+            /// A reconstruction seeds the trees from the newest stored
+            /// checkpoint below `height` and appends each stored compact
+            /// block's note commitments up to `height`, one block at a time.
+            /// That checkpoint must be no lower than the newest
+            /// [`TREE_STATE_CHECKPOINT_STRIDE`](crate::TREE_STATE_CHECKPOINT_STRIDE)
+            /// multiple at or below `height`, or the history predecessor when
+            /// that is newer, so a reconstruction replays fewer than
+            /// `TREE_STATE_CHECKPOINT_STRIDE` blocks. Each block must extend
+            /// the one below it and reach the tree sizes its compact block
+            /// records, the last must be the canonical block at `height`, and
+            /// the resulting frontiers are re-encoded and checked against the
+            /// appended trees. A missing checkpoint or a failed check is store
+            /// damage and fails with
+            /// [`CanonicalStoreError::PublicationRefused`].
+            ///
+            /// `network_upgrade_activations` must agree with the schedule this
+            /// store admits at every height through `height`, so a node table
+            /// that only changes activations above `height` is accepted before
+            /// the writer admits it. Without a writer-admitted schedule it must
+            /// equal the construction table. Any other table fails with
+            /// [`CanonicalStoreError::AdmissionRefused`]. Returns `Ok(None)`
+            /// for a height below the history predecessor or above the
+            /// visible tip.
+            pub fn tree_state_checkpoint_at(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+                super::tree_state_replay::read_tree_state_checkpoint_at(
+                    self,
+                    height,
+                    network_upgrade_activations,
+                )
+            }
+
             /// Reads the contiguous subtree-root rows requested by `range`.
             ///
             /// In a store loaded with retained-range coverage, an absent root
@@ -284,7 +355,7 @@ fn read_chain_epoch_at(
     decode_chain_epoch(store.serving_network(), epoch_id, &encoded)
 }
 
-fn read_block_header_at(
+pub(super) fn read_block_header_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
@@ -328,7 +399,7 @@ fn read_block_hash_lookup(
     }
 }
 
-fn read_compact_block_at(
+pub(super) fn read_compact_block_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
@@ -784,7 +855,7 @@ fn append_block_blob_batch(
     Ok(())
 }
 
-fn read_tree_state_checkpoint_at_or_before(
+pub(super) fn read_tree_state_checkpoint_at_or_before(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {

@@ -2387,6 +2387,57 @@ mod tests {
         Ok(())
     }
 
+    /// Tree state is served from storage, so a node that advertises it but
+    /// not broadcast backs no operation, and its outage does not drain the
+    /// runtime.
+    #[tokio::test]
+    async fn wallet_node_probe_ignores_a_node_that_backs_no_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = MutableHealthSource::new()?;
+        source.capabilities = NodeCapabilities::new([
+            NodeCapability::TipId,
+            NodeCapability::TreeState,
+            NodeCapability::OpenRpcDiscovery,
+        ])?;
+        source.available.store(false, Ordering::SeqCst);
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            source.capabilities(),
+            &admitted_ingest_control,
+        );
+        assert!(capabilities.contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::awaiting_node_source(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            source,
+            &capabilities,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        )?;
+
+        wait_for_readiness_cause(&runtime, |cause| {
+            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            runtime.report().cause,
+            zinder_runtime::ReadinessCause::Ready
+        ));
+
+        cancel.cancel();
+        handle.await?;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn wallet_node_probe_stops_while_a_node_request_is_pending()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2748,7 +2799,7 @@ mod tests {
                 stalled_request_started: Arc::new(tokio::sync::Notify::new()),
                 capabilities: NodeCapabilities::new([
                     NodeCapability::TipId,
-                    NodeCapability::TreeState,
+                    NodeCapability::TransactionBroadcast,
                     NodeCapability::OpenRpcDiscovery,
                 ])?,
             })
@@ -4304,6 +4355,7 @@ mod tests {
             WALLET_READ_COMPACT_BLOCK_AT_V2,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
             WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
             WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
@@ -4327,12 +4379,6 @@ mod tests {
                 .any(|capability| capability == partially_implemented),
             "serving-pair query advertised an operation that is not production-admitted: \
              {partially_implemented}"
-        );
-        assert!(
-            !advertised
-                .iter()
-                .any(|capability| capability == WALLET_READ_TREE_STATE_AT_HEIGHT_V2),
-            "tree-state fill must not be advertised without a probed upstream provider"
         );
         let (healthy_status, healthy_healthz) = fetch_operations_json(ops_address, "/healthz")?;
         assert_eq!(healthy_status, 200);

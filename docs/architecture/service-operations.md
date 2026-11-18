@@ -286,9 +286,12 @@ because both observe the same control plane.
 
 The node probe exercises `tip_id` and upstream synchronization health through
 the same shared source handle installed in the query. It does not repeat
-structural capability discovery. Any node-backed composition must admit
-`TipId` before binding so this liveness prerequisite cannot fail later as a
-configuration surprise. The serving-pair publisher, node-readiness probe, and
+structural capability discovery. Transaction broadcast is the only node-backed
+operation; tree state at any height is served from the serving pair. A query
+that does not advertise broadcast therefore runs no node probe, and its node
+input is always ready. Any node-backed composition must admit `TipId` before
+binding so this liveness prerequisite cannot fail later as a configuration
+surprise. The serving-pair publisher, node-readiness probe, and
 ingest-control-readiness probe are supervised with the gRPC server; an
 unexpected exit drains readiness and terminates the runtime.
 
@@ -552,6 +555,14 @@ operations. Store metrics use explicit canonical or wallet role labels.
   count each `compact_blocks_in_range` request asked for. A compatibility
   block-range chunk asks for up to 1,000 blocks and can keep fewer under its
   byte cap; the sample counts what it asked for.
+- `zinder_query_tree_state_replayed_blocks` samples the compact blocks each
+  `tree_state_at` reconstruction replayed, from 1 to 99. A height with a
+  stored checkpoint records no sample.
+- `zinder_query_tree_state_replay_refusals_total` counts `tree_state_at`
+  requests refused with `tree_state_replay_limit_reached` because the query
+  already ran one reconstruction per available CPU. A sustained rate means
+  wallets anchor on construction-built history faster than the host replays
+  it.
 
 `status` is `ok` or `error`. `error_class` is `none` on success. On error it is
 the snake-case name of the `QueryError` variant, such as
@@ -561,9 +572,10 @@ the snake-case name of the `QueryError` variant, such as
 `subtree_roots_in_range`.
 
 Each `WalletServingQuery` request records exactly one sample when it returns.
-The sample's duration covers argument validation, the storage read, and any
-upstream node call, such as the tree-state fill or transaction broadcast. A
-request rejected by validation is still recorded with its error class. A read
+The sample's duration covers argument validation, the storage read, including
+any tree-state reconstruction, and the upstream node call of a transaction
+broadcast. A request rejected by validation is still recorded with its error
+class. A read
 the serving pair cannot answer still records, with an error class such as
 `endpoint_capability_unavailable` or `materialized_view_unavailable`, and so
 does `network_upgrade_activations`, which reads no storage. A streaming read,

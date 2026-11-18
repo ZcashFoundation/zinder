@@ -37,8 +37,8 @@ wallet-projection secondaries. It does not write canonical storage, build
 artifacts independently, or use Zebra as a fallback for indexed history.
 
 The compatibility runtime uses `zinder-source` only for explicit edge
-capabilities: transaction broadcast, network-upgrade activation discovery, and
-sparse tree-state fill where the query contract delegates that read upstream.
+capabilities: transaction broadcast and network-upgrade activation discovery.
+`GetTreeState` is served from stored checkpoints and compact blocks.
 Those calls never substitute for indexed history or change the pinned serving
 pair.
 
