@@ -91,7 +91,10 @@ ingest runs it admits no new table, so upgrade the nodes one at a time:
    logs `node_endpoint_skipped` with reason `schedule_conflict` for it and
    ingest cannot switch to it.
 2. Upgrade the other nodes, then restart ingest. It starts on `[node]` again,
-   admits the new table, and every endpoint qualifies again.
+   admits the new table, and every endpoint qualifies again. Restart ingest
+   while `[node]` answers: a fallback whose table differs from the admitted one
+   is refused at startup, so if `[node]` is unreachable then and no fallback
+   advertises the admitted table, ingest exits and the restart tries again.
 
 Ingest does not switch back on its own, so after a failover it keeps reading
 from the fallback until the fallback fails or ingest restarts. Restarting the

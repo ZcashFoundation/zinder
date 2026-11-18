@@ -69,13 +69,19 @@ table.
 
 The writer admits a table only when it opens the store. When ingest has
 fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
-it admits the table of the endpoint it starts on. Every other endpoint must
-advertise exactly that table at startup, and a switch target must advertise
-exactly the table the store admitted, compared entry by entry, names included.
-An endpoint with any other table is refused, and no table is admitted while
-ingest runs. After an operator aligns the nodes, for example by upgrading both
-to a release that announces the same upgrade, restarting ingest admits the new
-table.
+it admits the table of the endpoint it starts on. Before choosing that
+endpoint, it reads the store's latest admitted revision without opening the
+primary, and a fallback whose table differs from that revision is refused at
+startup. Only `[node]` can bring a new table, so a fallback running an older
+release never removes a pending activation while `[node]` is merely slow to
+answer; when `[node]` is unreachable and no fallback matches, startup fails as a
+single-endpoint startup would and the restart tries again. Every other endpoint
+must advertise exactly the starting endpoint's table, and a switch target must
+advertise exactly the table the store admitted, compared entry by entry, names
+included. An endpoint with any other table is refused, and no table is admitted
+while ingest runs. After an operator aligns the nodes, for example by upgrading
+both to a release that announces the same upgrade, restarting ingest admits the
+new table.
 
 Zebra 7.0.0 and Zakura 1.8.6 report identical `getblockchaininfo.upgrades`
 names on Regtest, so plain equality lets them back each other up.
@@ -203,5 +209,6 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
   `NetworkUpgradeScheduleNotAdmitted`. A broadcasting reader verifies its
   node's table on first contact instead.
 - 2026-11-18: Added "Node endpoint switches": ingest admits only its starting
-  endpoint's table, and other endpoints must advertise exactly the admitted
-  table to take over.
+  endpoint's table, a fallback starts ingest only with the store's admitted
+  table, and other endpoints must advertise exactly the admitted table to take
+  over.

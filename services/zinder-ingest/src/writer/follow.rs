@@ -28,7 +28,8 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block, prepare_canonical_block,
+    MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block,
+    prepare_canonical_block,
     source_recovery::{
         SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
         detail_for_ongoing_outage,
@@ -254,6 +255,8 @@ enum SourceRecovery {
     Switched(NodeEndpointSwitch),
 }
 
+/// Tip confirmation after a switch to `switch`'s target.
+///
 /// The final switch check found the visible tip block on a non-diverged
 /// target, which is the evidence an append gives, so readers keep serving
 /// while the new endpoint's first iteration is still pending. A diverged

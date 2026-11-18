@@ -29,6 +29,7 @@ use zinder_ingest::{
     follow_canonical_tip_with_control, spawn_node_endpoint_monitor,
     spawn_upstream_health_probe_task,
 };
+use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{
     ActiveNodeEndpoint, ComposedReadiness, Readiness, ReadinessCause, ReadinessInput,
 };
@@ -37,7 +38,6 @@ use zinder_source::{
     SourceChainSegment, SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
 };
-use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_store::RocksDbCanonicalStore;
 use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
@@ -321,7 +321,7 @@ impl StartedFailover {
         let mut endpoints = endpoints.into_iter();
         let primary = endpoints.next().ok_or("the node list needs [node]")?;
         let (nodes, switch) = NodeSet::new(primary, endpoints);
-        let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest).await?;
+        let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, None).await?;
         let readiness = Readiness::default();
         let required_inputs: &[ReadinessInput] = if run.gates_node_source_input {
             &[ReadinessInput::NodeSource]
@@ -639,7 +639,7 @@ async fn startup_reads_from_the_first_admitted_endpoint() -> TestResult {
     let admitted = FailoverEndpoint::serving(&blocks, 4)?;
     let (nodes, _switch) = NodeSet::new(unreachable, [admitted]);
 
-    let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest).await?;
+    let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, None).await?;
 
     assert_eq!(admissions.active_position(), 1);
     assert!(matches!(
@@ -686,7 +686,7 @@ async fn startup_excludes_endpoints_only_on_positive_evidence() -> TestResult {
         ],
     );
 
-    let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest).await?;
+    let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, None).await?;
     let labels = admissions
         .verdicts()
         .map(|(_, verdict)| verdict.label())
@@ -707,6 +707,90 @@ async fn startup_excludes_endpoints_only_on_positive_evidence() -> TestResult {
     Ok(())
 }
 
+/// Only `[node]` may bring a table other than the store's admitted revision.
+///
+/// A fallback that would remove a pending activation never becomes active,
+/// so it cannot rewrite the schedule while `[node]` is unreachable.
+#[tokio::test]
+async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() -> TestResult {
+    let PublishedStore {
+        blocks,
+        mut store,
+        _directory: directory,
+    } = published_store().await?;
+    store.admit_network_upgrade_schedule(&sample_regtest_upgrade_activations())?;
+    assert!(
+        RocksDbCanonicalStore::read_admitted_network_upgrade_activations(
+            directory.path().join("absent")
+        )?
+        .is_none()
+    );
+    let store_activations = RocksDbCanonicalStore::read_admitted_network_upgrade_activations(
+        directory.path().join("canonical"),
+    )?
+    .ok_or("the writer admitted a schedule")?;
+    assert_eq!(store_activations, sample_regtest_upgrade_activations());
+    let older_table = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        store_activations
+            .activations()
+            .split_last()
+            .map(|(_, older)| older.to_vec())
+            .unwrap_or_default(),
+    )?;
+    let unreachable_primary = || -> TestResult<FailoverEndpoint> {
+        let primary = FailoverEndpoint::serving(&blocks, 4)?;
+        primary.set_unreachable(true);
+        Ok(primary)
+    };
+    let older_fallback = || -> TestResult<FailoverEndpoint> {
+        let mut fallback = FailoverEndpoint::serving(&blocks, 4)?;
+        fallback.activations = older_table.clone();
+        Ok(fallback)
+    };
+
+    let (only_older, _switch) = NodeSet::new(unreachable_primary()?, [older_fallback()?]);
+    let refusal =
+        NodeEndpointAdmissions::admit(&only_older, Network::ZcashRegtest, Some(&store_activations))
+            .await
+            .err()
+            .ok_or("an older fallback must not start ingest")?;
+    let message = refusal.to_string();
+    assert!(message.contains("position 1: excluded"), "{message}");
+
+    let (with_matching, _switch) = NodeSet::new(
+        unreachable_primary()?,
+        [older_fallback()?, FailoverEndpoint::serving(&blocks, 4)?],
+    );
+    let admissions = NodeEndpointAdmissions::admit(
+        &with_matching,
+        Network::ZcashRegtest,
+        Some(&store_activations),
+    )
+    .await?;
+    assert_eq!(admissions.active_position(), 2);
+    assert_eq!(
+        admissions
+            .verdicts()
+            .nth(1)
+            .map(|(_, verdict)| verdict.label()),
+        Some(EndpointExclusion::ScheduleConflict.label())
+    );
+
+    let mut older_primary = FailoverEndpoint::serving(&blocks, 4)?;
+    older_primary.activations = older_table;
+    let (primary_changes, _switch) =
+        NodeSet::new(older_primary, [FailoverEndpoint::serving(&blocks, 4)?]);
+    let admissions = NodeEndpointAdmissions::admit(
+        &primary_changes,
+        Network::ZcashRegtest,
+        Some(&store_activations),
+    )
+    .await?;
+    assert_eq!(admissions.active_position(), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn startup_fails_when_no_endpoint_is_admitted() -> TestResult {
     let blocks = parseable_multi_block_chain()?;
@@ -716,7 +800,7 @@ async fn startup_fails_when_no_endpoint_is_admitted() -> TestResult {
     fallback.genesis_hash = Network::ZcashMainnet.genesis_hash();
     let (nodes, _switch) = NodeSet::new(primary, [fallback]);
 
-    let refusal = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest)
+    let refusal = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, None)
         .await
         .err()
         .ok_or("no admitted endpoint must fail startup")?;
@@ -745,7 +829,7 @@ async fn startup_does_not_wait_for_a_fallback_that_does_not_answer() -> TestResu
 
     let admissions = tokio::time::timeout(
         Duration::from_secs(5),
-        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest),
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, None),
     )
     .await??;
 
@@ -932,10 +1016,13 @@ struct SwitchStatuses {
     store: RocksDbCanonicalStore,
 }
 
-/// Follows to height 4 over `[node]` and `fallback`, reading `WriterStatus`
-/// once the tip is confirmed and again right after `[node]` fails and ingest
-/// switches. `fallback` serves no block above `blocked_above` until the
-/// second status is read, so its first iterations fail.
+/// Reads `WriterStatus` before and right after ingest switches to `fallback`.
+///
+/// The follower runs to height 4 over `[node]` and `fallback`; the first
+/// status is read once the tip is confirmed and the second right after
+/// `[node]` fails and ingest switches. `fallback` serves no block above
+/// `blocked_above` until the second status is read, so its first iterations
+/// fail.
 async fn writer_statuses_around_switch(
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     store: RocksDbCanonicalStore,

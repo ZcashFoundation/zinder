@@ -783,6 +783,45 @@ impl RocksDbCanonicalStore {
         read_construction_manifest_binding(path.as_ref())
     }
 
+    /// Reads the activation table of the latest schedule revision a canonical
+    /// writer admitted, without opening a `RocksDB` primary.
+    ///
+    /// Returns `None` when no store exists at `path` or no writer has admitted
+    /// a schedule yet. A writer reads it before choosing which node endpoint
+    /// to start on.
+    pub fn read_admitted_network_upgrade_activations(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<NetworkUpgradeActivations>, CanonicalStoreError> {
+        let path = path.as_ref();
+        let exists = path.try_exists().map_err(|error| {
+            CanonicalStoreError::admission(path, format!("store path check failed: {error}"))
+        })?;
+        if !exists {
+            return Ok(None);
+        }
+        let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+            CanonicalStoreError::admission(
+                path,
+                format!("column-family discovery failed: {source}"),
+            )
+        })?;
+        validate_exact_column_families(path, &column_families)?;
+        let db = DB::open_cf_for_read_only(&Options::default(), path, &column_families, false)
+            .map_err(|source| {
+                CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
+            })?;
+        let encoded_control = db
+            .get(STORE_CONTROL_KEY)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "store control read",
+                source,
+            })?
+            .ok_or_else(|| CanonicalStoreError::admission(path, "store identity is absent"))?;
+        let control = decode_store_control(path, &encoded_control)?;
+        Ok(read_admitted_schedule(&db, path, &control)?
+            .map(|schedule| schedule.activations().clone()))
+    }
+
     /// Returns the immutable network persisted by the store control record.
     #[must_use]
     pub const fn network(&self) -> Network {

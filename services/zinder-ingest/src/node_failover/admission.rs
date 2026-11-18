@@ -31,7 +31,8 @@ pub enum EndpointExclusion {
     /// The node's block 0 is not the configured network's genesis block.
     GenesisMismatch,
     /// The node advertises an activation table other than the active
-    /// endpoint's.
+    /// endpoint's, or a fallback advertises one other than the store's
+    /// writer-admitted revision.
     ScheduleConflict,
 }
 
@@ -58,7 +59,7 @@ impl fmt::Display for EndpointExclusion {
             Self::GenesisMismatch => formatter
                 .write_str("the node's block 0 is not the configured network's genesis block"),
             Self::ScheduleConflict => formatter.write_str(
-                "the node's network upgrade activations differ from the active endpoint's",
+                "the node's network upgrade activations differ from the active endpoint's or the store's admitted schedule",
             ),
         }
     }
@@ -175,6 +176,12 @@ impl NodeEndpointAdmissions {
     /// Checks every endpoint concurrently and selects the first admitted one
     /// in position order.
     ///
+    /// `store_activations` is the table of the store's latest writer-admitted
+    /// schedule revision, if any. A fallback whose table differs from it is
+    /// excluded with [`EndpointExclusion::ScheduleConflict`], so only `[node]`
+    /// can introduce a new revision and a fallback never rewrites the
+    /// schedule while `[node]` is merely slow to answer.
+    ///
     /// Admission returns as soon as every position below the first admitted
     /// one has a verdict, so a fallback that does not answer never delays a
     /// healthy `[node]`. Endpoints still being checked then are
@@ -184,6 +191,7 @@ impl NodeEndpointAdmissions {
     pub async fn admit<Endpoint>(
         nodes: &NodeSet<Endpoint>,
         network: Network,
+        store_activations: Option<&NetworkUpgradeActivations>,
     ) -> Result<Self, NoNodeEndpointAdmitted>
     where
         Endpoint: NodeSource,
@@ -209,7 +217,11 @@ impl NodeEndpointAdmissions {
                 break None;
             };
             if let Some(slot) = decided.get_mut(position) {
-                *slot = Some(verdict);
+                *slot = Some(refuse_fallback_schedule_change(
+                    position,
+                    verdict,
+                    store_activations,
+                ));
             }
         };
         drop(checks);
@@ -261,6 +273,24 @@ impl NodeEndpointAdmissions {
     /// Genesis hash of the configured network.
     pub(super) const fn genesis_hash(&self) -> BlockHash {
         self.genesis_hash
+    }
+}
+
+/// Excludes a fallback whose table differs from the store's admitted
+/// revision. `[node]` may still bring a new table, which the store admits
+/// only as a future-only revision.
+fn refuse_fallback_schedule_change(
+    position: usize,
+    verdict: EndpointAdmission,
+    store_activations: Option<&NetworkUpgradeActivations>,
+) -> EndpointAdmission {
+    match (verdict, store_activations) {
+        (EndpointAdmission::Admitted(admitted), Some(store_activations))
+            if position > 0 && admitted.activations != *store_activations =>
+        {
+            EndpointAdmission::Excluded(EndpointExclusion::ScheduleConflict)
+        }
+        (verdict, _) => verdict,
     }
 }
 
