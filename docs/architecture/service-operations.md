@@ -1420,9 +1420,9 @@ lightwalletd compatibility, and the optional Explorer, which the
 `deploy/docker-compose.explorer.yml` overlay adds to that composition. A
 release also publishes the three single-volume host images in
 `deploy/release-single-volume-images.json` for hosts that attach one volume to
-one container: `zinder-wallet-serving`, which is native-only and omits
-lightwalletd compatibility; `zinder-wallet-serving-explorer`, which adds the
-Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
+one container: `zinder-wallet-serving`, which supervises ingest, projector,
+native query, and lightwalletd compatibility over one volume;
+`zinder-wallet-serving-explorer`, which adds the Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
 canary runtime. None is the complete supported composition. Every image is a
 target of the single `deploy/Dockerfile`. Cipherscan and PostgreSQL are not
 release classes.
