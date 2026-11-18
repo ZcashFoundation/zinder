@@ -86,8 +86,9 @@ The release procedure and how operators verify a download are in
   binary itself or attaches a separate toolbox container, as
   [Deploying on a VM](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
   shows.
-- A node that runs under another UID needs `basic` authentication, or Zinder
-  containers that run as the node's UID.
+- The reference Compose deployment requires the node to run as UID 10001,
+  because its `state-init` service gives the stores to that UID on every
+  start.
 
 ## Alternatives rejected
 

@@ -127,13 +127,11 @@ Debian base with a shell, because their entrypoint scripts need one.
 
 The Zebra and Zakura images also run as UID 10001 and write the node's RPC
 cookie with mode 0600, so a Zinder container that mounts the cookie reads it
-directly. If your node runs under another UID, use `basic` node
-authentication where the node accepts a fixed RPC password. Otherwise, run the
-Zinder containers that mount the cookie as the node's UID. That UID then also
-needs write access to the data volume, which the reference Compose file's
-`state-init` service gives to UID 10001 on every start. In an orchestrator
-other than Compose, give mounted volumes to UID 10001 yourself, for example
-with Kubernetes `fsGroup: 10001`.
+directly. The reference Compose file requires the node to run as UID 10001.
+Its `state-init` service gives the data volume to UID 10001 on every start, so
+a Zinder container under another UID cannot write its stores. In an
+orchestrator other than Compose, give mounted volumes to UID 10001 yourself,
+for example with Kubernetes `fsGroup: 10001`.
 
 The runtime images listen on every container interface. Their default
 configuration sets each serving and operational listener to `[::]` and sets

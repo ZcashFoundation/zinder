@@ -14,8 +14,9 @@ host requirements and a shorter quickstart.
   For Zakura, see [Attach a Zakura node](#attach-a-zakura-node).
 - The node running as UID 10001, as the Zebra and Zakura images do, so the
   Zinder containers, which also run as UID 10001, can read its mode-0600
-  cookie. For a node under another UID, see
-  [Runtime images](../architecture/service-operations.md#runtime-images).
+  cookie. If you set another user on the node container, remove that setting.
+  [Runtime images](../architecture/service-operations.md#runtime-images)
+  explains why.
 - Disk and memory for your network, from
   [What you need](deploying.md#what-you-need).
 - A reverse proxy for TLS, authentication, rate limits, and quotas.
@@ -391,7 +392,7 @@ the shell.
 | --- | --- | --- |
 | Ingest logs `node_endpoints_unavailable` with `the node's block 0 is not the configured network's genesis block` | The node is on a different network than `ZINDER_NETWORK__NAME`. | Point `ZINDER_NODE__JSON_RPC_ADDR` at a node on the configured network. |
 | Ingest exits; `/readyz` reported `node_capability_missing` for `historical_block_bodies` | The node is pruned. | Use an archive node. |
-| Ingest `/readyz` reports `node_unavailable` while the node answers | Zinder cannot read the node's cookie, because the node runs under a UID other than 10001. | Use `basic` node authentication, or run the Zinder services as the node's UID, as [Runtime images](../architecture/service-operations.md#runtime-images) describes. |
+| Ingest `/readyz` reports `node_unavailable` while the node answers | Zinder cannot read the node's cookie, because the node runs under a UID other than 10001. | Run the node as UID 10001, the default of the Zebra and Zakura images. Do not set `user:` on the Zinder services; [Runtime images](../architecture/service-operations.md#runtime-images) explains why. |
 | Projector `/readyz` reports `wallet_transition_limit_exceeded` | One wallet update is larger than its limit, and the projector parked. | Raise `max_transition_logical_bytes` under `[projector.follow]` in `deploy/config/projector.toml` and restart the projector, as [Wallet transition exceeds its logical-byte limit](deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit) describes. |
 | Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. Restarting only parks ingest again. |
 
