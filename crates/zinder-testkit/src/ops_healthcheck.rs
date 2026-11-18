@@ -183,7 +183,7 @@ pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
         executable.display()
     );
 
-    let refused_addr = closed_loopback_addr()?;
+    let refused_addr = CLOSED_LOOPBACK_ADDR;
     let output = run_healthcheck(
         executable,
         &[],
@@ -316,6 +316,7 @@ fn ensure_exit(executable: &Path, output: &Output, code: i32, case: &str) -> Res
 
 /// Port 1 is privileged and unassigned on loopback, so nothing a test binds can
 /// take it, unlike a port released by a dropped listener.
-fn closed_loopback_addr() -> Result<SocketAddr> {
-    Ok(SocketAddr::from(([127, 0, 0, 1], 1)))
-}
+const CLOSED_LOOPBACK_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    1,
+));
