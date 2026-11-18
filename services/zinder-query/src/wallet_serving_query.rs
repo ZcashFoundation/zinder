@@ -45,6 +45,7 @@ use crate::{
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
     WalletProjectionReader, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
+    broadcast_byte_budget::BroadcastByteBudget,
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
@@ -396,6 +397,7 @@ pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     broadcaster: Broadcaster,
     native_ingest: NativeIngest,
     tree_state_replays: TreeStateReplayLimit,
+    broadcast_bytes: BroadcastByteBudget,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
     node_verifications: Option<EndpointVerifications>,
 }
@@ -435,6 +437,7 @@ impl WalletServingQuery<()> {
             broadcaster: (),
             native_ingest: (),
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
     }
@@ -464,6 +467,7 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
             broadcaster: (),
             native_ingest: ingest_control,
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
     }
@@ -502,6 +506,7 @@ impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
             broadcaster: nodes,
             native_ingest: self.native_ingest,
             tree_state_replays: self.tree_state_replays,
+            broadcast_bytes: self.broadcast_bytes,
             native_endpoint_capabilities,
         }
     }
@@ -1208,11 +1213,12 @@ where
                     maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
                 });
             }
+            let reservation = self.broadcast_bytes.try_reserve(raw_transaction.len())?;
             if let Some(node_verifications) = &self.node_verifications {
                 node_verifications.track_broadcast_height(&pair);
             }
-            self.broadcaster
-                .broadcast_transaction(raw_transaction)
+            reservation
+                .hold_during(self.broadcaster.broadcast_transaction(raw_transaction))
                 .await
                 .map_err(QueryError::Node)
         })
@@ -1609,6 +1615,140 @@ mod tree_state_replay_limit_tests {
             query.tree_state_at(reconstructed, None).await?.height,
             reconstructed
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod broadcast_byte_budget_tests {
+    use std::{error::Error, sync::Arc, time::Duration};
+
+    use zinder_core::{
+        BroadcastDuplicate, MAX_RAW_TRANSACTION_BYTES, Network, RawTransactionBytes,
+        TransactionBroadcastOutcome, TransactionId,
+    };
+    use zinder_testkit::{
+        ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
+    };
+
+    use crate::{
+        OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+        WalletServingReadPair, broadcast_byte_budget::BroadcastByteBudget,
+    };
+
+    /// A broadcast that does not fit the bytes other broadcasts hold is
+    /// refused before it reaches the node, and a finished broadcast returns
+    /// its bytes to the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spent_broadcast_budget_refuses_until_bytes_return() -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+            .with_node_activations(activations);
+        let node = OrderedBroadcaster::new(broadcaster.clone(), []);
+        node.verify(&slot).await?;
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
+        query.broadcast_bytes = BroadcastByteBudget::new(MAX_RAW_TRANSACTION_BYTES);
+        let largest = || RawTransactionBytes::new(vec![0; MAX_RAW_TRANSACTION_BYTES]);
+
+        let in_flight = query.broadcast_bytes.try_reserve(1)?;
+        assert!(matches!(
+            query.broadcast_transaction(largest()).await,
+            Err(QueryError::BroadcastBudgetExhausted { budget_bytes })
+                if budget_bytes == MAX_RAW_TRANSACTION_BYTES
+        ));
+        assert_eq!(broadcaster.call_count(), 0);
+
+        drop(in_flight);
+        query.broadcast_transaction(largest()).await?;
+        query.broadcast_transaction(largest()).await?;
+        assert_eq!(broadcaster.call_count(), 2);
+        Ok(())
+    }
+
+    /// A broadcast cancelled while its transaction waits to be hashed on the
+    /// blocking pool keeps its bytes reserved until that hashing ends.
+    #[test]
+    fn a_cancelled_broadcast_keeps_its_bytes_until_detached_hashing_ends()
+    -> Result<(), Box<dyn Error>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(cancel_a_broadcast_while_its_hashing_waits())
+    }
+
+    async fn cancel_a_broadcast_while_its_hashing_waits() -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        // An unreachable endpoint followed by a duplicate answer makes the
+        // broadcast hash the transaction to report it accepted.
+        let node = OrderedBroadcaster::new(
+            MockTransactionBroadcaster::node_unavailable("sendrawtransaction timed out")
+                .with_node_activations(activations.clone()),
+            [
+                MockTransactionBroadcaster::returning(TransactionBroadcastOutcome::Duplicate(
+                    BroadcastDuplicate {
+                        error_code: Some(-27),
+                        message: "transaction already exists in mempool".to_owned(),
+                    },
+                ))
+                .with_node_activations(activations),
+            ],
+        );
+        node.verify(&slot).await?;
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
+        query.broadcast_bytes = BroadcastByteBudget::new(MAX_RAW_TRANSACTION_BYTES);
+
+        // Hold the only blocking thread so the hashing task stays queued.
+        let (pool_held, pool_held_receiver) = tokio::sync::oneshot::channel();
+        let (release_pool, pool_released) = tokio::sync::oneshot::channel::<()>();
+        let held_pool = tokio::task::spawn_blocking(move || {
+            let _ = pool_held.send(());
+            let _ = pool_released.blocking_recv();
+        });
+        pool_held_receiver.await?;
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            query.broadcast_transaction(RawTransactionBytes::new(vec![
+                0;
+                MAX_RAW_TRANSACTION_BYTES
+            ])),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the broadcast finished without hashing");
+        assert!(
+            query.broadcast_bytes.try_reserve(1).is_err(),
+            "the queued hashing task holds the transaction outside the budget"
+        );
+
+        release_pool
+            .send(())
+            .map_err(|()| "the held blocking thread stopped waiting")?;
+        held_pool.await?;
+        let started = std::time::Instant::now();
+        while query.broadcast_bytes.try_reserve(1).is_err() {
+            if started.elapsed() > Duration::from_secs(5) {
+                return Err("the hashing task never returned its bytes".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Ok(())
     }
 }

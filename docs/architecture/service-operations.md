@@ -9,6 +9,10 @@ Every Zinder runtime exposes the same operational HTTP contract through
 | `/readyz` | Typed traffic readiness for the runtime's owned contract. |
 | `/metrics` | Prometheus metrics with bounded label sets. |
 
+Both the operational endpoint and the Cipherscan REST adapter serve HTTP/1
+through the bounded listener described under [HTTP listener
+limits](#http-listener-limits).
+
 Health does not imply readiness. A writer may be alive while synchronizing or
 recovering its source, and a reader may be alive while its secondaries cannot
 form an exact serving pair.
@@ -836,6 +840,12 @@ operations. Store metrics use explicit canonical or wallet role labels.
   already ran one reconstruction per available CPU. A sustained rate means
   wallets anchor on construction-built history faster than the host replays
   it.
+- `zinder_query_broadcast_budget_refusals_total` counts broadcasts and
+  lightwalletd `SendTransaction` calls refused with
+  `broadcast_budget_exhausted` because the process was already broadcasting
+  16 MiB of transactions. A sustained rate while few wallets send points at
+  clients flooding large transactions, or at a node slow enough that
+  broadcasts wait out `broadcast_timeout_secs`.
 
 `status` is `ok` or `error`. `error_class` is `none` on success. On error it is
 the snake-case name of the `QueryError` variant, such as
@@ -1112,6 +1122,36 @@ edge. The
 [compatibility reference](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
 sizes one stream.
 
+### Public gRPC request receiving
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` bound the
+requests they receive at once
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)):
+
+- `zinder_grpc_request_receive_refusals_total{pool}` counts requests refused
+  with `UNAVAILABLE` because every slot of their pool was taken.
+- `zinder_grpc_request_receive_timeouts_total{pool}` counts requests cancelled
+  with `DEADLINE_EXCEEDED` because their request did not arrive within
+  20 seconds (`pool="request"`) or their client stream completed no message
+  for 20 seconds (`pool="client_stream"`).
+- `zinder_grpc_request_receive_evictions_total{pool}` counts requests cancelled
+  with `UNAVAILABLE` because a full pool gave their slot to a request from a
+  connection holding fewer slots.
+- `zinder_grpc_response_send_stalls_total` counts responses ended with
+  `DEADLINE_EXCEEDED` because their client stopped reading them for
+  60 seconds.
+
+`pool` is `request` for unary and server-streaming calls and `client_stream`
+for client-streaming and bidirectional calls, including gRPC reflection.
+Refusals while traffic is light, or timeouts and evictions that keep rising,
+point at clients that open streams and send slowly or not at all. A full pool
+gives the oldest slot of the connection holding the most to a request from a
+connection holding fewer, so one connection cannot lock others out. Clients
+spread over many connections still can, so limit connections per client
+address at the edge.
+Send stalls that keep rising point at clients that open response streams and
+stop reading them.
+
 ### RocksDB
 
 `zinder-store` exports bounded role-labelled metrics for block-cache capacity
@@ -1238,7 +1278,55 @@ cookie contents, viewing keys, or unbounded payloads.
 Public listeners require explicit `security.allow_public_bind = true`. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
-operator-controlled HTTP/2 proxy.
+operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
+streams per connection, and requests being received across the process, and
+share receive slots fairly between connections, but they do not bound
+connections or requests per client address
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)). Behind a
+proxy, the server sees the proxy's upstream connections, so the proxy must
+enforce per-client limits.
+
+### HTTP listener limits
+
+`zinder-runtime` serves every axum router, the operational endpoint and the
+Cipherscan REST adapter, through one HTTP/1 listener (`serve_http`) instead of
+`axum::serve`, which installs no hyper timer and so leaves hyper's header read
+timeout disabled. A client that opens a connection and sends nothing, or sends
+request headers a few bytes at a time, would otherwise hold a connection and
+its task indefinitely. The listener applies these fixed bounds:
+
+| Bound | Value | Effect |
+| --- | --- | --- |
+| Request head | 10 seconds | A connection that has not delivered a complete request head in time is closed. The same deadline closes a keep-alive connection that stays idle between requests. |
+| Request body | 30 seconds in total | A request body that is not fully received within 30 seconds of its request head fails the request. Progress does not extend the deadline, so a client that sends one byte at a time cannot hold the request. |
+| Response write stall | 30 seconds | A connection whose write stays blocked for 30 seconds because the client is not reading is closed, including a pipelining client that never reads and a `WebSocket` client that stops reading. |
+| Concurrent connections | 2048 (64 on the operational endpoint) | Connections over the cap are closed as soon as they are accepted, and a slot frees when its socket closes. |
+| Request body size | 2 MiB (4 KiB on the operational endpoint) | Larger bodies are rejected with HTTP 413 by axum body extractors. |
+
+`WebSocket` upgrades stay enabled. An upgraded connection leaves the request
+head and body deadlines behind but keeps the write stall bound, and it holds its
+connection slot until the socket closes, so `WebSocket` sessions count against
+the cap. Graceful shutdown waits for in-flight HTTP requests and does not wait
+for upgraded connections, which the owning handler closes.
+
+The connection cap is a global ceiling that protects file descriptors and
+tasks, not a per-client limit. An idle HTTP connection closes after 10 seconds,
+but nothing bounds how long a connection stays open while its client keeps
+sending requests. A `WebSocket` session has no idle bound at all: it stays open,
+holding its slot, for as long as the client keeps reading, even if it never
+sends anything. A client that opens many connections or `WebSocket` sessions
+can therefore fill the Cipherscan cap and refuse other clients for as long as
+it keeps them open, so a public deployment still belongs behind an
+operator-controlled proxy that limits connections per client and applies its
+own timeouts.
+
+The cap is deliberately small on the operational endpoint, which serves only
+scrapers and probes, so it cannot compete with the gRPC listener and the
+stores for file descriptors. Any client that can reach the endpoint can
+therefore fill its 64 connections and make health probes and metric scrapes
+fail. Keep `ops.listen_addr` on loopback, its default, or on a private network
+that only the orchestrator and the metrics scraper can reach, and never expose
+it to the internet. The bounds are constants, not configuration.
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only

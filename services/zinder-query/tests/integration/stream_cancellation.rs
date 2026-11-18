@@ -38,7 +38,7 @@ use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, transport::Server};
+use tonic::Code;
 use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHeight, BlockHeightRange, Network, TransactionId, TransparentAddressScriptHash,
@@ -252,7 +252,7 @@ async fn shutdown_ends_an_open_chain_events_stream_and_drains_the_server() -> Re
     let server_addr = format!("http://{}", listener.local_addr()?);
     let server_shutdown = shutdown.clone();
     let server = tokio::spawn(async move {
-        Server::builder()
+        zinder_runtime::public_grpc_server()
             .add_service(grpc_adapter.into_server())
             .serve_with_incoming_shutdown(
                 TcpListenerStream::new(listener),
@@ -564,7 +564,7 @@ async fn spawn_wallet_query_server(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
     let _server_task = tokio::spawn(async move {
-        let server_result = Server::builder()
+        let server_result = zinder_runtime::public_grpc_server()
             .add_service(grpc_adapter.into_server())
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;

@@ -22,7 +22,10 @@ use zinder_source::{
 };
 use zinder_store::CanonicalActivationSchedule;
 
-use crate::{UpstreamNodeCapabilities, WalletServingPairSlot, WalletServingReadPair};
+use crate::{
+    UpstreamNodeCapabilities, WalletServingPairSlot, WalletServingReadPair,
+    broadcast_byte_budget::BroadcastReservation,
+};
 
 /// First exclusion of an endpoint that answered verification with evidence
 /// that it must not receive transactions. Each later exclusion doubles it.
@@ -468,9 +471,13 @@ fn no_verified_endpoint() -> SourceError {
 ///
 /// Parsing and hashing a large shielded transaction can hold a thread for
 /// milliseconds, so it runs on the blocking pool instead of the async worker
-/// serving other wallet requests.
+/// serving other wallet requests. That task outlives a cancelled broadcast
+/// and keeps the transaction until it runs, so it also keeps the broadcast's
+/// budget reservation.
 async fn submitted_transaction_id(raw_transaction: RawTransactionBytes) -> Option<TransactionId> {
+    let reservation = BroadcastReservation::current();
     tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
         raw_transaction
             .as_slice()
             .zcash_deserialize_into::<Transaction>()

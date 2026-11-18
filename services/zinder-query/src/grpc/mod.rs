@@ -3,6 +3,7 @@
 mod adapter;
 mod chain_events;
 mod native;
+mod request_limits;
 mod shutdown_stream;
 
 use tonic::Status;
@@ -27,6 +28,7 @@ pub use native::{
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
+pub use request_limits::WALLET_QUERY_FIELD_LIMITS;
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
 /// from [`Public Interfaces §Error Conventions`](../../../docs/architecture/public-interfaces.md#error-conventions).

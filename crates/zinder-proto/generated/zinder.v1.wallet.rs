@@ -2190,7 +2190,9 @@ pub mod wallet_query_client {
                 .insert(GrpcMethod::new("zinder.v1.wallet.WalletQuery", "SubtreeRoots"));
             self.inner.unary(req, path, codec).await
         }
-        /// Broadcast a raw transaction.
+        /// Broadcast a raw transaction. A broadcast refused because the server is
+        /// already broadcasting its budget of transaction bytes fails with
+        /// UNAVAILABLE and `BROADCAST_BUDGET_EXHAUSTED`.
         pub async fn broadcast_transaction(
             &mut self,
             request: impl tonic::IntoRequest<super::BroadcastTransactionRequest>,
@@ -2641,7 +2643,9 @@ pub mod wallet_query_server {
             tonic::Response<super::SubtreeRootsResponse>,
             tonic::Status,
         >;
-        /// Broadcast a raw transaction.
+        /// Broadcast a raw transaction. A broadcast refused because the server is
+        /// already broadcasting its budget of transaction bytes fails with
+        /// UNAVAILABLE and `BROADCAST_BUDGET_EXHAUSTED`.
         async fn broadcast_transaction(
             &self,
             request: tonic::Request<super::BroadcastTransactionRequest>,

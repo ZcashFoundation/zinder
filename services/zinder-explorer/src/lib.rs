@@ -9,7 +9,10 @@
 
 mod grpc;
 
-pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
+pub use grpc::{
+    EXPLORER_QUERY_FIELD_LIMITS, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
+    describe_request_metrics,
+};
 pub use zinder_materialized_views::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
     BlockCommitContext, BlockKeyedConsumer, BlockSummaryConsumer, BlockSummaryConsumerError,

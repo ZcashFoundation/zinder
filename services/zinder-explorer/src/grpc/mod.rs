@@ -15,6 +15,7 @@ mod network_upgrade_activations;
 mod network_upgrade_status;
 mod overview_snapshot;
 mod recent_transactions;
+mod request_limits;
 mod search;
 mod transaction_component_summary;
 mod transaction_detail;
@@ -28,6 +29,7 @@ mod value_pool_flow;
 mod value_pool_summary;
 
 pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
+pub use request_limits::EXPLORER_QUERY_FIELD_LIMITS;
 
 /// Clamps a caller-requested page size to a default and a hard cap.
 ///

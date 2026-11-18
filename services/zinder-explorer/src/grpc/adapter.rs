@@ -63,7 +63,8 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
-    RpcMetricNames, RpcOutcome, connect_zinder_grpc, describe_rpc_metrics, record_rpc_request,
+    RepeatedFieldGuard, RpcMetricNames, RpcOutcome, connect_zinder_grpc, describe_rpc_metrics,
+    record_rpc_request,
 };
 use zinder_source::NodeSource;
 
@@ -251,14 +252,24 @@ impl ExplorerQueryGrpcAdapter {
 
     /// Wraps the adapter into a tonic [`ExplorerQueryServer`] ready to be
     /// added to a `tonic::transport::Server` builder.
+    ///
+    /// The bearer token is checked first; an admitted request is then held to
+    /// the pre-decode bounds of
+    /// [`EXPLORER_QUERY_FIELD_LIMITS`](super::EXPLORER_QUERY_FIELD_LIMITS).
     #[must_use]
     pub fn into_server(
         self,
-    ) -> InterceptedService<ExplorerQueryServer<Self>, BearerTokenServerInterceptor> {
+    ) -> InterceptedService<
+        RepeatedFieldGuard<ExplorerQueryServer<Self>>,
+        BearerTokenServerInterceptor,
+    > {
         let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
         let server = ExplorerQueryServer::new(self)
             .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES);
-        InterceptedService::new(server, interceptor)
+        InterceptedService::new(
+            RepeatedFieldGuard::new(server, super::EXPLORER_QUERY_FIELD_LIMITS),
+            interceptor,
+        )
     }
 
     fn advertised_capability_readiness(&self) -> ExplorerReadiness {

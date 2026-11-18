@@ -231,9 +231,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .with_traffic_readiness(readiness.clone())
         .with_shutdown(cancel.clone());
 
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let reflection_service =
+        zinder_runtime::public_grpc_reflection(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)?;
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
         pair_slot,
@@ -280,7 +279,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = tonic::transport::Server::builder()
+    let server = zinder_runtime::public_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned());

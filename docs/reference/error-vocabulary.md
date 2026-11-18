@@ -8,11 +8,17 @@ The proto enum is defined in [`crates/zinder-proto/proto/zinder/v1/ops/error.pro
 
 ## How to read the wire
 
-Every Zinder gRPC failure ships:
+Every failure a Zinder handler returns ships:
 
 - A `tonic::Status` carrying a standard gRPC `Code` (one of 16).
 - A `google.rpc.ErrorInfo` detail with `domain = "zinder.dev"` and `reason = <ErrorReason name>` (the string-form name of the enum value, e.g. `"BROADCAST_DISABLED"`).
 - For some reasons, an additional structured detail (`BadRequest.field_violations`, `PreconditionFailure.violations`, `ResourceInfo`).
+
+A request the transport refuses before any handler runs carries only the
+status code and message, with no `ErrorInfo`: a request frame over 4 MiB, a
+message that fails to decode, or a list over its
+[request list bound](../architecture/public-interfaces.md#request-list-bounds),
+which fails with `INVALID_ARGUMENT`.
 
 Clients consult `ErrorInfo.reason` for the typed category and the auxiliary detail for the failure shape. Match on the domain first to avoid mistaking a non-Zinder service's `ErrorInfo` for a Zinder one. The Rust SDK converts recognized strings to its client-owned `ErrorReason` variants and preserves unrecognized Zinder reasons as `ErrorReason::Unknown(String)`, so a newer server does not erase diagnostic identity at an older client.
 
@@ -132,6 +138,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint, or native query's ingest control behind mempool calls) is temporarily unreachable |
 | `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
+| `BROADCAST_BUDGET_EXHAUSTED` | A transaction broadcast, including lightwalletd `SendTransaction`, was refused before reaching any node because the process is already broadcasting its 16 MiB budget of transaction bytes. The budget always fits one maximum-size transaction |
 
 ### `UNIMPLEMENTED` family
 

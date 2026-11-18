@@ -1568,6 +1568,24 @@ fn tree_state_replay_refusal_is_resource_exhausted_and_retryable() -> eyre::Resu
 }
 
 #[test]
+fn broadcast_budget_refusal_is_unavailable_and_retryable() -> eyre::Result<()> {
+    let reason = ops::ErrorReason::BroadcastBudgetExhausted;
+    assert_eq!(reason.as_str_name(), "BROADCAST_BUDGET_EXHAUSTED");
+    assert_eq!(
+        ops::ErrorReason::from_str_name("BROADCAST_BUDGET_EXHAUSTED"),
+        Some(reason)
+    );
+    assert_eq!(ops::ErrorReason::try_from(55)?, reason);
+    let policy = zinder_proto::reason_policy(reason);
+    assert_eq!(policy.code, tonic::Code::Unavailable);
+    assert_eq!(
+        policy.retry,
+        zinder_proto::RetryDisposition::RetryAfterBackoff
+    );
+    Ok(())
+}
+
+#[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
         (

@@ -212,6 +212,7 @@ Important current reasons include:
 | `UPSTREAM_UNREACHABLE` | A configured dependency is temporarily unreachable |
 | `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` identifies the stable cause |
 | `NODE_CAPABILITY_MISSING` | The source node cannot provide a required capability |
+| `BROADCAST_BUDGET_EXHAUSTED` | The process is already broadcasting its 16 MiB budget of transaction bytes; retry with backoff |
 
 Do not encode retry policy in error text. Do not reuse a reason for a different
 failure mode. Additive proto reasons receive new scalar values, mappings,
@@ -486,8 +487,13 @@ endpoint is configured, because readers start without contacting their node.
 Until one of the configured endpoints passes first-contact verification, and
 whenever every verified endpoint is unreachable, a broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE`, and while no endpoint is verified
-`WalletServerInfo.node` stays empty. Otherwise `WalletServerInfo.node` lists
-the capabilities that the first verified endpoint, in broadcast preference
+`WalletServerInfo.node` stays empty. A broadcast also reserves its
+transaction's bytes from a 16 MiB budget the process shares until the last
+copy is gone: when the node answers or the broadcast times out, or, for a
+cancelled broadcast, when work it handed to the blocking pool ends. One that
+does not fit fails at once with `UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED`
+without reaching any node. Otherwise `WalletServerInfo.node` lists the
+capabilities that the first verified endpoint, in broadcast preference
 order, advertised. The static capability registry owns identifiers and method
 associations, but does not select a runtime subset.
 
@@ -581,6 +587,84 @@ explorer.migration.denominations_v1
 - Optional fields represent genuine absence or unavailable capability. They are
   not filled with zero values to simplify clients.
 - Stable enum scalar values and field tags are never renumbered.
+- Every repeated request field has an element bound that the server checks
+  before decoding; see [Request list bounds](#request-list-bounds).
+
+## Request list bounds
+
+The public gRPC servers (`WalletQuery`, `ExplorerQuery`, and the lightwalletd
+`CompactTxStreamer`) accept request frames up to `MAX_DECODING_MESSAGE_BYTES`
+(4 MiB). An empty `string`, `bytes`, or message element takes 2 bytes in that
+frame and at least 24 once decoded, and a packed enum or integer takes 1 byte
+and 4 or 8 once decoded. A handler's own cap on a list runs only after the
+whole request is decoded, so without a bound before decoding one request could
+cost tens of MiB.
+
+Each server therefore counts the elements of every repeated request field
+before tonic decodes the request. The count covers every gRPC frame in the
+request body, packed and unpacked encodings alike, and the repeated fields of a
+nested message field such as a `filter`. A list inside the elements of a
+repeated message is bounded by its total across every element, because the
+outer list's bound does not limit how large one element's list can be. It
+allocates nothing. A request over
+a bound fails with `INVALID_ARGUMENT` before its handler runs, with the message
+`<Method> request field <field> carries <count> elements; at most <bound> are
+accepted`. That refusal belongs to the transport, as does tonic's refusal of a
+frame over 4 MiB, and carries no `ErrorInfo` reason. `INVALID_ARGUMENT` is the
+code the handlers already use for an over-cap list; the request can never
+succeed, so `RESOURCE_EXHAUSTED`, which invites a retry after backoff, does not
+fit.
+
+A field the handler caps gets twice that cap, so a request just over the cap
+still reaches the handler and gets its typed reason. An enum list that no
+handler caps gets `zinder_runtime::MAX_UNCAPPED_ENUM_LIST_ELEMENTS` (1,000).
+
+| Service | Method | Field | Bound | Handler cap |
+| --- | --- | --- | --- | --- |
+| `WalletQuery` | `ChainEvents` | `address_filter` | 512 | 256 |
+| `WalletQuery` | `TransparentOutpointSpendStatus` | `outpoints` | 2,048 | 1,024 |
+| `ExplorerQuery` | `ValuePoolFlowHistory` | `filter.directions`, `filter.pools` | 1,000 each | none |
+| `ExplorerQuery` | `ValuePoolFlowEventsInRange` | `directions`, `pools` | 1,000 each | none |
+| `ExplorerQuery` | `ValuePoolFlowSummary`, `ValuePoolFlowRoundedAmountSummary` | `pools` | 1,000 | none |
+| `ExplorerQuery` | `ValuePoolFlowAmountThresholdSummary` | `pools` | 1,000 | none |
+| `ExplorerQuery` | `ValuePoolFlowAmountThresholdSummary` | `minimum_amounts_zat` | 64 | 32 |
+| `ExplorerQuery` | `TransactionHistory` | `filter.privacy_shapes`, `filter.contains_any_protocol` | 1,000 each | none |
+| `CompactTxStreamer` | see [lightwalletd compatibility](../reference/lightwalletd-compatibility.md#request-list-limits) | | | |
+
+Each adapter owns its table (`WALLET_QUERY_FIELD_LIMITS`,
+`EXPLORER_QUERY_FIELD_LIMITS`, `COMPACT_TX_STREAMER_FIELD_LIMITS`) and applies
+it through `zinder_runtime::RepeatedFieldGuard` in its `into_server`. A test in
+each adapter compares the table with the service's file descriptor set, so a
+new repeated request field fails the build's tests until it has a bound.
+
+## Public gRPC listeners
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` build their
+listeners with `zinder_runtime::public_grpc_server`. Clients of any of them
+can meet these fixed limits:
+
+| Limit | Value | Client sees |
+| --- | --- | --- |
+| Request message size, every Zinder gRPC server and public gRPC reflection (`MAX_DECODING_MESSAGE_BYTES`) | 2 MiB | `OUT_OF_RANGE` |
+| Concurrent streams per HTTP/2 connection | 200 | Stream queued or a new connection, by client stack |
+| Unary and server-streaming requests being received, process-wide | 32 | `UNAVAILABLE` |
+| Client-streaming and bidirectional calls open, process-wide | 32 | `UNAVAILABLE` |
+| Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
+| Time a client stream may go without completing a message | 20 s | `DEADLINE_EXCEEDED` |
+| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` |
+
+A unary or server-streaming call holds its receive slot only until its
+request has arrived, so long-lived response streams such as `ChainEvents`,
+`CompactBlocksInRange`, and `GetBlockRange` hold none. When a pool is full, a
+request from a connection holding fewer slots takes the oldest slot of the
+connection holding the most, and the request that loses it fails with
+`UNAVAILABLE`. `UNAVAILABLE` from a full pool carries no `ErrorInfo`; retry
+with backoff. A response stream, unary response, or gRPC reflection answer
+that the client stops reading, by withholding HTTP/2 flow-control window, ends
+after 60 seconds. A response still waiting for the server to produce its next
+message is not affected.
+[ADR-0019](../adrs/0019-transport-policy-ownership.md#public-grpc-listeners)
+records the policy and its gaps.
 
 ## Operational names
 

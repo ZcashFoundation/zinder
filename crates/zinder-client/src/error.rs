@@ -486,7 +486,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
         | ErrorReason::TransactionNotFound
-        | ErrorReason::TreeStateReplayLimitReached => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::TreeStateReplayLimitReached
+        | ErrorReason::BroadcastBudgetExhausted => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }

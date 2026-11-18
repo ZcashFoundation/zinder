@@ -27,6 +27,7 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 
+mod broadcast_byte_budget;
 mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
@@ -38,9 +39,10 @@ mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
+pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
 pub use grpc::{
-    TransactionStatusLookup, WalletEndpointMetadata, WalletQueryGrpcAdapter,
-    address_lookup_to_script_hash, block_header_by_selector_response,
+    TransactionStatusLookup, WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata,
+    WalletQueryGrpcAdapter, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
@@ -399,8 +401,9 @@ const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
 /// Call once at startup, after `install_metrics_recorder` returns and before
 /// the gRPC server records its first request. Delegates the RPC metric pair
 /// to [`zinder_runtime::describe_rpc_metrics`] so every Zinder service
-/// shares one description template; the compact-block-range and tree-state
-/// rebuild metrics are `WalletQuery`-specific and stay registered here.
+/// shares one description template; the compact-block-range, tree-state
+/// rebuild, and broadcast budget metrics are `WalletQuery`-specific and stay
+/// registered here.
 pub fn describe_request_metrics() {
     zinder_runtime::describe_rpc_metrics(QUERY_RPC_METRICS, "WalletQuery");
     metrics::describe_histogram!(
@@ -410,6 +413,7 @@ pub fn describe_request_metrics() {
          by status. Used to monitor request fan-out and page sizing."
     );
     tree_state_replay_limit::describe_metrics();
+    broadcast_byte_budget::describe_metrics();
 }
 
 pub(crate) fn record_wallet_query_outcome<Response>(
@@ -470,6 +474,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedWalletEncoding { .. }) => "unsupported_wallet_encoding",
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
+        Some(QueryError::BroadcastBudgetExhausted { .. }) => "broadcast_budget_exhausted",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
         Some(QueryError::TreeStateReplayLimitReached { .. }) => "tree_state_replay_limit_reached",
@@ -969,6 +974,15 @@ pub enum QueryError {
         maximum: usize,
     },
 
+    /// The process is already broadcasting its budget of transaction bytes.
+    #[error(
+        "broadcast budget exhausted: this server already broadcasts {budget_bytes} bytes of transactions at once; retry with backoff"
+    )]
+    BroadcastBudgetExhausted {
+        /// Transaction bytes the process broadcasts at once.
+        budget_bytes: usize,
+    },
+
     /// Materialized-view-owned wallet projection is not configured for this query handle.
     #[error("materialized view is unavailable for {capability}")]
     MaterializedViewUnavailable {
@@ -1100,6 +1114,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
             Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
+            Self::BroadcastBudgetExhausted { .. } => ErrorReason::BroadcastBudgetExhausted,
             Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
             Self::EndpointCapabilityUnavailable { .. } => {
                 ErrorReason::EndpointCapabilityUnavailable
@@ -1246,6 +1261,9 @@ mod error_reason_tests {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,
                 maximum: MAX_RAW_TRANSACTION_BYTES,
             },
+            QueryError::BroadcastBudgetExhausted {
+                budget_bytes: crate::BROADCAST_BYTE_BUDGET,
+            },
             QueryError::MaterializedViewUnavailable {
                 capability: "probe",
             },
@@ -1301,6 +1319,19 @@ mod error_reason_tests {
             tonic_types::StatusExt::get_details_error_info(&status)
                 .map(|error_info| error_info.reason),
             Some("TREE_STATE_REPLAY_LIMIT_REACHED".to_owned())
+        );
+    }
+
+    #[test]
+    fn broadcast_budget_refusal_is_unavailable_on_the_wire() {
+        let status = crate::status_from_query_error(&QueryError::BroadcastBudgetExhausted {
+            budget_bytes: crate::BROADCAST_BYTE_BUDGET,
+        });
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("BROADCAST_BUDGET_EXHAUSTED".to_owned())
         );
     }
 

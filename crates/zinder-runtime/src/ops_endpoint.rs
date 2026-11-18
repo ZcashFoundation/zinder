@@ -9,9 +9,17 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BUILD_GIT_COMMIT, MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder,
-    sections::RuntimeService,
+    BUILD_GIT_COMMIT, HttpListenerLimits, MetricsHandle, MetricsInstallError, Readiness,
+    install_metrics_recorder, sections::RuntimeService, serve_http,
 };
+
+/// The operational routes are body-less `GET`s, so a small cap is ample.
+const OPS_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024;
+
+/// A handful of scrapers and probes use the operational endpoint. The small
+/// cap keeps it from competing with the gRPC listener and the stores for
+/// file descriptors.
+const OPS_MAX_CONNECTIONS: usize = 64;
 
 /// Service identity surfaced by `/metrics` for build-time labeling.
 #[derive(Clone, Debug)]
@@ -216,9 +224,12 @@ async fn serve_ops_endpoint_on_listener(
         "operational endpoint started"
     );
 
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await;
+    let limits = HttpListenerLimits {
+        max_request_body_bytes: OPS_MAX_REQUEST_BODY_BYTES,
+        max_connections: OPS_MAX_CONNECTIONS,
+        ..HttpListenerLimits::default()
+    };
+    let serve_result = serve_http(listener, app, limits, cancel.cancelled_owned()).await;
 
     tracing::info!(
         target: "zinder::runtime",

@@ -34,9 +34,8 @@ async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
             WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
         )));
     let adapter = LightwalletdGrpcAdapter::new(wallet_query).into_server();
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let reflection_service =
+        zinder_runtime::public_grpc_reflection(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;

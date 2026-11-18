@@ -285,6 +285,134 @@ exclusions cover IngestControl only. The indexer channel is a client of a
 server whose TLS policy the node operator sets, so Zinder must meet that
 policy itself.
 
+### Public gRPC listeners
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` accept
+connections from clients Zinder does not control. Each builds its listener with
+[`zinder_runtime::public_grpc_server`](../../crates/zinder-runtime/src/public_grpc_server.rs),
+which owns one policy for all three:
+
+- At most 200 concurrent streams on one HTTP/2 connection, hyper's own server
+  default, which tonic otherwise removes.
+- An HTTP/2 keepalive ping after one minute without a frame from the client.
+  A ping unanswered for 20 seconds closes the connection.
+- A process-wide bound on requests being received, `GrpcReceiveLimitLayer`.
+- An end to any response whose client stops reading it, `GrpcSendStallLayer`.
+
+tonic reads a whole request message into memory before the handler runs. The
+per-connection stream limit does not bound how many messages the process reads
+at once across connections, so many large requests sent together could exhaust
+memory. The receive limit has two pools of 32 slots each:
+
+- A unary or server-streaming call claims a request slot when its stream
+  opens, before any body arrives, and frees it when its request body ends,
+  before the handler runs. A long-lived response stream therefore holds no
+  slot. A request that has not finished arriving 20 seconds after its stream
+  opened fails with `DEADLINE_EXCEEDED`.
+- A client-streaming or bidirectional call, which today means lightwalletd
+  `GetTaddressBalanceStream` and gRPC reflection `ServerReflectionInfo`, claims
+  a client-stream slot and keeps it until the client half-closes or the call
+  ends. A client stream that completes no message for 20 seconds fails with
+  `DEADLINE_EXCEEDED`. Bytes that do not finish a message do not count, so a
+  client cannot hold a slot by dripping a partial message. The separate pool
+  keeps open client streams from starving single-message calls. A unit test
+  checks the list of client-streaming methods against every service descriptor
+  a public server registers.
+- When a pool is full, a new request takes the oldest slot of the client
+  connection holding the most slots, provided that connection holds more than
+  the requester's connection. The request that loses its slot fails with
+  `UNAVAILABLE`. Otherwise the new request is refused with `UNAVAILABLE` before
+  its body is read.
+
+The eviction rule keeps one connection from locking every other client out. A
+connection is identified by the remote address tonic records for it, which the
+layer reads from the request extensions. A connection that opens many streams
+and sends nothing only loses its own oldest slots to other connections, while
+a connection already holding as many slots as any other is refused. A request
+on a transport that reports no remote address counts as a connection of its
+own. `zinder_grpc_request_receive_evictions_total{pool}` counts evictions.
+
+An evicted request learns of it when its body is next read, which a handler
+blocked on its response never does. For a client stream, the receive layer
+therefore also attaches the slot's eviction signal to the request, and the
+send stall layer below it drops the handler's response body as soon as the
+slot is taken and ends the stream with `UNAVAILABLE`. A blocked gRPC
+reflection task then ends and frees its buffers when it next runs, so
+repeated evictions cannot pile up blocked producers beyond the pool size.
+That release follows the newcomer's admission by a scheduler turn rather
+than preceding it.
+
+gRPC reflection ends its response successfully when its request stream
+fails, which would report a timed-out or evicted client stream as `OK`. The
+receive layer therefore records a client stream's receive failure on the same
+handle, and the send stall layer replaces the handler's final status with it:
+`DEADLINE_EXCEEDED` after the receive timeout and `UNAVAILABLE` after an
+eviction.
+
+hyper asks a response body for its next frame only after the client's HTTP/2
+flow-control window has room for the previous one. A client that answers
+keepalive pings but never sends `WINDOW_UPDATE` therefore parks the response,
+and whatever produces it, with no end: gRPC reflection's task blocks on its
+one-message channel while holding the request stream, its client-stream slot,
+and several echoed messages, where the receive timeout cannot reach it. The send stall layer ends such a response. It hands each data chunk
+to hyper as copies of at most 64 KiB, and a watchdog task drops the handler's
+response body once hyper has held a piece for 60 seconds without asking for
+the next. Dropping the body cancels the handler the way a client cancellation
+does, which frees its task, slot, and buffers. A client that later resumes
+reading receives `DEADLINE_EXCEEDED`. A response waiting for the server to
+produce its next message is not stalled, because hyper keeps asking for it.
+The bound covers every response, including lightwalletd `GetBlockRange` and
+the mempool streams, so it follows lightwalletd's stream send timeout, which
+also uses 60 seconds. `zinder_grpc_response_send_stalls_total` counts the
+responses it ends. The copies matter because a slice of a chunk would share
+its allocation, often tonic's whole encode buffer, and the piece hyper keeps
+for a stalled stream would then keep that buffer alive after the handler is
+gone. Copying every byte once costs about 7 percent more CPU per byte in an
+in-process loopback stream that does nothing but encode, for both 1.5 MiB and
+50 KiB messages, and less where reading and encoding the data dominate.
+
+Every Zinder gRPC server also decodes at most `MAX_DECODING_MESSAGE_BYTES`
+(2 MiB) per request message. Public listeners build gRPC reflection with
+`zinder_runtime::public_grpc_reflection`, which applies the same bound instead
+of tonic's 4 MiB default. The largest legitimate request, a broadcast of a
+2,000,000-byte transaction, encodes to at most 2,000,015 bytes. With 32 slots
+per pool, each pool holds at most 64 MiB of request messages being decoded.
+tonic refuses a larger message with `OUT_OF_RANGE` from its 5-byte length
+prefix, before buffering it.
+
+The values are constants, not configuration. Precedent is lightwalletd's fix
+for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, message
+size, and eviction rule. That fix also bounds the transaction bytes
+`SendTransaction` works on at once, because a send's copies outlive its
+receive slot. Zinder's equivalent is not a transport policy: the wallet query
+reserves each broadcast's bytes from a 16 MiB process budget before it copies
+them, as
+[Public interfaces](../architecture/public-interfaces.md#capabilities)
+describes, so the bound covers native `BroadcastTransaction`, lightwalletd
+`SendTransaction`, and the Cipherscan broadcast that query serves.
+
+The policy leaves five gaps:
+
+- Clients spread over many connections can still keep a pool full, because
+  each connection then holds no more slots than a new one would. Limit
+  connections per client address at the edge.
+- tonic has no HTTP/2 handshake timeout, and keepalive pings start only after
+  the handshake. A TCP connection that never sends the HTTP/2 preface holds a
+  file descriptor until the client closes it.
+- Each connection can buffer up to hyper's 1 MiB connection window of request
+  data before the receive limit reads or refuses it.
+- A response the send stall layer ends keeps its HTTP/2 stream, and the one
+  copied piece of at most 64 KiB that hyper holds for it, until the client
+  reads, resets the stream, or closes the connection, because hyper waits for
+  flow-control window before it asks the body again. Graceful shutdown waits
+  for such a stream too.
+- The receive limit runs before each service's interceptors, so a request
+  claims a slot before the Explorer's bearer-token check refuses it. An
+  unauthenticated client can therefore fill a pool, or evict a request that is
+  still arriving, for the moment before its own request is refused. The
+  Explorer has no client-streaming methods, so that moment is short, but keep a
+  bearer-token listener on a private network.
+
 ### Observability
 
 A single helper, `record_transport_event(peer, event, reason)`,
@@ -363,3 +491,9 @@ translations.
   image that accepts the entrypoint-only `*_PEM` variables, and described how
   its entrypoint delivers the materialized paths to both the wallet-serving
   processes and `zinder-explorer`.
+- 2026-11-18: Added public gRPC listeners: the shared
+  `zinder_runtime::public_grpc_server` builder with its per-connection stream
+  limit, keepalive, and process-wide receive limit with per-connection
+  eviction, the 2 MiB request message bound, which also covers public gRPC
+  reflection, and the send stall bound, which also ends an evicted client
+  stream's response.

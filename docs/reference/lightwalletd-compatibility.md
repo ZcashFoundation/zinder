@@ -186,6 +186,16 @@ transaction id instead of -27 or -25, because the unreachable endpoint may
 have accepted the transaction. Without `[node]`, `SendTransaction` is
 unsupported.
 
+A send copies its transaction several times on the way to the node and holds
+the copies until the node answers or `broadcast_timeout_secs` expires. Its
+bytes stay reserved until the last copy is gone, including one a cancelled
+send left on the blocking pool to compute its transaction id. The
+process therefore works on at most 16 MiB of transactions at once, the
+default of lightwalletd's `--max-concurrent-sendtx-mib`. A send that does not
+fit fails at once with `UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED` and
+reaches no node. The budget always fits one 2,000,000-byte transaction, and
+`zinder_query_broadcast_budget_refusals_total` counts refusals.
+
 A compact-blocks `GetBlockRange` stream holds a canonical generation only
 while it reads one chunk, never while it waits for its client. A slow stream
 therefore does not keep the publisher from reopening the inactive generation,
@@ -473,8 +483,9 @@ sets no such limit.
 
 ### Connections
 
-The compatibility server limits one HTTP/2 connection to 200 concurrent
-streams, which is hyper's own server default. A client at that limit queues
+The compatibility server, like every public Zinder gRPC server, limits one
+HTTP/2 connection to 200 concurrent streams, which is hyper's own server
+default. A client at that limit queues
 further streams or opens another connection, depending on its HTTP/2 stack.
 
 The server pings a connection after one minute without a frame from it and
@@ -503,6 +514,42 @@ and it never returns `RESOURCE_EXHAUSTED`. It reads and sends one block at a
 time through an unbuffered channel, so its server holds about one block per
 stream.
 
+### Requests being received
+
+The server reads a whole request message into memory before the handler runs,
+so it bounds how many requests it receives at once across every connection.
+The bound is fixed and shared with native query and Explorer
+([ADR-0019](../adrs/0019-transport-policy-ownership.md#public-grpc-listeners)):
+
+- A request message larger than 2 MiB fails with `OUT_OF_RANGE` before the
+  server buffers it. A `SendTransaction` of the largest valid transaction,
+  2,000,000 bytes, fits.
+- At most 32 requests are being received at once. A unary or server-streaming
+  call holds its slot only until its request has arrived, so an open
+  `GetBlockRange` or `GetMempoolStream` holds none. A request that has not
+  arrived 20 seconds after its stream opened fails with `DEADLINE_EXCEEDED`.
+- `GetTaddressBalanceStream` and gRPC reflection draw on a separate pool of
+  32 slots and keep theirs until the client half-closes or the call ends. A
+  stream that completes no message for 20 seconds fails with
+  `DEADLINE_EXCEEDED`. gRPC reflection messages are also bounded at 2 MiB.
+- When a pool is full, a request from a connection holding fewer slots takes
+  the oldest slot of the connection holding the most, and the request that
+  loses it fails with `UNAVAILABLE`. Otherwise the new request fails with
+  `UNAVAILABLE` at once. `zinder_grpc_request_receive_refusals_total{pool}`
+  counts refusals, `zinder_grpc_request_receive_evictions_total{pool}` counts
+  evictions, and `zinder_grpc_request_receive_timeouts_total{pool}` counts
+  timeouts.
+- A response the client stops reading for 60 seconds, by withholding HTTP/2
+  flow-control window, ends with `DEADLINE_EXCEEDED`. This covers
+  `GetBlockRange`, the mempool streams, and gRPC reflection, and matches
+  lightwalletd's stream send timeout.
+  `zinder_grpc_response_send_stalls_total` counts these.
+
+One connection that opens many streams therefore cannot lock other clients
+out, but clients spread over many connections still can keep a pool full.
+Limit connections per client address at the edge. lightwalletd's fix for
+GHSA-xrx5-jc6q-9h8r sets the same values and eviction rule.
+
 ### Block caches
 
 In wallet serving, the compatibility runtime keeps up to four reader
@@ -518,6 +565,34 @@ size. Each open generation also keeps its own memtables, up to 16 MiB per
 store by default, and the table readers of the files it holds open.
 Compact-blocks serving keeps two canonical generations on one canonical block
 cache.
+
+## Request list limits
+
+The server counts the elements of every list in a request before it decodes
+the request, and refuses a request over the limit with `INVALID_ARGUMENT` and
+the message `<Method> request field <field> carries <count> elements; at most
+<limit> are accepted`. An empty address or txid suffix takes 2 bytes on the
+wire but at least 24 once decoded, so without this check one 4 MiB request
+could cost tens of MiB before a handler's own cap refused it.
+
+| Method | Field | Limit | Handler cap |
+| --- | --- | --- | --- |
+| `GetTaddressBalance` | `addresses` | 512 | 256 addresses per balance |
+| `GetAddressUtxos`, `GetAddressUtxosStream` | `addresses` | 10,000 | none |
+| `GetMempoolTx` | `exclude_txid_suffixes` | 2,048 | 1,024 |
+| `GetMempoolTx` | `poolTypes` | 1,000 | none |
+| `GetBlockRange`, `GetBlockRangeNullifiers` | `poolTypes` | 1,000 | none |
+| `GetTaddressTxids`, `GetTaddressTransactions` | `range.poolTypes` | 1,000 | none |
+
+A limit is twice the handler's cap where one exists, so a request just over
+the cap still gets the handler's error. `poolTypes` names at most five pools,
+and the server reduces it to a set once per request, so 1,000 entries leave
+room for any client while stopping a list that only inflates decoding.
+
+lightwalletd checks the same fields before decoding, also at twice its handler
+caps (lightwalletd `78c8476`), but reports the refusal as `INTERNAL`, because
+grpc-go turns every codec error into that code. lightwalletd does not check
+`range.poolTypes` in `GetTaddressTxids` and `GetTaddressTransactions`.
 
 ## Transaction lookup
 

@@ -196,7 +196,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         "explorer query gRPC server started"
     );
 
-    let server_result = tonic::transport::Server::builder()
+    let server_result = zinder_runtime::public_grpc_server()
         .add_service(grpc_adapter.into_server())
         .serve_with_shutdown(
             explorer_config.listen_addr,

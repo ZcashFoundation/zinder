@@ -7,6 +7,9 @@
 //!   [`ComposedReadiness`] precedence shared by multi-input runtimes.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
+//! - The bounded HTTP/1 listener ([`serve_http`], [`HttpListenerLimits`]) that
+//!   serves every axum router, so header, body, idle, and connection limits
+//!   are applied in one place.
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
 //!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
@@ -17,6 +20,12 @@
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
 //!   which rejects an invalid `RUST_LOG` with [`TracingSubscriberError`].
+//! - The gRPC server builder every public listener serves with
+//!   ([`public_grpc_server`]), which bounds streams per connection, pings
+//!   idle connections, limits how many requests the process receives at
+//!   once ([`GrpcReceiveLimitLayer`]), and ends responses whose client stops
+//!   reading them ([`GrpcSendStallLayer`]), and the gRPC reflection service those
+//!   listeners serve ([`public_grpc_reflection`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -25,6 +34,9 @@
 //!   ([`classify_canonical_writer_fence`],
 //!   [`converge_on_canonical_writer_fence`], [`WriterAttestation`]), shared
 //!   by every runtime that reads a canonical `RocksDB` secondary.
+//! - Pre-decode element-count bounds on repeated gRPC request fields
+//!   ([`RepeatedFieldGuard`], [`MethodFieldLimits`], [`RepeatedFieldLimit`]),
+//!   applied by every public gRPC server whose requests carry lists.
 //!
 //! It deliberately defines no storage or protocol types of its own; it
 //! composes those owned by `zinder-core`, `zinder-proto`, and `zinder-store`.
@@ -37,11 +49,14 @@ mod composed_readiness;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
+mod http_listener;
 mod logging;
 mod memory_budget;
 mod metrics;
 mod ops_endpoint;
+mod public_grpc_server;
 mod readiness;
+mod repeated_field_limits;
 mod rpc_metrics;
 mod sections;
 mod startup_phase;
@@ -73,6 +88,11 @@ pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
     render_environment_variable_table,
 };
+pub use http_listener::{
+    DEFAULT_HTTP_HEADER_READ_TIMEOUT, DEFAULT_HTTP_MAX_CONNECTIONS,
+    DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+    DEFAULT_HTTP_WRITE_STALL_TIMEOUT, HttpListenerLimits, serve_http,
+};
 pub use logging::{TracingSubscriberError, install_tracing_subscriber};
 pub use memory_budget::{
     canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
@@ -86,10 +106,19 @@ pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
     spawn_ops_endpoint_for,
 };
+pub use public_grpc_server::{
+    DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+    GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
+    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PublicGrpcServer, public_grpc_reflection,
+    public_grpc_server, public_grpc_server_with,
+};
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
     ReadinessDependency, ReadinessReport, ReadinessState, TrafficReadinessInterceptor,
     UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
+};
+pub use repeated_field_limits::{
+    MethodFieldLimits, RepeatedElementEncoding, RepeatedFieldGuard, RepeatedFieldLimit,
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
@@ -117,19 +146,32 @@ pub use transport::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Upper bound on the size of an incoming gRPC request frame, applied to
+/// Upper bound on the size of an incoming gRPC request message, applied to
 /// every serving Zinder gRPC server via `max_decoding_message_size`.
 ///
-/// The value accommodates the largest legitimate request: a broadcast
-/// transaction, itself capped at
-/// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2 MB), plus gRPC framing
-/// overhead. It must stay at or above that 2 MB bound so an oversized
-/// broadcast is rejected by the application-layer broadcast guard with its
-/// typed error, not by the transport.
+/// tonic holds a request message in memory while it decodes it, so this
+/// bound times [`DEFAULT_GRPC_RECEIVE_SLOTS`] bounds the request bytes a
+/// public server decodes at once.
 ///
-/// Setting it explicitly pins tonic's implicit default in place so a
-/// future framework default change cannot silently widen the limit.
-pub const MAX_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// The largest legitimate request is a broadcast transaction of
+/// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2,000,000 bytes), which
+/// encodes to at most 2,000,015 bytes as a lightwalletd `RawTransaction` and
+/// fits under 2 MiB with room to spare. A larger transaction that still fits
+/// is rejected by the broadcast guard with its typed error; one beyond this
+/// bound fails in the transport with `OUT_OF_RANGE`, before tonic buffers
+/// it.
+///
+/// Setting it explicitly also keeps a future tonic default from silently
+/// widening the limit.
+pub const MAX_DECODING_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Pre-decode element bound for a repeated enum request field that no
+/// handler caps, applied through [`RepeatedFieldGuard`].
+///
+/// Such a field selects among a handful of enum values, so no client needs
+/// more elements than this; the bound only stops a request that repeats them
+/// to inflate decoding.
+pub const MAX_UNCAPPED_ENUM_LIST_ELEMENTS: usize = 1_000;
 
 /// Git commit embedded by release builds.
 ///

@@ -5615,9 +5615,8 @@ mod tests {
         ));
         let grpc_adapter =
             WalletQueryGrpcAdapter::new(query.clone(), WalletEndpointMetadata::default());
-        let reflection_service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
-            .build_v1()?;
+        let reflection_service =
+            zinder_runtime::public_grpc_reflection(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)?;
         let advertised_capabilities = query.native_endpoint_capabilities().shared_identifiers();
         let ops_port_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
         let ops_address = ops_port_reservation.local_addr()?;

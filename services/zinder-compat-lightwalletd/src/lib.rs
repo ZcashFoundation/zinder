@@ -8,6 +8,7 @@ mod block_range;
 mod grpc;
 mod mempool;
 mod ping;
+mod request_limits;
 
 pub use block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse,
@@ -26,3 +27,4 @@ pub use mempool::{
     spawn_ingest_control_tip_change_publisher,
 };
 pub use ping::LightwalletdPing;
+pub use request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;

@@ -1520,7 +1520,9 @@ service WalletQuery {
   // Return at most 1024 shielded subtree roots per request.
   rpc SubtreeRoots(SubtreeRootsRequest) returns (SubtreeRootsResponse);
 
-  // Broadcast a raw transaction.
+  // Broadcast a raw transaction. A broadcast refused because the server is
+  // already broadcasting its budget of transaction bytes fails with
+  // UNAVAILABLE and `BROADCAST_BUDGET_EXHAUSTED`.
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 
   // Stream replayable chain events.

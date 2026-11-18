@@ -496,6 +496,11 @@ pub enum ErrorReason {
     /// from stored compact blocks at once. Retry with backoff; a height with a
     /// stored checkpoint is never refused this way.
     TreeStateReplayLimitReached = 54,
+    /// UNAVAILABLE family.
+    /// A transaction broadcast was refused because the server is already
+    /// broadcasting its budget of transaction bytes at once. Retry with
+    /// backoff; the budget always fits one maximum-size transaction.
+    BroadcastBudgetExhausted = 55,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -560,6 +565,7 @@ impl ErrorReason {
                 "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE"
             }
             Self::TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
+            Self::BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -627,6 +633,7 @@ impl ErrorReason {
                 Some(Self::TransparentOutpointCountOutOfRange)
             }
             "TREE_STATE_REPLAY_LIMIT_REACHED" => Some(Self::TreeStateReplayLimitReached),
+            "BROADCAST_BUDGET_EXHAUSTED" => Some(Self::BroadcastBudgetExhausted),
             _ => None,
         }
     }
