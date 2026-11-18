@@ -187,16 +187,22 @@ impl MempoolOwnerStatus {
 
     /// Returns the source tip and certification time of a serving index, or
     /// the status a request that needs one is refused with.
+    ///
+    /// A hydrating or rebuilding index waits on a node snapshot, so its
+    /// refusal carries `NODE_UNAVAILABLE`. The typed reason also tells a
+    /// reader that the writer answered, unlike a transport failure.
     fn serving_anchor(self) -> Result<(BlockId, UnixTimestampMillis), Status> {
         match self {
             Self::Serving {
                 source_tip,
                 snapshot_certified_at,
             } => Ok((source_tip, snapshot_certified_at)),
-            Self::Hydrating => Err(Status::unavailable(
+            Self::Hydrating => Err(status_for_reason(
+                ErrorReason::NodeUnavailable,
                 "live mempool index is hydrating from an upstream snapshot",
             )),
-            Self::RebuildRequired => Err(Status::unavailable(
+            Self::RebuildRequired => Err(status_for_reason(
+                ErrorReason::NodeUnavailable,
                 "live mempool index is rebuilding after a durable transition mismatch",
             )),
             Self::Halted(halt) => Err(halt.status()),
@@ -445,6 +451,12 @@ impl LiveMempoolOwner {
     }
 
     /// Reads one durable mempool event page and encodes it for the public wire.
+    ///
+    /// Retained events replay whatever the owner's state. An empty page means
+    /// the reader has caught up, so its next event depends on live
+    /// observation: a hydrating or rebuilding owner refuses with
+    /// `NODE_UNAVAILABLE` instead, because silence would read as an unchanged
+    /// mempool while the owner no longer follows its source.
     pub(crate) async fn event_page(
         &self,
         canonical: &CanonicalControlHandle,
@@ -452,7 +464,7 @@ impl LiveMempoolOwner {
     ) -> Result<Vec<wallet::MempoolEventEnvelope>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.require_not_halted()?;
-        canonical
+        let events = canonical
             .mempool_event_page(
                 after_cursor.map(|cursor| cursor.as_bytes().to_vec()),
                 std::num::NonZeroU32::new(MEMPOOL_EVENT_PAGE_SIZE)
@@ -465,7 +477,11 @@ impl LiveMempoolOwner {
                     Status::failed_precondition("durable mempool event cannot be encoded")
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if events.is_empty() {
+            self.require_serving()?;
+        }
+        Ok(events)
     }
 
     /// Stages one source transition while a generation hydrates, or applies
@@ -2196,6 +2212,64 @@ mod tests {
         assert_eq!(
             outcome.err().map(|status| status.code()),
             Some(Code::Unavailable)
+        );
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A withdrawn live index still replays retained mempool events, then
+    /// refuses the caught-up live tail with `NODE_UNAVAILABLE` instead of an
+    /// empty page that reads as an unchanged mempool.
+    #[tokio::test]
+    async fn event_page_refuses_the_live_tail_of_a_withdrawn_index() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let owner = LiveMempoolOwner::default();
+        let (added, observed_at) = added_transition(0xB1, 8, chain_epoch)?;
+        owner.apply_event(&canonical, added, observed_at).await?;
+        assert_eq!(
+            owner
+                .try_complete_hydration(&canonical, fixture_source_tip())
+                .await?,
+            SnapshotCertification::Certified
+        );
+        let retained = owner.event_page(&canonical, None).await?;
+        let caught_up = zinder_store::StreamCursorTokenV1::from_bytes(
+            retained
+                .first()
+                .ok_or("the certified generation recorded no event")?
+                .cursor
+                .clone(),
+        );
+        assert!(
+            owner
+                .event_page(&canonical, Some(caught_up.clone()))
+                .await?
+                .is_empty()
+        );
+
+        owner.withdraw_for_rebuild().await;
+        assert_eq!(owner.event_page(&canonical, None).await?, retained);
+        let refused = owner
+            .event_page(&canonical, Some(caught_up))
+            .await
+            .err()
+            .ok_or("a withdrawn index answered its live tail with an empty page")?;
+        assert_eq!(refused.code(), Code::Unavailable);
+        assert_eq!(
+            refused
+                .get_error_details()
+                .error_info()
+                .map(|error_info| error_info.reason.clone()),
+            Some(ErrorReason::NodeUnavailable.as_str_name().to_owned())
         );
         command_task.abort();
         let _join_result = command_task.await;

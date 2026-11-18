@@ -148,8 +148,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     }
 
     let readiness = Readiness::default();
-    let serving_readiness =
-        WalletServingReadiness::awaiting_node_and_ingest_control(readiness.clone());
+    let serving_readiness = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
     let admit_ingest_control_phase = StartupPhase::AdmitIngestControl.start();
     let ingest_control = match AdmittedIngestControl::connect(
         &query_config.ingest_control_addr,
@@ -599,8 +598,7 @@ mod tests {
     #[tokio::test]
     async fn serving_pair_publisher_exit_drains_the_runtime() {
         let runtime_readiness = Readiness::default();
-        let serving_readiness =
-            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
         let cancel = CancellationToken::new();
         let publisher = tokio::spawn(async {});
         let node_cancel = cancel.clone();
@@ -646,8 +644,7 @@ mod tests {
     #[tokio::test]
     async fn requested_shutdown_drains_all_runtime_tasks_cleanly() {
         let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
-        let serving_readiness =
-            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
         let cancel = CancellationToken::new();
         let serving_runtime_drained = CancellationToken::new();
         let publisher_cancel = cancel.clone();
@@ -697,8 +694,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
         let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
-        let serving_readiness =
-            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
         let cancel = CancellationToken::new();
         let serving_runtime_drained = CancellationToken::new();
         let publisher_cancel = cancel.clone();
@@ -745,8 +741,7 @@ mod tests {
     #[tokio::test]
     async fn node_probe_join_failure_is_a_typed_runtime_failure() {
         let runtime_readiness = Readiness::default();
-        let serving_readiness =
-            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
         let cancel = CancellationToken::new();
         let publisher_cancel = cancel.clone();
         let publisher = tokio::spawn(async move {
@@ -794,8 +789,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_control_probe_join_failure_is_a_typed_runtime_failure() {
         let runtime_readiness = Readiness::default();
-        let serving_readiness =
-            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
         let cancel = CancellationToken::new();
         let publisher_cancel = cancel.clone();
         let publisher = tokio::spawn(async move {

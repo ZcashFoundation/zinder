@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Native wallet serving, capability discovery, consumer admission, lightwalletd compatibility block-range streams |
-| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md), [Canonical storage topology](0035-canonical-storage-topologies.md), [Canonical storage access](0003-canonical-storage-access-boundary.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md) |
+| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md), [Canonical storage topology](0035-canonical-storage-topologies.md), [Canonical storage access](0003-canonical-storage-access-boundary.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md), [ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md) |
 
 ## Context
 
@@ -126,28 +126,39 @@ range before pair capture or storage access with
 
 Structural support is immutable for the process lifetime. A structurally
 supported operation is advertised even while one of its admitted dependencies
-is temporarily unhealthy; readiness becomes false and the request returns
-`UNAVAILABLE` with `SERVICE_NOT_READY` plus the stable `readiness_cause`
-metadata. A structurally absent operation is omitted and a direct call returns
-a precise unsupported or failed-precondition result. An expired chain view
-retains its capability and returns the typed epoch-expiry outcome. A
-replacement pair that changes the process contract is rejected, leaves the
-prior pair authoritative where safe, and makes readiness false.
+is temporarily unhealthy. Readiness then stays true, and only a request that
+calls the dependency fails: a node-backed request returns `UNAVAILABLE` with
+`NODE_UNAVAILABLE`, and an ingest-control request returns the channel's
+`UNAVAILABLE`
+([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)). When
+the serving pair itself refuses traffic, every request returns `UNAVAILABLE`
+with `SERVICE_NOT_READY` plus the stable `readiness_cause` metadata, or the
+typed `REORG_WINDOW_EXCEEDED` refusal of a parked writer. A structurally
+absent operation is omitted and a direct call returns a precise unsupported or
+failed-precondition result. An expired chain view retains its capability and
+returns the typed epoch-expiry outcome. A replacement pair that changes the
+process contract is rejected, leaves the prior pair authoritative where safe,
+and makes readiness false.
 
-Capability discovery is not a health check. Pair publication, provider health,
-and replica lag may change readiness but never rewrite the endpoint contract.
+Capability discovery is not a health check. Pair publication and replica lag
+may change readiness, and provider health may degrade a dependency, but none of
+them rewrites the endpoint contract.
 
 `WalletServingReadiness` retains pair state, admitted-node state, and
-ingest-control health independently and projects their conjunction into the
-shared operational and gRPC readiness handle. Shutdown dominates later writes.
+ingest-control health independently. The pair state alone decides readiness.
+Node and ingest-control health are dependencies that the shared operational
+and gRPC readiness handle reports under `degraded`, except that a parked
+writer's halt reported through ingest control refuses traffic. Shutdown
+dominates later writes.
 The node liveness task runs only when the query advertises a node-backed
 capability, and uses `tip_id` plus upstream synchronization health through the
 exact admitted source; it never repeats capability discovery or
 mutates the cached structural feature set. The ingest-control task calls
 `WriterStatus` and `MempoolSnapshot(max_entries = 1)` through the admitted
-channel, validates coherent network and tip evidence, and publishes
-`ingest_control_unavailable` on failure. It does not repeat `ServerInfo`
-admission. The task logs only outage and recovery transitions, and shares the
+channel and validates coherent network and tip evidence. On failure it
+publishes `ingest_control_unavailable` as the dependency's cause, or relays
+the writer's `upstream_not_ready` when the writer reports that its node is not
+ready. It does not repeat `ServerInfo` admission. The task logs only outage and recovery transitions, and shares the
 serving-pair refresh cadence because both observe the same control plane. An
 unexpected serving-pair publisher, node-readiness task, or
 ingest-control-readiness task exit drains readiness, cancels the runtime, and
@@ -591,6 +602,11 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: Readiness follows the serving pair. Node-source and
+  ingest-control health degrade the readiness report and fail only the
+  requests that call them, instead of refusing every request with
+  `SERVICE_NOT_READY`. A parked writer's halt still refuses all traffic
+  ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
 - 2026-11-17: Tree state at any height is served from the serving pair,
   reconstructed from stored compact blocks between checkpoints, so
   `wallet.read.tree_state_at_height_v2` is advertised without node evidence.

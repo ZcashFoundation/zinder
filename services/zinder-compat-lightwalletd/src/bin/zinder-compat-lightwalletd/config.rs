@@ -108,6 +108,9 @@ pub(crate) enum LightwalletdConfigError {
     WalletServingPair(#[from] zinder_query::WalletServingPairError),
 
     #[error(transparent)]
+    IngestControlAdmission(#[from] zinder_query::IngestControlAdmissionError),
+
+    #[error(transparent)]
     Query(#[from] zinder_query::QueryError),
 
     #[error(transparent)]

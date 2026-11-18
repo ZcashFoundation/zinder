@@ -36,12 +36,10 @@ use zinder_query::{QueryError, status_from_query_error};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
-    ComposedReadiness, ConfigError, NodeUnavailableDetail, Readiness, ReadinessCause,
-    ReadinessInput, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation,
+    ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
     classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
     expected_writer_fence,
 };
-use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
@@ -79,6 +77,8 @@ enum ConvergenceFailure {
     Storage(CompactBlockServingError),
 }
 
+/// Readiness of compact-blocks serving, which follows the published canonical
+/// generation alone: no compact-blocks method calls the node.
 #[derive(Clone)]
 pub(crate) struct CompactServingReadiness {
     composed: ComposedReadiness,
@@ -87,7 +87,7 @@ pub(crate) struct CompactServingReadiness {
 impl CompactServingReadiness {
     pub(crate) fn new(runtime: Readiness) -> Self {
         Self {
-            composed: ComposedReadiness::new(runtime, &[ReadinessInput::NodeSource]),
+            composed: ComposedReadiness::new(runtime, &[]),
         }
     }
 
@@ -99,9 +99,14 @@ impl CompactServingReadiness {
         self.composed.publish_admission(storage);
     }
 
-    pub(crate) fn publish_node(&self, node: ReadinessCause) {
-        self.composed
-            .publish_input(ReadinessInput::NodeSource, node);
+    /// Records the writer's commit time of the chain epoch `reader` serves.
+    /// The age only reports staleness, so a failed read keeps the last one.
+    fn publish_served_epoch(&self, reader: &RocksDbCanonicalSecondary) {
+        if let Ok(epoch) = reader.chain_epoch() {
+            self.composed
+                .runtime_readiness()
+                .set_served_epoch_committed_at(epoch.created_at);
+        }
     }
 
     pub(crate) fn publish_shutting_down(&self) {
@@ -220,6 +225,7 @@ impl CompactBlockPublisher {
         if refusal.is_none() {
             writer_attestation.attest();
         }
+        readiness.publish_served_epoch(&reader);
         readiness.publish_storage(
             refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
         );
@@ -437,6 +443,7 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
+        self.readiness.publish_served_epoch(&reader);
         // The writer can park between the first fetch and the one that
         // attested the candidate; the attesting status decides, as at bootstrap.
         let visible_height = reader.event_fence().visible_tip().height.value();
@@ -709,60 +716,6 @@ impl CompactBlockAdapter {
             ),
         }
     }
-}
-
-pub(crate) fn spawn_node_readiness_probe<Source>(
-    source: Source,
-    readiness: CompactServingReadiness,
-    poll_interval: Duration,
-    cancel: CancellationToken,
-) -> Result<JoinHandle<()>, ConfigError>
-where
-    Source: NodeSource,
-{
-    if !source.capabilities().supports(NodeCapability::TipId) {
-        return Err(ConfigError::invalid(
-            "compact-blocks serving requires the node TipId capability",
-        ));
-    }
-    Ok(tokio::spawn(async move {
-        loop {
-            let observation = match source.tip_id().await {
-                Ok(_) => source.poll_upstream_health().await,
-                Err(error) => Err(error),
-            };
-            match observation {
-                Ok(snapshot) if snapshot.ready_for_queries => {
-                    readiness.publish_node(ReadinessCause::Ready);
-                }
-                Ok(snapshot) => {
-                    readiness.publish_node(ReadinessCause::UpstreamNotReady(
-                        UpstreamNotReadyDetail {
-                            upstream_committed_height: snapshot.upstream_committed_height,
-                            upstream_estimated_height: snapshot.upstream_estimated_height,
-                            upstream_verification_progress: snapshot.upstream_verification_progress,
-                            upstream_health: UpstreamHealth {
-                                source: snapshot.source,
-                                reason: snapshot.reason,
-                            },
-                        },
-                    ));
-                }
-                Err(error) => {
-                    readiness.publish_node(ReadinessCause::NodeUnavailable(
-                        NodeUnavailableDetail::first_iteration(
-                            "node_unavailable",
-                            error.to_string(),
-                        ),
-                    ));
-                }
-            }
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(poll_interval) => {}
-            }
-        }
-    }))
 }
 
 #[tonic::async_trait]
@@ -1779,16 +1732,17 @@ mod tests {
     }
 
     #[test]
-    fn readiness_is_conjunctive_and_shutdown_is_irreversible() {
+    fn readiness_follows_the_published_generation_and_shutdown_is_irreversible() {
         let runtime = Readiness::default();
         let readiness = CompactServingReadiness::new(runtime.clone());
-        readiness.publish_storage(ReadinessState::ready(Some(10)));
         assert!(!runtime.report().is_ready);
-        readiness.publish_node(ReadinessCause::Ready);
-        assert!(runtime.report().is_ready);
+        readiness.publish_storage(ReadinessState::ready(Some(10)));
+        let report = runtime.report();
+        assert!(report.is_ready);
+        assert!(report.degraded.is_empty());
         readiness.publish_shutting_down();
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
-        readiness.publish_node(ReadinessCause::Ready);
+        readiness.publish_storage(ReadinessState::ready(Some(11)));
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
     }
 
@@ -1891,7 +1845,6 @@ mod tests {
             }
         });
         let serving_readiness = CompactServingReadiness::new(Readiness::default());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let budget = RocksDbResourceBudget::for_local_tests();
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
@@ -2022,7 +1975,6 @@ mod tests {
 
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
@@ -2213,7 +2165,6 @@ mod tests {
         });
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
@@ -2321,7 +2272,6 @@ mod tests {
 
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
@@ -2403,7 +2353,6 @@ mod tests {
         });
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
@@ -2541,7 +2490,6 @@ mod tests {
             }
         });
         let serving_readiness = CompactServingReadiness::new(Readiness::default());
-        serving_readiness.publish_node(ReadinessCause::Ready);
         let config = CompactBlockServingConfig {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
@@ -2685,7 +2633,6 @@ mod tests {
             let secondaries = tempfile::tempdir()?;
             let readiness = Readiness::default();
             let serving_readiness = CompactServingReadiness::new(readiness.clone());
-            serving_readiness.publish_node(ReadinessCause::Ready);
             let config = CompactBlockServingConfig {
                 canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
                 canonical_secondary_root: secondaries.path().to_path_buf(),

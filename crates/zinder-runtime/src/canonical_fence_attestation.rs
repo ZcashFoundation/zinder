@@ -15,7 +15,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::{
-    v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse},
+    v1::{
+        ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse},
+        ops::ReorgWindowExceededDetail,
+    },
     wire::{canonical_writer_fence_message, encode_canonical_network_upgrade_schedule},
 };
 use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
@@ -372,28 +375,43 @@ impl WriterAttestation {
         status: &CanonicalWriterStatusResponse,
         visible_height: Option<u32>,
     ) -> Option<ReadinessState> {
-        let refusing = |cause| ReadinessState {
-            current_height: visible_height,
-            ..ReadinessState::not_ready(cause)
-        };
         if status.network_name != encode_zinder_native_chain_name(self.network) {
             self.remembered_halt = None;
             return None;
         }
         if let Some(halt) = status.reorg_window_exceeded {
-            let halt = refusing(ReadinessCause::from(halt));
+            let halt = refusing(ReadinessCause::from(halt), visible_height);
             self.remembered_halt = Some(halt.clone());
             return Some(halt);
         }
         if status.tip_unconfirmed {
-            return Some(
-                self.remembered_halt
-                    .clone()
-                    .unwrap_or_else(|| refusing(ReadinessCause::CanonicalTipUnconfirmed)),
-            );
+            return Some(self.remembered_halt.clone().unwrap_or_else(|| {
+                refusing(ReadinessCause::CanonicalTipUnconfirmed, visible_height)
+            }));
         }
         self.remembered_halt = None;
         None
+    }
+
+    /// Remembers `halt`, which the reader learned outside writer status, and
+    /// returns the state that refuses traffic on a reader whose visible tip is
+    /// at `visible_height`.
+    ///
+    /// A reader that also probes the writer through another channel, such as
+    /// ingest control, can observe a park that its own writer-status reads
+    /// missed. The halt then withdraws the staleness allowance and stays, as
+    /// one read from writer status would, until a later status from a
+    /// following writer with a confirmed tip clears it, so the caller
+    /// validates its fence against that same status before traffic resumes.
+    pub fn remember_halt(
+        &mut self,
+        halt: ReorgWindowExceededDetail,
+        visible_height: Option<u32>,
+    ) -> ReadinessState {
+        let halt = refusing(ReadinessCause::from(halt), visible_height);
+        self.attested_at = None;
+        self.remembered_halt = Some(halt.clone());
+        halt
     }
 
     /// Records that a following writer with a confirmed tip attested the
@@ -417,6 +435,15 @@ impl WriterAttestation {
         self.attested_at
             .map(|attested_at| attested_at.elapsed())
             .filter(|staleness| *staleness < self.staleness_ceiling)
+    }
+}
+
+/// The not-ready state `cause` imposes on a reader whose visible tip is at
+/// `visible_height`.
+fn refusing(cause: ReadinessCause, visible_height: Option<u32>) -> ReadinessState {
+    ReadinessState {
+        current_height: visible_height,
+        ..ReadinessState::not_ready(cause)
     }
 }
 
@@ -1131,6 +1158,36 @@ mod tests {
 
         assert_eq!(
             attestation.observe(&following_writer_status(), Some(8)),
+            None
+        );
+        assert_eq!(attestation.remembered_halt(), None);
+        assert_eq!(attestation.stale_allowance(), None);
+    }
+
+    /// A halt learned outside writer status refuses like one read from it.
+    ///
+    /// It withdraws the staleness allowance, survives a writer that has not
+    /// confirmed its tip, and clears only on a following writer.
+    #[test]
+    fn halt_observed_outside_writer_status_lasts_until_a_following_writer() {
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_mins(1));
+        attestation.attest();
+        let halt = ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(7));
+        let detail = ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        assert_eq!(attestation.remember_halt(detail, Some(7)), halt);
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.remembered_halt(), Some(halt.clone()));
+
+        assert_eq!(
+            attestation.observe(&unconfirmed_writer_status(), Some(7)),
+            Some(halt)
+        );
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
             None
         );
         assert_eq!(attestation.remembered_halt(), None);

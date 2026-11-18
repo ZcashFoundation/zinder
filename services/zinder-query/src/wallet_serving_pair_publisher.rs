@@ -40,6 +40,7 @@ use crate::{
     WalletServingReadPair, ingest_control::wallet_ingest_control_request,
 };
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::{
     sync::{Notify, watch},
@@ -47,11 +48,14 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use zinder_core::{ChainEpochId, Network, NetworkUpgradeActivations};
+use zinder_core::{ChainEpochId, Network, NetworkUpgradeActivations, UnixTimestampMillis};
 use zinder_proto::{
-    v1::ingest::{
-        CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
-        canonical_control_client::CanonicalControlClient,
+    v1::{
+        ingest::{
+            CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
+            canonical_control_client::CanonicalControlClient,
+        },
+        ops::ReorgWindowExceededDetail,
     },
     wire::{canonical_writer_fence_message, decode_canonical_network_upgrade_schedule},
 };
@@ -380,46 +384,71 @@ impl WalletServingPairSlot {
     }
 }
 
-/// Conjunctive readiness owner for one wallet-serving runtime.
+/// Readiness owner for one wallet-serving runtime.
 ///
-/// Pair lifecycle, node-source health, and ingest-control health publish
-/// independent inputs to one [`ComposedReadiness`]. The existing runtime
-/// [`Readiness`] remains the single operations and gRPC projection, but no
-/// input writer can erase another input's failure.
+/// The serving pair alone decides whether the runtime admits traffic, because
+/// every stored read answers from it. Node-source and ingest-control health
+/// are dependencies published as separate inputs to one
+/// [`ComposedReadiness`]: a failing dependency fails only the requests that
+/// call it and appears in the report's degraded dependencies, except that a
+/// canonical writer's halt reported through ingest control still refuses all
+/// traffic. The runtime [`Readiness`] remains the single operations and gRPC
+/// projection, and no input writer can erase another input's observation.
+///
+/// A halt the ingest-control probe observes stays published until the pair
+/// publisher adopts it. The probe's later observations cannot clear it, so a
+/// publisher that missed the park cannot reopen traffic on its pair before it
+/// has validated that pair against a writer that follows again.
 #[derive(Clone, Debug)]
 pub struct WalletServingReadiness {
     composed: ComposedReadiness,
+    ingest_control: Arc<Mutex<IngestControlInput>>,
+}
+
+/// The ingest-control probe's latest observation, and a writer halt it
+/// observed that the pair publisher has not adopted yet.
+#[derive(Debug)]
+struct IngestControlInput {
+    observed: ReadinessCause,
+    unadopted_halt: Option<ReorgWindowExceededDetail>,
+}
+
+impl IngestControlInput {
+    fn published_cause(&self) -> ReadinessCause {
+        self.unadopted_halt
+            .map_or_else(|| self.observed.clone(), ReadinessCause::from)
+    }
 }
 
 impl WalletServingReadiness {
-    /// Starts with the serving pair, node source, and ingest control unadmitted.
+    /// Starts the composition native query and lightwalletd compatibility
+    /// wallet serving share: the serving pair unadmitted, and the node source
+    /// and ingest control as dependencies not yet observed.
+    ///
+    /// Both runtimes call the node only to broadcast, and ingest control for
+    /// mempool reads and unmined transaction lookups, so each runs both
+    /// dependency probes.
     #[must_use]
-    pub fn awaiting_node_and_ingest_control(runtime: Readiness) -> Self {
-        Self::new(
+    pub fn with_node_and_ingest_control(runtime: Readiness) -> Self {
+        Self::with_dependencies(
             runtime,
             &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
         )
     }
 
-    /// Starts with both the serving pair and required node source unadmitted.
-    ///
-    /// Compatibility runtimes that own a separate live-state readiness
-    /// contract use this constructor; native query uses
-    /// [`Self::awaiting_node_and_ingest_control`].
+    /// Starts a composition whose readiness is the serving pair alone.
     #[must_use]
-    pub fn awaiting_node_source(runtime: Readiness) -> Self {
-        Self::new(runtime, &[ReadinessInput::NodeSource])
+    pub fn pair_only(runtime: Readiness) -> Self {
+        Self::with_dependencies(runtime, &[])
     }
 
-    /// Starts a storage-only composition whose node contribution is already satisfied.
-    #[must_use]
-    pub fn without_node_source(runtime: Readiness) -> Self {
-        Self::new(runtime, &[])
-    }
-
-    fn new(runtime: Readiness, required_inputs: &[ReadinessInput]) -> Self {
+    fn with_dependencies(runtime: Readiness, dependency_inputs: &[ReadinessInput]) -> Self {
         Self {
-            composed: ComposedReadiness::new(runtime, required_inputs),
+            composed: ComposedReadiness::with_dependency_inputs(runtime, dependency_inputs),
+            ingest_control: Arc::new(Mutex::new(IngestControlInput {
+                observed: ReadinessCause::Starting,
+                unadopted_halt: None,
+            })),
         }
     }
 
@@ -438,14 +467,56 @@ impl WalletServingReadiness {
         self.composed.publish_admission(pair_state);
     }
 
+    fn publish_served_epoch(&self, committed_at: UnixTimestampMillis) {
+        self.composed
+            .runtime_readiness()
+            .set_served_epoch_committed_at(committed_at);
+    }
+
     fn publish_node_source_cause(&self, node_source_cause: ReadinessCause) {
         self.composed
             .publish_input(ReadinessInput::NodeSource, node_source_cause);
     }
 
+    /// Publishes the ingest-control probe's latest observation.
+    ///
+    /// A writer halt in it stays the published cause, whatever the probe
+    /// observes later, until the pair publisher adopts it.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the input lock must cover publication so a concurrent adoption cannot be overwritten by a stale cause"
+    )]
     fn publish_ingest_control_cause(&self, ingest_control_cause: ReadinessCause) {
+        let mut input = self.ingest_control.lock();
+        if let Some(halt) = ingest_control_cause.reorg_window_exceeded_detail() {
+            input.unadopted_halt = Some(halt);
+        }
+        input.observed = ingest_control_cause;
         self.composed
-            .publish_input(ReadinessInput::IngestControl, ingest_control_cause);
+            .publish_input(ReadinessInput::IngestControl, input.published_cause());
+    }
+
+    /// Hands a writer halt that only the ingest-control probe observed to
+    /// the pair admission, which `adopt` returns, and then republishes the
+    /// probe's latest observation as the dependency.
+    ///
+    /// The admission takes the halt before the dependency releases it, so
+    /// traffic stays refused in between.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the input lock must cover both publications so the probe cannot latch a newer halt between them"
+    )]
+    fn adopt_ingest_control_halt(
+        &self,
+        adopt: impl FnOnce(ReorgWindowExceededDetail) -> ReadinessState,
+    ) {
+        let mut input = self.ingest_control.lock();
+        let Some(halt) = input.unadopted_halt.take() else {
+            return;
+        };
+        self.composed.publish_admission(adopt(halt));
+        self.composed
+            .publish_input(ReadinessInput::IngestControl, input.published_cause());
     }
 }
 
@@ -453,8 +524,11 @@ impl WalletServingReadiness {
 ///
 /// Each observation reaches both `WriterStatus` and a bounded
 /// `MempoolSnapshot` through the same authenticated channel used by pair
-/// publication and live wallet operations. Structural capabilities remain
-/// immutable while a transient failure drains readiness.
+/// publication and live wallet operations. A failure degrades the
+/// ingest-control dependency without closing the traffic gate, except a
+/// parked writer's halt, which refuses traffic until the pair publisher has
+/// adopted it and read a following writer with a confirmed tip that attests
+/// the served pair. Structural capabilities stay immutable either way.
 pub fn spawn_wallet_ingest_control_readiness_probe(
     ingest_control: AdmittedIngestControl,
     readiness: WalletServingReadiness,
@@ -462,37 +536,11 @@ pub fn spawn_wallet_ingest_control_readiness_probe(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_health_was_available = None;
+        let mut observer = IngestControlObserver::default();
         loop {
-            let health_outcome = tokio::select! {
+            let cause = tokio::select! {
                 () = cancel.cancelled() => break,
-                outcome = ingest_control.probe_health() => outcome,
-            };
-            let cause = match health_outcome {
-                Ok(()) => {
-                    if last_health_was_available == Some(false) {
-                        tracing::info!(
-                            target: "zinder::query",
-                            event = "ingest_control_health_recovered",
-                            "admitted ingest-control health recovered"
-                        );
-                    }
-                    last_health_was_available = Some(true);
-                    ReadinessCause::Ready
-                }
-                Err(error) => {
-                    if last_health_was_available != Some(false) {
-                        tracing::warn!(
-                            target: "zinder::query",
-                            event = "ingest_control_health_unavailable",
-                            error_class = error.class(),
-                            error = %error,
-                            "admitted ingest-control health became unavailable"
-                        );
-                    }
-                    last_health_was_available = Some(false);
-                    error.readiness_cause()
-                }
+                cause = observer.observe(&ingest_control) => cause,
             };
             readiness.publish_ingest_control_cause(cause);
 
@@ -504,11 +552,76 @@ pub fn spawn_wallet_ingest_control_readiness_probe(
     })
 }
 
+/// State the ingest-control probe carries from one observation to the next.
+#[derive(Debug, Default)]
+struct IngestControlObserver {
+    /// Whether the last observation found ingest control healthy, so that
+    /// only transitions are logged.
+    last_health_was_available: Option<bool>,
+    /// Outage of the writer's live mempool, which waits on its node, in
+    /// progress across observations.
+    writer_mempool_outage: Option<WalletNodeOutage>,
+}
+
+impl IngestControlObserver {
+    /// Probes ingest control once and returns the cause to publish as the
+    /// ingest-control dependency.
+    async fn observe(&mut self, ingest_control: &AdmittedIngestControl) -> ReadinessCause {
+        let observed = match ingest_control.probe_health().await {
+            Ok(()) => {
+                if self.last_health_was_available == Some(false) {
+                    tracing::info!(
+                        target: "zinder::query",
+                        event = "ingest_control_health_recovered",
+                        "admitted ingest-control health recovered"
+                    );
+                }
+                self.last_health_was_available = Some(true);
+                ReadinessCause::Ready
+            }
+            Err(error) => {
+                if self.last_health_was_available != Some(false) {
+                    tracing::warn!(
+                        target: "zinder::query",
+                        event = "ingest_control_health_unavailable",
+                        error_class = error.class(),
+                        error = %error,
+                        "admitted ingest-control health became unavailable"
+                    );
+                }
+                self.last_health_was_available = Some(false);
+                error.readiness_cause()
+            }
+        };
+        self.continue_writer_mempool_outage(observed)
+    }
+
+    /// Carries the start and failure count of a writer mempool outage across
+    /// observations, so the relayed `node_unavailable` detail grows like the
+    /// node probe's own.
+    fn continue_writer_mempool_outage(&mut self, observed: ReadinessCause) -> ReadinessCause {
+        let ReadinessCause::NodeUnavailable(detail) = observed else {
+            self.writer_mempool_outage = None;
+            return observed;
+        };
+        let continued = WalletNodeOutage::continue_with(
+            self.writer_mempool_outage.as_ref(),
+            detail.failure_class,
+            &detail.last_reason,
+        );
+        let cause = ReadinessCause::NodeUnavailable(continued.detail.clone());
+        self.writer_mempool_outage = Some(continued);
+        cause
+    }
+}
+
 /// Starts the liveness probe for the exact node source admitted by a wallet query.
 ///
 /// Capability discovery remains a startup-only structural operation. This
 /// task observes liveness through `tip_id` and upstream sync health without
-/// mutating the source's cached capability set.
+/// mutating the source's cached capability set. An observed outage degrades
+/// the node-source dependency; it never closes the traffic gate, and
+/// node-backed requests still reach the node, so each fails on its own.
 pub fn spawn_wallet_node_readiness_probe<Source>(
     source: Source,
     native_endpoint_capabilities: &crate::NativeWalletEndpointCapabilities,
@@ -558,14 +671,15 @@ where
                     });
                 }
                 Err(error) => {
-                    let detail = node_unavailable_detail(&error, outage.as_ref());
-                    outage = Some(WalletNodeOutage {
-                        started_at: outage
-                            .as_ref()
-                            .map_or_else(Instant::now, |prior| prior.started_at),
-                        detail: detail.clone(),
-                    });
-                    readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(detail));
+                    let continued = WalletNodeOutage::continue_with(
+                        outage.as_ref(),
+                        error.upstream_classification().label(),
+                        &error.to_string(),
+                    );
+                    readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
+                        continued.detail.clone(),
+                    ));
+                    outage = Some(continued);
                 }
             }
 
@@ -590,23 +704,28 @@ struct WalletNodeOutage {
     detail: NodeUnavailableDetail,
 }
 
-fn node_unavailable_detail(
-    error: &SourceError,
-    prior_outage: Option<&WalletNodeOutage>,
-) -> NodeUnavailableDetail {
-    let failure_class = error.upstream_classification().label();
-    let last_reason = Cow::Owned(truncate_readiness_reason(&error.to_string()));
-    if let Some(prior_outage) = prior_outage {
+impl WalletNodeOutage {
+    /// Records one more failed observation of the node: it continues `prior`
+    /// when an outage is already in progress and starts one otherwise.
+    fn continue_with(prior: Option<&Self>, failure_class: &'static str, reason: &str) -> Self {
+        let last_reason = Cow::Owned(truncate_readiness_reason(reason));
+        let Some(prior) = prior else {
+            return Self {
+                started_at: Instant::now(),
+                detail: NodeUnavailableDetail::first_iteration(failure_class, last_reason),
+            };
+        };
         let outage_seconds =
-            u32::try_from(prior_outage.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
-        NodeUnavailableDetail::extend_with(
-            &prior_outage.detail,
-            failure_class,
-            last_reason,
-            outage_seconds,
-        )
-    } else {
-        NodeUnavailableDetail::first_iteration(failure_class, last_reason)
+            u32::try_from(prior.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
+        Self {
+            started_at: prior.started_at,
+            detail: NodeUnavailableDetail::extend_with(
+                &prior.detail,
+                failure_class,
+                last_reason,
+                outage_seconds,
+            ),
+        }
     }
 }
 
@@ -629,7 +748,7 @@ fn upstream_not_ready_detail(snapshot: UpstreamHealthSnapshot) -> UpstreamNotRea
         upstream_estimated_height: snapshot.upstream_estimated_height,
         upstream_verification_progress: snapshot.upstream_verification_progress,
         upstream_health: UpstreamHealth {
-            source: snapshot.source,
+            source: Cow::Borrowed(snapshot.source),
             reason: snapshot.reason,
         },
     }
@@ -653,10 +772,7 @@ pub enum WalletServingPairError {
         #[source]
         source: std::io::Error,
     },
-    /// The compatibility runtime could not connect to canonical writer status.
-    ///
-    /// P3 replaces this endpoint-only path with compatibility-specific
-    /// ingest-control admission.
+    /// A bare writer-status endpoint could not be connected.
     #[error(transparent)]
     WriterStatusConnect(#[from] BearerTokenConnectError),
     /// The private canonical-control RPC failed.
@@ -757,10 +873,12 @@ pub struct WalletServingPairPublisher {
 }
 
 impl WalletServingPairPublisher {
-    /// Bootstraps the current compatibility pair from its writer-status endpoint.
+    /// Bootstraps a pair from a bare writer-status endpoint, without
+    /// ingest-control admission.
     ///
-    /// This preserves the pre-P3 compatibility composition without applying
-    /// native wallet admission requirements to it.
+    /// The release runtimes bootstrap through
+    /// [`Self::bootstrap_with_admitted_ingest_control`]; this entry point
+    /// serves an embedding that reaches only `CanonicalControl`.
     pub async fn bootstrap_from_writer_status_endpoint(
         config: WalletServingPairConfig,
         readiness: WalletServingReadiness,
@@ -772,7 +890,8 @@ impl WalletServingPairPublisher {
         Self::bootstrap_with_writer_status(config, readiness, writer_status).await
     }
 
-    /// Bootstraps the native pair through its already-admitted ingest channel.
+    /// Bootstraps the pair through the runtime's already-admitted ingest
+    /// channel.
     pub async fn bootstrap_with_admitted_ingest_control(
         config: WalletServingPairConfig,
         readiness: WalletServingReadiness,
@@ -909,6 +1028,7 @@ impl WalletServingPairPublisher {
             .as_ref()
             .ok_or(WalletServingPairError::PairSlotUnavailable)?;
         let active_pair = serving_pair_slot.capture();
+        self.adopt_ingest_control_halt(&active_pair);
         let writer_status = self.writer_status.fetch().await?;
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
         // A pair missing a table file is replaced at the writer's fence even
@@ -1425,12 +1545,15 @@ impl WalletServingPairPublisher {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
-        let (pair, readers) = tokio::task::spawn_blocking(move || {
+        let (pair, readers, served_epoch) = tokio::task::spawn_blocking(move || {
             let readers = PublishedReaders::new(*candidate);
             let canonical: Arc<dyn CanonicalReader> = readers.canonical.clone();
             let wallet: Arc<dyn WalletProjectionReader> = readers.wallet.clone();
+            // The commit time only reports how stale the served view is, so a
+            // failed read leaves the previous one in place.
+            let served_epoch = canonical.chain_epoch().ok();
             WalletServingReadPair::new(canonical, wallet)
-                .map(|pair| (Arc::new(pair), readers))
+                .map(|pair| (Arc::new(pair), readers, served_epoch))
                 .map_err(WalletServingPairError::PairPublication)
         })
         .await
@@ -1456,6 +1579,9 @@ impl WalletServingPairPublisher {
         if refusal.is_none() {
             self.writer_attestation.attest();
         }
+        if let Some(served_epoch) = served_epoch {
+            self.readiness.publish_served_epoch(served_epoch.created_at);
+        }
         self.readiness
             .publish_pair_state(refusal.unwrap_or_else(|| ReadinessState::ready(visible_height)));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
@@ -1469,6 +1595,22 @@ impl WalletServingPairPublisher {
             "published exact immutable canonical and wallet secondary pair"
         );
         Ok(())
+    }
+
+    /// Takes over a writer halt that only the ingest-control probe observed,
+    /// as if this publisher had read it from writer status.
+    ///
+    /// The halt then withdraws the staleness allowance and refuses traffic on
+    /// `active_pair` until a writer status read after this call shows a
+    /// following writer with a confirmed tip. The same refresh validates the
+    /// pair's fence against that status before it publishes an admitting
+    /// state, so a probe that sees the writer recover cannot reopen traffic
+    /// on a pair the recovered writer no longer attests.
+    fn adopt_ingest_control_halt(&mut self, active_pair: &WalletServingReadPair) {
+        let visible_height = Some(active_pair.canonical_fence().visible_tip().height.value());
+        self.readiness.adopt_ingest_control_halt(|halt| {
+            self.writer_attestation.remember_halt(halt, visible_height)
+        });
     }
 
     fn update_active_readiness(
@@ -2166,12 +2308,12 @@ mod tests {
     };
 
     use super::{
-        CandidatePreparationCounts, CanonicalFenceRelation, RETAINED_PAIR_WINDOW,
-        SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
-        WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
-        WalletServingPairSlot, WalletServingReadiness, candidate_admission_outcome,
-        classify_canonical_writer_fence, classify_pair_admission, error_with_sources,
-        missing_table_file_reported, refresh_failure_is_routine_lag,
+        CandidatePreparationCounts, CanonicalFenceRelation, IngestControlObserver,
+        RETAINED_PAIR_WINDOW, SECONDARY_GENERATION_COUNT, SecondaryGenerationState,
+        WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
+        WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
+        candidate_admission_outcome, classify_canonical_writer_fence, classify_pair_admission,
+        error_with_sources, missing_table_file_reported, refresh_failure_is_routine_lag,
         refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
         spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
         wallet_ingest_control_request, wallet_source_writer_fence,
@@ -2186,10 +2328,21 @@ mod tests {
         sample_regtest_upgrade_activations,
     };
 
+    fn degraded_inputs(runtime: &zinder_runtime::Readiness) -> Vec<zinder_runtime::ReadinessInput> {
+        runtime
+            .report()
+            .degraded
+            .into_iter()
+            .map(|dependency| dependency.input)
+            .collect()
+    }
+
     #[test]
-    fn wallet_serving_readiness_retains_pair_node_and_ingest_failures_independently() {
+    fn wallet_serving_readiness_follows_the_pair_and_reports_dependencies_independently() {
+        use zinder_runtime::ReadinessInput::{IngestControl, NodeSource};
+
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         let visible_height = Some(42);
         let node_failure = zinder_runtime::ReadinessCause::NodeUnavailable(
             zinder_runtime::NodeUnavailableDetail::first_iteration(
@@ -2197,29 +2350,27 @@ mod tests {
                 "test node outage",
             ),
         );
-
-        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
         assert!(matches!(
             runtime.report().cause,
             zinder_runtime::ReadinessCause::Starting
         ));
 
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
+        assert!(runtime.report().is_ready);
+        assert_eq!(degraded_inputs(&runtime), [NodeSource, IngestControl]);
+
         readiness.publish_node_source_cause(node_failure.clone());
-        assert_eq!(runtime.report().cause, node_failure);
         readiness
             .publish_ingest_control_cause(zinder_runtime::ReadinessCause::IngestControlUnavailable);
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
-        assert_eq!(runtime.report().cause, node_failure);
+        let report = runtime.report();
+        assert!(report.is_ready);
+        assert_eq!(report.current_height, visible_height);
+        assert_eq!(report.degraded[0].cause, node_failure);
 
         readiness.publish_pair_state(zinder_runtime::ReadinessState::replica_lagging(
             2,
             visible_height,
-        ));
-        assert!(matches!(
-            runtime.report().cause,
-            zinder_runtime::ReadinessCause::ReplicaLagging {
-                lag_chain_epochs: 2
-            }
         ));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         assert!(matches!(
@@ -2228,18 +2379,15 @@ mod tests {
                 lag_chain_epochs: 2
             }
         ));
+        assert_eq!(degraded_inputs(&runtime), [IngestControl]);
 
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
-        assert!(matches!(
-            runtime.report().cause,
-            zinder_runtime::ReadinessCause::IngestControlUnavailable
-        ));
+        assert!(runtime.report().is_ready);
         readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
-        assert!(matches!(
-            runtime.report().cause,
-            zinder_runtime::ReadinessCause::Ready
-        ));
-        readiness.publish_node_source_cause(node_failure.clone());
+        assert!(runtime.report().is_ready);
+        assert!(degraded_inputs(&runtime).is_empty());
+
+        readiness.publish_node_source_cause(node_failure);
         readiness.publish_pair_state(zinder_runtime::ReadinessState::not_ready(
             zinder_runtime::ReadinessCause::StorageUnavailable,
         ));
@@ -2248,7 +2396,8 @@ mod tests {
             zinder_runtime::ReadinessCause::StorageUnavailable
         ));
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
-        assert_eq!(runtime.report().cause, node_failure);
+        assert!(runtime.report().is_ready);
+        assert_eq!(degraded_inputs(&runtime), [NodeSource]);
 
         readiness.publish_shutting_down();
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(visible_height));
@@ -2261,11 +2410,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_recovery_cannot_erase_another_readiness_input_failure() {
+    fn concurrent_recovery_cannot_erase_another_dependency_degradation() {
         const ITERATIONS: usize = 2_048;
 
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(42)));
         let iteration_start = Arc::new(Barrier::new(3));
         let iteration_complete = Arc::new(Barrier::new(3));
@@ -2307,19 +2456,17 @@ mod tests {
                 readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
                 iteration_start.wait();
                 iteration_complete.wait();
-                assert!(
-                    matches!(
-                        runtime.report().cause,
-                        zinder_runtime::ReadinessCause::IngestControlUnavailable
-                    ),
-                    "concurrent node recovery erased ingest failure at iteration {iteration}"
+                assert_eq!(
+                    degraded_inputs(&runtime),
+                    [zinder_runtime::ReadinessInput::IngestControl],
+                    "concurrent node recovery erased ingest degradation at iteration {iteration}"
                 );
             }
         });
     }
 
     #[tokio::test]
-    async fn wallet_node_probe_drains_and_recovers_without_changing_capabilities()
+    async fn wallet_node_probe_degrades_and_recovers_without_changing_capabilities()
     -> Result<(), Box<dyn std::error::Error>> {
         let source = MutableHealthSource::new()?;
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
@@ -2333,8 +2480,9 @@ mod tests {
         );
         let admitted_capabilities = capabilities.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_source(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source.clone(),
@@ -2344,40 +2492,42 @@ mod tests {
             cancel.clone(),
         )?;
 
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
         assert!(traffic_gate.call(Request::new(())).is_ok());
         source.available.store(false, Ordering::SeqCst);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::NodeUnavailable(_))
+        wait_for_report(&runtime, |report| {
+            matches!(
+                report.degraded.as_slice(),
+                [zinder_runtime::ReadinessDependency {
+                    input: zinder_runtime::ReadinessInput::NodeSource,
+                    cause: zinder_runtime::ReadinessCause::NodeUnavailable(_),
+                }]
+            )
         })
         .await?;
-        assert!(matches!(
-            traffic_gate.call(Request::new(())),
-            Err(status) if status.code() == Code::Unavailable
-        ));
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
         assert_eq!(capabilities, admitted_capabilities);
 
         source.available.store(true, Ordering::SeqCst);
         source.synchronized.store(false, Ordering::SeqCst);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::UpstreamNotReady(_))
+        wait_for_report(&runtime, |report| {
+            matches!(
+                report.degraded.as_slice(),
+                [zinder_runtime::ReadinessDependency {
+                    input: zinder_runtime::ReadinessInput::NodeSource,
+                    cause: zinder_runtime::ReadinessCause::UpstreamNotReady(_),
+                }]
+            )
         })
         .await?;
-        assert!(matches!(
-            traffic_gate.call(Request::new(())),
-            Err(status) if status.code() == Code::Unavailable
-        ));
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
         assert_eq!(capabilities, admitted_capabilities);
 
         source.synchronized.store(true, Ordering::SeqCst);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         assert!(traffic_gate.call(Request::new(())).is_ok());
         assert_eq!(capabilities, admitted_capabilities);
 
@@ -2388,8 +2538,8 @@ mod tests {
     }
 
     /// Tree state is served from storage, so a node that advertises it but
-    /// not broadcast backs no operation, and its outage does not drain the
-    /// runtime.
+    /// not broadcast backs no operation, and its outage is not reported as a
+    /// degraded dependency.
     #[tokio::test]
     async fn wallet_node_probe_ignores_a_node_that_backs_no_operation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2411,8 +2561,9 @@ mod tests {
         );
         assert!(capabilities.contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_source(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source,
@@ -2422,15 +2573,14 @@ mod tests {
             cancel.clone(),
         )?;
 
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        wait_for_report(&runtime, |report| {
+            report.is_ready && report.degraded.is_empty()
         })
         .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(matches!(
-            runtime.report().cause,
-            zinder_runtime::ReadinessCause::Ready
-        ));
+        let report = runtime.report();
+        assert!(report.is_ready);
+        assert!(report.degraded.is_empty());
 
         cancel.cancel();
         handle.await?;
@@ -2453,7 +2603,7 @@ mod tests {
             &admitted_ingest_control,
         );
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_source(runtime);
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source.clone(),
@@ -2484,7 +2634,7 @@ mod tests {
                 .await?;
         let direct_ingest_control = admitted_ingest_control.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2495,8 +2645,8 @@ mod tests {
             cancel.clone(),
         );
 
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        wait_for_report(&runtime, |report| {
+            report.is_ready && report.degraded.is_empty()
         })
         .await?;
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
@@ -2533,12 +2683,17 @@ mod tests {
     #[tokio::test]
     async fn wallet_ingest_control_probe_projects_a_parked_writer_as_a_typed_halt()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest_fixture = IngestControlFixtureService::new(Network::ZcashRegtest);
+        let writer_control = WriterControlFixture::spawn(
+            ingest_fixture.clone(),
+            MutableCanonicalControl::new(following_writer_status()),
+        )
+        .await?;
         let admitted_ingest_control =
-            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+            AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2548,8 +2703,8 @@ mod tests {
             Duration::from_millis(5),
             cancel.clone(),
         );
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        wait_for_report(&runtime, |report| {
+            report.is_ready && report.degraded.is_empty()
         })
         .await?;
 
@@ -2587,7 +2742,22 @@ mod tests {
             .ok_or("a parked writer must close the wallet traffic gate")?;
         assert_eq!(halted.code(), Code::FailedPrecondition);
 
+        // The probe alone cannot clear the halt: it waits for the publisher,
+        // which takes it over and clears it on a writer status that also
+        // attests the served pair.
         ingest_fixture.set_reorg_window_exceeded(None);
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        wait_for_probe_observation(&readiness, |observed| {
+            matches!(observed, zinder_runtime::ReadinessCause::Ready)
+        })
+        .await?;
+        assert!(matches!(
+            runtime.report().cause,
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded { .. }
+        ));
+        readiness.adopt_ingest_control_halt(|halt| {
+            zinder_runtime::ReadinessState::not_ready(zinder_runtime::ReadinessCause::from(halt))
+        });
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         wait_for_readiness_cause(&runtime, |cause| {
             matches!(cause, zinder_runtime::ReadinessCause::Ready)
@@ -2596,12 +2766,88 @@ mod tests {
 
         cancel.cancel();
         handle.await?;
-        ingest_fixture.shutdown().await?;
-        Ok(())
+        writer_control.shutdown().await
     }
 
+    /// A writer halt the ingest-control probe observed outlasts every later
+    /// probe observation.
+    ///
+    /// It keeps refusing traffic through a control outage and through a
+    /// writer that follows again, even while the pair publisher, which has
+    /// not seen the halt, admits traffic on its stale pair. Only the
+    /// publisher's adoption moves it, into the pair admission, after which
+    /// the dependency reports the probe's latest observation again.
     #[tokio::test]
-    async fn wallet_ingest_control_probe_drains_for_hydration_and_recovers()
+    async fn wallet_ingest_control_probe_halt_outlasts_later_observations_until_adopted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture = IngestControlFixtureService::new(Network::ZcashRegtest);
+        let writer_control = WriterControlFixture::spawn(
+            ingest_fixture.clone(),
+            MutableCanonicalControl::new(following_writer_status()),
+        )
+        .await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
+                .await?;
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::serving_pair_stale(
+            0,
+            1,
+            Some(1),
+        ));
+        readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let mut observer = IngestControlObserver::default();
+        let is_halted = |runtime: &zinder_runtime::Readiness| {
+            let report = runtime.report();
+            !report.is_ready
+                && matches!(
+                    report.cause,
+                    zinder_runtime::ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
+                )
+        };
+
+        ingest_fixture.set_reorg_window_exceeded(Some(
+            zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            },
+        ));
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(is_halted(&runtime), "{:?}", runtime.report());
+
+        ingest_fixture.set_health_available(false);
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(
+            is_halted(&runtime),
+            "a control outage must not reopen traffic on a parked writer's chain: {:?}",
+            runtime.report()
+        );
+
+        ingest_fixture.set_reorg_window_exceeded(None);
+        ingest_fixture.set_health_available(true);
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(
+            is_halted(&runtime),
+            "a following writer seen only by the probe must not reopen traffic: {:?}",
+            runtime.report()
+        );
+
+        readiness.adopt_ingest_control_halt(|halt| {
+            zinder_runtime::ReadinessState::not_ready(zinder_runtime::ReadinessCause::from(halt))
+        });
+        let adopted = runtime.report();
+        assert!(is_halted(&runtime), "{adopted:?}");
+        assert!(adopted.degraded.is_empty(), "{adopted:?}");
+
+        writer_control.shutdown().await
+    }
+
+    /// Snapshot refusals degrade the ingest-control dependency by what they
+    /// mean, and none drains the reader.
+    #[tokio::test]
+    async fn wallet_ingest_control_probe_classifies_snapshot_refusals_without_draining()
     -> Result<(), Box<dyn std::error::Error>> {
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
         let stale_status = zinder_proto::status_for_reason(
@@ -2613,7 +2859,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2623,55 +2869,54 @@ mod tests {
             Duration::from_millis(5),
             cancel.clone(),
         );
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
+        // A hydrating writer answers with a typed refusal: ingest control
+        // answers, and the dependency reports the writer's node outage that
+        // fails mempool calls, growing across observations.
+        ingest_fixture.set_mempool_snapshot_error(Some(zinder_proto::status_for_reason(
+            ErrorReason::NodeUnavailable,
+            "live mempool index is hydrating from an upstream snapshot",
+        )));
+        wait_for_report(&runtime, |report| {
+            report.degraded.iter().any(|dependency| {
+                dependency.input == zinder_runtime::ReadinessInput::IngestControl
+                    && matches!(
+                        &dependency.cause,
+                        zinder_runtime::ReadinessCause::NodeUnavailable(detail)
+                            if detail.consecutive_failures > 1
+                                && detail.failure_class == "stream_disconnected"
+                    )
+            })
+        })
+        .await?;
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
+
+        // An untyped unavailable status is indistinguishable from a transport
+        // failure.
         ingest_fixture.set_mempool_snapshot_error(Some(Status::unavailable(
             "fixture mempool hydration is unavailable",
         )));
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(
-                cause,
-                zinder_runtime::ReadinessCause::IngestControlUnavailable
-            )
-        })
-        .await?;
-        assert!(matches!(
-            traffic_gate.call(Request::new(())),
-            Err(status) if status.code() == Code::Unavailable
-        ));
+        wait_for_report(&runtime, ingest_control_is_unavailable).await?;
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
 
         ingest_fixture.set_mempool_snapshot_error(None);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
         ingest_fixture.set_mempool_snapshot_error(Some(stale_status));
         ingest_fixture.set_health_available(false);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(
-                cause,
-                zinder_runtime::ReadinessCause::IngestControlUnavailable
-            )
-        })
-        .await?;
-        assert!(matches!(
-            traffic_gate.call(Request::new(())),
-            Err(status) if status.code() == Code::Unavailable
-        ));
+        wait_for_report(&runtime, ingest_control_is_unavailable).await?;
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
 
         ingest_fixture.set_health_available(true);
         ingest_fixture.set_mempool_snapshot_error(None);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
         cancel.cancel();
@@ -2680,8 +2925,67 @@ mod tests {
         Ok(())
     }
 
+    /// A writer whose node is syncing reports `upstream_not_ready` in its
+    /// `WriterStatus`. Native query relays that observation as its
+    /// ingest-control dependency and keeps serving.
     #[tokio::test]
-    async fn wallet_ingest_control_probe_drains_and_recovers_without_changing_capabilities()
+    async fn wallet_ingest_control_probe_relays_a_writer_upstream_not_ready_without_draining()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_ingest_control_readiness_probe(
+            admitted_ingest_control,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+
+        ingest_fixture.set_upstream_not_ready(Some(
+            zinder_proto::v1::ops::UpstreamNotReadyDetail {
+                upstream_committed_height: Some(1),
+                upstream_estimated_height: Some(40),
+                upstream_verification_progress: Some(0.4),
+                upstream_health_source: "zebra_ready_endpoint".to_owned(),
+                upstream_health_reason: "syncing".to_owned(),
+            },
+        ));
+        wait_for_report(&runtime, |report| !report.degraded.is_empty()).await?;
+        let report = runtime.report();
+        assert!(report.is_ready);
+        assert_eq!(report.cause, zinder_runtime::ReadinessCause::Ready);
+        let [
+            zinder_runtime::ReadinessDependency {
+                input: zinder_runtime::ReadinessInput::IngestControl,
+                cause: zinder_runtime::ReadinessCause::UpstreamNotReady(detail),
+            },
+        ] = report.degraded.as_slice()
+        else {
+            return Err(format!("unexpected degraded dependencies {:?}", report.degraded).into());
+        };
+        assert_eq!(detail.upstream_estimated_height, Some(40));
+        assert_eq!(detail.upstream_health.reason, "syncing");
+        let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        assert!(traffic_gate.call(Request::new(())).is_ok());
+
+        ingest_fixture.set_upstream_not_ready(None);
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+
+        cancel.cancel();
+        handle.await?;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wallet_ingest_control_probe_degrades_and_recovers_without_changing_capabilities()
     -> Result<(), Box<dyn std::error::Error>> {
         let log_capture = LogCapture::install_for_target("zinder::query");
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
@@ -2695,7 +2999,7 @@ mod tests {
         );
         let admitted_capabilities = capabilities.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2706,33 +3010,18 @@ mod tests {
             cancel.clone(),
         );
 
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
         ingest_fixture.set_health_available(false);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(
-                cause,
-                zinder_runtime::ReadinessCause::IngestControlUnavailable
-            )
-        })
-        .await?;
+        wait_for_report(&runtime, ingest_control_is_unavailable).await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(matches!(
-            traffic_gate.call(Request::new(())),
-            Err(status) if status.code() == Code::Unavailable
-        ));
+        assert!(traffic_gate.call(Request::new(())).is_ok());
         assert_eq!(capabilities, admitted_capabilities);
 
         ingest_fixture.set_health_available(true);
-        wait_for_readiness_cause(&runtime, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
         assert!(traffic_gate.call(Request::new(())).is_ok());
         assert_eq!(capabilities, admitted_capabilities);
 
@@ -2765,6 +3054,48 @@ mod tests {
         Ok(())
     }
 
+    fn ingest_control_is_unavailable(report: &zinder_runtime::ReadinessReport) -> bool {
+        matches!(
+            report.degraded.as_slice(),
+            [zinder_runtime::ReadinessDependency {
+                input: zinder_runtime::ReadinessInput::IngestControl,
+                cause: zinder_runtime::ReadinessCause::IngestControlUnavailable,
+            }]
+        )
+    }
+
+    async fn wait_for_report(
+        readiness: &zinder_runtime::Readiness,
+        predicate: impl Fn(&zinder_runtime::ReadinessReport) -> bool + Send + Sync,
+    ) -> Result<(), &'static str> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if predicate(&readiness.report()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for readiness report")
+    }
+
+    async fn wait_for_probe_observation(
+        readiness: &WalletServingReadiness,
+        predicate: impl Fn(&zinder_runtime::ReadinessCause) -> bool + Send + Sync,
+    ) -> Result<(), &'static str> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if predicate(&readiness.ingest_control.lock().observed) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for the ingest-control probe observation")
+    }
+
     async fn wait_for_readiness_cause(
         readiness: &zinder_runtime::Readiness,
         predicate: impl Fn(&zinder_runtime::ReadinessCause) -> bool + Send + Sync,
@@ -2781,28 +3112,229 @@ mod tests {
         .map_err(|_| "timed out waiting for readiness cause")
     }
 
+    /// A node outage leaves every stored read serving through the traffic gate.
+    ///
+    /// Only a call that needs the node fails, on its own with
+    /// `NODE_UNAVAILABLE`, while `/readyz` lists the outage as a degraded
+    /// dependency.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the outage and recovery read as one end-to-end sequence over one composition"
+    )]
+    async fn node_outage_fails_only_node_calls_and_keeps_stored_reads_serving()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = MutableHealthSource::with_capabilities(NodeCapabilities::new([
+            NodeCapability::OpenRpcDiscovery,
+            NodeCapability::TipId,
+            NodeCapability::TreeState,
+            NodeCapability::TransactionBroadcast,
+        ])?);
+        let activations = Arc::new(sample_regtest_upgrade_activations());
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(crate::WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let visible_height = pair.canonical_fence().visible_tip().height.value();
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let query = WalletServingQuery::from_admitted_native_sources(
+            WalletServingPairSlot::new(pair),
+            source.clone(),
+            ingest_control.clone(),
+            Arc::clone(&activations),
+        )?;
+        assert!(
+            query
+                .native_endpoint_capabilities()
+                .contains(zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1)
+        );
+
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(visible_height)));
+        let cancel = CancellationToken::new();
+        let node_probe = spawn_wallet_node_readiness_probe(
+            source.clone(),
+            query.native_endpoint_capabilities(),
+            readiness.clone(),
+            Duration::from_millis(5),
+            cancel.clone(),
+        )?;
+        let ingest_probe = spawn_wallet_ingest_control_readiness_probe(
+            ingest_control,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        let ops_port_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let ops_address = ops_port_reservation.local_addr()?;
+        drop(ops_port_reservation);
+        let ops_handle = zinder_runtime::spawn_ops_endpoint(
+            ops_address,
+            zinder_runtime::OpsServer {
+                service_name: "zinder-query-test",
+                service_version: "0.0.0",
+                network_name: "zcash-regtest",
+                advertised_capabilities: query.native_endpoint_capabilities().shared_identifiers(),
+            },
+            runtime.clone(),
+        )
+        .await?;
+        let wallet_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let wallet_endpoint = format!("http://{}", wallet_listener.local_addr()?);
+        let grpc_adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+        let traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        let wallet_server = tokio::spawn({
+            let shutdown = cancel.clone().cancelled_owned();
+            async move {
+                Server::builder()
+                    .add_service(tonic::service::interceptor::InterceptedService::new(
+                        grpc_adapter.into_server(),
+                        traffic_gate,
+                    ))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(wallet_listener), shutdown)
+                    .await
+            }
+        });
+        let mut wallet_client = WalletQueryClient::connect(wallet_endpoint).await?;
+        wait_for_readyz(ops_address, |readyz| {
+            readyz["cause"] == "ready" && readyz.get("degraded").is_none()
+        })
+        .await?;
+
+        source.available.store(false, Ordering::SeqCst);
+        let outage_readyz = wait_for_readyz(ops_address, |readyz| {
+            readyz["degraded"][0]["input"] == "node_source"
+        })
+        .await?;
+        assert_eq!(outage_readyz["status"], "ready");
+        assert_eq!(outage_readyz["cause"], "ready");
+        assert_eq!(
+            outage_readyz["degraded"][0]["dependency_cause"]["node_unavailable"]["failure_class"],
+            "node_unreachable"
+        );
+        assert_eq!(
+            outage_readyz["degraded"].as_array().map(Vec::len),
+            Some(1),
+            "{outage_readyz}"
+        );
+
+        let outage_tip = wallet_client
+            .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+            .await?
+            .into_inner()
+            .visible_tip_block
+            .ok_or("the visible-tip response must contain a block during a node outage")?;
+        assert_eq!(outage_tip.height, visible_height);
+        let outage_block = wallet_client
+            .compact_block(wallet::CompactBlockRequest {
+                height: visible_height,
+                at_epoch_id: None,
+            })
+            .await?
+            .into_inner()
+            .compact_block
+            .ok_or("the compact-block response must contain a block during a node outage")?;
+        assert_eq!(outage_block.height, visible_height);
+        let broadcast_attempts = source.broadcast_attempts.load(Ordering::SeqCst);
+        let refused_broadcast = wallet_client
+            .broadcast_transaction(wallet::BroadcastTransactionRequest {
+                raw_transaction: vec![0x05; 32],
+            })
+            .await
+            .err()
+            .ok_or("a broadcast must fail while the node is unavailable")?;
+        assert_eq!(refused_broadcast.code(), Code::Unavailable);
+        let refused_details = refused_broadcast.get_error_details();
+        assert_eq!(
+            refused_details
+                .error_info()
+                .map(|error_info| error_info.reason.as_str()),
+            Some(ErrorReason::NodeUnavailable.as_str_name())
+        );
+        assert_eq!(
+            source.broadcast_attempts.load(Ordering::SeqCst),
+            broadcast_attempts + 1,
+            "the broadcast must reach the node instead of failing on the probe's last observation"
+        );
+
+        source.available.store(true, Ordering::SeqCst);
+        wait_for_readyz(ops_address, |readyz| readyz.get("degraded").is_none()).await?;
+        wallet_client
+            .broadcast_transaction(wallet::BroadcastTransactionRequest {
+                raw_transaction: vec![0x05; 32],
+            })
+            .await?;
+
+        cancel.cancel();
+        node_probe.await?;
+        ingest_probe.await?;
+        wallet_server.await??;
+        ops_handle.shutdown().await?;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct MutableHealthSource {
         available: Arc<AtomicBool>,
         synchronized: Arc<AtomicBool>,
         stalled: Arc<AtomicBool>,
         stalled_request_started: Arc<tokio::sync::Notify>,
+        broadcast_attempts: Arc<std::sync::atomic::AtomicUsize>,
         capabilities: NodeCapabilities,
     }
 
     impl MutableHealthSource {
         fn new() -> Result<Self, zinder_source::NodeCapabilitiesError> {
-            Ok(Self {
+            Ok(Self::with_capabilities(NodeCapabilities::new([
+                NodeCapability::TipId,
+                NodeCapability::TransactionBroadcast,
+                NodeCapability::OpenRpcDiscovery,
+            ])?))
+        }
+
+        fn with_capabilities(capabilities: NodeCapabilities) -> Self {
+            Self {
                 available: Arc::new(AtomicBool::new(true)),
                 synchronized: Arc::new(AtomicBool::new(true)),
                 stalled: Arc::new(AtomicBool::new(false)),
                 stalled_request_started: Arc::new(tokio::sync::Notify::new()),
-                capabilities: NodeCapabilities::new([
-                    NodeCapability::TipId,
-                    NodeCapability::TransactionBroadcast,
-                    NodeCapability::OpenRpcDiscovery,
-                ])?,
+                broadcast_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                capabilities,
+            }
+        }
+
+        fn outage_error(&self) -> Option<SourceError> {
+            (!self.available.load(Ordering::SeqCst)).then(|| SourceError::NodeUnavailable {
+                reason: "synthetic transient node outage".to_owned(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl zinder_source::TransactionBroadcaster for MutableHealthSource {
+        async fn broadcast_transaction(
+            &self,
+            _raw_transaction: zinder_core::RawTransactionBytes,
+        ) -> Result<zinder_core::TransactionBroadcastOutcome, SourceError> {
+            self.broadcast_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some(outage) = self.outage_error() {
+                return Err(outage);
+            }
+            Ok(zinder_core::TransactionBroadcastOutcome::Accepted(
+                zinder_core::BroadcastAccepted {
+                    transaction_id: zinder_core::TransactionId::from_bytes([0x05; 32]),
+                },
+            ))
         }
     }
 
@@ -3056,7 +3588,7 @@ mod tests {
                     temporary.path().join("wallet-secondaries"),
                     Arc::new(activations.clone()),
                 )?,
-                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
                 &endpoint,
                 None,
             )
@@ -3152,7 +3684,7 @@ mod tests {
                     temporary.path().join("wallet-secondaries"),
                     Arc::new(activations.clone()),
                 )?,
-                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
                 &endpoint,
                 None,
             )
@@ -3298,7 +3830,7 @@ mod tests {
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                 config,
-                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
                 &endpoint,
                 None,
             )
@@ -3561,7 +4093,7 @@ mod tests {
                     temporary.path().join("wallet-secondaries"),
                     Arc::new(activations.clone()),
                 )?,
-                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
                 &endpoint,
                 None,
             )
@@ -3682,7 +4214,7 @@ mod tests {
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                 config,
-                WalletServingReadiness::without_node_source(readiness.clone()),
+                WalletServingReadiness::pair_only(readiness.clone()),
                 &endpoint,
                 None,
             )
@@ -3712,8 +4244,8 @@ mod tests {
         Ok(())
     }
 
-    /// The compatibility composition refuses a writer that has not confirmed
-    /// its tip since it reopened.
+    /// The serving pair refuses a writer that has not confirmed its tip since
+    /// it reopened.
     ///
     /// It stays unready with `canonical_tip_unconfirmed`, never
     /// `serving_pair_stale`, through a writer-status outage, keeps a
@@ -3724,7 +4256,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "bootstrap, outage, recovery, a park, and the restarted writer form one causal sequence"
     )]
-    async fn compatibility_pair_refuses_a_writer_with_an_unconfirmed_tip()
+    async fn pair_refuses_a_writer_with_an_unconfirmed_tip()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
@@ -3762,7 +4294,8 @@ mod tests {
             }
         });
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let (mut publisher, _slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
@@ -3829,17 +4362,18 @@ mod tests {
         Ok(())
     }
 
-    /// The compatibility composition refuses a parked writer with its halt.
+    /// The serving pair refuses a parked writer with its halt.
     ///
-    /// A parked writer keeps attesting its frozen fence, and compatibility has
-    /// no ingest-control probe, so the halt must come from canonical writer
-    /// status: at bootstrap, on every refresh, and until the writer clears it.
+    /// A parked writer keeps attesting its frozen fence, so the publisher
+    /// reads the halt from canonical writer status itself, with no
+    /// ingest-control probe running: at bootstrap, on every refresh, and
+    /// until the writer clears it.
     #[tokio::test(flavor = "multi_thread")]
     #[expect(
         clippy::too_many_lines,
         reason = "bootstrap, recovery, a second park, and the following outage form one causal halt sequence"
     )]
-    async fn compatibility_pair_refuses_a_parked_writer_with_the_typed_halt()
+    async fn pair_refuses_a_parked_writer_with_the_typed_halt()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
@@ -3883,7 +4417,8 @@ mod tests {
         });
 
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let (mut publisher, _slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
@@ -3996,7 +4531,7 @@ mod tests {
                     temporary.path().join("wallet-secondaries"),
                     Arc::new(activations),
                 )?,
-                WalletServingReadiness::without_node_source(readiness.clone()),
+                WalletServingReadiness::pair_only(readiness.clone()),
                 &endpoint,
                 None,
             )
@@ -4011,6 +4546,134 @@ mod tests {
             parked.cause,
             zinder_runtime::ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
         ));
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
+    /// A halt that only the ingest-control probe observed keeps refusing
+    /// traffic until the publisher has validated its pair against a following
+    /// writer.
+    ///
+    /// The publisher never read the halt from writer status, so its pair
+    /// still admits traffic and its staleness allowance still runs. Once it
+    /// adopts the probe's halt, a status without a fence keeps the halt, a
+    /// writer far ahead refuses the pair as lagging instead of admitting it
+    /// as stale, and only a status that attests the served pair reopens
+    /// traffic.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the probe's halt, the probe's recovery, and the publisher's three validations form one causal sequence"
+    )]
+    async fn probe_observed_halt_refuses_traffic_until_the_publisher_validates_the_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let readiness = zinder_runtime::Readiness::default();
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path,
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path,
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations),
+                )?,
+                serving_readiness.clone(),
+                &endpoint,
+                None,
+            )
+            .await?;
+        serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        serving_readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        assert!(readiness.report().is_ready);
+        let is_halted = |report: &zinder_runtime::ReadinessReport| {
+            !report.is_ready
+                && matches!(
+                    report.cause,
+                    zinder_runtime::ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
+                )
+        };
+
+        serving_readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::from(
+            zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            },
+        ));
+        serving_readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        assert!(
+            is_halted(&readiness.report()),
+            "a probe that sees the writer recover must not reopen traffic on its own: {:?}",
+            readiness.report()
+        );
+
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            fence: None,
+            ..writer_status_for_store(&canonical_primary)
+        });
+        let missing_fence = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("a writer status without a fence must fail the refresh")?;
+        publisher.record_refresh_failure(&missing_fence);
+        let unvalidated = readiness.report();
+        assert!(is_halted(&unvalidated), "{unvalidated:?}");
+        assert!(unvalidated.degraded.is_empty(), "{unvalidated:?}");
+
+        let pair = slot.capture();
+        let mut far_ahead_status = writer_status_for_store(&canonical_primary);
+        let far_ahead_fence = far_ahead_status
+            .fence
+            .as_mut()
+            .ok_or("writer status fixture must carry a fence")?;
+        far_ahead_fence.chain_epoch_id = far_ahead_fence.chain_epoch_id.saturating_add(64);
+        far_ahead_fence.event_sequence = far_ahead_fence.event_sequence.saturating_add(64);
+        publisher.update_active_readiness(&pair, &far_ahead_status)?;
+        let lagging = readiness.report();
+        assert!(!lagging.is_ready, "{lagging:?}");
+        assert_eq!(lagging.cause.metric_label(), "replica_lagging");
+
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+        publisher.refresh_once().await?;
+        let recovered = readiness.report();
+        assert!(recovered.is_ready, "{recovered:?}");
+        assert!(recovered.degraded.is_empty(), "{recovered:?}");
 
         cancel.cancel();
         server_task.await??;
@@ -4064,7 +4727,7 @@ mod tests {
                 temporary.path().join("wallet-secondaries"),
                 Arc::new(activations),
             )?,
-            WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+            WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
             &endpoint,
             None,
         )
@@ -4144,7 +4807,7 @@ mod tests {
         );
         let readiness = zinder_runtime::Readiness::default();
         let serving_readiness =
-            WalletServingReadiness::awaiting_node_and_ingest_control(readiness.clone());
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_with_admitted_ingest_control(
                 wallet_serving_pair_config(
@@ -4230,26 +4893,21 @@ mod tests {
                 .await
         });
         let mut wallet_client = WalletQueryClient::connect(wallet_endpoint.clone()).await?;
-        let not_ready = wallet_client
+        // The published pair alone admits traffic: the node and ingest-control
+        // probes have not reported yet, so both dependencies are degraded.
+        let (pending_status, pending_readyz) = fetch_operations_json(ops_address, "/readyz")?;
+        assert_eq!(pending_status, 200);
+        assert_eq!(pending_readyz["cause"], "ready");
+        assert_eq!(
+            pending_readyz["degraded"],
+            serde_json::json!([
+                {"input": "node_source", "dependency_cause": "starting"},
+                {"input": "ingest_control", "dependency_cause": "starting"},
+            ])
+        );
+        wallet_client
             .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
-            .await
-            .err()
-            .ok_or("native traffic must be refused before readiness")?;
-        assert_eq!(not_ready.code(), Code::Unavailable);
-        let reflection_channel = tonic::transport::Endpoint::new(wallet_endpoint.clone())?
-            .connect()
             .await?;
-        let mut reflection_client = ServerReflectionClient::new(reflection_channel);
-        let reflection_request = Request::new(tokio_stream::once(ServerReflectionRequest {
-            host: String::new(),
-            message_request: Some(MessageRequest::ListServices(String::new())),
-        }));
-        let reflection_not_ready = reflection_client
-            .server_reflection_info(reflection_request)
-            .await
-            .err()
-            .ok_or("reflection traffic must be refused before readiness")?;
-        assert_eq!(reflection_not_ready.code(), Code::Unavailable);
         serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let ingest_control_probe_cancel = CancellationToken::new();
         let ingest_control_probe = spawn_wallet_ingest_control_readiness_probe(
@@ -4258,8 +4916,8 @@ mod tests {
             Duration::from_millis(5),
             ingest_control_probe_cancel.clone(),
         );
-        wait_for_readiness_cause(&readiness, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        wait_for_readyz(ops_address, |readyz| {
+            readyz["cause"] == "ready" && readyz.get("degraded").is_none()
         })
         .await?;
         let visible_response = wallet_client
@@ -4386,46 +5044,58 @@ mod tests {
         assert_eq!(ready_status, 200);
         assert_eq!(readyz["cause"], "ready");
 
+        assert!(readyz.get("degraded").is_none(), "{readyz}");
+        // The fixture writer committed the served epoch at a fixed past time.
+        let committed_at = old_pair.canonical().chain_epoch()?.created_at.value();
+        let served_epoch_age = readyz["served_epoch_age_seconds"]
+            .as_u64()
+            .ok_or("a published pair must report its served epoch age")?;
+        assert!(
+            served_epoch_age.abs_diff(
+                UnixTimestampMillis::now()
+                    .value()
+                    .saturating_sub(committed_at)
+                    / 1_000
+            ) <= 2,
+            "{readyz}"
+        );
+
+        // An ingest-control outage degrades only the live-state methods that
+        // call it; the published pair keeps serving every stored read.
         ingest_control_service.set_health_available(false);
-        wait_for_readiness_cause(&readiness, |cause| {
-            matches!(
-                cause,
-                zinder_runtime::ReadinessCause::IngestControlUnavailable
-            )
+        let outage_readyz = wait_for_readyz(ops_address, |readyz| {
+            readyz["degraded"]
+                == serde_json::json!([
+                    {"input": "ingest_control", "dependency_cause": "ingest_control_unavailable"},
+                ])
         })
         .await?;
-        let (outage_ready_status, outage_readyz) = fetch_operations_json(ops_address, "/readyz")?;
-        assert_eq!(outage_ready_status, 503);
-        assert_eq!(outage_readyz["cause"], "ingest_control_unavailable");
+        assert_eq!(outage_readyz["status"], "ready");
+        assert_eq!(outage_readyz["cause"], "ready");
         let (outage_health_status, outage_healthz) =
             fetch_operations_json(ops_address, "/healthz")?;
         assert_eq!(outage_health_status, 200);
         assert_eq!(outage_healthz, healthy_healthz);
 
-        let blocked_tip = wallet_client
+        let outage_tip = wallet_client
             .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+            .await?
+            .into_inner()
+            .visible_tip_block
+            .ok_or("native visible-tip response must contain a block during the outage")?;
+        assert_eq!(outage_tip.height, visible_tip.height.value());
+        let mempool_outage = wallet_client
+            .mempool_snapshot(wallet::MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            })
             .await
             .err()
-            .ok_or("native traffic must be refused during ingest-control outage")?;
-        assert_eq!(blocked_tip.code(), Code::Unavailable);
-        let blocked_error_details = blocked_tip.get_error_details();
-        let blocked_error_info = blocked_error_details
-            .error_info()
-            .ok_or("readiness-gated traffic must carry ErrorInfo")?;
-        assert_eq!(
-            blocked_error_info.reason,
-            ErrorReason::ServiceNotReady.as_str_name()
-        );
-        assert_eq!(
-            blocked_error_info.metadata.get("readiness_cause"),
-            Some(&"ingest_control_unavailable".to_owned())
-        );
+            .ok_or("a mempool snapshot must fail while ingest control is unavailable")?;
+        assert_eq!(mempool_outage.code(), Code::Unavailable);
 
         ingest_control_service.set_health_available(true);
-        wait_for_readiness_cause(&readiness, |cause| {
-            matches!(cause, zinder_runtime::ReadinessCause::Ready)
-        })
-        .await?;
+        wait_for_readyz(ops_address, |readyz| readyz.get("degraded").is_none()).await?;
         let recovered_server_info = wallet_client
             .server_info(wallet::ServerInfoRequest {})
             .await?
@@ -6087,6 +6757,27 @@ mod tests {
         Ok((status, body))
     }
 
+    /// Polls `/readyz` until `predicate` accepts its body and returns that
+    /// body.
+    async fn wait_for_readyz(
+        address: std::net::SocketAddr,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, readyz) = fetch_operations_json(address, "/readyz")?;
+            if predicate(&readyz) {
+                return Ok(readyz);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(
+                    format!("timed out waiting for /readyz, which last served {readyz}").into(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn writer_status(source: WalletCanonicalSourceIdentity) -> CanonicalWriterStatusResponse {
         let position = source.source_position();
         CanonicalWriterStatusResponse {
@@ -6500,7 +7191,7 @@ mod tests {
             Ok(
                 WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                     config,
-                    WalletServingReadiness::without_node_source(readiness),
+                    WalletServingReadiness::pair_only(readiness),
                     &self.endpoint,
                     None,
                 )
@@ -6707,9 +7398,7 @@ mod tests {
             Ok(
                 WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                     config,
-                    WalletServingReadiness::without_node_source(
-                        zinder_runtime::Readiness::default(),
-                    ),
+                    WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
                     &self.endpoint,
                     None,
                 )
@@ -6775,6 +7464,57 @@ mod tests {
             self.cancel.cancel();
             self.server_task.await??;
             Ok(())
+        }
+    }
+
+    /// Ingest control and canonical control served on one endpoint, as the
+    /// canonical writer serves them.
+    struct WriterControlFixture {
+        endpoint: String,
+        cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl WriterControlFixture {
+        async fn spawn(
+            ingest_control: IngestControlFixtureService,
+            canonical_control: MutableCanonicalControl,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let cancel = CancellationToken::new();
+            let server_cancel = cancel.clone();
+            let server_task = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(canonical_control))
+                    .add_service(IngestControlServer::new(ingest_control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            });
+            Ok(Self {
+                endpoint,
+                cancel,
+                server_task,
+            })
+        }
+
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.cancel.cancel();
+            self.server_task.await??;
+            Ok(())
+        }
+    }
+
+    /// Canonical status of a regtest writer that follows its node with a
+    /// confirmed tip.
+    fn following_writer_status() -> CanonicalWriterStatusResponse {
+        CanonicalWriterStatusResponse {
+            network_name: zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashRegtest)
+                .to_owned(),
+            ..CanonicalWriterStatusResponse::default()
         }
     }
 

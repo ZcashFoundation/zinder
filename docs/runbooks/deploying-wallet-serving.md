@@ -246,10 +246,18 @@ deployment's earlier healthcheck setting.
 `/healthz` passes as soon as the query endpoint listens. It does not show
 whether the native query surface serves. Watch query `/readyz` on port 9106 for
 that, and alert on it in monitoring. It is not the deploy-time healthcheck
-because it returns 503 with cause `upstream_not_ready` while the Zebra node is
-behind its estimated network tip, even when Zinder has indexed everything the
-node has committed. A lagging node would then fail the deployment without any
-Zinder fault.
+because it answers 503 in states a deployment should survive. A parked writer
+serves the typed refusal with `reorg_window_exceeded`, and after a restart
+query refuses with `canonical_tip_unconfirmed` until ingest confirms its
+stored tip against the node.
+
+Query `/readyz` stays 200 while the Zebra node is unavailable or behind its
+estimated network tip. Query keeps serving stored reads, fails broadcasts
+with `NODE_UNAVAILABLE`, and lists the node under `degraded` in its `/readyz`
+body. Alert on `zinder_readiness_dependency_state` with a cause that does not
+admit traffic, other than the `reorg_window_exceeded` halt that query already
+refuses traffic for, and on `zinder_readiness_served_epoch_age_seconds`, which grows while
+the node or ingest stops advancing the served chain.
 
 Also set the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` service variable. The
 entrypoint gives the three RocksDB openers twenty seconds to flush, so a
@@ -398,7 +406,9 @@ The container terminates with a non-zero status in these cases:
 
 - any process it started exits;
 - a plane reports `schema_mismatch` or `node_capability_missing`;
-- a plane stops admitting traffic for an hour;
+- a plane stops admitting traffic for an hour, except while ingest reports a
+  node outage;
+- ingest reports `node_unavailable` for 24 hours;
 - a plane keeps flapping, as described below; or
 - the projector leaves a park that kept query from starting, as described in
   [Wallet transition exceeds its logical-byte limit](#wallet-transition-exceeds-its-logical-byte-limit).
@@ -442,8 +452,31 @@ before it starts the new one, so the redeploy also ends the deployment that was
 serving the typed refusal. A plain restart or a crash restart under the
 `ALWAYS` policy comes back serving the halt.
 
-Upstream outages and sync lag drain readiness the same way but clear on their
-own, so they are tolerated for an hour before the container terminates.
+Sync lag and transient faults drain readiness but clear on their own, so a
+plane that stays unready is tolerated for an hour before the container
+terminates.
+
+A node outage is tolerated much longer. While ingest reports
+`node_unavailable` or `upstream_not_ready`, query keeps serving the stored
+chain, and a restart cannot help: ingest needs the node to start, so the
+restarted container would serve nothing. The supervisor keeps the outage out of
+the one-hour tolerance and the recurrence budgets below. While Zebra resyncs,
+or while only the node's mempool feed fails, ingest can report `syncing`
+instead, because it trails the node or its mempool cannot hydrate. The
+supervisor treats that as the same outage when query's `/readyz` lists
+`ingest_control` with `upstream_not_ready`, which is the writer's own
+observation of its node. An `upstream_not_ready` node answers, so a resync of
+any length never restarts the container. When query lists `ingest_control`
+with `node_unavailable` instead, the writer's mempool is waiting for a node
+snapshot. The supervisor counts that as an unreachable node only while
+ingest's `syncing` cause carries `"lag_blocks": null`, which means canonical
+ingest has caught up and only the mempool is behind. A numeric `lag_blocks`
+means the writer trails a node it can reach, and its mempool waits for it, so
+the one-hour tolerance and the recurrence budgets still apply. An unreachable
+node, including one that only the writer's mempool cannot reach, is logged
+once when the outage begins and once when it ends, and terminates the
+container only after it has lasted 24 hours, in case ingest is stuck in its
+own node client.
 
 A plane that flaps between ready and unready never stays down for an hour, so
 the supervisor also tracks its unready stretches. It terminates the container

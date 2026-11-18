@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
+use zinder_core::UnixTimestampMillis;
 use zinder_proto::{
     status_with_reason_and_metadata,
     v1::{
@@ -23,6 +24,8 @@ use zinder_proto::{
     },
     wire::encode_reorg_window_exceeded_metadata,
 };
+
+use crate::composed_readiness::ReadinessInput;
 
 /// Current phase of the canonical writer ([ADR-0015]).
 ///
@@ -258,8 +261,10 @@ pub struct UpstreamNotReadyDetail {
 pub struct UpstreamHealth {
     /// Stable kebab-case label naming the signal source:
     /// `zebra_ready_endpoint` (HTTP `/ready` probe) or
-    /// `verification_progress_fallback` (JSON-RPC derivation).
-    pub source: &'static str,
+    /// `verification_progress_fallback` (JSON-RPC derivation). A reader
+    /// that relays the canonical writer's observation carries the writer's
+    /// label.
+    pub source: Cow<'static, str>,
     /// Sentinel string surfaced by the signal source. For
     /// `zebra_ready_endpoint` this is the body of Zebra's 503 response
     /// (`syncing`, `no tip`, `tip_age=<N>s`, `lag=<N> blocks`,
@@ -274,8 +279,25 @@ impl From<&UpstreamNotReadyDetail> for ops_proto::UpstreamNotReadyDetail {
             upstream_committed_height: detail.upstream_committed_height,
             upstream_estimated_height: detail.upstream_estimated_height,
             upstream_verification_progress: detail.upstream_verification_progress,
-            upstream_health_source: detail.upstream_health.source.to_owned(),
+            upstream_health_source: detail.upstream_health.source.clone().into_owned(),
             upstream_health_reason: detail.upstream_health.reason.clone().into_owned(),
+        }
+    }
+}
+
+impl From<&ops_proto::UpstreamNotReadyDetail> for UpstreamNotReadyDetail {
+    /// Relays the upstream observation another Zinder runtime reported, such
+    /// as the `upstream_not_ready` the canonical writer carries in
+    /// `IngestControl.WriterStatus`.
+    fn from(detail: &ops_proto::UpstreamNotReadyDetail) -> Self {
+        Self {
+            upstream_committed_height: detail.upstream_committed_height,
+            upstream_estimated_height: detail.upstream_estimated_height,
+            upstream_verification_progress: detail.upstream_verification_progress,
+            upstream_health: UpstreamHealth {
+                source: Cow::Owned(detail.upstream_health_source.clone()),
+                reason: Cow::Owned(detail.upstream_health_reason.clone()),
+            },
         }
     }
 }
@@ -421,6 +443,34 @@ impl ReadinessCause {
     }
 }
 
+/// Latest cause one dependency input of a [`crate::ComposedReadiness`]
+/// reports.
+///
+/// A dependency is something the runtime keeps serving without, such as the
+/// node behind broadcast. Its refusing cause leaves the traffic gate open and
+/// appears in [`ReadinessReport::degraded`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReadinessDependency {
+    /// Dependency the cause describes.
+    pub input: ReadinessInput,
+    /// Latest cause the dependency's owner published.
+    ///
+    /// The JSON key is `dependency_cause`, so a `/readyz` parser that takes
+    /// the first `"cause"` key reads the runtime's own cause.
+    #[serde(rename = "dependency_cause")]
+    pub cause: ReadinessCause,
+}
+
+impl ReadinessDependency {
+    /// Returns whether the dependency is degraded: its cause does not admit
+    /// traffic and is not a canonical writer's halt, which refuses traffic as
+    /// the runtime's own cause instead.
+    #[must_use]
+    pub const fn is_degraded(&self) -> bool {
+        !self.cause.permits_traffic() && self.cause.reorg_window_exceeded_detail().is_none()
+    }
+}
+
 /// Snapshot of the current readiness state surfaced to operators.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReadinessReport {
@@ -443,6 +493,19 @@ pub struct ReadinessReport {
     /// Empty when the service has not admitted one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub materialized_view_identities: Vec<String>,
+    /// Seconds since the canonical writer committed the chain epoch this
+    /// reader serves, when the runtime serves one.
+    ///
+    /// A reader keeps serving its last chain view while its node or the
+    /// writer stops advancing, so this age, not [`Self::is_ready`], shows how
+    /// stale that view has become.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_epoch_age_seconds: Option<u64>,
+    /// Dependencies the runtime keeps serving without whose latest cause does
+    /// not admit traffic, in [`ReadinessInput`] declaration order. Each one
+    /// fails only the requests that call it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<ReadinessDependency>,
 }
 
 impl ReadinessReport {
@@ -456,6 +519,8 @@ impl ReadinessReport {
             target_height: None,
             phase: None,
             materialized_view_identities: Vec::new(),
+            served_epoch_age_seconds: None,
+            degraded: Vec::new(),
         }
     }
 }
@@ -464,8 +529,18 @@ impl ReadinessReport {
 /// and runtime tasks can update and observe the same value.
 #[derive(Clone, Debug)]
 pub struct Readiness {
-    inner: Arc<Mutex<ReadinessState>>,
+    inner: Arc<Mutex<RuntimeReadiness>>,
     materialized_view_identities: Arc<Mutex<Vec<String>>>,
+}
+
+/// One lock covers the state and the dependency causes a composition
+/// projected with it, so a report never pairs a cause with dependency causes
+/// from another publication.
+#[derive(Clone, Debug)]
+struct RuntimeReadiness {
+    state: ReadinessState,
+    dependencies: Vec<ReadinessDependency>,
+    served_epoch_committed_at: Option<UnixTimestampMillis>,
 }
 
 impl Default for Readiness {
@@ -479,9 +554,37 @@ impl Readiness {
     #[must_use]
     pub fn new(state: ReadinessState) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(state)),
+            inner: Arc::new(Mutex::new(RuntimeReadiness {
+                state,
+                dependencies: Vec::new(),
+                served_epoch_committed_at: None,
+            })),
             materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Records the writer's commit time of the chain epoch this reader now
+    /// serves, from which reports derive
+    /// [`ReadinessReport::served_epoch_age_seconds`].
+    pub fn set_served_epoch_committed_at(&self, committed_at: UnixTimestampMillis) {
+        self.inner.lock().served_epoch_committed_at = Some(committed_at);
+    }
+
+    /// Replaces the state and dependency causes with one composition's
+    /// projection.
+    pub(crate) fn publish_composition(
+        &self,
+        state: ReadinessState,
+        dependencies: Vec<ReadinessDependency>,
+    ) {
+        let mut guard = self.inner.lock();
+        guard.state = state;
+        guard.dependencies = dependencies;
+    }
+
+    /// Returns every dependency input's latest cause, degraded or not.
+    pub(crate) fn dependencies(&self) -> Vec<ReadinessDependency> {
+        self.inner.lock().dependencies.clone()
     }
 
     /// Records the consumer identities of the Explorer view store this
@@ -503,7 +606,7 @@ impl Readiness {
     /// [`ReadinessState::with_phase`] on `state` overrides the phase.
     pub fn set(&self, state: ReadinessState) {
         let mut guard = self.inner.lock();
-        *guard = state.replacing(&guard);
+        guard.state = state.replacing(&guard.state);
     }
 
     /// Atomically mutates the current readiness state.
@@ -517,14 +620,14 @@ impl Readiness {
     where
         F: FnOnce(&mut ReadinessState),
     {
-        update(&mut self.inner.lock());
+        update(&mut self.inner.lock().state);
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
     /// any other field. Used by the phase-driven ingest loop's per-iteration
     /// classifier stamp.
     pub fn set_phase(&self, phase: IngestPhase) {
-        self.inner.lock().phase = Some(phase);
+        self.inner.lock().state.phase = Some(phase);
     }
 
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
@@ -533,7 +636,7 @@ impl Readiness {
     /// such as the materialized-view replay phase gate that samples it per replayed event.
     #[must_use]
     pub fn phase(&self) -> Option<IngestPhase> {
-        self.inner.lock().phase
+        self.inner.lock().state.phase
     }
 
     /// Returns the halt of a writer parked by a reorg deeper than its window,
@@ -543,13 +646,17 @@ impl Readiness {
     /// halt, such as open streams that poll it per page.
     #[must_use]
     pub fn reorg_window_exceeded(&self) -> Option<ops_proto::ReorgWindowExceededDetail> {
-        self.inner.lock().cause.reorg_window_exceeded_detail()
+        self.inner.lock().state.cause.reorg_window_exceeded_detail()
     }
 
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
-        let state = self.inner.lock().clone();
+        let RuntimeReadiness {
+            state,
+            dependencies,
+            served_epoch_committed_at,
+        } = self.inner.lock().clone();
         let materialized_view_identities = self.materialized_view_identities.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
@@ -558,6 +665,16 @@ impl Readiness {
             target_height: state.target_height,
             phase: state.phase,
             materialized_view_identities,
+            served_epoch_age_seconds: served_epoch_committed_at.map(|committed_at| {
+                UnixTimestampMillis::now()
+                    .value()
+                    .saturating_sub(committed_at.value())
+                    / 1_000
+            }),
+            degraded: dependencies
+                .into_iter()
+                .filter(ReadinessDependency::is_degraded)
+                .collect(),
         }
     }
 }
@@ -1077,6 +1194,16 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
     }
 }
 
+impl From<&ReadinessDependency> for ops_proto::ReadinessDependency {
+    fn from(dependency: &ReadinessDependency) -> Self {
+        Self {
+            input: dependency.input.wire_label().to_owned(),
+            cause: ops_proto::ReadinessCause::from(&dependency.cause) as i32,
+            detail: Option::<ops_proto::ReadinessCauseDetail>::from(&dependency.cause),
+        }
+    }
+}
+
 impl From<&ReadinessReport> for ops_proto::ReadinessReport {
     fn from(report: &ReadinessReport) -> Self {
         Self {
@@ -1085,6 +1212,12 @@ impl From<&ReadinessReport> for ops_proto::ReadinessReport {
             target_height: report.target_height,
             detail: Option::<ops_proto::ReadinessCauseDetail>::from(&report.cause),
             materialized_view_identities: report.materialized_view_identities.clone(),
+            degraded: report
+                .degraded
+                .iter()
+                .map(ops_proto::ReadinessDependency::from)
+                .collect(),
+            served_epoch_age_seconds: report.served_epoch_age_seconds,
         }
     }
 }
@@ -1230,6 +1363,20 @@ mod tests {
         Ok(())
     }
 
+    // `deploy/wallet-serving-runtime-entrypoint` matches this exact text to
+    // tell ingest's mempool gate from a writer that trails its node.
+    #[test]
+    fn syncing_cause_renders_unknown_lag_as_null() -> Result<(), serde_json::Error> {
+        for (lag_blocks, expected) in [
+            (None, r#"{"syncing":{"lag_blocks":null}}"#),
+            (Some(40), r#"{"syncing":{"lag_blocks":40}}"#),
+        ] {
+            let rendered = serde_json::to_string(&ReadinessCause::Syncing { lag_blocks })?;
+            assert_eq!(rendered, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn ingest_phase_serializes_snake_case() -> Result<(), serde_json::Error> {
         for (phase, expected) in [
@@ -1314,7 +1461,7 @@ mod tests {
             upstream_estimated_height: Some(4_016_431),
             upstream_verification_progress: Some(0.149),
             upstream_health: UpstreamHealth {
-                source: "zebra_ready_endpoint",
+                source: Cow::Borrowed("zebra_ready_endpoint"),
                 reason: Cow::Borrowed("syncing"),
             },
         };
@@ -1339,7 +1486,7 @@ mod tests {
             upstream_estimated_height: None,
             upstream_verification_progress: None,
             upstream_health: UpstreamHealth {
-                source: "verification_progress_fallback",
+                source: Cow::Borrowed("verification_progress_fallback"),
                 reason: Cow::Borrowed("verification_progress_below_floor"),
             },
         };
@@ -1561,7 +1708,7 @@ mod tests {
                 upstream_estimated_height: None,
                 upstream_verification_progress: None,
                 upstream_health: UpstreamHealth {
-                    source: "zebra_ready_endpoint",
+                    source: Cow::Borrowed("zebra_ready_endpoint"),
                     reason: Cow::Borrowed("syncing"),
                 },
             }),
@@ -1668,7 +1815,7 @@ mod tests {
                 upstream_estimated_height: None,
                 upstream_verification_progress: None,
                 upstream_health: UpstreamHealth {
-                    source: "zebra_ready_endpoint",
+                    source: Cow::Borrowed("zebra_ready_endpoint"),
                     reason: Cow::Borrowed("syncing"),
                 },
             }),
@@ -1688,6 +1835,8 @@ mod tests {
             target_height: None,
             phase: None,
             materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
+            served_epoch_age_seconds: None,
+            degraded: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1726,6 +1875,8 @@ mod tests {
             target_height: None,
             phase: None,
             materialized_view_identities: Vec::new(),
+            served_epoch_age_seconds: None,
+            degraded: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1750,6 +1901,8 @@ mod tests {
             target_height: None,
             phase: None,
             materialized_view_identities: Vec::new(),
+            served_epoch_age_seconds: None,
+            degraded: Vec::new(),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1780,6 +1933,99 @@ mod tests {
         ));
         assert_eq!(cause.node_failure_class_label(), Some("node_unreachable"));
         assert_eq!(ReadinessCause::Ready.node_failure_class_label(), None);
+    }
+
+    #[test]
+    fn report_lists_degraded_dependencies_and_relays_them_on_the_wire()
+    -> Result<(), serde_json::Error> {
+        let runtime = Readiness::default();
+        let composed = crate::ComposedReadiness::with_dependency_inputs(
+            runtime.clone(),
+            &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
+        );
+        composed.publish_admission(ReadinessState::ready(Some(42)));
+        composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+        composed.publish_input(ReadinessInput::IngestControl, ReadinessCause::Ready);
+        let healthy = serde_json::to_value(runtime.report())?;
+        assert!(healthy.get("degraded").is_none(), "{healthy}");
+
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+                "node_unreachable",
+                "connection refused",
+            )),
+        );
+        let report = runtime.report();
+        assert!(report.is_ready);
+        let rendered = serde_json::to_value(&report)?;
+        assert_eq!(rendered["cause"], "ready");
+        assert_eq!(
+            rendered["degraded"],
+            serde_json::json!([{
+                "input": "node_source",
+                "dependency_cause": {"node_unavailable": {
+                    "failure_class": "node_unreachable",
+                    "last_reason": "connection refused",
+                    "consecutive_failures": 1,
+                    "outage_seconds": 0,
+                }},
+            }])
+        );
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(proto.cause, ops_proto::ReadinessCause::Ready as i32);
+        assert_eq!(
+            proto.degraded,
+            vec![ops_proto::ReadinessDependency {
+                input: "node_source".to_owned(),
+                cause: ops_proto::ReadinessCause::NodeUnavailable as i32,
+                detail: Some(ops_proto::ReadinessCauseDetail {
+                    payload: Some(ops_proto::readiness_cause_detail::Payload::NodeUnavailable(
+                        ops_proto::NodeUnavailableDetail {
+                            failure_class: "node_unreachable".to_owned(),
+                            last_reason: "connection refused".to_owned(),
+                            consecutive_failures: 1,
+                            outage_seconds: 0,
+                        }
+                    )),
+                }),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_derives_served_epoch_age_from_the_writer_commit_time() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        assert_eq!(readiness.report().served_epoch_age_seconds, None);
+        let committed_at =
+            UnixTimestampMillis::new(UnixTimestampMillis::now().value().saturating_sub(90_500));
+        readiness.set_served_epoch_committed_at(committed_at);
+        readiness.set(ReadinessState::ready(Some(11)));
+        let report = readiness.report();
+        let age = report.served_epoch_age_seconds.unwrap_or_default();
+        assert!((90..=92).contains(&age), "served epoch age {age}");
+        assert_eq!(
+            ops_proto::ReadinessReport::from(&report).served_epoch_age_seconds,
+            Some(age)
+        );
+    }
+
+    #[test]
+    fn writer_upstream_observation_converts_back_to_its_readiness_detail() {
+        let detail = UpstreamNotReadyDetail {
+            upstream_committed_height: Some(600_000),
+            upstream_estimated_height: Some(4_016_431),
+            upstream_verification_progress: Some(0.149),
+            upstream_health: UpstreamHealth {
+                source: Cow::Borrowed("zebra_ready_endpoint"),
+                reason: Cow::Borrowed("syncing"),
+            },
+        };
+        let relayed =
+            UpstreamNotReadyDetail::from(&ops_proto::UpstreamNotReadyDetail::from(&detail));
+        assert_eq!(relayed, detail);
     }
 
     #[test]

@@ -482,12 +482,24 @@ impl CanonicalControlHandle {
         )
         .await
         .map_err(|_| Status::resource_exhausted("canonical writer command queue is full"))?
-        .map_err(|_| Status::unavailable("canonical writer is unavailable"))?;
+        .map_err(|_| canonical_owner_unavailable("canonical writer is unavailable"))?;
         tokio::time::timeout(CANONICAL_CONTROL_REPLY_TIMEOUT, response)
             .await
-            .map_err(|_| Status::deadline_exceeded("canonical writer did not service the request"))?
-            .map_err(|_| Status::unavailable("canonical writer stopped before replying"))?
+            .map_err(|_| {
+                canonical_owner_unavailable("canonical writer did not service the request")
+            })?
+            .map_err(|_| canonical_owner_unavailable("canonical writer stopped before replying"))?
     }
+}
+
+/// Refusal for a request the owner of the canonical primary did not service.
+///
+/// The writer itself answers it, so it carries `STORAGE_UNAVAILABLE`. A
+/// reader that proxies writer calls types only statuses without a reason as
+/// transport failures, and must not mistake this one for an unreachable
+/// writer.
+fn canonical_owner_unavailable(message: &'static str) -> Status {
+    zinder_proto::status_for_reason(ops::ErrorReason::StorageUnavailable, message)
 }
 
 /// Creates the bounded channel serviced by the follower that owns the primary.
@@ -1648,6 +1660,54 @@ pub(crate) mod test_support {
     };
 
     use super::*;
+
+    /// A request the owner of the canonical primary never services fails with
+    /// the writer's typed `STORAGE_UNAVAILABLE`, whether the owner is gone,
+    /// drops the request, or does not answer in time.
+    #[tokio::test(start_paused = true)]
+    async fn unserviced_requests_fail_with_a_typed_storage_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tonic_types::StatusExt as _;
+
+        let storage_unavailable = |outcome: Result<CanonicalWriterSnapshot, Status>| {
+            outcome.err().map(|status| {
+                (
+                    status.code(),
+                    status
+                        .get_error_details()
+                        .error_info()
+                        .map(|error_info| error_info.reason.clone()),
+                )
+            })
+        };
+        let expected = Some((
+            tonic::Code::Unavailable,
+            Some(
+                ops::ErrorReason::StorageUnavailable
+                    .as_str_name()
+                    .to_owned(),
+            ),
+        ));
+
+        let (stopped, commands) = canonical_control_channel();
+        drop(commands);
+        assert_eq!(storage_unavailable(stopped.chain_epoch().await), expected);
+
+        let (dropping, mut commands) = canonical_control_channel();
+        let dropping_owner = tokio::spawn(async move { drop(commands.recv().await) });
+        assert_eq!(storage_unavailable(dropping.chain_epoch().await), expected);
+        dropping_owner.await?;
+
+        let (stalled, mut commands) = canonical_control_channel();
+        let stalled_owner = tokio::spawn(async move {
+            let held = commands.recv().await;
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+        assert_eq!(storage_unavailable(stalled.chain_epoch().await), expected);
+        stalled_owner.abort();
+        Ok(())
+    }
 
     #[test]
     fn canonical_mempool_event_batch_assigns_contiguous_positions()

@@ -21,7 +21,8 @@ mod compact_block_serving;
 mod config;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use zinder_query::{
-    WalletQueryApi, WalletServingPairConfig, WalletServingPairPublisher, WalletServingReadiness,
+    AdmittedIngestControl, WalletQueryApi, WalletServingPairConfig, WalletServingPairPublisher,
+    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 
@@ -187,7 +188,24 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
-    let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+    let serving_readiness = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
+    let admit_ingest_control_phase = StartupPhase::AdmitIngestControl.start();
+    let ingest_control = match AdmittedIngestControl::connect(
+        &lightwalletd_config.ingest_control_addr,
+        lightwalletd_config.ingest_control_bearer_token.as_ref(),
+        lightwalletd_config.network,
+    )
+    .await
+    {
+        Ok(ingest_control) => {
+            admit_ingest_control_phase.complete();
+            ingest_control
+        }
+        Err(error) => {
+            admit_ingest_control_phase.fail(&error);
+            return Err(error.into());
+        }
+    };
     let start_api_phase = StartupPhase::StartApi.start();
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
@@ -231,7 +249,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     };
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let (serving_pair_publisher, serving_pair_slot) =
-        WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+        WalletServingPairPublisher::bootstrap_with_admitted_ingest_control(
             WalletServingPairConfig {
                 canonical_primary_path: lightwalletd_config.storage.path.clone(),
                 canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
@@ -256,8 +274,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
                     .serving_pair_staleness_ceiling,
             },
             serving_readiness.clone(),
-            &lightwalletd_config.ingest_control_addr,
-            lightwalletd_config.ingest_control_bearer_token.as_ref(),
+            &ingest_control,
         )
         .await?;
     let visible_height = Some(
@@ -305,6 +322,14 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             ),
         cancel.clone(),
     )?;
+    // Health and serving-pair refresh observe the same ingest control plane, so
+    // they intentionally share one configured freshness cadence.
+    let ingest_control_readiness_handle = spawn_wallet_ingest_control_readiness_probe(
+        ingest_control,
+        serving_readiness.clone(),
+        lightwalletd_config.storage.secondary_catchup_interval,
+        cancel.clone(),
+    );
     let serving_runtime_drained = CancellationToken::new();
     let serving_pair_publisher_handle =
         serving_pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
@@ -433,6 +458,22 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         ),
     }
 
+    match ingest_control_readiness_handle.await {
+        Ok(()) => {}
+        Err(join_error) if join_error.is_panic() => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "wallet_ingest_control_readiness_probe_panic",
+            error = %join_error,
+            "wallet ingest-control readiness probe task panicked"
+        ),
+        Err(join_error) => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "wallet_ingest_control_readiness_probe_join_failed",
+            error = %join_error,
+            "wallet ingest-control readiness probe task did not exit cleanly"
+        ),
+    }
+
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
@@ -527,19 +568,6 @@ async fn run_compact_blocks(
     .await?;
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let node_readiness_handle = compact_block_serving::spawn_node_readiness_probe(
-        broadcaster_source.clone(),
-        serving_readiness.clone(),
-        lightwalletd_config
-            .broadcaster
-            .as_ref()
-            .and_then(|target| target.health.as_ref())
-            .map_or_else(
-                || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
-                |health| health.poll_interval,
-            ),
-        cancel.clone(),
-    )?;
     let serving_runtime_drained = CancellationToken::new();
     let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "compact-blocks").set(1.0);
@@ -588,15 +616,6 @@ async fn run_compact_blocks(
     );
     if let Some(handle) = ops_handle {
         handle.shutdown().await?;
-    }
-    match node_readiness_handle.await {
-        Ok(()) => {}
-        Err(error) => tracing::error!(
-            target: "zinder::compat_lightwalletd",
-            event = "compact_node_readiness_join_failed",
-            error = %error,
-            "compact node readiness task did not exit cleanly"
-        ),
     }
     match publisher_handle.await {
         Ok(()) => {}

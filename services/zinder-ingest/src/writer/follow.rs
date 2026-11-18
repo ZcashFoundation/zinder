@@ -1692,7 +1692,7 @@ mod tests {
             upstream_estimated_height: Some(4_000_000),
             upstream_verification_progress: Some(0.1),
             upstream_health: UpstreamHealth {
-                source: "zebra_ready_endpoint",
+                source: std::borrow::Cow::Borrowed("zebra_ready_endpoint"),
                 reason: std::borrow::Cow::Borrowed("syncing"),
             },
         })

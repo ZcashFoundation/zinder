@@ -210,7 +210,11 @@ bearer-token rule. Both wallet-facing gRPC ports are published on host loopback
 only. Readiness is also the dependency gate: expected fresh construction stays
 in Docker's `starting` state for the documented three-hour canonical and
 two-hour wallet-build hard gates instead of being reported unhealthy after one
-minute. Query and compatibility receive five-minute startup grace periods.
+minute. The projector waits for a healthy ingest, and query and compatibility
+wait for a healthy projector. Query and compatibility wait only for the ingest
+container to start, not for it to be healthy, because they share its network
+namespace and keep serving through a node outage that leaves ingest
+unhealthy. Query and compatibility receive five-minute startup grace periods.
 
 ### Attach a Zakura node
 
@@ -510,8 +514,11 @@ Interpret the probes in order:
    secondaries converge to one exact network, epoch, event sequence, visible
    tip, settled tip, and digest before publication.
 
-A healthy process with a non-ready dependency must continue returning 503. Do
-not route wallet traffic based on `/healthz`.
+A process whose own serving state is not ready must continue returning 503. Do
+not route wallet traffic based on `/healthz`. Query and compatibility stay
+ready through a node or ingest-control outage. Their `/readyz` body lists the
+outage under `degraded`, and only the requests that call that dependency
+fail.
 
 ## Put TLS in front of compatibility
 

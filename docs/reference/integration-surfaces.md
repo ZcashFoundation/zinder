@@ -187,8 +187,9 @@ discovery.
 The native endpoint therefore advertises transaction lookup and mempool
 snapshot and events from that concrete composition. Transaction-byte support
 additionally requires authenticated transaction-blob retention. Temporary
-ingest-control failure drains readiness without rewriting the immutable
-capability set. Methods with no admitted provider fail their capability guard
+ingest-control failure degrades the ingest-control dependency and fails the
+mempool methods and unmined transaction lookups, without draining readiness or
+rewriting the immutable capability set. Methods with no admitted provider fail their capability guard
 before provider access. The native transparent surface contains only the
 transparent-address UTXO and ascending history reads that Zallet calls, plus
 the outpoint spend status that Zallet's `spend-index` contract needs; ZODL

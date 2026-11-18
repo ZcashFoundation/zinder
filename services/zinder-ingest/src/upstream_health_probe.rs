@@ -88,7 +88,7 @@ fn upstream_not_ready_detail_from_snapshot(
         upstream_estimated_height: snapshot.upstream_estimated_height,
         upstream_verification_progress: snapshot.upstream_verification_progress,
         upstream_health: UpstreamHealth {
-            source: snapshot.source,
+            source: std::borrow::Cow::Borrowed(snapshot.source),
             reason: snapshot.reason,
         },
     }

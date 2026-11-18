@@ -240,8 +240,10 @@ Compose topology mounts the files into ingest with
 When `[node.health].addr` is configured, `ZebraJsonRpcSource` polls Zebra's
 readiness endpoint using the configured cadence and thresholds. Without that
 explicit endpoint, source status comes from the JSON-RPC observations available
-to the writer. Upstream readiness caps Zinder readiness even when local storage
-is healthy.
+to the writer. Upstream readiness caps ingest readiness even when local storage
+is healthy. Wallet-serving readers use their node only for broadcast, so they
+report its readiness as a degraded dependency and keep serving stored reads
+([ADR-0045](../adrs/0045-wallet-serving-readiness-follows-the-serving-pair.md)).
 
 ## Consensus parsing
 

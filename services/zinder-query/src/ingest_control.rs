@@ -16,19 +16,21 @@ use zinder_proto::{
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2, INGEST_CONTROL_SERVER_INFO_V1,
         INGEST_CONTROL_WRITER_STATUS_V1,
     },
+    status_for_reason,
     v1::ingest::{
         ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
     },
     v1::{
-        ops::{ErrorReason, ReorgWindowExceededDetail},
+        ops::{ErrorReason, ReorgWindowExceededDetail, UpstreamNotReadyDetail},
         wallet,
     },
     wire::chain_epoch_from_message,
 };
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, BearerTokenConnectError, ReadinessCause, RuntimeService,
-    connect_zinder_grpc,
+    AuthenticatedChannel, BearerToken, BearerTokenConnectError, NodeUnavailableDetail,
+    ReadinessCause, RuntimeService, connect_zinder_grpc,
 };
+use zinder_source::SourceFailureClass;
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
 pub const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUIRED_CAPABILITIES: [&str; 5] = [
@@ -145,7 +147,22 @@ impl AdmittedIngestControl {
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) if is_stale_mempool_snapshot_status(&status) => return Ok(()),
+            Err(status)
+                if is_writer_refusal(
+                    &status,
+                    Code::FailedPrecondition,
+                    ErrorReason::ChainEpochPinUnavailable,
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(status)
+                if is_writer_refusal(&status, Code::Unavailable, ErrorReason::NodeUnavailable) =>
+            {
+                return Err(IngestControlHealthError::WriterMempoolNodeUnavailable(
+                    status,
+                ));
+            }
             Err(status) => return Err(IngestControlHealthError::MempoolSnapshotRpc(status)),
         };
         validate_snapshot_observation(&writer_epoch, &snapshot, self.network_name)
@@ -193,8 +210,10 @@ fn validate_writer_status(
             writer_status.network_name == expected_network && epoch.network_name == expected_network
         })
         .ok_or(IngestControlHealthError::WriterStatusInvalid)?;
-    if writer_status.upstream_not_ready.is_some() {
-        return Err(IngestControlHealthError::WriterUpstreamNotReady);
+    if let Some(upstream_not_ready) = &writer_status.upstream_not_ready {
+        return Err(IngestControlHealthError::WriterUpstreamNotReady(
+            upstream_not_ready.clone(),
+        ));
     }
     let writer_epoch = chain_epoch_from_message(writer_epoch_message.clone())
         .map_err(|_| IngestControlHealthError::WriterStatusInvalid)?;
@@ -244,14 +263,46 @@ fn validate_snapshot_observation(
     Ok(())
 }
 
-fn is_stale_mempool_snapshot_status(status: &tonic::Status) -> bool {
-    status.code() == Code::FailedPrecondition
+/// Types a failed ingest-control call that the writer never answered.
+///
+/// A status the writer built carries a `zinder.dev` `ErrorInfo` and passes
+/// through unchanged. A transport failure, such as a refused connection or an
+/// expired deadline, carries none, so it becomes `UPSTREAM_UNREACHABLE` and a
+/// wallet client can tell an ingest-control outage from a writer answer.
+pub(crate) fn typed_ingest_control_status(status: tonic::Status) -> tonic::Status {
+    let is_transport_code = matches!(
+        status.code(),
+        Code::Unavailable | Code::Unknown | Code::DeadlineExceeded | Code::Cancelled
+    );
+    let carries_zinder_reason = status
+        .get_error_details()
+        .error_info()
+        .is_some_and(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN);
+    if !is_transport_code || carries_zinder_reason {
+        return status;
+    }
+    status_for_reason(
+        ErrorReason::UpstreamUnreachable,
+        format!("ingest control is unreachable: {}", status.message()),
+    )
+}
+
+/// Whether `status` is a refusal the writer itself built with `code` and
+/// `reason`, rather than a failure of the call or of another server.
+///
+/// A `MempoolSnapshot` that is not yet coherent at a new tip returns
+/// `CHAIN_EPOCH_PIN_UNAVAILABLE`, which leaves ingest control healthy. A live
+/// mempool that is hydrating or rebuilding from the node returns
+/// `NODE_UNAVAILABLE`, which the probe relays as the writer's node outage
+/// rather than an ingest-control failure.
+fn is_writer_refusal(status: &tonic::Status, code: Code, reason: ErrorReason) -> bool {
+    status.code() == code
         && status
             .get_error_details()
             .error_info()
             .is_some_and(|error_info| {
                 error_info.domain == ZINDER_ERROR_DOMAIN
-                    && error_info.reason == ErrorReason::ChainEpochPinUnavailable.as_str_name()
+                    && error_info.reason == reason.as_str_name()
             })
 }
 
@@ -262,7 +313,7 @@ pub(crate) enum IngestControlHealthError {
     #[error("ingest-control WriterStatus returned incoherent network or chain evidence")]
     WriterStatusInvalid,
     #[error("ingest-control WriterStatus reports that its upstream is not ready")]
-    WriterUpstreamNotReady,
+    WriterUpstreamNotReady(UpstreamNotReadyDetail),
     #[error(
         "canonical writer is parked: a {}-block replacement exceeds its {}-block reorg window",
         .0.depth,
@@ -271,6 +322,8 @@ pub(crate) enum IngestControlHealthError {
     WriterReorgWindowExceeded(ReorgWindowExceededDetail),
     #[error("ingest-control MempoolSnapshot failed: {0}")]
     MempoolSnapshotRpc(tonic::Status),
+    #[error("the writer's live mempool waits on its node: {}", .0.message())]
+    WriterMempoolNodeUnavailable(tonic::Status),
     #[error("ingest-control MempoolSnapshot returned incoherent chain evidence")]
     MempoolSnapshotInvalid,
     #[error("ingest-control MempoolSnapshot is older than the preceding WriterStatus")]
@@ -280,15 +333,25 @@ pub(crate) enum IngestControlHealthError {
 }
 
 impl IngestControlHealthError {
-    /// Returns the readiness cause this health failure projects onto the
-    /// wallet-serving gate. Only a parked writer's halt is a typed cause;
-    /// every other failure is a recoverable control-channel outage.
+    /// Returns the cause this health failure publishes as the ingest-control
+    /// dependency. A parked writer's halt refuses wallet traffic. A writer
+    /// whose node is not ready, or whose live mempool waits on its node,
+    /// relays that observation; every other failure is a recoverable
+    /// control-channel outage.
     pub(crate) fn readiness_cause(&self) -> ReadinessCause {
         match self {
             Self::WriterReorgWindowExceeded(halt) => ReadinessCause::from(*halt),
+            Self::WriterUpstreamNotReady(detail) => ReadinessCause::UpstreamNotReady(
+                zinder_runtime::UpstreamNotReadyDetail::from(detail),
+            ),
+            Self::WriterMempoolNodeUnavailable(status) => {
+                ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+                    SourceFailureClass::StreamDisconnected.label(),
+                    status.message().to_owned(),
+                ))
+            }
             Self::WriterStatusRpc(_)
             | Self::WriterStatusInvalid
-            | Self::WriterUpstreamNotReady
             | Self::MempoolSnapshotRpc(_)
             | Self::MempoolSnapshotInvalid
             | Self::MempoolSnapshotOlderThanWriter
@@ -300,9 +363,10 @@ impl IngestControlHealthError {
         match self {
             Self::WriterStatusRpc(_) => "writer_status_rpc",
             Self::WriterStatusInvalid => "writer_status_invalid",
-            Self::WriterUpstreamNotReady => "writer_upstream_not_ready",
+            Self::WriterUpstreamNotReady(_) => "writer_upstream_not_ready",
             Self::WriterReorgWindowExceeded(_) => "writer_reorg_window_exceeded",
             Self::MempoolSnapshotRpc(_) => "mempool_snapshot_rpc",
+            Self::WriterMempoolNodeUnavailable(_) => "writer_mempool_node_unavailable",
             Self::MempoolSnapshotInvalid => "mempool_snapshot_invalid",
             Self::MempoolSnapshotOlderThanWriter => "mempool_snapshot_older_than_writer",
             Self::MempoolSnapshotWriterFenceMismatch => "mempool_snapshot_writer_fence_mismatch",
@@ -371,7 +435,7 @@ mod tests {
 
     use super::{
         AdmittedIngestControl, IngestControlHealthError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-        is_stale_mempool_snapshot_status, validate_health_observation,
+        is_writer_refusal, typed_ingest_control_status, validate_health_observation,
     };
 
     const NETWORK: &str = "zcash-regtest";
@@ -437,14 +501,29 @@ mod tests {
     }
 
     #[test]
-    fn health_rejects_explicit_upstream_not_ready_evidence() {
+    fn health_relays_the_writer_upstream_not_ready_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = writer_status(1, 1, "01");
-        writer.upstream_not_ready = Some(UpstreamNotReadyDetail::default());
-        let outcome = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK);
-        assert!(matches!(
-            outcome,
-            Err(IngestControlHealthError::WriterUpstreamNotReady)
-        ));
+        writer.upstream_not_ready = Some(UpstreamNotReadyDetail {
+            upstream_committed_height: Some(1),
+            upstream_estimated_height: Some(9),
+            upstream_verification_progress: Some(0.5),
+            upstream_health_source: "zebra_ready_endpoint".to_owned(),
+            upstream_health_reason: "syncing".to_owned(),
+        });
+        let error = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK)
+            .err()
+            .ok_or("a writer whose node is not ready must fail health")?;
+        assert_eq!(error.class(), "writer_upstream_not_ready");
+        let zinder_runtime::ReadinessCause::UpstreamNotReady(detail) = error.readiness_cause()
+        else {
+            return Err(format!("unexpected cause {:?}", error.readiness_cause()).into());
+        };
+        assert_eq!(detail.upstream_committed_height, Some(1));
+        assert_eq!(detail.upstream_estimated_height, Some(9));
+        assert_eq!(detail.upstream_health.source, "zebra_ready_endpoint");
+        assert_eq!(detail.upstream_health.reason, "syncing");
+        Ok(())
     }
 
     #[test]
@@ -476,7 +555,7 @@ mod tests {
             Err(IngestControlHealthError::WriterStatusInvalid)
         ));
         assert!(matches!(
-            IngestControlHealthError::WriterUpstreamNotReady.readiness_cause(),
+            IngestControlHealthError::WriterStatusInvalid.readiness_cause(),
             zinder_runtime::ReadinessCause::IngestControlUnavailable
         ));
         Ok(())
@@ -527,42 +606,130 @@ mod tests {
     }
 
     #[test]
-    fn stale_snapshot_predicate_requires_the_exact_structured_status() {
+    fn writer_refusal_predicate_requires_the_exact_structured_status() {
+        use zinder_proto::v1::ops::ErrorReason;
+
+        let is_stale_view = |status: &Status| {
+            is_writer_refusal(
+                status,
+                Code::FailedPrecondition,
+                ErrorReason::ChainEpochPinUnavailable,
+            )
+        };
         let exact = status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+            ErrorReason::ChainEpochPinUnavailable,
             "requested chain epoch is no longer available",
         );
-        assert!(is_stale_mempool_snapshot_status(&exact));
+        assert!(is_stale_view(&exact));
 
-        let different_reason = status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::ServiceNotReady,
-            "mempool is not ready",
+        let hydrating = status_for_reason(
+            ErrorReason::NodeUnavailable,
+            "live mempool index is hydrating from an upstream snapshot",
         );
-        assert!(!is_stale_mempool_snapshot_status(&different_reason));
+        assert!(is_writer_refusal(
+            &hydrating,
+            Code::Unavailable,
+            ErrorReason::NodeUnavailable
+        ));
+        assert!(!is_stale_view(&hydrating));
+        let passed = typed_ingest_control_status(hydrating.clone());
+        assert_eq!(
+            passed
+                .get_error_details()
+                .error_info()
+                .map(|info| info.reason.clone()),
+            hydrating
+                .get_error_details()
+                .error_info()
+                .map(|info| info.reason.clone())
+        );
+
+        let different_reason =
+            status_for_reason(ErrorReason::ServiceNotReady, "mempool is not ready");
+        assert!(!is_stale_view(&different_reason));
 
         let foreign_domain = Status::with_error_details(
             Code::FailedPrecondition,
             "foreign stale view",
             ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", "other.example", []),
         );
-        assert!(!is_stale_mempool_snapshot_status(&foreign_domain));
+        assert!(!is_stale_view(&foreign_domain));
 
         let wrong_code = Status::with_error_details(
             Code::Unavailable,
             "stale view with the wrong code",
             ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", ZINDER_ERROR_DOMAIN, []),
         );
-        assert!(!is_stale_mempool_snapshot_status(&wrong_code));
+        assert!(!is_stale_view(&wrong_code));
 
         let absent_details = Status::failed_precondition("missing error details");
-        assert!(!is_stale_mempool_snapshot_status(&absent_details));
+        assert!(!is_stale_view(&absent_details));
 
         let malformed_details = Status::with_error_details(
             Code::FailedPrecondition,
             "missing ErrorInfo",
             ErrorDetails::new(),
         );
-        assert!(!is_stale_mempool_snapshot_status(&malformed_details));
+        assert!(!is_stale_view(&malformed_details));
+    }
+
+    /// A writer whose live mempool waits on its node relays that outage as a
+    /// node outage, not as an ingest-control failure.
+    #[test]
+    fn writer_mempool_node_refusal_reports_the_node_outage() -> Result<(), String> {
+        let error = IngestControlHealthError::WriterMempoolNodeUnavailable(status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::NodeUnavailable,
+            "live mempool index is hydrating from an upstream snapshot",
+        ));
+        let zinder_runtime::ReadinessCause::NodeUnavailable(detail) = error.readiness_cause()
+        else {
+            return Err(format!("unexpected cause {:?}", error.readiness_cause()));
+        };
+        assert_eq!(detail.failure_class, "stream_disconnected");
+        assert_eq!(
+            detail.last_reason,
+            "live mempool index is hydrating from an upstream snapshot"
+        );
+        assert_eq!(error.class(), "writer_mempool_node_unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn untyped_transport_failures_become_upstream_unreachable() {
+        let reason_of = |status: &Status| {
+            status
+                .get_error_details()
+                .error_info()
+                .map(|error_info| (error_info.domain.clone(), error_info.reason.clone()))
+        };
+        let unreachable = Some((
+            ZINDER_ERROR_DOMAIN.to_owned(),
+            zinder_proto::v1::ops::ErrorReason::UpstreamUnreachable
+                .as_str_name()
+                .to_owned(),
+        ));
+        for transport_status in [
+            Status::unavailable("tcp connect error"),
+            Status::unknown("transport error"),
+            Status::deadline_exceeded("deadline expired"),
+            Status::cancelled("timeout expired"),
+        ] {
+            let typed = typed_ingest_control_status(transport_status);
+            assert_eq!(typed.code(), Code::Unavailable);
+            assert_eq!(reason_of(&typed), unreachable);
+        }
+
+        let writer_answer = status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::ServiceNotReady,
+            "mempool is not ready",
+        );
+        let passed = typed_ingest_control_status(writer_answer.clone());
+        assert_eq!(passed.code(), writer_answer.code());
+        assert_eq!(reason_of(&passed), reason_of(&writer_answer));
+
+        let untyped_miss = typed_ingest_control_status(Status::not_found("no such transaction"));
+        assert_eq!(untyped_miss.code(), Code::NotFound);
+        assert_eq!(reason_of(&untyped_miss), None);
     }
 
     #[tokio::test(start_paused = true)]
