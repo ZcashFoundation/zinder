@@ -10,10 +10,10 @@
 //! after the stall timeout, drops the handler's body. Dropping it unwinds the
 //! handler the way a client cancellation does.
 //!
-//! Data chunks are handed to hyper in pieces of at most
+//! Data chunks are handed to hyper as copies of at most
 //! [`RESPONSE_PIECE_BYTES`], so the bytes hyper itself keeps for a stalled
-//! stream stay small, and a slow but steady client is polled often enough
-//! that it never looks stalled.
+//! stream stay small and pin none of the handler's buffers, and a slow but
+//! steady client is polled often enough that it never looks stalled.
 //!
 //! An outer layer can also end a response early by attaching a
 //! [`ResponseCancellation`] to its request. The receive limit uses it for a
@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
+use bytes::{Buf as _, Bytes};
 use futures_util::{FutureExt as _, TryFutureExt as _, future::BoxFuture};
 use http_body::{Frame, SizeHint};
 use parking_lot::Mutex;
@@ -199,10 +199,18 @@ impl SendStallBoundBody {
 }
 
 impl Sending {
+    /// Copies the next piece of `unsent` into an allocation of its own.
+    ///
+    /// A slice of `unsent` would share the handler's allocation, often
+    /// tonic's whole encode buffer, so the one piece hyper keeps for a
+    /// stalled stream would keep that buffer alive after the handler's body
+    /// is dropped.
     fn hand_out_piece(&mut self) -> Bytes {
         let piece_len = self.unsent.len().min(RESPONSE_PIECE_BYTES);
+        let piece = Bytes::copy_from_slice(self.unsent.get(..piece_len).unwrap_or_default());
+        self.unsent.advance(piece_len);
         self.handed_out_at = Some(Instant::now());
-        self.unsent.split_to(piece_len)
+        piece
     }
 
     fn is_stalled(&self, send_stall_timeout: Duration) -> bool {
@@ -334,5 +342,73 @@ impl http_body::Body for SendStallBoundBody {
             Source::Handler(handler_body) if sending.unsent.is_empty() => handler_body.size_hint(),
             Source::Handler(_) | Source::Abandoned(_) | Source::Reported => SizeHint::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use http_body::Frame;
+    use http_body_util::{BodyExt as _, StreamBody};
+    use tokio::sync::oneshot;
+    use tokio_stream::StreamExt as _;
+    use tokio_util::sync::CancellationToken;
+    use tonic::{Status, body::Body};
+
+    use super::{RESPONSE_PIECE_BYTES, ResponseCancellation, SendStallBoundBody};
+
+    /// A response chunk that reports when its allocation is freed.
+    struct TrackedChunk {
+        bytes: Vec<u8>,
+        _freed: oneshot::Sender<()>,
+    }
+
+    impl AsRef<[u8]> for TrackedChunk {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_response_frees_its_chunk_while_the_transport_holds_a_piece()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (freed_sender, freed) = oneshot::channel();
+        let chunk = Bytes::from_owner(TrackedChunk {
+            bytes: vec![0; 4 * 1024 * 1024],
+            _freed: freed_sender,
+        });
+        let handler_body = Body::new(StreamBody::new(
+            tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
+        ));
+        let cancelled = CancellationToken::new();
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_hours(1),
+            Some(ResponseCancellation::new(
+                cancelled.clone(),
+                Status::unavailable("evicted"),
+            )),
+        );
+
+        // The transport takes one piece and keeps it, as hyper does while
+        // the client withholds flow-control window.
+        let held_piece = body
+            .frame()
+            .await
+            .ok_or("the response ended before its first piece")??
+            .into_data()
+            .map_err(|_| "the first frame carried no data")?;
+        assert_eq!(held_piece.len(), RESPONSE_PIECE_BYTES);
+
+        cancelled.cancel();
+        let chunk_freed = tokio::time::timeout(Duration::from_secs(5), freed).await;
+        assert!(
+            chunk_freed.is_ok(),
+            "the held piece kept the handler's chunk alive"
+        );
+        assert_eq!(held_piece.len(), RESPONSE_PIECE_BYTES);
+        Ok(())
     }
 }

@@ -348,7 +348,7 @@ keepalive pings but never sends `WINDOW_UPDATE` therefore parks the response,
 and whatever produces it, with no end: gRPC reflection's task blocks on its
 one-message channel while holding the request stream, its client-stream slot,
 and several echoed messages, where the receive timeout cannot reach it. The send stall layer ends such a response. It hands each data chunk
-to hyper in pieces of at most 64 KiB, and a watchdog task drops the handler's
+to hyper as copies of at most 64 KiB, and a watchdog task drops the handler's
 response body once hyper has held a piece for 60 seconds without asking for
 the next. Dropping the body cancels the handler the way a client cancellation
 does, which frees its task, slot, and buffers. A client that later resumes
@@ -357,7 +357,12 @@ produce its next message is not stalled, because hyper keeps asking for it.
 The bound covers every response, including lightwalletd `GetBlockRange` and
 the mempool streams, so it follows lightwalletd's stream send timeout, which
 also uses 60 seconds. `zinder_grpc_response_send_stalls_total` counts the
-responses it ends.
+responses it ends. The copies matter because a slice of a chunk would share
+its allocation, often tonic's whole encode buffer, and the piece hyper keeps
+for a stalled stream would then keep that buffer alive after the handler is
+gone. Copying every byte once costs about 7 percent more CPU per byte in an
+in-process loopback stream that does nothing but encode, for both 1.5 MiB and
+50 KiB messages, and less where reading and encoding the data dominate.
 
 Every Zinder gRPC server also decodes at most `MAX_DECODING_MESSAGE_BYTES`
 (2 MiB) per request message. Public listeners build gRPC reflection with
@@ -390,9 +395,10 @@ The policy leaves four gaps:
 - Each connection can buffer up to hyper's 1 MiB connection window of request
   data before the receive limit reads or refuses it.
 - A response the send stall layer ends keeps its HTTP/2 stream, and the one
-  piece hyper holds for it, until the client reads, resets the stream, or
-  closes the connection, because hyper waits for flow-control window before
-  it asks the body again. Graceful shutdown waits for such a stream too.
+  copied piece of at most 64 KiB that hyper holds for it, until the client
+  reads, resets the stream, or closes the connection, because hyper waits for
+  flow-control window before it asks the body again. Graceful shutdown waits
+  for such a stream too.
 
 ### Observability
 
