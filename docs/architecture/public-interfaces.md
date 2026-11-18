@@ -603,7 +603,10 @@ cost tens of MiB.
 Each server therefore counts the elements of every repeated request field
 before tonic decodes the request. The count covers every gRPC frame in the
 request body, packed and unpacked encodings alike, and the repeated fields of a
-singular message field such as a `filter`. It allocates nothing. A request over
+nested message field such as a `filter`. A list inside the elements of a
+repeated message is bounded by its total across every element, because the
+outer list's bound does not limit how large one element's list can be. It
+allocates nothing. A request over
 a bound fails with `INVALID_ARGUMENT` before its handler runs, with the message
 `<Method> request field <field> carries <count> elements; at most <bound> are
 accepted`. That refusal belongs to the transport, as does tonic's refusal of a
