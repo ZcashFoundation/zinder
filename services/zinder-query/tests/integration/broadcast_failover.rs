@@ -137,6 +137,37 @@ fn schedule_with_a_future_upgrade() -> eyre::Result<NetworkUpgradeActivations> {
     )?)
 }
 
+/// Two regtest serving pairs whose broadcast heights straddle an activation.
+///
+/// NU6.1 and NU6.2 activate at height 3, which a broadcast targets once the
+/// served tip reaches height 2, so the pairs differ in verification basis.
+struct ActivationCrossing {
+    /// Serves a tip at height 1.
+    before_slot: WalletServingPairSlot,
+    /// Serves a tip at height 2.
+    after_slot: WalletServingPairSlot,
+    _stores: [WalletServingStoreFixture; 2],
+}
+
+impl ActivationCrossing {
+    fn new() -> eyre::Result<Self> {
+        let schedule = sample_regtest_upgrade_activations();
+        let mut before_store = WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
+            &schedule,
+        )?;
+        let mut after_store = WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+            &schedule,
+        )?;
+        Ok(Self {
+            before_slot: serving_pair_slot(&mut before_store)?,
+            after_slot: serving_pair_slot(&mut after_store)?,
+            _stores: [before_store, after_store],
+        })
+    }
+}
+
 /// Serialized bytes of a transaction this build decodes, with the id the
 /// consensus parser computes for them.
 ///
@@ -490,27 +521,16 @@ async fn endpoint_is_verified_again_after_a_schedule_revision() -> eyre::Result<
 /// an activation.
 ///
 /// A verification checked the node's table only through the height after the
-/// tip it saw. Here NU6.1 and NU6.2 activate at height 3, which a broadcast
-/// targets once the served tip reaches height 2.
+/// tip it saw.
 #[tokio::test]
 async fn endpoint_is_verified_again_when_the_tip_crosses_an_activation() -> eyre::Result<()> {
-    let schedule = sample_regtest_upgrade_activations();
-    let mut before_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
-        &schedule,
-    )?;
-    let mut after_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
-        &schedule,
-    )?;
-    let before_slot = serving_pair_slot(&mut before_store)?;
-    let after_slot = serving_pair_slot(&mut after_store)?;
-    let node = accepting_node(0xbb).with_node_activations(schedule);
+    let crossing = ActivationCrossing::new()?;
+    let node = accepting_node(0xbb);
     let nodes = OrderedBroadcaster::new(node.clone(), []);
 
-    nodes.verify(&before_slot).await?;
+    nodes.verify(&crossing.before_slot).await?;
     assert_eq!(node.capability_probe_count(), 1);
-    nodes.verify(&after_slot).await?;
+    nodes.verify(&crossing.after_slot).await?;
     assert_eq!(node.capability_probe_count(), 2);
     Ok(())
 }
@@ -581,23 +601,13 @@ async fn skipping_an_unverified_endpoint_keeps_the_preference() -> eyre::Result<
 #[tokio::test(start_paused = true)]
 async fn inconclusive_verification_after_a_basis_change_keeps_the_earlier_one() -> eyre::Result<()>
 {
-    let schedule = sample_regtest_upgrade_activations();
-    let mut before_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
-        &schedule,
-    )?;
-    let mut after_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
-        &schedule,
-    )?;
-    let before_slot = serving_pair_slot(&mut before_store)?;
-    let after_slot = serving_pair_slot(&mut after_store)?;
+    let crossing = ActivationCrossing::new()?;
     let node = accepting_node(0xee);
     let nodes = OrderedBroadcaster::new(node.clone(), []);
-    nodes.verify(&before_slot).await?;
+    nodes.verify(&crossing.before_slot).await?;
 
     node.report_another_chain();
-    nodes.verify(&after_slot).await?;
+    nodes.verify(&crossing.after_slot).await?;
     nodes
         .broadcast_transaction(RawTransactionBytes::new([0x0f]))
         .await?;
@@ -605,7 +615,7 @@ async fn inconclusive_verification_after_a_basis_change_keeps_the_earlier_one() 
     assert!(nodes.verified_capabilities().is_some());
 
     tokio::time::advance(Duration::from_secs(61)).await;
-    assert!(nodes.verify(&after_slot).await.is_err());
+    assert!(nodes.verify(&crossing.after_slot).await.is_err());
     assert!(
         nodes
             .broadcast_transaction(RawTransactionBytes::new([0x10]))
@@ -613,6 +623,50 @@ async fn inconclusive_verification_after_a_basis_change_keeps_the_earlier_one() 
             .is_err()
     );
     assert_eq!(node.call_count(), 1);
+    assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// The grace of an earlier verification ends on time even when no later
+/// verification round completes, as when the round waits on a slow node.
+#[tokio::test(start_paused = true)]
+async fn earlier_verification_ends_with_its_grace_without_another_round() -> eyre::Result<()> {
+    let crossing = ActivationCrossing::new()?;
+    let node = accepting_node(0x13);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    nodes.verify(&crossing.before_slot).await?;
+    node.report_another_chain();
+    nodes.verify(&crossing.after_slot).await?;
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    assert!(
+        nodes
+            .broadcast_transaction(RawTransactionBytes::new([0x13]))
+            .await
+            .is_err()
+    );
+    assert_eq!(node.call_count(), 0);
+    assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// An earlier verification kept after an inconclusive repeat is checked
+/// again when the pair returns to its basis, as after a reorg back below the
+/// activation, so the return does not extend its grace.
+#[tokio::test(start_paused = true)]
+async fn returning_to_the_earlier_basis_does_not_extend_its_grace() -> eyre::Result<()> {
+    let crossing = ActivationCrossing::new()?;
+    let node = accepting_node(0x14);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    nodes.verify(&crossing.before_slot).await?;
+    node.report_another_chain();
+    nodes.verify(&crossing.after_slot).await?;
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    assert!(nodes.verify(&crossing.before_slot).await.is_err());
+    assert_eq!(node.capability_probe_count(), 3);
     assert!(nodes.verified_capabilities().is_none());
     Ok(())
 }

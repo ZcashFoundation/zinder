@@ -668,8 +668,8 @@ Reader broadcast failover is covered by
 within a broadcast, the preferred endpoint, the duplicate-after-timeout
 answer, exclusion and its backoff, and verification after a schedule revision
 or an activation crossing, an inconclusive repeat that keeps the earlier
-verification, a preference that only a failover moves, and the endpoint
-metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
+verification until its grace ends on time, a preference that only a failover
+moves, and the endpoint metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
 One live test, `live::broadcast_fallback`, needs only one Regtest node: it puts
 a local TCP proxy to the live node at `[node]` and the live node itself at
 `[node_fallbacks.1]`, verifies both, stops the proxy, and checks that a

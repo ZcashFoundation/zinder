@@ -126,7 +126,10 @@ that has not received that block yet. Such an inconclusive repeat therefore
 keeps the endpoint's earlier verification for up to one minute, and rounds
 repeat every two seconds, or at the poll interval when it is shorter, until
 the endpoint passes, is refused, or the minute ends and it becomes
-unverified. Only positive evidence excludes an endpoint at once.
+unverified. The minute counts from the first inconclusive repeat and ends on
+time, so a broadcast after it skips the endpoint even while a round still
+waits on a node, and a pair that returns to the earlier basis does not renew
+it. Only positive evidence excludes an endpoint at once.
 
 A broadcast tries the verified endpoints in order, starting at the preferred
 one, which is `[node]` until a failover moves it. It moves to the next

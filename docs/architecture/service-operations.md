@@ -487,7 +487,8 @@ again at once instead of waiting for its next round. When that repeat is
 inconclusive, for example because the node has not received the block that
 crossed the activation, the endpoint keeps its earlier verification for up to
 one minute, logged once as `wallet_node_reverification_inconclusive`, and the
-probe retries every two seconds; after the minute it is unverified. An endpoint that
+probe retries every two seconds. After the minute it receives no broadcast,
+even before a retry finishes, and it is unverified. An endpoint that
 lacks `sendrawtransaction` or whose activation table disagrees is excluded and
 logged as `wallet_node_excluded`; it is verified again after a backoff that
 starts at 30 seconds and doubles to 5 minutes. An endpoint that cannot be

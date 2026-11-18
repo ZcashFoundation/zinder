@@ -499,6 +499,31 @@ impl VerificationState {
             Self::Excluded { .. } => "excluded",
         }
     }
+
+    /// Returns the capabilities of a verification a broadcast may rely on
+    /// now: one of the latest basis checked, or one of an earlier basis whose
+    /// [`STALE_VERIFICATION_GRACE`] has not ended.
+    ///
+    /// The grace ends on time even while no later verification completes, so
+    /// a slow verification round cannot extend it.
+    fn in_force(&self) -> Option<&UpstreamNodeCapabilities> {
+        match self {
+            Self::Verified {
+                capabilities,
+                stale_since,
+                ..
+            } if !stale_since.is_some_and(stale_grace_ended) => Some(capabilities),
+            Self::Unchecked | Self::Unverified | Self::Verified { .. } | Self::Excluded { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// Returns whether the grace of a verification first left stale at `since`
+/// has ended.
+fn stale_grace_ended(since: Instant) -> bool {
+    since.elapsed() >= STALE_VERIFICATION_GRACE
 }
 
 impl EndpointVerification {
@@ -513,7 +538,7 @@ impl EndpointVerification {
     }
 
     fn is_verified(&self) -> bool {
-        matches!(**self.state.load(), VerificationState::Verified { .. })
+        self.state.load().in_force().is_some()
     }
 
     fn awaits_reverification(&self) -> bool {
@@ -527,20 +552,21 @@ impl EndpointVerification {
     }
 
     fn verified_capabilities(&self) -> Option<UpstreamNodeCapabilities> {
-        match &**self.state.load() {
-            VerificationState::Verified { capabilities, .. } => Some(capabilities.clone()),
-            VerificationState::Unchecked
-            | VerificationState::Unverified
-            | VerificationState::Excluded { .. } => None,
-        }
+        self.state.load().in_force().cloned()
     }
 
     /// Returns the outcome of a verification that still holds against
     /// `basis`, or `None` when the endpoint must be verified again.
+    ///
+    /// A verification kept after an inconclusive repeat is never settled,
+    /// even when the pair returns to its basis, so a later round either
+    /// renews it or lets its grace end.
     fn settled(&self, basis: VerificationBasis) -> Option<Result<(), SourceError>> {
         match &**self.state.load() {
             VerificationState::Verified {
-                basis: verified, ..
+                basis: verified,
+                stale_since: None,
+                ..
             } if *verified == basis => Some(Ok(())),
             VerificationState::Excluded {
                 refusal, retry_at, ..
@@ -649,7 +675,7 @@ impl EndpointVerification {
         } = previous
         {
             let since = stale_since.unwrap_or_else(Instant::now);
-            if since.elapsed() < STALE_VERIFICATION_GRACE {
+            if !stale_grace_ended(since) {
                 if stale_since.is_none() {
                     tracing::warn!(
                         target: "zinder::wallet_serving",
