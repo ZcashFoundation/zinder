@@ -23,6 +23,27 @@ injected, while release images carry the full tag-target commit. The same
 version and commit appear in the `zinder_build_info` metric and native
 `ServerInfo`; lightwalletd compatibility exposes them through `LightdInfo`.
 
+## Healthcheck subcommand
+
+Every runtime binary, `zinder-ingest`, `zinder-projector`, `zinder-query`,
+`zinder-compat-lightwalletd`, and `zinder-explorer`, answers
+`healthcheck` with one plain HTTP/1.1 `GET` to its own operational endpoint.
+It exits 0 only on HTTP 200 and exits 1 otherwise, printing the reason, such
+as the refused address or the status and the start of the body, to stderr.
+Container runtimes record that line as the failure reason. The probe does not
+read the configuration file:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then the service's default ops address | The endpoint to probe. An unspecified host, `[::]` or `0.0.0.0`, probes loopback: `[::]` tries `[::1]`, then `127.0.0.1`. |
+| `--path` | `/readyz` | The route to request. Use `/healthz` for liveness only. |
+
+An empty `ZINDER_OPS__LISTEN_ADDR` disables the endpoint, so the probe fails
+without connecting. When the ops address is set only in the configuration
+file, pass it with `--addr`. The whole probe is bounded at 3 seconds, below
+the 5-second timeout of the image and Compose healthchecks, so the probe
+reports its own reason before the container runtime kills it.
+
 ## Readiness vocabulary
 
 `ReadinessCause` is shared by JSON and protobuf surfaces:
@@ -1275,7 +1296,9 @@ cookie contents, viewing keys, or unbounded payloads.
 
 ## Security boundary
 
-Public listeners require explicit `security.allow_public_bind = true`. The
+Public listeners require explicit `security.allow_public_bind = true`, which
+the [runtime images](#runtime-images) set because a container listener is
+exposed only through a published port. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
 operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
@@ -1382,3 +1405,44 @@ Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
 canary runtime. None is the complete supported composition. Every image is a
 target of the single `deploy/Dockerfile`. Cipherscan and PostgreSQL are not
 release classes.
+
+### Runtime images
+
+Each runtime image runs one binary as UID 1000 on a digest-pinned
+`gcr.io/distroless/cc-debian12:nonroot` base, which carries glibc, the GCC and
+C++ runtime libraries, and CA certificates. The image has no shell, curl,
+or package manager. Its `HEALTHCHECK` runs the
+[healthcheck subcommand](#healthcheck-subcommand): ingest probes `/healthz`
+after a 10-second start period, and the other runtimes probe `/readyz`. The
+single-volume host images, the benchmark, and the live-test runner keep the
+Debian base with `sh` and `curl`, because their entrypoint scripts need them.
+
+Each runtime image sets these listener defaults, so `docker run -p` reaches a
+container started without other configuration:
+
+| Image | Environment defaults |
+| --- | --- |
+| `zinder-ingest` | `ZINDER_OPS__LISTEN_ADDR=[::]:9105` |
+| `zinder-projector` | `ZINDER_OPS__LISTEN_ADDR=[::]:9110` |
+| `zinder-query` | `ZINDER_QUERY__LISTEN_ADDR=[::]:9102`, `ZINDER_OPS__LISTEN_ADDR=[::]:9106` |
+| `zinder-compat-lightwalletd` | `ZINDER_COMPAT__LISTEN_ADDR=[::]:9067`, `ZINDER_OPS__LISTEN_ADDR=[::]:9107` |
+| `zinder-explorer` | `ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068`, `ZINDER_OPS__LISTEN_ADDR=[::]:9069` |
+
+Every runtime image also sets `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`.
+Inside a container, `[::]` covers only the container's own interfaces, and a
+listener is reachable from the host only through a published port, so the port
+publication decides exposure. Publish ports on `127.0.0.1` unless a proxy
+terminates TLS and authorization in front of them. Ingest's `IngestControl`
+listener keeps its `127.0.0.1:9100` default.
+
+Environment variables outrank the configuration file, so these defaults also
+replace `listen_addr` and `allow_public_bind` values in a mounted file. To
+change one, set its environment variable, for example
+`-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`.
+
+To inspect a running container, run its binary with `docker exec`, for example
+`docker exec <container> zinder-query --config /etc/zinder/config.toml
+--print-config` for the effective, redacted configuration. For ordinary tools,
+start a throwaway container in the service's namespaces, as
+[Inspect a runtime container](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
+shows.

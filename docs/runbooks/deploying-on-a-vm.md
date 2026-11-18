@@ -94,7 +94,17 @@ sudo git clone https://github.com/ZcashFoundation/zinder.git /opt/zinder
 sudo git -C /opt/zinder checkout vX.Y.Z
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
+echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
 ```
+
+`ZINDER_VERSION` selects the signed release images
+`ghcr.io/zcashfoundation/<runtime>:vX.Y.Z` for every runtime. Set it to the
+tag you checked out, because each Compose file matches the images of its own
+release. To build every image from the checkout instead, leave
+`ZINDER_VERSION` out of the env file. `ZINDER_INGEST_IMAGE`,
+`ZINDER_PROJECTOR_IMAGE`, `ZINDER_QUERY_IMAGE`, `ZINDER_COMPAT_IMAGE`, and
+`ZINDER_EXPLORER_IMAGE` each replace one whole image reference, for example
+with a digest-pinned one.
 
 Pick the env file for your node and network:
 
@@ -207,12 +217,30 @@ docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml config -q
 ```
 
-Build and start the four release runtimes:
+Pull the release images and start the four release runtimes:
+
+```bash
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml up -d --no-build
+```
+
+`pull` fails when `ZINDER_VERSION` names a tag that was never published.
+`--no-build` keeps `up` from building that tag from source instead and naming
+the local result as the release. To verify the image signatures and
+attestations before starting them, follow
+[Verify publication](releasing.md#verify-publication).
+
+On a source-build host without `ZINDER_VERSION`, build and start the runtimes
+instead:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml up -d --build
 ```
+
+The later commands in this runbook use `--no-build`; replace it with
+`--build` on a source-build host.
 
 The Compose topology gives projector, query, and compatibility containers the
 ingest container's network namespace. This keeps `CanonicalControl` and
@@ -229,6 +257,15 @@ unhealthy. Query and compatibility receive five-minute startup grace periods.
 The projector has no node settings, and query and compatibility do not
 contact the node to start: they reach it only to broadcast transactions,
 after checking on first contact that it serves the store's chain.
+
+Each healthcheck runs the service's own binary, for example
+`zinder-query healthcheck`, which requests `/readyz` on the address in
+`ZINDER_OPS__LISTEN_ADDR` and passes only on HTTP 200. `docker compose ps`
+shows the result. The runtime images contain only the service binary and the
+C and C++ runtime libraries it links: there is no shell, curl, or package
+manager, so a custom healthcheck must also call the binary, for example
+`["CMD", "zinder-query", "healthcheck", "--path", "/healthz"]` for liveness
+only. See [Inspect a runtime container](#inspect-a-runtime-container).
 
 ### Attach a Zakura node
 
@@ -288,7 +325,7 @@ ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.node-fallback.yml \
-  up -d
+  up -d --no-build
 ```
 
 Run the cookie-permissions project for the fallback node's cookie volume too,
@@ -344,28 +381,18 @@ merge the explorer overlay:
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.explorer.yml \
-  up -d --build
-```
-
-With `--build`, the overlay builds `zinder-explorer` from the checked-out
-source. To run the released image instead, set
-`ZINDER_EXPLORER_IMAGE=ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z` in
-`/etc/zinder/env`, then pull it and start the Explorer without a build:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.explorer.yml \
   pull zinder-explorer
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.explorer.yml \
-  up -d --no-build zinder-explorer
+  up -d --no-build
 ```
 
-Do not pass `--build` while `ZINDER_EXPLORER_IMAGE` names a released image.
-Compose then builds from source and tags the local result with the release
-name.
+`ZINDER_VERSION` selects the released `zinder-explorer` image as it does for
+the other runtimes. On a source-build host, run the second command with
+`--build` instead of `--no-build`. Do not pass `--build` while
+`ZINDER_VERSION` or `ZINDER_EXPLORER_IMAGE` names a released image: Compose
+then builds from source and tags the local result with the release name.
 
 The Explorer opens a process-owned materialized-view
 secondary, and federates `WalletQuery` over the shared loopback namespace. The
@@ -549,7 +576,7 @@ docker compose --env-file /etc/zinder/env \
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.indexer-tls.yml \
-  up -d --build
+  up -d --no-build
 ```
 
 The overlay mounts the directory read-only into `zinder-ingest` only, because
@@ -600,6 +627,37 @@ not route wallet traffic based on `/healthz`. Query and compatibility stay
 ready through a node or ingest-control outage. Their `/readyz` body lists the
 outage under `degraded`, and only the requests that call that dependency
 fail.
+
+## Inspect a runtime container
+
+The runtime images run the service binary as UID 1000 and contain no shell,
+so `docker compose exec zinder-query sh` fails. Run the binary itself instead:
+
+```bash
+# The effective configuration after the config file and the environment,
+# with secrets redacted.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query --config /etc/zinder/config.toml --print-config
+# One readiness probe, which prints the reason when it fails.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query healthcheck
+```
+
+To look at files, processes, or loopback listeners with ordinary tools, attach
+a throwaway toolbox container to the service's namespaces, with its volumes
+read-only:
+
+```bash
+container="$(docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml ps -q zinder-query)"
+docker run --rm -it \
+  --network "container:${container}" --pid "container:${container}" \
+  --volumes-from "${container}:ro" \
+  busybox:1.37 sh
+```
+
+The toolbox leaves the running container and its image unchanged, and it
+stops when you exit the shell.
 
 ## Put TLS in front of compatibility
 

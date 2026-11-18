@@ -72,7 +72,7 @@ services:
     ports:
       - "127.0.0.1:${ZINDER_CANONICAL_RUNTIME_OPS_HOST_PORT:-19105}:9105"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9105/healthz"]
+      test: ["CMD", "zinder-ingest", "healthcheck", "--path", "/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 10s
