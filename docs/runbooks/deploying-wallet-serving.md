@@ -348,10 +348,10 @@ registry the service can read, and point the service at that image.
 | 9067 | lightwalletd `CompactTxStreamer` gRPC | Railway private network |
 | 9102 | native `WalletQuery` gRPC | Railway private network |
 | 9106 | query operational HTTP | Railway private network and healthcheck |
+| 9107 | compatibility operational HTTP | Railway private network |
 | 9100 | ingest control gRPC | container loopback |
 | 9101 | projector control gRPC | container loopback |
 | 9105 | ingest operational HTTP | container loopback |
-| 9107 | compatibility operational HTTP | container loopback |
 | 9110 | projector operational HTTP | container loopback |
 
 The private network is IPv6-only, so clients reach
@@ -374,10 +374,9 @@ entrypoint supervises it as it supervises query: its exit ends the container,
 it has its own one-hour unready tolerance and recurrence budgets, it runs as
 `zinder`, and it reads the same ingest-control token file. Query and
 compatibility are peers over the same pair, so the image `HEALTHCHECK`
-requires both. A process outside the container reaches neither compatibility's
-`/readyz` nor its `/metrics`, because port 9107 binds container loopback.
-From a shell in the container, run
-`curl -fsS http://127.0.0.1:9107/readyz`.
+requires both. Its operational endpoint binds `[::]:9107`, like query's 9106,
+so a metrics scraper or a proxy readiness check on the private network reaches
+its `/readyz` and `/metrics`.
 
 Configure it with `ZINDER_COMPAT__*` variables, which reach compatibility
 alone:
@@ -924,7 +923,7 @@ its own drain window.
   primaries have exactly one owner process each.
 - Do not override storage paths, listen addresses, control endpoints, or
   bearer token paths through `ZINDER_*` variables.
-- Do not expose 9100, 9101, 9105, 9107, or 9110 beyond the container.
+- Do not expose 9100, 9101, 9105, or 9110 beyond the container.
 - Do not attach a public domain to 9067, 9102, or 9068. These surfaces are
   plaintext; public exposure requires TLS, authentication, and quotas at a
   reverse proxy.

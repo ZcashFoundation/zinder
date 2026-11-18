@@ -985,7 +985,7 @@ expect_rejected_because \
   --dockerfile "$compat_less_wallet_serving_dockerfile"
 
 closed_compat_port_dockerfile="$temporary_directory/closed-compat-port.Dockerfile"
-sed 's/^EXPOSE 9067 9102 9106$/EXPOSE 9102 9106/' \
+sed 's/^EXPOSE 9067 9102 9106 9107$/EXPOSE 9102 9106 9107/' \
   "$repository_root/deploy/Dockerfile" > "$closed_compat_port_dockerfile"
 cmp -s "$repository_root/deploy/Dockerfile" "$closed_compat_port_dockerfile" \
   && fail "the fixture did not remove the wallet-serving compatibility port"

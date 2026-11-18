@@ -338,7 +338,7 @@ COPY --chmod=0755 deploy/wallet-serving-healthcheck \
 USER root:root
 WORKDIR /var/lib/zinder
 
-EXPOSE 9067 9102 9106
+EXPOSE 9067 9102 9106 9107
 
 # The start period covers the entrypoint's default canonical, wallet, and
 # serving deadlines, which together run to five and a half hours; query and
@@ -368,7 +368,7 @@ RUN sed -i 's/^explorer_views = false$/explorer_views = true/' /etc/zinder/inges
 COPY --chmod=0755 deploy/wallet-serving-explorer-runtime-entrypoint \
     /usr/local/bin/zinder-wallet-serving-explorer-runtime-entrypoint
 
-EXPOSE 9067 9068 9069 9102 9106
+EXPOSE 9067 9068 9069 9102 9106 9107
 
 # The inherited wallet-serving HEALTHCHECK deliberately ignores the Explorer:
 # the entrypoint restarts the Explorer alone, and a host that restarts

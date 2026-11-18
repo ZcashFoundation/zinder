@@ -33,7 +33,7 @@ pair_convergence_attempts = 12
 serving = "wallet"
 
 [ops]
-listen_addr = "127.0.0.1:9107"
+listen_addr = "[::]:9107"
 
 [security]
 allow_public_bind = true
