@@ -137,7 +137,7 @@ A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, c
 - A stream holds its slot from validation until it ends, fails, or is cancelled.
 - A valid request past the limit waits for a slot, first come first served, for up to 10 seconds, and reads nothing while it waits. If no slot returns in time, it fails with `UNAVAILABLE`. lightwalletd waits and fails the same way.
 - At most as many requests wait as the limit has slots, 100 by default. A request that finds the queue full fails with `UNAVAILABLE` at once. A client that cancels, disconnects, or reaches its deadline while it waits gives up its place.
-- The Zcash Android SDK, Slipstream, and Vizor retry a failed block-range request after a short backoff, so an occasional refusal delays a sync. Repeated refusals can still end a sync attempt.
+- The Zcash Android SDK, Slipstream, and Vizor retry a failed block-range request after a short backoff, so an occasional refusal delays a sync. Repeated refusals can still end a sync attempt. [Wallet engine error handling](#wallet-engine-error-handling) lists what each one does. A client you write should retry `UNAVAILABLE` with backoff.
 - `zinder_compat_block_range_streams_open` reports open streams, `zinder_compat_block_range_slot_wait_duration_seconds` how long requests waited, and `zinder_compat_block_range_stream_refusals_total` the refusals, as [Metrics](metrics.md#zinder-compat-lightwalletd) lists.
 - Every client shares the limit and the queue. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects, and one that also sends as many more requests fills the queue. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
 
@@ -147,7 +147,7 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 `GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns, and a refused rebuild is `UNAVAILABLE`.
 
-Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `UNAVAILABLE`, the code a full block-range limit returns, so a wallet retries both limits the same way. It fails at once when every waiting place is taken. `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` refuses the same rebuild with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
+Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `UNAVAILABLE`, the code a full block-range limit returns, so a wallet retries both limits the same way. [Wallet engine error handling](#wallet-engine-error-handling) describes how existing wallet engines retry it. It fails at once when every waiting place is taken. `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` refuses the same rebuild with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
 
 ### `GetSubtreeRoots`
 
@@ -233,6 +233,34 @@ The protocol has no lossless way to page past the cap. A single block with more 
 - The stream ends with `OK` when the chain tip changes, including a change already observed while the stream was starting. Clients reconnect, as with lightwalletd.
 - If the tip-change signal itself closes, for example during shutdown, the stream ends with `UNAVAILABLE`, so a client does not mistake it for a new block.
 - One stream sends at most 100,000 distinct transactions between tip changes. The next new one ends it with `UNAVAILABLE`, which clients retry.
+
+## Wallet engine error handling
+
+This section describes how three wallet sync engines react when a `GetBlockRange` or `GetTreeState` call fails, as read in their source. Use it to predict the load a refusal causes. It is not a support claim for these wallets; the [claim boundary](#claim-boundary) still applies.
+
+None of the three engines treats one gRPC status differently from another on these calls. `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `ABORTED`, `OUT_OF_RANGE`, `NOT_FOUND`, and `INVALID_ARGUMENT` all take the same retry path. A refused request therefore comes back within seconds, often on a new connection, and a refusal does not slow the client down.
+
+Slipstream is the sync engine in the ZODL Android and iOS apps. On a direct connection it does the following:
+
+- A failed `GetBlockRange` resumes from the first height not yet received, on a new connection, after 0.25, 0.5, and 1 seconds. After three retries that receive no block, the sync pass fails.
+- A failed `GetTreeState` is retried on a new connection after 1 and 3 seconds. A third failure fails the sync pass.
+- A failed sync pass runs again, up to three passes in all.
+- Through an OHTTP gateway only, `INVALID_ARGUMENT` on `GetBlockRange` halves the requested range and retries. On a direct connection it takes the same path as any other status.
+
+Slipstream asks for a tree state below its start height, then one at the end of each downloaded piece of up to 8 MiB, except the range's last piece. Four streams download at once, so one syncing wallet can have several tree-state requests in flight.
+
+Vizor does the following:
+
+- It requests each batch's blocks and the tree state below the batch together. If either call fails, it cancels the other.
+- A batch downloading ahead of the scan that fails within 10 seconds is retried after 1 and 4 seconds. If it still fails, Vizor downloads the batch again when the scan reaches it.
+- A failure of that download ends the sync attempt. Vizor tries again after 2, 4, and 8 seconds.
+- In Automatic endpoint mode, a failed call excludes the endpoint for one minute and selects another endpoint. A custom endpoint does not fail over.
+
+Vizor downloads up to four batches ahead of the one it scans, and each batch asks for its own tree state.
+
+The classic Zcash Android SDK, `CompactBlockProcessor`, downloads one batch at a time. It gives each `GetTreeState` and `GetBlockRange` call five attempts, 0.5, 1, 2, and 4 seconds apart. A retried `GetBlockRange` requests the whole batch again.
+
+`zinder-bench lightwalletd-wallet-load` sends these request patterns to an endpoint and reports the statuses its simulated wallets observe. The [benchmark README](../../services/zinder-bench/README.md#7-drive-wallet-shaped-load-at-an-endpoint) describes it.
 
 ## Request limits
 
