@@ -26,14 +26,11 @@ serves that one consistent view to every wallet, backend, and explorer you run.
   address data stay available while the node is down. Ingest and broadcast can
   fail over to a second node.
 
-Zinder serves chain data only. Keys, note scanning, and shielded balances stay
-in the wallet.
+Zinder serves public chain data. Keys, note scanning, and shielded balances
+stay in the wallet.
 
-The cost is a second service beside your node, about 465 GB of disk on
-Mainnet with Explorer views, and a first sync that takes hours. Zinder runs on
-one host, needs an archive node, and has no built-in TLS. If you only need
-node RPC, or a lightwalletd endpoint with the smallest footprint, another
-project may fit better. The
+Zinder runs beside an archive Zebra or Zakura node on one host.
+[Deploying Zinder](docs/runbooks/deploying.md) lists what it needs. The
 [indexer comparison](docs/reference/indexer-comparison.md) puts Zinder beside
 Zebra, Zakura, ztreamer, Zingod, and Go lightwalletd, feature by feature.
 
@@ -41,7 +38,7 @@ Zebra, Zakura, ztreamer, Zingod, and Go lightwalletd, feature by feature.
 
 | You want to | Read |
 | --- | --- |
-| Decide whether Zinder fits your product | [Use cases](docs/use-cases.md) |
+| See what Zinder gives your product | [Use cases](docs/use-cases.md) |
 | Run Zinder | [Deploying Zinder](docs/runbooks/deploying.md), which starts with a Docker Compose quickstart |
 | Connect a wallet or backend | [Integration surfaces](docs/reference/integration-surfaces.md) |
 | Understand how it works | [How Zinder works](docs/architecture/overview.md) |

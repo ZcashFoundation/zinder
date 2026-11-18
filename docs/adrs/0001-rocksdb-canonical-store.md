@@ -21,7 +21,7 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 1. Zinder stores its canonical chain data in RocksDB through `rust-rocksdb`. The wallet store and the materialized-view stores use the same engine.
 2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one.
 3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
-4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). Zinder can capture such a pair but has no restore command yet, so rebuilding is the only restore today, as [Service operations](../architecture/service-operations.md#recovery) describes.
+4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). Zinder captures such a pair and has no restore command. Recovery rebuilds the stores, as [Service operations](../architecture/service-operations.md#recovery) describes.
 
 [Storage backend](../architecture/storage-backend.md) describes the stores, their column families, and their layout.
 

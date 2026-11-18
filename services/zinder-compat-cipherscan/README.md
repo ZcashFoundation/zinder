@@ -2,7 +2,7 @@
 
 `zinder-compat-cipherscan` serves Cipherscan's REST and WebSocket API from Zinder's `ExplorerQuery` and `WalletQuery` services, so the Cipherscan frontend can use Zinder without changes. It opens no storage and keeps only bounded in-memory caches.
 
-The adapter is optional and is not published as a release image. It needs a running `zinder-explorer` (with `[ingest].explorer_views = true`) and a reachable `zinder-query`. Many Cipherscan routes are degraded or unavailable against the current Explorer; check the [coverage matrix](../../docs/architecture/cipherscan-adapter.md) before deploying.
+The adapter is optional, and you build it from the workspace. It needs a running `zinder-explorer` (with `[ingest].explorer_views = true`) and a reachable `zinder-query`. The [coverage matrix](../../docs/architecture/cipherscan-adapter.md#coverage-matrix) lists what each Cipherscan route returns; check it before deploying.
 
 ## Run it
 
@@ -30,6 +30,6 @@ Start the adapter after both gRPC endpoints are up, because it connects to them 
 cargo run --release -p zinder-compat-cipherscan -- --config /etc/zinder/cipherscan.toml
 ```
 
-The adapter refuses a public listen address unless `security.allow_public_bind = true`. It has no TLS or client authentication. Put public traffic behind your own TLS proxy with authentication, rate limits, and quotas. The optional bearer token is sent to both Zinder gRPC endpoints.
+The adapter refuses a public listen address unless `security.allow_public_bind = true`. TLS termination, client authentication, rate limits, and quotas belong in your proxy, so put public traffic behind one ([Service operations](../../docs/architecture/service-operations.md#security-boundary)). The optional bearer token is sent to both Zinder gRPC endpoints.
 
 `/healthz` on the ops listener shows the process is alive, and `/readyz` shows it connected to both endpoints. Neither proves that the Explorer's views cover a requested range. To check real routes, follow the [verification runbook](../../docs/runbooks/cipherscan-adapter-verification.md).

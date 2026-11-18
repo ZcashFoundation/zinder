@@ -1,6 +1,6 @@
 # Integration surfaces
 
-This page tells you how to connect a client to Zinder: which endpoint to use, the smallest working call, and what the client must handle. It is for wallet, SDK, and backend developers. To decide whether Zinder fits your product at all, read [Use cases](../use-cases.md) and [Indexer comparison](indexer-comparison.md).
+This page tells you how to connect a client to Zinder: which endpoint to use, the smallest working call, and what the client must handle. It is for wallet, SDK, and backend developers. To match Zinder to your product, read [Use cases](../use-cases.md) and [Indexer comparison](indexer-comparison.md).
 
 ## Choose a path
 
@@ -16,7 +16,7 @@ The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-com
 
 ## What every client must handle
 
-**Transport.** Zinder listeners speak plaintext HTTP/2 (h2c), and only `zinder-explorer` can require a shared bearer token (`explorer.bearer_token_path`), which clients send as `authorization: Bearer <token>`. Connect to the `https://` address of the operator's proxy, which the [security boundary](../architecture/service-operations.md#security-boundary) requires and [Exposing over TLS](../runbooks/exposing-over-tls.md) sets up.
+**Transport.** Zinder listeners speak plaintext HTTP/2 (h2c). TLS termination and client authentication belong in the operator's proxy, which the [security boundary](../architecture/service-operations.md#security-boundary) requires and [Exposing over TLS](../runbooks/exposing-over-tls.md) sets up. Connect to the proxy's `https://` address. `zinder-explorer` can also require a shared bearer token (`explorer.bearer_token_path`), which clients send as `authorization: Bearer <token>`; the other listeners rely on the proxy for authentication.
 
 **Readiness.** A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`. Retry with backoff. A request that fails with `REORG_WINDOW_EXCEEDED` cannot succeed until an operator repairs the indexer; stop creating spends against it. [Readiness](readiness.md) lists the causes.
 
@@ -41,7 +41,7 @@ grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
 
-A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode serves only block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported only after end-to-end certification, as its [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
+A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode answers `false` and serves block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
 
 ## Native gRPC clients
 

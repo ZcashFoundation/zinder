@@ -30,7 +30,7 @@ When enabled, ingest works in this order:
 3. After canonical sync reaches the tip, it replays committed blocks into every view and then follows new blocks.
 4. Once replay reaches the tip, it runs the historical backfills for the conventional-fee distribution and the transaction-component summary.
 
-The view store is a separate RocksDB instance at `<storage.path>/materialized-views`, on the canonical volume. Replay pauses when that volume runs low on space, as [What it costs](explorer-plane.md#what-it-costs) describes, and also slows or pauses under memory pressure.
+The view store is a separate RocksDB instance at `<storage.path>/materialized-views`, on the canonical volume. Replay pauses when that volume runs low on space, as [What it needs](explorer-plane.md#what-it-needs) describes, and also slows or pauses under memory pressure.
 
 `zinder-explorer` reads the store as a RocksDB secondary. A secondary validates the store after every catch-up and never writes.
 
@@ -72,9 +72,9 @@ The dispatch column says how a consumer receives data. "Replay" consumers follow
 | `conventional_fee_distribution` | Backfill join, with an ingest backfill | `ConventionalFeeDistribution` |
 | `transaction_component_summary` | Backfill join, with an ingest backfill | `TransactionComponentSummary` |
 | `value_pool_flow_history` | Backfill join | The `ValuePoolFlow*` methods |
-| `block_production_time` | Backfill join | `BlockProductionInTimeRange`, which the Explorer cannot serve |
-| `commitment_root_search` | Backfill join | `CommitmentRootSearch`, which the Explorer cannot serve |
-| `paid_fee_distribution` | Backfill join | `PaidFeeDistribution`, which the Explorer cannot serve |
+| `block_production_time` | Backfill join | `BlockProductionInTimeRange`, which the Explorer does not advertise |
+| `commitment_root_search` | Backfill join | `CommitmentRootSearch`, which the Explorer does not advertise |
+| `paid_fee_distribution` | Backfill join | `PaidFeeDistribution`, which the Explorer does not advertise |
 | `reorg_incidents` | Chain-event envelope only | `ChainReorgHistory` |
 | `value_pool_balance_history` | Backfill only | `ValuePoolBalanceHistory` |
 | `mempool_event_counts` | Mempool events | `MempoolEventCounts`, `OverviewSnapshot` |

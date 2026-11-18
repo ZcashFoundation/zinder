@@ -17,7 +17,7 @@ A live process is not always ready. A writer can be alive while it catches
 up, and a reader can be alive while it cannot attest the chain view it would
 serve. Point liveness probes at `/healthz` and load balancers at `/readyz`.
 
-The operational endpoint has no authentication. Keep it private, as
+The operational endpoint serves without authentication. Keep it private, as
 [Service operations](../architecture/service-operations.md#security-boundary)
 describes.
 
@@ -270,7 +270,7 @@ unreachable.
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
 Watch `served_epoch_age_seconds` during an outage. It grows while the chain
-stands still, and it is the only readiness signal that the served view is
+stands still, and it is the readiness signal that shows the served view is
 stale. A wallet that builds a transaction on a tip more than about 40 blocks
 behind the network creates one that has already expired.
 

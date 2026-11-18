@@ -1,12 +1,12 @@
 # Deploying Zinder
 
-This page takes an operator from nothing to a running, verified Zinder
-deployment. It covers what you deploy, what the host needs, which deployment
-to choose, and a Docker Compose quickstart.
+This page takes an operator from an empty host to a running, verified Zinder
+deployment that serves wallets from your own node. It covers what you deploy,
+what the host needs, which deployment to choose, and a Docker Compose
+quickstart.
 
-Zinder is alpha. It runs on one host, with no read replicas and no snapshot
-bootstrap: every new deployment builds its stores from your node. Pin exact
-release versions and expect breaking upgrades.
+A deployment runs on one host and builds its stores from your node. Pin an
+exact release tag, and read each release's notes before you upgrade.
 
 ## What you deploy
 
@@ -46,10 +46,10 @@ Compose also runs these private ports:
 
 You need an archive Zebra or Zakura node on the same network. Ingest reads
 every historical block, so it refuses a pruned node at startup. The certified
-node versions are Zebra 7.1.0 and Zakura 1.8.6. A Zakura node built by fast
-sync cannot serve a Mainnet first sync, because it never stored the
-per-height commitment trees below its last checkpoint. The node needs its own
-disk on top of the figures below.
+node versions are Zebra 7.1.0 and Zakura 1.8.6. For a Mainnet first sync, use
+a Zakura node that was not built by fast sync, because fast sync does not
+store the per-height commitment trees below its last checkpoint. Give the node
+its own disk on top of the figures below.
 
 | Network | Disk | Memory | First sync |
 | --- | --- | --- | --- |
@@ -58,12 +58,12 @@ disk on top of the figures below.
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
-ceilings, not measured use. The single-volume container needs at least 8 GB.
-CPU requirements are not measured. The release binaries need an x86-64-v3 or
-AArch64 CPU.
+ceilings, not measured use. Give the single-volume container at least 8 GB.
+The release binaries need an x86-64-v3 or AArch64 CPU. CPU use is not
+measured.
 
-The Mainnet disk figures come from separate observations, and they do not add
-up to a peak:
+The Mainnet disk figures come from separate observations, so do not add them
+up to get a peak:
 
 - About 465 GB is the volume in use on one deployment on v0.16.3, after both
   stores were built.
@@ -75,10 +75,10 @@ up to a peak:
 
 Peak disk use during a first sync has not been measured.
 
-The sync time has two sources that disagree. One measured build took about four hours for
-the chain store and more than two hours for the wallet store. Builds on
-earlier releases took about 16 hours in total. No full build has been timed on
-the current release, so plan for the longer figure.
+Plan for up to about 16 hours for a Mainnet first sync. One measured build
+took about four hours for the chain store and more than two hours for the
+wallet store. Builds on earlier releases took about 16 hours in total. No full
+build has been timed on the current release.
 
 ## Choose a deployment
 
@@ -192,8 +192,9 @@ Compose builds every image from the checkout and tags it `:local`.
 
 ## Before you expose it
 
-Wallet listeners have no TLS or client authentication, so expose them only
-through your own proxy ([Exposing over TLS](exposing-over-tls.md)). Compose
+Wallet listeners serve plaintext gRPC, and TLS termination and client
+authentication belong in your proxy. Expose them only through that proxy, as
+[Exposing over TLS](exposing-over-tls.md) sets up. Compose
 publishes ports on host loopback, but any container on the node's Docker
 network can still reach the wallet and ops listeners. The
 [security boundary](../architecture/service-operations.md#security-boundary)
@@ -217,7 +218,8 @@ lists what must stay private.
 
 ## What happens next
 
-The first sync builds the chain store and then the wallet store, and serves
-nothing until both finish. A restart during that build starts it over.
+The first sync builds the chain store and then the wallet store, and Zinder
+serves wallets once both finish. Do not restart a process during that build,
+because a restart starts it over.
 [Initial sync](initial-sync.md) describes each phase and what to watch.
 [Readiness](../reference/readiness.md) explains every `/readyz` state.

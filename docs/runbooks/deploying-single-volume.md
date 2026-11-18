@@ -10,10 +10,11 @@ requirements.
 
 ## When to use it
 
-Use this image when your platform cannot share one volume between containers.
-The readers must open the stores on the writers' filesystem, so the four
-processes share a container. If your host can share a volume between
-containers, use [Deploying on a VM](deploying-on-a-vm.md) instead.
+Use this image when your platform attaches one volume to one container. The
+readers open the stores on the writers' filesystem, so the four processes
+share a container. When your host shares a volume between containers,
+[Deploying on a VM](deploying-on-a-vm.md) runs each process in its own
+container.
 
 ## Get the image
 
@@ -45,11 +46,10 @@ least 8 GB of memory. All four processes share one memory limit. In a
 smaller container, the kernel kills a process during the first build. The
 whole container then restarts, and the build starts over and fails again.
 
-Lightwalletd compatibility starts only after both builds, so it does not
-raise the build peak that sets this minimum. Its memory while serving has not
-been measured in this image. The memory its block-range streams use has no
-enforced maximum, as
-[lightwalletd compatibility](../reference/lightwalletd-compatibility.md)
+Lightwalletd compatibility starts after both builds, so it does not raise the
+build peak that sets this minimum. Its memory while serving has not been
+measured in this image. Size its block-range streams as
+[lightwalletd compatibility](../reference/lightwalletd-compatibility.md#getblockrange-and-getblockrangenullifiers)
 describes. Before you rely on 8 GB, record the container's peak memory under
 the block ranges your wallets request. Lower
 `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` or add memory if the peak
@@ -67,9 +67,10 @@ Set these variables:
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL, such as `http://zebra.railway.internal:8155`. An `https://` URL uses TLS; see [Indexer TLS](#indexer-tls). |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | A stable 32-character hexadecimal value |
 
-The container stops at startup without `ZINDER_NODE__INDEXER_GRPC_ADDR`.
-Without the indexer stream, ingest rereads the whole node mempool after every
-block, and withdraws readiness whenever that takes longer than 30 seconds.
+The container requires `ZINDER_NODE__INDEXER_GRPC_ADDR` and stops at startup
+without it. Without the indexer stream, ingest would reread the whole node
+mempool after every block, and withdraw readiness whenever that takes longer
+than 30 seconds.
 
 These variables are optional:
 
@@ -81,9 +82,10 @@ These variables are optional:
 | `INGEST_CONTROL_BEARER_TOKEN`, `CHECKPOINT_BEARER_TOKEN` | The internal control tokens. The container generates them at startup when unset. |
 | `RUST_LOG` | Log filter. Default `info`. A value that does not parse stops the container. |
 
-The default deadlines fit Testnet but end a Mainnet build from an empty
-volume. For Mainnet, set at least `86400` (24 hours) and `43200` (12 hours)
-before the first deployment, and more on slower disks or a slower node.
+The default deadlines fit Testnet. For Mainnet, set at least `86400` (24
+hours) and `43200` (12 hours) before the first deployment, and more on slower
+disks or a slower node, because the defaults end a Mainnet build from an
+empty volume.
 
 Any other variable from the
 [configuration reference](../reference/configuration.md#environment-variables)
@@ -182,12 +184,12 @@ limits, and quotas in a proxy in front of them, as
    path to `/healthz` and the timeout to `3600`, then deploy again. A changed
    setting applies to a new deployment, not to Redeploy of an existing one.
 
-Railway cannot build this image from the repository, because it builds only
-the last stage of a Dockerfile. Clients reach the service at
-`<service>.railway.internal:9067` and `<service>.railway.internal:9102` over
-Railway's IPv6 private network.
+Deploy from the published image. Railway builds only the last stage of a
+Dockerfile, so it cannot build this image from the repository. Clients reach
+the service at `<service>.railway.internal:9067` and
+`<service>.railway.internal:9102` over Railway's IPv6 private network.
 
-The Railway health check only shows that query listens. It never reads
+The Railway health check confirms that query listens, and it does not read
 compatibility. Also monitor `/readyz` on 9106 and 9107, and
 `zinder_readiness_served_epoch_age_seconds`, which is the only signal of a
 [node outage](../reference/readiness.md#during-a-node-outage). A compatibility
@@ -197,7 +199,7 @@ container.
 ## What a fresh sync looks like
 
 A fresh volume builds the chain store, then the wallet store, and serves
-nothing until both finish. Several hours without a serving port is expected.
+wallets once both finish. Expect several hours without a serving port.
 The deploy log names each phase:
 
 | Log line | Phase |
@@ -305,20 +307,21 @@ ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z
 | 9069 | Explorer ops | The private network |
 
 The Explorer reads `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, and
-`ZINDER_EXPLORER__*` variables. It uses only `[node]`, not the fallbacks.
-Memory and disk for the Explorer and its views are not measured, so give the
-container more than the 8 GB minimum and watch the volume.
+`ZINDER_EXPLORER__*` variables. It reads from `[node]` and not from the
+fallbacks. Give the container more than the 8 GB minimum and watch the
+volume, because memory and disk for the Explorer and its views are not
+measured.
 
 The container stops at startup if the Explorer configuration is invalid. The
 Explorer starts once wallet serving passes its health check and ingest admits
 the view store, or 10 minutes after that check passes. An Explorer failure
 does not stop wallet serving: the entrypoint restarts the Explorer after 15
-seconds, doubling the delay up to 5 minutes. Neither the image `HEALTHCHECK`
-nor the Railway health check covers the Explorer, so monitor its `/readyz` on
-port 9069.
+seconds, doubling the delay up to 5 minutes. The image `HEALTHCHECK` and the
+Railway health check cover wallet serving, so monitor the Explorer's `/readyz`
+on port 9069.
 
 Ingest pauses the views when the volume runs low on space, as
-[What it costs](../architecture/explorer-plane.md#what-it-costs) describes. Set
+[What it needs](../architecture/explorer-plane.md#what-it-needs) describes. Set
 `ZINDER_INGEST__EXPLORER_VIEWS=false` to stop the views from growing while you
 grow the volume, and the Explorer serves them as they last stood.
 
@@ -332,7 +335,7 @@ then restart the deployment.
 
 Releases also publish `zinder-canonical-runtime`, which runs `zinder-ingest`
 alone. It builds and follows the chain store but serves no clients. Use it to
-check chain construction on a platform, not to serve wallets. The image has
-no configuration file, so you set every ingest setting, including the storage
-path under `/var/lib/zinder`, through `ZINDER_*` variables. Its ops port is
+check chain construction on a platform, not to serve wallets. The image takes
+every ingest setting, including the storage path under `/var/lib/zinder`,
+from `ZINDER_*` variables. Its ops port is
 9105, so set `PORT=9105` on Railway. Indexer TLS PEM variables work as above.

@@ -37,69 +37,76 @@ On this page:
 
 ## What each project is
 
-| Fact | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Kind | Validator with built-in serving | Validator with built-in serving | Indexer with a Zakura validator inside | Indexer on a Zakura validator | Indexer on a validator | Indexer on a validator | Indexer on a validator |
-| Version reviewed | zebrad 7.1.0 | zakurad 1.8.9 | 0.1.0, embedding Zakura 1.8.4 | 0.1.0 | 1.1.0 | 0.6.1 | 0.18.0, unreleased |
+| Fact | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Kind | Validator with built-in serving | Validator with built-in serving | Indexer on a Zakura validator, which it can also run in its own process (embedded mode, the default) | Indexer on a validator | Indexer on a validator | Indexer on a validator |
+| Version reviewed | zebrad 7.1.0 | zakurad 1.8.9 | 0.1.0, bundling Zakura 1.8.4 | 1.1.0 | 0.6.1 | 0.18.0, unreleased |
 
 ztreamer runs in one of two modes. Embedded mode, the default, runs a Zakura
 validator inside the ztreamer process. Remote mode follows one separate Zakura
-node. Every table that covers all six projects gives each mode its own column.
+node. The ztreamer column describes what the indexer itself provides, as a
+component that follows a validator, and a footnote names any difference in
+embedded mode. In embedded mode, the bundled Zakura serves its own node
+JSON-RPC and Indexer gRPC once their listen addresses are set, and those APIs
+appear in the Zakura column
+([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L52-L57),
+[Cargo.toml](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/Cargo.toml#L40)).
 
 ## Validator requirements
 
 Zebra and Zakura are the validators, so they have no column here.
 
-| Requirement | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- |
-| Runs on Zebra | No | Unknown[^ztr-zebra] | Yes | Yes | Yes[^zinder-certified] |
-| Runs on Zakura | Yes | Yes | Yes[^zingod-zakura] | Yes | Yes[^zinder-certified] |
-| Runs on zcashd | No | Unknown[^ztr-zcashd] | Yes[^zingod-zcashd] | Yes[^lwd-zcashd] | No |
-| Embeds a validator in its own process | Yes | No | No | No | No |
-| Fails over between several validators | n/a[^ztr-embedded-node] | No | Yes[^zingod-failover] | No | Yes[^zinder-failover] |
-| Broadcast fails over between validators | n/a[^ztr-embedded-node] | No | Yes[^zingod-broadcast-failover] | No | Yes[^zinder-broadcast-failover] |
-| Builds its index from a pruned validator | No[^ztr-pruned] | No[^ztr-pruned] | No[^zingod-pruned] | No[^lwd-pruned] | No[^zinder-archive] |
+| Requirement | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- |
+| Runs on Zebra | Unknown[^ztr-zebra] | Yes | Yes | Yes[^zinder-certified] |
+| Runs on Zakura | Yes | Yes[^zingod-zakura] | Yes | Yes[^zinder-certified] |
+| Runs on zcashd | Unknown[^ztr-zcashd] | Yes[^zingod-zcashd] | Yes[^lwd-zcashd] | No |
+| Fails over between several validators | No[^ztr-embedded] | Yes[^zingod-failover] | No | Yes[^zinder-failover] |
+| Broadcast fails over between validators | No[^ztr-embedded] | Yes[^zingod-broadcast-failover] | No | Yes[^zinder-broadcast-failover] |
+| Builds its index from a pruned validator | No[^ztr-pruned] | No[^zingod-pruned] | No[^lwd-pruned] | No[^zinder-archive] |
 
-ztreamer and Go lightwalletd each follow one validator. Zingod accepts 1 to 64
-validators. zinder-ingest follows one validator at a time from an ordered list
-of `[node]` and optional `[node_fallbacks.N]` endpoints. zinder-query and
+ztreamer and Go lightwalletd each follow one validator, and ztreamer is the
+only indexer here that can also run that validator in its own process. Zingod
+accepts 1 to 64 validators.
+zinder-ingest follows one validator at a time from an ordered list of `[node]`
+and optional `[node_fallbacks.N]` endpoints. zinder-query and
 zinder-compat-lightwalletd use their own node list only to broadcast, and
 zinder-explorer reads only `[node]`.
 
 ## Interfaces
 
-Each column counts only the APIs that the project's own processes serve.
+Each column counts only the APIs that the project itself serves.
 
-| API | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Node JSON-RPC | Yes | Yes | Yes[^ztr-node-apis] | No | No | No | No |
-| Node Indexer gRPC | Yes | Yes | Yes[^ztr-node-apis] | No | No | No | No |
-| Lightwalletd gRPC (`CompactTxStreamer`) | Experimental[^zebra-lwd-exp] | No | Yes | Yes | Yes | Yes | Yes |
-| Native wallet API beyond lightwalletd gRPC | No | No | No | No | No | No | Yes |
-| Explorer API | No | No | No | No | No | No | Optional[^zinder-explorer][^zinder-explorer-auth] |
-| Resumable reorg-aware event cursor | No[^zebra-events] | No[^zakura-events] | No | No | No | No | Yes[^zinder-retention] |
-| Pinned reads across requests | No | No | No | No | No[^zingod-pinned] | No | Yes[^zinder-pinned] |
-| Index replication or snapshot serving | No | No | Yes[^ztr-replicator] | Yes[^ztr-replicator] | No | No | No |
+| API | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Node JSON-RPC | Yes | Yes | No | No | No | No |
+| Node Indexer gRPC | Yes | Yes | No | No | No | No |
+| Lightwalletd gRPC (`CompactTxStreamer`) | Experimental[^zebra-lwd-exp] | No | Yes[^ztr-p2p] | Yes | Yes | Yes |
+| Native wallet API beyond lightwalletd gRPC | No | No | No | No | No | Yes |
+| Explorer API | No | No | No | No | No | Optional[^zinder-explorer][^zinder-explorer-auth] |
+| Resumable reorg-aware event cursor | No[^zebra-events] | No[^zakura-events] | No | No | No | Yes[^zinder-retention] |
+| Pinned reads across requests | No | No | No | No[^zingod-pinned] | No | Yes[^zinder-pinned] |
+| Index replication or snapshot serving | No | No | Yes[^ztr-replicator] | No | No | No |
 
-Zebra, Zakura, and ztreamer's embedded Zakura start with node JSON-RPC and
-Indexer gRPC off. Each listener serves once you set its listen address.
+Zebra and Zakura start with node JSON-RPC and Indexer gRPC off. Each listener
+serves once you set its listen address.
 
 ## Chain data
 
-| Data | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Compact blocks | Experimental[^zebra-lwd-exp] | No | Yes | Yes | Yes | Yes | Yes |
-| Full block by height or hash | Yes | Yes | Yes | No | No | No | Optional[^zinder-raw-all] |
-| Full block range stream | No | Optional[^zakura-range] | Yes[^ztr-range] | No | No | No | Optional[^zinder-raw-all] |
-| Tree states and subtree roots | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes | Yes[^forwarded] | Yes[^zinder-tree-local] |
-| Mined raw transaction by ID | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes |
-| Transparent address history, UTXOs, and balance | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes |
-| Mined spender of a transparent outpoint | No | No | No | No | No | No | Yes[^zinder-outpoint] |
-| Mempool snapshot and stream | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes | Yes[^forwarded] | Yes |
-| Broadcast a signed transaction | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] |
-| Block templates and block submission | Optional[^zebra-miner] | Optional[^zakura-miner] | Optional[^ztr-miner] | No | No | No | No |
-| Explorer search by transaction ID, height, hash, or address | No | No | No | No | No | No | Optional[^zinder-search] |
-| Aggregate views across blocks (fees, pools, supply) | No[^zebra-derived] | No[^zakura-derived] | No | No | No | No | Optional[^zinder-explorer] |
+| Data | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Compact blocks | Experimental[^zebra-lwd-exp] | No | Yes | Yes | Yes | Yes |
+| Full block by height or hash | Yes | Yes | No | No | No | Optional[^zinder-raw-all] |
+| Full block range stream | No | Optional[^zakura-range] | No | No | No | Optional[^zinder-raw-all] |
+| Tree states and subtree roots | Yes | Yes | Yes[^forwarded] | Yes | Yes[^forwarded] | Yes[^zinder-tree-local] |
+| Mined raw transaction by ID | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes |
+| Transparent address history, UTXOs, and balance | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes |
+| Mined spender of a transparent outpoint | No | No | No | No | No | Yes[^zinder-outpoint] |
+| Mempool snapshot and stream | Yes | Yes | Yes[^forwarded] | Yes | Yes[^forwarded] | Yes |
+| Broadcast a signed transaction | Yes | Yes | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] | Yes[^forwarded] |
+| Block templates and block submission | Optional[^zebra-miner] | Optional[^zakura-miner] | No | No | No | No |
+| Explorer search by transaction ID, height, hash, or address | No | No | No | No | No | Optional[^zinder-search] |
+| Aggregate views across blocks (fees, pools, supply) | No[^zebra-derived] | No[^zakura-derived] | No | No | No | Optional[^zinder-explorer] |
 
 Shielded data covers the Sapling, Orchard, and Ironwood pools in every
 project.
@@ -151,25 +158,21 @@ Zebra and Zakura serve from the validator process, so all their serving stops
 with the node, and this table omits them. For Zingod and Zinder, which can fail
 over, each row assumes that every configured validator is down.
 
-| Capability | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- |
-| Serves compact blocks it already indexed | No | Yes | Yes | Yes[^lwd-cached] | Yes[^zinder-down] |
-| Reports the current tip to wallets | No | No[^ztr-tip] | Optional[^zingod-p2p] | No | No[^zinder-tip-down] |
-| Serves tree state | No | Yes[^ztr-tree-down] | Yes | No | Yes[^zinder-down] |
-| Serves transparent address queries | No | No | Yes[^zingod-taddr-down] | No | Yes[^zinder-down] |
-| Broadcasts transactions | No | No | Optional[^zingod-p2p] | No | No[^zinder-broadcast-down] |
-| Readiness endpoint stays ready | No | No | Optional[^zingod-ready] | No[^lwd-no-ready] | Yes[^zinder-down][^zinder-ready] |
-| Readiness reports a stale chain tip | Yes[^ztr-stale] | Yes[^ztr-stale] | Yes[^zingod-stale] | No[^lwd-stale] | Yes[^zinder-stale] |
-| Recovers without a restart when the validator returns | No | Yes | Yes | Yes[^lwd-retries] | Yes[^zinder-down] |
-| Serving starts while the validator is down | n/a[^ztr-embedded-node] | No[^ztr-remote-start] | Optional[^zingod-start-down] | No[^lwd-start-down] | No[^zinder-reader-start] |
+| Capability | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- |
+| Serves compact blocks it already indexed | Yes[^ztr-embedded] | Yes | Yes[^lwd-cached] | Yes[^zinder-down] |
+| Reports the current tip to wallets | No[^ztr-tip] | Optional[^zingod-p2p] | No | No[^zinder-tip-down] |
+| Serves tree state | Yes[^ztr-tree-down][^ztr-embedded] | Yes | No | Yes[^zinder-down] |
+| Serves transparent address queries | No | Yes[^zingod-taddr-down] | No | Yes[^zinder-down] |
+| Broadcasts transactions | No | Optional[^zingod-p2p] | No | No[^zinder-broadcast-down] |
+| Readiness endpoint stays ready | No | Optional[^zingod-ready] | No[^lwd-no-ready] | Yes[^zinder-down][^zinder-ready] |
+| Readiness reports a stale chain tip | Yes[^ztr-stale] | Yes[^zingod-stale] | No[^lwd-stale] | Yes[^zinder-stale] |
+| Recovers without a restart when the validator returns | Yes[^ztr-embedded] | Yes | Yes[^lwd-retries] | Yes[^zinder-down] |
+| Serving starts while the validator is down | No[^ztr-remote-start][^ztr-embedded] | Optional[^zingod-start-down] | No[^lwd-start-down] | No[^zinder-reader-start] |
 
 A project with validator failover keeps advancing its tip and broadcasting
 while a configured validator that it accepts answers. The failover footnotes
 list each project's conditions.
-
-ztreamer in embedded mode also runs its validator in its own process. When any
-of its tasks stops, the whole daemon shuts down
-([lifecycle/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/lifecycle/mod.rs#L109-L132)).
 
 ## On a pruned validator
 
@@ -181,7 +184,8 @@ no pruned mode, so this table omits it
 
 Each indexer column assumes that the validator is a pruned Zakura. The Zakura
 column describes the pruned node itself, and reads n/a for rows about an
-indexer's own index. ztreamer behaves the same in both modes here.
+indexer's own index. ztreamer behaves the same whether the pruned Zakura runs
+separately or inside the ztreamer process.
 
 | Capability | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
 | --- | --- | --- | --- | --- | --- |
@@ -194,19 +198,19 @@ indexer's own index. ztreamer behaves the same in both modes here.
 
 ## Operations
 
-| Capability | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Built-in TLS on the lightwalletd gRPC listener | No[^zebra-tls] | No[^zakura-tls] | Optional[^ztr-tls] | Optional[^ztr-tls] | Yes[^zingod-tls] | Yes[^lwd-tls] | No[^zinder-tls] |
-| Client authentication on node JSON-RPC | Yes[^zebra-cookie] | Yes[^zakura-cookie] | Yes[^ztr-cookie] | n/a | n/a | n/a | n/a |
-| Client authentication on node Indexer gRPC | No[^zebra-grpc-no-auth] | Optional[^zakura-indexer-tls] | Optional[^ztr-indexer-tls] | n/a | n/a | n/a | n/a |
-| Client authentication on lightwalletd gRPC | No[^zebra-grpc-no-auth] | n/a | No[^ztr-auth] | No[^ztr-auth] | No | No | No |
-| Health or readiness endpoint | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| Prometheus metrics | Yes | Yes | Yes | Yes | Optional[^zingod-metrics] | Yes | Yes |
-| Serving restarts without restarting the validator | No | No | No | Yes | Yes | Yes[^lwd-retries] | Yes[^zinder-reader-start] |
-| Several serving processes over one index | No | No | No | No | No | No | Yes[^zinder-secondaries] |
-| Read replicas on other hosts | No | No | No | Yes[^ztr-replica] | No | No | No[^zinder-single-host] |
-| Bootstrap from a state or index snapshot | Yes[^zebra-snap] | Yes[^zakura-snap] | No | Yes[^ztr-snap] | Optional[^zingod-snap] | No | No[^zinder-snap] |
-| Published release binaries or images | Yes | Yes | No | No | Yes[^zingod-image] | Yes[^lwd-image] | Yes |
+| Capability | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Built-in TLS on the lightwalletd gRPC listener | No[^zebra-tls] | No[^zakura-tls] | Optional[^ztr-tls] | Yes[^zingod-tls] | Yes[^lwd-tls] | No[^zinder-tls] |
+| Client authentication on node JSON-RPC | Yes[^zebra-cookie] | Yes[^zakura-cookie] | n/a | n/a | n/a | n/a |
+| Client authentication on node Indexer gRPC | No[^zebra-grpc-no-auth] | Optional[^zakura-indexer-tls] | n/a | n/a | n/a | n/a |
+| Client authentication on lightwalletd gRPC | No[^zebra-grpc-no-auth] | n/a | No[^ztr-auth] | No | No | No |
+| Health or readiness endpoint | Yes | Yes | Yes | Yes | No | Yes |
+| Prometheus metrics | Yes | Yes | Yes | Optional[^zingod-metrics] | Yes | Yes |
+| Serving restarts without restarting the validator | No | No | Yes[^ztr-embedded] | Yes | Yes[^lwd-retries] | Yes[^zinder-reader-start] |
+| Several serving processes over one index | No | No | No | No | No | Yes[^zinder-secondaries] |
+| Read replicas on other hosts | No | No | Yes[^ztr-replica] | No | No | No[^zinder-single-host] |
+| Bootstrap from a state or index snapshot | Yes[^zebra-snap] | Yes[^zakura-snap] | Yes[^ztr-snap] | Optional[^zingod-snap] | No | No[^zinder-snap] |
+| Published release binaries or images | Yes | Yes | No | Yes[^zingod-image] | Yes[^lwd-image] | Yes |
 
 All six enforce built-in request limits. ztreamer and Go lightwalletd serve
 metrics by default, Zinder serves them by default on a loopback ops address,
@@ -215,29 +219,29 @@ and Zebra and Zakura serve them once you set a metrics listen address
 
 ### Deployment facts
 
-| Fact | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Processes, including the validator | 1: zebrad | 1: zakurad | 1: ztreamerd with Zakura inside | 2: ztreamerd and its Zakura | 2: zingod and its validator | 2: lightwalletd and its validator | 5, or 6 with zinder-explorer[^zinder-processes] |
-| Validators per deployment | 1, built in | 1, built in | 1, embedded | 1 | 1 to 64[^zingod-failover] | 1 | 1 active, plus any ordered fallbacks[^zinder-node-targets] |
-| Mainnet disk | About 300 GB[^zebra-disk] | 275 GiB minimum[^zakura-disk] | 17.3 GiB index, plus Zakura state[^ztr-disk] | 17.3 GiB index, plus Zakura state[^ztr-disk] | Not stated[^zingod-disk] | Not stated | About 465 GB, including Explorer views[^zinder-disk] |
-| First sync | Days from genesis, or a snapshot[^zebra-sync] | Checkpoint fast sync or snapshot; time not stated[^zakura-sync] | Zakura sync, then indexing[^ztr-sync] | Imports a signed snapshot; time not stated[^ztr-sync] | From genesis or snapshot; time not stated[^zingod-snap] | From height 0, about an hour[^lwd-sync] | About 16 hours from genesis[^zinder-sync] |
-| Built-in request limits | Stream, size, and count caps; no rate limit[^zebra-limits] | Size, batch, connection, and stream caps[^zakura-limits] | Stream, range, address, and size caps[^ztr-limits] | Stream, range, address, and size caps[^ztr-limits] | Connection, stream, and admission caps; no rate limit[^zingod-limits] | Stream, range, address, span, and size caps[^lwd-limits] | Stream, response, address, and rebuild caps[^zinder-limits] |
-| What a client sees on a reorg | No reorg event; some reads return `ABORTED`[^zebra-reorg] | New tip and fork blocks; no revert event[^zakura-reorg] | Affected streams fail with `UNAVAILABLE`[^ztr-reorg] | Affected streams fail with `UNAVAILABLE`[^ztr-reorg] | Tip drops to the fork point; no event[^zingod-reorg] | No reorg event; `GetBlockRange` may return `ABORTED`[^lwd-reorg] | `ChainReorged` event; `GetBlockRange` ends with `ABORTED`[^zinder-reorg] |
+| Fact | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Processes, including the validator | 1: zebrad | 1: zakurad | 2: ztreamerd and its Zakura[^ztr-embedded] | 2: zingod and its validator | 2: lightwalletd and its validator | 5, or 6 with zinder-explorer[^zinder-processes] |
+| Validators per deployment | 1, built in | 1, built in | 1 | 1 to 64[^zingod-failover] | 1 | 1 active, plus any ordered fallbacks[^zinder-node-targets] |
+| Mainnet disk | About 300 GB[^zebra-disk] | 275 GiB minimum[^zakura-disk] | 17.3 GiB index, plus Zakura state[^ztr-disk] | Not stated[^zingod-disk] | Not stated | About 465 GB, including Explorer views[^zinder-disk] |
+| First sync | Days from genesis, or a snapshot[^zebra-sync] | Checkpoint fast sync or snapshot; time not stated[^zakura-sync] | Imports a signed snapshot; time not stated[^ztr-sync] | From genesis or snapshot; time not stated[^zingod-snap] | From height 0, about an hour[^lwd-sync] | About 16 hours from genesis[^zinder-sync] |
+| Built-in request limits | Stream, size, and count caps; no rate limit[^zebra-limits] | Size, batch, connection, and stream caps[^zakura-limits] | Stream, range, address, and size caps[^ztr-limits] | Connection, stream, and admission caps; no rate limit[^zingod-limits] | Stream, range, address, span, and size caps[^lwd-limits] | Stream, response, address, and rebuild caps[^zinder-limits] |
+| What a client sees on a reorg | No reorg event; some reads return `ABORTED`[^zebra-reorg] | New tip and fork blocks; no revert event[^zakura-reorg] | Affected streams fail with `UNAVAILABLE`[^ztr-reorg] | Tip drops to the fork point; no event[^zingod-reorg] | No reorg event; `GetBlockRange` may return `ABORTED`[^lwd-reorg] | `ChainReorged` event; `GetBlockRange` ends with `ABORTED`[^zinder-reorg] |
 
 ## Consumer fit
 
 Each cell answers one question: does one deployment of this project serve this
 consumer without the application building its own index?
 
-| Consumer | Zebra | Zakura | ztreamer embedded | ztreamer remote | Zingod | Go lightwalletd | Zinder |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Light wallet over lightwalletd gRPC | Experimental[^zebra-lwd-exp] | No | Yes | Yes | Yes | Yes | Yes |
-| Wallet backend needing pinned reads across requests | No | No | No | No | No | No | Yes[^zinder-pinned] |
-| Explorer needing block, transaction, and address lookups | Yes | Yes | Yes[^ztr-node-apis] | No | No | No | Optional[^zinder-raw-all] |
-| Explorer needing search and aggregate views across blocks (fees, pools, supply) | No | No | No | No | No | No | Optional[^zinder-explorer] |
-| Deposit or payment tracking needing a resumable reorg-aware event cursor | No | No | No | No | No | No | Yes[^zinder-retention] |
-| Miner or mining faucet needing block templates | Optional[^zebra-miner] | Optional[^zakura-miner] | Optional[^ztr-miner] | No | No | No | No |
-| Light wallet, explorer with aggregate views, and deposit tracking from one deployment | No | No | No | No | No | No | Optional[^zinder-explorer] |
+| Consumer | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
+| --- | --- | --- | --- | --- | --- | --- |
+| Light wallet over lightwalletd gRPC | Experimental[^zebra-lwd-exp] | No | Yes | Yes | Yes | Yes |
+| Wallet backend needing pinned reads across requests | No | No | No | No | No | Yes[^zinder-pinned] |
+| Explorer needing block, transaction, and address lookups | Yes | Yes | No | No | No | Optional[^zinder-raw-all] |
+| Explorer needing search and aggregate views across blocks (fees, pools, supply) | No | No | No | No | No | Optional[^zinder-explorer] |
+| Deposit or payment tracking needing a resumable reorg-aware event cursor | No | No | No | No | No | Yes[^zinder-retention] |
+| Miner or mining faucet needing block templates | Optional[^zebra-miner] | Optional[^zakura-miner] | No | No | No | No |
+| Light wallet, explorer with aggregate views, and deposit tracking from one deployment | No | No | No | No | No | Optional[^zinder-explorer] |
 
 Each row takes the weakest value among the table rows it depends on, ranked
 No, Experimental, Optional, Yes. Experimental ranks below Optional because
@@ -295,15 +299,15 @@ Limits:
 Strengths:
 
 - Serves every lightwalletd gRPC method, including transparent inputs and outputs in compact blocks; `Ping` needs a testing-only flag.
-- Embedded mode also serves Zakura's node JSON-RPC and Indexer gRPC, including full blocks and the full block range stream.
+- Embedded mode, the default, runs the indexer and its Zakura validator as one process.
 - Remote mode keeps serving indexed compact blocks and tree states while Zakura is down, and recovers without a restart.
 - Index replication and signed snapshots let remote instances bootstrap on other hosts.
 
 Limits:
 
 - Embedded mode runs only Zakura, and remote mode is tested only against Zakura; Zebra and zcashd are unverified.
-- Remote mode forwards transparent address queries and broadcasts to Zakura, so they fail while it is down.
-- The lightwalletd gRPC listener does not authenticate clients.
+- Forwards transparent address queries and broadcasts to Zakura, so they fail while it is down, and in embedded mode all serving stops with Zakura.
+- No full blocks or explorer API of its own, and the lightwalletd gRPC listener does not authenticate clients.
 - Version 0.1.0 has no published binaries or images.
 
 ### Zingod
@@ -371,9 +375,9 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 - [Zingod `main` at `3664ce0`](https://github.com/zingolabs/zingod/commit/3664ce0bbea3f1945c84c8730359795b84959ed2)
 - [Go lightwalletd `master` at `faaf7aa`](https://github.com/zcash/lightwalletd/commit/faaf7aa1f917f41ad41def61d7095330078c8a8d)
 
-[^ztr-zebra]: Unverified: remote mode calls 14 node RPCs that all exist in Zebra 7.1.0, but ztreamer does not check the node's identity, and no test runs it against Zebra ([methods.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/remote/src/methods.rs#L66-L85)).
+[^ztr-zebra]: Unverified: remote mode calls 14 node RPCs that all exist in Zebra 7.1.0, but ztreamer does not check the node's identity, and no test runs it against Zebra. Embedded mode runs only its bundled Zakura ([methods.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/remote/src/methods.rs#L66-L85), [config.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/config.rs#L39-L51)).
 
-[^ztr-zcashd]: Unverified: ztreamer does not document or test zcashd and does not check zcashd's response shapes ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L10), [methods.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/remote/src/methods.rs#L1-L5)).
+[^ztr-zcashd]: Unverified: ztreamer does not document or test zcashd and does not check zcashd's response shapes. Embedded mode runs only its bundled Zakura ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L10), [methods.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/remote/src/methods.rs#L1-L5), [config.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/config.rs#L39-L51)).
 
 [^zinder-certified]: Zinder's live and parity lanes certify Zebra 7.1.0 and Zakura 1.8.6 ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L647-L663)).
 
@@ -391,7 +395,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-broadcast-failover]: When more than one validator is configured, zinder-query and wallet-mode zinder-compat-lightwalletd send a transaction on to the next verified endpoint when one is unreachable, including after its `broadcast_timeout_secs`, or rejects the transaction's consensus branch. An endpoint is used only after it passes a first-contact check of its methods, network-upgrade table, and chain, and the endpoint that answered stays preferred, with no timed failback ([service-operations.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/architecture/service-operations.md#L452-L477), [node-source-boundary.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/architecture/node-source-boundary.md#L209-L223)).
 
-[^ztr-embedded-node]: Embedded mode runs its Zakura validator inside the ztreamer process, so it has no separate validator to switch to or to start without, and it submits transactions to that node's own mempool ([embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L1-L3), [embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L43-L65), [config.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/config.rs#L39-L51), [submission.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/embedded/src/submission.rs#L10-L16)).
+[^ztr-embedded]: In embedded mode, the default, ztreamerd runs its Zakura validator as a task in its own process, so a deployment is one process, with no separate validator to switch to or to start without, and transactions go to that node's own mempool. When Zakura or any other task stops, the whole daemon shuts down, so in that mode the indexer serves nothing while its validator is down and restarts together with it ([embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L1-L3), [embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L78-L100), [config.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/config.rs#L39-L51), [submission.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/embedded/src/submission.rs#L10-L16), [lifecycle/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/lifecycle/mod.rs#L109-L132)).
 
 [^ztr-pruned]: ztreamer refuses to start unless its existing index already reaches Zakura's prune height ([pipeline/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/sync/src/pipeline/mod.rs#L293-L295), [replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/replicate/mod.rs#L138-L149)).
 
@@ -401,9 +405,9 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-archive]: zinder-ingest needs historical block bodies, so at startup it refuses a lone `[node]` that reports pruned storage or does not report its storage mode, and with `[node_fallbacks.N]` it excludes an endpoint that reports pruned storage until restart ([admission.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-ingest/src/node_failover/admission.rs#L18-L26), [admission.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-ingest/src/node_failover/admission.rs#L148-L165), [main.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-ingest/src/main.rs#L1222-L1230)).
 
-[^ztr-node-apis]: Embedded mode serves its Zakura's JSON-RPC and Indexer gRPC once their listen addresses are set ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L54-L61), [Cargo.toml](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/Cargo.toml#L40)).
-
 [^zebra-lwd-exp]: Zebra labels its lightwalletd gRPC listener experimental and warns that it may break clients in any release ([rpc.rs](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/zebra-rpc/src/config/rpc.rs#L58-L62)).
+
+[^ztr-p2p]: Embedded mode also serves `CompactTxStreamer` from its index to Zakura's v2 P2P peers, through a Zakura custom service ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L54-L56), [embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L81-L84), [lib.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/p2p/src/lib.rs#L1)).
 
 [^zebra-events]: The Indexer `NonFinalizedStateChange` stream resumes from known tips, but it covers only non-finalized blocks and sends no undo events ([indexer.proto](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/zebra-rpc/proto/indexer.proto#L73-L78)).
 
@@ -421,8 +425,6 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zakura-range]: Indexer `GetBlockRange` needs the `indexer` build feature, which default and Docker builds leave out ([methods.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-rpc/src/indexer/methods.rs#L415-L423), [Cargo.toml](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakurad/Cargo.toml#L62-L97)).
 
-[^ztr-range]: ztreamer builds its Zakura with the `indexer` feature, so Indexer `GetBlockRange` works once `[rpc] indexer_listen_addr` is set ([Cargo.toml](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/Cargo.toml#L40)).
-
 [^zinder-raw-all]: Needs `storage.raw_blob_policy = "all"`, while the shipped configurations use `"transactions"` ([native_wallet_endpoint_capabilities.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-query/src/native_wallet_endpoint_capabilities.rs#L108-L113), [ingest.toml](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/deploy/config/ingest.toml#L19)).
 
 [^zinder-outpoint]: Through the native `WalletQuery.TransparentOutpointSpendStatus` method only ([wallet.proto](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto#L1553)).
@@ -430,8 +432,6 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 [^zebra-miner]: `getblocktemplate` needs `mining.miner_address`, which is unset by default, and `submitblock` works without it ([get_block_template.rs](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/zebra-rpc/src/methods/types/get_block_template.rs#L513-L517), [mining.rs](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/zebra-rpc/src/config/mining.rs#L34-L41)).
 
 [^zakura-miner]: `getblocktemplate` needs `mining.miner_address`, which is unset by default ([methods.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-rpc/src/methods.rs#L3560-L3563), [mining.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-rpc/src/config/mining.rs#L103)).
-
-[^ztr-miner]: Through the embedded Zakura's JSON-RPC once `[mining] miner_address` is set, which it is not by default ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L57)).
 
 [^zebra-derived]: `getblock` returns per-block value pools, chain supply, and, at verbosity 3, transaction fees, but no aggregates across blocks ([methods.rs](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/zebra-rpc/src/methods.rs#L1843-L1871)).
 
@@ -537,10 +537,6 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zakura-indexer-tls]: Needs `rpc.indexer_tls`, which is unset by default and required for a non-loopback listen address. Clients must then present a certificate signed by `client_ca_file` ([rpc.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-rpc/src/config/rpc.rs#L98-L102), [server.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-rpc/src/indexer/server.rs#L212-L224)).
 
-[^ztr-cookie]: The embedded Zakura 1.8.4 turns on cookie authentication by default, once you set its JSON-RPC listen address ([Cargo.toml](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/Cargo.toml#L33), [default_config.toml](https://docs.rs/crate/zakura/1.8.4/source/src/commands/default_config.toml#143)).
-
-[^ztr-indexer-tls]: The embedded Zakura 1.8.4 passes `rpc.indexer_tls` to its Indexer gRPC listener. The setting is unset by default, and when set, clients must present a certificate signed by `client_ca_file` ([start.rs](https://docs.rs/crate/zakura/1.8.4/source/src/commands/start.rs#816-823), [zakura-rpc rpc.rs](https://docs.rs/crate/zakura-rpc/15.0.0/source/src/config/rpc.rs#98-102)).
-
 [^ztr-auth]: The lightwalletd gRPC listener, which also serves Replicator, has no client authentication ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L81-L95)).
 
 [^zinder-explorer-auth]: zinder-explorer requires a bearer token when `explorer.bearer_token_path` is set. The zinder-query and zinder-compat-lightwalletd listeners do not authenticate clients ([config.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-explorer/src/bin/zinder-explorer/config.rs#L27), [explorer-plane.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/architecture/explorer-plane.md#L405)).
@@ -553,7 +549,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-secondaries]: zinder-query, zinder-compat-lightwalletd, and zinder-explorer each open their own RocksDB secondary over shared primaries on one host ([ADR-0035](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/adrs/0035-canonical-storage-topologies.md#L169-L174)).
 
-[^ztr-replica]: A remote instance imports sealed ranges from a peer once, then follows its own Zakura ([replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/replicate/mod.rs#L121-L160)).
+[^ztr-replica]: A remote-mode instance imports sealed ranges from a peer once, then follows its own Zakura. Embedded mode does not import from a peer ([replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/replicate/mod.rs#L121-L160), [README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L59-L66)).
 
 [^zinder-single-host]: Only the `rocksdb-single-host` topology exists, and `postgres-horizontal` is decided but not implemented ([ADR-0035](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/adrs/0035-canonical-storage-topologies.md#L64-L70)).
 
@@ -561,7 +557,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zakura-snap]: The project publishes state snapshots, about 11 GB for pruned state, which you download outside zakurad ([README.md](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/README.md#L26)).
 
-[^ztr-snap]: Remote mode fetches a signed Mainnet snapshot by default, and Testnet needs `--replicate-from` ([replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/replicate/mod.rs#L75-L80)).
+[^ztr-snap]: Remote mode fetches a signed Mainnet snapshot by default, and Testnet needs `--replicate-from`. Embedded mode does not import a snapshot and indexes from its own Zakura ([replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/replicate/mod.rs#L75-L80), [README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L59-L63)).
 
 [^zingod-snap]: Needs a `[snapshot]` manifest, from which aria2c fills empty index directories ([config.rs](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/packages/zingod/src/config.rs#L533-L545)).
 
@@ -589,7 +585,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zakura-sync]: Checkpoint sync and verified-commitment-tree fast sync are on by default ([config.rs](https://github.com/zakura-core/zakura/blob/dd25aa429cd97eb1af903b7bc6375fe208132015/crates/zakura-consensus/src/config.rs#L129-L130)).
 
-[^ztr-sync]: Embedded mode waits until Zakura is near the tip, and indexing then took 92 seconds in the project's warm-cache benchmark, while the remote snapshot import time is not stated ([embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L41-L65), [README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L134-L144)).
+[^ztr-sync]: Remote mode imports sealed ranges from the published Mainnet snapshot or the `--replicate-from` source, then indexes the blocks above them from Zakura, and the import time is not stated. Embedded mode imports nothing: it waits until its Zakura is near the tip, and indexing then took 92 seconds in the project's warm-cache benchmark ([README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L63), [embedded.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/daemon/src/embedded.rs#L41-L65), [README.md](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/README.md#L134-L144)).
 
 [^lwd-sync]: The README's estimate, and the server answers requests while the cache fills ([README.md](https://github.com/zcash/lightwalletd/blob/faaf7aa1f917f41ad41def61d7095330078c8a8d/README.md#L131-L133)).
 

@@ -1,6 +1,6 @@
 # Cipherscan adapter
 
-This page explains what `zinder-compat-cipherscan` does, where its responsibilities end, and which Cipherscan routes it can serve today. It is for operators deciding whether to point Cipherscan at Zinder and for developers changing the adapter.
+This page explains what `zinder-compat-cipherscan` does, where its responsibilities end, and what each Cipherscan route returns. It is for operators deciding whether to point Cipherscan at Zinder and for developers changing the adapter.
 
 ## What it is
 
@@ -14,7 +14,7 @@ Cipherscan UI
         -> market-price provider    CoinGecko by default
 ```
 
-The adapter is optional and is not a release image. It builds from the workspace as the `zinder-compat-cipherscan` binary. It needs a running [Explorer](explorer-plane.md), which in turn needs `[ingest].explorer_views = true`, and a `zinder-query` endpoint. It opens no storage and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) shows how to run it.
+The adapter is optional. Build it from the workspace as the `zinder-compat-cipherscan` binary; the release images do not include it. It needs a running [Explorer](explorer-plane.md), which in turn needs `[ingest].explorer_views = true`, and a `zinder-query` endpoint. It opens no storage and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) shows how to run it.
 
 ## Boundaries
 
@@ -26,7 +26,7 @@ When a page needs a reusable chain fact that the native APIs cannot supply, the 
 
 ## How failures reach Cipherscan
 
-The Explorer runtime cannot serve seven methods that need canonical-store reads, including `BlockProductionSeries`, `BlockTransactions`, and `CommitmentRootSearch` ([Explorer plane](explorer-plane.md)). It also never advertises `explorer.transaction.history_v2` or `explorer.transaction.intrinsic_value_balances_v1`. A route that depends on one of these fails in one of three ways:
+The Explorer does not advertise seven methods that need canonical-store reads, including `BlockProductionSeries`, `BlockTransactions`, and `CommitmentRootSearch` ([Explorer plane](explorer-plane.md#unadvertised-methods)). It also does not advertise `explorer.transaction.history_v2` or `explorer.transaction.intrinsic_value_balances_v1`. A route that depends on one of these fails in one of three ways:
 
 - If the adapter calls the method directly, the native `FAILED_PRECONDITION` becomes HTTP 502 with code `upstream_error`.
 - If the adapter checks the capability first, it returns HTTP 503 with code `upstream_field_unavailable`.
@@ -70,7 +70,7 @@ Status is what each route family does against the current Explorer runtime. Any 
 | `/api/lightwalletd/scan` | 404: not implemented. Compact-block scans belong to `zinder-compat-lightwalletd` | None |
 | `/api/network/chain-size-history` | Degraded: needs operational telemetry | None |
 
-## Known limitations
+## Consensus economics
 
 The adapter computes consensus economics itself instead of reading them from the node: block subsidy, funding-stream and lockbox amounts, halving height, emission, target spacing, and difficulty. These appear on `/api/network/stats`, `/api/network/halving`, `/api/network/emission`, and `/api/circulating-supply`.
 
@@ -84,4 +84,4 @@ It takes them from the `zebra-chain` release Zinder is built with. Mainnet and T
 1. Cipherscan route names and presentation stop at the adapter. Native contracts carry only chain facts, freshness, coverage, and absence.
 2. A response that cannot prove its data exposes the capability, coverage, or unavailable state. It never invents rows, zeroes, finality, prices, labels, or risk conclusions.
 3. A reusable durable fact belongs in a Zinder view, with reorg and restart semantics. A product-only join stays in the adapter or a sidecar.
-4. Sidecar and unavailable rows are deliberate scope limits. A new Cipherscan route does not by itself justify new Zinder storage or a product-specific native API.
+4. Sidecar and unavailable rows are deliberate scope boundaries. A new Cipherscan route does not by itself justify new Zinder storage or a product-specific native API.

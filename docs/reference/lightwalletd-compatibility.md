@@ -6,9 +6,9 @@ The runtime serves the same stored data as the native `WalletQuery` service, des
 
 ## Claim boundary
 
-Zinder replaces the network-facing lightwalletd server only. Wallet-local scanning, key custody, transaction construction, and wallet UX stay in the client.
+Zinder replaces the network-facing lightwalletd server. Wallet-local scanning, key custody, transaction construction, and wallet UX stay in the client.
 
-Name one of these levels in release notes and operator docs, and claim only the highest level whose evidence is current:
+Name one of these levels in release notes and operator docs, and claim the highest level whose evidence is current:
 
 | Level | Evidence |
 | --- | --- |
@@ -17,14 +17,14 @@ Name one of these levels in release notes and operator docs, and claim only the 
 | `client-compatible` | A named lightwalletd client completes bootstrap, restore, transparent discovery, shielded-note discovery, send, and pending-transaction observation. |
 | `public-operator-compatible` | The deployed endpoint has TLS, access control, readiness, rate limits, and log redaction in place. |
 
-A named wallet is supported only after it passes end-to-end certification against a release on the claimed network; method coverage alone is not a support claim. Do not call the adapter a drop-in replacement without naming the protocol pin, the claimed methods, and the level.
+A named wallet is supported once it passes end-to-end certification against a release on the claimed network. Method coverage by itself is not a support claim. When you call the adapter a drop-in replacement, name the protocol pin, the claimed methods, and the level.
 
 ## Runtime serving selection
 
 The operator selects one of two serving modes with `[compat].serving`, the `ZINDER_COMPAT__SERVING` environment variable, or `--serving`. The default is `wallet`.
 
 - `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction`, and connects to ingest control for the mempool methods.
-- `compact-blocks` serves only `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
+- `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
 
 In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
 
@@ -50,7 +50,7 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | At most 100,000 outputs per response |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
 
-The vendored protocol, `lightwallet-protocol` v0.5.0, has no `GetStandardFee` method, so Zinder does not serve it. A client that calls it gets `UNIMPLEMENTED`.
+`GetStandardFee` is not part of the vendored protocol, `lightwallet-protocol` v0.5.0, so a call to it returns `UNIMPLEMENTED`.
 
 A handler that makes several storage reads pins them to the chain epoch of the tip it reads first, so one response never mixes two branches of a reorg. Block-range streams instead follow the chain, as described below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
 
@@ -102,25 +102,25 @@ Once a stream has started, a client can rely on the following:
 6. **Other mid-stream endings.** A storage failure ends the stream with `UNAVAILABLE`. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
 7. **No time limit.** Elapsed time, new blocks, and slow reading never end a stream. Shutdown, unanswered keepalive pings, and the listener's send-stall deadline do.
 
-A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. The server reads ahead by up to two chunks at the start of a stream, and afterwards by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks. The memory a stream uses beyond its stored bytes has no enforced maximum and is not measured.
+A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. The server reads ahead by up to two chunks at the start of a stream, and afterwards by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 
 - A stream holds its slot from validation until it ends, fails, or is cancelled. A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any read. `zinder_compat_block_range_stream_refusals_total` counts refusals, and `zinder_compat_block_range_streams_open` reports open streams.
-- The Zcash Android SDK retries a refused batch. How other clients handle `RESOURCE_EXHAUSTED` is not verified.
-- Every client shares the limit. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects. Limit concurrent requests per client at your proxy; the shipped Caddy template does not.
+- The Zcash Android SDK retries a refused batch. Other clients should retry `RESOURCE_EXHAUSTED` with backoff.
+- Every client shares the limit. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
 
-Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd sets no stream limit.
+The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd sets no stream limit.
 
 ### `GetTreeState` and `GetLatestTreeState`
 
 `GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns.
 
-lightwalletd has no rebuild limit, and how clients handle `RESOURCE_EXHAUSTED` here is not verified. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
+Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. Retry a `RESOURCE_EXHAUSTED` from `GetTreeState` with backoff. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
 
 ### `GetSubtreeRoots`
 
-lightwalletd treats `maxEntries = 0` as "every root". Zinder returns at most 1,000 roots for `maxEntries = 0`, so a client that wants more must page with `startIndex`. A positive `maxEntries` above 1,024 fails with `INVALID_ARGUMENT`. `completingBlockHash` is in RPC byte order, as lightwalletd sends it.
+lightwalletd treats `maxEntries = 0` as "every root". Zinder returns at most 1,000 roots for `maxEntries = 0`, and a client reads the rest by paging with `startIndex`. A positive `maxEntries` above 1,024 fails with `INVALID_ARGUMENT`. `completingBlockHash` is in RPC byte order, as lightwalletd sends it.
 
 ### `GetTransaction`
 
@@ -178,7 +178,7 @@ Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent ou
 
 One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. A request that would return more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
 
-The protocol has no lossless way to page past the cap, and a single block with more matching outputs than the cap cannot be served.
+The protocol has no lossless way to page past the cap. A single block with more matching outputs than the cap always fails with `RESOURCE_EXHAUSTED`.
 
 ### `GetMempoolTx`
 

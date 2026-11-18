@@ -147,7 +147,8 @@ explorer.migration.denominations_v1
 
 `zinder-query` derives its wallet capability set once, after it admits its
 storage and its ingest control connection, and keeps it for the life of the
-process. Operators cannot select or override individual capabilities.
+process. The set follows from the deployment's configuration, so operators do
+not select capabilities individually.
 
 "Always" below means every `zinder-query` that starts advertises it.
 
@@ -156,7 +157,7 @@ process. Operators cannot select or override individual capabilities.
 | `wallet.read.visible_tip_block_v1` | `VisibleTipBlock` | Always |
 | `wallet.read.settled_tip_block_v1` | `SettledTipBlock` | Always |
 | `wallet.read.block_id_by_selector_v1` | `BlockIdBySelector` | Always |
-| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Never; the current query does not serve it |
+| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Never; `zinder-query` does not serve it |
 | `wallet.read.compact_block_at_v2` | `CompactBlock` | Always |
 | `wallet.read.compact_block_range_v2` | `CompactBlocksInRange` | Always |
 | `wallet.read.compact_block_ironwood_v2` | Ironwood fields on compact blocks | Always |
@@ -174,7 +175,7 @@ process. Operators cannot select or override individual capabilities.
 | `wallet.events.chain_v1` | `ChainEvents` | Always |
 | `wallet.snapshot.mempool_v3` | `MempoolSnapshot` | Ingest control serves mempool snapshots |
 | `wallet.events.mempool_v2` | `MempoolEvents` | Ingest control serves mempool events |
-| `wallet.read.chain_value_pools_at_tip_v1` | `ChainValuePoolsAtTip` | Never; the current query does not serve it |
+| `wallet.read.chain_value_pools_at_tip_v1` | `ChainValuePoolsAtTip` | Never; `zinder-query` does not serve it |
 | `wallet.address.transparent_unspent_outputs_v1` | `TransparentAddressUnspentOutputs` | Always |
 | `wallet.address.transparent_history_v1` | `TransparentAddressTxIdsInRange` | Always |
 | `wallet.read.transparent_outpoint_spend_status_v1` | `TransparentOutpointSpendStatus` | Always |
