@@ -17,7 +17,7 @@ use zinder_core::{
 };
 
 use crate::{
-    MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceCapabilities,
+    MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceBackend, MempoolSourceCapabilities,
     MempoolSourceEventStream, MempoolSourceFactory, NodeCapabilities, NodeSource, NodeStorageMode,
     NodeTarget, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceError,
     SourceSubtreeRoots, UpstreamHealthSnapshot, ZebraJsonRpcSource,
@@ -143,10 +143,11 @@ where
 {
     /// Builds a mempool source that follows the active endpoint's mempool.
     ///
-    /// Each endpoint's own source is built once, here. A switch ends the open
-    /// event stream with one [`SourceError::MempoolStreamUnavailable`] item,
-    /// so the consumer rebuilds its snapshot from the newly active endpoint as
-    /// it does after any stream failure.
+    /// Each endpoint's own source is built once, here, and logged by its
+    /// position. A switch ends the open event stream with one
+    /// [`SourceError::MempoolStreamUnavailable`] item, so the consumer
+    /// rebuilds its snapshot from the newly active endpoint as it does after
+    /// any stream failure.
     #[must_use]
     pub fn mempool_source(
         &self,
@@ -155,11 +156,32 @@ where
         Arc::new(ActiveEndpointMempoolSource {
             sources: self
                 .endpoints()
-                .map(|(_, endpoint)| endpoint.mempool_source(admission_limits))
+                .map(|(position, endpoint)| {
+                    let source = endpoint.mempool_source(admission_limits);
+                    log_mempool_source_selected(position, source.capabilities().backend);
+                    source
+                })
                 .collect(),
             active: Arc::clone(&self.inner.active),
         })
     }
+}
+
+/// Logs the mempool backend of the endpoint at `position`.
+///
+/// Endpoint addresses can embed credentials, so logs name the endpoint by
+/// position only.
+fn log_mempool_source_selected(position: usize, backend: MempoolSourceBackend) {
+    tracing::info!(
+        target: "zinder::source",
+        event = "mempool_source_selected",
+        position,
+        backend = match backend {
+            MempoolSourceBackend::Streaming => "streaming",
+            MempoolSourceBackend::Polling => "polling",
+        },
+        "selected the node endpoint's mempool source"
+    );
 }
 
 /// The only handle that changes which endpoint a [`NodeSet`] reads from.

@@ -15,7 +15,7 @@ use zinder_source::{
     NodeCapabilities, NodeSet, NodeSource, NodeTarget, SourceBlock, SourceError,
 };
 use zinder_testkit::{
-    JsonRpcTestServer, MockMempoolSource, MockMempoolSourceControl, RpcReply, method,
+    JsonRpcTestServer, LogCapture, MockMempoolSource, MockMempoolSourceControl, RpcReply, method,
 };
 
 /// One endpoint of a test node set: it reports a fixed tip and owns a
@@ -184,5 +184,54 @@ async fn connect_builds_a_fallback_whose_cookie_file_is_missing() -> eyre::Resul
     );
     assert_eq!(primary_server.requests()?.len(), 1);
     assert!(fallback_server.requests()?.is_empty());
+    Ok(())
+}
+
+/// Building the mempool sources names each endpoint by position, never by
+/// address, because an address can embed credentials.
+#[tokio::test]
+async fn mempool_source_selection_logs_positions_not_addresses() -> eyre::Result<()> {
+    let capture = LogCapture::install_for_target("zinder::source");
+    let target = |json_rpc_addr: &str, indexer_grpc_addr: Option<&str>| {
+        NodeTarget::new(
+            Network::ZcashRegtest,
+            json_rpc_addr.to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(5),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        )
+        .with_indexer_grpc_addr(indexer_grpc_addr.map(str::to_owned))
+    };
+    let (nodes, _switch) = NodeSet::connect(
+        &target("http://127.0.0.1:1", None),
+        &[target(
+            "http://zebra:rpc-secret@127.0.0.1:2",
+            Some("http://zebra:indexer-secret@127.0.0.1:3/?token=query-secret"),
+        )],
+    )?;
+
+    let _mempool = nodes.mempool_source(MempoolSourceAdmissionLimits::default());
+
+    let selected = capture
+        .events()
+        .into_iter()
+        .filter(|event| event.field("event") == Some("mempool_source_selected"))
+        .collect::<Vec<_>>();
+    let described = selected
+        .iter()
+        .map(|event| (event.field("position"), event.field("backend")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        described,
+        [(Some("0"), Some("polling")), (Some("1"), Some("streaming"))]
+    );
+    for event in &selected {
+        for value in event.fields.values() {
+            assert!(
+                !value.contains("secret") && !value.contains("127.0.0.1"),
+                "a mempool source event logged an endpoint address: {event:?}"
+            );
+        }
+    }
     Ok(())
 }

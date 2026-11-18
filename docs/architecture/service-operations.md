@@ -1082,8 +1082,10 @@ With fallback node endpoints, ingest also logs `node_endpoint_admitted`,
 `node_endpoint_switched` with `from_position`, `to_position`, and
 `failure_class`; and `node_endpoint_switch_unavailable` when a trigger finds no
 endpoint that can take over. That last event repeats at most once per standby
-evaluation the monitor records, not on every follow iteration. Logs name endpoints by
-position, never by URL.
+evaluation the monitor records, not on every follow iteration. At startup,
+`mempool_source_selected` reports each endpoint's `position` and mempool
+`backend`, `streaming` or `polling`. These events name endpoints by position,
+never by URL, because an address can embed credentials.
 
 Explorer view replay logs `materialized_view_replay_volume_space_low` once
 when the free-space guard pauses replay and

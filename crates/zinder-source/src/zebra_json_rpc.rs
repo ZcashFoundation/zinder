@@ -1447,12 +1447,6 @@ impl MempoolSourceFactory for ZebraJsonRpcSource {
         admission_limits: MempoolSourceAdmissionLimits,
     ) -> Arc<dyn MempoolSource> {
         let Some(indexer_target) = self.indexer_target.clone() else {
-            tracing::info!(
-                target: "zinder::source",
-                event = "mempool_source_selected",
-                backend = "zebra-json-rpc-polling",
-                "selected polling mempool source"
-            );
             return Arc::new(JsonRpcMempoolSource::with_options(
                 self.clone(),
                 JsonRpcMempoolSourceOptions {
@@ -1461,17 +1455,6 @@ impl MempoolSourceFactory for ZebraJsonRpcSource {
                 },
             ));
         };
-        tracing::info!(
-            target: "zinder::source",
-            event = "mempool_source_selected",
-            backend = "zebra-indexer-grpc",
-            indexer_endpoint = %indexer_target.endpoint_url,
-            client_certificate = indexer_target
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.client_identity.is_some()),
-            "selected streaming mempool source"
-        );
         Arc::new(ZebraIndexerMempoolSource::with_options(
             indexer_target,
             self.clone(),
