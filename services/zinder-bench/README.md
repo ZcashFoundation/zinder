@@ -757,7 +757,10 @@ the last ones arrive: the load is the most an engine of that shape sends, not
 an average. They also omit what a sync does besides blocks and tree states:
 `GetSubtreeRoots`, transparent address queries, mempool streams, and tip polls.
 Vizor sizes batches from compiled Mainnet tree sizes; the simulated wallet
-uses the density it has received, so its first batch is 10 blocks.
+uses the density it has received, so its first batch is 10 blocks. When no
+block has arrived by the end of Slipstream's density wait, the simulated
+wallet asks for another 64-block chunk, where Slipstream asks for the full
+10,000 blocks.
 Each connection gives up after 10 seconds and sends no HTTP/2 keep-alive
 pings. Go lightwalletd's grpc-go server closes a connection whose client pings
 more often than every five minutes, so pinging would end streams a real

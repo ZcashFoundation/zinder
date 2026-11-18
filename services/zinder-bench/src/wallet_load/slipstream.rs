@@ -392,7 +392,11 @@ impl Dispatcher {
         let span = if next.index == 0 || next.density_unknown(blocks) {
             PROBE_SPAN
         } else {
-            bytes.checked_div(blocks).map_or(CHUNK_BLOCKS, |per_block| {
+            // With no block received by the end of the density wait,
+            // Slipstream takes the full chunk span. The simulated wallet keeps
+            // the probe span instead, so a stalled server is not sent the
+            // largest request.
+            bytes.checked_div(blocks).map_or(PROBE_SPAN, |per_block| {
                 (self.target_bytes / per_block.max(1)).clamp(MIN_SPAN, CHUNK_BLOCKS)
             })
         };
@@ -408,8 +412,10 @@ impl Dispatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        CHUNK_BLOCKS, DEFAULT_SPLIT_BYTES, Dispatcher, PieceSplitter, WalletPlan,
+        CHUNK_BLOCKS, DEFAULT_SPLIT_BYTES, DENSITY_WAIT, Dispatcher, PieceSplitter, WalletPlan,
         chunk_target_bytes,
     };
 
@@ -454,5 +460,28 @@ mod tests {
             dispatcher.take_now((64, 64 * 102_400)),
             Some((3_434_939, 3_435_101))
         );
+    }
+
+    #[test]
+    fn a_server_that_sent_no_block_by_the_density_wait_gets_probe_sized_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dispatcher = Dispatcher::new(
+            &WalletPlan {
+                from_height: 1_000,
+                to_height: 100_000,
+                mainnet: false,
+                sapling_activation_height: 1,
+            },
+            chunk_target_bytes(DEFAULT_SPLIT_BYTES),
+        );
+        assert_eq!(dispatcher.take_now((0, 0)), Some((1_000, 1_063)));
+        dispatcher.next.lock().probe_taken = Some(
+            Instant::now()
+                .checked_sub(DENSITY_WAIT + Duration::from_secs(1))
+                .ok_or("the clock is too close to its start")?,
+        );
+
+        assert_eq!(dispatcher.take_now((0, 0)), Some((1_064, 1_127)));
+        Ok(())
     }
 }
