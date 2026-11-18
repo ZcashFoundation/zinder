@@ -52,8 +52,13 @@ enum WriterPhase {
 message WriterStatusResponse {
   // Cross-plane chain-state envelope. The writer's latest committed chain
   // epoch (with its visible and settled tips) rides on
-  // `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the upstream
-  // observation. Absent when the writer has not committed a chain epoch yet.
+  // `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the node tip
+  // the writer last observed: the heights in the node-health probe's not-ready
+  // report when it has them, otherwise the follower's admission target.
+  // `upstream_tip` is absent while the writer's node admission reports the
+  // node unavailable, or before it observes a node tip. Absent when the writer
+  // has not committed a chain epoch yet, or while a parked writer can no
+  // longer read its epoch.
   optional zinder.v1.wallet.ChainView chain_view = 1;
 
   // Stable public network name, such as "zcash-regtest". Carried outside
@@ -64,8 +69,8 @@ message WriterStatusResponse {
   WriterPhase phase = 5;
 
   // Distance from the writer's visible tip to the observed upstream tip
-  // when known. Drives phase classification; populated whenever the writer
-  // has both a store tip and an upstream tip observation.
+  // when known. Drives phase classification; populated when `chain_view` and
+  // `chain_view.upstream_tip.committed_height` are both present.
   optional uint32 gap_blocks = 7;
 
   // Last upstream-health observation. Unset when no probe has produced a
