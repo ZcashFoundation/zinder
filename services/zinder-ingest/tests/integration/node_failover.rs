@@ -1443,6 +1443,50 @@ async fn upstream_health_probe_discards_an_observation_of_the_previous_endpoint(
     Ok(())
 }
 
+/// A switch abandons a probe of `[node]` that never answers, so the new
+/// endpoint's health replaces the reset input at once instead of after the
+/// previous endpoint's request times out.
+#[tokio::test(start_paused = true)]
+async fn a_switch_abandons_a_probe_of_the_previous_endpoint() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let silent_primary = FailoverEndpoint::serving(&blocks, 4)?;
+    silent_primary.health_hangs.store(true, Ordering::SeqCst);
+    let syncing_fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    syncing_fallback.set_ready(false);
+    let (nodes, switch) = NodeSet::new(silent_primary, [syncing_fallback]);
+    let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+    let cancel = CancellationToken::new();
+    let probe = spawn_upstream_health_probe_task(
+        Arc::new(nodes.clone()),
+        composed.clone(),
+        Duration::from_secs(1),
+        Some(nodes.subscribe_switches()),
+        cancel.clone(),
+    );
+
+    // The first probe of `[node]` starts after one interval and never ends.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(switch.switch_to(1));
+    composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Starting);
+    let observed = tokio::time::timeout(Duration::from_millis(500), async {
+        while !matches!(
+            composed.input_cause(ReadinessInput::NodeSource),
+            Some(ReadinessCause::UpstreamNotReady(_))
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    cancel.cancel();
+    probe.await?;
+
+    assert!(
+        observed.is_ok(),
+        "the probe of the previous endpoint held back the new endpoint's"
+    );
+    Ok(())
+}
+
 fn archive_capabilities_withheld(capabilities: NodeCapabilities) -> TestResult<NodeCapabilities> {
     Ok(NodeCapabilities::new(capabilities.iter().filter(
         |capability| *capability != NodeCapability::HistoricalBlockBodies,

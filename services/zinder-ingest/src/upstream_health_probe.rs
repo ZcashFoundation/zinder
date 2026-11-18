@@ -14,8 +14,9 @@
 //! malformed health response is not evidence that the upstream is ready.
 //! When the node failover switches endpoints it resets the input to
 //! `starting`, and the probe observes the new endpoint at once instead of at
-//! its next tick. A probe of the previous endpoint still in flight at the
-//! switch publishes nothing.
+//! its next tick. A switch abandons a probe of the previous endpoint still in
+//! flight, and a probe publishes only while the endpoint it probed is still
+//! active, so only the active endpoint updates the input.
 //!
 //! [ADR-0015 §Upstream sync detection]:
 //!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
@@ -27,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_runtime::{
     ComposedReadiness, ReadinessCause, ReadinessInput, UpstreamHealth, UpstreamNotReadyDetail,
 };
-use zinder_source::{NodeSource, UpstreamHealthSnapshot};
+use zinder_source::{NodeSource, SourceError, UpstreamHealthSnapshot};
 
 /// Spawns the upstream-health probe task.
 ///
@@ -36,9 +37,10 @@ use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 /// snapshot as the [`ReadinessInput::NodeSource`] input of `readiness`.
 /// Probe errors keep the last published observation and log a warning; the
 /// ingest loop continues to own the admission state. When `endpoint_switches`
-/// is supplied, each change of the active node endpoint probes immediately,
-/// and a probe that a switch interrupts publishes nothing: it observed the
-/// previous endpoint, and the switch already reset the input for the new one.
+/// is supplied, each change of the active node endpoint abandons the probe in
+/// flight and probes the new endpoint immediately; the switch already reset
+/// the input for the new endpoint. Cancellation also abandons a probe in
+/// flight.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_upstream_health_probe_task<Source>(
     source: Arc<Source>,
@@ -58,8 +60,14 @@ where
                 () = tokio::time::sleep(poll_interval) => {}
                 Some(()) = endpoint_switched(endpoint_switches.as_mut()) => {}
             }
-            run_upstream_health_probe_once(source.as_ref(), &readiness, endpoint_switches.as_mut())
-                .await;
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = run_upstream_health_probe_once(
+                    source.as_ref(),
+                    &readiness,
+                    endpoint_switches.as_mut(),
+                ) => {}
+            }
         }
     })
 }
@@ -76,19 +84,37 @@ async fn endpoint_switched(endpoint_switches: Option<&mut watch::Receiver<usize>
 async fn run_upstream_health_probe_once<Source>(
     source: &Source,
     readiness: &ComposedReadiness,
-    mut endpoint_switches: Option<&mut watch::Receiver<usize>>,
+    endpoint_switches: Option<&mut watch::Receiver<usize>>,
 ) where
     Source: NodeSource,
 {
-    if let Some(endpoint_switches) = endpoint_switches.as_deref_mut() {
-        endpoint_switches.mark_unchanged();
-    }
-    let probe_outcome = source.poll_upstream_health().await;
-    if endpoint_switches
-        .is_some_and(|endpoint_switches| endpoint_switches.has_changed().unwrap_or(false))
-    {
+    let Some(endpoint_switches) = endpoint_switches else {
+        publish_probe_outcome(source.poll_upstream_health().await, readiness);
         return;
+    };
+    endpoint_switches.mark_unchanged();
+    // The clone sees the switch that abandons this probe and leaves it unseen
+    // on `endpoint_switches`, so the task probes the new endpoint at once.
+    let mut probed_endpoint = endpoint_switches.clone();
+    let probe_outcome = tokio::select! {
+        biased;
+        Ok(()) = probed_endpoint.changed() => return,
+        probe_outcome = source.poll_upstream_health() => probe_outcome,
+    };
+    // The borrow holds the switch channel's read lock through the
+    // publication. A switch that landed first is seen here; one that lands
+    // later waits for the lock and then resets the input itself, so a probe
+    // of the previous endpoint never replaces that reset.
+    let probed_endpoint_still_active = endpoint_switches.borrow();
+    if !probed_endpoint_still_active.has_changed() {
+        publish_probe_outcome(probe_outcome, readiness);
     }
+}
+
+fn publish_probe_outcome(
+    probe_outcome: Result<UpstreamHealthSnapshot, SourceError>,
+    readiness: &ComposedReadiness,
+) {
     match probe_outcome {
         Ok(snapshot) => apply_upstream_health_snapshot(snapshot, readiness),
         Err(error) => {
