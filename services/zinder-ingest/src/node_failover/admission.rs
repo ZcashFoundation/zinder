@@ -177,10 +177,13 @@ impl NodeEndpointAdmissions {
     /// in position order.
     ///
     /// `store_activations` is the table of the store's latest writer-admitted
-    /// schedule revision, if any. A fallback whose table differs from it is
-    /// excluded with [`EndpointExclusion::ScheduleConflict`], so only `[node]`
-    /// can introduce a new revision and a fallback never rewrites the
-    /// schedule while `[node]` is merely slow to answer.
+    /// schedule revision, if any. A fallback that would become active with
+    /// another table is excluded with [`EndpointExclusion::ScheduleConflict`],
+    /// so only `[node]` can introduce a new revision and a fallback never
+    /// rewrites the schedule while `[node]` is merely slow to answer. The
+    /// comparison waits until every lower position has a verdict, so a
+    /// fallback that already advertises the table `[node]` brings is not
+    /// refused for answering first.
     ///
     /// Admission returns as soon as every position below the first admitted
     /// one has a verdict, so a fallback that does not answer never delays a
@@ -211,17 +214,22 @@ impl NodeEndpointAdmissions {
             .collect::<Vec<Option<EndpointAdmission>>>();
         let active_position = loop {
             if let Some(position) = settled_active_position(&decided) {
+                let Some(slot) = decided.get_mut(position) else {
+                    break None;
+                };
+                if starts_on_another_schedule(position, slot.as_ref(), store_activations) {
+                    *slot = Some(EndpointAdmission::Excluded(
+                        EndpointExclusion::ScheduleConflict,
+                    ));
+                    continue;
+                }
                 break Some(position);
             }
             let Some((position, verdict)) = checks.next().await else {
                 break None;
             };
             if let Some(slot) = decided.get_mut(position) {
-                *slot = Some(refuse_fallback_schedule_change(
-                    position,
-                    verdict,
-                    store_activations,
-                ));
+                *slot = Some(verdict);
             }
         };
         drop(checks);
@@ -276,21 +284,21 @@ impl NodeEndpointAdmissions {
     }
 }
 
-/// Excludes a fallback whose table differs from the store's admitted
-/// revision. `[node]` may still bring a new table, which the store admits
-/// only as a future-only revision.
-fn refuse_fallback_schedule_change(
+/// Returns whether an admitted fallback would start the writer with a table
+/// other than the store's admitted revision.
+///
+/// `[node]` may still bring a new table, which the store admits only as a
+/// future-only revision.
+fn starts_on_another_schedule(
     position: usize,
-    verdict: EndpointAdmission,
+    verdict: Option<&EndpointAdmission>,
     store_activations: Option<&NetworkUpgradeActivations>,
-) -> EndpointAdmission {
+) -> bool {
     match (verdict, store_activations) {
-        (EndpointAdmission::Admitted(admitted), Some(store_activations))
-            if position > 0 && admitted.activations != *store_activations =>
-        {
-            EndpointAdmission::Excluded(EndpointExclusion::ScheduleConflict)
+        (Some(EndpointAdmission::Admitted(admitted)), Some(store_activations)) => {
+            position > 0 && admitted.activations != *store_activations
         }
-        (verdict, _) => verdict,
+        _ => false,
     }
 }
 

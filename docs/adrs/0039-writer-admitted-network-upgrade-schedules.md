@@ -71,8 +71,10 @@ The writer admits a table only when it opens the store. When ingest has
 fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
 it admits the table of the endpoint it starts on. Before choosing that
 endpoint, it reads the store's latest admitted revision without opening the
-primary, and a fallback whose table differs from that revision is refused at
-startup. Only `[node]` can bring a new table, so a fallback running an older
+primary, and a fallback that would become active with a table other than that
+revision is refused at startup. The comparison waits until every lower
+position has a verdict, so a fallback that already advertises the table
+`[node]` brings is not refused for answering first. Only `[node]` can bring a new table, so a fallback running an older
 release never removes a pending activation while `[node]` is merely slow to
 answer; when `[node]` is unreachable and no fallback matches, startup fails as a
 single-endpoint startup would and the restart tries again. Every other endpoint

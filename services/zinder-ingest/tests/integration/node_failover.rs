@@ -19,8 +19,8 @@ use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
-    SubtreeRootRange,
+    BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, SubtreeRootRange,
 };
 use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, EndpointAdmission, EndpointExclusion,
@@ -802,6 +802,47 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
     .await?;
     assert_eq!(admissions.active_position(), 0);
     Ok(())
+}
+
+/// A fallback that answers before `[node]` with the new table `[node]` also
+/// brings stays a standby: the store's revision is compared only for the
+/// endpoint that becomes active.
+#[tokio::test]
+async fn startup_keeps_a_fallback_that_advertises_the_new_table_node_brings() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let store_activations = sample_regtest_upgrade_activations();
+    let upgraded_table = with_future_upgrade(&store_activations)?;
+    let mut upgraded_primary = FailoverEndpoint::serving(&blocks, 4)?;
+    upgraded_primary.activations = upgraded_table.clone();
+    *upgraded_primary.probe_delay.lock() = Duration::from_millis(200);
+    let mut upgraded_fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    upgraded_fallback.activations = upgraded_table;
+    let (nodes, _switch) = NodeSet::new(upgraded_primary, [upgraded_fallback]);
+
+    let admissions =
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, Some(&store_activations))
+            .await?;
+
+    assert_eq!(admissions.active_position(), 0);
+    assert!(matches!(
+        admissions.verdicts().nth(1),
+        Some((1, EndpointAdmission::Admitted(_)))
+    ));
+    Ok(())
+}
+
+/// `table` with one more upgrade, activating far above every fixture tip.
+fn with_future_upgrade(table: &NetworkUpgradeActivations) -> TestResult<NetworkUpgradeActivations> {
+    let mut activations = table.activations().to_vec();
+    activations.push(NetworkUpgradeActivation {
+        branch_id: ConsensusBranchId::new(0x0fed_cba9),
+        activation_height: BlockHeight::new(1_000_000),
+        name: "FutureUpgrade".to_owned(),
+    });
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
 }
 
 #[tokio::test]
