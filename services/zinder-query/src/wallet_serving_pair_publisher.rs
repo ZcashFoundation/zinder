@@ -421,24 +421,19 @@ impl IngestControlInput {
 }
 
 impl WalletServingReadiness {
-    /// Starts the native query composition: the serving pair unadmitted, and
-    /// the node source and ingest control as dependencies not yet observed.
+    /// Starts the composition native query and lightwalletd compatibility
+    /// wallet serving share: the serving pair unadmitted, and the node source
+    /// and ingest control as dependencies not yet observed.
+    ///
+    /// Both runtimes call the node only to broadcast, and ingest control for
+    /// mempool reads and unmined transaction lookups, so each runs both
+    /// dependency probes.
     #[must_use]
-    pub fn native_query(runtime: Readiness) -> Self {
+    pub fn with_node_and_ingest_control(runtime: Readiness) -> Self {
         Self::with_dependencies(
             runtime,
             &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
         )
-    }
-
-    /// Starts the lightwalletd compatibility composition: the serving pair
-    /// unadmitted, and the node source as a dependency not yet observed.
-    ///
-    /// Compatibility owns a separate live-state contract and has no
-    /// ingest-control probe.
-    #[must_use]
-    pub fn compatibility(runtime: Readiness) -> Self {
-        Self::with_dependencies(runtime, &[ReadinessInput::NodeSource])
     }
 
     /// Starts a composition whose readiness is the serving pair alone.
@@ -777,10 +772,7 @@ pub enum WalletServingPairError {
         #[source]
         source: std::io::Error,
     },
-    /// The compatibility runtime could not connect to canonical writer status.
-    ///
-    /// P3 replaces this endpoint-only path with compatibility-specific
-    /// ingest-control admission.
+    /// A bare writer-status endpoint could not be connected.
     #[error(transparent)]
     WriterStatusConnect(#[from] BearerTokenConnectError),
     /// The private canonical-control RPC failed.
@@ -881,10 +873,12 @@ pub struct WalletServingPairPublisher {
 }
 
 impl WalletServingPairPublisher {
-    /// Bootstraps the current compatibility pair from its writer-status endpoint.
+    /// Bootstraps a pair from a bare writer-status endpoint, without
+    /// ingest-control admission.
     ///
-    /// This preserves the pre-P3 compatibility composition without applying
-    /// native wallet admission requirements to it.
+    /// The release runtimes bootstrap through
+    /// [`Self::bootstrap_with_admitted_ingest_control`]; this entry point
+    /// serves an embedding that reaches only `CanonicalControl`.
     pub async fn bootstrap_from_writer_status_endpoint(
         config: WalletServingPairConfig,
         readiness: WalletServingReadiness,
@@ -896,7 +890,8 @@ impl WalletServingPairPublisher {
         Self::bootstrap_with_writer_status(config, readiness, writer_status).await
     }
 
-    /// Bootstraps the native pair through its already-admitted ingest channel.
+    /// Bootstraps the pair through the runtime's already-admitted ingest
+    /// channel.
     pub async fn bootstrap_with_admitted_ingest_control(
         config: WalletServingPairConfig,
         readiness: WalletServingReadiness,
@@ -2347,7 +2342,7 @@ mod tests {
         use zinder_runtime::ReadinessInput::{IngestControl, NodeSource};
 
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         let visible_height = Some(42);
         let node_failure = zinder_runtime::ReadinessCause::NodeUnavailable(
             zinder_runtime::NodeUnavailableDetail::first_iteration(
@@ -2419,7 +2414,7 @@ mod tests {
         const ITERATIONS: usize = 2_048;
 
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(42)));
         let iteration_start = Arc::new(Barrier::new(3));
         let iteration_complete = Arc::new(Barrier::new(3));
@@ -2485,8 +2480,9 @@ mod tests {
         );
         let admitted_capabilities = capabilities.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::compatibility(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source.clone(),
@@ -2565,8 +2561,9 @@ mod tests {
         );
         assert!(capabilities.contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::compatibility(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source,
@@ -2606,7 +2603,7 @@ mod tests {
             &admitted_ingest_control,
         );
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::compatibility(runtime);
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime);
         let cancel = CancellationToken::new();
         let handle = spawn_wallet_node_readiness_probe(
             source.clone(),
@@ -2637,7 +2634,7 @@ mod tests {
                 .await?;
         let direct_ingest_control = admitted_ingest_control.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2696,7 +2693,7 @@ mod tests {
             AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2793,7 +2790,7 @@ mod tests {
             AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::serving_pair_stale(
             0,
             1,
@@ -2862,7 +2859,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -2939,7 +2936,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -3002,7 +2999,7 @@ mod tests {
         );
         let admitted_capabilities = capabilities.clone();
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
         readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let cancel = CancellationToken::new();
@@ -3161,7 +3158,7 @@ mod tests {
         );
 
         let runtime = zinder_runtime::Readiness::default();
-        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
         readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(visible_height)));
         let cancel = CancellationToken::new();
         let node_probe = spawn_wallet_node_readiness_probe(
@@ -4247,8 +4244,8 @@ mod tests {
         Ok(())
     }
 
-    /// The compatibility composition refuses a writer that has not confirmed
-    /// its tip since it reopened.
+    /// The serving pair refuses a writer that has not confirmed its tip since
+    /// it reopened.
     ///
     /// It stays unready with `canonical_tip_unconfirmed`, never
     /// `serving_pair_stale`, through a writer-status outage, keeps a
@@ -4259,7 +4256,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "bootstrap, outage, recovery, a park, and the restarted writer form one causal sequence"
     )]
-    async fn compatibility_pair_refuses_a_writer_with_an_unconfirmed_tip()
+    async fn pair_refuses_a_writer_with_an_unconfirmed_tip()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
@@ -4297,7 +4294,8 @@ mod tests {
             }
         });
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::compatibility(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let (mut publisher, _slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
@@ -4364,17 +4362,18 @@ mod tests {
         Ok(())
     }
 
-    /// The compatibility composition refuses a parked writer with its halt.
+    /// The serving pair refuses a parked writer with its halt.
     ///
-    /// A parked writer keeps attesting its frozen fence, and compatibility has
-    /// no ingest-control probe, so the halt must come from canonical writer
-    /// status: at bootstrap, on every refresh, and until the writer clears it.
+    /// A parked writer keeps attesting its frozen fence, so the publisher
+    /// reads the halt from canonical writer status itself, with no
+    /// ingest-control probe running: at bootstrap, on every refresh, and
+    /// until the writer clears it.
     #[tokio::test(flavor = "multi_thread")]
     #[expect(
         clippy::too_many_lines,
         reason = "bootstrap, recovery, a second park, and the following outage form one causal halt sequence"
     )]
-    async fn compatibility_pair_refuses_a_parked_writer_with_the_typed_halt()
+    async fn pair_refuses_a_parked_writer_with_the_typed_halt()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
@@ -4418,7 +4417,8 @@ mod tests {
         });
 
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::compatibility(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
         let (mut publisher, _slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
@@ -4601,7 +4601,8 @@ mod tests {
             }
         });
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::native_query(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                 wallet_serving_pair_config(
@@ -4805,7 +4806,8 @@ mod tests {
                 .exists()
         );
         let readiness = zinder_runtime::Readiness::default();
-        let serving_readiness = WalletServingReadiness::native_query(readiness.clone());
+        let serving_readiness =
+            WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_with_admitted_ingest_control(
                 wallet_serving_pair_config(

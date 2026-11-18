@@ -58,10 +58,18 @@ chain view stays as it was:
 
 ### Dependencies degrade instead of refusing
 
-Native query declares the node source and ingest control as dependency
-inputs. Compatibility wallet serving declares the node source.
-Compact-blocks serving declares none and runs no node probe. Each dependency
-starts as `starting` and then carries its probe's latest cause.
+Native query and compatibility wallet serving declare the node source and
+ingest control as dependency inputs, because both broadcast through the node
+and serve mempool reads and unmined transaction lookups through ingest
+control. Compact-blocks serving declares none and runs no probe. Each
+dependency starts as `starting` and then carries its probe's latest cause.
+
+Compatibility wallet serving therefore admits ingest control at startup as
+native query does. `AdmittedIngestControl` validates the endpoint's service
+identity, network, contract revision, and required methods once, and the
+serving-pair publisher and the ingest-control probe share its channel.
+Compatibility's own mempool and tip-change calls keep their separate
+channels.
 
 A dependency whose cause does not admit traffic never closes the traffic gate.
 `ComposedReadiness::with_dependency_inputs` lists it in the report's `degraded`
@@ -72,7 +80,7 @@ Each input still owns only its own slot, so no probe can clear another probe's
 observation.
 
 Because an ingest-control failure no longer refuses traffic, a halt that
-native query's ingest-control probe observes stays published through every
+the ingest-control probe observes stays published through every
 later probe observation, including control failures and answers without the
 halt. The probe never clears it. The serving-pair publisher adopts the halt on
 its next refresh as if it had read it from `CanonicalControl.WriterStatus`: it
@@ -85,10 +93,10 @@ on a pair that the recovered writer does not attest, even when the publisher
 never saw the halt itself.
 
 When the canonical writer reports `upstream_not_ready` in
-`IngestControl.WriterStatus`, native query relays that observation, with the
+`IngestControl.WriterStatus`, the reader relays that observation, with the
 writer's heights and health source, as the `upstream_not_ready` cause of its
 ingest-control dependency. When the writer's live mempool, which waits on the
-node, refuses `MempoolSnapshot` with `NODE_UNAVAILABLE`, native query reports
+node, refuses `MempoolSnapshot` with `NODE_UNAVAILABLE`, the reader reports
 `node_unavailable` as that dependency's cause, so `/readyz` shows that mempool
 calls fail even while the reader's own node probe succeeds. Every other
 ingest-control health failure reports `ingest_control_unavailable`.
@@ -117,10 +125,10 @@ A revision 8 server keeps such a subscription open and silent, so a consumer
 that relies on the stream ending requires revision 9.
 `zinder_client::MIN_SUPPORTED_CONTRACT_REVISION` stays 8, because the client
 reads both behaviors correctly and only misses the ending against an older
-server. `zinder-query` admits `zinder-ingest` only at its own revision, so
-ingest and the readers upgrade together.
+server. `zinder-query` and wallet-mode compatibility admit `zinder-ingest`
+only at their own revision, so ingest and the readers upgrade together.
 
-Losing ingest control entirely stays bounded. Native query reads
+Losing ingest control entirely stays bounded. The reader reads
 `CanonicalControl.WriterStatus` through the same admitted channel, so the pair
 reports `serving_pair_stale` and then refuses traffic with
 `writer_status_unavailable` once the staleness ceiling passes. An unattested
@@ -213,9 +221,13 @@ ingest.
   `node_capability_missing`, or `ingest_control_unavailable` as its own cause,
   and compatibility no longer reports the node causes. These causes appear
   only under `degraded`.
+- Wallet-mode compatibility starts only against an ingest endpoint that passes
+  `AdmittedIngestControl`, so, like native query, it fails at startup against
+  an ingest of another network or contract revision.
 - A reader restart during a node outage still fails, because the readers probe
   the node at startup and ingest needs the node to open its store and confirm
-  its tip. This decision does not change startup.
+  its tip. Apart from compatibility's ingest-control admission, this decision
+  does not change startup.
 
 ## Alternatives considered
 

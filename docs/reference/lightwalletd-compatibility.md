@@ -39,8 +39,8 @@ claim derived by the compatibility constructor. Construction admits it only
 when the canonical pair retains transaction blobs (`transactions` or `all`)
 and the exact wallet-serving pair provides the transparent reads; insufficient
 retention fails before the listener binds. Later pair lag changes readiness,
-and a node outage degrades the node dependency, without rewriting
-`GetLightdInfo`.
+and a node or ingest-control outage degrades that dependency, without
+rewriting `GetLightdInfo`.
 
 `GetLightdInfo` derives its upgrade fields from one activation table and the
 served tip on every request:

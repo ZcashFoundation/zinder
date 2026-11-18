@@ -355,8 +355,8 @@ root cause. A `WriterStatus` that reports a parked writer refuses traffic with
 it causes. New native requests then fail with
 `REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
 status. The serving-pair publisher reads the same halt from
-`CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
-which has no ingest-control probe, refuses traffic in both serving modes.
+`CanonicalControl.WriterStatus`, as compact-blocks compatibility, which runs
+no ingest-control probe, does to refuse traffic.
 
 A halt the probe observes stays published through every later probe
 observation, including a probe failure or a writer restarted on its frozen
@@ -421,17 +421,26 @@ projector reports the park.
 Compatibility is ready only while `WalletServingPairPublisher` can reach writer
 status, catch canonical and wallet secondaries up, and publish a pair that
 passes exact-fence admission. In wallet mode, the node source behind
-`SendTransaction` is a dependency. Its outage appears under `degraded`, and
-`SendTransaction` fails with `UNAVAILABLE` while every other method, including
-`GetTreeState` at any height, keeps answering. Compact-blocks
-mode calls the node from no method and runs no node probe. Traffic uses a
-readiness interceptor, so a process whose serving pair refuses traffic does
-not accept new gRPC requests.
-Compatibility bootstraps its serving pair through the writer-status endpoint
-and uses separate ingest-control channels for mempool and tip-change traffic.
-It does not instantiate the native query's admitted ingest type or advertise
-native capabilities. Consumer support additionally requires the selected
-lightwalletd client to pass its complete lifecycle through a trusted edge.
+`SendTransaction` and ingest control behind `GetMempoolStream`,
+`GetMempoolTx`, and unmined `GetTransaction` lookups are dependencies, probed
+as native query probes them. An outage of either appears under `degraded`,
+and only the methods that call it fail with `UNAVAILABLE` while every other
+method, including `GetTreeState` at any height, keeps answering. A writer
+mempool that hydrates or rebuilds from its node degrades ingest control with
+`node_unavailable`, and a writer halt observed by the ingest-control probe
+refuses traffic until the serving-pair publisher validates a following
+writer. Compact-blocks mode calls neither from any method and runs no
+dependency probe. Traffic uses a readiness interceptor, so a process whose
+serving pair refuses traffic does not accept new gRPC requests.
+
+Wallet-mode compatibility admits ingest control at startup through the same
+`AdmittedIngestControl` as native query, which validates service identity,
+network, contract revision, and the required methods once. The serving-pair
+publisher and the ingest-control probe share that channel, while mempool and
+tip-change traffic use their own ingest-control channels. Compatibility does
+not advertise native capabilities. Consumer support additionally requires the
+selected lightwalletd client to pass its complete lifecycle through a trusted
+edge.
 
 Writer-status transport failures, replica or projection lag, and a candidate
 whose RocksDB open or catch-up fails on a table file the primary just deleted

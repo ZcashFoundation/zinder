@@ -148,7 +148,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     }
 
     let readiness = Readiness::default();
-    let serving_readiness = WalletServingReadiness::native_query(readiness.clone());
+    let serving_readiness = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
     let admit_ingest_control_phase = StartupPhase::AdmitIngestControl.start();
     let ingest_control = match AdmittedIngestControl::connect(
         &query_config.ingest_control_addr,
