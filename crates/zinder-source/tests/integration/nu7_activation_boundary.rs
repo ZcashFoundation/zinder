@@ -151,7 +151,10 @@ fn assert_node_reported_identifiers(
         assert_eq!(facts.is_coinbase, index == 0);
         if facts.is_coinbase {
             assert_eq!(facts.expiry_height, Some(height));
-            assert!(fact_set.transparent_inputs.is_empty());
+            assert_eq!(
+                fact_set.transparent_inputs,
+                [] as [zinder_core::TransparentInputFact; 0]
+            );
         }
     }
     Ok(())

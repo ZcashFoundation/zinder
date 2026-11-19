@@ -1898,11 +1898,17 @@ impl LiveWriterFenceProbe<'_, '_> {
 impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
     type Error = ProjectorError;
 
-    async fn catch_up(
+    fn catch_up(
         &mut self,
-    ) -> Result<Option<zinder_proto::v1::ingest::CanonicalWriterFence>, ProjectorError> {
-        self.canonical.try_catch_up()?;
-        Ok(Some(expected_writer_fence(self.canonical.event_fence())))
+    ) -> impl std::future::Future<
+        Output = Result<Option<zinder_proto::v1::ingest::CanonicalWriterFence>, ProjectorError>,
+    > {
+        std::future::ready(
+            self.canonical
+                .try_catch_up()
+                .map(|_| Some(expected_writer_fence(self.canonical.event_fence())))
+                .map_err(ProjectorError::from),
+        )
     }
 
     async fn writer_status(
@@ -3215,13 +3221,20 @@ mod tests {
     impl CanonicalFenceProbe for BurstProbe {
         type Error = ProjectorError;
 
-        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProjectorError> {
+        fn catch_up(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<Option<CanonicalWriterFence>, ProjectorError>> + Send
+        {
             self.catch_ups += 1;
             self.secondary_sequence = self.writer_sequence;
-            Ok(Some(scripted_writer_fence(self.secondary_sequence)))
+            std::future::ready(Ok(Some(scripted_writer_fence(self.secondary_sequence))))
         }
 
-        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProjectorError> {
+        fn writer_status(
+            &mut self,
+        ) -> impl std::future::Future<
+            Output = Result<CanonicalWriterStatusResponse, ProjectorError>,
+        > + Send {
             if self.burst_commits_remaining > 0 {
                 self.burst_commits_remaining -= 1;
                 self.writer_sequence += 1;
@@ -3229,12 +3242,12 @@ mod tests {
             let writer_sequence = self
                 .writer_sequence_override
                 .unwrap_or(self.writer_sequence);
-            Ok(CanonicalWriterStatusResponse {
+            std::future::ready(Ok(CanonicalWriterStatusResponse {
                 network_name: encode_zinder_native_chain_name(test_network()).to_owned(),
                 fence: Some(scripted_writer_fence(writer_sequence)),
                 oldest_retained_event_sequence: 1,
                 ..CanonicalWriterStatusResponse::default()
-            })
+            }))
         }
 
         fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
@@ -3243,9 +3256,11 @@ mod tests {
     }
 
     impl FollowingFenceProbe for BurstProbe {
-        async fn deadline_passed(&mut self) -> Result<(), ProjectorError> {
+        fn deadline_passed(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), ProjectorError>> + Send {
             self.deadlines += 1;
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 

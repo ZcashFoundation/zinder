@@ -1214,15 +1214,15 @@ mod tests {
         assert_eq!(anchor.transaction_index, 7);
         assert_eq!(decoded_filter, filter);
         assert_eq!(decoded_fence, read_fence);
-        assert!(
+        assert_eq!(
             history_page_cursor(
                 &page,
                 TransactionHistoryDirection::Older,
                 TransactionHistoryDirection::Newer,
                 &filter,
                 &read_fence,
-            )
-            .is_empty()
+            ),
+            [] as [u8; 0]
         );
         Ok(())
     }

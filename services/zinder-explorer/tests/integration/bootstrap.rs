@@ -561,7 +561,7 @@ fn seeded_reorg_history_materialized_view_store(
     let reorg_cursor = primary_materialized_view_store
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
         .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
-    assert!(!reorg_cursor.is_empty());
+    assert_ne!(reorg_cursor, [] as [u8; 0]);
 
     let materialized_view_secondary_tempdir = tempfile::tempdir()?;
     let materialized_view_store = MaterializedViewStore::open_secondary(
@@ -614,7 +614,7 @@ async fn assert_recorded_reorg_history_page(
         freshness.capability_version,
         EXPLORER_CHAIN_REORG_HISTORY_V1
     );
-    assert!(first_page.next_cursor.is_empty());
+    assert_eq!(first_page.next_cursor, [] as [u8; 0]);
     assert_eq!(first_page.events.len(), 1);
     let reorg = first_page
         .events
@@ -622,7 +622,7 @@ async fn assert_recorded_reorg_history_page(
         .ok_or_else(|| eyre!("reorg event missing"))?;
     let reorg_cursor = reorg.cursor.clone();
     assert_eq!(reorg.event_sequence, 2);
-    assert!(!reorg_cursor.is_empty());
+    assert_ne!(reorg_cursor, [] as [u8; 0]);
     assert_eq!(reorg.chain_epoch_id, 2);
     assert_eq!(
         reorg
@@ -666,8 +666,11 @@ async fn assert_reorg_history_empty_after(
         })
         .await?
         .into_inner();
-    assert!(empty_page.events.is_empty());
-    assert!(empty_page.next_cursor.is_empty());
+    assert_eq!(
+        empty_page.events,
+        [] as [zinder_proto::v1::explorer::ChainReorgHistoryEvent; 0]
+    );
+    assert_eq!(empty_page.next_cursor, [] as [u8; 0]);
     Ok(())
 }
 
@@ -934,7 +937,10 @@ fn assert_overview_wallet_fields_from_production_endpoint(
         response.mempool.is_some(),
         "the production wallet endpoint serves a mempool snapshot"
     );
-    assert!(response.value_pools.is_empty());
+    assert_eq!(
+        response.value_pools,
+        [] as [zinder_proto::v1::wallet::ChainValuePool; 0]
+    );
     let freshness = response
         .freshness
         .as_ref()
@@ -1271,8 +1277,11 @@ async fn explorer_query_pages_transparent_address_deltas() -> Result<()> {
         .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 200, 300, 0, Vec::new()))
         .await?
         .into_inner();
-    assert!(empty.entries.is_empty());
-    assert!(empty.next_cursor.is_empty());
+    assert_eq!(
+        empty.entries,
+        [] as [zinder_proto::v1::explorer::TransparentAddressDeltasEntry; 0]
+    );
+    assert_eq!(empty.next_cursor, [] as [u8; 0]);
 
     let first_page = client
         .transparent_address_deltas(deltas_request(DELTAS_TEST_ADDRESS, 0, 100, 1, Vec::new()))
@@ -1280,7 +1289,7 @@ async fn explorer_query_pages_transparent_address_deltas() -> Result<()> {
         .into_inner();
     assert_eq!(first_page.entries.len(), 1);
     assert_eq!(first_page.entries[0].block_height, 10);
-    assert!(!first_page.next_cursor.is_empty());
+    assert_ne!(first_page.next_cursor, [] as [u8; 0]);
 
     let second_page = client
         .transparent_address_deltas(deltas_request(

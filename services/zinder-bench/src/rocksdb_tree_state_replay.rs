@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(spread_evenly(entries.clone(), 20), entries);
         assert_eq!(spread_evenly(entries.clone(), 5), [0, 2, 4, 6, 8]);
         assert_eq!(spread_evenly(entries.clone(), 1), [0]);
-        assert!(spread_evenly(entries, 0).is_empty());
+        assert_eq!(spread_evenly(entries, 0), [] as [i32; 0]);
     }
 
     #[test]

@@ -760,8 +760,7 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
         store_activations
             .activations()
             .split_last()
-            .map(|(_, older)| older.to_vec())
-            .unwrap_or_default(),
+            .map_or_default(|(_, older)| older.to_vec()),
     )?;
     let unreachable_primary = || -> TestResult<FailoverEndpoint> {
         let primary = FailoverEndpoint::serving(&blocks, 4)?;

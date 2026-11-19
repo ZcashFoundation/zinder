@@ -207,7 +207,7 @@ struct WaitingPlace<'waiters> {
 impl<'waiters> WaitingPlace<'waiters> {
     fn take(waiters: &'waiters AtomicU32, max_waiters: u32) -> Option<Self> {
         waiters
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
                 (waiting < max_waiters).then_some(waiting + 1)
             })
             .ok()

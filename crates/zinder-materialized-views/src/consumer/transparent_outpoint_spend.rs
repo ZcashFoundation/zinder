@@ -225,7 +225,7 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
         let index_cf = ctx
             .store
             .consumer_column_family(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY)?;
-        for chunk in index_payload.chunks_exact(OUTPOINT_KEY_LEN) {
+        for chunk in index_payload.as_chunks::<OUTPOINT_KEY_LEN>().0 {
             ctx.batch.delete_cf(&spend_cf, chunk);
         }
         ctx.batch.delete_cf(&index_cf, index_key);

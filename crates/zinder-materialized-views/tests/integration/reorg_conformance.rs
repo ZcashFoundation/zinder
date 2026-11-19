@@ -286,7 +286,7 @@ fn pruning_stopped_after_its_range_delete_reclaims_the_files_after_a_restart() -
         checks.set(checks.get() + 1);
         checks.get() > 1
     })?;
-    assert!(stopped.is_empty());
+    assert_eq!(stopped, []);
 
     let pruned = pruned.reopen(WINDOW, UndoRows::Pruned)?;
     let resumed = pruned.store.prune_undo_indexes(|| false)?;
@@ -299,7 +299,7 @@ fn pruning_stopped_after_its_range_delete_reclaims_the_files_after_a_restart() -
         declared_families,
         "the restarted pass must reclaim the index whose rows were already hidden"
     );
-    assert!(pruned.store.prune_undo_indexes(|| false)?.is_empty());
+    assert_eq!(pruned.store.prune_undo_indexes(|| false)?, []);
     assert_no_divergence(&pruned, &unpruned, 12 - WINDOW)
 }
 
@@ -314,7 +314,7 @@ fn every_registry_entry_declares_how_it_conforms_to_reorgs() {
         );
     }
     for (column_family, reason) in PATH_DEPENDENT_COLUMN_FAMILIES {
-        assert!(!reason.is_empty());
+        assert_ne!(*reason, "");
         assert!(
             bundled_materialized_view_consumer_definitions()
                 .iter()

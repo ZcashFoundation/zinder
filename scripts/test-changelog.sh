@@ -253,7 +253,7 @@ resolver = "3"
 version = "0.5.0"
 edition = "2024"
 publish = false
-rust-version = "1.95"
+rust-version = "1.100"
 TOML
 cat > "$prepare_repository/crates/zinder-core/Cargo.toml" <<'TOML'
 [package]

@@ -1,7 +1,7 @@
 //! Stream cursor byte contract.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use thiserror::Error;
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId, TransparentOutPoint};
@@ -591,7 +591,7 @@ fn verify_auth_tag(
 }
 
 fn cursor_mac(cursor_auth_key: [u8; 32]) -> Result<HmacSha256, StreamCursorError> {
-    <HmacSha256 as Mac>::new_from_slice(&cursor_auth_key)
+    <HmacSha256 as KeyInit>::new_from_slice(&cursor_auth_key)
         .map_err(|_| StreamCursorError::InvalidAuthKey)
 }
 
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn invalid_auth_tag_is_rejected() -> Result<(), StreamCursorError> {
         let mut cursor_bytes = test_cursor()?.as_bytes().to_vec();
-        assert!(!cursor_bytes.is_empty());
+        assert_ne!(cursor_bytes, [] as [u8; 0]);
         let last_index = cursor_bytes.len() - 1;
         let last_byte = &mut cursor_bytes[last_index];
         *last_byte ^= 1;

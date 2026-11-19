@@ -494,9 +494,7 @@ impl ServerState {
         }
 
         let batch_shaper = self.batch_shaper.lock().clone();
-        let shapes = batch_shaper
-            .map(|shape_batch| shape_batch(members.len()))
-            .unwrap_or_default();
+        let shapes = batch_shaper.map_or_default(|shape_batch| shape_batch(members.len()));
         ResolvedReply::Body(shape_batch_response(responses, &shapes))
     }
 }

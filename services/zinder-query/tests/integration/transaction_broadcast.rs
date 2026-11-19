@@ -67,7 +67,10 @@ async fn broadcast_before_node_verification_fails_without_sending() -> eyre::Res
         matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
         "unexpected unverified-node error: {error:?}"
     );
-    assert!(broadcaster.captured_calls().is_empty());
+    assert_eq!(
+        broadcaster.captured_calls(),
+        [] as [zinder_core::RawTransactionBytes; 0]
+    );
 
     node.verify(&slot).await?;
     assert!(wallet_query.upstream_node_capabilities().is_some());
@@ -119,7 +122,10 @@ async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre
             .await
             .is_err()
     );
-    assert!(broadcaster.captured_calls().is_empty());
+    assert_eq!(
+        broadcaster.captured_calls(),
+        [] as [zinder_core::RawTransactionBytes; 0]
+    );
     Ok(())
 }
 
@@ -155,7 +161,10 @@ async fn node_with_the_same_schedule_on_another_chain_fails_verification() -> ey
             .await
             .is_err()
     );
-    assert!(broadcaster.captured_calls().is_empty());
+    assert_eq!(
+        broadcaster.captured_calls(),
+        [] as [zinder_core::RawTransactionBytes; 0]
+    );
     Ok(())
 }
 

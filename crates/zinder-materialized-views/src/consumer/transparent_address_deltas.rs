@@ -237,7 +237,7 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
         let index_cf = ctx
             .store
             .consumer_column_family(TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY)?;
-        for chunk in index_payload.chunks_exact(INDEX_ENTRY_LEN) {
+        for chunk in index_payload.as_chunks::<INDEX_ENTRY_LEN>().0 {
             let address_bytes: [u8; ADDRESS_HASH_LEN] =
                 chunk[0..ADDRESS_HASH_LEN].try_into().unwrap_or([0u8; 32]);
             let position_bytes: [u8; POSITION_LEN] = chunk
@@ -296,7 +296,6 @@ pub enum TransparentAddressDeltasConsumerError {
 mod tests {
     use std::error::Error;
 
-    use prost::Message as _;
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
     use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_transaction_id_hex};
@@ -379,7 +378,7 @@ mod tests {
             record.internal_transaction_id,
             encode_internal_transaction_id(transaction_id)
         );
-        assert!(record.transaction_id.is_empty());
+        assert_eq!(record.transaction_id, "");
         assert_eq!(
             TransparentAddressDeltasConsumer::stored_transaction_id(&record)?,
             transaction_id

@@ -223,14 +223,23 @@ async fn shielded_outputs_are_indexed_after_mining() -> Result<()> {
             )
         })?;
     assert_eq!(shielding_transaction.data.transparent_inputs.len(), 1);
-    assert!(shielding_transaction.data.transparent_outputs.is_empty());
+    assert_eq!(
+        shielding_transaction.data.transparent_outputs,
+        [] as [zinder_core::CompactTransparentOutput; 0]
+    );
     assert_eq!(
         shielding_transaction.data.ironwood_actions.len(),
         2,
         "one Ironwood note padded to two actions"
     );
-    assert!(shielding_transaction.data.orchard_actions.is_empty());
-    assert!(shielding_transaction.data.sapling_outputs.is_empty());
+    assert_eq!(
+        shielding_transaction.data.orchard_actions,
+        [] as [zinder_core::CompactShieldedAction; 0]
+    );
+    assert_eq!(
+        shielding_transaction.data.sapling_outputs,
+        [] as [zinder_core::CompactSaplingOutput; 0]
+    );
 
     let node_block = regtest_json_rpc_call(
         &env,

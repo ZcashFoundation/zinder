@@ -1046,6 +1046,12 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
         Err(Self::unsupported("GetAddressUtxosStream"))
     }
+    async fn get_standard_fee(
+        &self,
+        _request: Request<lightwalletd::Empty>,
+    ) -> Result<Response<lightwalletd::StandardFee>, Status> {
+        Err(Self::unsupported("GetStandardFee"))
+    }
     async fn ping(
         &self,
         request: Request<lightwalletd::Duration>,
@@ -1928,8 +1934,14 @@ mod tests {
             .map(|transaction| transaction.index)
             .collect();
         assert_eq!(indexes, vec![0]);
-        assert!(pruned.vtx[0].spends.is_empty());
-        assert!(!pruned.vtx[0].vout.is_empty());
+        assert_eq!(
+            pruned.vtx[0].spends,
+            [] as [zinder_proto::compat::lightwalletd::CompactSaplingSpend; 0]
+        );
+        assert_ne!(
+            pruned.vtx[0].vout,
+            [] as [zinder_proto::compat::lightwalletd::TxOut; 0]
+        );
     }
 
     #[test]
@@ -1940,7 +1952,10 @@ mod tests {
         readiness.publish_storage(ReadinessState::ready(Some(10)));
         let report = runtime.report();
         assert!(report.is_ready);
-        assert!(report.degraded.is_empty());
+        assert_eq!(
+            report.degraded,
+            [] as [zinder_runtime::ReadinessDependency; 0]
+        );
         readiness.publish_shutting_down();
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
         readiness.publish_storage(ReadinessState::ready(Some(11)));

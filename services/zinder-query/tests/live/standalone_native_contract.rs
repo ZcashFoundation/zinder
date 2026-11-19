@@ -243,7 +243,7 @@ async fn verify_tree_state(
     )?;
     assert_eq!(tree_state.height, settled_tip.height);
     assert_eq!(tree_state.block_hash, settled_tip.block_hash);
-    assert!(!tree_state.payload_bytes.is_empty());
+    assert_ne!(tree_state.payload_bytes, [] as [u8; 0]);
     assert!(tree_state.block_time_seconds.is_some());
     let tree_state_json: serde_json::Value = serde_json::from_slice(&tree_state.payload_bytes)
         .wrap_err("pinned tree-state payload is not JSON")?;

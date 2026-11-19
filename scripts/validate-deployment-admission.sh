@@ -583,9 +583,9 @@ EOF
     || ! grep -Fq 'needs: validate' <<< "$sdk_package_job" \
     || ! grep -Fq 'fetch-depth: 0' <<< "$sdk_package_job" \
     || ! grep -Fq 'persist-credentials: false' <<< "$sdk_package_job" \
-    || ! grep -Fq 'toolchain: 1.95.0' <<< "$sdk_package_job" \
+    || ! grep -Fq 'toolchain: 1.100.0' <<< "$sdk_package_job" \
     || ! grep -Fq 'scripts/verify-sdk-packages.sh' <<< "$sdk_package_job" \
-    || ! grep -Fq 'uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac' \
+    || ! grep -Fq 'uses: ZcashFoundation/cargo-release@f212e2569995d569baeb6cdeb7ed99b7602303a4 # v0.1.1' \
       <<< "$sdk_package_job" \
     || ! grep -Fq 'phase: check' <<< "$sdk_package_job" \
     || ! grep -Fq 'base-sha: ${{ needs.validate.outputs.base_commit }}' \
@@ -600,15 +600,15 @@ EOF
     || grep -Fq 'actions/upload-artifact' <<< "$sdk_package_job"; then
     cat >&2 <<'EOF'
 release admission rejected: the pre-auth SDK package job must use exact Rust
-1.95, verify the hermetic package catalog, run the complete Cargo Release
+1.100, verify the hermetic package catalog, run the complete Cargo Release
 readiness check, and receive no registry credential.
 EOF
     exit 1
   fi
 
   crate_publication_job="$(release_job_body publish-sdk-crates)"
-  auth_line="$(grep -nF 'uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5' <<< "$crate_publication_job" | cut -d: -f1)"
-  publish_line="$(grep -nF 'uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac' <<< "$crate_publication_job" | cut -d: -f1)"
+  auth_line="$(grep -nF 'uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6' <<< "$crate_publication_job" | cut -d: -f1)"
+  publish_line="$(grep -nF 'uses: ZcashFoundation/cargo-release@f212e2569995d569baeb6cdeb7ed99b7602303a4 # v0.1.1' <<< "$crate_publication_job" | cut -d: -f1)"
   consumer_line="$(grep -nF 'scripts/verify-published-sdk.sh "$SDK_VERSION"' <<< "$crate_publication_job" | cut -d: -f1)"
   registry_verifier="$repository_root/scripts/verify-published-sdk.sh"
   if [[ -z "$crate_publication_job" ]] \
@@ -641,7 +641,7 @@ EOF
     || [[ ! -x "$registry_verifier" ]] \
     || ! grep -Fq 'CARGO_HOME="$consumer_directory/cargo-home"' \
       "$registry_verifier" \
-    || ! grep -Fq 'cargo +1.95.0 check' "$registry_verifier" \
+    || ! grep -Fq 'cargo +1.100.0 check' "$registry_verifier" \
     || [[ "$(grep -Fc 'CARGO_REGISTRY_TOKEN:' <<< "$crate_publication_job")" -ne 1 ]] \
     || grep -Eq 'secrets\.(CARGO_REGISTRY_TOKEN|CRATES_IO_TOKEN)' <<< "$crate_publication_job" \
     || grep -Fq 'needs.validate.outputs.stable' <<< "$crate_publication_job" \
@@ -784,7 +784,7 @@ EOF
   )"
   if [[ "$exported_binary_catalog" != "$configured_release_images" ]] \
     || grep -Eq 'zinder-(bench|compat-cipherscan|proto-codegen)' <<< "$binary_export_stage" \
-    || ! grep -Fq 'ARG RUST_VERSION=1.95.0' "$dockerfile" \
+    || ! grep -Fq 'ARG RUST_VERSION=1.100.0' "$dockerfile" \
     || ! grep -Eq '^ARG RUST_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
     || ! grep -Eq '^ARG DEBIAN_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
     || ! grep -Fq 'ENV CARGO_INCREMENTAL=0' "$dockerfile" \
@@ -793,7 +793,7 @@ EOF
     || ! grep -Fq -- '--remap-path-prefix=/workspace=/usr/src/zinder' "$dockerfile" \
     || ! grep -Fq -- '--remap-path-prefix=/usr/local/cargo=/cargo' "$dockerfile" \
     || ! grep -Fq 'ENV CARGO_PROFILE_RELEASE_STRIP=symbols' "$dockerfile" \
-    || ! grep -Fq 'cargo install cargo-auditable --version 0.7.4 --locked' "$dockerfile" \
+    || ! grep -Fq 'cargo install cargo-auditable --version 0.7.7 --locked' "$dockerfile" \
     || ! grep -Fq 'cargo auditable build --locked --release' "$dockerfile" \
     || ! grep -Fq 'libstdc++6' "$dockerfile"; then
     cat >&2 <<'EOF'
@@ -1038,7 +1038,7 @@ EOF
     || grep -Fq 'RELEASE_CACHE_SCOPE' <<< "$image_job" \
     || grep -Fq -- '--target release-binaries' <<< "$image_job" \
     || ! grep -Fq 'name: release-build-${{ matrix.platform }}' <<< "$binary_archive_job" \
-    || [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' <<< "$binary_archive_job")" -ne 2 ]] \
+    || [[ "$(grep -Fc 'uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2' <<< "$binary_archive_job")" -ne 2 ]] \
     || ! grep -Eq '^[[:space:]]+- images$' <<< "$merge_job" \
     || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
     || ! grep -Fq 'spdx.json' <<< "$collected_binary_job" \
@@ -1046,7 +1046,7 @@ EOF
     || ! grep -Fq 'name: release-binary-assets' <<< "$assemble_release_job" \
     || ! grep -Eq '^[[:space:]]+- assemble-and-sign$' <<< "$prepare_release_job" \
     || ! grep -Fq 'name: Checkout validated commit' <<< "$prepare_release_job" \
-    || ! grep -Fq 'uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6' \
+    || ! grep -Fq 'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1' \
       <<< "$prepare_release_job" \
     || ! grep -Fq 'ref: ${{ needs.validate.outputs.commit }}' \
       <<< "$prepare_release_job" \
@@ -1168,10 +1168,10 @@ EOF
     exit 1
   fi
 
-  if [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' "$release_workflow")" -ne 5 ]] \
+  if [[ "$(grep -Fc 'uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2' "$release_workflow")" -ne 5 ]] \
     || [[ "$(grep -Fc 'create-storage-record: false' "$release_workflow")" -ne 5 ]] \
-    || [[ "$(grep -Fc 'uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0' "$release_workflow")" -ne 2 ]] \
-    || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2' "$release_workflow")" -ne 3 ]] \
+    || [[ "$(grep -Fc 'uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3' "$release_workflow")" -ne 2 ]] \
+    || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3' "$release_workflow")" -ne 3 ]] \
     || [[ "$(grep -Fc 'scripts/install-release-gh.sh' "$release_workflow")" -ne 4 ]] \
     || grep -Fq 'artifact-metadata:' "$release_workflow" \
     || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \

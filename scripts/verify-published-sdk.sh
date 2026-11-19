@@ -42,7 +42,7 @@ for attempt in 1 2 3; do
   if CARGO_HOME="$consumer_directory/cargo-home" \
     PROTOC=/does/not/exist \
     CARGO_INCREMENTAL=0 \
-    cargo +1.95.0 check --manifest-path "$consumer_directory/Cargo.toml"; then
+    cargo +1.100.0 check --manifest-path "$consumer_directory/Cargo.toml"; then
     exit 0
   fi
 

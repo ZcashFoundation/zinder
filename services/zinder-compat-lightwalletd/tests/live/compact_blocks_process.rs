@@ -620,7 +620,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
         ],
     };
     assert!(output.status.success());
-    assert!(source_before_hash == source_after_hash);
+    assert_eq!(source_before_hash, source_after_hash);
     assert!(compat_stopped && ops_stopped && control_shutdown.is_cancelled());
     write_report_atomically(&evidence_root.join("report.json"), &report)?;
     Ok(())

@@ -492,7 +492,10 @@ mod tests {
     #[test]
     fn group_cohorts_reports_zeroed_stats_when_empty() {
         let (cohorts, stats) = group_cohorts(&[]);
-        assert!(cohorts.is_empty());
+        assert_eq!(
+            cohorts,
+            [] as [zinder_proto::v1::explorer::MigrationCohort; 0]
+        );
         assert_eq!(stats.cohorts, 0);
         assert_eq!(stats.avg_members, 0);
         assert_eq!(stats.min_members, 0);

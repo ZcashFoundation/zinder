@@ -30,10 +30,10 @@
 #       --build-arg ZINDER_BINARIES_SOURCE=zinder-archived-binaries \
 #       --build-context zinder-archived-binaries=DIR .
 
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.100.0
 ARG DEBIAN_RELEASE=bookworm
-ARG RUST_IMAGE_DIGEST=sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
-ARG DEBIAN_IMAGE_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG RUST_IMAGE_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+ARG DEBIAN_IMAGE_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG DISTROLESS_IMAGE_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG ZINDER_BINARIES_SOURCE=zinder-binaries
 
@@ -57,7 +57,7 @@ WORKDIR /workspace
 # `COPY . .`, every source-change rebuild can pay for component synchronization.
 COPY rust-toolchain.toml ./
 RUN rustup show active-toolchain >/dev/null
-RUN cargo install cargo-auditable --version 0.7.4 --locked
+RUN cargo install cargo-auditable --version 0.7.7 --locked
 
 FROM zinder-build-base AS zinder-release-source
 

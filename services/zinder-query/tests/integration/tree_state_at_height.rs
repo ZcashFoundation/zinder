@@ -378,8 +378,7 @@ fn delete_tree_state_checkpoint(
 fn reason(status: &tonic::Status) -> String {
     status
         .get_details_error_info()
-        .map(|error_info| error_info.reason)
-        .unwrap_or_default()
+        .map_or_default(|error_info| error_info.reason)
 }
 
 /// Node double that admits discovery only and fails every call.

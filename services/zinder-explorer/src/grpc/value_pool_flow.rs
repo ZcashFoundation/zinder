@@ -1715,7 +1715,7 @@ mod tests {
         .err()
         .ok_or("summary scan unexpectedly succeeded")?;
         assert_eq!(summary_error.code(), Code::Internal);
-        assert!(
+        assert_eq!(
             read_amount_threshold_summary_blocking(
                 &unconfigured_store,
                 1,
@@ -1723,8 +1723,8 @@ mod tests {
                 PoolFilter(0),
                 Vec::new(),
             )
-            .await?
-            .is_empty()
+            .await?,
+            [] as [zinder_proto::v1::explorer::ValuePoolFlowAmountThresholdSummaryRow; 0]
         );
         let threshold_error = read_amount_threshold_summary_blocking(
             &unconfigured_store,

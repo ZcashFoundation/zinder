@@ -262,7 +262,7 @@ fn validate_sampled_block_families(
     assert_eq!(persisted_height, height_key);
 
     let compact_bytes = read_uncached(database, COMPACT_BLOCK_COLUMN_FAMILY, &height_key)?;
-    assert!(!compact_bytes.is_empty());
+    assert_ne!(compact_bytes, [] as [u8; 0]);
 
     let last_transaction_index = facts.transactions.len().saturating_sub(1);
     for transaction_index in [0, last_transaction_index] {

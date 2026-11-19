@@ -392,7 +392,10 @@ mod tests {
             })
             .await?
             .into_inner();
-        assert!(snapshot.entries.is_empty());
+        assert_eq!(
+            snapshot.entries,
+            [] as [zinder_proto::v1::wallet::MempoolEntry; 0]
+        );
         assert!(snapshot.chain_view.is_some());
         assert_eq!(
             snapshot.source_tip,

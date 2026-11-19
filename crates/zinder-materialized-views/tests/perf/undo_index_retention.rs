@@ -346,7 +346,7 @@ impl FixtureRandom {
 
     fn bytes32(&mut self) -> [u8; 32] {
         let mut bytes = [0; 32];
-        for chunk in bytes.chunks_exact_mut(8) {
+        for chunk in bytes.as_chunks_mut::<8>().0 {
             chunk.copy_from_slice(&self.next().to_be_bytes());
         }
         bytes

@@ -44,7 +44,7 @@ jobs:
     outputs:
       release_images: ${{ steps.images.outputs.release_images }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify deployment admission
         run: bash scripts/test-deployment-admission.sh
@@ -75,10 +75,10 @@ jobs:
       RELEASE_IMAGES_JSON: ${{ needs.verify.outputs.release_images }}
       SMOKE_BUILD_GIT_COMMIT: 0123456789abcdef0123456789abcdef01234567
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build and smoke test images
         run: |

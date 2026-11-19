@@ -324,8 +324,7 @@ pub fn mempool_entry_message(entry: &MempoolEntry) -> wallet::MempoolEntry {
         transaction_id: encode_rpc_transaction_id_hex(entry.transaction_id()),
         auth_digest: entry
             .auth_digest()
-            .map(encode_rpc_auth_digest_hex)
-            .unwrap_or_default(),
+            .map_or_default(encode_rpc_auth_digest_hex),
         raw_transaction_bytes: entry.raw_transaction_bytes().as_slice().to_vec(),
         compact_transaction_data: Some(compact_transaction_data_message(
             entry.compact_transaction_data(),

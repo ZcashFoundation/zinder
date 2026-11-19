@@ -4,6 +4,7 @@
 /// `common` carries the cross-service identity, capability set, and
 /// deprecation metadata defined in \[`zinder.v1.ops.ServerInfo`\]. The
 /// remaining fields describe the Explorer view plane.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExplorerServerInfo {
     /// Cross-service identity and capability descriptor.
@@ -29,6 +30,7 @@ pub struct ExplorerServerInfo {
     >,
 }
 /// Server descriptor request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoRequest {}
 /// Server descriptor response.
@@ -41,6 +43,7 @@ pub struct ServerInfoRequest {}
 /// be reachable through materialized-view-backed endpoints that are capability-gated and
 /// unavailable during `bulk_catchup`, leaving sync-progress UIs unable to
 /// compute an honest denominator at exactly the moment they most need it.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerInfoResponse {
     #[prost(message, optional, tag = "1")]
@@ -55,6 +58,7 @@ pub struct ServerInfoResponse {
 /// string comes from the canonical registry in
 /// `crates/zinder-core/src/explorer_reasons.rs`; the contract is defined in
 /// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnavailableField {
     /// Dotted path matching the response field hierarchy, e.g.
@@ -77,6 +81,7 @@ pub struct UnavailableField {
 /// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md);
 /// every `ExplorerQuery` RPC's response carries this field tag 1 first so
 /// consumers can read `response.freshness` unconditionally.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExplorerFreshness {
     /// Cross-plane chain-state envelope the response was produced from.
@@ -95,6 +100,7 @@ pub struct ExplorerFreshness {
     pub unavailable: ::prost::alloc::vec::Vec<UnavailableField>,
 }
 /// Transaction-format identifier carried on the explorer wire.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionVersion {
     #[prost(enumeration = "TransactionVersionKind", tag = "1")]
@@ -109,6 +115,7 @@ pub struct TransactionVersion {
 /// Mirrors `zinder_core::LockTime`: explicit `unlocked` marker, height-based
 /// lock time, or Unix-seconds lock time. The oneof is closed; clients
 /// switch on the present arm.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LockTime {
     #[prost(oneof = "lock_time::Kind", tags = "1, 2, 3")]
@@ -116,6 +123,7 @@ pub struct LockTime {
 }
 /// Nested message and enum types in `LockTime`.
 pub mod lock_time {
+    #[allow(clippy::all)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
@@ -127,9 +135,11 @@ pub mod lock_time {
     }
 }
 /// Discrete marker for the "no lock-time constraint" case.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LockTimeUnlocked {}
 /// Component counts feeding the privacy classifier and the wire surface.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionComponentCounts {
     #[prost(uint32, tag = "1")]
@@ -153,6 +163,7 @@ pub struct TransactionComponentCounts {
 /// Parsed once by `zinder_source::parse_transaction_public_facts` from raw
 /// transaction bytes plus the node-discovered network upgrade table per
 /// [ADR-0018](../../../../../docs/adrs/0018-transaction-facts-status-and-broadcast.md).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionPublicFacts {
     /// Canonical Zcash transaction identifier in RPC byte order (64 lowercase
@@ -207,6 +218,7 @@ pub struct TransactionPublicFacts {
 /// This record deliberately excludes the prevout script: fee materialized-view rows
 /// need only the value, while `TransactionDetail` resolves the complete prevout
 /// from retained canonical parent facts at request time.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentInputValueRecord {
     #[prost(uint32, tag = "1")]
@@ -222,6 +234,7 @@ pub struct TransparentInputValueRecord {
 /// after the parent script is unavailable. Absence must not be interpreted as a
 /// zero value or an empty script. Shielded spends are not represented because
 /// their values and receivers are encrypted by protocol.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentInput {
     #[prost(uint32, tag = "1")]
@@ -242,6 +255,7 @@ pub struct TransparentInput {
 /// lists `transparent_outputs.spent_by`, in which case spent state is unknown.
 /// Mempool spends remain a separate wallet-plane relation and do not change
 /// this field.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutput {
     #[prost(uint32, tag = "1")]
@@ -255,6 +269,7 @@ pub struct TransparentOutput {
 ///
 /// `at_epoch_id` optionally pins the read to a specific chain epoch so the
 /// response stays consistent with a concurrent caller's other reads.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionDetailRequest {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -306,6 +321,7 @@ pub struct TransactionDetailRequest {
 /// `intrinsic_value_balances` is populated only for mined transactions when
 /// the canonical artifact or retained transaction blob is available at the
 /// response's pinned chain epoch. Absence is distinct from an all-zero balance.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionDetailResponse {
     #[prost(message, optional, tag = "1")]
@@ -333,6 +349,7 @@ pub struct TransactionDetailResponse {
 /// `ExplorerQuery.BlockSummariesInRange` (materialized view) and
 /// `ExplorerQuery.BlockDetail` (full record). See
 /// [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockSummary {
     /// Canonical block height.
@@ -406,6 +423,7 @@ pub struct BlockSummary {
 /// `ExplorerQuery.BlockDetail` (emitting `summary` plus `transaction_ids`).
 /// One record per canonical block, keyed by big-endian block height inside
 /// the consumer's `block_summary` column family.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockSummaryRecord {
     #[prost(message, optional, tag = "1")]
@@ -431,6 +449,7 @@ pub struct BlockSummaryRecord {
 ///
 /// Returns one `BlockSummary` per canonical block in
 /// `\[start_height, end_height\]` inclusive, ordered by ascending height.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockSummariesInRangeRequest {
     /// First block height to return (inclusive).
@@ -444,6 +463,7 @@ pub struct BlockSummariesInRangeRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// `ExplorerQuery.BlockSummariesInRange` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockSummariesInRangeResponse {
     #[prost(message, optional, tag = "1")]
@@ -458,6 +478,7 @@ pub struct BlockSummariesInRangeResponse {
 /// difficulty target from the canonical block header. Consumers can derive
 /// difficulty, inter-block intervals, and rolling production rates without
 /// requiring a second per-height header lookup.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockProductionPoint {
     #[prost(message, optional, tag = "1")]
@@ -475,6 +496,7 @@ pub struct BlockProductionPoint {
     pub coinbase: ::core::option::Option<CoinbaseTransactionSummary>,
 }
 /// Public facts for the canonical coinbase transaction of one production point.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoinbaseTransactionSummary {
     /// Canonical transaction id in RPC byte order.
@@ -495,6 +517,7 @@ pub struct CoinbaseTransactionSummary {
 /// The range is bounded server-side. `at_epoch_id` optionally pins canonical
 /// header visibility to one chain epoch; materialized-view rows are joined only when their
 /// block hash and time agree with that canonical header.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockProductionSeriesRequest {
     #[prost(uint32, tag = "1")]
@@ -511,6 +534,7 @@ pub struct BlockProductionSeriesRequest {
 /// and agreed. `missing_block_count` makes partial local retention, view lag,
 /// and concurrent reorg mismatches explicit instead of emitting fabricated
 /// zero-valued observations.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockProductionSeriesResponse {
     #[prost(message, optional, tag = "1")]
@@ -534,6 +558,7 @@ pub struct BlockProductionSeriesResponse {
 /// non-monotonic timestamps remain deterministic. The cursor binds the time
 /// bounds, resolved chain epoch, and materialized-view revision so every page
 /// reads one canonical/materialized-view fence.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockProductionInTimeRangeRequest {
     /// Inclusive Unix timestamp lower bound.
@@ -564,6 +589,7 @@ pub struct BlockProductionInTimeRangeRequest {
 /// canonical header and block-summary row and yields one point. A missing
 /// candidate has incomplete or mismatched production facts and yields no
 /// fabricated point. Their sum is the number of candidates scanned.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockProductionInTimeRangeResponse {
     #[prost(message, optional, tag = "1")]
@@ -586,6 +612,7 @@ pub struct BlockProductionInTimeRangeResponse {
     pub read_fence: ::core::option::Option<BlockProductionTimeRangeReadFence>,
 }
 /// Durable and request-specific coverage for a production-time query.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockProductionTimeRangeCoverage {
     #[prost(uint32, optional, tag = "1")]
@@ -600,6 +627,7 @@ pub struct BlockProductionTimeRangeCoverage {
     pub requested_range_complete: bool,
 }
 /// Materialized-view identity bound into every continuation cursor.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockProductionTimeRangeReadFence {
     #[prost(uint64, tag = "1")]
@@ -615,6 +643,7 @@ pub struct BlockProductionTimeRangeReadFence {
 /// height range `\[start_height, end_height\]`. The range is bounded server-side;
 /// consumers that need longer-lived history must request an explicit durable
 /// materialized view rather than treating this request-time aggregate as unbounded.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockActivityDistributionRequest {
     #[prost(uint32, tag = "1")]
@@ -628,6 +657,7 @@ pub struct BlockActivityDistributionRequest {
 /// Monday is one, through Saturday at six. Rows are ordered by weekday then
 /// hour and include zero-valued buckets so consumers never need to synthesize a
 /// missing grid cell.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockActivityBucket {
     #[prost(uint32, tag = "1")]
@@ -645,6 +675,7 @@ pub struct BlockActivityBucket {
 /// of materialized rows read. A nonzero `missing_block_count` means the materialized view
 /// store does not cover the entire requested range, so a caller must present
 /// the returned window as partial rather than a complete history.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockActivityDistributionResponse {
     #[prost(message, optional, tag = "1")]
@@ -672,6 +703,7 @@ pub struct BlockActivityDistributionResponse {
 /// lookups consult the upstream wallet plane's
 /// `WalletQuery.BlockIdBySelector` indirection so the materialized-view store keeps a
 /// single height-keyed schema.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockDetailRequest {
     /// Optional chain-epoch id pin for snapshot consistency with concurrent reads.
@@ -682,6 +714,7 @@ pub struct BlockDetailRequest {
 }
 /// Nested message and enum types in `BlockDetailRequest`.
 pub mod block_detail_request {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Selector {
         #[prost(uint32, tag = "1")]
@@ -699,6 +732,7 @@ pub mod block_detail_request {
 /// `ExplorerQuery.TransactionDetail` with each id; the v1 surface keeps
 /// per-transaction data out of the block-detail wire shape to avoid the
 /// fan-out cost of parsing every transaction at request time.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockDetailResponse {
     #[prost(message, optional, tag = "1")]
@@ -719,6 +753,7 @@ pub struct BlockDetailResponse {
 /// absent message is unavailable data, never an all-zero transaction. The
 /// transparent outputs are in ascending output-index order. Shielded output
 /// values are encrypted and are intentionally not represented here.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockTransaction {
     /// Zero-based position in canonical block order. The leading row is the
@@ -751,6 +786,7 @@ pub struct BlockTransaction {
 /// transaction-fact artifacts. This is deliberately separate from
 /// `BlockDetail`: callers needing only ids avoid output-script payloads, while
 /// explorer pages avoid one `TransactionDetail` RPC per row.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockTransactionsResponse {
     #[prost(message, optional, tag = "1")]
@@ -773,6 +809,7 @@ pub struct BlockTransactionsResponse {
 /// Bytes retain the same order Zebra emits through
 /// `z_gettreestate.*.commitments.finalRoot`; hex-encoding them produces the
 /// root string used by `CommitmentRootSearch` and explorer UIs.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockFinalNoteCommitmentRoots {
     #[prost(bytes = "vec", optional, tag = "1")]
@@ -790,6 +827,7 @@ pub struct BlockFinalNoteCommitmentRoots {
 /// `canonical_form` echoes the classified input when echoing is safe
 /// (e.g. a Sapling-encoded shielded address); it is omitted for viewing
 /// keys, where echoing would be a privacy regression.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NotPubliclyIndexable {
     #[prost(enumeration = "NotPubliclyIndexableReason", tag = "1")]
@@ -801,6 +839,7 @@ pub struct NotPubliclyIndexable {
 }
 /// Block candidate produced when the input parses as a height or a
 /// 32-byte block hash that the upstream wallet confirms.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockMatch {
     /// Canonical block height of the resolved block.
@@ -816,6 +855,7 @@ pub struct BlockMatch {
 ///
 /// Mined transactions carry block-context fields; mempool transactions
 /// populate only the transaction id.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionMatch {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -839,6 +879,7 @@ pub struct TransactionMatch {
 /// The classifier verifies that the input parses as a valid Zcash
 /// transparent address on the configured network; existence of on-chain
 /// history is not asserted.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressMatch {
     /// Canonical base58check form of the address.
@@ -858,6 +899,7 @@ pub struct TransparentAddressMatch {
 /// both the canonical `tex1.../textest1...` form and the equivalent
 /// `t1.../tm...` P2PKH form so the UI can link directly to the
 /// transparent-address page.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TexAddressMatch {
     /// Canonical Bech32m `tex1.../textest1...` form.
@@ -884,6 +926,7 @@ pub struct TexAddressMatch {
 /// receiver as its own routing hint; transparent receivers carry a
 /// `TransparentAddressMatch`, while shielded receivers carry the typed
 /// `NotPubliclyIndexable` refusal.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnifiedAddressMatch {
     /// Original Bech32m encoding of the input.
@@ -900,6 +943,7 @@ pub struct UnifiedAddressMatch {
     pub receivers: ::prost::alloc::vec::Vec<UnifiedAddressReceiver>,
 }
 /// Per-receiver routing inside a unified address.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnifiedAddressReceiver {
     #[prost(enumeration = "UnifiedAddressReceiverKind", tag = "1")]
@@ -909,6 +953,7 @@ pub struct UnifiedAddressReceiver {
 }
 /// Nested message and enum types in `UnifiedAddressReceiver`.
 pub mod unified_address_receiver {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         #[prost(message, tag = "2")]
@@ -919,6 +964,7 @@ pub mod unified_address_receiver {
 }
 /// Shielded-address candidate. The classifier always routes this arm
 /// through `NotPubliclyIndexable`; no storage call is ever issued.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShieldedAddressMatch {
     #[prost(message, optional, tag = "1")]
@@ -927,12 +973,14 @@ pub struct ShieldedAddressMatch {
 /// Viewing-key candidate. The classifier never echoes the key bytes,
 /// because doing so on the response surface would itself be a privacy
 /// regression even when the server never persists the key.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ViewingKeyMatch {
     #[prost(message, optional, tag = "1")]
     pub not_publicly_indexable: ::core::option::Option<NotPubliclyIndexable>,
 }
 /// Catch-all candidate when no other arm classifies the input.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnclassifiedMatch {
     /// Operator-readable hint explaining what the classifier expected.
@@ -940,6 +988,7 @@ pub struct UnclassifiedMatch {
     pub hint: ::prost::alloc::string::String,
 }
 /// One classified search candidate. Exactly one `match` arm is populated.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchCandidate {
     /// Heuristic confidence in `\[0.0, 1.0\]`. `1.0` means the classifier is
@@ -954,6 +1003,7 @@ pub struct SearchCandidate {
 }
 /// Nested message and enum types in `SearchCandidate`.
 pub mod search_candidate {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Match {
         #[prost(message, tag = "1")]
@@ -975,6 +1025,7 @@ pub mod search_candidate {
     }
 }
 /// `ExplorerQuery.Search` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SearchRequest {
     /// Raw user input. Capped at 4 KiB on the server side; longer payloads
@@ -984,6 +1035,7 @@ pub struct SearchRequest {
 }
 /// `ExplorerQuery.Search` response. One request produces zero or more
 /// typed candidates; the UI renders the highest-confidence arm first.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchResponse {
     #[prost(message, optional, tag = "1")]
@@ -996,6 +1048,7 @@ pub struct SearchResponse {
 /// Searches final, post-block note-commitment-tree roots. It intentionally does
 /// not search transaction-intermediate anchors or completed 2^16-leaf subtree
 /// roots: those are different protocol facts.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommitmentRootSearchRequest {
     /// Final note-commitment-tree root bytes. Exactly 32 bytes, in the same byte
@@ -1009,6 +1062,7 @@ pub struct CommitmentRootSearchRequest {
     pub max_matches: u32,
 }
 /// One canonical block whose final root matches the requested bytes.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommitmentRootMatch {
     #[prost(uint32, tag = "1")]
@@ -1026,6 +1080,7 @@ pub struct CommitmentRootMatch {
 /// The materialized view can serve tip-adjacent blocks while a preceding range
 /// is still backfilling. Consumers must not interpret an empty `matches` list as a
 /// definitive absence unless `canonical_history_complete` is true.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommitmentRootSearchCoverage {
     /// First height in the contiguous historical backfill range. Absent until the
@@ -1053,6 +1108,7 @@ pub struct CommitmentRootSearchCoverage {
 /// `displaced_matches` list as a definitive absence before activation, or when
 /// `root_artifact_unavailable_count` is nonzero. Even a definitive negative is
 /// limited to the captured range, never all historical displaced blocks.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommitmentRootSearchDisplacedCoverage {
     /// First event covered by displaced-root capture. Absent before activation,
@@ -1079,6 +1135,7 @@ pub struct CommitmentRootSearchDisplacedCoverage {
     pub captured_range_complete: bool,
 }
 /// `ExplorerQuery.CommitmentRootSearch` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommitmentRootSearchResponse {
     #[prost(message, optional, tag = "1")]
@@ -1099,6 +1156,7 @@ pub struct CommitmentRootSearchResponse {
     >,
 }
 /// Per-shape count carried by \[`MempoolSummaryResponse`\].
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrivacyShapeCount {
     #[prost(enumeration = "PrivacyShape", tag = "1")]
@@ -1107,6 +1165,7 @@ pub struct PrivacyShapeCount {
     pub count: u32,
 }
 /// Per-version count carried by \[`MempoolSummaryResponse`\].
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionVersionCount {
     #[prost(enumeration = "TransactionVersionKind", tag = "1")]
@@ -1118,6 +1177,7 @@ pub struct TransactionVersionCount {
 ///
 /// Optionally pins the read to a specific chain epoch so the response
 /// stays consistent with concurrent reads.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolSummaryRequest {
     #[prost(uint64, optional, tag = "1")]
@@ -1130,6 +1190,7 @@ pub struct MempoolSummaryRequest {
 /// distribution, and freshness extremes. The handler parses every entry
 /// via `zinder_source::parse_transaction_public_facts` so the shape and
 /// version classifiers stay in lockstep with `TransactionDetail`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -1162,6 +1223,7 @@ pub struct MempoolSummaryResponse {
 /// The fields deliberately mirror `MempoolSummaryResponse` without its
 /// response-level freshness envelope so a paged snapshot can return its global
 /// totals and rows from one source read.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolSnapshotSummary {
     #[prost(uint32, tag = "1")]
@@ -1182,6 +1244,7 @@ pub struct MempoolSnapshotSummary {
 /// Selects one bounded page from the same current mempool observation used for
 /// the returned summary. The cursor is opaque and has the same transient
 /// semantics as `MempoolActivityRequest`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolSnapshotRequest {
     #[prost(uint32, tag = "1")]
@@ -1194,6 +1257,7 @@ pub struct MempoolSnapshotRequest {
 /// `summary`, `entries`, and `next_cursor` are all derived from one
 /// `WalletQuery.MempoolSnapshot` response. This avoids combining global totals
 /// with a page that may have been read after a transaction was mined or added.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolSnapshotResponse {
     #[prost(message, optional, tag = "1")]
@@ -1211,6 +1275,7 @@ pub struct MempoolSnapshotResponse {
 /// time. The cursor is opaque and encodes the prior page's last entry so
 /// subsequent calls resume past it. Mempool state is transient; restarted
 /// pages may return new entries that arrived since the prior call.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolActivityRequest {
     #[prost(uint32, tag = "1")]
@@ -1219,6 +1284,7 @@ pub struct MempoolActivityRequest {
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// One mempool entry projected into the explorer wire shape.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolActivityEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1264,6 +1330,7 @@ pub struct MempoolActivityEntry {
     pub transparent_output_total_zat: u64,
 }
 /// `ExplorerQuery.MempoolActivity` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolActivityResponse {
     #[prost(message, optional, tag = "1")]
@@ -1280,6 +1347,7 @@ pub struct MempoolActivityResponse {
 /// carry no outputs or scripts. Pending activity for an address comes from
 /// filtering `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
 /// `transparent_outputs` and `transparent_spends`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRequest {
     /// Selector for the transparent address being queried.
@@ -1321,6 +1389,7 @@ pub struct TransparentAddressActivityRequest {
 /// negative when it spent from the address. Absent when prevout
 /// resolution did not produce a complete picture; the
 /// `prevout_resolution_status` field disambiguates why.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1394,6 +1463,7 @@ pub struct TransparentAddressActivityEntry {
 /// Lifetime fields are absent for a valid address with no retained history.
 /// `script_pub_key` is absent when the request supplied only a script hash and
 /// neither snapshot nor tail facts retained the corresponding raw script.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressSummary {
     #[prost(bytes = "vec", optional, tag = "1")]
@@ -1412,6 +1482,7 @@ pub struct TransparentAddressSummary {
     pub last_seen_unix_seconds: ::core::option::Option<i64>,
 }
 /// `ExplorerQuery.TransparentAddressActivity` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentAddressActivityResponse {
     #[prost(message, optional, tag = "1")]
@@ -1435,6 +1506,7 @@ pub struct TransparentAddressActivityResponse {
 /// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
 /// `transparent_outputs` and `transparent_spends`; ExplorerQuery has no
 /// per-address mempool read.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRequest {
     /// Selector for the transparent address being queried.
@@ -1472,6 +1544,7 @@ pub struct TransparentAddressDeltasRequest {
 /// events use `spent_value_zat` recorded on the canonical spend fact, so they
 /// need no prevout re-resolution at read time. A spend whose prevout cannot
 /// be resolved produces no event rather than a wrong number.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1496,6 +1569,7 @@ pub struct TransparentAddressDeltasEntry {
     pub kind: i32,
 }
 /// `ExplorerQuery.TransparentAddressDeltas` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentAddressDeltasResponse {
     #[prost(message, optional, tag = "1")]
@@ -1516,6 +1590,7 @@ pub struct TransparentAddressDeltasResponse {
 /// A row carries its transaction id in exactly one of `transaction_id` and
 /// `internal_transaction_id`. Rows written before `internal_transaction_id`
 /// existed set `transaction_id`; newer rows set `internal_transaction_id`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRecord {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1537,6 +1612,7 @@ pub struct TransparentAddressDeltasRecord {
 /// Aggregates per-transaction ZIP-317 conventional fee floors over the
 /// inclusive block range `\[start_height, end_height\]` from the typed
 /// `BlockSummaryRecord` facts materialized by the materialized-view plane.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FeeSummaryRequest {
     #[prost(uint32, tag = "1")]
@@ -1550,6 +1626,7 @@ pub struct FeeSummaryRequest {
 /// fees. Computing actual fees requires prevout resolution and is
 /// intentionally out of scope for `v1`; the conventional-fee floor is the
 /// minimum a wallet should attach to a transaction with the given shape.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FeeSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -1580,6 +1657,7 @@ pub struct FeeSummaryResponse {
 /// materializes. Both bounds absent aggregates the full indexed history;
 /// present bounds restrict the aggregate to the inclusive block range
 /// `\[start_height, end_height\]`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MigrationOverviewRequest {
     /// First block height to aggregate (inclusive). Absent starts from genesis.
@@ -1596,6 +1674,7 @@ pub struct MigrationOverviewRequest {
 /// and `ironwood_inflow_zat` are the two-sided pool audit: they sum the two
 /// value balances independently and should closely track each other net of
 /// fees, which is what makes a divergence detectable.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MigrationOverviewResponse {
     #[prost(message, optional, tag = "1")]
@@ -1629,6 +1708,7 @@ pub struct MigrationOverviewResponse {
 ///
 /// Groups migrations in the inclusive block range `\[start_height, end_height\]`
 /// by shared Orchard anchor.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MigrationCohortsRequest {
     /// First block height to group (inclusive).
@@ -1650,6 +1730,7 @@ pub struct MigrationCohortsRequest {
 /// cohort is a larger anonymity set. `conformant_member_count` narrows the
 /// count to members whose migration shape is genuinely privacy-preserving, so a
 /// client can show how much of a cohort is real cover.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MigrationCohort {
     /// The shared Orchard anchor: 32 raw bytes in canonical wire order (the
@@ -1668,6 +1749,7 @@ pub struct MigrationCohort {
     pub conformant_member_count: u32,
 }
 /// `ExplorerQuery.MigrationCohorts` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MigrationCohortsResponse {
     #[prost(message, optional, tag = "1")]
@@ -1692,6 +1774,7 @@ pub struct MigrationCohortsResponse {
 /// `ExplorerQuery.MigrationDenominations` request.
 ///
 /// Bins conformant migrations in the inclusive block range `\[start_height,  end_height\]` by the power-of-ten magnitude of their Ironwood output amount.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MigrationDenominationsRequest {
     /// First block height to bin (inclusive).
@@ -1708,6 +1791,7 @@ pub struct MigrationDenominationsRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// One power-of-ten denomination bucket.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MigrationDenominationBin {
     /// The bucket's representative amount: the power-of-ten floor of its members'
@@ -1719,6 +1803,7 @@ pub struct MigrationDenominationBin {
     pub count: u32,
 }
 /// `ExplorerQuery.MigrationDenominations` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MigrationDenominationsResponse {
     #[prost(message, optional, tag = "1")]
@@ -1736,6 +1821,7 @@ pub struct MigrationDenominationsResponse {
 /// Selects the half-open block-time range
 /// `[start_time_unix_seconds, end_time_unix_seconds)`. Boundary UTC days are
 /// clipped to transactions in the requested range.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ConventionalFeeDistributionRequest {
     #[prost(int64, tag = "1")]
@@ -1746,6 +1832,7 @@ pub struct ConventionalFeeDistributionRequest {
 /// One exact ZIP-317 conventional-fee frequency.
 ///
 /// This is the ZIP-317 conventional fee, not the miner-collected fee.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ConventionalFeeFrequency {
     #[prost(uint64, tag = "1")]
@@ -1755,6 +1842,7 @@ pub struct ConventionalFeeFrequency {
 }
 /// Exact conventional-fee frequencies for one UTC day, clipped to the
 /// request's half-open time range.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConventionalFeeDistributionDay {
     /// UTC midnight as Unix seconds.
@@ -1768,6 +1856,7 @@ pub struct ConventionalFeeDistributionDay {
     pub unavailable_transaction_count: u64,
 }
 /// Contiguous materialized-view coverage for a conventional-fee distribution query.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ConventionalFeeDistributionCoverage {
     #[prost(uint32, optional, tag = "1")]
@@ -1785,6 +1874,7 @@ pub struct ConventionalFeeDistributionCoverage {
     pub requested_range_complete: bool,
 }
 /// `ExplorerQuery.ConventionalFeeDistribution` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConventionalFeeDistributionResponse {
     #[prost(message, optional, tag = "1")]
@@ -1799,6 +1889,7 @@ pub struct ConventionalFeeDistributionResponse {
 /// Selects the half-open block-time range
 /// `[start_time_unix_seconds, end_time_unix_seconds)`. Boundary UTC days are
 /// clipped to transactions in the requested range.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PaidFeeDistributionRequest {
     #[prost(int64, tag = "1")]
@@ -1808,6 +1899,7 @@ pub struct PaidFeeDistributionRequest {
 }
 /// One exact positive miner-collected fee frequency. Proven zero-fee
 /// transactions are omitted and are not counted as unavailable.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PaidFeeFrequency {
     #[prost(uint64, tag = "1")]
@@ -1817,6 +1909,7 @@ pub struct PaidFeeFrequency {
 }
 /// Exact paid-fee frequencies for one UTC day, clipped to the request's
 /// half-open time range.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PaidFeeDistributionDay {
     /// UTC midnight as Unix seconds.
@@ -1830,6 +1923,7 @@ pub struct PaidFeeDistributionDay {
     pub unavailable_transaction_count: u64,
 }
 /// Contiguous materialized-view coverage for a paid-fee distribution query.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PaidFeeDistributionCoverage {
     #[prost(uint32, optional, tag = "1")]
@@ -1845,6 +1939,7 @@ pub struct PaidFeeDistributionCoverage {
     pub requested_range_complete: bool,
 }
 /// `ExplorerQuery.PaidFeeDistribution` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PaidFeeDistributionResponse {
     #[prost(message, optional, tag = "1")]
@@ -1859,6 +1954,7 @@ pub struct PaidFeeDistributionResponse {
 /// Component counters and transaction predicates are public protocol facts.
 /// Predicate counters name their exact protocol scope so callers do not infer
 /// behavior for future pools.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionComponentTotals {
     #[prost(uint64, tag = "1")]
@@ -1921,6 +2017,7 @@ pub struct TransactionComponentTotals {
     pub transaction_predicate_unavailable_count: u64,
 }
 /// One UTC-day bucket clipped to the request's half-open time range.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionComponentDay {
     /// UTC midnight as Unix seconds.
@@ -1938,6 +2035,7 @@ pub struct TransactionComponentDay {
     >,
 }
 /// Historical range whose transaction-component materialized view is contiguous.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionComponentCoverage {
     #[prost(uint32, tag = "1")]
@@ -1955,6 +2053,7 @@ pub struct TransactionComponentCoverage {
 ///
 /// Includes transactions whose canonical block timestamp is in
 /// `[start_time_unix_seconds, end_time_unix_seconds)`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionComponentSummaryRequest {
     #[prost(int64, tag = "1")]
@@ -1967,6 +2066,7 @@ pub struct TransactionComponentSummaryRequest {
     pub totals_only: bool,
 }
 /// `ExplorerQuery.TransactionComponentSummary` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionComponentSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -1983,6 +2083,7 @@ pub struct TransactionComponentSummaryResponse {
 /// Offset is a rank offset in the response's deterministic
 /// `(balance descending, script hash ascending)` order. The server caps limit;
 /// callers must not assume an unbounded page.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressRankingRequest {
     #[prost(uint32, tag = "1")]
@@ -1994,6 +2095,7 @@ pub struct TransparentAddressRankingRequest {
 ///
 /// Address string encoding remains an edge concern because it depends on the
 /// target network. The native surface returns the canonical raw script.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressRankingEntry {
     #[prost(uint64, tag = "1")]
@@ -2014,6 +2116,7 @@ pub struct TransparentAddressRankingEntry {
     pub last_seen_unix_seconds: ::core::option::Option<i64>,
 }
 /// Recovery coverage for transparent-address ranking and lifetime facts.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressRankingCoverage {
     #[prost(uint32, tag = "1")]
@@ -2026,6 +2129,7 @@ pub struct TransparentAddressRankingCoverage {
     pub lifetime_statistics_complete: bool,
 }
 /// Positive-address count and balance for one standard script template.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressScriptTypeSummary {
     #[prost(enumeration = "TransparentScriptType", tag = "1")]
@@ -2036,6 +2140,7 @@ pub struct TransparentAddressScriptTypeSummary {
     pub total_positive_balance_zat: u64,
 }
 /// `ExplorerQuery.TransparentAddressRanking` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentAddressRankingResponse {
     #[prost(message, optional, tag = "1")]
@@ -2058,6 +2163,7 @@ pub struct TransparentAddressRankingResponse {
     >,
 }
 /// `ExplorerQuery.ValuePoolSummary` request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolSummaryRequest {}
 /// `ExplorerQuery.ValuePoolSummary` response.
@@ -2066,6 +2172,7 @@ pub struct ValuePoolSummaryRequest {}
 /// cross-cutting `ExplorerFreshness` envelope at field tag 1. Values are
 /// the cumulative chain totals reported by the upstream node, not
 /// per-block deltas.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2079,6 +2186,7 @@ pub struct ValuePoolSummaryResponse {
     pub source_tip: ::core::option::Option<super::wallet::BlockTip>,
 }
 /// Typed filters applied to a value-pool flow history page.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowFilter {
     /// Empty means either direction.
@@ -2092,6 +2200,7 @@ pub struct ValuePoolFlowFilter {
     pub minimum_amount_zat: u64,
 }
 /// One canonical transaction crossing the transparent/shielded boundary.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowEvent {
     /// Canonical transaction id in RPC byte order (64 lowercase hex characters).
@@ -2119,6 +2228,7 @@ pub struct ValuePoolFlowEvent {
 /// segment begins at `live_tail_from_height` and advances from canonical ingest.
 /// Callers can compare both segments with `freshness.chain_view` before making
 /// a completeness claim for a requested range.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowCoverage {
     /// Boundary timestamps describe the blocks at the historical height bounds;
@@ -2145,6 +2255,7 @@ pub struct ValuePoolFlowCoverage {
     pub requested_range_complete: bool,
 }
 /// `ExplorerQuery.ValuePoolFlowHistory` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowHistoryRequest {
     /// Zero asks for the server default; the server clamps larger values.
@@ -2163,6 +2274,7 @@ pub struct ValuePoolFlowHistoryRequest {
     pub include_total_count: bool,
 }
 /// One bounded, newest-first value-pool flow page.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolFlowHistoryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2184,6 +2296,7 @@ pub struct ValuePoolFlowHistoryResponse {
 }
 /// Bounded query for individual canonical value-pool flow events in one
 /// half-open block-time range.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowEventsInRangeRequest {
     /// Inclusive Unix timestamp lower bound.
@@ -2210,6 +2323,7 @@ pub struct ValuePoolFlowEventsInRangeRequest {
 }
 /// Bounded canonical events plus enough metadata to distinguish an empty
 /// complete range from a truncated or incompletely indexed query.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolFlowEventsInRangeResponse {
     #[prost(message, optional, tag = "1")]
@@ -2226,6 +2340,7 @@ pub struct ValuePoolFlowEventsInRangeResponse {
     pub coverage: ::core::option::Option<ValuePoolFlowCoverage>,
 }
 /// `ExplorerQuery.ValuePoolFlowSummary` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowSummaryRequest {
     /// Inclusive Unix timestamp lower bound.
@@ -2241,6 +2356,7 @@ pub struct ValuePoolFlowSummaryRequest {
     pub resolution: i32,
 }
 /// Exact flow totals for one UTC-aligned bucket.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowSummaryBucket {
     #[prost(int64, tag = "1")]
@@ -2255,6 +2371,7 @@ pub struct ValuePoolFlowSummaryBucket {
     pub deshield_amount_zat: u64,
 }
 /// `ExplorerQuery.ValuePoolFlowSummary` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolFlowSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2265,6 +2382,7 @@ pub struct ValuePoolFlowSummaryResponse {
     pub coverage: ::core::option::Option<ValuePoolFlowCoverage>,
 }
 /// `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowAmountThresholdSummaryRequest {
     /// Inclusive Unix timestamp lower bound.
@@ -2281,6 +2399,7 @@ pub struct ValuePoolFlowAmountThresholdSummaryRequest {
     pub minimum_amounts_zat: ::prost::alloc::vec::Vec<u64>,
 }
 /// Exact value-pool flow totals at one requested minimum amount.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowAmountThresholdSummaryRow {
     #[prost(uint64, tag = "1")]
@@ -2295,6 +2414,7 @@ pub struct ValuePoolFlowAmountThresholdSummaryRow {
     pub deshield_amount_zat: u64,
 }
 /// `ExplorerQuery.ValuePoolFlowAmountThresholdSummary` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolFlowAmountThresholdSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2306,6 +2426,7 @@ pub struct ValuePoolFlowAmountThresholdSummaryResponse {
     pub coverage: ::core::option::Option<ValuePoolFlowCoverage>,
 }
 /// `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowRoundedAmountSummaryRequest {
     /// Inclusive Unix timestamp lower bound.
@@ -2338,6 +2459,7 @@ pub struct ValuePoolFlowRoundedAmountSummaryRequest {
     pub max_rows: u32,
 }
 /// Exact value-pool flow event counts for one rounded raw amount.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolFlowRoundedAmountSummaryRow {
     /// Raw amount rounded according to `rounding_quantum_zat`, with positive
@@ -2350,6 +2472,7 @@ pub struct ValuePoolFlowRoundedAmountSummaryRow {
     pub deshield_event_count: u64,
 }
 /// `ExplorerQuery.ValuePoolFlowRoundedAmountSummary` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolFlowRoundedAmountSummaryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2363,6 +2486,7 @@ pub struct ValuePoolFlowRoundedAmountSummaryResponse {
     pub coverage: ::core::option::Option<ValuePoolFlowCoverage>,
 }
 /// One cumulative balance for a dynamically identified consensus value pool.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolBalance {
     #[prost(string, tag = "1")]
@@ -2374,6 +2498,7 @@ pub struct ValuePoolBalance {
     pub value_zat: ::core::option::Option<u64>,
 }
 /// One canonical highest-height snapshot observed in a UTC calendar day.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolBalanceHistoryPoint {
     #[prost(int64, tag = "1")]
@@ -2389,6 +2514,7 @@ pub struct ValuePoolBalanceHistoryPoint {
     pub pools: ::prost::alloc::vec::Vec<ValuePoolBalance>,
 }
 /// Height-domain coverage for cumulative value-pool history.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolBalanceHistoryCoverage {
     #[prost(uint32, optional, tag = "1")]
@@ -2405,6 +2531,7 @@ pub struct ValuePoolBalanceHistoryCoverage {
     pub complete_through_visible_tip: bool,
 }
 /// `ExplorerQuery.ValuePoolBalanceHistory` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ValuePoolBalanceHistoryRequest {
     /// Zero asks for the server default; the server clamps larger values.
@@ -2415,6 +2542,7 @@ pub struct ValuePoolBalanceHistoryRequest {
     pub cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// One bounded newest-first page of canonical daily balance snapshots.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValuePoolBalanceHistoryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2429,6 +2557,7 @@ pub struct ValuePoolBalanceHistoryResponse {
     pub coverage: ::core::option::Option<ValuePoolBalanceHistoryCoverage>,
 }
 /// `ExplorerQuery.NetworkUpgradeStatus` request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeStatusRequest {}
 /// One network-upgrade activation entry projected for explorer consumers.
@@ -2437,6 +2566,7 @@ pub struct NetworkUpgradeStatusRequest {}
 /// node's `getblockchaininfo.upgrades`, as the wallet query serves it.
 /// `active` is `true` when `activation_height <= tip_height` in the enclosing
 /// response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeEntry {
     /// Upgrade name as reported by the node (for example `"Sapling"`, `"NU5"`,
@@ -2460,6 +2590,7 @@ pub struct NetworkUpgradeEntry {
 /// Carries the writer-admitted upgrade table ordered by ascending activation
 /// height, the canonical tip height the `active` flags are computed against,
 /// and the currently-active upgrade's name and branch id for convenience.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkUpgradeStatusResponse {
     #[prost(message, optional, tag = "1")]
@@ -2491,6 +2622,7 @@ pub struct NetworkUpgradeStatusResponse {
 /// A row carries its transaction id in exactly one of `transaction_id` and
 /// `internal_transaction_id`. Rows written before `internal_transaction_id`
 /// existed set `transaction_id`; newer rows set `internal_transaction_id`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRecord {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -2529,6 +2661,7 @@ pub struct TransparentAddressActivityRecord {
 /// it to populate the per-entry `paid_fee_zat`. One record per non-
 /// coinbase transaction the consumer has indexed; the key is the canonical
 /// 32-byte transaction id.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionFeesRecord {
     /// Paid fee in zatoshis (`sum(transparent_input_value) -  sum(transparent_output_value)`). Set only for fully resolved
@@ -2555,6 +2688,7 @@ pub struct TransactionFeesRecord {
 ///
 /// Streams the newest-first view of canonical transactions materialized
 /// by `RecentTransactionsConsumer`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecentTransactionsRequest {
     /// Hard cap on entries returned across all stream chunks. Server clamps
@@ -2567,6 +2701,7 @@ pub struct RecentTransactionsRequest {
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// One streaming chunk of `RecentTransactions` entries.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecentTransactionsChunk {
     #[prost(message, optional, tag = "1")]
@@ -2581,6 +2716,7 @@ pub struct RecentTransactionsChunk {
 /// Denormalized to keep a recent-transactions panel renderable from one
 /// streaming RPC. `zip317_conventional_fee_zat` is unset for coinbase rows;
 /// `paid_fee_zat` is set only when every transparent prevout was resolved.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecentTransactionEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex characters).
@@ -2611,6 +2747,7 @@ pub struct RecentTransactionEntry {
 }
 /// Read fence for the transaction-history materialized view and the canonical chain
 /// snapshot used to produce a response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryReadFence {
     #[prost(uint64, tag = "1")]
@@ -2623,6 +2760,7 @@ pub struct TransactionHistoryReadFence {
     pub materialized_view_tip_hash: ::prost::alloc::string::String,
 }
 /// Verified contiguous coverage of the transaction-history materialized view.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryCoverage {
     #[prost(uint32, tag = "1")]
@@ -2634,6 +2772,7 @@ pub struct TransactionHistoryCoverage {
 }
 /// Product-neutral filters over retained public transaction facts. Repeated
 /// fields use OR semantics within the field and AND semantics across fields.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryFilter {
     #[prost(bool, optional, tag = "1")]
@@ -2651,6 +2790,7 @@ pub struct TransactionHistoryFilter {
 ///
 /// Native clients should resume with an opaque cursor; compatibility adapters
 /// can map a height/index pair through this shape.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryAnchor {
     #[prost(uint32, tag = "1")]
@@ -2659,6 +2799,7 @@ pub struct TransactionHistoryAnchor {
     pub transaction_index: u32,
 }
 /// `ExplorerQuery.TransactionHistory` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryRequest {
     /// Zero asks for the server default; the server clamps larger values.
@@ -2678,6 +2819,7 @@ pub struct TransactionHistoryRequest {
 }
 /// Nested message and enum types in `TransactionHistoryRequest`.
 pub mod transaction_history_request {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Start {
         #[prost(bytes, tag = "2")]
@@ -2687,6 +2829,7 @@ pub mod transaction_history_request {
     }
 }
 /// One bounded canonical transaction-history page.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionHistoryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2720,6 +2863,7 @@ pub struct TransactionHistoryResponse {
 /// the transaction from the named pool, while negative value leaves the
 /// transaction for that pool. Transparent value is deliberately absent because
 /// it requires resolving previous outputs.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionIntrinsicValueBalances {
     #[prost(sint64, tag = "1")]
@@ -2732,6 +2876,7 @@ pub struct TransactionIntrinsicValueBalances {
     pub ironwood_zat: i64,
 }
 /// One canonical transaction-history row.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -2784,12 +2929,14 @@ pub struct TransactionHistoryEntry {
 /// events from the per-second counter column family
 /// `MempoolEventCountsConsumer` writes. The server clamps `window_seconds`
 /// to `\[60, 3600\]`; passing zero asks for the server default (300).
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolEventCountsRequest {
     #[prost(uint32, tag = "1")]
     pub window_seconds: u32,
 }
 /// `ExplorerQuery.MempoolEventCounts` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolEventCountsResponse {
     #[prost(message, optional, tag = "1")]
@@ -2814,6 +2961,7 @@ pub struct MempoolEventCountsResponse {
 /// materialized-view consumer first runs, then keeps future incidents independently of
 /// chain-event retention. It cannot reconstruct incidents that were pruned
 /// before the materialized view existed.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainReorgHistoryRequest {
     /// Maximum incident rows to return. Zero selects the server default; values
@@ -2826,6 +2974,7 @@ pub struct ChainReorgHistoryRequest {
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// `ExplorerQuery.ChainReorgHistory` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChainReorgHistoryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2839,6 +2988,7 @@ pub struct ChainReorgHistoryResponse {
     pub next_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// One recorded chain reorg incident projected for explorer consumers.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainReorgHistoryEvent {
     /// Monotonic sequence in the chain-event stream.
@@ -2870,6 +3020,7 @@ pub struct ChainReorgHistoryEvent {
 ///
 /// The native contract exposes the raw script instead of an address string so
 /// network-specific encodings and miner branding remain consumer concerns.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisplacedBlockCoinbaseOutput {
     #[prost(uint32, tag = "1")]
@@ -2881,6 +3032,7 @@ pub struct DisplacedBlockCoinbaseOutput {
 }
 /// Product-neutral facts captured when a previously canonical block is
 /// displaced by an accepted replacement branch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisplacedBlockSummary {
     #[prost(uint32, tag = "1")]
@@ -2912,6 +3064,7 @@ pub struct DisplacedBlockSummary {
 /// This deliberately stays narrower than `BlockSummary`: every field is
 /// read directly from the pinned canonical store and no materialized-view-only aggregate
 /// is silently emitted as zero.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisplacedBlockCanonicalCounterpart {
     #[prost(uint32, tag = "1")]
@@ -2933,6 +3086,7 @@ pub struct DisplacedBlockCanonicalCounterpart {
 }
 /// One displaced block and the canonical block currently visible at its former
 /// height, both resolved against the response freshness epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisplacedBlockHistoryEntry {
     #[prost(message, optional, tag = "1")]
@@ -2946,6 +3100,7 @@ pub struct DisplacedBlockHistoryEntry {
 ///
 /// The archive guarantees capture only for replacement events at or after this
 /// activation event. It does not claim historical completeness before then.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisplacedBlockArchiveCoverage {
     #[prost(uint64, tag = "1")]
@@ -2956,6 +3111,7 @@ pub struct DisplacedBlockArchiveCoverage {
     pub activated_at_millis: u64,
 }
 /// `ExplorerQuery.DisplacedBlockHistory` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisplacedBlockHistoryRequest {
     /// Maximum rows to return. Zero selects the server default; values above the
@@ -2968,6 +3124,7 @@ pub struct DisplacedBlockHistoryRequest {
     pub cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// `ExplorerQuery.DisplacedBlockHistory` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisplacedBlockHistoryResponse {
     #[prost(message, optional, tag = "1")]
@@ -2986,6 +3143,7 @@ pub struct DisplacedBlockHistoryResponse {
     pub coverage: ::core::option::Option<DisplacedBlockArchiveCoverage>,
 }
 /// `ExplorerQuery.DisplacedBlockDetail` request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisplacedBlockDetailRequest {
     /// Displaced block hash in RPC byte order.
@@ -2993,6 +3151,7 @@ pub struct DisplacedBlockDetailRequest {
     pub block_hash: ::prost::alloc::string::String,
 }
 /// `ExplorerQuery.DisplacedBlockDetail` response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisplacedBlockDetailResponse {
     #[prost(message, optional, tag = "1")]
@@ -3021,6 +3180,7 @@ pub struct DisplacedBlockDetailResponse {
 /// (reorged out, or rolled off retention) with this typed error attached
 /// to the gRPC status's `details`. Consumers re-issue from the start of
 /// the range or jump to `recommended_resume_height`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CursorExpiredError {
     /// Recommended restart height for a fresh
@@ -3041,6 +3201,7 @@ pub struct CursorExpiredError {
 /// effective values back inside the response (`recent_blocks.len()`,
 /// `recent_transactions.len()`, `mempool_events.window_seconds`,
 /// `fee_summary.block_count`).
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OverviewSnapshotRequest {
     /// Number of `recent_blocks` entries to return, newest-first.
@@ -3073,6 +3234,7 @@ pub struct OverviewSnapshotRequest {
 /// materialized-view field once, in one pass, then assembles the single
 /// freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
 /// `visible_tip` across responses to detect snapshot boundary crosses.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OverviewSnapshotResponse {
     /// Cross-cutting envelope (field tag 1 per ADR-0019). Single freshness
@@ -3128,6 +3290,7 @@ pub struct OverviewSnapshotResponse {
 /// overview surface aggregates privacy shape from `recent_transactions`
 /// instead, and the version distribution is a per-feature concern served
 /// by `ExplorerQuery.MempoolSummary` for callers that need it.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OverviewMempool {
     /// Number of transactions in the snapshot.
@@ -3150,6 +3313,7 @@ pub struct OverviewMempool {
 /// Mirrors `MempoolEventCountsResponse`. The `window_seconds` field is the
 /// effective server-clamped value, not the requested value; consumers can
 /// rely on it for cadence math without echoing the request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OverviewMempoolEvents {
     /// Effective window size after server clamping.
@@ -3170,6 +3334,7 @@ pub struct OverviewMempoolEvents {
 /// Mirrors `FeeSummaryResponse`. The values aggregate ZIP-317
 /// conventional-fee floors across non-coinbase transactions in the last
 /// `block_count` blocks ending at the snapshot's tip.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OverviewFeeSummary {
     /// Effective number of blocks the aggregate was computed over after
@@ -3196,6 +3361,7 @@ pub struct OverviewFeeSummary {
     pub max_zip317_conventional_fee_zat: u64,
 }
 /// Coarse classification of why an explorer field is absent.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum UnavailableReason {
@@ -3255,6 +3421,7 @@ impl UnavailableReason {
 /// [ZIP-225](<https://zips.z.cash/zip-0225>). `version_group_id` carries the
 /// raw `nVersionGroupId` for v3/v4/v5+ transactions. The discrete `kind`
 /// arm lets clients switch on a closed enum without parsing the integer.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TransactionVersionKind {
@@ -3301,6 +3468,7 @@ impl TransactionVersionKind {
 }
 /// Coarse privacy classification computed by
 /// `zinder_core::classify_privacy_shape`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PrivacyShape {
@@ -3354,6 +3522,7 @@ impl PrivacyShape {
 /// has a known prevout value in the hydrated canonical spend facts, `PARTIAL`
 /// when at least one is missing, and `UNAVAILABLE` when the committed block
 /// carried no hydrated spend facts for the transaction.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PrevoutResolutionStatus {
@@ -3392,6 +3561,7 @@ impl PrevoutResolutionStatus {
 /// `value_zat` is positive and `index` is the output index. `SPENT` is a
 /// transparent input consuming one of the address's prior outputs: the
 /// signed `value_zat` is negative and `index` is the input index.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TransparentDeltaKind {
@@ -3422,6 +3592,7 @@ impl TransparentDeltaKind {
     }
 }
 /// Discrete reason classes the explorer refuses public history for.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NotPubliclyIndexableReason {
@@ -3502,6 +3673,7 @@ impl NotPubliclyIndexableReason {
     }
 }
 /// ZIP-316 receiver typecodes the classifier recognizes.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum UnifiedAddressReceiverKind {
@@ -3548,6 +3720,7 @@ impl UnifiedAddressReceiverKind {
     }
 }
 /// Standard transparent script template represented by a ranking aggregate.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TransparentScriptType {
@@ -3578,6 +3751,7 @@ impl TransparentScriptType {
     }
 }
 /// Direction of one net flow between the transparent and shielded value pools.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ValuePoolFlowDirection {
@@ -3610,6 +3784,7 @@ impl ValuePoolFlowDirection {
     }
 }
 /// Shielded-pool attribution for one net value-pool flow event.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ValuePoolFlowPool {
@@ -3650,6 +3825,7 @@ impl ValuePoolFlowPool {
     }
 }
 /// UTC bucket width requested from `ExplorerQuery.ValuePoolFlowSummary`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ValuePoolFlowSummaryResolution {
@@ -3681,6 +3857,7 @@ impl ValuePoolFlowSummaryResolution {
 }
 /// Direction from a transaction-history anchor. Responses remain newest-first
 /// in both directions.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TransactionHistoryDirection {
@@ -3711,6 +3888,7 @@ impl TransactionHistoryDirection {
     }
 }
 /// Scope proven by an optional transaction-history count.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TransactionHistoryCountScope {
@@ -3741,6 +3919,7 @@ impl TransactionHistoryCountScope {
     }
 }
 /// Shielded protocols whose presence can select transaction-history rows.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ShieldedProtocol {

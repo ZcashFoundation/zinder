@@ -613,7 +613,7 @@ mod tests {
             }]
         );
         composed.publish_input(ReadinessInput::IngestControl, ReadinessCause::Ready);
-        assert!(runtime.report().degraded.is_empty());
+        assert_eq!(runtime.report().degraded, []);
         assert_eq!(
             composed.input_cause(ReadinessInput::IngestControl),
             Some(ReadinessCause::Ready)
@@ -623,7 +623,7 @@ mod tests {
         let halted = runtime.report();
         assert!(!halted.is_ready);
         assert_eq!(halted.cause, writer_halt());
-        assert!(halted.degraded.is_empty());
+        assert_eq!(halted.degraded, []);
         Ok(())
     }
 

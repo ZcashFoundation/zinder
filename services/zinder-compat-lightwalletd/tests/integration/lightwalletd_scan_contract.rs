@@ -100,7 +100,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
     );
 
     for compact_block in &received_blocks {
-        assert!(compact_block.header.is_empty());
+        assert_eq!(compact_block.header, [] as [u8; 0]);
         assert_compact_block_carries_indexed_transactions(compact_block, &mut client).await?;
         assert_compact_block_carries_chain_metadata(compact_block)?;
     }
@@ -229,7 +229,7 @@ fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> eyre::Result<Compact
 
 fn lightwalletd_scan_txid_bytes(height_value: u32) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
-    for chunk in bytes.chunks_exact_mut(4) {
+    for chunk in bytes.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&height_value.to_be_bytes());
     }
     bytes

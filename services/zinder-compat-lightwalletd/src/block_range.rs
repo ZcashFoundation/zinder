@@ -352,7 +352,7 @@ impl QueuedRequest {
     /// requests already wait.
     fn enter(waiters: &Arc<AtomicUsize>, max_waiters: usize, started_at: Instant) -> Option<Self> {
         waiters
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
                 (waiting < max_waiters).then(|| waiting + 1)
             })
             .ok()?;
@@ -487,7 +487,6 @@ impl BlockRangeStreamSlot {
 
     /// Returns a response that sends `messages` and holds this slot until it
     /// is dropped.
-    #[must_use]
     pub fn hold_for<Message: Send + 'static>(
         self,
         messages: Vec<Message>,
@@ -501,7 +500,6 @@ impl BlockRangeStreamSlot {
     ///
     /// The response and the reader's sink each hold this slot, so the reader
     /// keeps the slot while it reads, even after the client has gone away.
-    #[must_use]
     pub fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,

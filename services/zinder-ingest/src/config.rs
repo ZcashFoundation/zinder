@@ -1120,8 +1120,7 @@ mod tests {
         ] {
             let error = resolve_tree_state_densification(section)
                 .err()
-                .map(|error| error.to_string())
-                .unwrap_or_default();
+                .map_or_default(|error| error.to_string());
             assert!(error.contains(field), "{field}: {error}");
         }
     }

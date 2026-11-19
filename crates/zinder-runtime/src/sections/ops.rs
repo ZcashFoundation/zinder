@@ -50,7 +50,7 @@ impl OpsToml {
     #[must_use]
     pub fn from_resolved(listen_addr: Option<SocketAddr>) -> Self {
         Self {
-            listen_addr: listen_addr.map(|addr| addr.to_string()).unwrap_or_default(),
+            listen_addr: listen_addr.map_or_default(|addr| addr.to_string()),
         }
     }
 }
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn ops_toml_renders_empty_when_disabled() {
         let toml = OpsToml::from_resolved(None);
-        assert!(toml.listen_addr.is_empty());
+        assert_eq!(toml.listen_addr, "");
     }
 
     #[test]

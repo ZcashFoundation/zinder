@@ -867,7 +867,7 @@ mod tests {
             .await?
             .into_inner();
         assert_eq!(first_page.entries.len(), 1);
-        assert!(!first_page.next_cursor.is_empty());
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
         let resume_cursor = first_page.events_resume_cursor.clone();
 
         let late_entry = fixture_mempool_entry_with_id(0xD4, chain_epoch)?;

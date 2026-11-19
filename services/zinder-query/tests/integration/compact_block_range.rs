@@ -358,7 +358,10 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
     let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
 
     assert_eq!(decoded_response.start_index, 0);
-    assert!(decoded_response.subtree_roots.is_empty());
+    assert_eq!(
+        decoded_response.subtree_roots,
+        [] as [zinder_proto::v1::wallet::SubtreeRoot; 0]
+    );
 
     Ok(())
 }
@@ -657,8 +660,7 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
         };
         let reason = status
             .get_details_error_info()
-            .map(|error_info| error_info.reason)
-            .unwrap_or_default();
+            .map_or_default(|error_info| error_info.reason);
         if status.code() != tonic::Code::NotFound || reason != "ARTIFACT_UNAVAILABLE" {
             mismatches.push(format!(
                 "{label} ({start_height}..={end_height}) gRPC: expected NotFound/ARTIFACT_UNAVAILABLE, observed {:?}/{reason} \"{}\"",

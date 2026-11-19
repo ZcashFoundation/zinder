@@ -1475,7 +1475,7 @@ mod tests {
         );
 
         mutate_blocks(&store, &mut consumer, &[], &[BlockHeight::new(10)])?;
-        assert!(all_rows(&store)?.is_empty());
+        assert_eq!(all_rows(&store)?, []);
         assert_eq!(
             BlockProductionTimeConsumer::tail_coverage(&store)?,
             Some(BlockProductionTimeTailCoverage::from_boundary(

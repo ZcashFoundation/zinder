@@ -939,7 +939,7 @@ mod tests {
                 Some(ConfigError::EntrypointOnlyEnvVar { path_name, .. })
                     if *path_name == expected_path_name
             ));
-            let message = error.map(|error| error.to_string()).unwrap_or_default();
+            let message = error.map_or_default(|error| error.to_string());
             assert!(message.contains("zinder-canonical-runtime"));
             assert!(message.contains("zinder-wallet-serving"));
             assert!(message.contains(&expected_path_name));

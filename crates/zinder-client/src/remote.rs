@@ -740,12 +740,11 @@ impl ChainIndex for RemoteChainIndex {
             }),
             start_height: query.start_height.value(),
             end_height: query.end_height.value(),
-            max_entries: query.max_entries.map(NonZeroU32::get).unwrap_or_default(),
+            max_entries: query.max_entries.map_or_default(NonZeroU32::get),
             from_cursor: query
                 .from_cursor
                 .as_ref()
-                .map(|cursor| cursor.as_bytes().to_vec())
-                .unwrap_or_default(),
+                .map_or_default(|cursor| cursor.as_bytes().to_vec()),
         };
         let response = self
             .client()
@@ -985,8 +984,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
     ) -> Result<MempoolSnapshotView, IndexerError> {
         let from_cursor = request
             .from_cursor
-            .map(|cursor| cursor.as_bytes().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|cursor| cursor.as_bytes().to_vec());
         let response = self
             .client()
             .mempool_snapshot(Request::new(wallet::MempoolSnapshotRequest {

@@ -1353,7 +1353,7 @@ fn decode_distribution_value(
         return Err(malformed_distribution(payload));
     }
     let mut frequencies = Vec::with_capacity(frequency_count);
-    for pair in payload[VALUE_HEADER_LEN..].chunks_exact(FREQUENCY_LEN) {
+    for pair in payload[VALUE_HEADER_LEN..].as_chunks::<FREQUENCY_LEN>().0 {
         frequencies.push(PaidFeeFrequency {
             paid_fee_zat: u64::from_be_bytes(
                 pair[..size_of::<u64>()]
@@ -2068,7 +2068,7 @@ mod tests {
     fn proven_zero_fee_is_excluded_without_becoming_unavailable() -> TestResult {
         let contribution = contribution_for_block(&block(100, 1, 10, &[Some(0)]))?;
 
-        assert!(contribution.day.frequencies.is_empty());
+        assert_eq!(contribution.day.frequencies, []);
         assert_eq!(contribution.day.unavailable_transaction_count, 0);
         Ok(())
     }
@@ -2093,7 +2093,7 @@ mod tests {
         );
 
         let contribution = contribution_for_block(&block)?;
-        assert!(contribution.day.frequencies.is_empty());
+        assert_eq!(contribution.day.frequencies, []);
         assert_eq!(contribution.day.unavailable_transaction_count, 1);
         Ok(())
     }
@@ -2137,7 +2137,7 @@ mod tests {
         );
 
         let contribution = contribution_for_block(&block)?;
-        assert!(contribution.day.frequencies.is_empty());
+        assert_eq!(contribution.day.frequencies, []);
         assert_eq!(contribution.day.unavailable_transaction_count, 0);
         Ok(())
     }

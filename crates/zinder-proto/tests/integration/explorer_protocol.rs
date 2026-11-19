@@ -399,7 +399,10 @@ fn block_transactions_response_preserves_optional_facts_and_transparent_rows() -
     assert!(decoded.transactions[0].public_facts.is_some());
     assert_eq!(decoded.transactions[1].transaction_index, 1);
     assert!(decoded.transactions[1].public_facts.is_none());
-    assert!(decoded.transactions[1].transparent_outputs.is_empty());
+    assert_eq!(
+        decoded.transactions[1].transparent_outputs,
+        [] as [zinder_proto::v1::wallet::TransparentOutput; 0]
+    );
     assert_eq!(
         decoded.transactions[0].transparent_inputs[0]
             .spent_outpoint
@@ -426,7 +429,10 @@ fn block_transactions_response_preserves_optional_facts_and_transparent_rows() -
             .as_deref(),
         Some([0x52].as_slice())
     );
-    assert!(decoded.transactions[1].transparent_inputs.is_empty());
+    assert_eq!(
+        decoded.transactions[1].transparent_inputs,
+        [] as [zinder_proto::v1::explorer::TransparentInput; 0]
+    );
     assert_eq!(
         decoded
             .freshness
@@ -697,10 +703,10 @@ fn transparent_address_records_round_trip_an_internal_transaction_id() -> eyre::
     })?;
 
     assert_eq!(deltas.internal_transaction_id, internal_transaction_id);
-    assert!(deltas.transaction_id.is_empty());
+    assert_eq!(deltas.transaction_id, "");
     assert_eq!(deltas.value_zat, -9_000);
     assert_eq!(activity.internal_transaction_id, internal_transaction_id);
-    assert!(activity.transaction_id.is_empty());
+    assert_eq!(activity.transaction_id, "");
     assert_eq!(activity.net_value_zat, Some(4_000));
     Ok(())
 }
@@ -719,7 +725,7 @@ fn transparent_address_records_written_with_rpc_hex_decode_without_internal_byte
     let decoded = explorer::TransparentAddressDeltasRecord::decode(encoded.as_slice())?;
 
     assert_eq!(decoded.transaction_id, transaction_id);
-    assert!(decoded.internal_transaction_id.is_empty());
+    assert_eq!(decoded.internal_transaction_id, [] as [u8; 0]);
     Ok(())
 }
 
@@ -737,10 +743,9 @@ fn explorer_server_info_round_trips_materialized_view_identities() -> eyre::Resu
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded, server_info);
-    assert!(
-        round_trip(&explorer::ExplorerServerInfo::default())?
-            .materialized_view_identities
-            .is_empty()
+    assert_eq!(
+        round_trip(&explorer::ExplorerServerInfo::default())?.materialized_view_identities,
+        [] as [std::string::String; 0]
     );
     Ok(())
 }

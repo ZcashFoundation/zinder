@@ -437,14 +437,14 @@ fn migration_rows_are_removed_on_revert() -> Result<()> {
     }
     store.write_batch(&batch)?;
 
-    assert!(
+    assert_eq!(
         IronwoodMigrationConsumer::read_migrations_in_range(
             &store,
             BlockHeight::new(0),
             BlockHeight::new(10),
             16,
-        )?
-        .is_empty()
+        )?,
+        []
     );
     Ok(())
 }

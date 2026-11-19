@@ -48,9 +48,8 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetLatestTreeState` | Served | `UNIMPLEMENTED` | |
 | `GetSubtreeRoots` | Served | `UNIMPLEMENTED` | `maxEntries = 0` returns at most 1,000 |
 | `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | At most 100,000 outputs per response |
+| `GetStandardFee` | `UNIMPLEMENTED` | `UNIMPLEMENTED` | Zinder does not expose a backend `getstandardfee` estimator |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
-
-`GetStandardFee` is not part of the vendored protocol, `lightwallet-protocol` v0.5.0, so a call to it returns `UNIMPLEMENTED`.
 
 A handler that makes several storage reads pins them to the chain epoch of the tip it reads first, so one response never mixes two branches of a reorg. Block-range streams instead follow the chain, as described below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
 
@@ -63,7 +62,7 @@ Both methods describe the serving process and its current tip. Whole messages re
 | `GetLightdInfo` fields | Rule |
 | --- | --- |
 | `chainName`, `saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight` | Comparable with lightwalletd at the same `blockHeight`. `chainName` is `main` or `test`; Regtest reports `test`. `consensusBranchId` is the lowercase hex branch active at the tip. `upgradeName` and `upgradeHeight` name the next pending upgrade and are empty and 0 when none is pending. |
-| `lightwalletProtocolVersion` | The vendored `lightwallet-protocol` release tag, `v0.5.0`. Wallets parse it as a version; zingolib refuses to sync below 0.5.0. |
+| `lightwalletProtocolVersion` | The vendored `lightwallet-protocol` release tag, `v0.6.0`. Wallets parse it as a version; zingolib refuses to sync below 0.5.0. |
 | `blockHeight` | The served visible tip. Compare with a tolerance of one block. |
 | `vendor`, `version`, `gitCommit` | `Zinder`, the crate version, and the build commit. Never compare. |
 | `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress` | Always empty. Never compare. |
@@ -253,9 +252,9 @@ lightwalletd reports an over-cap list refusal as `INTERNAL`.
 
 The vendored protocol and the images the parity suite runs are:
 
-- `lightwallet-protocol` `v0.5.0` (`ac7cee052a1bf5d430985a478d39e8b513fc4bd4`);
-- `lightwalletd` `v0.6.0` (`e7436d2adb9ab5828eb8a27de534e16218841fc2`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
-- `electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613`;
+- `lightwallet-protocol` `v0.6.0` (`299805c19011a027d2c48c5e912dd05041f76156`);
+- `lightwalletd` `v0.6.2` (`f8fe2cca7ede03b1f76b1d637a2ab467d151b79d`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
+- `electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951`;
 - `docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`, started on Regtest with `deploy/zebra/regtest.toml`, which activates every upgrade through NU7 (see [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7));
 - `docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`, started on Regtest with `deploy/zakura/regtest.toml`, which uses the same schedule.
 

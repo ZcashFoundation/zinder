@@ -130,10 +130,22 @@ fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
     assert_eq!(compact_block_artifact.transactions().len(), 1);
     assert_eq!(compact_transaction.index, 0);
     assert_eq!(compact_transaction.transaction_id.as_bytes().len(), 32);
-    assert!(compact_transaction.data.transparent_inputs.is_empty());
-    assert!(compact_transaction.data.sapling_spends.is_empty());
-    assert!(compact_transaction.data.sapling_outputs.is_empty());
-    assert!(compact_transaction.data.orchard_actions.is_empty());
+    assert_eq!(
+        compact_transaction.data.transparent_inputs,
+        [] as [zinder_core::CompactTransparentInput; 0]
+    );
+    assert_eq!(
+        compact_transaction.data.sapling_spends,
+        [] as [zinder_core::CompactSaplingSpend; 0]
+    );
+    assert_eq!(
+        compact_transaction.data.sapling_outputs,
+        [] as [zinder_core::CompactSaplingOutput; 0]
+    );
+    assert_eq!(
+        compact_transaction.data.orchard_actions,
+        [] as [zinder_core::CompactShieldedAction; 0]
+    );
 
     let transparent_output = compact_transaction
         .data
@@ -806,7 +818,10 @@ fn testnet_sapling_block_compact_artifact_carries_sapling_outputs() -> Result<()
         .find(|transaction| !transaction.data.sapling_outputs.is_empty())
         .ok_or("compact block missing Sapling-bearing transaction")?;
     assert_eq!(sapling_transaction.data.sapling_outputs.len(), 1);
-    assert!(sapling_transaction.data.orchard_actions.is_empty());
+    assert_eq!(
+        sapling_transaction.data.orchard_actions,
+        [] as [zinder_core::CompactShieldedAction; 0]
+    );
 
     let sapling_output = sapling_transaction
         .data
@@ -839,7 +854,10 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
         .find(|transaction| !transaction.data.orchard_actions.is_empty())
         .ok_or("compact block missing Orchard-bearing transaction")?;
     assert_eq!(orchard_transaction.data.orchard_actions.len(), 2);
-    assert!(orchard_transaction.data.sapling_outputs.is_empty());
+    assert_eq!(
+        orchard_transaction.data.sapling_outputs,
+        [] as [zinder_core::CompactSaplingOutput; 0]
+    );
 
     for action in &orchard_transaction.data.orchard_actions {
         assert_eq!(action.nullifier.len(), 32);
@@ -871,8 +889,14 @@ fn regtest_ironwood_block_compact_artifact_carries_ironwood_actions() -> Result<
         .find(|transaction| !transaction.data.ironwood_actions.is_empty())
         .ok_or("compact block missing Ironwood-bearing transaction")?;
     assert_eq!(ironwood_transaction.data.ironwood_actions.len(), 2);
-    assert!(ironwood_transaction.data.orchard_actions.is_empty());
-    assert!(ironwood_transaction.data.transparent_outputs.is_empty());
+    assert_eq!(
+        ironwood_transaction.data.orchard_actions,
+        [] as [zinder_core::CompactShieldedAction; 0]
+    );
+    assert_eq!(
+        ironwood_transaction.data.transparent_outputs,
+        [] as [zinder_core::CompactTransparentOutput; 0]
+    );
     assert_eq!(ironwood_transaction.data.transparent_inputs.len(), 1);
 
     for action in &ironwood_transaction.data.ironwood_actions {

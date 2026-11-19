@@ -853,7 +853,7 @@ fn validate_persisted_tree_state_checkpoints(
             None => {}
         }
         if height == build_plan.build_tip().height {
-            tip_frontiers = Some(frontiers.clone());
+            tip_frontiers = Some(frontiers);
         }
         previous_height = Some(height);
         row_count = row_count.checked_add(1).ok_or_else(|| {

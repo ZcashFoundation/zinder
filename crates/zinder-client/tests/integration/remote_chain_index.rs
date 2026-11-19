@@ -103,7 +103,7 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         ChainEvent::ChainCommitted { committed }
             if committed.block_range.start == BlockHeight::new(1)
     ));
-    assert!(!first_event.cursor.as_bytes().is_empty());
+    assert_ne!(first_event.cursor.as_bytes(), [] as [u8; 0]);
 
     Ok(())
 }
@@ -518,7 +518,7 @@ async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> e
 
     let empty = snapshot.transparent_outpoint_spend_status(&[]).await?;
     assert_eq!(empty.chain_epoch, snapshot.chain_epoch());
-    assert!(empty.statuses.is_empty());
+    assert_eq!(empty.statuses, []);
     assert!(matches!(
         chain_index
             .transparent_outpoint_spend_status(&[], None)

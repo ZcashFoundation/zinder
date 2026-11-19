@@ -32,7 +32,7 @@ because an OCI image tag cannot carry it.
   `ZcashFoundation/zinder`, workflow `release.yml`, and environment `release`.
   Do not add a `CARGO_REGISTRY_TOKEN` secret; the workflow gets a short-lived
   token through OIDC.
-- Changie v1.25.1, GitHub CLI 2.94 or newer, and Cosign are installed.
+- Changie v1.26.0, GitHub CLI 2.94 or newer, and Cosign are installed.
 - Every change for the release has merged with its `.changes/unreleased/`
   fragment, as [`.changes/README.md`](../../.changes/README.md) describes.
 

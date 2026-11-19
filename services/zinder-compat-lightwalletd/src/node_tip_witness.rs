@@ -158,8 +158,7 @@ impl NodeTipWitness {
                 node_tip_height: Some(height),
                 observed_at: now,
                 superseded: reachable
-                    .map(|previous| self.superseded_by(previous, height, now))
-                    .unwrap_or_default(),
+                    .map_or_default(|previous| self.superseded_by(previous, height, now)),
                 unreachable_since: None,
             },
         };

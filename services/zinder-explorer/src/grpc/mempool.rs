@@ -290,8 +290,7 @@ fn build_mempool_snapshot_page(
         summary: summary.finish(now_unix_millis),
         entries,
         next_cursor: last_emitted
-            .map(|(millis, tail)| encode_activity_cursor(millis, tail))
-            .unwrap_or_default(),
+            .map_or_default(|(millis, tail)| encode_activity_cursor(millis, tail)),
     })
 }
 
@@ -347,9 +346,8 @@ pub(crate) async fn query_mempool_activity(
         }
     }
 
-    let next_cursor = last_emitted
-        .map(|(millis, tail)| encode_activity_cursor(millis, tail))
-        .unwrap_or_default();
+    let next_cursor =
+        last_emitted.map_or_default(|(millis, tail)| encode_activity_cursor(millis, tail));
     let chain_epoch = snapshot
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
@@ -584,7 +582,7 @@ mod tests {
             page.summary.oldest_entry_age_millis, 1_000,
             "the summary must include entries excluded from the bounded page",
         );
-        assert!(!page.next_cursor.is_empty());
+        assert_ne!(page.next_cursor, [] as [u8; 0]);
         Ok(())
     }
 

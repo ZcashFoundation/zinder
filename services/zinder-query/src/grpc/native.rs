@@ -903,7 +903,7 @@ mod server_info_tests {
         };
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
         assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
-        assert!(!common.capabilities.is_empty());
+        assert_ne!(common.capabilities, [] as [std::string::String; 0]);
         ingest_fixture.shutdown().await?;
         Ok(())
     }
@@ -929,7 +929,7 @@ mod server_info_tests {
             unreachable!("node field must always be set")
         };
         assert!(node.version.is_none());
-        assert!(node.capabilities.is_empty());
+        assert_eq!(node.capabilities, [] as [std::string::String; 0]);
 
         let Some(common) = descriptor.common else {
             unreachable!("common ops.ServerInfo field must always be set")

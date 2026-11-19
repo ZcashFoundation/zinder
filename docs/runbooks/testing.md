@@ -520,7 +520,7 @@ refuse `Ping`.
 ```bash
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 150
 docker run -d --name lightwalletd-reference --network host \
-  docker.io/electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613 \
+  docker.io/electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951 \
   --grpc-bind-addr 0.0.0.0:9088 \
   --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
   --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout

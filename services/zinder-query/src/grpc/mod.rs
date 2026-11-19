@@ -252,16 +252,13 @@ mod tests {
             end_height: BlockHeight::new(5),
         });
         let details = status.get_error_details();
-        let fields = details
-            .bad_request()
-            .map(|bad_request| {
-                bad_request
-                    .field_violations
-                    .iter()
-                    .map(|violation| violation.field.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let fields = details.bad_request().map_or_default(|bad_request| {
+            bad_request
+                .field_violations
+                .iter()
+                .map(|violation| violation.field.clone())
+                .collect::<Vec<_>>()
+        });
 
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(fields, vec!["start_height", "end_height"]);

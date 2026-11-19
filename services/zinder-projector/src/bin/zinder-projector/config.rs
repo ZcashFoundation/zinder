@@ -615,7 +615,7 @@ fn parse_build_owner(encoded: &str) -> Result<[u8; 16], ConfigError> {
         ));
     }
     let mut owner = [0_u8; 16];
-    for (index, chunk) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|_| {
             ConfigError::invalid(
                 "projector.build_owner_hex must be exactly 32 hexadecimal characters",

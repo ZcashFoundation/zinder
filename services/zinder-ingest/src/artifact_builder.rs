@@ -942,7 +942,10 @@ mod tests {
         assert_eq!(no_blobs.replay_envelope, all_blobs.replay_envelope);
 
         assert!(no_blobs.retained_raw_blobs.block_blob.is_none());
-        assert!(no_blobs.retained_raw_blobs.transaction_blobs.is_empty());
+        assert_eq!(
+            no_blobs.retained_raw_blobs.transaction_blobs,
+            [] as [zinder_core::TransactionBlobArtifact; 0]
+        );
         assert!(transaction_blobs.retained_raw_blobs.block_blob.is_none());
         assert_eq!(
             transaction_blobs.retained_raw_blobs.transaction_blobs.len(),

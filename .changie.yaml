@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/miniscruff/changie/v1.25.1/docs/schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/miniscruff/changie/v1.26.0/docs/schema.json
 changesDir: .changes
 unreleasedDir: unreleased
 headerPath: header.tpl.md

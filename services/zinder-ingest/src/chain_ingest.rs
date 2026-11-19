@@ -368,7 +368,7 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
 }
 
 fn usize_to_u32_saturating(amount: usize) -> u32 {
-    u32::try_from(amount).map_or(u32::MAX, |converted| converted)
+    u32::try_from(amount).unwrap_or(u32::MAX)
 }
 
 #[allow(

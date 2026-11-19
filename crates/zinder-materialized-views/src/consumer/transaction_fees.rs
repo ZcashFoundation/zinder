@@ -231,7 +231,7 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
         let fees_cf = ctx
             .store
             .consumer_column_family(TRANSACTION_FEES_COLUMN_FAMILY)?;
-        for chunk in index_payload.chunks_exact(TXID_LEN) {
+        for chunk in index_payload.as_chunks::<TXID_LEN>().0 {
             ctx.batch.delete_cf(&fees_cf, chunk);
         }
         ctx.batch.delete_cf(&index_cf, index_key);

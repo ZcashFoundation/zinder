@@ -1133,6 +1133,15 @@ where
         )))
     }
 
+    async fn get_standard_fee(
+        &self,
+        _request: Request<lightwalletd::Empty>,
+    ) -> Result<Response<lightwalletd::StandardFee>, Status> {
+        Err(Status::unimplemented(
+            "GetStandardFee is not implemented because Zinder does not expose a backend getstandardfee estimator",
+        ))
+    }
+
     async fn ping(
         &self,
         request: Request<lightwalletd::Duration>,
@@ -2192,9 +2201,7 @@ fn lightd_info(
         .activations()
         .iter()
         .find(|activation| activation.activation_height > tip_height);
-    let upgrade_name = next_pending
-        .map(|activation| activation.name.clone())
-        .unwrap_or_default();
+    let upgrade_name = next_pending.map_or_default(|activation| activation.name.clone());
     let upgrade_height = next_pending.map_or(0, |activation| {
         u64::from(activation.activation_height.value())
     });
@@ -2926,9 +2933,9 @@ mod tests {
         assert_eq!(pruned.ironwood_actions.len(), 1);
         let action = &pruned.ironwood_actions[0];
         assert_eq!(action.nullifier, vec![20; 32]);
-        assert!(action.cmx.is_empty());
-        assert!(action.ephemeral_key.is_empty());
-        assert!(action.ciphertext.is_empty());
+        assert_eq!(action.cmx, [] as [u8; 0]);
+        assert_eq!(action.ephemeral_key, [] as [u8; 0]);
+        assert_eq!(action.ciphertext, [] as [u8; 0]);
     }
 
     #[test]
@@ -2943,7 +2950,10 @@ mod tests {
             },
             CompactBlockPayloadMode::Full,
         );
-        assert!(pruned.ironwood_actions.is_empty());
+        assert_eq!(
+            pruned.ironwood_actions,
+            [] as [zinder_proto::compat::lightwalletd::CompactOrchardAction; 0]
+        );
         assert_eq!(pruned.actions.len(), 1);
     }
 

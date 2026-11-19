@@ -67,7 +67,10 @@ async fn read_endpoint_latency_baseline() -> Result<()> {
         )
         .await?;
     let compact_block_range_50_micros = measurement_start.elapsed().as_micros();
-    assert!(!range.compact_blocks.is_empty());
+    assert_ne!(
+        range.compact_blocks,
+        [] as [zinder_core::CompactBlockArtifact; 0]
+    );
 
     let measurement_start = std::time::Instant::now();
     let _tree = wallet_query.tree_state_at(tip_height, None).await?;

@@ -115,13 +115,11 @@ impl WalletProjectionSerialOracle {
     }
 
     /// Iterates address transactions in exact durable key order.
-    #[must_use]
     pub fn address_transactions(&self) -> impl ExactSizeIterator<Item = &WalletAddressTransaction> {
         self.address_transactions.values()
     }
 
     /// Iterates retained undo rows in ascending block-height order.
-    #[must_use]
     pub fn reorg_undo(&self) -> impl ExactSizeIterator<Item = &WalletReorgUndo> {
         self.reorg_undo.values()
     }
@@ -672,7 +670,7 @@ mod tests {
             undo.created_outpoints,
             vec![WalletOutpointKey::new(same_block_outpoint)]
         );
-        assert!(undo.spent_outpoints.is_empty());
+        assert_eq!(undo.spent_outpoints, []);
         assert!(oracle.find_unspent_output(same_block_outpoint).is_none());
         assert!(oracle.find_spent_output(same_block_outpoint).is_some());
     }

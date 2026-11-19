@@ -6572,7 +6572,7 @@ async fn relay_mempool_events(adapter: CipherscanRestAdapter) {
                     &error,
                 );
             }
-            resume_cursor = Some(mempool_event.cursor.clone());
+            resume_cursor = Some(mempool_event.cursor);
         }
 
         if !wait_for_realtime_retry(&adapter.realtime_cancel).await {
@@ -9978,8 +9978,8 @@ fn reorg_forks_with_archive_json(
     offset: u32,
     archive: Option<&DisplacedBlockHistoryResponse>,
 ) -> Result<Value, CipherscanRestError> {
-    let offset_usize = usize::try_from(offset).map_or(usize::MAX, |offset| offset);
-    let limit_usize = usize::try_from(limit).map_or(usize::MAX, |limit| limit);
+    let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let total = reorg_total_fork_events(snapshot);
     let forks: Vec<Value> = snapshot
         .events
@@ -18043,7 +18043,7 @@ mod tests {
         assert_eq!(row["counterparty"], json!(expected_sender));
         assert_eq!(row["senderCount"], json!(1));
         assert_eq!(row["recipientCount"], json!(1));
-        assert!(unavailable.is_empty());
+        assert_eq!(unavailable, [] as [&str; 0]);
         Ok(())
     }
 

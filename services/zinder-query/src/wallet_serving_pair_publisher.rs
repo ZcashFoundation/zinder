@@ -2602,7 +2602,10 @@ mod tests {
         assert!(runtime.report().is_ready);
         readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
         assert!(runtime.report().is_ready);
-        assert!(degraded_inputs(&runtime).is_empty());
+        assert_eq!(
+            degraded_inputs(&runtime),
+            [] as [zinder_runtime::ReadinessInput; 0]
+        );
 
         readiness.publish_node_source_cause(node_failure);
         readiness.publish_pair_state(zinder_runtime::ReadinessState::not_ready(
@@ -2775,7 +2778,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let report = runtime.report();
         assert!(report.is_ready);
-        assert!(report.degraded.is_empty());
+        assert_eq!(
+            report.degraded,
+            [] as [zinder_runtime::ReadinessDependency; 0]
+        );
 
         cancel.cancel();
         handle.await?;
@@ -5763,7 +5769,7 @@ mod tests {
             .await
             .ok_or("native serving-pair event stream must return the baseline event")??;
         assert_eq!(first_chain_event.event_sequence, 1);
-        assert!(!first_chain_event.cursor.is_empty());
+        assert_ne!(first_chain_event.cursor, [] as [u8; 0]);
         let advertised = server_info
             .common
             .ok_or("native server info must contain common metadata")?
@@ -5952,7 +5958,10 @@ mod tests {
             .network_upgrade_activations(wallet::NetworkUpgradeActivationsRequest {})
             .await?
             .into_inner();
-        assert!(!activation_response.activations.is_empty());
+        assert_ne!(
+            activation_response.activations,
+            [] as [zinder_proto::v1::wallet::NetworkUpgradeActivation; 0]
+        );
         let reflection_channel = tonic::transport::Endpoint::new(wallet_endpoint)?
             .connect()
             .await?;
@@ -6654,9 +6663,8 @@ mod tests {
             .rev()
             .take(SECONDARY_GENERATION_COUNT)
             .collect::<Vec<_>>();
-        for generation in 0..SECONDARY_GENERATION_COUNT {
-            let SecondaryGenerationState::Published { readers, .. } =
-                &publisher.generations[generation].state
+        for (generation, generation_entry) in publisher.generations.iter().enumerate() {
+            let SecondaryGenerationState::Published { readers, .. } = &generation_entry.state
             else {
                 return Err(format!("generation {generation} must stay open").into());
             };

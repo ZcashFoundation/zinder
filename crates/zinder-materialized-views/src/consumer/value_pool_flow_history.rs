@@ -690,13 +690,7 @@ fn decode_height_index(
         });
     }
     let mut keys = Vec::with_capacity(payload.len() / VALUE_POOL_FLOW_HISTORY_KEY_LEN);
-    for chunk in payload.chunks_exact(VALUE_POOL_FLOW_HISTORY_KEY_LEN) {
-        let key: [u8; VALUE_POOL_FLOW_HISTORY_KEY_LEN] = chunk.try_into().map_err(|_| {
-            ValuePoolFlowHistoryConsumerError::MalformedHeightIndex {
-                height: height.value(),
-                bytes: payload.len(),
-            }
-        })?;
+    for &key in payload.as_chunks::<VALUE_POOL_FLOW_HISTORY_KEY_LEN>().0 {
         let (_, indexed_height, _) = decode_event_key(&key)?;
         if indexed_height != height {
             return Err(ValuePoolFlowHistoryConsumerError::IndexHeightMismatch {

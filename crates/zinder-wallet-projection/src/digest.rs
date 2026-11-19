@@ -369,7 +369,12 @@ fn blake2x_expand(message: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
     hash_many(blocks.iter_mut());
 
     let mut output = [0; WALLET_PROJECTION_ACCUMULATOR_LEN];
-    for (output_block, block) in output.chunks_exact_mut(BLAKE2B_OUTPUT_LEN).zip(&blocks) {
+    for (output_block, block) in output
+        .as_chunks_mut::<BLAKE2B_OUTPUT_LEN>()
+        .0
+        .iter_mut()
+        .zip(&blocks)
+    {
         output_block.copy_from_slice(block.to_hash().as_bytes());
     }
     output
@@ -825,8 +830,10 @@ mod tests {
             let expanded = blake2x_expand(message);
             let reference = serial_reference_expand(message);
             for (block_index, (block, reference_block)) in expanded
-                .chunks_exact(BLAKE2B_OUTPUT_LEN)
-                .zip(reference.chunks_exact(BLAKE2B_OUTPUT_LEN))
+                .as_chunks::<BLAKE2B_OUTPUT_LEN>()
+                .0
+                .iter()
+                .zip(reference.as_chunks::<BLAKE2B_OUTPUT_LEN>().0.iter())
                 .enumerate()
             {
                 assert_eq!(

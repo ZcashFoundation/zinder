@@ -9,7 +9,7 @@ x-common: &common
 
 services:
   prometheus:
-    image: prom/prometheus:v3.2.0
+    image: prom/prometheus:v3.16.0
     container_name: zinder_prometheus
     restart: unless-stopped
     <<: *common
@@ -35,7 +35,7 @@ services:
       retries: 6
 
   grafana:
-    image: grafana/grafana:11.5.1
+    image: grafana/grafana:13.3.1
     container_name: zinder_grafana
     restart: unless-stopped
     <<: *common

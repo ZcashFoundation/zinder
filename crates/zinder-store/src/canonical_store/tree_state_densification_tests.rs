@@ -590,7 +590,7 @@ fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> 
     assert_eq!(dense.reads, 100);
 
     let second = store.scan_tree_state_strides(first.next_from, EVERY_BLOCK, one)?;
-    assert!(second.incomplete.is_empty());
+    assert_eq!(second.incomplete, []);
     assert_eq!(second.examined, 0);
     assert_eq!(second.next_from, BlockHeight::new(100));
     assert!(second.reached_unsettled);
@@ -604,7 +604,7 @@ fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> 
     )?;
     let budget = TreeStateCheckpointSelection::CommitmentBudget(one);
     let damaged = store.scan_tree_state_strides(BlockHeight::new(0), budget, one)?;
-    assert!(damaged.incomplete.is_empty());
+    assert_eq!(damaged.incomplete, []);
     assert_eq!(
         damaged
             .damaged

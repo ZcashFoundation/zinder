@@ -434,7 +434,7 @@ mod tests {
 
         let outputs: Vec<_> = stream.collect::<Result<_, _>>().await?;
 
-        assert!(outputs.is_empty());
+        assert_eq!(outputs, [] as [zinder_core::TransparentUnspentOutput; 0]);
         assert_eq!(fixture.page_reads(), 1);
         fixture.wait_until_released().await
     }

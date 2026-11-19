@@ -293,7 +293,10 @@ mod tests {
         );
 
         assert_eq!(totals.transaction_count, 1);
-        assert!(days.is_empty());
+        assert_eq!(
+            days,
+            [] as [zinder_proto::v1::explorer::TransactionComponentDay; 0]
+        );
     }
 
     #[test]

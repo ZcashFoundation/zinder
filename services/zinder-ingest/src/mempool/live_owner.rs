@@ -1851,14 +1851,14 @@ mod tests {
             MempoolOwnerStatus::Hydrating
         ));
         assert!(!owner.is_serving());
-        assert!(
+        assert_eq!(
             canonical
                 .mempool_event_page(
                     None,
                     NonZeroU32::new(8).ok_or("mempool page size must be nonzero")?,
                 )
-                .await?
-                .is_empty()
+                .await?,
+            [] as [zinder_store::MempoolEventEnvelope; 0]
         );
         command_task.abort();
         let _ = command_task.await;
@@ -1961,7 +1961,10 @@ mod tests {
             .snapshot_page(&canonical, chain_epoch, 8, Vec::new())
             .await?;
 
-        assert!(snapshot.entries.is_empty());
+        assert_eq!(
+            snapshot.entries,
+            [] as [std::sync::Arc<zinder_core::MempoolEntry>; 0]
+        );
         assert!(snapshot.snapshot_age_millis >= 5_000);
         command_task.abort();
         let _ = command_task.await;
@@ -2264,11 +2267,11 @@ mod tests {
                 .cursor
                 .clone(),
         );
-        assert!(
+        assert_eq!(
             owner
                 .event_page(&canonical, Some(caught_up.clone()))
-                .await?
-                .is_empty()
+                .await?,
+            [] as [zinder_proto::v1::wallet::MempoolEventEnvelope; 0]
         );
 
         owner.withdraw_for_rebuild().await;

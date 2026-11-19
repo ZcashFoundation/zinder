@@ -316,7 +316,7 @@ mod tests {
 
         let events = address_value_events(&block, Some(&HashMap::new()));
 
-        assert!(events.is_empty());
+        assert_eq!(events, []);
     }
 
     #[test]

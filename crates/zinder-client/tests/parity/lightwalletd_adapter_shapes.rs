@@ -93,8 +93,8 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(second_ranged_block.height, 2);
     assert!(compact_blocks.next().await.is_none());
     assert_eq!(tree_state.height, 2);
-    assert!(tree_state.sapling_tree.is_empty());
-    assert!(tree_state.orchard_tree.is_empty());
+    assert_eq!(tree_state.sapling_tree, "");
+    assert_eq!(tree_state.orchard_tree, "");
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, visible_tip_block.height);

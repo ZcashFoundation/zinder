@@ -744,7 +744,7 @@ fn assert_wallet_ticker_deltas(report: &Value) -> Result<()> {
     let blocks = report["repeats"][0]["blocks"]
         .as_array()
         .ok_or_else(|| eyre!("report must list blocks"))?;
-    assert!(!blocks.is_empty());
+    assert_ne!(blocks.as_slice(), &[] as &[Value]);
     for block in blocks {
         let deltas = &block["wallet_ticker_deltas"];
         let point_reads = deltas["rocksdb.number.keys.read"].as_u64();

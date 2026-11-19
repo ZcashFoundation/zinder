@@ -5,6 +5,7 @@
 /// capability set returns this message from a `ServerInfo` rpc. Some
 /// services wrap it inside a richer descriptor (WalletQuery layers
 /// reorg-window depth on top).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfo {
     /// Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`.
@@ -34,6 +35,7 @@ pub struct ServerInfo {
     pub build_git_commit: ::prost::alloc::string::String,
 }
 /// Snapshot of the current readiness state surfaced to operators and orchestrators.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessReport {
     /// Stable readiness cause.
@@ -73,6 +75,7 @@ pub struct ReadinessReport {
     pub active_node: ::core::option::Option<ActiveNodeEndpoint>,
 }
 /// One endpoint of the ordered node list a runtime is configured with.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ActiveNodeEndpoint {
     /// Position in the ordered list: 0 is \[node\], N is \[node_fallbacks.N\].
@@ -80,6 +83,7 @@ pub struct ActiveNodeEndpoint {
     pub position: u32,
 }
 /// Latest observation of one dependency a process keeps serving without.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessDependency {
     /// Stable snake-case dependency label: `node_source` or `ingest_control`.
@@ -95,6 +99,7 @@ pub struct ReadinessDependency {
 /// Operator-actionable detail tied to a parametric readiness cause. The
 /// active oneof variant must match the cause enum value or the report is
 /// malformed.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessCauseDetail {
     #[prost(
@@ -105,6 +110,7 @@ pub struct ReadinessCauseDetail {
 }
 /// Nested message and enum types in `ReadinessCauseDetail`.
 pub mod readiness_cause_detail {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
         #[prost(message, tag = "1")]
@@ -128,6 +134,7 @@ pub mod readiness_cause_detail {
     }
 }
 /// Detail for READINESS_CAUSE_SYNCING.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SyncingDetail {
     /// Distance between the visible chain tip and the target tip when known.
@@ -135,6 +142,7 @@ pub struct SyncingDetail {
     pub lag_blocks: ::core::option::Option<u64>,
 }
 /// Detail for READINESS_CAUSE_NODE_CAPABILITY_MISSING.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeCapabilityMissingDetail {
     /// Stable name of the missing capability (matches NodeCapability::name()).
@@ -142,6 +150,7 @@ pub struct NodeCapabilityMissingDetail {
     pub capability: ::prost::alloc::string::String,
 }
 /// Detail for READINESS_CAUSE_REORG_WINDOW_EXCEEDED.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReorgWindowExceededDetail {
     /// Number of replaced visible heights.
@@ -158,6 +167,7 @@ pub struct ReorgWindowExceededDetail {
     pub covered: ::core::option::Option<u64>,
 }
 /// Detail for READINESS_CAUSE_REPLICA_LAGGING.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReplicaLaggingDetail {
     /// Chain-epoch distance between the writer and this secondary reader.
@@ -165,6 +175,7 @@ pub struct ReplicaLaggingDetail {
     pub lag_chain_epochs: u64,
 }
 /// Detail for READINESS_CAUSE_CURSOR_AT_RISK.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CursorAtRiskDetail {
     /// Age of the oldest retained event, rounded down to whole hours.
@@ -180,6 +191,7 @@ pub struct CursorAtRiskDetail {
 /// has moved past the published pair, and how long the pair has gone without
 /// a writer attestation. The reader stops admitting traffic once the staleness
 /// crosses its configured ceiling.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServingPairStaleDetail {
     /// Chain-epoch distance between the writer and the published pair at the
@@ -193,6 +205,7 @@ pub struct ServingPairStaleDetail {
 /// Detail for READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED.
 ///
 /// Carries the two numbers an operator needs to choose a new limit.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WalletTransitionLimitExceededDetail {
     /// Logical bytes the refused transition had already accounted when the
@@ -212,6 +225,7 @@ pub struct WalletTransitionLimitExceededDetail {
 /// many iterations the writer has been retrying, and how long the outage has
 /// lasted. The kind label matches SourceFailureClass::label() in
 /// zinder-source so dashboards can pivot on a stable identifier.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeUnavailableDetail {
     /// Stable kebab-case label naming the upstream failure class. Mirrors
@@ -240,6 +254,7 @@ pub struct NodeUnavailableDetail {
 /// is sourced from Zebra's HTTP `/ready` endpoint when configured, or from
 /// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
 /// See ADR-0009 §Upstream sync detection.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpstreamNotReadyDetail {
     /// Upstream's last committed tip height when known.
@@ -269,6 +284,7 @@ pub struct UpstreamNotReadyDetail {
 /// Stable readiness cause. New causes are additive only and must reserve a
 /// new scalar code; existing variants' semantics are stable within a major
 /// version.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ReadinessCause {
@@ -399,6 +415,7 @@ impl ReadinessCause {
 /// an existing reason's semantics is a breaking native-contract change: bump
 /// `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
 /// and cut controlled consumers over with the server.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorReason {
