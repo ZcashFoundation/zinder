@@ -178,9 +178,11 @@ async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
     let mut stream = TcpStream::connect(authority)
         .await
         .map_err(|error| format!("{url}: {error}"))?;
+    // An HTTP/1.0 request rules out a chunked response, so the body is
+    // every byte after the headers until the server closes the connection.
     stream
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+            format!("GET {path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
         )
         .await
@@ -197,6 +199,15 @@ async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
         return Err(format!(
             "{url}: {}",
             head.lines().next().unwrap_or_default()
+        ));
+    }
+    let transfer_coded = head.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+    });
+    if transfer_coded {
+        return Err(format!(
+            "{url}: the response has a Transfer-Encoding, which an HTTP/1.0 request does not allow"
         ));
     }
     Ok(parse_prometheus_samples(body))
@@ -319,6 +330,42 @@ mod tests {
             .err()
             .ok_or("a stalled endpoint must fail the scrape")?;
         assert!(error.contains("no complete response"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scrape_asks_for_http_1_0_and_refuses_a_chunked_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 512];
+            let read = socket.read(&mut request).await?;
+            // The chunks split a metric name, which chunk framing passed to
+            // the parser would break.
+            let (first, second) = ("zinder_query_tree_", "state_replay_refusals_total 5\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 {:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                first.len(),
+                second.len()
+            );
+            socket.write_all(response.as_bytes()).await?;
+            Ok::<_, std::io::Error>(String::from_utf8_lossy(&request[..read]).into_owned())
+        });
+
+        let scraped = scrape(&url).await;
+        let request = server.await??;
+
+        assert!(
+            request.starts_with("GET /metrics HTTP/1.0\r\n"),
+            "{request}"
+        );
+        let error = scraped
+            .err()
+            .ok_or("a chunked response must fail the scrape")?;
+        assert!(error.contains("Transfer-Encoding"), "{error}");
         Ok(())
     }
 }
