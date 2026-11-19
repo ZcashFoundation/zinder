@@ -28,10 +28,10 @@ mod compact_block_serving;
 mod config;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use zinder_query::{
-    AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT, OrderedBroadcaster,
-    WalletServingPairConfig, WalletServingPairPublisher, WalletServingQuery,
-    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
-    spawn_wallet_node_readiness_probe,
+    AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
+    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
+    WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
+    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
 };
 
 #[global_allocator]
@@ -272,9 +272,13 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_replay_wait = lightwalletd_config
         .tree_state_replay_wait
         .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAIT);
+    let tree_state_replay_waiters_per_slot = lightwalletd_config
+        .tree_state_replay_waiters_per_slot
+        .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT);
     let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
         .with_node_broadcast(node_broadcast.clone())
-        .with_tree_state_replay_wait(tree_state_replay_wait);
+        .with_tree_state_replay_wait(tree_state_replay_wait)
+        .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
     let cancel = CancellationToken::new();
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
@@ -344,6 +348,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
         tree_state_replay_wait_ms = tree_state_replay_wait.as_millis(),
+        tree_state_replay_waiters_per_slot = tree_state_replay_waiters_per_slot.get(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );

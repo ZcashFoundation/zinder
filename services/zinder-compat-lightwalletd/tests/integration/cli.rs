@@ -463,8 +463,53 @@ fn tree_state_replay_wait_defaults_to_two_seconds_and_is_bounded() -> eyre::Resu
     Ok(())
 }
 
+/// Wallet serving's tree-state rebuild waiters per slot default to 64,
+/// follow their environment variable, and are refused outside 1..=256.
+#[test]
+fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-replay-waiters-store"),
+            &tempdir.path().join("compat-replay-waiters-secondary"),
+            &tempdir.path().join("compat-replay-waiters-wallet"),
+        )?,
+    )?;
+    let rendered = |waiters: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        command.env_remove("ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT");
+        if let Some(waiters) = waiters {
+            command.env("ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT", waiters);
+        }
+        Ok(command.output()?)
+    };
+
+    for (configured, expected) in [(None, "64"), (Some("1"), "1"), (Some("256"), "256")] {
+        let output = rendered(configured)?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("tree_state_replay_waiters_per_slot = {expected}")),
+            "{stdout}"
+        );
+    }
+    for refused in ["0", "257"] {
+        let output = rendered(Some(refused))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("compat.tree_state_replay_waiters_per_slot must be in 1..=256"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// Compact-block serving answers no tree-state request, so it refuses the
-/// tree-state rebuild wait like any other wallet setting.
+/// tree-state rebuild wait and waiters like any other wallet setting.
 #[test]
 fn compact_blocks_rejects_the_tree_state_replay_wait() -> eyre::Result<()> {
     let temporary = tempdir()?;
@@ -488,14 +533,32 @@ fn compact_blocks_rejects_the_tree_state_replay_wait() -> eyre::Result<()> {
         "{stderr}"
     );
 
+    let waiters = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env_remove("ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS")
+        .env("ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT", "8")
+        .output()?;
+    assert!(!waiters.status.success(), "{waiters:?}");
+    let stderr = String::from_utf8(waiters.stderr)?;
+    assert!(
+        stderr.contains("does not accept compat.tree_state_replay_waiters_per_slot"),
+        "{stderr}"
+    );
+
     let default = zinder_compat_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
         .env_remove("ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS")
+        .env_remove("ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT")
         .output()?;
     assert!(default.status.success(), "{default:?}");
+    let stdout = String::from_utf8(default.stdout)?;
     assert!(
-        !String::from_utf8(default.stdout)?.contains("tree_state_replay_wait_ms"),
+        !stdout.contains("tree_state_replay_wait_ms"),
         "compact-block serving must not render a tree-state wait"
+    );
+    assert!(
+        !stdout.contains("tree_state_replay_waiters_per_slot"),
+        "compact-block serving must not render tree-state waiters"
     );
     Ok(())
 }

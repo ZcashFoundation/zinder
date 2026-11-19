@@ -1179,6 +1179,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       once; defaults to 2000.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+        toml_path: "compat.tree_state_replay_waiters_per_slot",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; \
+                      a rebuild that finds every waiting place taken fails at once with \
+                      `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. \
+                      Must be in 1..=256; defaults to 64.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",
         toml_path: "compat.ping_very_insecure",
         used_by: &["zinder-compat-lightwalletd"],
@@ -1924,6 +1935,7 @@ mod tests {
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
+                "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
             ]
         );

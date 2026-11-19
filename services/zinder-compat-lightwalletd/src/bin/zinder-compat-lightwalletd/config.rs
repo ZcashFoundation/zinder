@@ -14,7 +14,10 @@ use zinder_compat_lightwalletd::{
     DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdAdmissionError,
 };
 use zinder_core::Network;
-use zinder_query::{DEFAULT_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAIT};
+use zinder_query::{
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+};
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
@@ -72,6 +75,9 @@ pub(crate) struct LightwalletdConfig {
     /// serving. Compact-block serving answers no tree-state request and has
     /// none.
     pub(crate) tree_state_replay_wait: Option<Duration>,
+    /// Most tree-state rebuilds that wait for each rebuild slot in wallet
+    /// serving. Compact-block serving has none.
+    pub(crate) tree_state_replay_waiters_per_slot: Option<NonZeroU32>,
     /// Whether `Ping` answers, as `lightwalletd --ping-very-insecure` does.
     pub(crate) ping_very_insecure: bool,
     pub(crate) broadcaster: Option<NodeTarget>,
@@ -226,6 +232,7 @@ struct CompatSection {
     pair_convergence_attempts: Option<u8>,
     max_concurrent_block_range_streams: Option<u32>,
     tree_state_replay_wait_ms: Option<u64>,
+    tree_state_replay_waiters_per_slot: Option<u32>,
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
 }
@@ -273,6 +280,8 @@ fn resolve_lightwalletd_config(
         } else {
             (None, None, None)
         };
+    let (tree_state_replay_wait, tree_state_replay_waiters_per_slot) =
+        resolve_tree_state_replay(serving, &config.compat)?;
     let ResolvedIngestControlReader {
         addr: ingest_control_addr,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -291,8 +300,6 @@ fn resolve_lightwalletd_config(
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
         config.compat.max_concurrent_block_range_streams,
     )?;
-    let tree_state_replay_wait =
-        resolve_tree_state_replay_wait(serving, config.compat.tree_state_replay_wait_ms)?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let (broadcaster, node_fallbacks) =
@@ -315,6 +322,7 @@ fn resolve_lightwalletd_config(
         pair_convergence_attempts,
         max_concurrent_block_range_streams,
         tree_state_replay_wait,
+        tree_state_replay_waiters_per_slot,
         ping_very_insecure: config.compat.ping_very_insecure.unwrap_or(false),
         broadcaster,
         node_fallbacks,
@@ -393,6 +401,9 @@ impl LightwalletdConfigToml {
                 tree_state_replay_wait_ms: config
                     .tree_state_replay_wait
                     .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+                tree_state_replay_waiters_per_slot: config
+                    .tree_state_replay_waiters_per_slot
+                    .map(NonZeroU32::get),
                 ping_very_insecure: config.ping_very_insecure,
                 serving: config.serving,
             },
@@ -410,6 +421,8 @@ struct CompatToml {
     max_concurrent_block_range_streams: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     tree_state_replay_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_state_replay_waiters_per_slot: Option<u32>,
     ping_very_insecure: bool,
     serving: CompatServing,
 }
@@ -460,6 +473,21 @@ fn require_max_concurrent_block_range_streams(
         })
 }
 
+/// Resolves the tree-state rebuild wait and waiters per slot, which only
+/// wallet serving uses.
+fn resolve_tree_state_replay(
+    serving: CompatServing,
+    compat: &CompatSection,
+) -> Result<(Option<Duration>, Option<NonZeroU32>), ConfigError> {
+    Ok((
+        resolve_tree_state_replay_wait(serving, compat.tree_state_replay_wait_ms)?,
+        resolve_tree_state_replay_waiters_per_slot(
+            serving,
+            compat.tree_state_replay_waiters_per_slot,
+        )?,
+    ))
+}
+
 /// Resolves the tree-state rebuild wait, which only wallet serving uses.
 fn resolve_tree_state_replay_wait(
     serving: CompatServing,
@@ -481,6 +509,29 @@ fn resolve_tree_state_replay_wait(
             }
             Ok(Some(wait))
         }
+    }
+}
+
+/// Resolves the tree-state rebuild waiters per slot, which only wallet
+/// serving uses.
+fn resolve_tree_state_replay_waiters_per_slot(
+    serving: CompatServing,
+    configured: Option<u32>,
+) -> Result<Option<NonZeroU32>, ConfigError> {
+    match (serving, configured) {
+        (CompatServing::CompactBlocks, None) => Ok(None),
+        (CompatServing::CompactBlocks, Some(_)) => Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept compat.tree_state_replay_waiters_per_slot, because compact-block serving answers no tree-state request; remove it or select compat.serving = \"wallet\"",
+        )),
+        (CompatServing::Wallet, None) => Ok(Some(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT)),
+        (CompatServing::Wallet, Some(configured)) => NonZeroU32::new(configured)
+            .filter(|waiters| *waiters <= MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
+            .map(Some)
+            .ok_or_else(|| {
+                ConfigError::invalid(format!(
+                    "compat.tree_state_replay_waiters_per_slot must be in 1..={MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT}"
+                ))
+            }),
     }
 }
 
