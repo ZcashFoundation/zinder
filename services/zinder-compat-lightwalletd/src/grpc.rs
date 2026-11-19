@@ -17,9 +17,10 @@ use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
-    CompactBlockArtifact, CompactTransaction, CompactTransactionData, MinedTransaction, Network,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
+    CompactBlockArtifact, CompactTransaction, CompactTransactionData,
+    MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction, Network, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
@@ -73,7 +74,7 @@ struct EntryChainView {
     visible_tip_height: BlockHeight,
 }
 
-/// Default maximum subtree roots returned when lightwalletd requests "all entries".
+/// Default number of subtree roots one native read returns while `GetSubtreeRoots` streams.
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 /// Default maximum transparent UTXOs one `GetAddressUtxos` response returns.
 ///
@@ -81,6 +82,9 @@ pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.s
 /// on Zebra the same way.
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(99_999);
+/// Native per-request subtree-root cap expressed as a `NonZeroU32`.
+const MAX_SUBTREE_ROOT_PAGE_SIZE: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(MAX_SUBTREE_ROOTS_PER_REQUEST - 1);
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
@@ -89,6 +93,8 @@ const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Transactions a `GetTaddressTransactions` or `GetTaddressTxids` response
 /// reads ahead of its client.
 const TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY: usize = 8;
+/// Subtree roots a `GetSubtreeRoots` response reads ahead of its client.
+const SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY: usize = 64;
 /// Rows a `GetAddressUtxosStream` response merges ahead of its client.
 const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
 /// Outputs the first pages of one UTXO request's address streams share, so
@@ -113,11 +119,12 @@ const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
 /// [`LightwalletdGrpcAdapter::from_admitted_compatibility_query`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LightwalletdResponseLimits {
-    /// Bound used when `GetSubtreeRoots.maxEntries` is zero.
+    /// Roots one native read returns while `GetSubtreeRoots` streams, clamped to
+    /// [`MAX_SUBTREE_ROOTS_PER_REQUEST`].
     ///
-    /// Upstream lightwalletd defines zero as "all entries". Zinder keeps the
-    /// response bounded so one compatibility request cannot materialize
-    /// unbounded history.
+    /// It bounds memory per read, not the response: `GetSubtreeRoots` pages
+    /// through every requested root, and `maxEntries = 0` means every
+    /// remaining root, as in upstream lightwalletd.
     pub max_subtree_roots: NonZeroU32,
     /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
     /// returns.
@@ -1052,24 +1059,19 @@ where
         let at_epoch_id = self.entry_chain_epoch_id().await?;
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
-        let max_entries =
-            NonZeroU32::new(request.max_entries).unwrap_or(self.response_limits.max_subtree_roots);
-        let subtree_roots = self
-            .query_api
-            .subtree_roots(
-                SubtreeRootRange::new(
-                    protocol,
-                    SubtreeRootIndex::new(request.start_index),
-                    max_entries,
-                ),
-                Some(at_epoch_id),
-            )
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
+        let source = SubtreeRootsStream::start(
+            self.query_api.clone(),
+            protocol,
+            &request,
+            self.response_limits.max_subtree_roots,
+            at_epoch_id,
+        )
+        .await?;
 
-        Ok(Response::new(stream_items(lightwalletd_subtree_roots(
-            &subtree_roots,
-        ))))
+        Ok(Response::new(spawn_response_stream(
+            source,
+            SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     async fn get_address_utxos(
@@ -1269,6 +1271,112 @@ where
             }
             if let Err(status) = self.read_page().await {
                 self.has_later_pages = false;
+                return Some(Err(status));
+            }
+        }
+    }
+}
+
+/// One protocol's subtree roots at one chain epoch, read one bounded native
+/// page at a time until `max_entries` is reached or the store runs out.
+///
+/// `start` reads the first page, so argument and retained-history-floor
+/// failures surface before the response stream opens.
+struct SubtreeRootsStream<QueryApi> {
+    query_api: QueryApi,
+    protocol: ShieldedProtocol,
+    at_epoch_id: ChainEpochId,
+    /// Index of the next root to read, or `None` once the stream is complete.
+    next_index: Option<u32>,
+    /// Roots still to return. `maxEntries = 0` ("all") starts at `u32::MAX`,
+    /// which no store reaches because subtree indexes are `u32`.
+    remaining: u32,
+    page_limit: NonZeroU32,
+    page: std::vec::IntoIter<lightwalletd::SubtreeRoot>,
+}
+
+impl<QueryApi> SubtreeRootsStream<QueryApi>
+where
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
+{
+    async fn start(
+        query_api: QueryApi,
+        protocol: ShieldedProtocol,
+        request: &lightwalletd::GetSubtreeRootsArg,
+        page_limit: NonZeroU32,
+        at_epoch_id: ChainEpochId,
+    ) -> Result<Self, Status> {
+        let mut stream = Self {
+            query_api,
+            protocol,
+            at_epoch_id,
+            next_index: Some(request.start_index),
+            remaining: if request.max_entries == 0 {
+                u32::MAX
+            } else {
+                request.max_entries
+            },
+            page_limit: page_limit.min(MAX_SUBTREE_ROOT_PAGE_SIZE),
+            page: Vec::new().into_iter(),
+        };
+        stream.read_next_page().await?;
+        Ok(stream)
+    }
+
+    async fn read_next_page(&mut self) -> Result<(), Status> {
+        let (Some(start_index), Some(remaining)) =
+            (self.next_index, NonZeroU32::new(self.remaining))
+        else {
+            self.next_index = None;
+            return Ok(());
+        };
+        let page_entries = remaining.min(self.page_limit);
+        let subtree_roots = self
+            .query_api
+            .subtree_roots(
+                SubtreeRootRange::new(
+                    self.protocol,
+                    SubtreeRootIndex::new(start_index),
+                    page_entries,
+                ),
+                Some(self.at_epoch_id),
+            )
+            .await
+            .map_err(|error| subtree_roots_status(&error))?;
+        let received = u32::try_from(subtree_roots.subtree_roots.len())
+            .map_err(|_| Status::internal("native subtree_roots page length exceeds u32"))?;
+
+        let completed_subtree_count = subtree_roots
+            .chain_epoch
+            .tip_metadata
+            .completed_subtree_count(self.protocol);
+
+        self.remaining = self.remaining.saturating_sub(received);
+        // The page's own epoch says where the roots end, so a full page that
+        // reaches the last completed root ends the stream without another
+        // read that a retired epoch would turn into `UNAVAILABLE`.
+        self.next_index = start_index.checked_add(received).filter(|next_index| {
+            received >= page_entries.get() && *next_index < completed_subtree_count
+        });
+        self.page = lightwalletd_subtree_roots(&subtree_roots).into_iter();
+        Ok(())
+    }
+}
+
+impl<QueryApi> ResponseSource for SubtreeRootsStream<QueryApi>
+where
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
+{
+    type Message = lightwalletd::SubtreeRoot;
+
+    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        loop {
+            if let Some(root) = self.page.next() {
+                return Some(Ok(root));
+            }
+            self.next_index?;
+            if let Err(status) = self.read_next_page().await {
+                self.next_index = None;
                 return Some(Err(status));
             }
         }
@@ -1482,10 +1590,6 @@ impl CompactBlockPoolSelection {
 enum CompactBlockPayloadMode {
     Full,
     NullifiersOnly,
-}
-
-fn stream_items<T: Send + 'static>(items: Vec<T>) -> GrpcStream<T> {
-    Box::pin(stream::iter(items.into_iter().map(Ok)))
 }
 
 /// How one `BlockRange` handler reads and shapes its window.
@@ -2130,6 +2234,18 @@ fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
 /// reason.
 fn tree_state_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
+        return Status::unavailable(format!("{error}; retry shortly"));
+    }
+    status_from_query_error(error)
+}
+
+/// Maps a subtree-root read failure to the lightwalletd status.
+///
+/// A page read after the entry epoch is retired fails with `UNAVAILABLE`, so a
+/// wallet retries the request rather than treating the cut-off stream as a
+/// permanent precondition failure.
+fn subtree_roots_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::ChainEpochPinUnavailable { .. }) {
         return Status::unavailable(format!("{error}; retry shortly"));
     }
     status_from_query_error(error)
