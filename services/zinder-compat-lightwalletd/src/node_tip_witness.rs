@@ -45,6 +45,20 @@ pub const NODE_TIP_OBSERVATION_MAX_AGE: Duration = Duration::from_secs(30);
 /// when that is longer.
 const SUPERSEDED_NODE_TIP_GRACE: Duration = Duration::from_secs(10);
 
+/// Shortest time readings that name no node tip must keep failing before the
+/// witness stops vouching.
+///
+/// The follower reports its node unavailable after one failed call and backs
+/// off for 2 seconds, so a single failed call must not withdraw. The delay
+/// lasts two poll intervals when that is longer.
+const NODE_OUTAGE_WITHDRAWAL_DELAY: Duration = Duration::from_secs(5);
+
+/// Longest time readings that name no node tip keep a witness vouching.
+///
+/// It stays far below the shortest stale-tip limit, 5 minutes, however long
+/// the poll interval is.
+const MAX_NODE_OUTAGE_WITHDRAWAL_DELAY: Duration = Duration::from_mins(1);
+
 /// The writer's latest report of its node's committed tip, shared by every
 /// clone.
 ///
@@ -55,6 +69,7 @@ pub struct NodeTipWitness {
     latest: Arc<ArcSwapOption<NodeTipObservation>>,
     max_age: Duration,
     superseded_grace: Duration,
+    withdrawal_delay: Duration,
 }
 
 impl Default for NodeTipWitness {
@@ -63,11 +78,13 @@ impl Default for NodeTipWitness {
             latest: Arc::default(),
             max_age: NODE_TIP_OBSERVATION_MAX_AGE,
             superseded_grace: SUPERSEDED_NODE_TIP_GRACE,
+            withdrawal_delay: NODE_OUTAGE_WITHDRAWAL_DELAY,
         }
     }
 }
 
-/// One `WriterStatus` reading.
+/// The latest `WriterStatus` reading that named a node tip, or one that named
+/// none when the witness has no such reading to keep.
 #[derive(Clone, Copy, Debug)]
 struct NodeTipObservation {
     /// The node's committed tip, or `None` when the writer could not report
@@ -77,6 +94,8 @@ struct NodeTipObservation {
     /// The oldest node tip a newer one replaced and when, while its grace
     /// runs.
     superseded: Option<(BlockHeight, Instant)>,
+    /// When readings started to name no node tip, while this one is kept.
+    unreachable_since: Option<Instant>,
 }
 
 impl NodeTipWitness {
@@ -84,8 +103,9 @@ impl NodeTipWitness {
     ///
     /// A reading vouches for three intervals or
     /// [`NODE_TIP_OBSERVATION_MAX_AGE`], whichever is longer. A superseded
-    /// node tip keeps vouching for three intervals or 10 seconds, whichever
-    /// is longer.
+    /// node tip keeps vouching for three intervals or 10 seconds, and failed
+    /// readings withdraw after two intervals or 5 seconds, but never later
+    /// than one minute.
     #[must_use]
     pub fn for_poll_interval(poll_interval: Duration) -> Self {
         Self {
@@ -96,25 +116,46 @@ impl NodeTipWitness {
             superseded_grace: poll_interval
                 .saturating_mul(3)
                 .max(SUPERSEDED_NODE_TIP_GRACE),
+            withdrawal_delay: poll_interval.saturating_mul(2).clamp(
+                NODE_OUTAGE_WITHDRAWAL_DELAY,
+                MAX_NODE_OUTAGE_WITHDRAWAL_DELAY,
+            ),
         }
     }
 
     /// Records that the writer reported its node at `node_tip_height`, or
     /// could not report a node tip when it is `None`.
+    ///
+    /// A reading that names no node tip keeps the last fresh one that did
+    /// until such readings have lasted the withdrawal delay.
     pub fn observe(&self, node_tip_height: Option<BlockHeight>) {
         let now = Instant::now();
         let previous = self.latest.load_full();
-        let superseded = node_tip_height.and_then(|height| {
-            let previous = previous
-                .as_deref()
-                .filter(|previous| previous.observed_at.elapsed() <= self.max_age)?;
-            self.superseded_by(previous, height, now)
+        let reachable = previous.as_deref().filter(|previous| {
+            previous.node_tip_height.is_some()
+                && previous.observed_at.elapsed() <= self.max_age
+                && !self.outage_withdraws(previous)
         });
-        self.latest.store(Some(Arc::new(NodeTipObservation {
-            node_tip_height,
-            observed_at: now,
-            superseded,
-        })));
+        let observation = match (node_tip_height, reachable) {
+            (None, Some(reachable)) => NodeTipObservation {
+                unreachable_since: Some(reachable.unreachable_since.unwrap_or(now)),
+                ..*reachable
+            },
+            (None, None) => NodeTipObservation {
+                node_tip_height: None,
+                observed_at: now,
+                superseded: None,
+                unreachable_since: None,
+            },
+            (Some(height), reachable) => NodeTipObservation {
+                node_tip_height: Some(height),
+                observed_at: now,
+                superseded: reachable
+                    .and_then(|previous| self.superseded_by(previous, height, now)),
+                unreachable_since: None,
+            },
+        };
+        self.latest.store(Some(Arc::new(observation)));
     }
 
     /// Returns the superseded node tip to keep when a reading at `height`
@@ -139,6 +180,14 @@ impl NodeTipWitness {
         )
     }
 
+    /// Returns whether readings naming no node tip have lasted longer than
+    /// the withdrawal delay since `observation`.
+    fn outage_withdraws(&self, observation: &NodeTipObservation) -> bool {
+        observation
+            .unreachable_since
+            .is_some_and(|since| since.elapsed() > self.withdrawal_delay)
+    }
+
     /// Returns whether the latest reading, within its maximum age, shows a
     /// reachable node with no block above `served_tip_height`, or one that
     /// passed that height within the superseded grace, so the served tip is
@@ -146,7 +195,9 @@ impl NodeTipWitness {
     #[must_use]
     pub fn vouches_for(&self, served_tip_height: BlockHeight) -> bool {
         self.latest.load().as_deref().is_some_and(|observation| {
-            if observation.observed_at.elapsed() > self.max_age {
+            if observation.observed_at.elapsed() > self.max_age
+                || self.outage_withdraws(observation)
+            {
                 return false;
             }
             let Some(node_tip_height) = observation.node_tip_height else {
@@ -215,8 +266,9 @@ fn node_reports_it_is_behind_its_peers(detail: &UpstreamNotReadyDetail) -> bool 
 /// Starts polling the `WriterStatus` of the `network` writer every
 /// `poll_interval` and returns the witness it updates.
 ///
-/// A failed call records that no node tip could be read, so the witness stops
-/// vouching at once rather than when the last reading ages out.
+/// A failed call records that no node tip could be read. The witness stops
+/// vouching once such readings have lasted its withdrawal delay, a few
+/// seconds by default, rather than when the last reading ages out.
 #[must_use]
 pub fn spawn_node_tip_witness(
     ingest_control_endpoint: String,
@@ -375,9 +427,6 @@ mod tests {
 
         witness.observe(Some(BlockHeight::new(120)));
         assert!(witness.vouches_for(served));
-        // The node is unreachable.
-        witness.observe(None);
-        assert!(!witness.vouches_for(served));
         // The writer is behind a node that has had a newer block for a while.
         witness.observe(Some(BlockHeight::new(125)));
         tokio::time::sleep(SUPERSEDED_NODE_TIP_GRACE + Duration::from_secs(1)).await;
@@ -411,12 +460,6 @@ mod tests {
             !witness.vouches_for(served),
             "a reader still behind after the grace is behind its node"
         );
-
-        // An outage drops the grace at once.
-        witness.observe(Some(BlockHeight::new(122)));
-        witness.observe(None);
-        witness.observe(Some(BlockHeight::new(122)));
-        assert!(!witness.vouches_for(BlockHeight::new(121)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -458,8 +501,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_expired_reading_starts_no_grace() {
+    async fn one_failed_reading_keeps_vouching_and_a_lasting_outage_withdraws() {
         let witness = NodeTipWitness::default();
+        let served = BlockHeight::new(120);
+        witness.observe(Some(BlockHeight::new(120)));
+
+        // One failed reading is a blip.
+        witness.observe(None);
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        witness.observe(Some(BlockHeight::new(120)));
+        assert!(witness.vouches_for(served));
+
+        // Readings keep failing for longer than the withdrawal delay.
+        witness.observe(None);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        witness.observe(None);
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !witness.vouches_for(served),
+            "a lasting outage withdraws without waiting for another reading"
+        );
+        witness.observe(None);
+        assert!(!witness.vouches_for(served));
+
+        // The node returns past the served tip: the tip from before the
+        // outage gets no grace.
+        witness.observe(Some(BlockHeight::new(122)));
+        assert!(!witness.vouches_for(BlockHeight::new(121)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blip_keeps_the_grace_and_an_expired_reading_starts_none() {
+        let witness = NodeTipWitness::default();
+        let served = BlockHeight::new(120);
+        witness.observe(Some(BlockHeight::new(120)));
+        witness.observe(None);
+        witness.observe(Some(BlockHeight::new(121)));
+        assert!(
+            witness.vouches_for(served),
+            "a block reported right after a blip keeps the grace"
+        );
+
         // A hung call lets the reading expire before the node moves on.
         witness.observe(Some(BlockHeight::new(121)));
         tokio::time::sleep(NODE_TIP_OBSERVATION_MAX_AGE + Duration::from_secs(1)).await;
@@ -473,6 +557,28 @@ mod tests {
         // A reorg to a lower tip vouches for that tip.
         witness.observe(Some(BlockHeight::new(124)));
         assert!(witness.vouches_for(BlockHeight::new(124)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_outage_withdrawal_delay_scales_with_the_poll_interval_up_to_a_minute() {
+        let witness = NodeTipWitness::for_poll_interval(Duration::from_secs(20));
+        witness.observe(Some(BlockHeight::new(120)));
+        witness.observe(None);
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(witness.vouches_for(BlockHeight::new(120)));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!witness.vouches_for(BlockHeight::new(120)));
+
+        let witness = NodeTipWitness::for_poll_interval(Duration::from_mins(10));
+        witness.observe(Some(BlockHeight::new(120)));
+        witness.observe(None);
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        assert!(witness.vouches_for(BlockHeight::new(120)));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !witness.vouches_for(BlockHeight::new(120)),
+            "the delay stays far below the stale-tip limit"
+        );
     }
 
     #[test]

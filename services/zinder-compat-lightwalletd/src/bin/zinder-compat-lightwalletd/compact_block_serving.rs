@@ -4334,10 +4334,16 @@ mod tests {
                 .map(|status| status.code()),
             Some(Code::Unavailable)
         );
-        // The node becomes unreachable.
-        node_tip_witness.observe(None);
+        // The node has been unreachable since the witness started.
+        let unreachable_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let unreachable = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(unreachable_witness.clone());
+        unreachable_witness.observe(None);
         assert_eq!(
-            vouched
+            unreachable
                 .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
                 .await
                 .err()
