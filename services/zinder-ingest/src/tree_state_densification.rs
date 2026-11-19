@@ -30,9 +30,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
-    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection, TreeStateStride,
-    TreeStateStrideCommit,
+    MAX_TREE_STATE_STRIDE_SCAN_READS, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
+    TreeStateStride, TreeStateStrideCommit,
 };
 
 use crate::{
@@ -77,6 +77,14 @@ const SCAN_READS_PER_BLOCK: u32 = 2;
 /// Reads one scan chunk makes before the pass paces it, the reads of one
 /// densified stride, so a scan bursts no more than a replay does.
 const SCAN_CHUNK_READS: u32 = SCAN_READS_PER_BLOCK * TREE_STATE_CHECKPOINT_STRIDE;
+/// Replayed blocks charged for a scan chunk that failed, so its reads are
+/// unknown.
+///
+/// A chunk stops only after the stride that reaches [`SCAN_CHUNK_READS`], so
+/// it makes up to that many reads less one, plus the most one more stride
+/// adds.
+const FAILED_SCAN_CHARGE_BLOCKS: u32 =
+    (SCAN_CHUNK_READS + MAX_TREE_STATE_STRIDE_SCAN_READS).div_ceil(SCAN_READS_PER_BLOCK);
 
 /// Resolved `[ingest.tree_state_densification]` settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,11 +414,8 @@ impl DensificationPass {
                 Ok(reads) => reads,
                 Err(reason) => {
                     // A failed chunk loses its read count, so the retry is
-                    // charged the most a chunk reads before it is paced.
-                    if self
-                        .pace(SCAN_CHUNK_READS.div_ceil(SCAN_READS_PER_BLOCK), cancel)
-                        .await
-                    {
+                    // charged the most a chunk can read.
+                    if self.pace(FAILED_SCAN_CHARGE_BLOCKS, cancel).await {
                         return Ok(StepOutcome::Cancelled);
                     }
                     return Err(reason);
@@ -825,4 +830,23 @@ fn record_integrity_failure(seed_height: BlockHeight, end_height: BlockHeight, r
         reason,
         "a settled tree-state stride does not replay to its stored checkpoints; it was not densified and reads there keep replaying"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_scan_is_charged_the_worst_case_reads_of_a_mixed_density_chunk() {
+        // Strides of 99 and 100 reads leave the chunk under its budget, so a
+        // third stride that reads the most any stride can still runs.
+        let chunk_reads = (SCAN_CHUNK_READS - 1).max(99 + 100) + MAX_TREE_STATE_STRIDE_SCAN_READS;
+        let charged_reads = FAILED_SCAN_CHARGE_BLOCKS * SCAN_READS_PER_BLOCK;
+
+        assert!(
+            charged_reads >= chunk_reads,
+            "charged {charged_reads} reads for a chunk that can make {chunk_reads}"
+        );
+        assert!(charged_reads > SCAN_CHUNK_READS);
+    }
 }

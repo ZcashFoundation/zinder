@@ -223,8 +223,9 @@ so the defaults hold the pass near 1,000 reads per second on average, with
 short bursts of up to one stride per worker. A scan stops after the stride that
 brings its reads to 200, the charge of one replayed stride, so densified
 history is scanned a stride or two at a time and the pass paces each chunk. A
-scan that fails is charged 200 reads before its retry, so a rescan of dense
-history after an upgrade stays within the same burst. Progress is reported by the
+scan that fails is charged 350 reads before its retry, the 199 reads a chunk
+makes before its last stride plus the 150 reads the costliest stride adds, so
+repeated failures stay within the configured rate. Progress is reported by the
 `zinder_ingest_tree_state_densification_*` metrics in
 [Metrics](../reference/metrics.md). A canonical rebuild returns history to the
 100-block cadence until the pass runs again.

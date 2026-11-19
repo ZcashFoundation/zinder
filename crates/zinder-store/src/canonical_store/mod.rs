@@ -92,8 +92,8 @@ pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };
 pub use tree_state_densification::{
-    DensifiedTreeStateStride, TreeStateCheckpointSelection, TreeStateStride, TreeStateStrideCommit,
-    TreeStateStrideScan,
+    DensifiedTreeStateStride, MAX_TREE_STATE_STRIDE_SCAN_READS, TreeStateCheckpointSelection,
+    TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan,
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
 

@@ -33,6 +33,16 @@ use super::{
     tree_state_replay::append_compact_block_commitments,
 };
 
+/// Most reads one stride adds to a scan.
+///
+/// A stride costs a read for each checkpoint row it holds and two more for each
+/// gap between rows that its selection checks. A gap needs at least one block
+/// of its own and a row fills one block, so a stride that alternates a row and
+/// a gap, one block each, reads the most: half a stride of rows and half a
+/// stride of gaps.
+pub const MAX_TREE_STATE_STRIDE_SCAN_READS: u32 =
+    TREE_STATE_CHECKPOINT_STRIDE + TREE_STATE_CHECKPOINT_STRIDE / 2;
+
 /// Which blocks of a stride receive a stored tree-state checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -178,8 +188,8 @@ impl RocksDbCanonicalSecondary {
     /// scan of a long history by the reads it makes.
     ///
     /// The scan always examines at least one stride and stops after the
-    /// stride that reaches the budget, so it overshoots by at most one
-    /// stride's reads.
+    /// stride that reaches the budget, so it makes fewer than `read_budget`
+    /// plus [`MAX_TREE_STATE_STRIDE_SCAN_READS`] reads.
     pub fn scan_tree_state_strides(
         &self,
         from: BlockHeight,
