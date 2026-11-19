@@ -10,7 +10,10 @@
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -503,7 +506,7 @@ async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<(
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
-            writer: UnavailableWriter,
+            writer: UnavailableWriter::default(),
             gate: following_tip_gate(),
             config: TreeStateDensificationConfig::default(),
         },
@@ -526,14 +529,64 @@ async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<(
     Ok(())
 }
 
-/// A writer that never commits.
-struct UnavailableWriter;
+/// Strides the pass replays are charged against its rate even when the
+/// writer cannot commit them, so retries stay under the configured ceiling.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn replays_the_writer_did_not_commit_are_charged_against_the_rate() -> eyre::Result<()> {
+    const RUN_FOR: Duration = Duration::from_secs(1_000);
+    const STRIDE_BLOCKS: u64 = 100;
+    let harness = Harness::new()?;
+    let writer = UnavailableWriter::default();
+    let attempts = Arc::clone(&writer.attempts);
+    let cancel = CancellationToken::new();
+    let task = spawn_tree_state_densification_task(
+        TreeStateDensificationContext {
+            canonical_primary_path: harness.primary_path()?,
+            secondary_path: next_secondary_path(harness.secondary_root.path()),
+            network_upgrade_activations: Arc::new(harness.activations.clone()),
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::None,
+            reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            writer,
+            gate: following_tip_gate(),
+            config: TreeStateDensificationConfig {
+                enabled: true,
+                selection: EVERY_BLOCK,
+                workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
+                max_blocks_per_second: NonZeroU32::MIN,
+            },
+        },
+        cancel.clone(),
+    );
+
+    tokio::time::sleep(RUN_FOR).await;
+    cancel.cancel();
+    task.await?;
+
+    // Each attempt follows a replay of a two-stride batch, and the pass may
+    // replay one batch ahead of its budget.
+    let replayed_blocks = u64::try_from(attempts.load(Ordering::SeqCst))? * 2 * STRIDE_BLOCKS;
+    eyre::ensure!(replayed_blocks > 0, "the pass never reached the writer");
+    eyre::ensure!(
+        replayed_blocks <= RUN_FOR.as_secs() + 2 * STRIDE_BLOCKS,
+        "the pass replayed {replayed_blocks} blocks in {RUN_FOR:?} at one block per second"
+    );
+    Ok(())
+}
+
+/// A writer that never commits and counts the strides offered to it.
+#[derive(Default)]
+struct UnavailableWriter {
+    attempts: Arc<AtomicUsize>,
+}
 
 impl TreeStateStrideWriter for UnavailableWriter {
     async fn commit_tree_state_stride(
         &self,
         _stride: DensifiedTreeStateStride,
     ) -> Result<TreeStateStrideCommit, TreeStateStrideWriteError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(TreeStateStrideWriteError::Unavailable {
             reason: "the test writer is unavailable".to_owned(),
         })

@@ -205,7 +205,7 @@ wallet serving.
 `ingest.tree_state_densification.workers` (2 by default) bounds how many
 strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
 (500 by default) bounds, on average, how many stored blocks it replays per
-second; a scan is charged one block for every two reads it makes. A replayed block costs
+second, including replays the writer could not commit and the pass retries; a scan is charged one block for every two reads it makes. A replayed block costs
 about two reads, its compact block and its header, and adds at most one row,
 so the defaults hold the pass near 1,000 reads per second on average, with
 short bursts of up to one stride per worker. Progress is reported by the

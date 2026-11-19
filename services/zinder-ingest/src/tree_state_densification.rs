@@ -426,16 +426,21 @@ impl DensificationPass {
                 Ok(()) => {
                     committed += 1;
                     record_remaining(self.queue.len() + batch.len() - committed);
-                    let replayed_blocks =
-                        stride.end_height().value() - stride.seed_height().value();
-                    if self.pace(replayed_blocks, cancel).await {
+                    if self.pace(replayed_blocks(*stride), cancel).await {
                         return Ok(StepOutcome::Cancelled);
                     }
                 }
                 Err(reason) => {
                     // This stride and the rest of the batch are retried first.
-                    for retried in batch[committed..].iter().rev() {
+                    // Their replays are discarded but were already made, so
+                    // they count against the rate before the retry.
+                    let discarded = &batch[committed..];
+                    for retried in discarded.iter().rev() {
                         self.queue.push_front(*retried);
+                    }
+                    let discarded_blocks = discarded.iter().copied().map(replayed_blocks).sum();
+                    if self.pace(discarded_blocks, cancel).await {
+                        return Ok(StepOutcome::Cancelled);
                     }
                     return Err(reason);
                 }
@@ -768,6 +773,12 @@ impl WatermarkFile {
         }
         Ok(())
     }
+}
+
+/// Blocks a replay of `stride` appends, which the pass charges against its
+/// rate.
+const fn replayed_blocks(stride: TreeStateStride) -> u32 {
+    stride.end_height().value() - stride.seed_height().value()
 }
 
 fn record_remaining(remaining: usize) {
