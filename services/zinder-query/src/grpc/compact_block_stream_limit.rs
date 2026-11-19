@@ -1,6 +1,6 @@
 //! Bound on concurrent native `CompactBlocksInRange` streams.
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::{future::Future, num::NonZeroU32, sync::Arc};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
@@ -17,8 +17,9 @@ pub const DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS: NonZeroU32 =
 /// Process-wide limit on open `CompactBlocksInRange` streams.
 ///
 /// A stream holds one slot from before its first read until it ends or the
-/// client drops it, so each open stream's buffered blocks count against the
-/// limit. Clones share the slots.
+/// client drops it and its outstanding read finishes, so each open stream's
+/// buffered blocks and blocking reads count against the limit. Clones share
+/// the slots.
 #[derive(Clone, Debug)]
 pub(super) struct CompactBlockStreamLimit {
     slots: Arc<Semaphore>,
@@ -37,20 +38,52 @@ impl CompactBlockStreamLimit {
         }
     }
 
-    /// Takes a slot for one stream, held until the returned permit drops.
+    /// Takes a slot for one stream, held until the returned slot and every
+    /// clone of it drop.
     ///
     /// # Errors
     ///
     /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
     /// refusal.
-    pub(super) fn try_open(&self) -> Result<OwnedSemaphorePermit, Status> {
-        Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
+    pub(super) fn try_open(&self) -> Result<CompactBlockStreamSlot, Status> {
+        let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
             metrics::counter!(STREAM_REFUSALS_COUNTER).increment(1);
             Status::resource_exhausted(format!(
                 "this server already serves {} CompactBlocksInRange streams; retry after a short delay",
                 self.max_streams
             ))
+        })?;
+        Ok(CompactBlockStreamSlot {
+            _permit: Arc::new(permit),
         })
+    }
+}
+
+/// One open stream's slot, returned to the limit when the last clone drops.
+///
+/// A cancelled request or a dropped stream does not stop a read already on
+/// the blocking pool. The query opening the stream takes a clone with
+/// [`CompactBlockStreamSlot::current`] for each such read and for the task
+/// that issues the later ones, so the slot stays taken until they end.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactBlockStreamSlot {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+tokio::task_local! {
+    static CURRENT_SLOT: CompactBlockStreamSlot;
+}
+
+impl CompactBlockStreamSlot {
+    /// Runs `open` while this slot is its [`current`](Self::current) one,
+    /// holding it until `open` ends or is dropped.
+    pub(super) async fn hold_during<F: Future>(self, open: F) -> F::Output {
+        CURRENT_SLOT.scope(self, open).await
+    }
+
+    /// The slot of the stream being opened, if any.
+    pub(crate) fn current() -> Option<Self> {
+        CURRENT_SLOT.try_with(Self::clone).ok()
     }
 }
 
@@ -77,11 +110,17 @@ mod tests {
     {
         let limit = CompactBlockStreamLimit::new(NonZeroU32::MIN);
         let open = limit.try_open()?;
+        let shared = open.clone();
         assert_eq!(
             limit.try_open().err().map(|status| status.code()),
             Some(Code::ResourceExhausted)
         );
         drop(open);
+        assert!(
+            limit.try_open().is_err(),
+            "a clone of the slot keeps it taken"
+        );
+        drop(shared);
         limit.try_open().map(drop)
     }
 }

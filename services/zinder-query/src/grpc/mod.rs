@@ -17,6 +17,7 @@ use zinder_store::status_from_store_error;
 use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
+pub(crate) use compact_block_stream_limit::CompactBlockStreamSlot;
 pub use compact_block_stream_limit::DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS;
 pub(crate) use compact_block_stream_limit::describe_metrics as describe_compact_block_stream_metrics;
 pub use native::{

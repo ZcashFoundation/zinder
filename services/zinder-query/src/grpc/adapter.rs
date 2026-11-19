@@ -432,6 +432,10 @@ where
             .map(Response::new)
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the item closure keeps the stream slot until the client drops the stream"
+    )]
     async fn compact_blocks_in_range(
         &self,
         request: Request<wallet::CompactBlocksInRangeRequest>,
@@ -454,17 +458,20 @@ where
                 None
             };
 
-        let compact_block_stream = self
-            .query_api
-            .compact_block_stream(block_range, at_epoch)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
+        // The query's blocking reads and the task issuing them take clones of
+        // the slot, so a cancelled request or a dropped stream keeps it until
+        // the read already on the blocking pool ends.
+        let open = self.query_api.compact_block_stream(block_range, at_epoch);
+        let compact_block_stream = match stream_slot.clone() {
+            Some(slot) => slot.hold_during(open).await,
+            None => open.await,
+        }
+        .map_err(|error| status_from_query_error(&error))?;
         let header = stream::once(Ok(compact_blocks_in_range_header(
             compact_block_stream.chain_epoch,
         )));
-        // The slot lives in the item closure, so it frees when the stream
-        // ends or the client drops it. A dropped stream's reader stops at its
-        // next send, so it can outlive the slot by one byte-capped read.
+        // The item closure keeps the slot while the client holds the stream,
+        // so blocks queued for it count against the limit.
         let items = ReceiverStream::new(compact_block_stream.blocks).map(move |block| {
             let _stream_slot = &stream_slot;
             block

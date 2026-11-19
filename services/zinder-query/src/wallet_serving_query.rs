@@ -49,6 +49,7 @@ use crate::{
     UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
     WalletServingPairSlot, WalletServingReadPair,
     broadcast_byte_budget::BroadcastByteBudget,
+    grpc::CompactBlockStreamSlot,
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
@@ -807,12 +808,18 @@ where
     ) -> Result<CompactBlockStream, QueryError> {
         let requested_blocks = Some(block_range.into_iter().len());
         let sub_read_bytes = self.compact_block_stream_sub_read_bytes;
+        // A read on the blocking pool outlives a cancelled request or a
+        // dropped stream, so the read and the task issuing the later ones
+        // each keep the adapter's stream slot until they end.
+        let stream_slot = CompactBlockStreamSlot::current();
         serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
             // The first read checks the whole range against retained history,
             // so a range the epoch cannot answer fails here, before any block.
+            let first_read_slot = stream_slot.clone();
             let (pair, chain_epoch, first_blocks) =
                 serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+                    let _stream_slot = &first_read_slot;
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     let first_blocks = pair.canonical().compact_blocks_in_range_up_to(
                         block_range,
@@ -823,17 +830,21 @@ where
                 })
                 .await?;
             let (blocks, receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
+            let range_drive = drive_serving_pair_compact_block_range(
+                self.serving_pair_slot.clone(),
+                pair,
+                CompactBlockRangeReads {
+                    last_height: block_range.end,
+                    sub_read_bytes,
+                },
+                first_blocks,
+                blocks,
+            );
             tokio::spawn(
-                drive_serving_pair_compact_block_range(
-                    self.serving_pair_slot.clone(),
-                    pair,
-                    CompactBlockRangeReads {
-                        last_height: block_range.end,
-                        sub_read_bytes,
-                    },
-                    first_blocks,
-                    blocks,
-                )
+                async move {
+                    let _stream_slot = stream_slot;
+                    range_drive.await;
+                }
                 .in_current_span(),
             );
             Ok(CompactBlockStream {
@@ -1952,17 +1963,185 @@ mod tree_state_replay_limit_tests {
 
 #[cfg(test)]
 mod compact_block_stream_tests {
-    use std::{error::Error, sync::Arc, time::Duration};
+    use std::{error::Error, num::NonZeroU32, sync::Arc, time::Duration};
 
+    use tokio_stream::StreamExt as _;
+    use tonic::{Code, Request};
     use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
+    use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
     use zinder_testkit::{
-        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+        ChainFixture, IngestControlFixture, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
     };
 
     use crate::{
-        QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-        WalletServingReadPair,
+        AdmittedIngestControl, QueryError, WalletEndpointMetadata, WalletQueryApi,
+        WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
     };
+
+    type NativeQuery = WalletServingQuery<(), AdmittedIngestControl>;
+
+    /// The only blocking thread of a runtime built with one, held until
+    /// [`release`](Self::release).
+    struct HeldBlockingPool {
+        release: tokio::sync::oneshot::Sender<()>,
+        holder: tokio::task::JoinHandle<()>,
+    }
+
+    impl HeldBlockingPool {
+        async fn hold() -> Result<Self, Box<dyn Error>> {
+            let (pool_held, pool_held_receiver) = tokio::sync::oneshot::channel();
+            let (release, pool_released) = tokio::sync::oneshot::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || {
+                let _ = pool_held.send(());
+                let _ = pool_released.blocking_recv();
+            });
+            pool_held_receiver.await?;
+            Ok(Self { release, holder })
+        }
+
+        async fn release(self) -> Result<(), Box<dyn Error>> {
+            self.release
+                .send(())
+                .map_err(|()| "the held blocking thread stopped waiting")?;
+            self.holder.await?;
+            Ok(())
+        }
+    }
+
+    /// A native adapter over three blocks that serves one stream at once,
+    /// whose stream reads keep at most `sub_read_bytes` each.
+    async fn one_stream_adapter(
+        sub_read_bytes: usize,
+    ) -> Result<
+        (
+            WalletQueryGrpcAdapter<NativeQuery>,
+            WalletServingStoreFixture,
+            IngestControlFixture,
+        ),
+        Box<dyn Error>,
+    > {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let mut query = WalletServingQuery::from_admitted_native_serving_pair(slot, ingest_control);
+        query.compact_block_stream_sub_read_bytes = sub_read_bytes;
+        let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default())
+            .with_max_concurrent_compact_block_streams(NonZeroU32::MIN);
+        Ok((adapter, store, ingest_fixture))
+    }
+
+    fn range_request(end_height: u32) -> Request<wallet::CompactBlocksInRangeRequest> {
+        Request::new(wallet::CompactBlocksInRangeRequest {
+            start_height: 1,
+            end_height,
+            at_epoch_id: None,
+        })
+    }
+
+    /// Asserts that opening a stream is refused at once because the only
+    /// slot is still taken.
+    async fn assert_slot_taken(
+        adapter: &WalletQueryGrpcAdapter<NativeQuery>,
+    ) -> Result<(), Box<dyn Error>> {
+        let opened = tokio::time::timeout(
+            Duration::from_secs(1),
+            WalletQueryService::compact_blocks_in_range(adapter, range_request(3)),
+        )
+        .await
+        .map_err(|_| "a stream took the slot a queued read still needs")?;
+        match opened {
+            Ok(_) => Err("a stream opened while the only slot was taken".into()),
+            Err(status) if status.code() == Code::ResourceExhausted => Ok(()),
+            Err(status) => Err(format!("unexpected status {status:?}").into()),
+        }
+    }
+
+    /// Waits until a stream opens again once the queued read has ended.
+    async fn wait_for_free_slot(
+        adapter: &WalletQueryGrpcAdapter<NativeQuery>,
+    ) -> Result<(), Box<dyn Error>> {
+        let started = std::time::Instant::now();
+        loop {
+            match WalletQueryService::compact_blocks_in_range(adapter, range_request(3)).await {
+                Ok(_) => return Ok(()),
+                Err(status) if status.code() == Code::ResourceExhausted => {}
+                Err(status) => return Err(format!("unexpected status {status:?}").into()),
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                return Err("the stream slot was never returned".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn one_blocking_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+    }
+
+    /// A request cancelled while its first read waits on the blocking pool
+    /// keeps its stream slot until that read ends.
+    #[test]
+    fn a_cancelled_compact_block_stream_keeps_its_slot_until_its_read_ends()
+    -> Result<(), Box<dyn Error>> {
+        one_blocking_thread_runtime()?.block_on(cancel_a_stream_while_its_first_read_waits())
+    }
+
+    async fn cancel_a_stream_while_its_first_read_waits() -> Result<(), Box<dyn Error>> {
+        let (adapter, _store, _ingest) =
+            one_stream_adapter(crate::COMPACT_BLOCK_STREAM_SUB_READ_BYTES).await?;
+        let held_pool = HeldBlockingPool::hold().await?;
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            WalletQueryService::compact_blocks_in_range(&adapter, range_request(3)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the stream opened without reading");
+        assert_slot_taken(&adapter).await?;
+
+        held_pool.release().await?;
+        wait_for_free_slot(&adapter).await
+    }
+
+    /// A stream the client drops while its next read waits on the blocking
+    /// pool keeps its slot until that read ends.
+    #[test]
+    fn a_dropped_compact_block_stream_keeps_its_slot_until_its_next_read_ends()
+    -> Result<(), Box<dyn Error>> {
+        one_blocking_thread_runtime()?.block_on(drop_a_stream_while_its_next_read_waits())
+    }
+
+    async fn drop_a_stream_while_its_next_read_waits() -> Result<(), Box<dyn Error>> {
+        let (adapter, _store, _ingest) = one_stream_adapter(1).await?;
+        let mut stream = WalletQueryService::compact_blocks_in_range(&adapter, range_request(3))
+            .await?
+            .into_inner();
+        // Held before the stream's task runs, so its second read queues.
+        let held_pool = HeldBlockingPool::hold().await?;
+        for _ in 0..2 {
+            stream.next().await.ok_or("the stream ended early")??;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        drop(stream);
+        assert_slot_taken(&adapter).await?;
+
+        held_pool.release().await?;
+        wait_for_free_slot(&adapter).await
+    }
 
     fn query_over(
         blocks: u32,
