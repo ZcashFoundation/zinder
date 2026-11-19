@@ -241,6 +241,7 @@ pub(crate) struct RpcSummary {
     /// Time from opening a stream to its first block.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_message_seconds: Option<Percentiles>,
+    /// Messages received: each block of a stream, or a unary response.
     messages: u64,
     /// Protobuf-encoded size of the messages received, not bytes on the wire.
     bytes: u64,
@@ -343,11 +344,17 @@ pub(super) async fn unary<Response, Call>(
     call: Call,
 ) -> Result<Response, CallFailure>
 where
+    Response: prost::Message,
     Call: Future<Output = Result<tonic::Response<Response>, Status>>,
 {
     let mut pending = PendingCall::new(recorder, method);
     let outcome = match tokio::time::timeout(deadline, call).await {
-        Ok(Ok(response)) => Ok(response.into_inner()),
+        Ok(Ok(response)) => {
+            let response = response.into_inner();
+            pending.messages = 1;
+            pending.bytes = u64::try_from(response.encoded_len()).unwrap_or(u64::MAX);
+            Ok(response)
+        }
         Ok(Err(status)) => Err(CallFailure::from_status(&status)),
         Err(_) => Err(CallFailure::client_timeout(method, deadline)),
     };
@@ -639,7 +646,41 @@ fn serialize_optional_seconds<S: serde::Serializer>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, TreeStateHeights};
+    use std::time::Duration;
+
+    use prost::Message as _;
+    use tonic::Status;
+    use zinder_proto::compat::lightwalletd::TreeState;
+
+    use super::{CallRecorder, Percentiles, TreeStateHeights, unary};
+
+    #[tokio::test]
+    async fn a_unary_response_counts_as_one_message_of_its_encoded_size() {
+        let recorder = CallRecorder::default();
+        let tree_state = TreeState {
+            height: 3_424_810,
+            sapling_tree: "00".repeat(40),
+            ..TreeState::default()
+        };
+        let encoded_bytes = u64::try_from(tree_state.encoded_len()).unwrap_or(u64::MAX);
+
+        let answered = unary(&recorder, "GetTreeState", Duration::from_secs(1), async {
+            Ok(tonic::Response::new(tree_state))
+        })
+        .await;
+        let refused = unary::<TreeState, _>(&recorder, "GetTreeState", Duration::from_secs(1), {
+            async { Err(Status::unavailable("busy")) }
+        })
+        .await;
+
+        assert!(answered.is_ok());
+        assert!(refused.is_err());
+        let summary = &recorder.rpc_summaries()["GetTreeState"];
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.messages, 1);
+        assert_eq!(summary.bytes, encoded_bytes);
+        assert!(summary.first_message_seconds.is_none());
+    }
 
     #[test]
     fn tree_state_heights_count_replay_depth_off_the_checkpoint_cadence() {
