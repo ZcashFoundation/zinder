@@ -8,7 +8,8 @@
 //! blocks. Each worker hands its stream on in pieces of up to 8 MiB, and every
 //! piece except the range's last asks for the tree state at its last block. A
 //! failed chunk is resumed from its next height on a fresh connection after
-//! 0.25, 0.5, and 1 seconds. When the blocks are in, the wallet fetches
+//! 0.25, 0.5, and 1 seconds; only a stream that ends cleanly after the chunk's
+//! last block completes it. When the blocks are in, the wallet fetches
 //! transactions eight at a time.
 
 use std::{
@@ -179,7 +180,11 @@ async fn fetch_worker(wallet: &Arc<Wallet>) -> Result<(), CallFailure> {
 
 /// Streams one plan chunk, resuming after failures, and hands it on in pieces.
 ///
-/// A failed connect counts as a failed attempt, like a failed stream.
+/// A failed attempt hands on the blocks it received as a piece, except a
+/// piece holding the chunk's last block: as in Slipstream, only a stream
+/// that ends cleanly after that block completes the chunk, so the attempt
+/// that follows asks for the piece again. A failed connect counts as a
+/// failed attempt, like a failed stream.
 async fn fetch_chunk(
     wallet: &Arc<Wallet>,
     client: &mut Option<LwdClient>,
@@ -191,7 +196,7 @@ async fn fetch_chunk(
     let mut pieces = PieceSplitter::new(wallet.split_bytes);
     let mut failed_attempts = 0_u32;
     while resume_from <= end {
-        let mut made_progress = false;
+        let attempt_start = resume_from;
         let streamed = match wallet.connector.reuse_or_connect(client).await {
             Ok(connected) => {
                 calls::get_block_range(
@@ -209,7 +214,6 @@ async fn fetch_chunk(
                             hand_on_piece(wallet, last_height);
                         }
                         resume_from = block.height.saturating_add(1);
-                        made_progress = true;
                     },
                 )
                 .await
@@ -217,11 +221,13 @@ async fn fetch_chunk(
             Err(failure) => Err(failure),
         };
         let Err(failure) = streamed else { break };
-        if resume_from > end {
-            break;
+        match pieces.take_open() {
+            Some((first_height, last_height)) if last_height >= end => resume_from = first_height,
+            Some((_, last_height)) => hand_on_piece(wallet, last_height),
+            None => {}
         }
-        // An attempt that received blocks starts a fresh retry budget.
-        failed_attempts = if made_progress {
+        // An attempt that handed on blocks starts a fresh retry budget.
+        failed_attempts = if resume_from > attempt_start {
             1
         } else {
             failed_attempts + 1
@@ -245,7 +251,8 @@ async fn fetch_chunk(
 struct PieceSplitter {
     split_bytes: u64,
     bytes: u64,
-    last_height: Option<u64>,
+    /// First and last height of the piece still open.
+    open: Option<(u64, u64)>,
 }
 
 impl PieceSplitter {
@@ -253,27 +260,36 @@ impl PieceSplitter {
         Self {
             split_bytes,
             bytes: 0,
-            last_height: None,
+            open: None,
         }
     }
 
     /// Adds one block, returning the last height of the piece it completes.
     fn push(&mut self, height: u64, encoded_bytes: u64) -> Option<u64> {
-        let completed =
-            if self.bytes > 0 && self.bytes.saturating_add(encoded_bytes) > self.split_bytes {
-                self.bytes = 0;
-                self.last_height
-            } else {
-                None
-            };
+        let completed = match self.open {
+            Some((_, last_height))
+                if self.bytes.saturating_add(encoded_bytes) > self.split_bytes =>
+            {
+                self.take_open();
+                Some(last_height)
+            }
+            Some(_) | None => None,
+        };
+        let first_height = self.open.map_or(height, |(first_height, _)| first_height);
+        self.open = Some((first_height, height));
         self.bytes = self.bytes.saturating_add(encoded_bytes);
-        self.last_height = Some(height);
         completed
     }
 
+    /// Closes the piece still open, returning its first and last height.
+    fn take_open(&mut self) -> Option<(u64, u64)> {
+        self.bytes = 0;
+        self.open.take()
+    }
+
     /// The last height of the piece still open, if any.
-    fn finish(self) -> Option<u64> {
-        self.last_height.filter(|_| self.bytes > 0)
+    fn finish(mut self) -> Option<u64> {
+        self.take_open().map(|(_, last_height)| last_height)
     }
 }
 
@@ -414,10 +430,96 @@ impl Dispatcher {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use std::sync::Arc;
+
+    use tonic::Code;
+
     use super::{
-        CHUNK_BLOCKS, DEFAULT_SPLIT_BYTES, DENSITY_WAIT, Dispatcher, PieceSplitter, WalletPlan,
-        chunk_target_bytes,
+        CHUNK_BLOCKS, CHUNK_RETRIES, DEFAULT_SPLIT_BYTES, DENSITY_WAIT, Dispatcher, PieceSplitter,
+        WalletPlan, chunk_target_bytes, sync_wallet,
     };
+    use crate::wallet_load::{
+        WalletProgress, WorkloadSettings,
+        calls::{CallFailure, CallRecorder, Connector},
+        mock_streamer::{self, MockStreamer, RangeEnding},
+        vizor::VizorProfile,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// One wallet syncing 1..=5, a single probe-sized chunk, from a mock
+    /// server whose block streams end with `range_ending`.
+    async fn sync_one_chunk(
+        range_ending: RangeEnding,
+    ) -> Result<(Result<(), CallFailure>, Arc<CallRecorder>), Box<dyn std::error::Error>> {
+        let server = mock_streamer::serve(MockStreamer { range_ending }).await?;
+        let recorder = Arc::new(CallRecorder::default());
+        let connector = Connector::new(&server.url, Arc::clone(&recorder))?;
+        let plan = Arc::new(WalletPlan {
+            from_height: 1,
+            to_height: 5,
+            mainnet: false,
+            sapling_activation_height: 1,
+        });
+        let settings = Arc::new(WorkloadSettings {
+            transactions_per_wallet: 0,
+            split_bytes: DEFAULT_SPLIT_BYTES,
+            vizor_profile: VizorProfile::Mobile,
+            batch_byte_budget: None,
+            rounds: 0,
+            transparent_addresses: Vec::new(),
+        });
+        let synced = sync_wallet(connector, plan, settings, Arc::new(WalletProgress::new(0))).await;
+        Ok((synced, recorder))
+    }
+
+    fn block_range_requests(recorder: &CallRecorder) -> Result<u64, Box<dyn std::error::Error>> {
+        let summaries = serde_json::to_value(recorder.rpc_summaries())?;
+        summaries
+            .pointer("/GetBlockRange/requests")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("no GetBlockRange requests in {summaries}").into())
+    }
+
+    #[tokio::test]
+    async fn a_chunk_completes_when_its_stream_ends_cleanly_after_its_last_block() -> TestResult {
+        let (synced, recorder) = sync_one_chunk(RangeEnding::Clean).await?;
+
+        assert!(synced.is_ok(), "{synced:?}");
+        assert_eq!(block_range_requests(&recorder)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_sends_a_block_past_the_chunk_fails_the_chunk() -> TestResult {
+        let (synced, recorder) = sync_one_chunk(RangeEnding::ExtraBlock).await?;
+
+        let failure = synced
+            .err()
+            .ok_or("an extra trailing block must fail the chunk")?;
+        assert_eq!(failure.label, "out_of_sequence");
+        // The first attempt and every retry asked for the whole chunk again.
+        assert_eq!(
+            block_range_requests(&recorder)?,
+            u64::from(CHUNK_RETRIES) + 1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_fails_after_the_chunk_last_block_fails_the_chunk() -> TestResult {
+        let (synced, recorder) = sync_one_chunk(RangeEnding::Status(Code::Internal)).await?;
+
+        let failure = synced
+            .err()
+            .ok_or("a failed final status must fail the chunk")?;
+        assert_eq!(failure.label, "internal");
+        assert_eq!(
+            block_range_requests(&recorder)?,
+            u64::from(CHUNK_RETRIES) + 1
+        );
+        Ok(())
+    }
 
     #[test]
     fn pieces_close_before_the_block_that_would_overflow_them() {
@@ -431,6 +533,18 @@ mod tests {
         assert_eq!(pieces.push(14, 10), Some(13));
         assert_eq!(pieces.finish(), Some(14));
         assert_eq!(PieceSplitter::new(1_000).finish(), None);
+    }
+
+    #[test]
+    fn taking_the_open_piece_starts_the_next_one_empty() {
+        let mut pieces = PieceSplitter::new(1_000);
+
+        assert_eq!(pieces.push(10, 600), None);
+        assert_eq!(pieces.push(11, 300), None);
+        assert_eq!(pieces.take_open(), Some((10, 11)));
+        assert_eq!(pieces.push(12, 600), None);
+        assert_eq!(pieces.push(13, 300), None);
+        assert_eq!(pieces.finish(), Some(13));
     }
 
     #[test]

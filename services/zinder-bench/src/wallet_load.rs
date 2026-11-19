@@ -10,6 +10,8 @@
 
 mod calls;
 mod classic_sdk;
+#[cfg(test)]
+mod mock_streamer;
 mod point_reads;
 mod server_metrics;
 mod slipstream;

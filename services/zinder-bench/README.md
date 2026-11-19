@@ -708,9 +708,12 @@ source:
   a 64-block probe. Later requests are sized to 16 MiB at the density received
   so far, at most 10,000 blocks. Each 8 MiB piece of a stream (`--split-bytes`)
   except the range's last asks for the tree state at its last block. A failed
-  request resumes from its next block on a fresh connection after 0.25, 0.5,
-  and 1 seconds, and a failed tree state is retried after 1 and 3 seconds. Once
-  the blocks are in, the wallet fetches `--transactions-per-wallet`
+  request hands on the blocks it received and resumes after them on a fresh
+  connection after 0.25, 0.5, and 1 seconds. Only a stream that ends cleanly
+  after the request's last block completes it, so a stream that sends a block
+  past the request or fails after its last block is retried from the start of
+  that block's piece. A failed tree state is retried after 1 and 3 seconds.
+  Once the blocks are in, the wallet fetches `--transactions-per-wallet`
   transactions from them, 8 at a time.
 - `vizor`: the Vizor wallet. Each batch streams its blocks with a pool filter
   naming Sapling, Orchard, and Ironwood and asks for the tree state below its
