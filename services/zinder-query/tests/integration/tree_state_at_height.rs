@@ -207,6 +207,99 @@ async fn tree_state_without_its_history_predecessor_checkpoint_reports_damaged_s
     served.shutdown().await
 }
 
+/// Raw `payload_bytes` of a tree state whose three pools are all active.
+///
+/// The bytes are the base revision's wire output: pool objects in ascending
+/// name order, no whitespace, `finalState` as lowercase hexadecimal. Writing
+/// them out keeps the test independent of the serializer that produces them.
+const THREE_POOL_PAYLOAD: &[u8] = concat!(
+    r#"{"ironwood":{"commitments":{"finalState":""#,
+    "01daa66d2b00030000000000000000000000000000000000000000000000000000001f",
+    "00000000000000000000000000000000000000000000000000000000000000",
+    r#""}},"orchard":{"commitments":{"finalState":""#,
+    "0178dde6e401020000000000000000000000000000000000000000000000000000001f",
+    "0180be2f81414cf2c73c2eb5c59db17b62b352d7410d78ff26aa380d51597c5c22",
+    "000000000000000000000000000000000000000000000000000000000000",
+    r#""}},"sapling":{"commitments":{"finalState":""#,
+    "013c6ef372010100000000000000000000000000000000000000000000000000000178dde6e4",
+    "000100000000000000000000000000000000000000000000000000001f",
+    "011a35bf37458bdb4f7ab8cf4ad101e8b3474de87819799351ea2a0f33d529e934",
+    "000000000000000000000000000000000000000000000000000000000000",
+    r#""}}}"#,
+)
+.as_bytes();
+
+#[tokio::test]
+async fn native_tree_state_rpcs_emit_the_literal_three_pool_payload_bytes() -> eyre::Result<()> {
+    let activations = three_pool_activations()?;
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(4),
+        &activations,
+    )?;
+    let tip_height = BlockHeight::new(4);
+    let tip = commitment_tree_checkpoints(&chain, &activations, &[tip_height])?;
+    let tip = tip
+        .first()
+        .ok_or_else(|| eyre!("the fixture chain must have a tip checkpoint"))?;
+    for protocol in [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ] {
+        assert!(
+            tip.frontiers.get(protocol).is_some(),
+            "{protocol:?} must be active at the tip"
+        );
+    }
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let served = NodelessQuery::over(writer.into_serving_store_fixture()?).await?;
+
+    let at_height = WalletQueryService::tree_state_at_height(
+        &served.adapter,
+        Request::new(wallet::TreeStateAtHeightRequest {
+            height: tip_height.value(),
+            at_epoch_id: None,
+        }),
+    )
+    .await?
+    .into_inner();
+    let latest = WalletQueryService::latest_tree_state_checkpoint(
+        &served.adapter,
+        Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch_id: None }),
+    )
+    .await?
+    .into_inner();
+
+    assert_eq!(at_height.payload_bytes, THREE_POOL_PAYLOAD);
+    assert_eq!(latest.payload_bytes, THREE_POOL_PAYLOAD);
+    served.shutdown().await
+}
+
+/// Regtest activations where Sapling, Orchard, and Ironwood are all active
+/// by height 3.
+fn three_pool_activations() -> eyre::Result<NetworkUpgradeActivations> {
+    let sample = sample_regtest_upgrade_activations();
+    let activations = sample
+        .activations()
+        .iter()
+        .map(|activation| {
+            let activation_height = match activation.name.as_str() {
+                "NU5" | "NU6" | "NU6.1" | "NU6.2" => BlockHeight::new(2),
+                "NU6.3" | "NU7" => BlockHeight::new(3),
+                _ => activation.activation_height,
+            };
+            NetworkUpgradeActivation {
+                activation_height,
+                ..activation.clone()
+            }
+        })
+        .collect();
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
+}
+
 /// Regtest activations with Orchard and Ironwood activating between
 /// construction checkpoints.
 fn gap_activations() -> eyre::Result<NetworkUpgradeActivations> {

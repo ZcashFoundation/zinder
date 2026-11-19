@@ -9,7 +9,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use zinder_core::{
@@ -17,9 +16,9 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
+    NetworkUpgradeActivations, RawTransactionBytes, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -46,8 +45,8 @@ use crate::{
     SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
-    WalletServingPairSlot, WalletServingReadPair,
+    TreeStateFrontiers, UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader,
+    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
     broadcast_byte_budget::BroadcastByteBudget,
     grpc::CompactBlockStreamSlot,
     node_broadcast::EndpointVerifications,
@@ -1221,10 +1220,9 @@ where
                 .await?;
             let replay = match lookup {
                 TreeStateLookup::Stored(stored) => {
-                    let tree_state = tree_state_from_checkpoint(lookup_epoch, &stored)?;
                     let trees = stored.tip_metadata();
                     record_tree_state_read(height, 0, trees, trees);
-                    return Ok(tree_state);
+                    return Ok(tree_state_from_checkpoint(lookup_epoch, stored));
                 }
                 TreeStateLookup::Replay(replay) => replay,
             };
@@ -1248,10 +1246,11 @@ where
                     Ok((chain_epoch, outcome, started_at.elapsed()))
                 })
                 .await?;
-            match &outcome {
+            let checkpoint = match outcome {
                 TreeStateReplayOutcome::Stored(stored) => {
                     let trees = stored.tip_metadata();
                     record_tree_state_read(height, 0, trees, trees);
+                    stored
                 }
                 TreeStateReplayOutcome::Replayed { replay, checkpoint } => {
                     record_replay_duration(height, replay_duration);
@@ -1261,9 +1260,10 @@ where
                         replay.seed().tip_metadata(),
                         checkpoint.tip_metadata(),
                     );
+                    checkpoint
                 }
-            }
-            tree_state_from_checkpoint(chain_epoch, outcome.checkpoint())
+            };
+            Ok(tree_state_from_checkpoint(chain_epoch, checkpoint))
         })
         .await
     }
@@ -1286,7 +1286,7 @@ where
                             chain_epoch.visible_tip_height,
                         )
                     })?;
-                tree_state_from_checkpoint(chain_epoch, &checkpoint)
+                Ok(tree_state_from_checkpoint(chain_epoch, checkpoint))
             },
         )
         .await
@@ -1684,38 +1684,97 @@ fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryErr
 
 fn tree_state_from_checkpoint(
     chain_epoch: ChainEpoch,
-    checkpoint: &zinder_core::CommitmentTreeCheckpoint,
-) -> Result<TreeState, QueryError> {
-    let mut payload = Map::new();
-    for (name, protocol) in [
-        ("sapling", ShieldedProtocol::Sapling),
-        ("orchard", ShieldedProtocol::Orchard),
-        ("ironwood", ShieldedProtocol::Ironwood),
-    ] {
-        if let Some(frontier) = checkpoint.frontiers.get(protocol) {
-            payload.insert(
-                name.to_owned(),
-                json!({
-                    "commitments": {
-                        "finalState": hex::encode(frontier.final_state_bytes())
-                    }
-                }),
-            );
+    checkpoint: zinder_core::CommitmentTreeCheckpoint,
+) -> TreeState {
+    let zinder_core::CommitmentTreeCheckpoint {
+        block_id,
+        block_time_seconds,
+        frontiers,
+    } = checkpoint;
+    let (sapling, orchard, ironwood) = frontiers.into_parts();
+    let final_state = |frontier: zinder_core::CommitmentTreeFrontier| {
+        frontier.into_final_state_bytes().into_vec()
+    };
+    TreeState {
+        chain_epoch,
+        height: block_id.height,
+        block_hash: block_id.hash,
+        block_time_seconds,
+        frontiers: TreeStateFrontiers {
+            sapling_final_state: sapling.map(final_state),
+            orchard_final_state: orchard.map(final_state),
+            ironwood_final_state: ironwood.map(final_state),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tree_state_conversion_tests {
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
+        ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+        CommitmentTreeFrontiers, Network, ShieldedProtocol, UnixTimestampMillis,
+    };
+
+    use super::tree_state_from_checkpoint;
+
+    fn chain_epoch() -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(1),
+            visible_tip_hash: BlockHash::from_bytes([1; 32]),
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: BlockHash::from_bytes([1; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(20),
+            tip_metadata: ChainTipMetadata::new(0, 0, 0),
+            created_at: UnixTimestampMillis::new(0),
         }
     }
-    let payload_bytes = serde_json::to_vec(&Value::Object(payload)).map_err(|source| {
-        QueryError::ArtifactCorrupt {
-            family: ArtifactFamily::TreeState,
-            reason: source.to_string(),
+
+    /// The response must own the checkpoint's buffers, not copies of them.
+    #[test]
+    fn tree_state_from_checkpoint_moves_each_frontier_buffer_into_the_response() {
+        let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
+        let orchard = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
+        let ironwood = CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood);
+        let source_buffers = [
+            sapling.final_state_bytes().as_ptr(),
+            orchard.final_state_bytes().as_ptr(),
+            ironwood.final_state_bytes().as_ptr(),
+        ];
+        let expected_lengths = [
+            sapling.final_state_bytes().len(),
+            orchard.final_state_bytes().len(),
+            ironwood.final_state_bytes().len(),
+        ];
+        let checkpoint = CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([2; 32])),
+            1_774_668_401,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(sapling),
+                Some(orchard),
+                Some(ironwood),
+            ),
+        );
+
+        let tree_state = tree_state_from_checkpoint(chain_epoch(), checkpoint);
+        let served = [
+            tree_state.frontiers.sapling_final_state,
+            tree_state.frontiers.orchard_final_state,
+            tree_state.frontiers.ironwood_final_state,
+        ];
+
+        for ((served, source_buffer), expected_length) in
+            served.iter().zip(source_buffers).zip(expected_lengths)
+        {
+            let served = served.as_deref().unwrap_or_default();
+            assert_eq!(served.as_ptr(), source_buffer);
+            assert_eq!(served.len(), expected_length);
         }
-    })?;
-    Ok(TreeState {
-        chain_epoch,
-        height: checkpoint.block_id.height,
-        block_hash: checkpoint.block_id.hash,
-        block_time_seconds: checkpoint.block_time_seconds,
-        payload_bytes,
-    })
+        assert_eq!(tree_state.height, BlockHeight::new(1));
+        assert_eq!(tree_state.block_time_seconds, 1_774_668_401);
+    }
 }
 
 #[cfg(test)]

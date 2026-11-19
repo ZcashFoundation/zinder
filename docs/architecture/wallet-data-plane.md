@@ -93,6 +93,8 @@ Full blocks exist only when ingest writes block blobs, which requires `storage.r
 
 Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at the tip where that sync ends, and at every block it appends afterwards. While following, it adds checkpoints to settled history from the first sync: by default one each time 1,024 note commitments have accumulated, or one for every block when `ingest.tree_state_densification.selection` is `every-block`, as [Chain ingestion](chain-ingestion.md#tree-state-densification) describes. A height with a checkpoint is read directly. Any other height is rebuilt from the nearest checkpoint below it and the stored compact blocks in between, which replays at most 99 blocks.
 
+The query hands each tree state to its adapters as typed per-pool frontier bytes. Native `TreeStateAtHeight` and `LatestTreeStateCheckpoint` encode them as the `z_gettreestate`-shaped JSON `payload_bytes`, with an entry only for each pool active at that height. The lightwalletd adapter hex-encodes the same bytes into its per-pool strings and returns an empty string for an inactive pool.
+
 | Condition | Status and reason |
 | --- | --- |
 | Height above the visible tip, or below the parent of the store's first retained block | `NOT_FOUND`, `BLOCK_NOT_IN_BEST_CHAIN` |

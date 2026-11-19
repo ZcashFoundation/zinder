@@ -136,6 +136,12 @@ impl CommitmentTreeFrontier {
     pub fn final_state_bytes(&self) -> &[u8] {
         &self.final_state_bytes
     }
+
+    /// Consumes the frontier and returns its `finalState` bytes without copying.
+    #[must_use]
+    pub fn into_final_state_bytes(self) -> Box<[u8]> {
+        self.final_state_bytes
+    }
 }
 
 #[cfg(feature = "commitment-tree-codec")]
@@ -459,6 +465,19 @@ impl CommitmentTreeFrontiers {
     #[must_use]
     pub const fn ironwood(&self) -> Option<&CommitmentTreeFrontier> {
         self.ironwood.as_ref()
+    }
+
+    /// Consumes the frontiers and returns the Sapling, Orchard, and Ironwood
+    /// frontiers in that order.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<CommitmentTreeFrontier>,
+        Option<CommitmentTreeFrontier>,
+        Option<CommitmentTreeFrontier>,
+    ) {
+        (self.sapling, self.orchard, self.ironwood)
     }
 
     /// Derives chain-tip metadata from the admitted frontier sizes.

@@ -803,6 +803,20 @@ pub struct TransparentAddressTxIds {
     pub next_cursor: Option<StreamCursorTokenV1>,
 }
 
+/// Typed canonical `z_gettreestate` `finalState` frontier bytes per pool.
+///
+/// `None` marks a pool that is not active at the tree state's height;
+/// `Some(bytes)` holds the raw canonical legacy `CommitmentTree` encoding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TreeStateFrontiers {
+    /// Raw Sapling `finalState` bytes, or `None` before Sapling activation.
+    pub sapling_final_state: Option<Vec<u8>>,
+    /// Raw Orchard `finalState` bytes, or `None` before NU5 activation.
+    pub orchard_final_state: Option<Vec<u8>>,
+    /// Raw Ironwood `finalState` bytes, or `None` before NU6.3 activation.
+    pub ironwood_final_state: Option<Vec<u8>>,
+}
+
 /// Tree-state response bound to one chain epoch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeState {
@@ -814,8 +828,37 @@ pub struct TreeState {
     pub block_hash: zinder_core::BlockHash,
     /// Block timestamp in Unix seconds.
     pub block_time_seconds: u32,
-    /// Encoded tree-state payload bytes.
-    pub payload_bytes: Vec<u8>,
+    /// Typed per-pool canonical `finalState` frontier bytes.
+    pub frontiers: TreeStateFrontiers,
+}
+
+impl TreeState {
+    /// Encodes the native `z_gettreestate`-compatible JSON payload bytes.
+    pub fn encode_json_payload(&self) -> Result<Vec<u8>, QueryError> {
+        let mut payload = serde_json::Map::new();
+        for (name, bytes) in [
+            ("sapling", self.frontiers.sapling_final_state.as_deref()),
+            ("orchard", self.frontiers.orchard_final_state.as_deref()),
+            ("ironwood", self.frontiers.ironwood_final_state.as_deref()),
+        ] {
+            if let Some(bytes) = bytes {
+                payload.insert(
+                    name.to_owned(),
+                    serde_json::json!({
+                        "commitments": {
+                            "finalState": hex::encode(bytes)
+                        }
+                    }),
+                );
+            }
+        }
+        serde_json::to_vec(&serde_json::Value::Object(payload)).map_err(|source| {
+            QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::TreeState,
+                reason: source.to_string(),
+            }
+        })
+    }
 }
 
 /// Subtree-root response bound to one chain epoch.
@@ -1468,5 +1511,153 @@ mod error_reason_tests {
             reason: "probe".to_owned(),
         });
         assert_eq!(transient.error_reason(), ErrorReason::NodeUnavailable);
+    }
+}
+
+#[cfg(test)]
+mod tree_state_payload_tests {
+    use serde_json::{Map, Value, json};
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+        Network, UnixTimestampMillis,
+    };
+
+    use super::{TreeState, TreeStateFrontiers};
+
+    /// The payload encoding `WalletServingQuery` produced before frontiers
+    /// reached the adapters as typed bytes.
+    fn reference_payload(pools: [(&'static str, Option<&[u8]>); 3]) -> Vec<u8> {
+        let mut payload = Map::new();
+        for (name, bytes) in pools {
+            if let Some(bytes) = bytes {
+                payload.insert(
+                    name.to_owned(),
+                    json!({ "commitments": { "finalState": hex::encode(bytes) } }),
+                );
+            }
+        }
+        serde_json::to_vec(&Value::Object(payload)).unwrap_or_default()
+    }
+
+    fn tree_state(frontiers: TreeStateFrontiers) -> TreeState {
+        TreeState {
+            chain_epoch: ChainEpoch {
+                id: ChainEpochId::new(1),
+                network: Network::ZcashRegtest,
+                visible_tip_height: BlockHeight::new(1),
+                visible_tip_hash: BlockHash::from_bytes([1; 32]),
+                settled_tip_height: BlockHeight::new(1),
+                settled_tip_hash: BlockHash::from_bytes([1; 32]),
+                artifact_schema_version: ArtifactSchemaVersion::new(20),
+                tip_metadata: ChainTipMetadata::new(0, 0, 0),
+                created_at: UnixTimestampMillis::new(0),
+            },
+            height: BlockHeight::new(1),
+            block_hash: BlockHash::from_bytes([2; 32]),
+            block_time_seconds: 1_774_668_401,
+            frontiers,
+        }
+    }
+
+    #[test]
+    fn encode_json_payload_is_byte_identical_to_the_previous_encoding_for_every_pool_subset()
+    -> Result<(), super::QueryError> {
+        let sapling = vec![0x01, 0xaa, 0x00];
+        let orchard = vec![0xbb];
+        let ironwood = vec![0xcc, 0xdd];
+
+        for subset in 0_u8..8 {
+            let pick = |bit: u8, bytes: &[u8]| (subset & bit != 0).then(|| bytes.to_vec());
+            let frontiers = TreeStateFrontiers {
+                sapling_final_state: pick(1, &sapling),
+                orchard_final_state: pick(2, &orchard),
+                ironwood_final_state: pick(4, &ironwood),
+            };
+            let expected = reference_payload([
+                ("sapling", frontiers.sapling_final_state.as_deref()),
+                ("orchard", frontiers.orchard_final_state.as_deref()),
+                ("ironwood", frontiers.ironwood_final_state.as_deref()),
+            ]);
+
+            assert_eq!(
+                tree_state(frontiers).encode_json_payload()?,
+                expected,
+                "pool subset {subset:#05b}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The wire bytes the base revision emits for three active pools.
+    ///
+    /// Pools appear in ascending name order (`ironwood`, `orchard`,
+    /// `sapling`) with no whitespace. Enabling `serde_json/preserve_order`
+    /// would reorder them to match insertion order, so the literal pins the
+    /// order independently of the production serializer.
+    const THREE_POOL_PAYLOAD: &[u8] = concat!(
+        r#"{"ironwood":{"commitments":{"finalState":"cc"}},"#,
+        r#""orchard":{"commitments":{"finalState":"bb"}},"#,
+        r#""sapling":{"commitments":{"finalState":"aa"}}}"#,
+    )
+    .as_bytes();
+
+    #[test]
+    fn encode_json_payload_writes_three_pools_in_the_literal_wire_order()
+    -> Result<(), super::QueryError> {
+        let all = tree_state(TreeStateFrontiers {
+            sapling_final_state: Some(vec![0xaa]),
+            orchard_final_state: Some(vec![0xbb]),
+            ironwood_final_state: Some(vec![0xcc]),
+        });
+        assert_eq!(all.encode_json_payload()?, THREE_POOL_PAYLOAD);
+
+        let orchard_and_sapling = tree_state(TreeStateFrontiers {
+            sapling_final_state: Some(vec![0xaa]),
+            orchard_final_state: Some(vec![0xbb]),
+            ironwood_final_state: None,
+        });
+        assert_eq!(
+            orchard_and_sapling.encode_json_payload()?,
+            concat!(
+                r#"{"orchard":{"commitments":{"finalState":"bb"}},"#,
+                r#""sapling":{"commitments":{"finalState":"aa"}}}"#,
+            )
+            .as_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encode_json_payload_writes_an_empty_object_for_no_active_pool()
+    -> Result<(), super::QueryError> {
+        let empty = tree_state(TreeStateFrontiers::default());
+        assert_eq!(empty.encode_json_payload()?, b"{}");
+        Ok(())
+    }
+
+    #[test]
+    fn encode_json_payload_writes_the_documented_shape_for_all_pools()
+    -> Result<(), super::QueryError> {
+        let all = tree_state(TreeStateFrontiers {
+            sapling_final_state: Some(vec![0xaa]),
+            orchard_final_state: Some(vec![0xbb]),
+            ironwood_final_state: Some(vec![0xcc]),
+        });
+        let payload: Value =
+            serde_json::from_slice(&all.encode_json_payload()?).map_err(|source| {
+                super::QueryError::ArtifactCorrupt {
+                    family: super::ArtifactFamily::TreeState,
+                    reason: source.to_string(),
+                }
+            })?;
+        assert_eq!(
+            payload,
+            json!({
+                "sapling": { "commitments": { "finalState": "aa" } },
+                "orchard": { "commitments": { "finalState": "bb" } },
+                "ironwood": { "commitments": { "finalState": "cc" } }
+            })
+        );
+        Ok(())
     }
 }
