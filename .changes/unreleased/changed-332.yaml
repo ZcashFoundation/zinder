@@ -1,0 +1,6 @@
+kind: changed
+body: "Tree-state densification now stores a checkpoint for every settled block by default, so tree-state requests no longer rebuild state from compact blocks once a stride is complete. The first start after upgrading fills the missing rows once; the Mainnet cost is estimated at about 2.4 GB of rows before compression and 4 to 5 CPU-hours. To keep the smaller `commitment-budget` selection, set `ingest.tree_state_densification.selection` before the first upgraded start, because switching later keeps the rows already written."
+time: 2026-11-19T20:00:00.000000000Z
+custom:
+    Bump: minor
+    PR: "332"

@@ -626,10 +626,11 @@ fn a_stride_reports_satisfied_only_when_its_stored_rows_satisfy_the_selection() 
 }
 
 #[test]
-fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> TestResult {
+fn a_bounded_scan_stops_after_the_stride_that_reaches_its_read_budget_and_reports_where_to_continue()
+-> TestResult {
     let temporary = TempDir::new()?;
     let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
-    let one = std::num::NonZeroU32::new(1).ok_or("limit must be nonzero")?;
+    let one = std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?;
 
     let first = store.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, one)?;
     assert_eq!(first.incomplete, vec![stride(0, 100)]);
@@ -672,5 +673,24 @@ fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> 
         vec![stride(0, 100)]
     );
     assert_eq!(damaged.next_from, BlockHeight::new(100));
+    Ok(())
+}
+
+#[test]
+fn the_costliest_stride_reads_the_most_a_scan_charges_for_one_stride() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    densify_all(&store, &activations()?, EVERY_BLOCK)?;
+    for height in (1..100).step_by(2) {
+        delete_row(&store, BlockHeight::new(height))?;
+    }
+    let one = std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?;
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(one);
+
+    let scan = store.scan_tree_state_strides(BlockHeight::new(0), budget, one)?;
+
+    assert!(scan.incomplete.is_empty() && scan.damaged.is_empty());
+    assert_eq!(scan.examined, 1);
+    assert_eq!(scan.reads, super::MAX_TREE_STATE_STRIDE_SCAN_READS);
     Ok(())
 }

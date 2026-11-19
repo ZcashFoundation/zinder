@@ -30,9 +30,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
-    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection, TreeStateStride,
-    TreeStateStrideCommit,
+    MAX_TREE_STATE_STRIDE_SCAN_READS, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
+    TreeStateStride, TreeStateStrideCommit,
 };
 
 use crate::{
@@ -51,7 +51,8 @@ pub const DEFAULT_TREE_STATE_DENSIFICATION_WORKERS: u32 = 2;
 /// bounds the pass's reads, and the rows it writes, which never exceed the
 /// blocks it replays.
 pub const DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND: u32 = 500;
-/// Default commitment budget of the budgeted selection.
+/// Default commitment budget of the budgeted selection, which is not the
+/// default selection.
 pub const DEFAULT_TREE_STATE_COMMITMENT_BUDGET: u32 = 1_024;
 
 /// How long the pass waits before looking for newly settled strides once every
@@ -68,13 +69,22 @@ pub const TREE_STATE_DENSIFICATION_WATERMARK_FILE: &str = "tree-state-densificat
 const WATERMARK_VERSION: u32 = 1;
 /// Least time between two progress records while strides are committed.
 const WATERMARK_WRITE_INTERVAL: Duration = Duration::from_secs(10);
-/// Settled strides one scan chunk examines.
-const SCAN_CHUNK_STRIDES: u32 = 64;
 /// Scan reads charged as one replayed block against the replay rate.
 ///
 /// A replay reads a compact block and a header for each block, and a scan
 /// counts each checkpoint row it visits and each compact block it reads.
 const SCAN_READS_PER_BLOCK: u32 = 2;
+/// Reads one scan chunk makes before the pass paces it, the reads of one
+/// densified stride, so a scan bursts no more than a replay does.
+const SCAN_CHUNK_READS: u32 = SCAN_READS_PER_BLOCK * TREE_STATE_CHECKPOINT_STRIDE;
+/// Replayed blocks charged for a scan chunk that failed, so its reads are
+/// unknown.
+///
+/// A chunk stops only after the stride that reaches [`SCAN_CHUNK_READS`], so
+/// it makes up to that many reads less one, plus the most one more stride
+/// adds.
+const FAILED_SCAN_CHARGE_BLOCKS: u32 =
+    (SCAN_CHUNK_READS + MAX_TREE_STATE_STRIDE_SCAN_READS).div_ceil(SCAN_READS_PER_BLOCK);
 
 /// Resolved `[ingest.tree_state_densification]` settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,9 +104,7 @@ impl Default for TreeStateDensificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            selection: TreeStateCheckpointSelection::CommitmentBudget(
-                NonZeroU32::new(DEFAULT_TREE_STATE_COMMITMENT_BUDGET).unwrap_or(NonZeroU32::MIN),
-            ),
+            selection: TreeStateCheckpointSelection::EveryBlock,
             workers: NonZeroU32::new(DEFAULT_TREE_STATE_DENSIFICATION_WORKERS)
                 .unwrap_or(NonZeroU32::MIN),
             max_blocks_per_second: NonZeroU32::new(
@@ -402,7 +410,17 @@ impl DensificationPass {
                 self.record_watermark(true).await;
                 return Ok(StepOutcome::CaughtUp);
             }
-            let reads = self.scan_chunk().await?;
+            let reads = match self.scan_chunk().await {
+                Ok(reads) => reads,
+                Err(reason) => {
+                    // A failed chunk loses its read count, so the retry is
+                    // charged the most a chunk can read.
+                    if self.pace(FAILED_SCAN_CHARGE_BLOCKS, cancel).await {
+                        return Ok(StepOutcome::Cancelled);
+                    }
+                    return Err(reason);
+                }
+            };
             self.record_watermark(false).await;
             if self
                 .pace(reads.div_ceil(SCAN_READS_PER_BLOCK), cancel)
@@ -457,18 +475,19 @@ impl DensificationPass {
         Ok(StepOutcome::Progressed)
     }
 
-    /// Catches the secondary up and examines one bounded chunk of settled
-    /// strides on a blocking thread, returning the reads it made.
+    /// Catches the secondary up and examines one chunk of settled strides, up
+    /// to [`SCAN_CHUNK_READS`] reads, on a blocking thread, returning the
+    /// reads it made.
     async fn scan_chunk(&mut self) -> Result<u32, String> {
         let secondary = Arc::clone(&self.secondary);
         let selection = self.config.selection;
         let from = self.scan_from;
-        let limit = NonZeroU32::new(SCAN_CHUNK_STRIDES).unwrap_or(NonZeroU32::MIN);
+        let read_budget = NonZeroU32::new(SCAN_CHUNK_READS).unwrap_or(NonZeroU32::MIN);
         let scan = tokio::task::spawn_blocking(move || {
             secondary.write().try_catch_up()?;
             secondary
                 .read()
-                .scan_tree_state_strides(from, selection, limit)
+                .scan_tree_state_strides(from, selection, read_budget)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -811,4 +830,23 @@ fn record_integrity_failure(seed_height: BlockHeight, end_height: BlockHeight, r
         reason,
         "a settled tree-state stride does not replay to its stored checkpoints; it was not densified and reads there keep replaying"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_scan_is_charged_the_worst_case_reads_of_a_mixed_density_chunk() {
+        // Strides of 99 and 100 reads leave the chunk under its budget, so a
+        // third stride that reads the most any stride can still runs.
+        let chunk_reads = (SCAN_CHUNK_READS - 1).max(99 + 100) + MAX_TREE_STATE_STRIDE_SCAN_READS;
+        let charged_reads = FAILED_SCAN_CHARGE_BLOCKS * SCAN_READS_PER_BLOCK;
+
+        assert!(
+            charged_reads >= chunk_reads,
+            "charged {charged_reads} reads for a chunk that can make {chunk_reads}"
+        );
+        assert!(charged_reads > SCAN_CHUNK_READS);
+    }
 }

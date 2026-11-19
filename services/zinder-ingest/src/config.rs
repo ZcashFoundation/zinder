@@ -708,7 +708,7 @@ fn resolve_tree_state_densification(
         })
     };
     let selection = match (section.selection, section.commitment_budget) {
-        (Some(TreeStateSelectionName::EveryBlock), None) => {
+        (None | Some(TreeStateSelectionName::EveryBlock), None) => {
             TreeStateCheckpointSelection::EveryBlock
         }
         (Some(TreeStateSelectionName::EveryBlock), Some(_)) => {
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_state_densification_defaults_to_a_commitment_budget_and_accepts_every_block() {
+    fn tree_state_densification_defaults_to_every_block_and_accepts_a_commitment_budget() {
         let defaults =
             resolve_tree_state_densification(IngestTreeStateDensificationSection::default());
         assert_eq!(
@@ -1029,10 +1029,10 @@ mod tests {
             defaults,
             Ok(TreeStateDensificationConfig {
                 enabled: true,
-                selection: zinder_store::TreeStateCheckpointSelection::CommitmentBudget(budget),
+                selection: zinder_store::TreeStateCheckpointSelection::EveryBlock,
                 workers,
                 max_blocks_per_second,
-            }) if budget.get() == 1_024 && workers.get() == 2 && max_blocks_per_second.get() == 500
+            }) if workers.get() == 2 && max_blocks_per_second.get() == 500
         ));
         let budget_without_selection =
             resolve_tree_state_densification(IngestTreeStateDensificationSection {

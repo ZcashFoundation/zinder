@@ -1621,10 +1621,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Which settled blocks receive a stored tree-state checkpoint: \
-                      `commitment-budget` stores one each time `commitment_budget` note \
-                      commitments have accumulated, and `every-block` stores one for every \
-                      block, so no tree-state read replays. Defaults to \
-                      `commitment-budget`.",
+                      `every-block` stores one for every block, so no tree-state read in a \
+                      completed stride replays (heights in the stride the settled tip has not \
+                      yet passed still do), and `commitment-budget` stores one each time \
+                      `commitment_budget` note commitments have accumulated. Defaults to \
+                      `every-block`, or to `commitment-budget` when only `commitment_budget` \
+                      is set. An operator who wants `commitment-budget` selects it before the \
+                      first start of a version that defaults to `every-block`; switching later \
+                      keeps every stored row, because a dense stride already satisfies the \
+                      looser budget and the pass only inserts missing rows, and only changes \
+                      the work still outstanding. The `every-block` cost on Mainnet is an \
+                      estimate pending measurement: about 2.4 GB of rows before compression \
+                      and 4 to 5 CPU-hours for the one-time pass.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",
@@ -1633,9 +1641,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Note commitments, over every pool, between two stored tree-state \
-                      checkpoints under the `commitment-budget` selection. Must be greater \
-                      than zero and is refused with `selection = \"every-block\"`. Defaults \
-                      to 1024.",
+                      checkpoints under the `commitment-budget` selection, which setting it \
+                      selects when `selection` is unset. Must be greater than zero and is \
+                      refused with `selection = \"every-block\"`. Defaults to 1024.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__WORKERS",
