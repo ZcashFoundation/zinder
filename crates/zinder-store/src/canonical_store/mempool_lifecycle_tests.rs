@@ -6,18 +6,20 @@ use std::{
 
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHash, BlockHeight, ChainEpoch, CompactTransactionData, CompactTransparentInput,
-    CompactTransparentOutput, MempoolEntry, MempoolEvictionReason, MempoolObservation, Network,
-    RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, CompactTransactionData,
+    CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEvictionReason,
+    MempoolObservation, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
+use zinder_proto::v1::wallet;
 
 use super::{
     CanonicalStoreError, RocksDbCanonicalStore,
     live_replacement_tests::{open_store, published_store},
 };
 use crate::{
-    EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
-    MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, StreamCursorTokenV1,
+    CANONICAL_STORE_SCHEMA_VERSION, CURRENT_ARTIFACT_SCHEMA_VERSION, EventStreamStartPosition,
+    MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventRetentionConfig,
+    MempoolEventRetentionStepBudget, StreamCursorTokenV1, mempool_event_envelope_message,
 };
 
 const REORG_WINDOW: u32 = 2;
@@ -317,6 +319,69 @@ fn mempool_retention_floor_persists_across_primary_reopen() -> Result<(), Box<dy
                 .mempool_event_history(MempoolEventHistoryRequest::with_default_limit(None))?
         ),
         vec![pruned_floor]
+    );
+    Ok(())
+}
+
+/// A replayed added event reports the artifact schema version of its
+/// first-seen epoch that a canonical read of that epoch reports.
+///
+/// Events saved by earlier releases carry the store layout version in that
+/// epoch. After a reopen, the replayed entry and its wire message report the
+/// current version instead.
+#[test]
+fn a_reopened_pre_upgrade_added_event_reports_the_canonical_artifact_schema_version()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let first_seen_epoch_id = {
+        let store = published_store(
+            &store_path,
+            REORG_WINDOW,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+        )?;
+        let pre_upgrade_epoch = ChainEpoch {
+            artifact_schema_version: ArtifactSchemaVersion::new(CANONICAL_STORE_SCHEMA_VERSION),
+            ..store.chain_epoch()?
+        };
+        store.append_mempool_event(
+            MempoolEvent::Added {
+                entry: synthetic_entry(0xA0, pre_upgrade_epoch)?,
+            },
+            RECENT_OBSERVATION,
+        )?;
+        pre_upgrade_epoch.id
+    };
+
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let reopened = open_store(&store_path, &activations, REORG_WINDOW)?;
+    let history =
+        reopened.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(None))?;
+    let [replayed] = history.as_slice() else {
+        return Err(format!("expected one replayed event, got {}", history.len()).into());
+    };
+    let MempoolEvent::Added { entry } = &replayed.event else {
+        return Err("the replayed event must be the added event".into());
+    };
+    let canonical_version = reopened
+        .chain_epoch_at(first_seen_epoch_id)?
+        .artifact_schema_version;
+    assert_eq!(canonical_version, CURRENT_ARTIFACT_SCHEMA_VERSION);
+    assert_eq!(
+        entry.first_seen_chain_epoch().artifact_schema_version,
+        canonical_version
+    );
+    let message = mempool_event_envelope_message(replayed)?;
+    let Some(wallet::mempool_event_envelope::Event::Added(added)) = message.event else {
+        return Err("the replayed message must carry the added event".into());
+    };
+    assert_eq!(
+        added
+            .entry
+            .and_then(|entry| entry.first_seen_chain_epoch)
+            .map(|epoch| epoch.artifact_schema_version),
+        Some(u32::from(canonical_version.value()))
     );
     Ok(())
 }

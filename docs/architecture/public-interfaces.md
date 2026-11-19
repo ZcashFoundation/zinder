@@ -23,7 +23,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `ChainEpoch` | One immutable snapshot of the visible best chain. Its id starts at 1 and grows by one with each durable canonical commit, so epoch ids and chain-event sequences share one identity space. | `zinder-core` |
 | `visible_tip` | The best block in a chain epoch. | `ChainEpoch` |
 | `settled_tip` | The highest block buried at least `reorg_window_blocks` deep. | `ChainEpoch` |
-| `artifact_schema_version` | The durable artifact schema version of the serving binary, the version of the contract for compact blocks and scan data. It equals `schema_version` in `WalletServerInfo`; it is not the store layout version. | `ChainEpoch` |
+| `artifact_schema_version` | The durable artifact schema version of the serving binary, the version of the contract for compact blocks and scan data. It equals `schema_version` in `WalletServerInfo`; it is not the store layout version. Every served epoch carries it, including the first-seen epoch of a mempool entry. | `ChainEpoch` |
 | `ChainView` | Response envelope: a `ChainEpoch` plus optional `indexed_tip`, `upstream_tip`, and `materialized_views` status. | `zinder.v1.wallet` |
 | `CanonicalEventFence` | Proof of one writer position: chain epoch, event sequence, visible tip, and sequence digest. A reader compares fences to prove it sees exactly what the writer committed. | `zinder-store` |
 | `CanonicalWriterFence` | The wire form of the writer's fence, returned by `CanonicalControl.WriterStatus`. Writer and readers both encode it with `zinder_proto::wire::canonical_writer_fence_message`. | `zinder.v1.ingest` |
