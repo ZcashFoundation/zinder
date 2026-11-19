@@ -1,0 +1,6 @@
+kind: fixed
+body: The bundled Grafana overview dashboard now queries the metric names Zinder emits, so its wallet-serving catch-up, replica-lag, refresh, and storage-access panels show data instead of staying empty or reading 0. Re-import `observability/grafana/dashboards/zinder-overview.json` to pick up the fix.
+time: 2026-11-19T03:22:05.934000227Z
+custom:
+    Bump: patch
+    PR: "321"
