@@ -21,7 +21,7 @@ use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
-    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ServedTreeState, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -134,11 +134,14 @@ pub trait CanonicalReader: Send + Sync + 'static {
         location: TransactionLocation,
     ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError>;
 
-    /// Reads the newest commitment-tree checkpoint at or below a height.
+    /// Reads the newest commitment-tree checkpoint stored at or below a
+    /// height, as
+    /// [`RocksDbCanonicalSecondary::tree_state_checkpoint_at_or_before`]
+    /// does.
     fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
+    ) -> Result<Option<ServedTreeState>, CanonicalStoreError>;
 
     /// Reads the commitment-tree checkpoint at exactly `height`,
     /// reconstructing it from stored compact blocks when no checkpoint is
@@ -162,7 +165,10 @@ pub trait CanonicalReader: Send + Sync + 'static {
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
         self.tree_state_checkpoint_at(height, network_upgrade_activations)
-            .map(|checkpoint| checkpoint.map(TreeStateLookup::Stored))
+            .map(|checkpoint| {
+                checkpoint
+                    .map(|checkpoint| TreeStateLookup::Stored(ServedTreeState::from(checkpoint)))
+            })
     }
 
     /// Reconstructs the tree state a [`Self::tree_state_lookup`] found no
@@ -181,7 +187,7 @@ pub trait CanonicalReader: Send + Sync + 'static {
             .map(|checkpoint| {
                 checkpoint.map(|checkpoint| TreeStateReplayOutcome::Replayed {
                     replay: Box::new(replay.clone()),
-                    checkpoint,
+                    tree_state: ServedTreeState::from(checkpoint),
                 })
             })
     }
@@ -421,7 +427,7 @@ macro_rules! impl_canonical_read {
             fn tree_state_checkpoint_at_or_before(
                 &self,
                 height: BlockHeight,
-            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+            ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
                 self.tree_state_checkpoint_at_or_before(height)
             }
 

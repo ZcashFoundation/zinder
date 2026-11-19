@@ -1,11 +1,14 @@
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    FinalNoteCommitmentRoot, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, ShieldedProtocol,
-    TransactionLocation, wire::encode_height_key_ascending,
+    CommitmentTreeFrontiersError, FinalNoteCommitmentRoot,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, ShieldedProtocol, TransactionLocation,
+    wire::encode_height_key_ascending,
 };
 
 use thiserror::Error;
+
+use crate::canonical_store::served_tree_state::{ServedFrontier, ServedFrontiers};
 
 pub(in crate::canonical_store) const BLOCK_HEADER_VALUE_LEN: usize = 184;
 pub(super) const BLOCK_HASH_INDEX_RECORD_LEN: usize = 36;
@@ -53,13 +56,21 @@ pub(in crate::canonical_store) enum CanonicalFamilyValueDecodeError {
         /// Frontier length declared by the encoded value.
         encoded_bytes: usize,
     },
-    /// The official Zcash codec rejected a frontier or its claimed root.
+    /// A frontier's encoding was rejected, or, by a decode that revalidates
+    /// frontiers, its claimed root.
     #[error("tree_state_checkpoint {protocol:?} frontier is invalid: {source}")]
     InvalidFrontier {
         /// Shielded pool whose frontier was rejected.
         protocol: ShieldedProtocol,
         #[source]
         source: CommitmentTreeFrontierValidationError,
+    },
+    /// A decoded frontier was validated for a pool other than the one whose
+    /// position holds it.
+    #[error("tree_state_checkpoint frontiers are misplaced: {source}")]
+    MisplacedFrontier {
+        #[source]
+        source: CommitmentTreeFrontiersError,
     },
     /// Bytes remained after every field selected by the presence bitmap.
     #[error("{family} value has {trailing_bytes} trailing bytes")]
@@ -145,20 +156,64 @@ pub(in crate::canonical_store) fn encode_tree_state_checkpoint(
 }
 
 /// Decodes and revalidates one exact v1 tree-state checkpoint value.
+///
+/// Each frontier is parsed with the official Zcash codec, must be its
+/// canonical encoding, and must derive its stored root, so the result can seed
+/// further tree state or certify stored rows.
 pub(in crate::canonical_store) fn decode_tree_state_checkpoint(
     encoded: &[u8],
 ) -> Result<(u32, CommitmentTreeFrontiers), CanonicalFamilyValueDecodeError> {
+    let (block_time_seconds, [sapling, orchard, ironwood]) =
+        decode_checkpoint_frontiers(encoded, |protocol, final_root, final_state_bytes| {
+            CommitmentTreeFrontier::from_canonical_final_state(
+                protocol,
+                final_root,
+                final_state_bytes,
+            )
+        })?;
+    let frontiers = CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood)
+        .map_err(|source| CanonicalFamilyValueDecodeError::MisplacedFrontier { source })?;
+    Ok((block_time_seconds, frontiers))
+}
+
+/// Decodes one exact v1 tree-state checkpoint value for serving.
+///
+/// Each frontier's framing is checked and its stored root skipped, without
+/// decoding or hashing tree nodes.
+pub(in crate::canonical_store) fn decode_served_tree_state_checkpoint(
+    encoded: &[u8],
+) -> Result<(u32, ServedFrontiers), CanonicalFamilyValueDecodeError> {
+    let (block_time_seconds, [sapling, orchard, ironwood]) =
+        decode_checkpoint_frontiers(encoded, |_, _, final_state_bytes| {
+            ServedFrontier::from_stored_final_state(final_state_bytes)
+        })?;
+    Ok((
+        block_time_seconds,
+        ServedFrontiers::new(sapling, orchard, ironwood),
+    ))
+}
+
+/// Decodes the exact v1 layout of a tree-state checkpoint value, building
+/// each present frontier from its pool, stored root, and `finalState` bytes
+/// with `frontier`.
+fn decode_checkpoint_frontiers<Frontier>(
+    encoded: &[u8],
+    mut frontier: impl FnMut(
+        ShieldedProtocol,
+        FinalNoteCommitmentRoot,
+        Vec<u8>,
+    ) -> Result<Frontier, CommitmentTreeFrontierValidationError>,
+) -> Result<(u32, [Option<Frontier>; 3]), CanonicalFamilyValueDecodeError> {
     let mut decoder = ValueDecoder::new("tree_state_checkpoint", encoded);
     let block_time_seconds = decoder.read_u32("block time")?;
     let presence_bitmap = decoder.read_presence_bitmap()?;
-    let sapling = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Sapling)?;
-    let orchard = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Orchard)?;
-    let ironwood = decode_frontier(&mut decoder, presence_bitmap, ShieldedProtocol::Ironwood)?;
+    let mut decode =
+        |protocol| decode_frontier(&mut decoder, presence_bitmap, protocol, &mut frontier);
+    let sapling = decode(ShieldedProtocol::Sapling)?;
+    let orchard = decode(ShieldedProtocol::Orchard)?;
+    let ironwood = decode(ShieldedProtocol::Ironwood)?;
     decoder.reject_trailing_bytes()?;
-    Ok((
-        block_time_seconds,
-        CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood),
-    ))
+    Ok((block_time_seconds, [sapling, orchard, ironwood]))
 }
 
 /// Encodes one v1 block-root value without key/header-owned block identity.
@@ -244,11 +299,16 @@ const fn shielded_protocols() -> [ShieldedProtocol; 3] {
     ]
 }
 
-fn decode_frontier(
+fn decode_frontier<Frontier>(
     decoder: &mut ValueDecoder<'_>,
     presence_bitmap: u8,
     protocol: ShieldedProtocol,
-) -> Result<Option<CommitmentTreeFrontier>, CanonicalFamilyValueDecodeError> {
+    frontier: &mut impl FnMut(
+        ShieldedProtocol,
+        FinalNoteCommitmentRoot,
+        Vec<u8>,
+    ) -> Result<Frontier, CommitmentTreeFrontierValidationError>,
+) -> Result<Option<Frontier>, CanonicalFamilyValueDecodeError> {
     if presence_bitmap & protocol_presence_bit(protocol) == 0 {
         return Ok(None);
     }
@@ -265,7 +325,7 @@ fn decode_frontier(
     let final_state_bytes = decoder
         .read_bytes(final_state_len, "commitment-tree frontier bytes")?
         .to_vec();
-    CommitmentTreeFrontier::from_canonical_final_state(protocol, final_root, final_state_bytes)
+    frontier(protocol, final_root, final_state_bytes)
         .map(Some)
         .map_err(|source| CanonicalFamilyValueDecodeError::InvalidFrontier { protocol, source })
 }
@@ -433,14 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn tree_state_checkpoint_v1_has_exact_known_bytes_and_round_trips() {
+    fn tree_state_checkpoint_v1_has_exact_known_bytes_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
         let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
         let orchard = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
         let frontiers = CommitmentTreeFrontiers::from_validated_parts(
             Some(sapling.clone()),
             Some(orchard.clone()),
             None,
-        );
+        )?;
 
         let encoded = encode_tree_state_checkpoint(0x0102_0304, &frontiers);
         let mut expected = vec![4, 3, 2, 1, SAPLING_PRESENCE_BIT | ORCHARD_PRESENCE_BIT];
@@ -457,9 +518,21 @@ mod tests {
             Ok((0x0102_0304, frontiers))
         );
         assert_eq!(
+            decode_served_tree_state_checkpoint(&encoded),
+            Ok((
+                0x0102_0304,
+                ServedFrontiers::new(
+                    Some(ServedFrontier::from(&sapling)),
+                    Some(ServedFrontier::from(&orchard)),
+                    None,
+                )
+            ))
+        );
+        assert_eq!(
             encode_tree_state_checkpoint(0x0102_0304, &CommitmentTreeFrontiers::default()),
             [4, 3, 2, 1, 0]
         );
+        Ok(())
     }
 
     #[test]
@@ -485,25 +558,107 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tree_state_checkpoint_v1_rejects_non_exact_or_invalid_values()
-    -> Result<(), Box<dyn std::error::Error>> {
-        assert!(matches!(
-            decode_tree_state_checkpoint(&[0, 0, 0]),
-            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
-        ));
-        assert_eq!(
-            decode_tree_state_checkpoint(&[0, 0, 0, 0, 0x80]),
-            Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
-                family: "tree_state_checkpoint",
-                presence_bitmap: 0x80,
-            })
-        );
+    /// A checkpoint decode reduced to the block time it reads.
+    type BlockTimeDecode = fn(&[u8]) -> Result<u32, CanonicalFamilyValueDecodeError>;
 
+    #[test]
+    fn tree_state_checkpoint_v1_rejects_non_exact_values_in_either_decode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decodes: [BlockTimeDecode; 2] = [
+            |encoded| decode_tree_state_checkpoint(encoded).map(|(block_time, _)| block_time),
+            |encoded| {
+                decode_served_tree_state_checkpoint(encoded).map(|(block_time, _)| block_time)
+            },
+        ];
         let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
-        let frontiers = CommitmentTreeFrontiers::from_validated_parts(Some(sapling), None, None);
-        let mut wrong_root = encode_tree_state_checkpoint(0, &frontiers);
+        let frontiers = CommitmentTreeFrontiers::from_validated_parts(Some(sapling), None, None)?;
+        let mut broken_frontier = encode_tree_state_checkpoint(0, &frontiers);
+        // The frontier's first presence flag follows the root and its length.
+        broken_frontier[5 + 32 + 2] = 2;
+        let oversized_len = MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES + 1;
+        let mut oversized = vec![0, 0, 0, 0, SAPLING_PRESENCE_BIT];
+        oversized.extend_from_slice(&[0; 32]);
+        oversized.extend_from_slice(&u16::try_from(oversized_len)?.to_le_bytes());
+        let mut trailing = encode_tree_state_checkpoint(0, &CommitmentTreeFrontiers::default());
+        trailing.push(0);
+        // Framing the canonical encoder never writes: an empty tree with a
+        // parent slot, and one leaf without the 31 parent slots.
+        let mut one_leaf = vec![1, 1];
+        one_leaf.extend_from_slice(&[0; 31]);
+        one_leaf.extend_from_slice(&[0, 0]);
+        let non_canonical_frontiers = [vec![0, 0, 1, 0], one_leaf]
+            .iter()
+            .map(|final_state| sapling_row(final_state))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for decode in decodes {
+            assert!(matches!(
+                decode(&[0, 0, 0]),
+                Err(CanonicalFamilyValueDecodeError::Truncated { .. })
+            ));
+            assert_eq!(
+                decode(&[0, 0, 0, 0, 0x80]),
+                Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
+                    family: "tree_state_checkpoint",
+                    presence_bitmap: 0x80,
+                })
+            );
+            assert!(matches!(
+                decode(&broken_frontier),
+                Err(CanonicalFamilyValueDecodeError::InvalidFrontier {
+                    protocol: ShieldedProtocol::Sapling,
+                    source: CommitmentTreeFrontierValidationError::InvalidEncoding { .. },
+                })
+            ));
+            assert_eq!(
+                decode(&oversized),
+                Err(CanonicalFamilyValueDecodeError::FrontierTooLarge {
+                    protocol: ShieldedProtocol::Sapling,
+                    encoded_bytes: oversized_len,
+                })
+            );
+            assert_eq!(
+                decode(&trailing),
+                Err(CanonicalFamilyValueDecodeError::TrailingBytes {
+                    family: "tree_state_checkpoint",
+                    trailing_bytes: 1,
+                })
+            );
+            for row in &non_canonical_frontiers {
+                assert!(
+                    matches!(
+                        decode(row),
+                        Err(CanonicalFamilyValueDecodeError::InvalidFrontier {
+                            protocol: ShieldedProtocol::Sapling,
+                            source: CommitmentTreeFrontierValidationError::InvalidEncoding { .. },
+                        })
+                    ),
+                    "row {row:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// One checkpoint value whose only frontier is a Sapling frontier with
+    /// `final_state` bytes and an all-zero root.
+    fn sapling_row(final_state: &[u8]) -> Result<Vec<u8>, std::num::TryFromIntError> {
+        let mut row = vec![0, 0, 0, 0, SAPLING_PRESENCE_BIT];
+        row.extend_from_slice(&[0; 32]);
+        row.extend_from_slice(&u16::try_from(final_state.len())?.to_le_bytes());
+        row.extend_from_slice(final_state);
+        Ok(row)
+    }
+
+    #[test]
+    fn only_the_revalidating_decode_checks_the_stored_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
+        let frontiers =
+            CommitmentTreeFrontiers::from_validated_parts(Some(sapling.clone()), None, None)?;
+        let mut wrong_root = encode_tree_state_checkpoint(7, &frontiers);
         wrong_root[5] ^= 0xff;
+
         assert_eq!(
             decode_tree_state_checkpoint(&wrong_root),
             Err(CanonicalFamilyValueDecodeError::InvalidFrontier {
@@ -511,27 +666,13 @@ mod tests {
                 source: CommitmentTreeFrontierValidationError::RootMismatch,
             })
         );
-
-        let oversized_len = MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES + 1;
-        let mut oversized = vec![0, 0, 0, 0, SAPLING_PRESENCE_BIT];
-        oversized.extend_from_slice(&[0; 32]);
-        oversized.extend_from_slice(&u16::try_from(oversized_len)?.to_le_bytes());
         assert_eq!(
-            decode_tree_state_checkpoint(&oversized),
-            Err(CanonicalFamilyValueDecodeError::FrontierTooLarge {
-                protocol: ShieldedProtocol::Sapling,
-                encoded_bytes: oversized_len,
-            })
-        );
-
-        let mut trailing = encode_tree_state_checkpoint(0, &CommitmentTreeFrontiers::default());
-        trailing.push(0);
-        assert_eq!(
-            decode_tree_state_checkpoint(&trailing),
-            Err(CanonicalFamilyValueDecodeError::TrailingBytes {
-                family: "tree_state_checkpoint",
-                trailing_bytes: 1,
-            })
+            decode_served_tree_state_checkpoint(&wrong_root),
+            Ok((
+                7,
+                ServedFrontiers::new(Some(ServedFrontier::from(&sapling)), None, None)
+            )),
+            "a served decode skips the root and keeps the stored frontier"
         );
         Ok(())
     }

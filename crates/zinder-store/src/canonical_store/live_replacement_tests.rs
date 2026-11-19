@@ -2044,7 +2044,7 @@ fn published_chain_store(
     builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
         BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash)),
         build_tip_height.value(),
-        super::test_checkpoint_frontiers(&activations, build_tip_height),
+        super::test_checkpoint_frontiers(&activations, build_tip_height)?,
     ))?;
     let validated = builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -2283,7 +2283,7 @@ fn add_checkpoint(block: &mut CanonicalBuildBlock) -> Result<(), Box<dyn std::er
     block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
         BlockId::new(header.height, header.block_hash),
         u32::try_from(header.block_time)?,
-        super::test_checkpoint_frontiers(&activations, header.height),
+        super::test_checkpoint_frontiers(&activations, header.height)?,
     ));
     Ok(())
 }

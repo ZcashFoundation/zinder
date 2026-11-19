@@ -190,7 +190,7 @@ async fn drive_park_and_resume(
     // A block on top of the refused one moves the writer but leaves the same
     // transition first: the follower plans once, stays parked, and reports
     // the new target.
-    control.append(empty_canonical_block(3, [0x22; 32], [0x23; 32]))?;
+    control.append(empty_canonical_block(3, [0x22; 32], [0x23; 32])?)?;
     let still_parked = wait_for_report(readiness, "the park at the new target", |report| {
         report.target_height == Some(3)
     })
@@ -205,8 +205,8 @@ async fn drive_park_and_resume(
     // A reorg that replaces the dense block changes the next transition, so
     // following resumes, applies it, and moves its lease as usual.
     control.replace_from_height_two(vec![
-        empty_canonical_block(2, [0x11; 32], [0x32; 32]),
-        empty_canonical_block(3, [0x32; 32], [0x33; 32]),
+        empty_canonical_block(2, [0x11; 32], [0x32; 32])?,
+        empty_canonical_block(3, [0x32; 32], [0x33; 32])?,
     ])?;
     let resumed = wait_for_report(
         readiness,
@@ -303,7 +303,7 @@ async fn drive_bootstrap_park_and_resume(
     assert_eq!(refused_capture.code(), tonic::Code::FailedPrecondition);
     assert!(refused_capture.message().contains("parked"));
 
-    control.append(empty_canonical_block(3, [0x22; 32], [0x23; 32]))?;
+    control.append(empty_canonical_block(3, [0x22; 32], [0x23; 32])?)?;
     let still_parked = wait_for_report(
         readiness,
         "the bootstrap park at the new target",
@@ -312,8 +312,8 @@ async fn drive_bootstrap_park_and_resume(
     .await?;
     assert_eq!(still_parked.cause, parked.cause);
     control.replace_from_height_two(vec![
-        empty_canonical_block(2, [0x11; 32], [0x32; 32]),
-        empty_canonical_block(3, [0x32; 32], [0x33; 32]),
+        empty_canonical_block(2, [0x11; 32], [0x32; 32])?,
+        empty_canonical_block(3, [0x32; 32], [0x33; 32])?,
     ])?;
     let resumed = wait_for_report(
         readiness,
@@ -411,7 +411,7 @@ impl ParkFixture {
         let (writer, _) = writer.commit_live_append(
             CanonicalLiveAppend::new(
                 fence,
-                dense_canonical_block(2, [0x11; 32], [0x22; 32]),
+                dense_canonical_block(2, [0x11; 32], [0x22; 32])?,
                 Vec::new(),
                 block_one_id,
                 UnixTimestampMillis::new(2),
@@ -441,8 +441,8 @@ fn dense_canonical_block(
     height: u32,
     parent_hash: [u8; 32],
     block_hash: [u8; 32],
-) -> CanonicalBuildBlock {
-    let mut block = empty_canonical_block(height, parent_hash, block_hash);
+) -> Result<CanonicalBuildBlock, zinder_core::CommitmentTreeFrontiersError> {
+    let mut block = empty_canonical_block(height, parent_hash, block_hash)?;
     let outputs: Vec<TransparentOutputFact> = (0..DENSE_BLOCK_OUTPUTS)
         .map(|output_index| {
             let mut address = [0xa0; 32];
@@ -474,7 +474,7 @@ fn dense_canonical_block(
         CanonicalBlockReplayFormatVersion::V1,
         CanonicalBlockFactsDigestVersion::V1,
     );
-    block
+    Ok(block)
 }
 
 fn park_config(

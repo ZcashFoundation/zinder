@@ -1668,7 +1668,7 @@ mod tests {
     fn lifecycle_build_block(
         block: &zinder_testkit::FixtureBlock,
         activations: &NetworkUpgradeActivations,
-    ) -> CanonicalBuildBlock {
+    ) -> Result<CanonicalBuildBlock, zinder_core::CommitmentTreeFrontiersError> {
         let facts = CanonicalBlockFacts {
             block_header: block.block_header_artifact(),
             serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
@@ -1676,7 +1676,7 @@ mod tests {
             ),
             transactions: Vec::new(),
         };
-        CanonicalBuildBlock {
+        Ok(CanonicalBuildBlock {
             replay_envelope: encode_canonical_block_replay(
                 &facts,
                 CanonicalBlockReplayFormatVersion::V1,
@@ -1687,13 +1687,13 @@ mod tests {
             tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
                 BlockId::new(block.height, block.hash),
                 block.block_time_seconds,
-                lifecycle_frontiers(activations, block.height),
+                lifecycle_frontiers(activations, block.height)?,
             )),
             block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
-        }
+        })
     }
 
     /// Live following derives each checkpoint's frontiers from its
@@ -1702,7 +1702,7 @@ mod tests {
     fn lifecycle_frontiers(
         activations: &NetworkUpgradeActivations,
         height: BlockHeight,
-    ) -> CommitmentTreeFrontiers {
+    ) -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
         let active_frontier = |protocol: ShieldedProtocol| {
             activations
                 .activation_height_by_name(protocol.activation_upgrade_name())
@@ -1809,13 +1809,13 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         builder.bulk_load_blocks(std::iter::once(Ok::<_, std::io::Error>(
-            lifecycle_build_block(&first, activations),
+            lifecycle_build_block(&first, activations)?,
         )))?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             BlockId::new(first.height, first.hash),
             first.block_time_seconds,
-            lifecycle_frontiers(activations, first.height),
+            lifecycle_frontiers(activations, first.height)?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -2297,7 +2297,7 @@ mod tests {
         let (primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&second, &activations),
+                lifecycle_build_block(&second, &activations)?,
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(2_000),
@@ -2422,7 +2422,7 @@ mod tests {
         let (next_primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&second, &activations),
+                lifecycle_build_block(&second, &activations)?,
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(2_000),
@@ -2447,7 +2447,7 @@ mod tests {
         let (next_primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&third, &activations),
+                lifecycle_build_block(&third, &activations)?,
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(3_000),
@@ -2793,7 +2793,7 @@ mod tests {
         let (primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&second, &activations),
+                lifecycle_build_block(&second, &activations)?,
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(2_000),
@@ -2941,7 +2941,7 @@ mod tests {
             let (next_primary, _) = primary.commit_live_append(
                 CanonicalLiveAppend::new(
                     expected_fence,
-                    lifecycle_build_block(block, &upgraded),
+                    lifecycle_build_block(block, &upgraded)?,
                     Vec::new(),
                     expected_fence.visible_tip(),
                     UnixTimestampMillis::new(u64::from(block.height.value()) * 1_000),

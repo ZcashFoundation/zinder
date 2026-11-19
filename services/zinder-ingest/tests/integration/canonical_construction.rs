@@ -214,7 +214,7 @@ async fn load_ironwood_fixture(
         .map(BlockHeight::new)
         .ok_or("fixture must have a predecessor")?;
     let checkpoint = BlockId::new(predecessor_height, source_block.parent_hash);
-    let predecessor_frontiers = pre_ironwood_empty_frontiers();
+    let predecessor_frontiers = pre_ironwood_empty_frontiers()?;
     let expected_tip_metadata = ChainTipMetadata::new(0, 0, 2);
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let activations = regtest_activations();
@@ -243,7 +243,8 @@ async fn load_ironwood_fixture(
     Ok((temporary, store_path, outcome, expected_tip_metadata))
 }
 
-fn pre_ironwood_empty_frontiers() -> CommitmentTreeFrontiers {
+fn pre_ironwood_empty_frontiers()
+-> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
     CommitmentTreeFrontiers::from_validated_parts(
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
@@ -350,7 +351,7 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             None,
             None,
-        ),
+        )?,
     );
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -399,7 +400,7 @@ async fn construction_stops_when_the_build_tip_left_the_node_best_chain()
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             None,
             None,
-        ),
+        )?,
     );
     assert_ne!(sibling_checkpoint.block_id, fixed_tip);
     let temporary = TempDir::new()?;
@@ -705,7 +706,7 @@ fn held_construction_chain()
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             None,
             None,
-        ),
+        )?,
     );
     Ok((source_block, chain_checkpoint))
 }

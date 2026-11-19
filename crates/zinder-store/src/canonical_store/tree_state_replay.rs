@@ -19,16 +19,18 @@ use zinder_core::{
 use super::{
     CanonicalStoreError, CanonicalStoreReadyEvidence, TREE_STATE_CHECKPOINT_STRIDE,
     reader::{
-        CanonicalServingRead, read_block_header_at, read_tree_state_checkpoint_at_or_before,
+        CanonicalServingRead, decode_served_tree_state, decode_stored_tree_state_checkpoint,
+        read_block_header_at, read_tree_state_checkpoint_row_at_or_before,
         visit_compact_blocks_in_range,
     },
+    served_tree_state::ServedTreeState,
 };
 
 /// How the store answers the tree state at one retained height.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TreeStateLookup {
-    /// A checkpoint is stored at the height.
-    Stored(CommitmentTreeCheckpoint),
+    /// A checkpoint is stored at the height, read as a wallet read serves it.
+    Stored(ServedTreeState),
     /// No checkpoint is stored at the height, so it must be reconstructed.
     Replay(TreeStateReplay),
 }
@@ -55,22 +57,22 @@ pub struct TreeStateReplay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TreeStateReplayOutcome {
     /// The store holds a checkpoint at the height, so nothing was replayed.
-    Stored(CommitmentTreeCheckpoint),
+    Stored(ServedTreeState),
     /// The store rebuilt the tree state from the seed `replay` names.
     Replayed {
         /// The reconstruction the store ran.
         replay: Box<TreeStateReplay>,
         /// The tree state it produced.
-        checkpoint: CommitmentTreeCheckpoint,
+        tree_state: ServedTreeState,
     },
 }
 
 impl TreeStateReplayOutcome {
     /// Returns the tree state at the replayed height.
     #[must_use]
-    pub const fn checkpoint(&self) -> &CommitmentTreeCheckpoint {
+    pub const fn tree_state(&self) -> &ServedTreeState {
         match self {
-            Self::Stored(checkpoint) | Self::Replayed { checkpoint, .. } => checkpoint,
+            Self::Stored(tree_state) | Self::Replayed { tree_state, .. } => tree_state,
         }
     }
 }
@@ -114,32 +116,69 @@ impl TreeStateReplay {
     }
 }
 
-/// Reads the stored checkpoint at `height`, or reconstructs it from the newest
-/// checkpoint below `height` and the stored compact blocks above that one.
+/// Reads the validated tree state at `height`, which can seed further tree
+/// state.
+///
+/// A checkpoint stored at `height` is revalidated in full. Any other height
+/// is reconstructed from the newest checkpoint below it and the stored
+/// compact blocks above that one.
 pub(super) fn read_tree_state_checkpoint_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-    match lookup_tree_state(store, height, activations)? {
+    match find_tree_state(store, height, activations)? {
         None => Ok(None),
-        Some(TreeStateLookup::Stored(checkpoint)) => Ok(Some(checkpoint)),
-        Some(TreeStateLookup::Replay(replay)) => {
-            reconstruct(store, &replay.seed, height, activations).map(Some)
+        Some(TreeStateSource::StoredRow(encoded)) => {
+            decode_stored_tree_state_checkpoint(store, height, &encoded).map(Some)
+        }
+        Some(TreeStateSource::Seed(seed)) => {
+            reconstruct(store, &seed, height, activations).map(Some)
         }
     }
 }
 
-/// Finds the stored checkpoint at `height`, or the seed a reconstruction of
-/// `height` starts from.
-///
-/// Returns `Ok(None)` for a height above the visible tip or below the history
-/// predecessor. A seed below [`required_seed_height`] is store damage.
+/// Finds the checkpoint stored at `height`, read as a wallet read serves it,
+/// or the revalidated seed a reconstruction of `height` starts from.
 pub(super) fn lookup_tree_state(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+    Ok(match find_tree_state(store, height, activations)? {
+        None => None,
+        Some(TreeStateSource::StoredRow(encoded)) => Some(TreeStateLookup::Stored(
+            decode_served_tree_state(store, height, &encoded)?,
+        )),
+        Some(TreeStateSource::Seed(seed)) => Some(TreeStateLookup::Replay(TreeStateReplay {
+            seed,
+            height,
+            seed_chain: VisibleChain::of(store),
+        })),
+    })
+}
+
+/// Where the tree state at one height comes from.
+enum TreeStateSource {
+    /// The checkpoint row stored at the height, not yet decoded.
+    StoredRow(Box<[u8]>),
+    /// The revalidated checkpoint a reconstruction of the height starts from.
+    Seed(CommitmentTreeCheckpoint),
+}
+
+/// Finds the checkpoint row stored at `height`, or reads and revalidates the
+/// seed a reconstruction of `height` starts from.
+///
+/// One seek reads the newest row at or below `height`, and only a row below
+/// `height` is decoded here, so the caller decodes a stored row as its use
+/// requires. Returns `Ok(None)` for a height above the visible tip or below
+/// the history predecessor. A seed below [`required_seed_height`] is store
+/// damage.
+fn find_tree_state(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> Result<Option<TreeStateSource>, CanonicalStoreError> {
     refuse_unadmitted_activations(store, height, activations)?;
     let history_predecessor_height = store
         .serving_build_plan()
@@ -152,30 +191,27 @@ pub(super) fn lookup_tree_state(
         return Ok(None);
     }
     let required_seed = required_seed_height(height, history_predecessor_height);
-    let seed = read_tree_state_checkpoint_at_or_before(store, height)?
-        .filter(|seed| seed.block_id.height >= required_seed)
+    let row = read_tree_state_checkpoint_row_at_or_before(store, height)?
+        .filter(|row| row.height >= required_seed)
         .ok_or_else(|| {
             CanonicalStoreError::publication(format!(
                 "tree-state checkpoint at height {} is absent",
                 required_seed.value()
             ))
         })?;
-    if seed.block_id.height == height {
-        return Ok(Some(TreeStateLookup::Stored(seed)));
+    if row.height == height {
+        return Ok(Some(TreeStateSource::StoredRow(row.encoded)));
     }
-    Ok(Some(TreeStateLookup::Replay(TreeStateReplay {
-        seed,
-        height,
-        seed_chain: VisibleChain::of(store),
-    })))
+    decode_stored_tree_state_checkpoint(store, row.height, &row.encoded)
+        .map(|seed| Some(TreeStateSource::Seed(seed)))
 }
 
 /// Reconstructs the tree state `replay` names, reporting how it was
 /// answered.
 ///
 /// A store showing another visible chain than the one that issued `replay`
-/// answers as [`read_tree_state_checkpoint_at`] does, so `Ok(None)` means the
-/// height left that store's retained history.
+/// looks the height up again, serving a checkpoint it stores there as stored,
+/// so `Ok(None)` means the height left that store's retained history.
 pub(super) fn replay_tree_state(
     store: &impl CanonicalServingRead,
     replay: &TreeStateReplay,
@@ -187,8 +223,8 @@ pub(super) fn replay_tree_state(
     } else {
         match lookup_tree_state(store, replay.height, activations)? {
             None => return Ok(None),
-            Some(TreeStateLookup::Stored(checkpoint)) => {
-                return Ok(Some(TreeStateReplayOutcome::Stored(checkpoint)));
+            Some(TreeStateLookup::Stored(tree_state)) => {
+                return Ok(Some(TreeStateReplayOutcome::Stored(tree_state)));
             }
             Some(TreeStateLookup::Replay(reread)) => reread,
         }
@@ -196,7 +232,7 @@ pub(super) fn replay_tree_state(
     let checkpoint = reconstruct(store, &replay.seed, replay.height, activations)?;
     Ok(Some(TreeStateReplayOutcome::Replayed {
         replay: Box::new(replay),
-        checkpoint,
+        tree_state: ServedTreeState::from(checkpoint),
     }))
 }
 

@@ -117,7 +117,7 @@ impl KnownSubtreeCompletion {
             frontier(ShieldedProtocol::Sapling)?,
             frontier(ShieldedProtocol::Orchard)?,
             frontier(ShieldedProtocol::Ironwood)?,
-        ))
+        )?)
     }
 }
 

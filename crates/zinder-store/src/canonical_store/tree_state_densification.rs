@@ -27,7 +27,7 @@ use super::{
     publication::column_family,
     reader::{
         CanonicalServingRead, read_block_header_at, read_compact_block_at,
-        read_tree_state_checkpoint_at_or_before,
+        read_stored_tree_state_checkpoint_at,
     },
     rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     tree_state_replay::append_compact_block_commitments,
@@ -604,8 +604,7 @@ fn replay_stride(
         ));
     }
     let stored_rows = StoredStrideRows::read(store, stride)?;
-    let seed = read_tree_state_checkpoint_at_or_before(store, stride.seed_height)?
-        .filter(|seed| seed.block_id.height == stride.seed_height)
+    let seed = read_stored_tree_state_checkpoint_at(store, stride.seed_height)?
         .ok_or_else(|| stride_mismatch(stride, "the seed checkpoint is absent"))?;
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
         seed.block_id.height,

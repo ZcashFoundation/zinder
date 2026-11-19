@@ -513,7 +513,7 @@ fn completed_sapling_subtree_chain(block_count: u32) -> eyre::Result<ChainFixtur
             Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
             None,
             None,
-        ),
+        )?,
     ))
 }
 

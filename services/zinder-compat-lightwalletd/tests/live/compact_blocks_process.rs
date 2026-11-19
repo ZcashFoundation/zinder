@@ -877,7 +877,7 @@ fn build_reorg_process_primary(
     builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
         baseline_tip,
         baseline_tip_block.block_time_seconds,
-        checkpoint_frontiers(activations, baseline_tip.height),
+        checkpoint_frontiers(activations, baseline_tip.height)?,
     ))?;
     let validated = builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -942,13 +942,17 @@ fn canonical_build_blocks(
                 .height
                 .value()
                 .is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
-        let tree_state_checkpoint = checkpoint_required.then(|| {
-            CommitmentTreeCheckpoint::new(
-                BlockId::new(fixture_block.height, fixture_block.hash),
-                fixture_block.block_time_seconds,
-                checkpoint_frontiers(activations, fixture_block.height),
-            )
-        });
+        let tree_state_checkpoint = checkpoint_required
+            .then(|| {
+                checkpoint_frontiers(activations, fixture_block.height).map(|frontiers| {
+                    CommitmentTreeCheckpoint::new(
+                        BlockId::new(fixture_block.height, fixture_block.hash),
+                        fixture_block.block_time_seconds,
+                        frontiers,
+                    )
+                })
+            })
+            .transpose()?;
         blocks.push(CanonicalBuildBlock {
             facts,
             replay_envelope,
@@ -966,7 +970,7 @@ fn canonical_build_blocks(
 fn checkpoint_frontiers(
     activations: &zinder_core::NetworkUpgradeActivations,
     height: BlockHeight,
-) -> CommitmentTreeFrontiers {
+) -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
     let active_frontier = |protocol: ShieldedProtocol| {
         activations
             .activation_height_by_name(protocol.activation_upgrade_name())

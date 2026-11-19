@@ -735,9 +735,10 @@ mod tests {
         BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
         CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
         ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-        CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata, ConsensusBranchId,
-        Network, NetworkUpgradeActivation, NetworkUpgradeActivations, SerializedBytesDigest,
-        ShieldedProtocol, UnixTimestampMillis, encode_canonical_block_replay,
+        CommitmentTreeFrontiers, CommitmentTreeFrontiersError, CompactBlockArtifact,
+        CompactChainMetadata, ConsensusBranchId, Network, NetworkUpgradeActivation,
+        NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
+        encode_canonical_block_replay,
     };
     use zinder_source::{
         NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceError,
@@ -837,7 +838,7 @@ mod tests {
             [3; 32],
             fence.visible_tip().hash.as_bytes(),
             &extended,
-        );
+        )?;
         let (store, _) = store.commit_live_append(
             zinder_store::CanonicalLiveAppend::new(
                 fence,
@@ -1200,7 +1201,7 @@ mod tests {
             CommitmentTreeCheckpoint::new(
                 parent,
                 1_700_000_000,
-                test_frontiers(activations, parent.height),
+                test_frontiers(activations, parent.height)?,
             ),
             build_tip,
             RawBlobRetention::Transactions,
@@ -1212,13 +1213,13 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let block = canonical_build_block(tip, [2; 32], [1; 32], activations);
+        let block = canonical_build_block(tip, [2; 32], [1; 32], activations)?;
         builder.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             build_tip,
             tip.value(),
-            test_frontiers(activations, tip),
+            test_frontiers(activations, tip)?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -1281,14 +1282,14 @@ mod tests {
             [1; 32],
             Network::ZcashRegtest.genesis_hash().as_bytes(),
             activations,
-        );
-        let tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32], activations);
+        )?;
+        let tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32], activations)?;
         builder.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             build_tip,
             2,
-            test_frontiers(activations, BlockHeight::new(2)),
+            test_frontiers(activations, BlockHeight::new(2))?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -1304,7 +1305,7 @@ mod tests {
         block_hash: [u8; 32],
         parent_hash: [u8; 32],
         activations: &NetworkUpgradeActivations,
-    ) -> CanonicalBuildBlock {
+    ) -> Result<CanonicalBuildBlock, CommitmentTreeFrontiersError> {
         let facts = CanonicalBlockFacts {
             block_header: BlockHeaderArtifact::new(
                 height,
@@ -1326,14 +1327,18 @@ mod tests {
             CanonicalBlockReplayFormatVersion::V1,
             CanonicalBlockFactsDigestVersion::V1,
         );
-        let tree_state_checkpoint = (height.value() >= 2).then(|| {
-            CommitmentTreeCheckpoint::new(
-                BlockId::new(height, facts.block_header.block_hash),
-                height.value(),
-                test_frontiers(activations, height),
-            )
-        });
-        CanonicalBuildBlock {
+        let tree_state_checkpoint = (height.value() >= 2)
+            .then(|| {
+                test_frontiers(activations, height).map(|frontiers| {
+                    CommitmentTreeCheckpoint::new(
+                        BlockId::new(height, facts.block_header.block_hash),
+                        height.value(),
+                        frontiers,
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(CanonicalBuildBlock {
             compact_block: CompactBlockArtifact::empty(
                 BlockId::new(height, facts.block_header.block_hash),
                 facts.block_header.parent_hash,
@@ -1351,13 +1356,13 @@ mod tests {
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
-        }
+        })
     }
 
     fn test_frontiers(
         activations: &NetworkUpgradeActivations,
         height: BlockHeight,
-    ) -> CommitmentTreeFrontiers {
+    ) -> Result<CommitmentTreeFrontiers, CommitmentTreeFrontiersError> {
         let frontier = |protocol: ShieldedProtocol| {
             activations
                 .activation_height_by_name(protocol.activation_upgrade_name())

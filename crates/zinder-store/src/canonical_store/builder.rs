@@ -629,7 +629,7 @@ mod tests {
             crate::canonical_store::test_checkpoint_frontiers(
                 &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
                 BlockHeight::new(2),
-            ),
+            )?,
         );
         store.confirm_source_tip_checkpoint(&source_tip)?;
         assert!(store.is_source_tip_checkpoint_confirmed());
@@ -813,7 +813,7 @@ mod tests {
         builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             build_tip,
             2,
-            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(2)),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(2))?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
@@ -1461,7 +1461,7 @@ mod tests {
         assert_eq!(store.block_header_at(predecessor.block_id.height)?, None);
         assert_eq!(
             store.tree_state_checkpoint_at_or_before(BlockHeight::new(1))?,
-            Some(predecessor.clone())
+            Some(crate::ServedTreeState::from(predecessor))
         );
         Ok(())
     }
@@ -1938,7 +1938,7 @@ mod tests {
         builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
             100,
-            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(100)),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(100))?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
@@ -2429,6 +2429,153 @@ mod tests {
         assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
         Ok(())
     }
+    /// No intermediate checkpoint whose root its frontier does not derive is
+    /// published.
+    ///
+    /// A bulk load takes every checkpoint as a validated
+    /// `CommitmentTreeCheckpoint`. A frontier built from stored `finalState`
+    /// bytes must derive the root it is given, so bytes paired with a root
+    /// they do not derive never reach the loader, and a served tree state,
+    /// which carries no roots, has no conversion into one. A row that holds
+    /// such a root anyway is refused by the cold-certified readback before
+    /// publication.
+    #[test]
+    fn bulk_load_refuses_an_intermediate_checkpoint_whose_root_does_not_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stored =
+            zinder_core::CommitmentTreeFrontier::empty(zinder_core::ShieldedProtocol::Sapling);
+        assert_eq!(
+            zinder_core::CommitmentTreeFrontier::from_canonical_final_state(
+                zinder_core::ShieldedProtocol::Sapling,
+                FinalNoteCommitmentRoot::from_bytes([0xff; 32]),
+                stored.final_state_bytes(),
+            ),
+            Err(zinder_core::CommitmentTreeFrontierValidationError::RootMismatch)
+        );
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let builder =
+            complete_loaded_builder_with_reorg_window(&store_path, 100, BlockHeight::new(150))?;
+        let family = builder
+            .bounded_open
+            .db
+            .cf_handle(crate::canonical_store::rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+            .ok_or("tree-state checkpoint family should exist")?;
+        let key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(100));
+        let mut row = builder
+            .bounded_open
+            .db
+            .get_cf(&family, key)?
+            .ok_or("height 100 holds a cadence checkpoint")?;
+        // The Sapling root follows the block time and the presence bitmap.
+        let root_byte = row
+            .get_mut(5)
+            .ok_or("checkpoint row holds no Sapling root")?;
+        *root_byte ^= 0xff;
+        builder.bounded_open.db.put_cf(&family, key, &row)?;
+        drop(family);
+
+        let error = builder
+            .prepare_cold_certified_publication()
+            .err()
+            .ok_or("cold publication must refuse a checkpoint whose root does not match")?;
+
+        let CanonicalStoreError::BlockLoadSequenceInvalid { reason } = &error else {
+            return Err(error.into());
+        };
+        assert!(
+            reason.contains("height 100") && reason.contains("root does not match"),
+            "{reason}"
+        );
+        Ok(())
+    }
+
+    /// No intermediate checkpoint holding another pool's frontier is
+    /// published by the trusted-fresh path, which serves intermediate
+    /// checkpoints without re-deriving their roots.
+    ///
+    /// Empty Sapling and Orchard frontiers encode as the same bytes, and
+    /// Orchard and Ironwood frontiers share a hash function, so the loader's
+    /// tree-size check cannot tell the pools apart. A frontier keeps the pool
+    /// it was validated for, so a checkpoint with a frontier in another
+    /// pool's position cannot be built for the loader, and the checkpoint it
+    /// takes at height 100 is served there exactly as a replay seeded from
+    /// it reads it.
+    #[test]
+    fn trusted_fresh_bulk_load_cannot_take_a_frontier_of_another_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_core::{
+            CommitmentTreeFrontier, CommitmentTreeFrontiers, CommitmentTreeFrontiersError,
+            ShieldedProtocol,
+        };
+
+        let pools = [
+            ShieldedProtocol::Sapling,
+            ShieldedProtocol::Orchard,
+            ShieldedProtocol::Ironwood,
+        ];
+        let height = BlockHeight::new(100);
+        for pool in pools {
+            for frontier_protocol in pools.into_iter().filter(|protocol| *protocol != pool) {
+                let frontier = |position| {
+                    Some(CommitmentTreeFrontier::empty(if position == pool {
+                        frontier_protocol
+                    } else {
+                        position
+                    }))
+                };
+                assert_eq!(
+                    CommitmentTreeFrontiers::from_validated_parts(
+                        frontier(ShieldedProtocol::Sapling),
+                        frontier(ShieldedProtocol::Orchard),
+                        frontier(ShieldedProtocol::Ironwood),
+                    ),
+                    Err(CommitmentTreeFrontiersError::PoolMismatch {
+                        pool,
+                        frontier_protocol,
+                    }),
+                    "{frontier_protocol:?} frontier in the {pool:?} position at {height:?}"
+                );
+            }
+        }
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let builder =
+            complete_loaded_builder_with_reorg_window(&store_path, 100, BlockHeight::new(150))?;
+        let validated = builder.prepare_trusted_fresh_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(149), BlockHash::from_bytes([149; 32])),
+            UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+        let served = store
+            .tree_state_checkpoint_at_or_before(height)?
+            .ok_or("height 100 holds a cadence checkpoint")?;
+        let revalidated = store
+            .tree_state_checkpoint_at(height, &activations)?
+            .ok_or("height 100 holds a cadence checkpoint")?;
+        assert_eq!(served, crate::ServedTreeState::from(&revalidated));
+        assert_eq!(
+            pools.map(|protocol| revalidated
+                .frontiers
+                .get(protocol)
+                .map(CommitmentTreeFrontier::protocol)),
+            pools.map(Some)
+        );
+        assert!(
+            store
+                .tree_state_checkpoint_at(BlockHeight::new(101), &activations)?
+                .is_some(),
+            "a replay seeded from height 100 reconstructs height 101"
+        );
+        Ok(())
+    }
+
     #[test]
     fn publication_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
         let Some(child) = process_crash::crash_child() else {
@@ -3253,7 +3400,7 @@ mod tests {
                         crate::canonical_store::test_checkpoint_frontiers(
                             &activations,
                             checkpoint.height,
-                        ),
+                        )?,
                     ),
                     BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
                     RawBlobRetention::Transactions,
@@ -3365,7 +3512,9 @@ mod tests {
             };
             let mut block =
                 canonical_build_block(BlockHeight::new(height), [block_hash; 32], parent_hash);
-            if height == build_tip_height.value() {
+            if height == build_tip_height.value()
+                || height.is_multiple_of(crate::TREE_STATE_CHECKPOINT_STRIDE)
+            {
                 add_tree_state_checkpoint(&mut block)?;
             }
             blocks.push(Ok::<_, std::io::Error>(block));
@@ -3378,7 +3527,7 @@ mod tests {
                 BlockHash::from_bytes([build_tip_byte; 32]),
             ),
             build_tip_height.value(),
-            crate::canonical_store::test_checkpoint_frontiers(&activations, build_tip_height),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, build_tip_height)?,
         ))?;
         Ok(store)
     }
@@ -3962,7 +4111,7 @@ mod tests {
         block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(header.height, header.block_hash),
             u32::try_from(header.block_time)?,
-            crate::canonical_store::test_checkpoint_frontiers(&activations, header.height),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, header.height)?,
         ));
         Ok(())
     }
