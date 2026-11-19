@@ -55,8 +55,19 @@ pub const DEFAULT_TREE_STATE_REPLAY_WAIT: Duration = Duration::from_secs(2);
 /// deadline.
 pub const MAX_TREE_STATE_REPLAY_WAIT: Duration = Duration::from_secs(5);
 
-/// Requests that may wait for a replay slot, per slot.
-const WAITERS_PER_SLOT: u32 = 2;
+/// Default number of requests that may wait for a replay slot, per slot.
+///
+/// At a 30 ms rebuild, about the 99th percentile measured on Testnet, one
+/// slot serves 64 queued requests in 1.92 s, inside
+/// [`DEFAULT_TREE_STATE_REPLAY_WAIT`], so a burst of a few hundred wallets
+/// queues instead of being refused.
+pub const DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(63);
+
+/// Most requests a query lets wait for a replay slot, per slot.
+///
+/// The cap keeps the waiting requests a bounded number of small futures.
+pub const MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.saturating_add(255);
 
 /// Limit on the tree-state reconstructions one wallet query runs at once.
 ///
@@ -65,8 +76,10 @@ const WAITERS_PER_SLOT: u32 = 2;
 /// reconstructions of dense history could otherwise occupy every blocking
 /// thread. Clones share one limit, so the clones of a runtime's query share
 /// it. A request that finds every slot taken waits for one up to the
-/// configured wait, alongside at most [`WAITERS_PER_SLOT`] other requests per
-/// slot, and is refused when the wait ends or the waiting places are full.
+/// configured wait, alongside at most the configured number of other
+/// requests per slot, [`DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT`] by
+/// default, and is refused when the wait ends or the waiting places are
+/// full. A waiter that is dropped gives up its place at once.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
     slots: Arc<Semaphore>,
@@ -98,7 +111,9 @@ impl TreeStateReplayLimit {
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
             waiters: Arc::new(AtomicU32::new(0)),
-            max_waiters: max_replays.get().saturating_mul(WAITERS_PER_SLOT),
+            max_waiters: max_replays
+                .get()
+                .saturating_mul(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT.get()),
             wait: wait.min(MAX_TREE_STATE_REPLAY_WAIT),
         }
     }
@@ -108,6 +123,19 @@ impl TreeStateReplayLimit {
     pub(crate) fn with_wait(self, wait: Duration) -> Self {
         Self {
             wait: wait.min(MAX_TREE_STATE_REPLAY_WAIT),
+            ..self
+        }
+    }
+
+    /// Returns this limit with at most `waiters_per_slot` requests, capped at
+    /// [`MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT`], waiting for each slot.
+    pub(crate) fn with_waiters_per_slot(self, waiters_per_slot: NonZeroU32) -> Self {
+        Self {
+            max_waiters: self.max_replays.get().saturating_mul(
+                waiters_per_slot
+                    .min(MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
+                    .get(),
+            ),
             ..self
         }
     }
@@ -153,7 +181,7 @@ impl TreeStateReplayLimit {
 }
 
 /// Why a reconstruction was refused a replay slot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplayRefusal {
     /// No slot freed within the wait.
     WaitExpired,
@@ -317,11 +345,14 @@ pub(crate) fn describe_metrics() {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, num::NonZeroU32, time::Duration};
+    use std::{error::Error, num::NonZeroU32, sync::atomic::Ordering, time::Duration};
 
     use zinder_core::{BlockHeight, ChainTipMetadata};
 
-    use super::{TreeStateReplayLimit, appended_commitments, height_band};
+    use super::{
+        DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+        ReplayRefusal, TreeStateReplayLimit, appended_commitments, height_band,
+    };
     use crate::QueryError;
 
     const WAIT: Duration = Duration::from_secs(2);
@@ -361,14 +392,72 @@ mod tests {
         Ok(())
     }
 
+    /// Spawns `count` requests that each take a slot through `limit`, hold
+    /// it for `rebuild`, and release it.
+    fn spawn_rebuilds(
+        limit: &TreeStateReplayLimit,
+        count: u32,
+        rebuild: Duration,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), QueryError>>> {
+        (0..count)
+            .map(|_| {
+                let limit = limit.clone();
+                tokio::spawn(async move {
+                    let permit = limit.admit().await?;
+                    tokio::time::sleep(rebuild).await;
+                    drop(permit);
+                    Ok(())
+                })
+            })
+            .collect()
+    }
+
+    /// Lets spawned requests run until `waiting` of them wait for a slot.
+    async fn until_waiting(limit: &TreeStateReplayLimit, waiting: u32) -> Result<(), String> {
+        for _ in 0..10_000 {
+            if limit.waiters.load(Ordering::Acquire) == waiting {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(format!(
+            "{} requests waited, not {waiting}",
+            limit.waiters.load(Ordering::Acquire)
+        ))
+    }
+
+    /// With the default 64 waiting places per slot and 30 ms rebuilds, about
+    /// the measured 99th percentile, every request of a burst far larger
+    /// than the slots is served within the 2-second wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_fast_rebuilds_waits_instead_of_being_refused() -> Result<(), Box<dyn Error>>
+    {
+        const SLOTS: u32 = 2;
+        const REBUILD: Duration = Duration::from_millis(30);
+        let limit = TreeStateReplayLimit::new(NonZeroU32::MIN.saturating_add(SLOTS - 1), WAIT);
+        let burst = SLOTS * (1 + DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT.get());
+        let started_at = tokio::time::Instant::now();
+
+        for rebuild in spawn_rebuilds(&limit, burst, REBUILD) {
+            rebuild.await??;
+        }
+        assert!(started_at.elapsed() < WAIT, "{:?}", started_at.elapsed());
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_request_past_the_waiting_places_is_refused_at_once() -> Result<(), Box<dyn Error>> {
         let limit = one_slot();
         let _held = limit.admit().await?;
-        let waiters = [limit.clone(), limit.clone()]
-            .map(|limit| tokio::spawn(async move { limit.admit().await.map(drop) }));
-        tokio::task::yield_now().await;
+        let waiting = DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT.get();
+        let waiters = spawn_rebuilds(&limit, waiting, Duration::ZERO);
+        until_waiting(&limit, waiting).await?;
+
         let started_at = tokio::time::Instant::now();
+        assert_eq!(
+            limit.acquire().await.err(),
+            Some(ReplayRefusal::WaitersFull)
+        );
         assert!(is_refused(&limit.admit().await));
         assert_eq!(started_at.elapsed(), Duration::ZERO);
         for waiter in waiters {
@@ -377,21 +466,62 @@ mod tests {
         Ok(())
     }
 
+    /// A configured count replaces the default, and the next request past it
+    /// is refused for full waiting places.
+    #[tokio::test(start_paused = true)]
+    async fn the_configured_waiters_per_slot_bound_the_waiting_places() -> Result<(), Box<dyn Error>>
+    {
+        let limit = one_slot().with_waiters_per_slot(NonZeroU32::MIN.saturating_add(2));
+        let _held = limit.admit().await?;
+        let waiters = spawn_rebuilds(&limit, 3, Duration::ZERO);
+        until_waiting(&limit, 3).await?;
+
+        assert_eq!(
+            limit.acquire().await.err(),
+            Some(ReplayRefusal::WaitersFull)
+        );
+        for waiter in waiters {
+            waiter.abort();
+        }
+        Ok(())
+    }
+
+    /// Dropping waiting requests, as a server does when their clients go
+    /// away, frees their places at once, so a new request waits again.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_waiter_gives_up_its_waiting_place() -> Result<(), Box<dyn Error>> {
         let limit = one_slot();
         let held = limit.admit().await?;
-        for _ in 0..2 {
-            assert!(tokio::time::timeout(WAIT / 4, limit.admit()).await.is_err());
+        let waiting = DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT.get();
+        let waiters = spawn_rebuilds(&limit, waiting, Duration::ZERO);
+        until_waiting(&limit, waiting).await?;
+
+        let cancelled_at = tokio::time::Instant::now();
+        for waiter in waiters {
+            waiter.abort();
+            assert!(waiter.await.is_err_and(|error| error.is_cancelled()));
         }
-        let waiter = tokio::spawn({
-            let limit = limit.clone();
-            async move { limit.admit().await.map(drop) }
-        });
-        tokio::task::yield_now().await;
+        assert_eq!(limit.waiters.load(Ordering::Acquire), 0);
+        assert_eq!(cancelled_at.elapsed(), Duration::ZERO);
+
+        let waiter = spawn_rebuilds(&limit, 1, Duration::ZERO);
+        until_waiting(&limit, 1).await?;
         drop(held);
-        waiter.await??;
+        for waiter in waiter {
+            waiter.await??;
+        }
         Ok(())
+    }
+
+    #[test]
+    fn waiters_per_slot_default_to_64_and_are_capped_at_256() {
+        let two_slots = NonZeroU32::MIN.saturating_add(1);
+        let limit = TreeStateReplayLimit::new(two_slots, WAIT);
+        assert_eq!(limit.max_waiters, 2 * 64);
+        assert_eq!(
+            limit.with_waiters_per_slot(NonZeroU32::MAX).max_waiters,
+            2 * MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT.get()
+        );
     }
 
     #[test]

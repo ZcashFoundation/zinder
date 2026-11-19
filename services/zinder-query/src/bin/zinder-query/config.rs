@@ -2,7 +2,7 @@
 
 use std::{
     net::SocketAddr,
-    num::NonZeroU8,
+    num::{NonZeroU8, NonZeroU32},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -10,7 +10,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_query::{DEFAULT_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAIT};
+use zinder_query::{
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+};
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
@@ -42,6 +45,8 @@ pub(super) struct QueryConfig {
     pub(super) pair_convergence_attempts: NonZeroU8,
     /// Longest a tree-state rebuild waits for a rebuild slot.
     pub(super) tree_state_replay_wait: Duration,
+    /// Most tree-state rebuilds that wait for each rebuild slot.
+    pub(super) tree_state_replay_waiters_per_slot: NonZeroU32,
     /// First node endpoint transaction broadcast tries, or `None` for a
     /// storage-only query.
     pub(super) node: Option<NodeTarget>,
@@ -167,6 +172,7 @@ struct QuerySection {
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
     tree_state_replay_wait_ms: Option<u64>,
+    tree_state_replay_waiters_per_slot: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,6 +218,9 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
     let tree_state_replay_wait =
         require_tree_state_replay_wait(config.query.tree_state_replay_wait_ms)?;
+    let tree_state_replay_waiters_per_slot = require_tree_state_replay_waiters_per_slot(
+        config.query.tree_state_replay_waiters_per_slot,
+    )?;
     let node = config
         .node
         .map(|section| NodeTarget::resolve(network, section))
@@ -237,6 +246,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         canonical_reorg_policy,
         pair_convergence_attempts,
         tree_state_replay_wait,
+        tree_state_replay_waiters_per_slot,
         node,
         node_fallbacks,
     })
@@ -270,6 +280,21 @@ fn require_tree_state_replay_wait(configured_ms: Option<u64>) -> Result<Duration
         )));
     }
     Ok(wait)
+}
+
+fn require_tree_state_replay_waiters_per_slot(
+    configured: Option<u32>,
+) -> Result<NonZeroU32, ConfigError> {
+    let Some(configured) = configured else {
+        return Ok(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT);
+    };
+    NonZeroU32::new(configured)
+        .filter(|waiters| *waiters <= MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
+        .ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "query.tree_state_replay_waiters_per_slot must be in 1..={MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT}"
+            ))
+        })
 }
 
 fn require_distinct_storage_paths(
@@ -366,6 +391,7 @@ impl QueryConfigToml {
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
                 tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
                     .unwrap_or(u64::MAX),
+                tree_state_replay_waiters_per_slot: config.tree_state_replay_waiters_per_slot.get(),
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -379,6 +405,7 @@ struct QueryToml {
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
     tree_state_replay_wait_ms: u64,
+    tree_state_replay_waiters_per_slot: u32,
 }
 
 #[derive(Serialize)]

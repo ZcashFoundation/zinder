@@ -69,7 +69,10 @@ pub use node_broadcast::OrderedBroadcaster;
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
-pub use tree_state_replay_limit::{DEFAULT_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAIT};
+pub use tree_state_replay_limit::{
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+};
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };

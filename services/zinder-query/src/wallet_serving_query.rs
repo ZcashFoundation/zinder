@@ -398,8 +398,11 @@ mod tests {
 /// stored compact blocks. The query and its clones run at most one such
 /// reconstruction per available CPU at once. A reconstruction that finds
 /// every slot taken waits for one, by default up to
-/// [`DEFAULT_TREE_STATE_REPLAY_WAIT`](crate::DEFAULT_TREE_STATE_REPLAY_WAIT),
-/// and is then refused with [`QueryError::TreeStateReplayLimitReached`].
+/// [`DEFAULT_TREE_STATE_REPLAY_WAIT`](crate::DEFAULT_TREE_STATE_REPLAY_WAIT)
+/// alongside at most
+/// [`DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT`](crate::DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
+/// other requests per slot, and is otherwise refused with
+/// [`QueryError::TreeStateReplayLimitReached`].
 #[derive(Clone)]
 pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     serving_pair_slot: WalletServingPairSlot,
@@ -542,6 +545,26 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     pub fn with_tree_state_replay_wait(self, wait: std::time::Duration) -> Self {
         Self {
             tree_state_replays: self.tree_state_replays.with_wait(wait),
+            ..self
+        }
+    }
+
+    /// Lets at most `waiters_per_slot` tree-state reconstructions wait for
+    /// each replay slot; a reconstruction that finds every waiting place
+    /// taken is refused at once.
+    ///
+    /// The count is capped at
+    /// [`MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT`](crate::MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
+    /// and defaults to
+    /// [`DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT`](crate::DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT).
+    /// The query and every clone made after this call share the new count,
+    /// the existing slots, and the requests already waiting.
+    #[must_use]
+    pub fn with_tree_state_replay_waiters_per_slot(self, waiters_per_slot: NonZeroU32) -> Self {
+        Self {
+            tree_state_replays: self
+                .tree_state_replays
+                .with_waiters_per_slot(waiters_per_slot),
             ..self
         }
     }

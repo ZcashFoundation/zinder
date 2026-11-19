@@ -242,3 +242,43 @@ fn tree_state_replay_wait_defaults_to_two_seconds_and_is_bounded() -> eyre::Resu
     );
     Ok(())
 }
+
+/// Tree-state rebuild waiters per slot default to 64, follow their
+/// environment variable, and are refused outside 1..=256.
+#[test]
+fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    let rendered = |waiters: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = query_command(&temporary, &secondary);
+        command.env_remove("ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT");
+        if let Some(waiters) = waiters {
+            command.env("ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT", waiters);
+        }
+        Ok(command.output()?)
+    };
+
+    for (configured, expected) in [(None, "64"), (Some("1"), "1"), (Some("256"), "256")] {
+        let output = rendered(configured)?;
+        assert!(
+            output.status.success(),
+            "print-config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("tree_state_replay_waiters_per_slot = {expected}")),
+            "{stdout}"
+        );
+    }
+    for refused in ["0", "257"] {
+        let output = rendered(Some(refused))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("query.tree_state_replay_waiters_per_slot must be in 1..=256"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
