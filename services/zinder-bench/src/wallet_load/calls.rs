@@ -267,7 +267,7 @@ pub(crate) struct TreeStateHeights {
 
 impl TreeStateHeights {
     /// Adds what the server counted over the run.
-    pub(super) const fn with_server_observed(
+    pub(super) fn with_server_observed(
         mut self,
         observed: super::server_metrics::ServerObserved,
     ) -> Self {

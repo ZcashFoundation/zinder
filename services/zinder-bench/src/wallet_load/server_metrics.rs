@@ -6,6 +6,8 @@
 //! run given the server's metrics endpoint reports the server's own counts
 //! over the run instead of inferring them from the 100-block stride.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -15,34 +17,123 @@ use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples, sum_b
 
 const TREE_STATE_RECONSTRUCTIONS: &str = "zinder_query_tree_state_replayed_blocks_count";
 const TREE_STATE_REPLAYED_BLOCKS: &str = "zinder_query_tree_state_replayed_blocks_sum";
+const TREE_STATE_READS: &str = "zinder_query_tree_state_reads_total";
+const TREE_STATE_REPLAY_ADMISSIONS: &str = "zinder_query_tree_state_replay_admissions_total";
 const TREE_STATE_REPLAY_REFUSALS: &str = "zinder_query_tree_state_replay_refusals_total";
+const TREE_STATE_REPLAY_WAIT_SUM: &str = "zinder_query_tree_state_replay_wait_duration_seconds_sum";
+const TREE_STATE_REPLAY_WAIT_COUNT: &str =
+    "zinder_query_tree_state_replay_wait_duration_seconds_count";
+const BLOCK_RANGE_ADMISSIONS: &str = "zinder_compat_block_range_streams_admitted_total";
 const BLOCK_RANGE_REFUSALS: &str = "zinder_compat_block_range_stream_refusals_total";
+const BLOCK_RANGE_SLOT_WAIT_SUM: &str = "zinder_compat_block_range_slot_wait_duration_seconds_sum";
+const BLOCK_RANGE_SLOT_WAIT_COUNT: &str =
+    "zinder_compat_block_range_slot_wait_duration_seconds_count";
+const BLOCK_RANGE_STAGE_SUM: &str = "zinder_compat_block_range_stage_duration_seconds_sum";
+const BLOCK_RANGE_STAGE_COUNT: &str = "zinder_compat_block_range_stage_duration_seconds_count";
 const RECEIVE_REFUSALS: &str = "zinder_grpc_request_receive_refusals_total";
+const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 
 /// What the server counted between the start and the end of a run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+///
+/// A server that does not export a metric reports zero for it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(crate) struct ServerObserved {
     /// Tree states the server rebuilt by replaying compact blocks. Every
     /// other answered tree state came from a stored checkpoint.
     tree_state_reconstructions: u64,
     tree_state_replayed_blocks: u64,
+    tree_state_stored_reads: u64,
+    tree_state_replayed_reads: u64,
+    tree_state_replay_admissions: u64,
     tree_state_replay_refusals: u64,
+    /// Total time tree-state rebuilds waited for a rebuild slot.
+    tree_state_replay_wait_seconds: f64,
+    tree_state_replay_waits: u64,
+    block_range_admissions: u64,
     block_range_refusals: u64,
+    /// Total time block-range requests waited for a stream slot.
+    block_range_slot_wait_seconds: f64,
+    block_range_slot_waits: u64,
+    /// Time block-range chunks spent in each stage, by stage name.
+    block_range_stages: BTreeMap<String, StageTime>,
     receive_refusals: u64,
+    stale_tip_refusals: u64,
+}
+
+/// Total time and chunk count of one block-range stage over a run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct StageTime {
+    seconds: f64,
+    chunks: u64,
 }
 
 impl ServerObserved {
     /// The counter increases from `before` to `after`.
     pub(super) fn between(before: &[MetricSample], after: &[MetricSample]) -> Self {
-        let delta = |name| counter_value(sum_by_name(after, name) - sum_by_name(before, name));
+        let delta = |name| after_minus_before(before, after, name, None);
+        let count = |name| counter_value(delta(name));
+        let labeled =
+            |name, label| counter_value(after_minus_before(before, after, name, Some(label)));
+        let block_range_stages = after
+            .iter()
+            .filter(|sample| sample.name == BLOCK_RANGE_STAGE_SUM)
+            .filter_map(|sample| sample.label("stage").map(str::to_owned))
+            .map(|stage| {
+                let time = StageTime {
+                    seconds: after_minus_before(
+                        before,
+                        after,
+                        BLOCK_RANGE_STAGE_SUM,
+                        Some(("stage", &stage)),
+                    )
+                    .max(0.0),
+                    chunks: counter_value(after_minus_before(
+                        before,
+                        after,
+                        BLOCK_RANGE_STAGE_COUNT,
+                        Some(("stage", &stage)),
+                    )),
+                };
+                (stage, time)
+            })
+            .collect();
         Self {
-            tree_state_reconstructions: delta(TREE_STATE_RECONSTRUCTIONS),
-            tree_state_replayed_blocks: delta(TREE_STATE_REPLAYED_BLOCKS),
-            tree_state_replay_refusals: delta(TREE_STATE_REPLAY_REFUSALS),
-            block_range_refusals: delta(BLOCK_RANGE_REFUSALS),
-            receive_refusals: delta(RECEIVE_REFUSALS),
+            tree_state_reconstructions: count(TREE_STATE_RECONSTRUCTIONS),
+            tree_state_replayed_blocks: count(TREE_STATE_REPLAYED_BLOCKS),
+            tree_state_stored_reads: labeled(TREE_STATE_READS, ("source", "stored")),
+            tree_state_replayed_reads: labeled(TREE_STATE_READS, ("source", "replayed")),
+            tree_state_replay_admissions: count(TREE_STATE_REPLAY_ADMISSIONS),
+            tree_state_replay_refusals: count(TREE_STATE_REPLAY_REFUSALS),
+            tree_state_replay_wait_seconds: delta(TREE_STATE_REPLAY_WAIT_SUM).max(0.0),
+            tree_state_replay_waits: count(TREE_STATE_REPLAY_WAIT_COUNT),
+            block_range_admissions: count(BLOCK_RANGE_ADMISSIONS),
+            block_range_refusals: count(BLOCK_RANGE_REFUSALS),
+            block_range_slot_wait_seconds: delta(BLOCK_RANGE_SLOT_WAIT_SUM).max(0.0),
+            block_range_slot_waits: count(BLOCK_RANGE_SLOT_WAIT_COUNT),
+            block_range_stages,
+            receive_refusals: count(RECEIVE_REFUSALS),
+            stale_tip_refusals: count(STALE_TIP_REFUSALS),
         }
     }
+}
+
+/// The increase of `name`, summed over every series or only those whose
+/// label matches.
+fn after_minus_before(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    name: &str,
+    label: Option<(&str, &str)>,
+) -> f64 {
+    let total = |samples: &[MetricSample]| match label {
+        None => sum_by_name(samples, name),
+        Some((key, wanted)) => samples
+            .iter()
+            .filter(|sample| sample.name == name && sample.label(key) == Some(wanted))
+            .map(|sample| sample.reading)
+            .sum(),
+    };
+    total(after) - total(before)
 }
 
 /// Rounds a counter increase to a whole count; a reset reads as zero.
@@ -122,6 +213,36 @@ mod tests {
         assert_eq!(observed.tree_state_replay_refusals, 3);
         assert_eq!(observed.receive_refusals, 2);
         assert_eq!(observed.block_range_refusals, 0);
+    }
+
+    #[test]
+    fn labeled_reads_waits_and_stages_are_split_by_label() {
+        let before = parse_prometheus_samples(
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 2\n\
+             zinder_compat_block_range_stage_duration_seconds_sum{stage=\"read\"} 1.5\n\
+             zinder_compat_block_range_stage_duration_seconds_count{stage=\"read\"} 3\n",
+        );
+        let after = parse_prometheus_samples(
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 7\n\
+             zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"a\"} 4\n\
+             zinder_query_tree_state_replay_wait_duration_seconds_sum 0.25\n\
+             zinder_query_tree_state_replay_wait_duration_seconds_count 4\n\
+             zinder_compat_block_range_stage_duration_seconds_sum{stage=\"read\"} 4.0\n\
+             zinder_compat_block_range_stage_duration_seconds_count{stage=\"read\"} 13\n\
+             zinder_compat_block_range_stage_duration_seconds_sum{stage=\"send\"} 0.5\n\
+             zinder_compat_block_range_stage_duration_seconds_count{stage=\"send\"} 9\n",
+        );
+
+        let observed = ServerObserved::between(&before, &after);
+
+        assert_eq!(observed.tree_state_stored_reads, 5);
+        assert_eq!(observed.tree_state_replayed_reads, 4);
+        assert_eq!(observed.tree_state_replay_waits, 4);
+        assert!((observed.tree_state_replay_wait_seconds - 0.25).abs() < 1e-9);
+        let read = &observed.block_range_stages["read"];
+        assert!((read.seconds - 2.5).abs() < 1e-9);
+        assert_eq!(read.chunks, 10);
+        assert_eq!(observed.block_range_stages["send"].chunks, 9);
     }
 
     #[tokio::test]
