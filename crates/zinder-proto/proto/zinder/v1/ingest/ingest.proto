@@ -53,10 +53,13 @@ message WriterStatusResponse {
   // Cross-plane chain-state envelope. The writer's latest committed chain
   // epoch (with its visible and settled tips) rides on
   // `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the node tip
-  // the writer last observed: the heights in the node-health probe's not-ready
-  // report when it has them, otherwise the follower's admission target.
-  // `upstream_tip` is absent while the writer's node admission reports the
-  // node unavailable, or before it observes a node tip. Absent when the writer
+  // the writer last observed. Its committed height is the larger of the
+  // node-health probe's not-ready report and the follower's admission target,
+  // and its estimated height, present only when the probe reports one, is
+  // never below that target, so a report the probe kept from before an outage
+  // never names an older tip. `upstream_tip` is absent while the writer's node
+  // admission reports the node unavailable, even after a shutdown drain
+  // starts, or before it observes a node tip. Absent when the writer
   // has not committed a chain epoch yet, or while a parked writer can no
   // longer read its epoch.
   optional zinder.v1.wallet.ChainView chain_view = 1;

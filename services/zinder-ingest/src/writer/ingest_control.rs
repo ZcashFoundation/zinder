@@ -163,7 +163,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 None,
                 &readiness_report,
                 node_source_observation.as_ref(),
-                self.readiness.admission_target_height(),
+                FollowedNode::of(&self.readiness),
             )));
         }
         // A parked writer reports its frozen fence while it still answers;
@@ -186,7 +186,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             chain_epoch,
             &readiness_report,
             node_source_observation.as_ref(),
-            self.readiness.admission_target_height(),
+            FollowedNode::of(&self.readiness),
         )))
     }
 
@@ -444,15 +444,33 @@ fn chain_epoch_committed_message(
     }
 }
 
-/// `followed_target` is the node tip the follower last observed, which the
-/// projected `readiness_report` drops while a required node-health input
-/// refuses.
+/// What the follower's own admission state says about the node, which the
+/// projected readiness report hides while a required node-health input
+/// refuses or the writer drains for shutdown.
+#[derive(Clone, Copy, Debug)]
+struct FollowedNode {
+    /// The node tip the follower last observed.
+    target_height: Option<u32>,
+    /// Whether the follower reports the node unreachable.
+    is_unavailable: bool,
+}
+
+impl FollowedNode {
+    fn of(readiness: &ComposedReadiness) -> Self {
+        let admission = readiness.admission_state();
+        Self {
+            target_height: admission.target_height,
+            is_unavailable: matches!(admission.cause, ReadinessCause::NodeUnavailable(_)),
+        }
+    }
+}
+
 fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
     node_source_observation: Option<&ReadinessCause>,
-    followed_target: Option<u32>,
+    followed_node: FollowedNode,
 ) -> WriterStatusResponse {
     let upstream_not_ready = [node_source_observation, Some(&readiness_report.cause)]
         .into_iter()
@@ -467,10 +485,12 @@ fn writer_status_response(
     // The health probe keeps its last observation when a probe fails, so
     // while the follower reports the node unreachable that observation is
     // stale and names no tip the node can still vouch for.
-    let upstream_tip = if matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_)) {
+    let upstream_tip = if followed_node.is_unavailable
+        || matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_))
+    {
         None
     } else {
-        upstream_tip_from_readiness(followed_target, upstream_not_ready)
+        upstream_tip_from_readiness(followed_node.target_height, upstream_not_ready)
     };
     let gap_blocks = upstream_tip
         .as_ref()
@@ -497,28 +517,27 @@ fn writer_status_response(
     }
 }
 
+/// Returns the node tip to report from the follower's observed target and
+/// the node-health probe's not-ready report.
+///
+/// A probe keeps its last report when a probe fails, so after an outage the
+/// report can name an older tip than the follower observes. Each height is
+/// therefore the larger of the two, and Zebra's `/ready` reports, which carry
+/// no heights, leave the follower's target.
 fn upstream_tip_from_readiness(
     followed_target: Option<u32>,
     upstream_not_ready: Option<&UpstreamNotReadyDetail>,
 ) -> Option<wallet::UpstreamTip> {
-    let followed_tip = || {
-        followed_target.map(|committed_height| wallet::UpstreamTip {
-            committed_height: Some(committed_height),
-            estimated_height: None,
-        })
-    };
-    // Zebra's `/ready` reports carry no heights, so a report without them
-    // leaves the node tip the follower observed.
-    upstream_not_ready
-        .filter(|detail| {
-            detail.upstream_committed_height.is_some() || detail.upstream_estimated_height.is_some()
-        })
-        .map_or_else(followed_tip, |detail| {
-            Some(wallet::UpstreamTip {
-                committed_height: detail.upstream_committed_height,
-                estimated_height: detail.upstream_estimated_height,
-            })
-        })
+    let committed_height = upstream_not_ready
+        .and_then(|detail| detail.upstream_committed_height)
+        .max(followed_target);
+    let estimated_height = upstream_not_ready
+        .and_then(|detail| detail.upstream_estimated_height)
+        .map(|estimated| followed_target.map_or(estimated, |target| estimated.max(target)));
+    (committed_height.is_some() || estimated_height.is_some()).then_some(wallet::UpstreamTip {
+        committed_height,
+        estimated_height,
+    })
 }
 
 fn chain_value_pools_response(
@@ -1318,6 +1337,156 @@ mod tests {
             "the follower's observed node tip must stand in for a heightless report"
         );
         assert_eq!(response.gap_blocks, Some(0));
+
+        fixture.shutdown().await
+    }
+
+    /// Builds the ingest-control adapter over `composed` for a writer-status
+    /// test.
+    fn writer_status_adapter(
+        fixture: &SharedControlFixture,
+        composed: ComposedReadiness,
+    ) -> Result<CanonicalIngestControlGrpcAdapter, Box<dyn std::error::Error>> {
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        Ok(CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            source,
+            composed,
+        ))
+    }
+
+    /// Writer status reports the newer of the probe's and the follower's tip.
+    ///
+    /// The JSON-RPC health fallback's not-ready report from before an outage
+    /// names an older tip than the one the follower observes once the node
+    /// returns, and a failed probe keeps that report, so the old report must
+    /// not vouch for a stale tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_never_reports_a_probe_tip_below_the_followed_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let visible_height = fixture
+            .canonical
+            .chain_epoch()
+            .await?
+            .chain_epoch
+            .visible_tip_height
+            .value();
+        // `[node.health]` makes the probe a required input.
+        let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+        // A quiet chain: the probe's last report before the outage names the
+        // served tip.
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: Some(visible_height),
+                upstream_estimated_height: Some(visible_height.saturating_add(20)),
+                upstream_verification_progress: Some(0.99),
+                upstream_health: UpstreamHealth {
+                    source: std::borrow::Cow::Borrowed("verification_progress_fallback"),
+                    reason: std::borrow::Cow::Borrowed("estimated_gap_above_floor"),
+                },
+            }),
+        );
+        let adapter = writer_status_adapter(&fixture, composed.clone())?;
+        let upstream_tip = async || -> Result<_, Box<dyn std::error::Error>> {
+            let response =
+                IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+                    .await?
+                    .into_inner();
+            Ok((
+                response.chain_view.and_then(|view| view.upstream_tip),
+                response.gap_blocks,
+            ))
+        };
+
+        // The node goes down, and the failed probes keep that report.
+        composed.publish_admission(
+            ReadinessState::node_unavailable_with_detail(
+                zinder_runtime::NodeUnavailableDetail::first_iteration(
+                    "connection",
+                    "connection refused",
+                ),
+                Some(visible_height),
+            )
+            .with_phase(IngestPhase::FollowingTip),
+        );
+        assert_eq!(upstream_tip().await?.0, None);
+
+        // The node comes back 90 blocks ahead of the served tip before the
+        // probe's next report.
+        composed.publish_admission(
+            ReadinessState::syncing(
+                Some(90),
+                Some(visible_height),
+                Some(visible_height.saturating_add(90)),
+            )
+            .with_phase(IngestPhase::FollowingTip),
+        );
+        let (upstream_tip, gap_blocks) = upstream_tip().await?;
+        assert_eq!(
+            upstream_tip.and_then(|tip| tip.committed_height),
+            Some(visible_height.saturating_add(90))
+        );
+        assert_eq!(
+            upstream_tip.and_then(|tip| tip.estimated_height),
+            Some(visible_height.saturating_add(90))
+        );
+        assert_eq!(gap_blocks, Some(90));
+
+        fixture.shutdown().await
+    }
+
+    /// A shutdown drain that starts during a node outage replaces the
+    /// projected cause, and writer status still names no upstream tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_reports_no_upstream_tip_while_draining_through_an_outage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let visible_height = fixture
+            .canonical
+            .chain_epoch()
+            .await?
+            .chain_epoch
+            .visible_tip_height
+            .value();
+        let composed = ComposedReadiness::new(Readiness::default(), &[]);
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: Some(visible_height),
+                upstream_estimated_height: Some(visible_height.saturating_add(20)),
+                upstream_verification_progress: Some(0.99),
+                upstream_health: UpstreamHealth {
+                    source: std::borrow::Cow::Borrowed("verification_progress_fallback"),
+                    reason: std::borrow::Cow::Borrowed("estimated_gap_above_floor"),
+                },
+            }),
+        );
+        composed.publish_admission(
+            ReadinessState::node_unavailable_with_detail(
+                zinder_runtime::NodeUnavailableDetail::first_iteration(
+                    "connection",
+                    "connection refused",
+                ),
+                Some(visible_height),
+            )
+            .with_phase(IngestPhase::FollowingTip),
+        );
+        composed.publish_shutting_down();
+        let adapter = writer_status_adapter(&fixture, composed)?;
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(response.chain_view.and_then(|view| view.upstream_tip), None);
 
         fixture.shutdown().await
     }
