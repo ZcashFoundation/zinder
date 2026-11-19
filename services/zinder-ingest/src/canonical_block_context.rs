@@ -80,10 +80,11 @@ pub fn require_genesis_complete_history(
 /// One reader serves a sequence of ranges. Sequential ranges reuse the
 /// commitment-tree state left by the previous call; any other range reseeds
 /// from the newest persisted tree-state checkpoint at or before its start.
+/// A reader built with [`Self::without_final_roots`] derives no roots.
 pub struct CanonicalBlockContextReader<'canonical> {
     secondary: &'canonical RocksDbCanonicalSecondary,
     activations: &'canonical NetworkUpgradeActivations,
-    roots: FinalRootsCursor,
+    roots: Option<FinalRootsCursor>,
     prevouts: Option<&'canonical mut PrevoutCache>,
 }
 
@@ -100,7 +101,7 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         Self {
             secondary,
             activations,
-            roots: FinalRootsCursor { accumulator: None },
+            roots: Some(FinalRootsCursor { accumulator: None }),
             prevouts: None,
         }
     }
@@ -119,9 +120,22 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         Self {
             secondary,
             activations,
-            roots: FinalRootsCursor { accumulator: None },
+            roots: Some(FinalRootsCursor { accumulator: None }),
             prevouts: Some(prevouts),
         }
+    }
+
+    /// Stops deriving final note-commitment roots, so every hydrated context
+    /// carries `final_note_commitment_roots: None`.
+    ///
+    /// Deriving roots reads every compact block in a range, seeds the
+    /// commitment trees from a tree-state checkpoint, and hashes each block's
+    /// commitments. Use this only for consumers that never read roots; the
+    /// commitment-root search index needs them.
+    #[must_use]
+    pub fn without_final_roots(mut self) -> Self {
+        self.roots = None;
+        self
     }
 
     /// Returns the prevout cache this reader resolves through, if any.
@@ -234,7 +248,12 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
-        let mut roots = self.read_final_note_commitment_roots(range)?;
+        let mut roots = match self.roots.as_mut() {
+            Some(cursor) => {
+                read_final_note_commitment_roots(self.secondary, self.activations, cursor, range)?
+            }
+            None => HashMap::new(),
+        };
         let transparent_spends = Arc::new(self.resolve_transparent_spends(&blocks)?);
         let intrinsic_value_balances = Arc::new(intrinsic_value_balances(&blocks));
         let mut contexts = Vec::with_capacity(blocks.len());
@@ -262,25 +281,6 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
                     .map_err(IngestError::from)
             })
             .collect()
-    }
-
-    fn read_final_note_commitment_roots(
-        &mut self,
-        range: BlockHeightRange,
-    ) -> Result<HashMap<BlockHeight, BlockFinalNoteCommitmentRoots>, IngestError> {
-        let compact_blocks = self.secondary.compact_blocks_in_range(range)?;
-        let accumulator = self
-            .roots
-            .position_at(self.secondary, self.activations, range.start)?;
-        let mut roots = HashMap::with_capacity(compact_blocks.len());
-        for compact_block in &compact_blocks {
-            append_compact_block(accumulator, compact_block)?;
-            let block_roots = accumulator.final_note_commitment_roots(compact_block.block_hash());
-            if has_any_pool_root(&block_roots) {
-                roots.insert(compact_block.height(), block_roots);
-            }
-        }
-        Ok(roots)
     }
 
     /// Resolves every non-coinbase input in `blocks`, then teaches the cache
@@ -487,6 +487,25 @@ fn read_prevout_deltas(
         )));
     }
     Ok(deltas)
+}
+
+fn read_final_note_commitment_roots(
+    secondary: &RocksDbCanonicalSecondary,
+    activations: &NetworkUpgradeActivations,
+    cursor: &mut FinalRootsCursor,
+    range: BlockHeightRange,
+) -> Result<HashMap<BlockHeight, BlockFinalNoteCommitmentRoots>, IngestError> {
+    let compact_blocks = secondary.compact_blocks_in_range(range)?;
+    let accumulator = cursor.position_at(secondary, activations, range.start)?;
+    let mut roots = HashMap::with_capacity(compact_blocks.len());
+    for compact_block in &compact_blocks {
+        append_compact_block(accumulator, compact_block)?;
+        let block_roots = accumulator.final_note_commitment_roots(compact_block.block_hash());
+        if has_any_pool_root(&block_roots) {
+            roots.insert(compact_block.height(), block_roots);
+        }
+    }
+    Ok(roots)
 }
 
 /// Commitment-tree state carried across sequential hydration ranges.

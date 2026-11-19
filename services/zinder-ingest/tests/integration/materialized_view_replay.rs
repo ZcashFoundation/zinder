@@ -684,7 +684,7 @@ async fn wait_until(condition: impl Fn() -> bool + Sync) -> Result<(), Box<dyn E
     .map_err(|_| "the tailer did not reach the expected state within 30 seconds".into())
 }
 
-fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
+pub(super) fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let store = open_view_store(directory.path())?;
     Ok((directory, store))
@@ -751,7 +751,7 @@ fn assert_view_rows_match(
     Ok(())
 }
 
-fn view_rows(
+pub(super) fn view_rows(
     view: &MaterializedViewStore,
     column_family: &'static str,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Box<dyn Error>> {
@@ -784,7 +784,7 @@ fn delete_chain_event_cursors(
 /// Removes every transparent-address ranking row and its cursor from a closed
 /// view store, as a store whose views were built before the ranking was
 /// published leaves them.
-fn clear_transparent_address_ranking(path: &Path) -> Result<(), Box<dyn Error>> {
+pub(super) fn clear_transparent_address_ranking(path: &Path) -> Result<(), Box<dyn Error>> {
     let options = rust_rocksdb::Options::default();
     let column_families = rust_rocksdb::DB::list_cf(&options, path)?;
     let db = rust_rocksdb::DB::open_cf(&options, path, &column_families)?;
@@ -812,7 +812,7 @@ fn clear_transparent_address_ranking(path: &Path) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-fn transparent_address_ranking(
+pub(super) fn transparent_address_ranking(
     view: &MaterializedViewStore,
 ) -> Result<
     (
