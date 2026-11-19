@@ -245,15 +245,32 @@ async fn open_secondary_when_published<Writer: TreeStateStrideWriter>(
 ) -> Option<RocksDbCanonicalSecondary> {
     let mut waiting_logged = false;
     loop {
-        match RocksDbCanonicalSecondary::open_ready(
-            &context.canonical_primary_path,
-            &context.secondary_path,
-            &context.network_upgrade_activations,
+        // Opening catches the secondary up and admits the store, which reads
+        // retained history, so it runs off the async workers live ingest uses.
+        let primary_path = context.canonical_primary_path.clone();
+        let secondary_path = context.secondary_path.clone();
+        let activations = Arc::clone(&context.network_upgrade_activations);
+        let (workload, raw_blob_retention, reorg_policy, resource_budget) = (
             context.workload,
             context.raw_blob_retention,
             context.reorg_policy,
             context.resource_budget,
-        ) {
+        );
+        let opened = tokio::task::spawn_blocking(move || {
+            RocksDbCanonicalSecondary::open_ready(
+                primary_path,
+                secondary_path,
+                &activations,
+                workload,
+                raw_blob_retention,
+                reorg_policy,
+                resource_budget,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.to_string()));
+        match opened {
             Ok(secondary) => return Some(secondary),
             Err(error) if !waiting_logged => {
                 waiting_logged = true;

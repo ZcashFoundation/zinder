@@ -471,6 +471,75 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
     Ok(())
 }
 
+/// Opening the secondary reads store files, which the pass does off the async
+/// workers. A FIFO in place of the primary's `CURRENT` file holds that read
+/// until the test writes to it.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<()> {
+    const RELEASE_AFTER: Duration = Duration::from_secs(3);
+    let root = tempfile::tempdir()?;
+    let primary_path = root.path().join("canonical");
+    std::fs::create_dir(&primary_path)?;
+    let current = primary_path.join("CURRENT");
+    eyre::ensure!(
+        std::process::Command::new("mkfifo")
+            .arg(&current)
+            .status()?
+            .success(),
+        "mkfifo failed"
+    );
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(RELEASE_AFTER);
+        std::fs::write(&current, b"not a manifest name\n")
+    });
+    let cancel = CancellationToken::new();
+    let task = spawn_tree_state_densification_task(
+        TreeStateDensificationContext {
+            canonical_primary_path: primary_path,
+            secondary_path: root.path().join("secondary"),
+            network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::None,
+            reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            writer: UnavailableWriter,
+            gate: following_tip_gate(),
+            config: TreeStateDensificationConfig::default(),
+        },
+        cancel.clone(),
+    );
+
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let elapsed = started.elapsed();
+    cancel.cancel();
+    task.await?;
+    release
+        .join()
+        .map_err(|_| eyre::eyre!("the release thread panicked"))??;
+
+    eyre::ensure!(
+        elapsed < RELEASE_AFTER,
+        "a 50 ms timer took {elapsed:?} while the secondary was opening"
+    );
+    Ok(())
+}
+
+/// A writer that never commits.
+struct UnavailableWriter;
+
+impl TreeStateStrideWriter for UnavailableWriter {
+    async fn commit_tree_state_stride(
+        &self,
+        _stride: DensifiedTreeStateStride,
+    ) -> Result<TreeStateStrideCommit, TreeStateStrideWriteError> {
+        Err(TreeStateStrideWriteError::Unavailable {
+            reason: "the test writer is unavailable".to_owned(),
+        })
+    }
+}
+
 /// The writer commits a stride sent through its command queue between follow
 /// iterations, and refuses one replayed on another chain as data loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
