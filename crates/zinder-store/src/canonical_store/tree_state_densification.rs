@@ -5,18 +5,18 @@
 //! read between two of them replays stored compact blocks. Densification fills
 //! a stride, from one stored checkpoint to the next cadence checkpoint, with
 //! the checkpoints a [`TreeStateCheckpointSelection`] picks. It replays the
-//! stride with the checks a tree-state reconstruction applies, and accepts the
-//! result only when the replay reproduces every checkpoint already stored in
-//! the stride, including the one that ends it, byte for byte. Each stride commits in one batch, so a stride is
-//! either complete or untouched, and only settled strides are densified, so no
-//! reorg can remove a densified row.
+//! stride with the per-block step a tree-state reconstruction runs, and
+//! accepts the result only when the replay reproduces every checkpoint already
+//! stored in the stride, including the one that ends it, byte for byte. Each
+//! stride commits in one batch, so a stride is either complete or untouched,
+//! and only settled strides are densified, so no reorg can remove a densified
+//! row.
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 
 use rust_rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
-    CommitmentTreeAccumulatorError, CompactBlockArtifact, NetworkUpgradeActivations,
+    BlockHeight, BlockId, ChainTipMetadata, NetworkUpgradeActivations,
     wire::decode_height_key_ascending,
 };
 
@@ -30,7 +30,7 @@ use super::{
         read_stored_tree_state_checkpoint_at,
     },
     rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    tree_state_replay::append_compact_block_commitments,
+    tree_state_replay::{recorded_tree_sizes, replay_compact_blocks},
 };
 
 /// Most reads one stride adds to a scan.
@@ -621,122 +621,53 @@ fn replay_stride(
     let stored_rows = StoredStrideRows::read(store, stride)?;
     let seed = read_stored_tree_state_checkpoint_at(store, stride.seed_height)?
         .ok_or_else(|| stride_mismatch(stride, "the seed checkpoint is absent"))?;
-    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-        seed.block_id.height,
-        &seed.frontiers,
-        network_upgrade_activations,
-    )
-    .map_err(|source| replay_mismatch(stride, seed.block_id.height, &source))?;
-    let seed_commitments = commitment_count(accumulator.tip_metadata());
+    let seed_commitments = commitment_count(seed.tip_metadata());
     let mut checkpoint_commitments = seed_commitments;
-    let mut tip = seed.block_id;
     let mut rows = Vec::new();
-    while tip.height < stride.end_height {
-        let height = tip.height.next().ok_or_else(|| {
-            CanonicalStoreError::publication("tree-state densification height exceeds u32::MAX")
-        })?;
-        let (block_time_seconds, block_hash) =
-            append_stored_block(store, stride, &mut accumulator, tip)?;
-        tip = BlockId::new(height, block_hash);
-        let commitments = commitment_count(accumulator.tip_metadata());
-        let stored = stored_rows.at(height);
-        let selected = height < stride.end_height
-            && selection.requires_checkpoint(commitments.saturating_sub(checkpoint_commitments));
-        if !selected && stored.is_none() {
-            continue;
-        }
-        let frontiers = accumulator
-            .cross_checked_frontiers()
-            .map_err(|source| replay_mismatch(stride, height, &source))?;
-        let row = encode_tree_state_checkpoint(block_time_seconds, &frontiers);
-        checkpoint_commitments = commitments;
-        match stored {
-            Some(stored) if stored != row.as_slice() => {
-                return Err(stride_mismatch(
+    let trees = replay_compact_blocks(
+        store,
+        &seed,
+        stride.end_height,
+        network_upgrade_activations,
+        |trees| {
+            let height = trees.tip().height;
+            let commitments = commitment_count(trees.tree_sizes());
+            let stored = stored_rows.at(height);
+            let selected = height < stride.end_height
+                && selection
+                    .requires_checkpoint(commitments.saturating_sub(checkpoint_commitments));
+            if !selected && stored.is_none() {
+                return Ok(());
+            }
+            let checkpoint = trees.checkpoint(store)?;
+            let row =
+                encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers);
+            checkpoint_commitments = commitments;
+            match stored {
+                Some(stored) if stored != row.as_slice() => Err(stride_mismatch(
                     stride,
                     format!(
                         "the replay does not reproduce the checkpoint stored at height {}",
                         height.value()
                     ),
-                ));
+                )),
+                Some(_) => Ok(()),
+                None => {
+                    rows.push((height, row));
+                    Ok(())
+                }
             }
-            Some(_) => {}
-            None => rows.push((height, row)),
-        }
-    }
+        },
+    )?;
     Ok(DensifiedTreeStateStride {
         stride,
-        end_block: tip,
+        end_block: trees.tip(),
         seed_row: stored_rows.seed_row,
         end_row: stored_rows.end_row,
         rows,
-        replayed_commitment_count: commitment_count(accumulator.tip_metadata())
+        replayed_commitment_count: commitment_count(trees.tree_sizes())
             .saturating_sub(seed_commitments),
     })
-}
-
-/// Appends the stored block above `tip` and returns its block time and hash.
-///
-/// The block must extend `tip`, reach the tree sizes its compact block
-/// records, and match the canonical header at its height, as a tree-state
-/// reconstruction requires.
-fn append_stored_block(
-    store: &impl CanonicalServingRead,
-    stride: TreeStateStride,
-    accumulator: &mut CommitmentTreeAccumulator,
-    tip: BlockId,
-) -> Result<(u32, zinder_core::BlockHash), CanonicalStoreError> {
-    let height = tip.height.next().ok_or_else(|| {
-        CanonicalStoreError::publication("tree-state densification height exceeds u32::MAX")
-    })?;
-    let compact_block = read_compact_block_at(store, height)?.ok_or_else(|| {
-        stride_mismatch(
-            stride,
-            format!("compact block at height {} is absent", height.value()),
-        )
-    })?;
-    if compact_block.previous_block_hash() != tip.hash {
-        return Err(stride_mismatch(
-            stride,
-            format!(
-                "compact block at height {} does not extend the block below it",
-                height.value()
-            ),
-        ));
-    }
-    append_compact_block_commitments(accumulator, &compact_block)
-        .map_err(|source| replay_mismatch(stride, height, &source))?;
-    if accumulator.tip_metadata() != recorded_tree_sizes(&compact_block) {
-        return Err(stride_mismatch(
-            stride,
-            format!(
-                "compact block at height {} records tree sizes its note commitments do not reach",
-                height.value()
-            ),
-        ));
-    }
-    let header = read_block_header_at(store, height)?.ok_or_else(|| {
-        stride_mismatch(
-            stride,
-            format!("block header at height {} is absent", height.value()),
-        )
-    })?;
-    if header.block_hash != compact_block.block_hash() {
-        return Err(stride_mismatch(
-            stride,
-            format!(
-                "compact block at height {} is not the canonical block",
-                height.value()
-            ),
-        ));
-    }
-    let block_time_seconds = u32::try_from(header.block_time).map_err(|_| {
-        stride_mismatch(
-            stride,
-            format!("block time at height {} is outside u32", height.value()),
-        )
-    })?;
-    Ok((block_time_seconds, header.block_hash))
 }
 
 /// The raw checkpoint rows stored from a stride's seed through its end.
@@ -796,15 +727,6 @@ impl StoredStrideRows {
     }
 }
 
-fn recorded_tree_sizes(compact_block: &CompactBlockArtifact) -> ChainTipMetadata {
-    let recorded = compact_block.chain_metadata();
-    ChainTipMetadata::new(
-        recorded.sapling_commitment_tree_size,
-        recorded.orchard_commitment_tree_size,
-        recorded.ironwood_commitment_tree_size,
-    )
-}
-
 fn commitment_count(tree_sizes: ChainTipMetadata) -> u64 {
     u64::from(tree_sizes.sapling_commitment_tree_size)
         + u64::from(tree_sizes.orchard_commitment_tree_size)
@@ -826,18 +748,4 @@ fn stride_mismatch(stride: TreeStateStride, reason: impl Into<String>) -> Canoni
         end_height: stride.end_height,
         reason: reason.into(),
     }
-}
-
-fn replay_mismatch(
-    stride: TreeStateStride,
-    height: BlockHeight,
-    source: &CommitmentTreeAccumulatorError,
-) -> CanonicalStoreError {
-    stride_mismatch(
-        stride,
-        format!(
-            "commitment trees at height {} cannot be replayed: {source}",
-            height.value()
-        ),
-    )
 }
