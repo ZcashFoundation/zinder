@@ -450,7 +450,7 @@ async fn run_compact_blocks(
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
-    let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
+    let grpc_adapter = zinder_compat_lightwalletd::CompactBlocksGrpcAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )

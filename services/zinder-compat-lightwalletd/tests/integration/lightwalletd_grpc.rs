@@ -900,6 +900,64 @@ async fn get_block_range_times_each_chunk_stage() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A block-range chunk becomes lightwalletd messages on the blocking pool,
+/// not on the task that read it.
+///
+/// The runtime has one blocking thread and the test holds it, so a chunk the
+/// query has already read waits to be converted until the test releases the
+/// thread.
+#[test]
+fn get_block_range_converts_each_chunk_on_the_blocking_pool() -> eyre::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(convert_a_chunk_while_the_blocking_pool_is_held())
+}
+
+async fn convert_a_chunk_while_the_blocking_pool_is_held() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(10));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let (gate_held, gate_held_receiver) = tokio::sync::oneshot::channel();
+    let (release_gate, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate_thread = tokio::task::spawn_blocking(move || {
+        let _ = gate_held.send(());
+        let _ = gate.blocking_recv();
+    });
+    gate_held_receiver.await?;
+
+    let mut call = Box::pin(adapter.get_block_range(Request::new(block_range_request(1, 10))));
+    let chunk_read = async {
+        while recorder.recorded_compact_block_ranges().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => {
+            return Err(eyre!(
+                "the call answered before its chunk was read: {:?}",
+                outcome.map(|_| ())
+            ));
+        }
+        () = chunk_read => {}
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut call)
+            .await
+            .is_err(),
+        "a read chunk must wait for the blocking pool to be converted"
+    );
+
+    let _ = release_gate.send(());
+    gate_thread.await?;
+    let blocks = collect_stream(call.await?.into_inner()).await?;
+    assert_one_linked_chain(&blocks, 1, 10);
+    Ok(())
+}
+
 fn block_range_request(start: u64, end: u64) -> lightwalletd::BlockRange {
     lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {

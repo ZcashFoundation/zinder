@@ -1,8 +1,8 @@
-//! Private compact-block compatibility composition.
+//! Private compact-blocks compatibility composition.
 //!
-//! This module deliberately owns both the canonical-secondary lifecycle and
-//! the restricted protocol adapter. No compact-only topology type crosses the
-//! binary boundary.
+//! This module owns the canonical-secondary lifecycle that publishes the
+//! reader [`zinder_compat_lightwalletd::CompactBlocksGrpcAdapter`] serves. No
+//! compact-only topology type crosses the binary boundary.
 //!
 //! Both generations open on one block cache that the publisher owns, so the
 //! configured cache size bounds the process, and a generation opened on a
@@ -10,31 +10,17 @@
 
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
-use arc_swap::ArcSwap;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status};
-use zinder_compat_lightwalletd::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
-    BlockRangeStage, BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdPing, NodeTipWitness, StaleTipLimit, TipBlockTime, TipBlockTimeCache,
-    compact_transaction_has_payload, estimated_network_height, unix_now_seconds,
-};
-use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
-    CompactTransaction, CompactTransactionData, Network, NetworkUpgradeActivations,
-    wire::{encode_branch_id_hex, encode_internal_block_hash, encode_internal_transaction_id},
-};
-use zinder_proto::{
-    compat::lightwalletd::{self, compact_tx_streamer_server},
-    v1::ingest::{
-        CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
-        canonical_control_client::CanonicalControlClient,
-    },
+use tonic::{Response, Status};
+use zinder_compat_lightwalletd::CanonicalReaderSlot;
+use zinder_core::Network;
+use zinder_proto::v1::ingest::{
+    CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
+    canonical_control_client::CanonicalControlClient,
 };
 use zinder_query::{
-    CanonicalReader, QueryError, RocksDbCanonicalReader, StorageReadError, read_on_blocking_thread,
-    status_from_query_error, wallet_ingest_control_request,
+    CanonicalReader, RocksDbCanonicalReader, StorageReadError, wallet_ingest_control_request,
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
@@ -44,18 +30,12 @@ use zinder_runtime::{
     expected_writer_fence, refresh_within_stale_deadline,
 };
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
-    RocksDbResourceBudget, SharedBlockCache, StoreRole, record_instance_memory_gauges,
-    record_shared_block_cache_gauges,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedBlockCache, StoreRole, record_instance_memory_gauges, record_shared_block_cache_gauges,
 };
 
-type GrpcStream<T> = std::pin::Pin<
-    Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>,
->;
-
 const GENERATION_COUNT: usize = 2;
-const RANGE_CHANNEL_CAPACITY: usize = 8;
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
@@ -153,29 +133,6 @@ pub(crate) struct CompactBlockServingConfig {
     pub(crate) lag_threshold: u64,
 }
 
-/// The generation that compact-blocks requests read, which only the
-/// publisher replaces.
-#[derive(Clone)]
-pub(crate) struct CompactBlockServingSlot {
-    current: Arc<ArcSwap<RocksDbCanonicalReader>>,
-}
-
-impl CompactBlockServingSlot {
-    fn new(reader: Arc<RocksDbCanonicalReader>) -> Self {
-        Self {
-            current: Arc::new(ArcSwap::from(reader)),
-        }
-    }
-
-    pub(crate) fn capture(&self) -> Arc<RocksDbCanonicalReader> {
-        self.current.load_full()
-    }
-
-    fn publish(&self, reader: Arc<RocksDbCanonicalReader>) -> Arc<RocksDbCanonicalReader> {
-        self.current.swap(reader)
-    }
-}
-
 struct WriterStatus {
     client: CanonicalControlClient<AuthenticatedChannel>,
 }
@@ -208,7 +165,7 @@ pub(crate) struct CompactBlockPublisher {
     config: CompactBlockServingConfig,
     writer_status: WriterStatus,
     readiness: CompactServingReadiness,
-    slot: CompactBlockServingSlot,
+    slot: CanonicalReaderSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalReader>>,
     /// The block cache both generations open on, sized by the configured
@@ -230,7 +187,7 @@ impl CompactBlockPublisher {
         readiness: CompactServingReadiness,
         writer_status_endpoint: &str,
         bearer_token: Option<&BearerToken>,
-    ) -> Result<(Self, CompactBlockServingSlot), CompactBlockServingError> {
+    ) -> Result<(Self, CanonicalReaderSlot), CompactBlockServingError> {
         let mut writer_status = WriterStatus::connect(writer_status_endpoint, bearer_token)
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
@@ -261,7 +218,7 @@ impl CompactBlockPublisher {
             }
         })?;
         let reader = Arc::new(admit_generation(candidate).await?);
-        let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
+        let slot = CanonicalReaderSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
@@ -691,21 +648,6 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
     }
 }
 
-/// Returns the schedule the canonical writer admitted, which every generation
-/// adopts when it opens.
-fn writer_admitted_activations(
-    reader: &RocksDbCanonicalReader,
-) -> Result<&NetworkUpgradeActivations, Status> {
-    reader
-        .network_upgrade_schedule()
-        .map(CanonicalActivationSchedule::activations)
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                "canonical reader carries no writer-admitted network-upgrade schedule",
-            )
-        })
-}
-
 fn candidate_unavailable() -> ConvergenceFailure {
     ConvergenceFailure::Storage(CompactBlockServingError::Runtime(
         "compact-block candidate is unavailable".to_owned(),
@@ -793,851 +735,13 @@ async fn converge_candidate<'a>(
     }
 }
 
-/// The Unix time in seconds that tip calls judge a tip's age at.
-type UnixClock = Arc<dyn Fn() -> i64 + Send + Sync>;
-
-#[derive(Clone)]
-pub(crate) struct CompactBlockAdapter {
-    slot: CompactBlockServingSlot,
-    block_range_streams: BlockRangeStreamLimit,
-    stale_tip_limit: StaleTipLimit,
-    tip_block_times: TipBlockTimeCache,
-    node_tip_witness: NodeTipWitness,
-    ping: LightwalletdPing,
-    unix_clock: UnixClock,
-}
-
-impl CompactBlockAdapter {
-    pub(crate) fn new(slot: CompactBlockServingSlot) -> Self {
-        Self {
-            slot,
-            block_range_streams: BlockRangeStreamLimit::new(
-                DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-            ),
-            stale_tip_limit: StaleTipLimit::DISABLED,
-            tip_block_times: TipBlockTimeCache::default(),
-            node_tip_witness: NodeTipWitness::default(),
-            ping: LightwalletdPing::default(),
-            unix_clock: Arc::new(unix_now_seconds),
-        }
-    }
-
-    /// Judges tip ages at the Unix time `unix_clock` reports.
-    #[cfg(test)]
-    fn with_unix_clock(mut self, unix_clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
-        self.unix_clock = Arc::new(unix_clock);
-        self
-    }
-
-    /// Sets how old the served tip may be before `GetLatestBlock` and
-    /// `GetLightdInfo` fail with `UNAVAILABLE`.
-    pub(crate) const fn with_stale_tip_limit(mut self, stale_tip_limit: StaleTipLimit) -> Self {
-        self.stale_tip_limit = stale_tip_limit;
-        self
-    }
-
-    /// Sets the witness whose report of the writer's node decides whether an
-    /// old served tip is the chain tip or a stale one.
-    pub(crate) fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
-        self.node_tip_witness = node_tip_witness;
-        self
-    }
-
-    /// Sets how this adapter answers `Ping`.
-    pub(crate) fn with_ping(mut self, ping: LightwalletdPing) -> Self {
-        self.ping = ping;
-        self
-    }
-
-    /// Limits how many `GetBlockRange` streams this adapter serves at once.
-    pub(crate) fn with_max_concurrent_block_range_streams(
-        mut self,
-        max_streams: NonZeroU32,
-    ) -> Self {
-        self.block_range_streams = BlockRangeStreamLimit::new(max_streams)
-            .with_max_wait(self.block_range_streams.max_wait());
-        self
-    }
-
-    pub(crate) fn into_server(
-        self,
-    ) -> zinder_runtime::RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>>
-    {
-        zinder_runtime::RepeatedFieldGuard::new(
-            compact_tx_streamer_server::CompactTxStreamerServer::new(self)
-                .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
-            zinder_compat_lightwalletd::COMPACT_TX_STREAMER_FIELD_LIMITS,
-        )
-    }
-
-    fn reader(&self) -> Arc<RocksDbCanonicalReader> {
-        self.slot.capture()
-    }
-
-    /// Reads the served generation's chain epoch and the times of its tip
-    /// for the tip call `method`, and refuses the tip when it is older than
-    /// the stale-tip limit.
-    async fn served_tip(
-        &self,
-        reader: &RocksDbCanonicalReader,
-        method: &'static str,
-    ) -> Result<(ChainEpoch, TipBlockTime, i64), Status> {
-        let epoch = reader.chain_epoch();
-        let tip_height = epoch.visible_tip_height;
-        let tip = self
-            .tip_block_times
-            .block_time(epoch.id, tip_height, move || async move {
-                reader
-                    .block_header_at(tip_height)
-                    .await
-                    .map_err(store_status)?
-                    .map(|header| header.block_time)
-                    .ok_or_else(|| Status::unavailable("the served tip has no stored block header"))
-            })
-            .await?;
-        // Sampled after the header read, which can wait for a blocking
-        // thread, so the tip's age is the one it has when the call answers.
-        let now = (self.unix_clock)();
-        self.stale_tip_limit.check(
-            method,
-            tip.aged_from_unix_seconds,
-            now,
-            self.node_tip_witness.vouches_for(epoch.visible_tip_height),
-        )?;
-        Ok((epoch, tip, now))
-    }
-
-    fn unsupported(method: &'static str) -> Status {
-        Status::unimplemented(format!(
-            "compact-blocks compatibility does not implement {method}"
-        ))
-    }
-
-    /// Returns the height or the hash `block` names.
-    fn requested_block(block: &lightwalletd::BlockId) -> Result<RequestedBlock, Status> {
-        if block.height != 0 {
-            return u32::try_from(block.height)
-                .map(|height| RequestedBlock::Height(BlockHeight::new(height)))
-                .map_err(|_| Status::invalid_argument("block height exceeds u32"));
-        }
-        if block.hash.len() != 32 {
-            return Err(Status::invalid_argument("block identifier is unspecified"));
-        }
-        Ok(RequestedBlock::Hash(BlockHash::from_bytes(
-            block
-                .hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?,
-        )))
-    }
-}
-
-/// The block a `GetBlock` request names.
-#[derive(Clone, Copy)]
-enum RequestedBlock {
-    Height(BlockHeight),
-    Hash(BlockHash),
-}
-
-#[tonic::async_trait]
-impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
-    type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
-    type GetBlockRangeNullifiersStream = GrpcStream<lightwalletd::CompactBlock>;
-    type GetTaddressTxidsStream = GrpcStream<lightwalletd::RawTransaction>;
-    type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
-    type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
-    type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
-    type GetSubtreeRootsStream = GrpcStream<lightwalletd::SubtreeRoot>;
-    type GetAddressUtxosStreamStream = GrpcStream<lightwalletd::GetAddressUtxosReply>;
-
-    async fn get_lightd_info(
-        &self,
-        _request: Request<lightwalletd::Empty>,
-    ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
-        let reader = self.reader();
-        let (epoch, tip, now) = self.served_tip(&reader, "get_lightd_info").await?;
-        let activations = writer_admitted_activations(&reader)?;
-        let estimated_height = estimated_network_height(
-            activations,
-            epoch.visible_tip_height,
-            tip.block_time_unix_seconds,
-            now,
-        );
-        Ok(Response::new(lightd_info(
-            activations,
-            epoch.visible_tip_height.value(),
-            estimated_height,
-            false,
-        )))
-    }
-
-    async fn get_latest_block(
-        &self,
-        _request: Request<lightwalletd::ChainSpec>,
-    ) -> Result<Response<lightwalletd::BlockId>, Status> {
-        let reader = self.reader();
-        let (epoch, _, _) = self.served_tip(&reader, "get_latest_block").await?;
-        Ok(Response::new(lightwalletd::BlockId {
-            height: u64::from(epoch.visible_tip_height.value()),
-            hash: encode_internal_block_hash(epoch.visible_tip_hash).to_vec(),
-        }))
-    }
-
-    async fn get_block(
-        &self,
-        request: Request<lightwalletd::BlockId>,
-    ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let reader = self.reader();
-        let request = request.into_inner();
-        // The reader resolves a hash and reads its block in one read.
-        let block = match Self::requested_block(&request)? {
-            RequestedBlock::Height(height) => {
-                if height > reader.chain_epoch().visible_tip_height {
-                    return Err(Status::out_of_range(
-                        "requested block is newer than latest block",
-                    ));
-                }
-                reader
-                    .compact_block_at(height)
-                    .await
-                    .map_err(store_status)?
-                    .ok_or_else(|| Status::not_found("block is not indexed"))?
-            }
-            RequestedBlock::Hash(hash) => reader
-                .compact_block_by_hash(hash)
-                .await
-                .map_err(store_status)?
-                .ok_or_else(|| Status::not_found("block is not in the canonical best chain"))?,
-        };
-        let response = compact_block_to_lightwalletd(&block)?;
-        if !request.hash.is_empty() && request.hash != response.hash {
-            return Err(Status::not_found(
-                "requested block hash does not match indexed block",
-            ));
-        }
-        Ok(Response::new(response))
-    }
-
-    async fn get_block_range(
-        &self,
-        request: Request<lightwalletd::BlockRange>,
-    ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
-        let request = request.into_inner();
-        let start = request
-            .start
-            .ok_or_else(|| Status::invalid_argument("range.start is required"))?;
-        let end = request
-            .end
-            .ok_or_else(|| Status::invalid_argument("range.end is required"))?;
-        let start = BlockHeight::new(
-            u32::try_from(start.height)
-                .map_err(|_| Status::invalid_argument("range height exceeds u32"))?,
-        );
-        let end = BlockHeight::new(
-            u32::try_from(end.height)
-                .map_err(|_| Status::invalid_argument("range height exceeds u32"))?,
-        );
-        let descending = start > end;
-        let range = if descending {
-            BlockHeightRange::inclusive(end, start)
-        } else {
-            BlockHeightRange::inclusive(start, end)
-        };
-        let pool_selection = pool_selection_from_request(&request.pool_types)?;
-        let stream_slot = self.block_range_streams.open().await?;
-        let reader = self.reader();
-        let epoch = reader.chain_epoch();
-        if range.end > epoch.visible_tip_height {
-            return Err(Status::out_of_range(
-                "requested range is newer than latest block",
-            ));
-        }
-        let encoding = ChunkEncoding {
-            selection: pool_selection,
-            descending,
-        };
-        let (first_messages, later_chunks) = stream_slot
-            .hold_during(read_first_chunk(
-                reader,
-                BlockRangeChunks::new(range, descending),
-                epoch.id,
-                encoding,
-            ))
-            .await?;
-        let Some((chunks, continuity)) = later_chunks else {
-            return Ok(Response::new(stream_slot.hold_for(first_messages)));
-        };
-        let slot = self.slot.clone();
-        Ok(Response::new(stream_slot.hold_with_reader(
-            first_messages,
-            RANGE_CHANNEL_CAPACITY,
-            |sink| stream_later_chunks(slot, chunks, continuity, encoding, sink),
-        )))
-    }
-
-    async fn get_block_nullifiers(
-        &self,
-        _request: Request<lightwalletd::BlockId>,
-    ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        Err(Self::unsupported("GetBlockNullifiers"))
-    }
-    async fn get_block_range_nullifiers(
-        &self,
-        _request: Request<lightwalletd::BlockRange>,
-    ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
-        Err(Self::unsupported("GetBlockRangeNullifiers"))
-    }
-    async fn get_transaction(
-        &self,
-        _request: Request<lightwalletd::TxFilter>,
-    ) -> Result<Response<lightwalletd::RawTransaction>, Status> {
-        Err(Self::unsupported("GetTransaction"))
-    }
-    async fn send_transaction(
-        &self,
-        _request: Request<lightwalletd::RawTransaction>,
-    ) -> Result<Response<lightwalletd::SendResponse>, Status> {
-        Err(Self::unsupported("SendTransaction"))
-    }
-    async fn get_taddress_txids(
-        &self,
-        _request: Request<lightwalletd::TransparentAddressBlockFilter>,
-    ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTxids"))
-    }
-    async fn get_taddress_transactions(
-        &self,
-        _request: Request<lightwalletd::TransparentAddressBlockFilter>,
-    ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTransactions"))
-    }
-    async fn get_taddress_balance(
-        &self,
-        _request: Request<lightwalletd::AddressList>,
-    ) -> Result<Response<lightwalletd::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalance"))
-    }
-    async fn get_taddress_balance_stream(
-        &self,
-        _request: Request<tonic::Streaming<lightwalletd::Address>>,
-    ) -> Result<Response<lightwalletd::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalanceStream"))
-    }
-    async fn get_mempool_tx(
-        &self,
-        _request: Request<lightwalletd::GetMempoolTxRequest>,
-    ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-        Err(Self::unsupported("GetMempoolTx"))
-    }
-    async fn get_mempool_stream(
-        &self,
-        _request: Request<lightwalletd::Empty>,
-    ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        Err(Self::unsupported("GetMempoolStream"))
-    }
-    async fn get_tree_state(
-        &self,
-        _request: Request<lightwalletd::BlockId>,
-    ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        Err(Self::unsupported("GetTreeState"))
-    }
-    async fn get_latest_tree_state(
-        &self,
-        _request: Request<lightwalletd::Empty>,
-    ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        Err(Self::unsupported("GetLatestTreeState"))
-    }
-    async fn get_subtree_roots(
-        &self,
-        _request: Request<lightwalletd::GetSubtreeRootsArg>,
-    ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
-        Err(Self::unsupported("GetSubtreeRoots"))
-    }
-    async fn get_address_utxos(
-        &self,
-        _request: Request<lightwalletd::GetAddressUtxosArg>,
-    ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
-        Err(Self::unsupported("GetAddressUtxos"))
-    }
-    async fn get_address_utxos_stream(
-        &self,
-        _request: Request<lightwalletd::GetAddressUtxosArg>,
-    ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        Err(Self::unsupported("GetAddressUtxosStream"))
-    }
-    async fn get_standard_fee(
-        &self,
-        _request: Request<lightwalletd::Empty>,
-    ) -> Result<Response<lightwalletd::StandardFee>, Status> {
-        Err(Self::unsupported("GetStandardFee"))
-    }
-    async fn ping(
-        &self,
-        request: Request<lightwalletd::Duration>,
-    ) -> Result<Response<lightwalletd::PingResponse>, Status> {
-        self.ping
-            .respond(request.into_inner())
-            .await
-            .map(Response::new)
-    }
-}
-
-fn store_status(error: StorageReadError) -> Status {
-    status_from_query_error(&QueryError::canonical_read(error))
-}
-
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "the four protocol pool toggles are independent operator selections"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PoolSelection {
-    sapling: bool,
-    orchard: bool,
-    ironwood: bool,
-    transparent: bool,
-}
-
-fn pool_selection_from_request(pool_types: &[i32]) -> Result<PoolSelection, Status> {
-    if pool_types.is_empty() {
-        return Ok(PoolSelection {
-            sapling: true,
-            orchard: true,
-            ironwood: true,
-            transparent: false,
-        });
-    }
-    let mut selection = PoolSelection {
-        sapling: false,
-        orchard: false,
-        ironwood: false,
-        transparent: false,
-    };
-    for pool_type in pool_types {
-        match lightwalletd::PoolType::try_from(*pool_type) {
-            Ok(lightwalletd::PoolType::Sapling) => selection.sapling = true,
-            Ok(lightwalletd::PoolType::Orchard) => selection.orchard = true,
-            Ok(lightwalletd::PoolType::Ironwood) => selection.ironwood = true,
-            Ok(lightwalletd::PoolType::Transparent) => selection.transparent = true,
-            Ok(lightwalletd::PoolType::Invalid) | Err(_) => {
-                return Err(Status::invalid_argument("invalid pool type requested"));
-            }
-        }
-    }
-    Ok(selection)
-}
-
-/// How a block-range stream shapes the blocks it sends.
-#[derive(Clone, Copy)]
-struct ChunkEncoding {
-    selection: PoolSelection,
-    descending: bool,
-}
-
-type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
-
-/// How long one chunk spent in each stage that runs on the blocking pool,
-/// for the stages that ran.
-///
-/// The blocking closure measures the stages and the async caller records
-/// them, so the samples reach the recorder of the task that serves the
-/// stream.
-#[derive(Clone, Copy, Debug, Default)]
-struct ChunkTimings {
-    read: Option<Duration>,
-    convert: Option<Duration>,
-}
-
-impl ChunkTimings {
-    fn record(self) {
-        if let Some(read) = self.read {
-            BlockRangeStage::Read.record(read);
-        }
-        if let Some(convert) = self.convert {
-            BlockRangeStage::Convert.record(convert);
-        }
-    }
-}
-
-/// Runs `stage_work` and returns its output and how long it took.
-fn timed<Output>(stage_work: impl FnOnce() -> Output) -> (Output, Duration) {
-    let started_at = std::time::Instant::now();
-    let output = stage_work();
-    (output, started_at.elapsed())
-}
-
-/// Reads and encodes the first chunk of a range at `reader`, the generation
-/// the request's bounds were checked against.
-///
-/// When heights remain after the blocks the read kept, returns the plan and
-/// the continuity that later chunks must follow. The reader is dropped when
-/// the read returns. The caller runs this under
-/// [`zinder_compat_lightwalletd::BlockRangeStreamSlot::hold_during`], because
-/// the blocking read and encoding finish even when the client cancels the
-/// request.
-async fn read_first_chunk(
-    reader: Arc<RocksDbCanonicalReader>,
-    chunks: BlockRangeChunks,
-    chain_epoch_id: ChainEpochId,
-    encoding: ChunkEncoding,
-) -> Result<FirstChunk, Status> {
-    let (first_chunk, timings) = tokio::task::spawn_blocking(move || {
-        let mut timings = ChunkTimings::default();
-        let first_chunk =
-            read_and_encode_first_chunk(reader, chunks, chain_epoch_id, encoding, &mut timings);
-        (first_chunk, timings)
-    })
-    .await
-    .map_err(|error| range_worker_failed(&error))?;
-    timings.record();
-    first_chunk
-}
-
-type FirstChunk = (
-    ChunkMessages,
-    Option<(BlockRangeChunks, BlockRangeContinuity)>,
-);
-
-fn read_and_encode_first_chunk(
-    reader: Arc<RocksDbCanonicalReader>,
-    mut chunks: BlockRangeChunks,
-    chain_epoch_id: ChainEpochId,
-    encoding: ChunkEncoding,
-    timings: &mut ChunkTimings,
-) -> Result<FirstChunk, Status> {
-    let Some(chunk) = chunks.next_chunk() else {
-        return Ok((Vec::new(), None));
-    };
-    let (blocks, read) = timed(|| read_chunk_blocks(reader.as_ref(), chunk, &chunks));
-    timings.read = Some(read);
-    let blocks = blocks?;
-    drop(reader);
-    chunks.advance(blocks.len());
-    let later_chunks = chunks
-        .has_remaining()
-        .then(|| {
-            BlockRangeContinuity::after_first_chunk(&blocks, chain_epoch_id, encoding.descending)
-                .map(|continuity| (chunks, continuity))
-        })
-        .transpose()?;
-    let (messages, convert) = timed(|| encode_blocks(&blocks, encoding));
-    timings.convert = Some(convert);
-    Ok((messages?, later_chunks))
-}
-
-/// Streams every chunk after the first, each read at the generation current
-/// when it is read.
-///
-/// Each chunk captures the current generation on the blocking thread that
-/// reads it and releases it before encoding, so the task holds a generation
-/// only inside one storage read: never while the read waits for a blocking
-/// thread, while its blocks are encoded, or while the client makes room, and
-/// a slow client or a busy blocking pool cannot keep the publisher from
-/// recycling the retired generation.
-async fn stream_later_chunks(
-    slot: CompactBlockServingSlot,
-    mut chunks: BlockRangeChunks,
-    mut continuity: BlockRangeContinuity,
-    encoding: ChunkEncoding,
-    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
-) {
-    while chunks.has_remaining() {
-        let read = tokio::task::spawn_blocking({
-            let slot = slot.clone();
-            move || {
-                let mut timings = ChunkTimings::default();
-                let messages =
-                    read_later_chunk(&slot, &mut chunks, &mut continuity, encoding, &mut timings);
-                (chunks, continuity, messages, timings)
-            }
-        })
-        .await;
-        let messages = match read {
-            Ok((next_chunks, next_continuity, Ok(messages), timings)) => {
-                timings.record();
-                chunks = next_chunks;
-                continuity = next_continuity;
-                messages
-            }
-            Ok((_, _, Err(status), timings)) => {
-                timings.record();
-                let _ = sink.send(Err(status)).await;
-                return;
-            }
-            Err(error) => {
-                let _ = sink.send(Err(range_worker_failed(&error))).await;
-                return;
-            }
-        };
-        let sent_chunk = BlockRangeStage::Send
-            .time_async(async {
-                for message in messages {
-                    if sink.send(message).await.is_err() {
-                        return false;
-                    }
-                }
-                true
-            })
-            .await;
-        if !sent_chunk {
-            return;
-        }
-    }
-}
-
-/// Reads the next chunk at the current generation, accepts it only when it
-/// continues the chain the stream has sent, and moves the plan past it.
-fn read_later_chunk(
-    slot: &CompactBlockServingSlot,
-    chunks: &mut BlockRangeChunks,
-    continuity: &mut BlockRangeContinuity,
-    encoding: ChunkEncoding,
-    timings: &mut ChunkTimings,
-) -> Result<ChunkMessages, Status> {
-    let Some(chunk) = chunks.next_chunk() else {
-        return Ok(Vec::new());
-    };
-    let reader = slot.capture();
-    let epoch = reader.chain_epoch();
-    continuity.check_view_reaches(chunk, &epoch)?;
-    let (blocks, read) = timed(|| read_chunk_blocks(reader.as_ref(), chunk, chunks));
-    timings.read = Some(read);
-    let blocks = blocks?;
-    drop(reader);
-    continuity.advance(chunk, &epoch, &blocks)?;
-    chunks.advance(blocks.len());
-    let (messages, convert) = timed(|| encode_blocks(&blocks, encoding));
-    timings.convert = Some(convert);
-    messages
-}
-
-/// Reads the blocks of `chunk` that fit one chunk's byte budget, from the
-/// end the stream sends first, through the canonical read interface on the
-/// calling blocking thread.
-///
-/// The read stage is timed here rather than around the blocking task, so it
-/// leaves out the time the task waited for a blocking thread.
-fn read_chunk_blocks(
-    reader: &impl CanonicalReader,
-    chunk: BlockHeightRange,
-    chunks: &BlockRangeChunks,
-) -> Result<Vec<CompactBlockArtifact>, Status> {
-    read_on_blocking_thread(reader.compact_blocks_in_range_up_to(
-        chunk,
-        chunks.order(),
-        BLOCK_RANGE_CHUNK_MAX_BYTES,
-    ))
-    .map_err(store_status)
-}
-
-fn range_worker_failed(error: &tokio::task::JoinError) -> Status {
-    Status::unavailable(format!("compact range worker failed: {error}"))
-}
-
-fn encode_blocks(
-    blocks: &[CompactBlockArtifact],
-    encoding: ChunkEncoding,
-) -> Result<ChunkMessages, Status> {
-    let mut messages = blocks
-        .iter()
-        .map(|block| {
-            compact_block_to_lightwalletd(block)
-                .map(|message| prune_pool_types(message, encoding.selection))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if encoding.descending {
-        messages.reverse();
-    }
-    Ok(messages.into_iter().map(Ok).collect())
-}
-
-fn prune_pool_types(
-    mut block: lightwalletd::CompactBlock,
-    selection: PoolSelection,
-) -> lightwalletd::CompactBlock {
-    for transaction in &mut block.vtx {
-        if !selection.sapling {
-            transaction.spends.clear();
-            transaction.outputs.clear();
-        }
-        if !selection.orchard {
-            transaction.actions.clear();
-        }
-        if !selection.ironwood {
-            transaction.ironwood_actions.clear();
-        }
-        if !selection.transparent {
-            transaction.vin.clear();
-            transaction.vout.clear();
-        }
-    }
-    // lightwalletd omits a transaction left with no payload, such as a
-    // transparent-only coinbase under the default shielded selection. The
-    // remaining transactions keep their original block positions.
-    block.vtx.retain(compact_transaction_has_payload);
-    block
-}
-
-fn compact_block_to_lightwalletd(
-    block: &CompactBlockArtifact,
-) -> Result<lightwalletd::CompactBlock, Status> {
-    let metadata = block.chain_metadata();
-    Ok(lightwalletd::CompactBlock {
-        height: u64::from(block.height().value()),
-        hash: encode_internal_block_hash(block.block_hash()).to_vec(),
-        prev_hash: encode_internal_block_hash(block.previous_block_hash()).to_vec(),
-        time: block.time(),
-        header: Vec::new(),
-        vtx: block
-            .transactions()
-            .iter()
-            .map(compact_transaction_to_lightwalletd)
-            .collect::<Result<Vec<_>, _>>()?,
-        chain_metadata: Some(lightwalletd::ChainMetadata {
-            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
-            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
-        }),
-    })
-}
-
-fn compact_transaction_to_lightwalletd(
-    transaction: &CompactTransaction,
-) -> Result<lightwalletd::CompactTx, Status> {
-    compact_transaction_data_to_lightwalletd(
-        transaction.index,
-        transaction.transaction_id,
-        &transaction.data,
-    )
-}
-
-fn compact_transaction_data_to_lightwalletd(
-    index: u64,
-    transaction_id: zinder_core::TransactionId,
-    transaction_data: &CompactTransactionData,
-) -> Result<lightwalletd::CompactTx, Status> {
-    let fee = transaction_data
-        .fee_zat
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| Status::data_loss("compact transaction fee exceeds u32"))?
-        .unwrap_or_default();
-    Ok(lightwalletd::CompactTx {
-        index,
-        txid: encode_internal_transaction_id(transaction_id).to_vec(),
-        fee,
-        spends: transaction_data
-            .sapling_spends
-            .iter()
-            .map(|spend| lightwalletd::CompactSaplingSpend {
-                nf: spend.nullifier.to_vec(),
-            })
-            .collect(),
-        outputs: transaction_data
-            .sapling_outputs
-            .iter()
-            .map(|output| lightwalletd::CompactSaplingOutput {
-                cmu: output.commitment.to_vec(),
-                ephemeral_key: output.ephemeral_key.to_vec(),
-                ciphertext: output.ciphertext.to_vec(),
-            })
-            .collect(),
-        actions: transaction_data
-            .orchard_actions
-            .iter()
-            .map(|action| lightwalletd::CompactOrchardAction {
-                nullifier: action.nullifier.to_vec(),
-                cmx: action.commitment.to_vec(),
-                ephemeral_key: action.ephemeral_key.to_vec(),
-                ciphertext: action.ciphertext.to_vec(),
-            })
-            .collect(),
-        ironwood_actions: transaction_data
-            .ironwood_actions
-            .iter()
-            .map(|action| lightwalletd::CompactOrchardAction {
-                nullifier: action.nullifier.to_vec(),
-                cmx: action.commitment.to_vec(),
-                ephemeral_key: action.ephemeral_key.to_vec(),
-                ciphertext: action.ciphertext.to_vec(),
-            })
-            .collect(),
-        vin: transaction_data
-            .transparent_inputs
-            .iter()
-            .map(|input| lightwalletd::CompactTxIn {
-                prevout_txid: encode_internal_transaction_id(input.previous_transaction_id)
-                    .to_vec(),
-                prevout_index: input.previous_output_index,
-            })
-            .collect(),
-        vout: transaction_data
-            .transparent_outputs
-            .iter()
-            .map(|output| lightwalletd::TxOut {
-                script_pub_key: output.script_pub_key.clone(),
-                value: output.value_zat,
-            })
-            .collect(),
-    })
-}
-
-fn lightd_info(
-    activations: &NetworkUpgradeActivations,
-    height: u32,
-    estimated_height: BlockHeight,
-    taddr_support: bool,
-) -> lightwalletd::LightdInfo {
-    let tip_height = BlockHeight::new(height);
-    let consensus_branch_id = activations.active_at(tip_height).map_or_else(
-        || "00000000".to_owned(),
-        |activation| encode_branch_id_hex(activation.branch_id),
-    );
-    // The protocol defines `upgradeName` and `upgradeHeight` as the next
-    // pending upgrade, not the active one.
-    let next_pending = activations
-        .activations()
-        .iter()
-        .find(|activation| activation.activation_height > tip_height);
-    let upgrade_name = next_pending.map_or_else(String::new, |activation| activation.name.clone());
-    let upgrade_height = next_pending.map_or(0, |activation| {
-        u64::from(activation.activation_height.value())
-    });
-    let sapling_activation_height = activations
-        .activation_height_by_name("Sapling")
-        .map_or(0, |height| u64::from(height.value()));
-    lightwalletd::LightdInfo {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        vendor: "Zinder".to_owned(),
-        taddr_support,
-        chain_name: zinder_core::wire::encode_bip70_chain_name(activations.network()).to_owned(),
-        sapling_activation_height,
-        consensus_branch_id,
-        block_height: u64::from(height),
-        git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
-        branch: String::new(),
-        build_date: String::new(),
-        build_user: String::new(),
-        estimated_height: u64::from(estimated_height.max(tip_height).value()),
-        zcashd_build: String::new(),
-        zcashd_subversion: String::new(),
-        donation_address: String::new(),
-        upgrade_name,
-        upgrade_height,
-        lightwallet_protocol_version:
-            zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        CompactBlockAdapter, CompactBlockPublisher, CompactBlockServingConfig,
-        CompactBlockServingError, CompactBlockServingSlot, CompactServingReadiness, PoolSelection,
-        compact_block_to_lightwalletd, transport_failure_cause,
+        CompactBlockPublisher, CompactBlockServingConfig, CompactBlockServingError,
+        CompactServingReadiness, transport_failure_cause,
     };
     use compact_tx_streamer_server::CompactTxStreamer;
     use parking_lot::Mutex;
@@ -1646,6 +750,7 @@ mod tests {
     use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
     use tokio_util::sync::CancellationToken;
     use tonic::{Code, Request, transport::Server};
+    use zinder_compat_lightwalletd::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
     use zinder_core::{
         BlockHeight, BlockId, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
         CanonicalBlockReplayFormatVersion, ChainTipMetadata, CommitmentTreeCheckpoint,
@@ -1983,125 +1088,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_pool_request_is_shielded_only() {
-        let selection_result = super::pool_selection_from_request(&[]);
-        assert!(selection_result.is_ok());
-        let Some(selection) = selection_result.ok() else {
-            return;
-        };
-        assert_eq!(
-            selection,
-            PoolSelection {
-                sapling: true,
-                orchard: true,
-                ironwood: true,
-                transparent: false,
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_pool_request_fails_before_storage_read() {
-        let error_result = super::pool_selection_from_request(&[99]);
-        assert!(error_result.is_err());
-        let Some(error) = error_result.err() else {
-            return;
-        };
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
-
-    fn transparent_only_transaction(index: u64) -> lightwalletd::CompactTx {
-        lightwalletd::CompactTx {
-            index,
-            vin: vec![lightwalletd::CompactTxIn {
-                prevout_txid: vec![0; 32],
-                prevout_index: u32::MAX,
-            }],
-            vout: vec![lightwalletd::TxOut {
-                value: 625_000_000,
-                script_pub_key: vec![0x76, 0xa9],
-            }],
-            ..lightwalletd::CompactTx::default()
-        }
-    }
-
-    fn sapling_transaction(index: u64) -> lightwalletd::CompactTx {
-        lightwalletd::CompactTx {
-            index,
-            spends: vec![lightwalletd::CompactSaplingSpend { nf: vec![7; 32] }],
-            ..lightwalletd::CompactTx::default()
-        }
-    }
-
-    fn block_with_transactions(vtx: Vec<lightwalletd::CompactTx>) -> lightwalletd::CompactBlock {
-        lightwalletd::CompactBlock {
-            height: 139,
-            vtx,
-            ..lightwalletd::CompactBlock::default()
-        }
-    }
-
-    #[test]
-    fn default_selection_drops_transparent_only_transactions_and_keeps_indexes() {
-        let block = block_with_transactions(vec![
-            transparent_only_transaction(0),
-            sapling_transaction(1),
-            transparent_only_transaction(2),
-            sapling_transaction(3),
-        ]);
-
-        let pruned = super::prune_pool_types(
-            block,
-            PoolSelection {
-                sapling: true,
-                orchard: true,
-                ironwood: true,
-                transparent: false,
-            },
-        );
-
-        let indexes: Vec<u64> = pruned
-            .vtx
-            .iter()
-            .map(|transaction| transaction.index)
-            .collect();
-        assert_eq!(indexes, vec![1, 3]);
-    }
-
-    #[test]
-    fn transparent_selection_keeps_transparent_only_transactions() {
-        let block = block_with_transactions(vec![
-            transparent_only_transaction(0),
-            sapling_transaction(1),
-        ]);
-
-        let pruned = super::prune_pool_types(
-            block,
-            PoolSelection {
-                sapling: false,
-                orchard: false,
-                ironwood: false,
-                transparent: true,
-            },
-        );
-
-        let indexes: Vec<u64> = pruned
-            .vtx
-            .iter()
-            .map(|transaction| transaction.index)
-            .collect();
-        assert_eq!(indexes, vec![0]);
-        assert_eq!(
-            pruned.vtx[0].spends,
-            [] as [zinder_proto::compat::lightwalletd::CompactSaplingSpend; 0]
-        );
-        assert_ne!(
-            pruned.vtx[0].vout,
-            [] as [zinder_proto::compat::lightwalletd::TxOut; 0]
-        );
-    }
-
-    #[test]
     fn readiness_follows_the_published_generation_and_shutdown_is_irreversible() {
         let runtime = Readiness::default();
         let readiness = CompactServingReadiness::new(runtime.clone());
@@ -2245,7 +1231,7 @@ mod tests {
             reader.secondary().network_upgrade_activations(),
             Some(&activations)
         );
-        let info = CompactBlockAdapter::new(slot.clone())
+        let info = CompactBlocksGrpcAdapter::new(slot.clone())
             .get_lightd_info(Request::new(lightwalletd::Empty {}))
             .await?
             .into_inner();
@@ -3453,7 +2439,7 @@ mod tests {
         };
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
-        let adapter = CompactBlockAdapter::new(slot.clone());
+        let adapter = CompactBlocksGrpcAdapter::new(slot.clone());
         let startup = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
             .await?
@@ -3545,8 +2531,8 @@ mod tests {
         control: MutableCanonicalControl,
         readiness: Readiness,
         publisher: CompactBlockPublisher,
-        slot: CompactBlockServingSlot,
-        adapter: CompactBlockAdapter,
+        slot: CanonicalReaderSlot,
+        adapter: CompactBlocksGrpcAdapter,
         shutdown: oneshot::Sender<()>,
         server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
         _secondaries: tempfile::TempDir,
@@ -3596,7 +2582,7 @@ mod tests {
             let (publisher, slot) =
                 CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None)
                     .await?;
-            let adapter = CompactBlockAdapter::new(slot.clone());
+            let adapter = CompactBlocksGrpcAdapter::new(slot.clone());
             Ok(Self {
                 writer,
                 control,
@@ -3922,6 +2908,10 @@ mod tests {
     async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns()
     -> Result<(), Box<dyn std::error::Error>> {
         const TIP_HEIGHT: u32 = 2_100;
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
         let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(TIP_HEIGHT);
@@ -3964,15 +2954,11 @@ mod tests {
         // The test runtime has one thread, so the reader of later chunks has
         // not run since the stream was dropped. It still holds the slot, so
         // the next request waits until the reader stops.
-        // Admission takes a free slot on its first poll, so a pending first
-        // poll shows that the slot is still taken, without yielding to the
-        // reader.
-        let mut admission = Box::pin(adapter.block_range_streams.open());
-        assert!(
-            poll_once(&mut admission).is_pending(),
+        assert_eq!(
+            open_block_range_streams(&metrics_handle.render()),
+            Some(1),
             "the reader of a dropped stream must keep its slot until it stops"
         );
-        drop(admission);
         let next = adapter.get_block_range(Request::new(block_range(1, 4)));
         let admitted = tokio::time::timeout(Duration::from_secs(10), next)
             .await??
@@ -3987,13 +2973,10 @@ mod tests {
 
     /// Returns a clone of `adapter` that shares its block-range slots but
     /// waits only briefly for one, so a test can observe a refusal quickly.
-    fn impatient_clone(adapter: &CompactBlockAdapter) -> CompactBlockAdapter {
-        let mut impatient = adapter.clone();
-        impatient.block_range_streams = impatient
-            .block_range_streams
+    fn impatient_clone(adapter: &CompactBlocksGrpcAdapter) -> CompactBlocksGrpcAdapter {
+        adapter
             .clone()
-            .with_max_wait(Duration::from_millis(50));
-        impatient
+            .with_block_range_admission_wait(Duration::from_millis(50))
     }
 
     /// Polls `call` once, so a test can cancel it where it first waits.
@@ -4077,6 +3060,77 @@ mod tests {
         harness.stop().await
     }
 
+    /// `GetLightdInfo`, `GetLatestBlock`, and `GetBlock` read the canonical
+    /// store on the blocking pool, never on a reactor thread.
+    ///
+    /// The runtime has one blocking thread and the test holds it, so each
+    /// call waits at its first storage read until the test releases the
+    /// thread.
+    #[test]
+    fn unary_block_methods_read_storage_on_the_blocking_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(call_unary_block_methods_while_the_blocking_pool_is_held())
+    }
+
+    async fn call_unary_block_methods_while_the_blocking_pool_is_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(4);
+        let (reader, _fixture) = large_block_reader(&chain)?;
+        let tip_hash =
+            zinder_core::wire::encode_internal_block_hash(reader.chain_epoch().visible_tip_hash)
+                .to_vec();
+        let adapter = adapter_serving(&reader);
+
+        let (gate_held, gate_held_receiver) = oneshot::channel();
+        let (release_gate, gate) = oneshot::channel::<()>();
+        let gate_thread = tokio::task::spawn_blocking(move || {
+            let _ = gate_held.send(());
+            let _ = gate.blocking_recv();
+        });
+        gate_held_receiver.await?;
+
+        let mut lightd_info = adapter.get_lightd_info(Request::new(lightwalletd::Empty::default()));
+        let mut latest_block =
+            adapter.get_latest_block(Request::new(lightwalletd::ChainSpec::default()));
+        let mut block_at_height = adapter.get_block(Request::new(lightwalletd::BlockId {
+            height: 2,
+            hash: Vec::new(),
+        }));
+        let mut block_by_hash = adapter.get_block(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: tip_hash,
+        }));
+        assert!(
+            poll_once(&mut lightd_info).is_pending(),
+            "GetLightdInfo must read the tip header on the blocking pool"
+        );
+        assert!(
+            poll_once(&mut latest_block).is_pending(),
+            "GetLatestBlock must read the tip header on the blocking pool"
+        );
+        assert!(
+            poll_once(&mut block_at_height).is_pending(),
+            "GetBlock must read the block on the blocking pool"
+        );
+        assert!(
+            poll_once(&mut block_by_hash).is_pending(),
+            "GetBlock must resolve a hash on the blocking pool"
+        );
+
+        let _ = release_gate.send(());
+        gate_thread.await?;
+        assert_eq!(lightd_info.await?.into_inner().block_height, 4);
+        assert_eq!(latest_block.await?.into_inner().height, 4);
+        assert_eq!(block_at_height.await?.into_inner().height, 2);
+        assert_eq!(block_by_hash.await?.into_inner().height, 4);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn snapshot_capture_pins_old_generation_until_request_drain()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4092,8 +3146,7 @@ mod tests {
         drop(first_wallet);
         drop(second_wallet);
 
-        let slot =
-            CompactBlockServingSlot::new(Arc::new(RocksDbCanonicalReader::new(first_reader)?));
+        let slot = CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(first_reader)?));
         let pinned = slot.capture();
         let retired = slot.publish(Arc::new(RocksDbCanonicalReader::new(second_reader)?));
         assert_eq!(
@@ -4119,7 +3172,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
 
@@ -4239,7 +3292,7 @@ mod tests {
     /// The default shielded selection empties the transparent-only ones, so
     /// the served range exercises transaction omission and position
     /// preservation.
-    fn range_parity_adapter() -> Result<CompactBlockAdapter, Box<dyn std::error::Error>> {
+    fn range_parity_adapter() -> Result<CompactBlocksGrpcAdapter, Box<dyn std::error::Error>> {
         let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .extend_blocks(RANGE_PARITY_TIP);
         let transactions_by_height = [
@@ -4302,13 +3355,13 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        Ok(CompactBlockAdapter::new(CompactBlockServingSlot::new(
+        Ok(CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(
             Arc::new(RocksDbCanonicalReader::new(canonical)?),
         )))
     }
 
     async fn range_parity_blocks(
-        adapter: &CompactBlockAdapter,
+        adapter: &CompactBlocksGrpcAdapter,
         start_height: u64,
         end_height: u64,
         pool_types: Vec<i32>,
@@ -4429,8 +3482,8 @@ mod tests {
         Ok((Arc::new(RocksDbCanonicalReader::new(canonical)?), fixture))
     }
 
-    fn adapter_serving(reader: &Arc<RocksDbCanonicalReader>) -> CompactBlockAdapter {
-        CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::clone(reader)))
+    fn adapter_serving(reader: &Arc<RocksDbCanonicalReader>) -> CompactBlocksGrpcAdapter {
+        CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::clone(reader)))
     }
 
     /// Returns how many blocks of `1..=LARGE_BLOCK_TIP` one byte-capped chunk
@@ -4493,6 +3546,15 @@ mod tests {
             "a descending stream must send the one-block reads in reverse"
         );
         Ok(())
+    }
+
+    /// Returns how many block-range streams `rendered` reports open.
+    fn open_block_range_streams(rendered: &str) -> Option<u64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix("zinder_compat_block_range_streams_open ")?
+                .parse::<u64>()
+                .ok()
+        })
     }
 
     /// Returns how many samples `rendered` holds for the block-range `stage`.
@@ -4574,7 +3636,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
         let by_height = adapter
@@ -4748,14 +3810,15 @@ mod tests {
         ] {
             let (replacement, _replacement_fixture) =
                 large_block_reader(&large_block_chain(Some(fork_height))?)?;
-            let adapter = adapter_serving(&reader);
+            let slot = CanonicalReaderSlot::new(Arc::clone(&reader));
+            let adapter = CompactBlocksGrpcAdapter::new(slot.clone());
             let mut stream = adapter
                 .get_block_range(Request::new(block_range(1, LARGE_BLOCK_TIP)))
                 .await?
                 .into_inner();
             // The test runtime has one thread, so the reader of later chunks
             // has not run yet and reads every later chunk at the replacement.
-            drop(adapter.slot.publish(replacement));
+            drop(slot.publish(replacement));
             let mut blocks = Vec::new();
             let ending = read_blocks(&mut stream, &mut blocks, usize::MAX)
                 .await
@@ -4943,7 +4006,7 @@ mod tests {
             .block_header_at(tip.height)?
             .ok_or("the fixture tip must have a header")?
             .block_time;
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
 
@@ -5100,60 +4163,6 @@ mod tests {
         Ok(())
     }
 
-    /// A tip call judges the tip's age when its header read ends, not when
-    /// the call starts.
-    ///
-    /// The runtime has one blocking thread, which the test holds while the
-    /// call waits to read the tip's header. A paused clock shows the tip one
-    /// minute old when the call starts and advances past the stale-tip limit
-    /// before the read is let through.
-    #[test]
-    fn a_tip_call_judges_the_tip_age_after_its_header_read()
-    -> Result<(), Box<dyn std::error::Error>> {
-        one_blocking_thread_runtime()?.block_on(judge_the_tip_age_across_a_held_read())
-    }
-
-    async fn judge_the_tip_age_across_a_held_read() -> Result<(), Box<dyn std::error::Error>> {
-        use std::sync::atomic::{AtomicI64, Ordering};
-
-        let chain =
-            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(4);
-        let (reader, _fixture) = large_block_reader(&chain)?;
-        let tip_block_time = reader
-            .secondary()
-            .block_header_at(reader.chain_epoch().visible_tip_height)?
-            .ok_or("the fixture tip must have a header")?
-            .block_time;
-        let paused_clock = Arc::new(AtomicI64::new(tip_block_time + 60));
-        let adapter = adapter_serving(&reader)
-            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
-                Duration::from_mins(25),
-            ))
-            .with_unix_clock({
-                let paused_clock = Arc::clone(&paused_clock);
-                move || paused_clock.load(Ordering::SeqCst)
-            });
-
-        let held = BlockingGate::hold().await?;
-        let mut call = adapter.get_latest_block(Request::new(lightwalletd::ChainSpec::default()));
-        assert!(
-            poll_once(&mut call).is_pending(),
-            "the tip header read must wait for the held blocking thread"
-        );
-        paused_clock.store(tip_block_time + 30 * 60, Ordering::SeqCst);
-        held.release().await?;
-        let refused = tokio::time::timeout(Duration::from_secs(5), call)
-            .await?
-            .err()
-            .map(|status| status.code());
-        assert_eq!(
-            refused,
-            Some(Code::Unavailable),
-            "the tip is 30 minutes old when its header read ends"
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
@@ -5172,8 +4181,7 @@ mod tests {
         let expected_block = canonical
             .compact_block_at(BlockHeight::new(2))?
             .ok_or("fixture block missing")?;
-        let expected_wire = compact_block_to_lightwalletd(&expected_block)?;
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
 
@@ -5197,7 +4205,17 @@ mod tests {
             }))
             .await?
             .into_inner();
-        assert_eq!(block.encode_to_vec(), expected_wire.encode_to_vec());
+        assert_eq!(block.height, u64::from(expected_block.height().value()));
+        assert_eq!(
+            block.hash,
+            zinder_core::wire::encode_internal_block_hash(expected_block.block_hash()).to_vec()
+        );
+        assert_eq!(
+            block.prev_hash,
+            zinder_core::wire::encode_internal_block_hash(expected_block.previous_block_hash())
+                .to_vec()
+        );
+        assert_eq!(block.vtx.len(), expected_block.transactions().len());
 
         let transparent = adapter
             .get_block_range(Request::new(lightwalletd::BlockRange {
@@ -5336,7 +4354,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -5375,7 +4393,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+        let adapter = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
             RocksDbCanonicalReader::new(canonical)?,
         )));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -5458,7 +4476,7 @@ mod tests {
             zinder_runtime::RuntimeService::CompatLightwalletd,
         );
         let router = runtime.public_grpc_router(
-            CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::new(
                 RocksDbCanonicalReader::new(canonical)?,
             )))
             .into_server(),

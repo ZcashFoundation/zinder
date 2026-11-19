@@ -67,7 +67,7 @@ impl StaleTipLimit {
     /// Returns `UNAVAILABLE` when the node does not vouch for the tip and the
     /// tip is older than the limit, and counts the refusal in
     /// `zinder_compat_stale_tip_refusals_total{method}`.
-    pub fn check(
+    pub(crate) fn check(
         self,
         method: &'static str,
         tip_aged_from_unix_seconds: i64,
@@ -98,16 +98,16 @@ impl StaleTipLimit {
 
 /// The times of a served tip that tip calls use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TipBlockTime {
+pub(crate) struct TipBlockTime {
     /// The Unix time in the tip block's header, which `estimatedHeight`
     /// counts from.
-    pub block_time_unix_seconds: i64,
+    pub(crate) block_time_unix_seconds: i64,
     /// The Unix time the tip's age counts from: its block time, or when this
     /// process first read the tip if that is earlier.
     ///
     /// Consensus accepts a block time well ahead of the local clock, and such
     /// a tip would otherwise look fresh long after it stopped advancing.
-    pub aged_from_unix_seconds: i64,
+    pub(crate) aged_from_unix_seconds: i64,
 }
 
 /// The times of the last served tip a tip call read, so the frequent tip
@@ -115,7 +115,7 @@ pub struct TipBlockTime {
 ///
 /// Clones share one cache.
 #[derive(Clone, Debug, Default)]
-pub struct TipBlockTimeCache {
+pub(crate) struct TipBlockTimeCache {
     last: Arc<ArcSwapOption<(ChainEpochId, BlockHeight, TipBlockTime)>>,
 }
 
@@ -127,7 +127,7 @@ impl TipBlockTimeCache {
     /// # Errors
     ///
     /// Returns the error of `read_block_time`.
-    pub async fn block_time<Read, ReadFuture>(
+    pub(crate) async fn block_time<Read, ReadFuture>(
         &self,
         chain_epoch_id: ChainEpochId,
         height: BlockHeight,
@@ -147,7 +147,7 @@ impl TipBlockTimeCache {
     /// Returns the cached times of the tip at `height` in `chain_epoch_id`,
     /// if the cache holds that tip.
     #[must_use]
-    pub fn cached(
+    pub(crate) fn cached(
         &self,
         chain_epoch_id: ChainEpochId,
         height: BlockHeight,
@@ -167,7 +167,7 @@ impl TipBlockTimeCache {
     /// A newer chain epoch over the same tip block keeps the time the cache
     /// first read that tip.
     #[must_use]
-    pub fn store(
+    pub(crate) fn store(
         &self,
         chain_epoch_id: ChainEpochId,
         height: BlockHeight,
@@ -196,7 +196,7 @@ impl TipBlockTimeCache {
 
 /// Returns the current Unix time in whole seconds.
 #[must_use]
-pub fn unix_now_seconds() -> i64 {
+pub(crate) fn unix_now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since_epoch| {

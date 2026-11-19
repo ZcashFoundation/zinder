@@ -1,10 +1,18 @@
-//! lightwalletd-compatible wallet sync adapter.
+//! lightwalletd-compatible wallet sync adapters.
 //!
 //! This crate owns compatibility translation for the vendored lightwalletd
-//! `CompactTxStreamer` protocol. It consumes [`zinder_query::WalletQueryApi`]
-//! and does not open storage, call upstream nodes, or build artifacts.
+//! `CompactTxStreamer` protocol. [`LightwalletdGrpcAdapter`] serves every
+//! method from [`zinder_query::WalletQueryApi`].
+//! [`CompactBlocksGrpcAdapter`] serves the block methods from the
+//! [`zinder_query::RocksDbCanonicalReader`] of each compact-blocks
+//! generation alone, and both answer those methods through one
+//! implementation. Neither opens storage, calls upstream nodes, or builds
+//! artifacts.
 
+mod block_methods;
 mod block_range;
+mod compact_block_messages;
+mod compact_blocks_grpc;
 mod grpc;
 mod mempool;
 mod network_tip_estimate;
@@ -14,14 +22,13 @@ mod request_limits;
 mod stale_tip;
 
 pub use block_range::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse,
-    BlockRangeSink, BlockRangeStage, BlockRangeStreamLimit, BlockRangeStreamSlot,
-    DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
+pub use compact_blocks_grpc::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
-    compact_transaction_has_payload,
 };
 pub use mempool::{
     IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
@@ -36,6 +43,4 @@ pub use node_tip_witness::{
 };
 pub use ping::LightwalletdPing;
 pub use request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
-pub use stale_tip::{
-    DEFAULT_STALE_TIP_LIMIT, StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds,
-};
+pub use stale_tip::{DEFAULT_STALE_TIP_LIMIT, StaleTipLimit};
