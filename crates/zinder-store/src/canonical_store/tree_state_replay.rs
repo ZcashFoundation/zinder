@@ -47,6 +47,34 @@ pub struct TreeStateReplay {
     seed_chain: VisibleChain,
 }
 
+/// How a store answered a [`TreeStateReplay`].
+///
+/// A store showing another visible chain than the one that issued the replay
+/// looks the height up again, so it can answer from a checkpoint it stores
+/// there or replay from another seed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreeStateReplayOutcome {
+    /// The store holds a checkpoint at the height, so nothing was replayed.
+    Stored(CommitmentTreeCheckpoint),
+    /// The store rebuilt the tree state from the seed `replay` names.
+    Replayed {
+        /// The reconstruction the store ran.
+        replay: Box<TreeStateReplay>,
+        /// The tree state it produced.
+        checkpoint: CommitmentTreeCheckpoint,
+    },
+}
+
+impl TreeStateReplayOutcome {
+    /// Returns the tree state at the replayed height.
+    #[must_use]
+    pub const fn checkpoint(&self) -> &CommitmentTreeCheckpoint {
+        match self {
+            Self::Stored(checkpoint) | Self::Replayed { checkpoint, .. } => checkpoint,
+        }
+    }
+}
+
 /// The visible chain a store's READY evidence names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VisibleChain {
@@ -142,7 +170,8 @@ pub(super) fn lookup_tree_state(
     })))
 }
 
-/// Reconstructs the tree state `replay` names.
+/// Reconstructs the tree state `replay` names, reporting how it was
+/// answered.
 ///
 /// A store showing another visible chain than the one that issued `replay`
 /// answers as [`read_tree_state_checkpoint_at`] does, so `Ok(None)` means the
@@ -151,12 +180,24 @@ pub(super) fn replay_tree_state(
     store: &impl CanonicalServingRead,
     replay: &TreeStateReplay,
     activations: &NetworkUpgradeActivations,
-) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-    if replay.seed_chain != VisibleChain::of(store) {
-        return read_tree_state_checkpoint_at(store, replay.height, activations);
-    }
-    refuse_unadmitted_activations(store, replay.height, activations)?;
-    reconstruct(store, &replay.seed, replay.height, activations).map(Some)
+) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    let replay = if replay.seed_chain == VisibleChain::of(store) {
+        refuse_unadmitted_activations(store, replay.height, activations)?;
+        replay.clone()
+    } else {
+        match lookup_tree_state(store, replay.height, activations)? {
+            None => return Ok(None),
+            Some(TreeStateLookup::Stored(checkpoint)) => {
+                return Ok(Some(TreeStateReplayOutcome::Stored(checkpoint)));
+            }
+            Some(TreeStateLookup::Replay(reread)) => reread,
+        }
+    };
+    let checkpoint = reconstruct(store, &replay.seed, replay.height, activations)?;
+    Ok(Some(TreeStateReplayOutcome::Replayed {
+        replay: Box::new(replay),
+        checkpoint,
+    }))
 }
 
 fn refuse_unadmitted_activations(

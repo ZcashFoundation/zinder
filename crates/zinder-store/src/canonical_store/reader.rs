@@ -29,7 +29,7 @@ use super::{
     subtree_load::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
     },
-    tree_state_replay::{TreeStateLookup, TreeStateReplay},
+    tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome},
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
@@ -338,17 +338,20 @@ macro_rules! impl_canonical_typed_reads {
 
             /// Reconstructs the tree state a [`Self::tree_state_lookup`]
             /// found no checkpoint for, applying every check of
-            /// [`Self::tree_state_checkpoint_at`].
+            /// [`Self::tree_state_checkpoint_at`], and reports how it was
+            /// answered.
             ///
             /// Replays from the seed the lookup read. When this store shows
             /// another visible chain than the store that issued `replay`, it
             /// answers exactly as [`Self::tree_state_checkpoint_at`] does for
-            /// [`TreeStateReplay::height`], including `Ok(None)`.
+            /// [`TreeStateReplay::height`], including `Ok(None)`: from the
+            /// checkpoint it stores there, or by a replay from the seed it
+            /// reads itself, which the outcome names.
             pub fn replay_tree_state(
                 &self,
                 replay: &TreeStateReplay,
                 network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
                 super::tree_state_replay::replay_tree_state(
                     self,
                     replay,

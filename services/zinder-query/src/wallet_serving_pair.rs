@@ -21,7 +21,7 @@ use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
-    TreeStateLookup, TreeStateReplay,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -166,17 +166,24 @@ pub trait CanonicalReader: Send + Sync + 'static {
     }
 
     /// Reconstructs the tree state a [`Self::tree_state_lookup`] found no
-    /// checkpoint for, as [`RocksDbCanonicalSecondary::replay_tree_state`]
-    /// does.
+    /// checkpoint for, and reports how it was answered, as
+    /// [`RocksDbCanonicalSecondary::replay_tree_state`] does.
     ///
     /// The default reads the height through
-    /// [`Self::tree_state_checkpoint_at`].
+    /// [`Self::tree_state_checkpoint_at`] and reports it replayed from the
+    /// seed `replay` names.
     fn replay_tree_state(
         &self,
         replay: &TreeStateReplay,
         network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
         self.tree_state_checkpoint_at(replay.height(), network_upgrade_activations)
+            .map(|checkpoint| {
+                checkpoint.map(|checkpoint| TreeStateReplayOutcome::Replayed {
+                    replay: Box::new(replay.clone()),
+                    checkpoint,
+                })
+            })
     }
 
     /// Reads a contiguous range of subtree roots.
@@ -438,7 +445,7 @@ macro_rules! impl_canonical_read {
                 &self,
                 replay: &TreeStateReplay,
                 network_upgrade_activations: &NetworkUpgradeActivations,
-            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
                 self.replay_tree_state(replay, network_upgrade_activations)
             }
 

@@ -338,7 +338,7 @@ impl CanonicalReader for GatedCanonicalReader {
         &self,
         replay: &zinder_store::TreeStateReplay,
         network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, CanonicalStoreError> {
         self.canonical_reader
             .replay_tree_state(replay, network_upgrade_activations)
     }

@@ -13,7 +13,7 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, TreeStateLookup,
+    RocksDbCanonicalStore, TreeStateLookup, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
     publication::column_family,
@@ -277,7 +277,10 @@ fn a_replay_starts_from_the_seed_its_lookup_read() -> Result<(), Box<dyn std::er
 
     assert_eq!(
         store.replay_tree_state(&replay, &activations)?,
-        Some(expected_checkpoint(&activations, height)?)
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(replay.clone()),
+            checkpoint: expected_checkpoint(&activations, height)?,
+        })
     );
     assert_publication_refused(&store, height, &activations)
 }
@@ -302,11 +305,27 @@ fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn 
         }
     };
     let within_both = replay_at(120)?;
+    let stored_by_other = replay_at(140)?;
     let above_other_tip = replay_at(145)?;
+    let Some(TreeStateLookup::Replay(other_seed)) =
+        other.tree_state_lookup(BlockHeight::new(120), &activations)?
+    else {
+        return Err("height 120 has no stored checkpoint in the other store".into());
+    };
 
     assert_eq!(
         other.replay_tree_state(&within_both, &activations)?,
-        Some(expected_checkpoint(&activations, BlockHeight::new(120))?)
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(other_seed),
+            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+        })
+    );
+    assert_eq!(
+        other.replay_tree_state(&stored_by_other, &activations)?,
+        Some(TreeStateReplayOutcome::Stored(expected_checkpoint(
+            &activations,
+            BlockHeight::new(140)
+        )?))
     );
     assert_eq!(
         other.replay_tree_state(&above_other_tip, &activations)?,
@@ -319,7 +338,10 @@ fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn 
     ));
     assert_eq!(
         issuing.replay_tree_state(&within_both, &activations)?,
-        Some(expected_checkpoint(&activations, BlockHeight::new(120))?)
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(within_both.clone()),
+            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+        })
     );
     Ok(())
 }

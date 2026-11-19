@@ -86,7 +86,7 @@ pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary}
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };
-pub use tree_state_replay::{TreeStateLookup, TreeStateReplay};
+pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";

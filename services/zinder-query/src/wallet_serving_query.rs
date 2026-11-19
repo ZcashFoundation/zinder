@@ -30,7 +30,7 @@ use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
     ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    StreamCursorTokenV1, TreeStateLookup,
+    StreamCursorTokenV1, TreeStateLookup, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -1207,30 +1207,38 @@ where
             // while it waits gives up its place, and no pair is held while it
             // waits. Once taken, the blocking replay holds it, so a cancelled
             // request frees it only when its replay ends. The replay captures
-            // the pair again; one showing a newer chain reads its own seed.
+            // the pair again; one showing a newer chain can answer from a
+            // checkpoint it stores or from its own seed, so the metrics
+            // record the outcome that read reports.
             let replay_slot = Arc::new(self.tree_state_replays.admit().await?);
-            let seed_trees = replay.seed().tip_metadata();
-            let replayed_blocks = replay.replayed_blocks();
-            let (chain_epoch, checkpoint, replay_duration) =
+            let (chain_epoch, outcome, replay_duration) =
                 serving_read::read_at(self.pin(at_epoch_id), move |pair| {
                     let _replay_slot = replay_slot;
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     let started_at = Instant::now();
-                    let checkpoint = pair
+                    let outcome = pair
                         .canonical()
                         .replay_tree_state(&replay, pair.network_upgrade_activations())?
                         .ok_or(QueryError::BlockNotInBestChain)?;
-                    Ok((chain_epoch, checkpoint, started_at.elapsed()))
+                    Ok((chain_epoch, outcome, started_at.elapsed()))
                 })
                 .await?;
-            record_replay_duration(height, replay_duration);
-            record_tree_state_read(
-                height,
-                replayed_blocks,
-                seed_trees,
-                checkpoint.tip_metadata(),
-            );
-            tree_state_from_checkpoint(chain_epoch, &checkpoint)
+            match &outcome {
+                TreeStateReplayOutcome::Stored(stored) => {
+                    let trees = stored.tip_metadata();
+                    record_tree_state_read(height, 0, trees, trees);
+                }
+                TreeStateReplayOutcome::Replayed { replay, checkpoint } => {
+                    record_replay_duration(height, replay_duration);
+                    record_tree_state_read(
+                        height,
+                        replay.replayed_blocks(),
+                        replay.seed().tip_metadata(),
+                        checkpoint.tip_metadata(),
+                    );
+                }
+            }
+            tree_state_from_checkpoint(chain_epoch, outcome.checkpoint())
         })
         .await
     }
@@ -1899,6 +1907,72 @@ mod tree_state_replay_limit_tests {
         drop(held_slot);
 
         assert_eq!(waiting.await??.height, reconstructed);
+        Ok(())
+    }
+
+    /// A request whose pair is replaced while it waits for a rebuild slot
+    /// records how the new pair answered: here from the checkpoint it
+    /// stores, with no replayed blocks and no rebuild time.
+    #[tokio::test]
+    async fn a_pair_replaced_during_the_slot_wait_records_how_it_answered()
+    -> Result<(), Box<dyn Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        // Construction checkpoints only the tip of the first store, and
+        // height 2 as the build tip of the store that live-appends block 3.
+        let mut replaying = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let mut storing =
+            WalletServingStoreFixture::from_chain_after_live_append(&chain, &activations)?;
+        let (canonical, wallet) = replaying.take_readers()?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        let (canonical, wallet) = storing.take_readers()?;
+        let replacement = Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let replacement_epoch = replacement.canonical_fence().chain_epoch_id();
+        let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+        let query = query.with_tree_state_replay_wait(Duration::from_secs(5));
+        let height = BlockHeight::new(2);
+
+        let held_slot = query.tree_state_replays.admit().await?;
+        let waiting = tokio::spawn({
+            let query = query.clone();
+            async move { query.tree_state_at(height, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the request did not wait for the slot"
+        );
+        slot.publish_for_test(replacement);
+        drop(held_slot);
+        let tree_state = waiting.await??;
+
+        assert_eq!(tree_state.height, height);
+        assert_eq!(tree_state.chain_epoch.id, replacement_epoch);
+        let rendered = rendered.render();
+        assert!(
+            rendered.lines().any(|line| line
+                == "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"0\"} 1"),
+            "the read must count as stored:\n{rendered}"
+        );
+        for absent in [
+            "zinder_query_tree_state_reads_total{source=\"replayed\"",
+            "zinder_query_tree_state_replay_duration_seconds",
+        ] {
+            assert!(
+                !rendered.contains(absent),
+                "a stored answer records no rebuild ({absent}):\n{rendered}"
+            );
+        }
         Ok(())
     }
 
