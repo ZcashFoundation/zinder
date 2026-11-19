@@ -16,7 +16,7 @@ use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BlockValuePoolBalances, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -34,14 +34,17 @@ use crate::{
     NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource, NodeStorageMode,
     NodeTarget, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
-    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
+    SourceTransparentUnspentOutput, TransactionBroadcaster, TransparentAddressLookup,
+    TransparentAddressRowLimit, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
     ZebraIndexerSourceTarget, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
-    source_chain_update::SourceChainCursorPosition, zebra_ready_endpoint::ZebraReadyClient,
+    source_chain_update::SourceChainCursorPosition,
+    source_transparent_address::{ZebraAddressBalance, ZebraAddressUtxo, decode_address_utxo_page},
+    zebra_ready_endpoint::ZebraReadyClient,
 };
 
 /// Result of looking up a transaction at the upstream node.
@@ -119,6 +122,8 @@ const JSON_RPC_INVALID_ENCODING_CODE: i32 = -22;
 const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 /// JSON-RPC error code returned when a txid is not in mempool or main chain.
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
+/// JSON-RPC 2.0 code for a method the server does not implement.
+const JSON_RPC_METHOD_NOT_FOUND_CODE: i64 = -32_601;
 /// JSON-RPC error code for general transaction verification failures.
 ///
 /// Zebra collapses every mempool rejection into this code; the
@@ -890,6 +895,137 @@ impl ZebraJsonRpcSource {
         }
     }
 
+    /// Fetches the confirmed transparent balance of `lookup` from the node's
+    /// address index, using `getaddressbalance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::TransparentAddressIndexesUnavailable`] when the
+    /// node does not maintain its transparent address indexes,
+    /// [`SourceError::TransparentAddressLookupNetworkMismatch`] when `lookup`
+    /// targets another network, and [`SourceError::NodeUnavailable`] when the
+    /// node cannot be reached.
+    pub async fn fetch_transparent_address_balance(
+        &self,
+        lookup: &TransparentAddressLookup,
+    ) -> Result<SourceTransparentAddressBalance, SourceError> {
+        self.check_transparent_address_lookup(lookup)?;
+        let balance: ZebraAddressBalance = self
+            .call_typed(
+                "getaddressbalance",
+                positional_params([json!({ "addresses": lookup.rpc_addresses() })])?,
+                |error| transparent_address_call_error("getaddressbalance", error),
+            )
+            .await?;
+        Ok(balance.into())
+    }
+
+    /// Fetches the ids of the transactions that pay or spend `lookup`'s
+    /// addresses in blocks `start_height..=end_height`, in chain order, using
+    /// `getaddresstxids`.
+    ///
+    /// The node clamps both heights to its tip, so a range that starts above
+    /// the tip would return the tip block's transactions. The source reads
+    /// the tip first and returns nothing for such a range, or for an empty
+    /// one. Neither node indexes the genesis block, and both read an end
+    /// height of zero as the tip, so a range ending at genesis is answered
+    /// without a node request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when the
+    /// range holds more than [`TransparentAddressRowLimit::MAX`]
+    /// transactions, and the errors of
+    /// [`Self::fetch_transparent_address_balance`].
+    pub async fn fetch_transparent_address_transaction_ids(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+    ) -> Result<Vec<TransactionId>, SourceError> {
+        self.check_transparent_address_lookup(lookup)?;
+        if start_height > end_height || end_height == BlockHeight::new(0) {
+            return Ok(Vec::new());
+        }
+        let tip_height = self.tip_id().await?.height;
+        let end_height = end_height.min(tip_height);
+        if start_height > end_height || end_height == BlockHeight::new(0) {
+            return Ok(Vec::new());
+        }
+
+        let txid_hex_list: Vec<String> = self
+            .call_typed(
+                "getaddresstxids",
+                positional_params([json!({
+                    "addresses": lookup.rpc_addresses(),
+                    "start": start_height.value(),
+                    "end": end_height.value(),
+                })])?,
+                |error| transparent_address_call_error("getaddresstxids", error),
+            )
+            .await?;
+        if txid_hex_list.len() > TransparentAddressRowLimit::MAX.row_count() {
+            return Err(SourceError::TransparentAddressRowLimitExceeded {
+                operation: "getaddresstxids",
+                max_rows: TransparentAddressRowLimit::MAX.get(),
+            });
+        }
+        txid_hex_list
+            .iter()
+            .map(|txid_hex| decode_display_transaction_id(txid_hex))
+            .collect()
+    }
+
+    /// Fetches up to `max_rows` unspent outputs of `lookup`'s addresses mined
+    /// at or above `start_height`, in chain order, using `getaddressutxos`.
+    ///
+    /// Zebra bounds its index scan by `startHeight` and `maxEntries`. Zakura
+    /// ignores both and returns every unspent output, which the source then
+    /// bounds itself, so the answer still counts toward
+    /// `node.max_response_bytes` in full. A page of exactly `max_rows` rows
+    /// may have more after it; the next page starts at the last row's height
+    /// and repeats the rows already returned at that height.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::SourceResponseTooLarge`] when the answer
+    /// exceeds `node.max_response_bytes`, and the errors of
+    /// [`Self::fetch_transparent_address_transaction_ids`].
+    pub async fn fetch_transparent_address_utxos(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        max_rows: TransparentAddressRowLimit,
+    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+        self.check_transparent_address_lookup(lookup)?;
+        let rows: Vec<ZebraAddressUtxo> = self
+            .call_typed(
+                "getaddressutxos",
+                positional_params([json!({
+                    "addresses": lookup.rpc_addresses(),
+                    "startHeight": start_height.value(),
+                    "maxEntries": max_rows.get(),
+                })])?,
+                |error| transparent_address_call_error("getaddressutxos", error),
+            )
+            .await?;
+        decode_address_utxo_page(rows, start_height, max_rows)
+    }
+
+    fn check_transparent_address_lookup(
+        &self,
+        lookup: &TransparentAddressLookup,
+    ) -> Result<(), SourceError> {
+        if lookup.network() == self.network {
+            Ok(())
+        } else {
+            Err(SourceError::TransparentAddressLookupNetworkMismatch {
+                lookup_network: lookup.network(),
+                source_network: self.network,
+            })
+        }
+    }
+
     async fn fetch_bounded_subtree_roots(
         &self,
         protocol: ShieldedProtocol,
@@ -1646,6 +1782,43 @@ fn subtree_roots_call_error(
     }
 }
 
+/// Zakura's refusal of an address lookup by a node that stopped maintaining
+/// its transparent indexes (`zakura_state::TransparentIndexesUnavailable`).
+const TRANSPARENT_INDEXES_UNAVAILABLE_REFUSAL: &str =
+    "transparent address and spender indexes are unavailable";
+
+/// Zebra's refusals of an address lookup that matched more rows than
+/// `MAX_ADDRESS_QUERY_RESULTS` (Zebra 7.1.0 and later).
+const ADDRESS_ROW_LIMIT_REFUSALS: [&str; 3] = [
+    "transactions match; narrow the height range",
+    "unspent outputs match; page with startHeight and maxEntries",
+    "maxEntries must be at most",
+];
+
+/// Maps a call error from `getaddressbalance`, `getaddresstxids`, or
+/// `getaddressutxos`.
+fn transparent_address_call_error(operation: &'static str, error: JsonRpcCallError) -> SourceError {
+    if error
+        .message
+        .contains(TRANSPARENT_INDEXES_UNAVAILABLE_REFUSAL)
+        || error.code == Some(JSON_RPC_METHOD_NOT_FOUND_CODE)
+    {
+        SourceError::TransparentAddressIndexesUnavailable {
+            reason: error.message,
+        }
+    } else if ADDRESS_ROW_LIMIT_REFUSALS
+        .iter()
+        .any(|refusal| error.message.contains(refusal))
+    {
+        SourceError::TransparentAddressRowLimitExceeded {
+            operation,
+            max_rows: TransparentAddressRowLimit::MAX.get(),
+        }
+    } else {
+        map_node_unavailable(error)
+    }
+}
+
 struct BatchedSourceBlocks {
     blocks: Vec<SourceBlock>,
     stats: SourceChainSegmentStats,
@@ -1858,6 +2031,15 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         }
         Some(SourceError::HistoricalSubtreeRootsUnavailable { .. }) => {
             "historical_subtree_roots_unavailable"
+        }
+        Some(SourceError::TransparentAddressIndexesUnavailable { .. }) => {
+            "transparent_address_indexes_unavailable"
+        }
+        Some(SourceError::TransparentAddressRowLimitExceeded { .. }) => {
+            "transparent_address_row_limit_exceeded"
+        }
+        Some(SourceError::TransparentAddressLookupNetworkMismatch { .. }) => {
+            "transparent_address_lookup_network_mismatch"
         }
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
         Some(SourceError::SourcePayloadEncodingFailed { .. }) => "source_payload_encoding_failed",

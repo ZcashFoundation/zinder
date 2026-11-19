@@ -354,6 +354,42 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The node cannot answer transparent-address lookups.
+    ///
+    /// A Zakura node in pruned storage mode with checkpoint sync stops
+    /// maintaining its transparent address indexes and refuses
+    /// `getaddressbalance`, `getaddresstxids`, and `getaddressutxos` instead
+    /// of answering from partial data. A node without these methods is
+    /// reported the same way. Retrying the same node cannot succeed.
+    #[error("transparent address lookups are unavailable from this node: {reason}")]
+    TransparentAddressIndexesUnavailable {
+        /// Node error message.
+        reason: String,
+    },
+
+    /// A transparent-address lookup matched more rows than one answer holds.
+    ///
+    /// The caller narrows the lookup, by height range for transaction ids or
+    /// by paging for unspent outputs, and retries.
+    #[error("{operation} matched more than {max_rows} rows; narrow the lookup")]
+    TransparentAddressRowLimitExceeded {
+        /// Node method that matched too many rows.
+        operation: &'static str,
+        /// Most rows one answer holds.
+        max_rows: u32,
+    },
+
+    /// A transparent-address lookup targets another network than the source.
+    #[error(
+        "transparent address lookup for {lookup_network:?} sent to a {source_network:?} node source"
+    )]
+    TransparentAddressLookupNetworkMismatch {
+        /// Network the lookup was validated for.
+        lookup_network: zinder_core::Network,
+        /// Network the node source serves.
+        source_network: zinder_core::Network,
+    },
+
     /// The node response did not match the expected JSON-RPC contract.
     ///
     /// Prefer this variant when the JSON-RPC envelope or response shape is
@@ -470,8 +506,9 @@ pub enum SourceFailureClass {
     /// Bytes returned by the upstream could not be decoded or parsed as
     /// valid Zcash data. Operator action: investigate the upstream version.
     Malformed,
-    /// Adapter configuration is invalid (unsupported auth scheme,
-    /// broadcast disabled by deliberate read-only configuration).
+    /// Adapter configuration or a request bound refused the operation
+    /// (unsupported auth scheme, broadcast disabled by deliberate read-only
+    /// configuration, a response or row limit exceeded).
     Configuration,
 }
 
@@ -539,7 +576,11 @@ impl SourceError {
             | Self::MempoolTransactionCountLimitExceeded { .. }
             | Self::MempoolRawTransactionBytesLimitExceeded { .. }
             | Self::TransactionBroadcastDisabled
-            | Self::UnsupportedNodeAuth { .. } => SourceFailureClass::Configuration,
+            | Self::UnsupportedNodeAuth { .. }
+            | Self::TransparentAddressRowLimitExceeded { .. }
+            | Self::TransparentAddressLookupNetworkMismatch { .. } => {
+                SourceFailureClass::Configuration
+            }
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }
@@ -550,7 +591,8 @@ impl SourceError {
             Self::NodeCapabilityMissing { .. }
             | Self::HistoricalTreeStateUnavailable { .. }
             | Self::HistoricalBlockBodyUnavailable { .. }
-            | Self::HistoricalSubtreeRootsUnavailable { .. } => {
+            | Self::HistoricalSubtreeRootsUnavailable { .. }
+            | Self::TransparentAddressIndexesUnavailable { .. } => {
                 SourceFailureClass::CapabilityMissing
             }
             Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,
