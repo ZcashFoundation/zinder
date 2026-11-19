@@ -170,8 +170,8 @@ one:
 The pass works one stride at a time, from one stored checkpoint to the next
 multiple of 100. It replays the stride's compact blocks from the first
 checkpoint with the checks a tree-state rebuild applies, and accepts the result
-only when the replay reproduces the stored checkpoint that ends the stride byte
-for byte. The writer then adds the stride's rows in one batch between live
+only when the replay reproduces every checkpoint already stored in the stride,
+including the one that ends it, byte for byte. The writer then adds the stride's rows in one batch between live
 commits, after checking that the stride ends at or below the settled tip, that
 both stored checkpoints are unchanged, and that a row already stored at one of
 its heights holds the same bytes. A stride that fails a check is not written:

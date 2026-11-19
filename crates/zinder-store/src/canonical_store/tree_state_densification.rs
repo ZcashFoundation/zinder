@@ -1,4 +1,4 @@
-//! Densifying the tree-state checkpoints of settled constructed history.
+//! Densifying the tree-state checkpoints of settled history.
 //!
 //! Construction stores a tree-state checkpoint at its history predecessor,
 //! every [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its build tip, so a
@@ -6,8 +6,8 @@
 //! a stride, from one stored checkpoint to the next cadence checkpoint, with
 //! the checkpoints a [`TreeStateCheckpointSelection`] picks. It replays the
 //! stride with the checks a tree-state reconstruction applies, and accepts the
-//! result only when the replay reproduces the stored checkpoint that ends the
-//! stride byte for byte. Each stride commits in one batch, so a stride is
+//! result only when the replay reproduces every checkpoint already stored in
+//! the stride, including the one that ends it, byte for byte. Each stride commits in one batch, so a stride is
 //! either complete or untouched, and only settled strides are densified, so no
 //! reorg can remove a densified row.
 
