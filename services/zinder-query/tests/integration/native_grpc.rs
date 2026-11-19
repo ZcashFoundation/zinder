@@ -331,6 +331,28 @@ async fn ingest_control_admission_reports_transport_failure() {
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn ingest_control_admission_gives_up_on_a_dial_that_never_completes() -> eyre::Result<()> {
+    // The listener's backlog accepts the TCP connection, but nothing answers
+    // the TLS handshake.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("https://{}", listener.local_addr()?);
+
+    let outcome = tokio::time::timeout(
+        zinder_runtime::DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
+        AdmittedIngestControl::connect(&endpoint, None, Network::ZcashRegtest),
+    )
+    .await?;
+
+    assert!(matches!(
+        outcome,
+        Err(IngestControlAdmissionError::Connect(
+            zinder_runtime::BearerTokenConnectError::ConnectTimeout { .. }
+        ))
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);

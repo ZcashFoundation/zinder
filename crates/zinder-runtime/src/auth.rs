@@ -252,6 +252,12 @@ pub enum BearerTokenConnectError {
     /// The transport could not connect to the endpoint.
     #[error("zinder gRPC transport connect failed: {0}")]
     Transport(#[source] tonic::transport::Error),
+    /// The dial did not complete within its connect timeout.
+    #[error("zinder gRPC dial did not complete within {connect_timeout:?}")]
+    ConnectTimeout {
+        /// Bound the dial was given.
+        connect_timeout: std::time::Duration,
+    },
     /// The bearer token could not be encoded as gRPC metadata.
     #[error(transparent)]
     Token(#[from] BearerTokenError),

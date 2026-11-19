@@ -128,10 +128,11 @@ impl IngestControlMempoolSurface {
 
     /// Runs `operation` under the surface's request timeout.
     ///
-    /// The bound must cover [`Self::ingest_control_client`] as well as the
-    /// RPC: the first dial has no deadline of its own, and concurrent callers
-    /// wait on the same cell. A cancelled dial leaves the cell empty, so the
-    /// next call dials again.
+    /// The bound covers [`Self::ingest_control_client`] as well as the RPC, and
+    /// concurrent callers wait on the same cell. The dial also carries the
+    /// transport's connect timeout, so whichever bound is shorter ends it. A
+    /// failed or cancelled dial leaves the cell empty, so the next call dials
+    /// again.
     async fn bounded<T>(
         &self,
         operation_name: &str,
@@ -500,6 +501,7 @@ mod tests {
     use std::time::Instant;
 
     use tokio::net::TcpListener;
+    use zinder_runtime::DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT;
 
     use super::*;
 
@@ -529,6 +531,32 @@ mod tests {
         assert!(
             elapsed >= request_timeout && elapsed < Duration::from_secs(2),
             "lookup took {elapsed:?}"
+        );
+        drop(listener);
+        Ok(())
+    }
+
+    /// A writer that accepts TCP but never completes the TLS handshake must
+    /// fail the first dial within the transport's connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn mempool_transaction_is_unavailable_when_the_dial_stalls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let surface =
+            IngestControlMempoolSurface::new(format!("https://{}", listener.local_addr()?));
+
+        let lookup = tokio::time::timeout(
+            DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
+            surface.mempool_transaction(TransactionId::from_bytes([7; 32])),
+        )
+        .await?;
+
+        let Err(MempoolSurfaceError::Unavailable { reason }) = lookup else {
+            return Err(format!("stalled dial must be unavailable, got {lookup:?}").into());
+        };
+        assert!(
+            reason.contains("dial did not complete"),
+            "unexpected reason: {reason}"
         );
         drop(listener);
         Ok(())

@@ -160,7 +160,8 @@ pub use sections::{
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{
-    InvalidZinderGrpcEndpoint, connect_zinder_grpc, validate_zinder_grpc_endpoint,
+    DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, InvalidZinderGrpcEndpoint, connect_zinder_grpc,
+    connect_zinder_grpc_with_timeout, validate_zinder_grpc_endpoint,
 };
 
 use tokio::task::JoinHandle;
