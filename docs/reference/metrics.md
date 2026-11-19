@@ -55,6 +55,9 @@ Other signals that need attention when they keep rising:
 
 - `zinder_ingest_node_endpoint_active{position="0"} == 0`: ingest runs on a
   fallback node and stays there until that node fails or ingest restarts.
+- `zinder_ingest_tree_state_verification_mismatches_total` or
+  `zinder_ingest_tree_state_densification_strides_total{outcome="integrity_failure"}`
+  above 0: the canonical store is damaged. Rebuild it.
 - `zinder_query_tree_state_replay_refusals_total`: wallets request old tree
   states faster than the host can rebuild them.
 - `zinder_query_broadcast_budget_refusals_total`: clients send many large
@@ -125,7 +128,7 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_source_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of ingest's node requests. |
 | `zinder_ingest_source_retry_total` | counter | `operation` | Node requests retried within one call. |
 | `zinder_ingest_source_fetch_active` | gauge | `operation` | Node fetches in flight. |
-| `zinder_ingest_historical_work_gate_open` | gauge | | 1 when ingest follows the tip and, if Explorer views are enabled, they have caught up, so backfills and tree-state densification may run. |
+| `zinder_ingest_historical_work_gate_open` | gauge | | 1 when ingest follows the tip and, if Explorer views are enabled, they have caught up, so backfills, tree-state densification, and tree-state verification may run. |
 | `zinder_ingest_tree_state_densification_strides_total` | counter | `outcome` | Settled 100-block strides the densification pass finished: `densified` when the writer committed it, even with no rows left to add, or `integrity_failure` when its stored blocks or checkpoints are damaged or do not replay to each other. Any `integrity_failure` is store damage. The pass skips that stride and holds its recorded progress below it, so it examines the stride again after ingest restarts. |
 | `zinder_ingest_tree_state_densification_remaining_strides` | gauge | | Strides the pass has found in its current scan chunk and not finished yet. |
 | `zinder_ingest_tree_state_densification_watermark_height` | gauge | | Height through which the pass has recorded every settled stride as satisfying the selection. |
@@ -133,6 +136,11 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_tree_state_densification_replayed_commitments_total` | counter | | Note commitments the pass appended while replaying strides. |
 | `zinder_ingest_tree_state_densification_stride_duration_seconds` | histogram | | Time to replay one stride. |
 | `zinder_ingest_tree_state_densification_retries_total` | counter | | Steps the pass retried after a store or writer error. |
+| `zinder_ingest_tree_state_verification_rows_total` | counter | | Stored tree-state checkpoint rows the verification pass checked and found intact. |
+| `zinder_ingest_tree_state_verification_mismatches_total` | counter | | Rows that failed verification. Any increase is store damage: ingest reports `storage_unavailable` and the pass stops. |
+| `zinder_ingest_tree_state_verification_watermark_height` | gauge | | Height the current verification cycle continues from. It returns to 0 when a cycle ends. |
+| `zinder_ingest_tree_state_verification_cycles_total` | counter | | Cycles that checked every settled row. The time between increments is the pass's detection bound. |
+| `zinder_ingest_tree_state_verification_retries_total` | counter | | Steps the verification pass retried after a store error. |
 | `zinder_explorer_views_admitted` | gauge | | 1 when ingest admitted its Explorer view store. |
 | `zinder_ingest_raw_blob_disabled_total` | counter | `table` | Rows stored without raw bytes under the raw-blob policy. |
 
@@ -468,6 +476,7 @@ information and query.
 | `mempool_source_selected` | ingest | Each endpoint's mempool backend, `streaming` or `polling`. |
 | `materialized_view_replay_volume_space_low`, `materialized_view_replay_volume_space_recovered` | ingest | View replay paused or resumed for disk space. |
 | `materialized_view_replay_ranking_build_stalled` | ingest | Replay stopped waiting for a ranking build that made no progress for 5 minutes. |
+| `tree_state_verification_cycle_completed`, `tree_state_verification_mismatch` | ingest | The verification pass checked every settled tree-state row, or found a damaged one, with its `height`, `pool`, and `reason`. |
 | `canonical_secondary_behind_writer` | projector | A convergence attempt timed out. |
 | `wallet_serving_pair_publisher_published` | query, compatibility | A pair was published. Match it with `canonical_live_append_committed` to measure block-to-wallet delay. |
 | `wallet_serving_pair_publisher_refresh_failed` | query, compatibility | A refresh failed. Routine lag logs at debug level. |

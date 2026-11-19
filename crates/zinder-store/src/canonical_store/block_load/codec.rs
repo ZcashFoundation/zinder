@@ -82,6 +82,24 @@ pub(in crate::canonical_store) enum CanonicalFamilyValueDecodeError {
     },
 }
 
+impl CanonicalFamilyValueDecodeError {
+    /// Returns the pool whose frontier was rejected, or `None` when the
+    /// value failed outside any one frontier.
+    pub(in crate::canonical_store) const fn protocol(&self) -> Option<ShieldedProtocol> {
+        match self {
+            Self::FrontierTooLarge { protocol, .. } | Self::InvalidFrontier { protocol, .. } => {
+                Some(*protocol)
+            }
+            Self::MisplacedFrontier {
+                source: CommitmentTreeFrontiersError::PoolMismatch { pool, .. },
+            } => Some(*pool),
+            Self::Truncated { .. }
+            | Self::UnknownPresenceBits { .. }
+            | Self::TrailingBytes { .. } => None,
+        }
+    }
+}
+
 pub(in crate::canonical_store) fn encode_block_header(
     header: &BlockHeaderArtifact,
 ) -> [u8; BLOCK_HEADER_VALUE_LEN] {

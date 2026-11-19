@@ -1818,9 +1818,13 @@ mod tests {
             builder_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks(std::iter::once(Ok::<_, std::io::Error>(
-            lifecycle_build_block(&first, activations)?,
-        )))?;
+        builder.bulk_load_blocks(
+            activations,
+            std::iter::once(Ok::<_, std::io::Error>(lifecycle_build_block(
+                &first,
+                activations,
+            )?)),
+        )?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             BlockId::new(first.height, first.hash),

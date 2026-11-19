@@ -1,6 +1,6 @@
 use std::{ffi::OsString, fs, path::PathBuf};
 
-use zinder_core::{Network, NetworkUpgradeActivationsFingerprint};
+use zinder_core::{Network, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint};
 
 use crate::{
     BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb,
@@ -8,6 +8,7 @@ use crate::{
 
 use super::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    activation_schedule::admits_activation_table,
     block_load::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, CanonicalStagedSstEvidence,
@@ -154,15 +155,21 @@ impl RocksDbCanonicalBuilder {
     /// The returned evidence describes the prepared rows accepted by `RocksDB`;
     /// READY publication additionally requires cache-bypassing family readback.
     ///
+    /// `network_upgrade_activations` must be the table the build plan was
+    /// made from. Every tree-state checkpoint must carry a frontier for
+    /// exactly the pools that table activates at or below its height.
+    ///
     /// A source error leaves the block-load staging in place, so a source
     /// that stops for shutdown returns without deleting it. Discard it with
     /// [`Self::discard_unpublished_block_load_staging`] along with the
     /// unpublished build. Other failures remove the staging before returning.
     pub fn bulk_load_blocks<SourceError>(
         &mut self,
+        network_upgrade_activations: &NetworkUpgradeActivations,
         blocks: impl IntoIterator<Item = Result<CanonicalBuildBlock, SourceError>>,
     ) -> Result<CanonicalBlockLoadEvidence, CanonicalStoreBuildError<SourceError>> {
         self.bulk_load_blocks_with_limits(
+            network_upgrade_activations,
             blocks,
             CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES,
             REVERSE_INDEX_SORT_MEMORY_BYTES,
@@ -171,6 +178,7 @@ impl RocksDbCanonicalBuilder {
 
     pub(super) fn bulk_load_blocks_with_limits<SourceError>(
         &mut self,
+        network_upgrade_activations: &NetworkUpgradeActivations,
         blocks: impl IntoIterator<Item = Result<CanonicalBuildBlock, SourceError>>,
         sst_target_logical_bytes: u64,
         reverse_index_sort_memory_bytes: usize,
@@ -179,6 +187,12 @@ impl RocksDbCanonicalBuilder {
             || !canonical_block_families_are_empty(&self.bounded_open.db)?
         {
             return Err(CanonicalStoreError::BlockLoadAlreadyLoaded.into());
+        }
+        if !admits_activation_table(&self.build_plan, None, network_upgrade_activations) {
+            return Err(CanonicalStoreError::block_load_sequence(
+                "the activation table differs from the one the build plan was made from",
+            )
+            .into());
         }
         let staging_path = canonical_block_staging_path(&self.store_path);
         let staging = FreshCanonicalBlockStaging::create(staging_path)?;
@@ -190,6 +204,7 @@ impl RocksDbCanonicalBuilder {
                 options: &sst_options,
                 workload: self.workload,
                 build_plan: &self.build_plan,
+                network_upgrade_activations,
                 sst_target_logical_bytes,
                 reverse_index_sort_memory_bytes,
             },
@@ -502,7 +517,7 @@ mod tests {
             add_tree_state_checkpoint(tip)?;
         }
 
-        let evidence = store.bulk_load_blocks(blocks)?;
+        let evidence = store.bulk_load_blocks(&testnet_activations()?, blocks)?;
 
         assert_eq!(evidence.block_count, 2);
         assert_eq!(evidence.block_header_count, 2);
@@ -537,7 +552,8 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let recorder_handle = recorder.handle();
 
-        metrics::with_local_recorder(&recorder, || store.bulk_load_blocks(blocks))?;
+        let activations = testnet_activations()?;
+        metrics::with_local_recorder(&recorder, || store.bulk_load_blocks(&activations, blocks))?;
 
         let rendered = recorder_handle.render();
         for stage in ["validate", "encode", "sequence", "write"] {
@@ -596,7 +612,10 @@ mod tests {
         );
         let mut tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32]);
         add_tree_state_checkpoint(&mut tip)?;
-        store.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
+        store.bulk_load_blocks(
+            &testnet_activations()?,
+            [Ok::<_, std::io::Error>(first), Ok(tip)],
+        )?;
         assert_eq!(store.required_subtree_root_ranges()?, []);
 
         let unexpected_root = CanonicalBuildSubtreeRoot {
@@ -805,10 +824,13 @@ mod tests {
         let mut second =
             canonical_build_block_with_block_blob(BlockHeight::new(2), [2; 32], [1; 32], vec![22]);
         add_tree_state_checkpoint(&mut second)?;
-        builder.bulk_load_blocks([
-            Ok::<_, std::io::Error>(first),
-            Ok::<_, std::io::Error>(second),
-        ])?;
+        builder.bulk_load_blocks(
+            &testnet_activations()?,
+            [
+                Ok::<_, std::io::Error>(first),
+                Ok::<_, std::io::Error>(second),
+            ],
+        )?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             build_tip,
@@ -2102,7 +2124,7 @@ mod tests {
         let mut block = canonical_build_block(BlockHeight::new(100), [10; 32], [9; 32]);
         add_tree_state_checkpoint(&mut block)?;
         let expected_replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len())?;
-        builder.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+        builder.bulk_load_blocks(&testnet_activations()?, [Ok::<_, std::io::Error>(block)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
@@ -2747,6 +2769,99 @@ mod tests {
         Ok(())
     }
 
+    /// A loaded checkpoint carries a frontier for exactly the pools active at
+    /// its height.
+    ///
+    /// An omitted pool and an empty active one both have tree size zero, so
+    /// the loader's tree-size check alone accepts a checkpoint that omits an
+    /// active pool whose tree is still empty.
+    #[test]
+    fn bulk_load_refuses_a_checkpoint_whose_frontiers_differ_from_the_active_pools()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_core::{CommitmentTreeFrontier, CommitmentTreeFrontiers, ShieldedProtocol};
+
+        let empty = |protocol| Some(CommitmentTreeFrontier::empty(protocol));
+        let cases = [
+            // Every pool is active at the cadence checkpoint at height 100.
+            (
+                BlockHeight::new(150),
+                BlockHeight::new(100),
+                CommitmentTreeFrontiers::from_validated_parts(
+                    empty(ShieldedProtocol::Sapling),
+                    empty(ShieldedProtocol::Orchard),
+                    None,
+                )?,
+                "block 100 tree-state checkpoint has no frontier for the Ironwood pool although it is active",
+            ),
+            // Ironwood activates at height 10, after the build tip at 8.
+            (
+                BlockHeight::new(8),
+                BlockHeight::new(8),
+                CommitmentTreeFrontiers::from_validated_parts(
+                    empty(ShieldedProtocol::Sapling),
+                    empty(ShieldedProtocol::Orchard),
+                    empty(ShieldedProtocol::Ironwood),
+                )?,
+                "block 8 tree-state checkpoint carries a frontier for the Ironwood pool before it activates",
+            ),
+        ];
+        for (build_tip_height, checkpoint_height, frontiers, expected) in cases {
+            let temporary = TempDir::new()?;
+            let mut builder =
+                building_store_through(&temporary.path().join("canonical"), build_tip_height)?;
+            let blocks = chain_with_checkpoints(build_tip_height, |block| {
+                if block.facts.block_header.height == checkpoint_height
+                    && let Some(checkpoint) = block.tree_state_checkpoint.as_mut()
+                {
+                    checkpoint.frontiers = frontiers.clone();
+                }
+            })?;
+
+            let error = builder
+                .bulk_load_blocks(&testnet_activations()?, blocks)
+                .err()
+                .ok_or("the loader must refuse frontiers that differ from the active pools")?;
+
+            let CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid {
+                reason,
+            }) = &error
+            else {
+                return Err(error.into());
+            };
+            assert_eq!(reason, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_load_refuses_an_activation_table_other_than_the_build_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let mut builder =
+            building_store_through(&temporary.path().join("canonical"), BlockHeight::new(2))?;
+        let blocks = chain_with_checkpoints(BlockHeight::new(2), |_| {})?;
+        let mut later_ironwood = testnet_activations()?.activations().to_vec();
+        for activation in &mut later_ironwood {
+            if activation.name == "NU6.3" {
+                activation.activation_height = BlockHeight::new(20);
+            }
+        }
+        let other = NetworkUpgradeActivations::new(Network::ZcashTestnet, later_ironwood)?;
+
+        let error = builder
+            .bulk_load_blocks(&other, blocks)
+            .err()
+            .ok_or("the loader must refuse another activation table")?;
+
+        assert!(
+            error
+                .to_string()
+                .contains("activation table differs from the one the build plan was made from"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn publication_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
         let Some(child) = process_crash::crash_child() else {
@@ -2982,7 +3097,10 @@ mod tests {
         let expected_compact_block_logical_bytes = 4_u64
             + u64::try_from(zinder_proto::wire::encode_compact_block(&block.compact_block).len())?;
 
-        let evidence = store.bulk_load_blocks(vec![Ok::<_, std::io::Error>(block)])?;
+        let evidence = store.bulk_load_blocks(
+            &testnet_activations()?,
+            vec![Ok::<_, std::io::Error>(block)],
+        )?;
 
         assert_eq!(evidence.block_header_logical_bytes, 4 + 184);
         assert_eq!(evidence.block_hash_index_logical_bytes, 32 + 4);
@@ -3054,8 +3172,10 @@ mod tests {
         expected_sequence_digest
             .try_append(reference.facts.digest(CanonicalBlockFactsDigestVersion::V1))?;
 
-        let evidence = store
-            .bulk_load_blocks([Ok::<_, std::io::Error>(explorer_block_with_every_family()?)])?;
+        let evidence = store.bulk_load_blocks(
+            &testnet_activations()?,
+            [Ok::<_, std::io::Error>(explorer_block_with_every_family()?)],
+        )?;
 
         let db = &store.bounded_open.db;
         let height_key = encode_block_position(BlockHeight::new(1));
@@ -3114,7 +3234,7 @@ mod tests {
         block.facts.serialized_bytes_digest = SerializedBytesDigest::from_serialized_bytes(&[1]);
 
         let error = store
-            .bulk_load_blocks([Ok::<_, std::io::Error>(block)])
+            .bulk_load_blocks(&testnet_activations()?, [Ok::<_, std::io::Error>(block)])
             .err()
             .ok_or("an envelope digest of other facts must be rejected")?;
 
@@ -3196,7 +3316,8 @@ mod tests {
         block.block_blob = None;
         add_tree_state_checkpoint(&mut block)?;
 
-        let evidence = store.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+        let evidence =
+            store.bulk_load_blocks(&testnet_activations()?, [Ok::<_, std::io::Error>(block)])?;
 
         assert_eq!(evidence.transaction_count, 1);
         assert_eq!(evidence.transaction_location_count, 1);
@@ -3242,7 +3363,8 @@ mod tests {
             add_tree_state_checkpoint(tip)?;
         }
 
-        let evidence = store.bulk_load_blocks_with_limits(blocks, 1, 72)?;
+        let evidence =
+            store.bulk_load_blocks_with_limits(&testnet_activations()?, blocks, 1, 72)?;
 
         assert_eq!(evidence.block_hash_index_count, 3);
         assert!(evidence.sst_file_count > 7);
@@ -3277,7 +3399,7 @@ mod tests {
         ];
 
         let error = store
-            .bulk_load_blocks(blocks)
+            .bulk_load_blocks(&testnet_activations()?, blocks)
             .err()
             .ok_or("source failure must abort every family")?;
 
@@ -3306,7 +3428,10 @@ mod tests {
             [],
         ));
         let error = wallet
-            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(wallet_block)])
+            .bulk_load_blocks(
+                &testnet_activations()?,
+                vec![Ok::<_, std::io::Error>(wallet_block)],
+            )
             .err()
             .ok_or("wallet raw block must be rejected")?;
         assert!(matches!(
@@ -3334,7 +3459,10 @@ mod tests {
             },
         );
         let error = compact_store
-            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(compact_block)])
+            .bulk_load_blocks(
+                &testnet_activations()?,
+                vec![Ok::<_, std::io::Error>(compact_block)],
+            )
             .err()
             .ok_or("divergent compact payload must be rejected")?;
         assert!(matches!(
@@ -3424,7 +3552,10 @@ mod tests {
             Network::ZcashTestnet.genesis_hash().as_bytes(),
         );
         let error = missing_checkpoint_store
-            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(missing_checkpoint)])
+            .bulk_load_blocks(
+                &testnet_activations()?,
+                vec![Ok::<_, std::io::Error>(missing_checkpoint)],
+            )
             .err()
             .ok_or("tip without a tree-state checkpoint must be rejected")?;
         assert!(matches!(
@@ -3457,7 +3588,10 @@ mod tests {
                 BlockHash::from_bytes([1; 32]),
             ));
         let error = wallet_roots_store
-            .bulk_load_blocks(vec![Ok::<_, std::io::Error>(wallet_roots)])
+            .bulk_load_blocks(
+                &testnet_activations()?,
+                vec![Ok::<_, std::io::Error>(wallet_roots)],
+            )
             .err()
             .ok_or("wallet workload roots must be rejected")?;
         assert!(matches!(
@@ -3654,43 +3788,18 @@ mod tests {
         reorg_window_blocks: u32,
         build_tip_height: BlockHeight,
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
-        let activations =
-            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let activations = testnet_activations()?;
         let build_tip_byte = u8::try_from(build_tip_height.value())?;
-        let build_plan = CanonicalStoreBuildPlan::complete(
-            &activations,
-            0,
-            BlockId::new(
-                build_tip_height,
-                BlockHash::from_bytes([build_tip_byte; 32]),
-            ),
-            RawBlobRetention::Transactions,
-            CanonicalReorgPolicy::new(reorg_window_blocks)?,
-        )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             path,
             CanonicalStoreWorkload::Wallet,
-            build_plan,
+            complete_build_plan_through(build_tip_height, reorg_window_blocks)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let mut blocks = Vec::new();
-        for height in 1..=build_tip_height.value() {
-            let block_hash = u8::try_from(height)?;
-            let parent_hash = if height == 1 {
-                Network::ZcashTestnet.genesis_hash().as_bytes()
-            } else {
-                [u8::try_from(height - 1)?; 32]
-            };
-            let mut block =
-                canonical_build_block(BlockHeight::new(height), [block_hash; 32], parent_hash);
-            if height == build_tip_height.value()
-                || height.is_multiple_of(crate::TREE_STATE_CHECKPOINT_STRIDE)
-            {
-                add_tree_state_checkpoint(&mut block)?;
-            }
-            blocks.push(Ok::<_, std::io::Error>(block));
-        }
-        store.bulk_load_blocks(blocks)?;
+        store.bulk_load_blocks(
+            &activations,
+            chain_with_checkpoints(build_tip_height, |_| {})?,
+        )?;
         store.load_subtree_roots(std::iter::empty())?;
         store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             BlockId::new(
@@ -4271,6 +4380,72 @@ mod tests {
             None,
             Some(FinalNoteCommitmentRoot::from_bytes([33; 32])),
         )
+    }
+
+    /// A complete build plan whose tip at `build_tip_height` has every hash
+    /// byte equal to the height.
+    fn complete_build_plan_through(
+        build_tip_height: BlockHeight,
+        reorg_window_blocks: u32,
+    ) -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
+        let build_tip_byte = u8::try_from(build_tip_height.value())?;
+        Ok(CanonicalStoreBuildPlan::complete(
+            &testnet_activations()?,
+            0,
+            BlockId::new(
+                build_tip_height,
+                BlockHash::from_bytes([build_tip_byte; 32]),
+            ),
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(reorg_window_blocks)?,
+        )?)
+    }
+
+    fn building_store_through(
+        path: &Path,
+        build_tip_height: BlockHeight,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        Ok(RocksDbCanonicalBuilder::create_fresh(
+            path,
+            CanonicalStoreWorkload::Wallet,
+            complete_build_plan_through(build_tip_height, 100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?)
+    }
+
+    /// Blocks 1 through `build_tip_height`, each hash byte equal to its
+    /// height, with a checkpoint at every cadence height and at the tip.
+    /// `adjust` sees each block before it is returned.
+    fn chain_with_checkpoints(
+        build_tip_height: BlockHeight,
+        mut adjust: impl FnMut(&mut crate::CanonicalBuildBlock),
+    ) -> Result<Vec<Result<crate::CanonicalBuildBlock, std::io::Error>>, Box<dyn std::error::Error>>
+    {
+        let mut blocks = Vec::new();
+        for height in 1..=build_tip_height.value() {
+            let block_hash = u8::try_from(height)?;
+            let parent_hash = if height == 1 {
+                Network::ZcashTestnet.genesis_hash().as_bytes()
+            } else {
+                [u8::try_from(height - 1)?; 32]
+            };
+            let mut block =
+                canonical_build_block(BlockHeight::new(height), [block_hash; 32], parent_hash);
+            if height == build_tip_height.value()
+                || height.is_multiple_of(crate::TREE_STATE_CHECKPOINT_STRIDE)
+            {
+                add_tree_state_checkpoint(&mut block)?;
+            }
+            adjust(&mut block);
+            blocks.push(Ok(block));
+        }
+        Ok(blocks)
+    }
+
+    fn testnet_activations() -> Result<NetworkUpgradeActivations, Box<dyn std::error::Error>> {
+        Ok(crate::canonical_store::test_network_upgrade_activations(
+            Network::ZcashTestnet,
+        )?)
     }
 
     fn add_tree_state_checkpoint(

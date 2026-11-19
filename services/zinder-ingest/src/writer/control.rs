@@ -33,7 +33,9 @@ use zinder_proto::v1::ingest::{
     canonical_control_server::{CanonicalControl, CanonicalControlServer},
 };
 use zinder_proto::v1::ops;
-use zinder_runtime::{BearerToken, BearerTokenServerInterceptor, ReadinessCause, not_ready_status};
+use zinder_runtime::{
+    BearerToken, BearerTokenServerInterceptor, ComposedReadiness, ReadinessCause, not_ready_status,
+};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
@@ -1082,22 +1084,30 @@ pub struct CanonicalControlGrpcAdapter {
     handle: CanonicalControlHandle,
     checkpoint_staging_root: CanonicalCheckpointStagingRoot,
     checkpoint_admission_resource_budget: RocksDbResourceBudget,
+    writer_readiness: ComposedReadiness,
     bearer_token: Option<BearerToken>,
     checkpoint_bearer_token: Option<BearerToken>,
 }
 
 impl CanonicalControlGrpcAdapter {
     /// Creates an adapter that never opens or owns canonical storage.
+    ///
+    /// `writer_readiness` is the writer's own readiness. While its admission
+    /// reports `storage_unavailable`, as it does once ingest finds damage in
+    /// the store, `WriterStatus` is refused, so the store's readers stop
+    /// attesting their copies of it.
     #[must_use]
     pub fn new(
         handle: CanonicalControlHandle,
         checkpoint_staging_root: CanonicalCheckpointStagingRoot,
         checkpoint_admission_resource_budget: RocksDbResourceBudget,
+        writer_readiness: ComposedReadiness,
     ) -> Self {
         Self {
             handle,
             checkpoint_staging_root,
             checkpoint_admission_resource_budget,
+            writer_readiness,
             bearer_token: None,
             checkpoint_bearer_token: None,
         }
@@ -1135,6 +1145,10 @@ impl CanonicalControl for CanonicalControlGrpcAdapter {
         &self,
         _request: Request<CanonicalWriterStatusRequest>,
     ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
+        let admission = self.writer_readiness.admission_state().cause;
+        if admission == ReadinessCause::StorageUnavailable {
+            return Err(not_ready_status(&admission));
+        }
         self.handle.writer_status().await.map(Response::new)
     }
 
@@ -1887,6 +1901,7 @@ pub(crate) mod test_support {
                 handle,
                 CanonicalCheckpointStagingRoot::new(checkpoint_staging_root),
                 RocksDbResourceBudget::for_local_tests(),
+                ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]),
             )
             .with_bearer_token(Some(bearer_token))
             .with_checkpoint_bearer_token(Some(checkpoint_bearer_token));
@@ -1944,6 +1959,55 @@ pub(crate) mod test_support {
 
         cancel.cancel();
         server_task.await?;
+        command_task.abort();
+        Ok(())
+    }
+
+    /// Damage found in the store withdraws the writer's attestation, so the
+    /// store's readers stop serving it once their staleness ceiling passes.
+    #[tokio::test]
+    async fn writer_status_is_refused_while_the_writer_reports_store_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tonic_types::StatusExt as _;
+
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (handle, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let writer_readiness = ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]);
+        let adapter = CanonicalControlGrpcAdapter::new(
+            handle,
+            CanonicalCheckpointStagingRoot::new(temporary.path().to_path_buf()),
+            RocksDbResourceBudget::for_local_tests(),
+            writer_readiness.clone(),
+        );
+        let attested = adapter
+            .writer_status(Request::new(CanonicalWriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(attested.fence.map(|fence| fence.event_sequence), Some(1));
+
+        writer_readiness.park_admission(zinder_runtime::ReadinessState::not_ready(
+            ReadinessCause::StorageUnavailable,
+        ));
+        let refused = adapter
+            .writer_status(Request::new(CanonicalWriterStatusRequest {}))
+            .await
+            .err()
+            .ok_or("a writer with a damaged store must refuse writer status")?;
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            refused
+                .get_error_details()
+                .error_info()
+                .and_then(|info| info.metadata.get("readiness_cause").cloned()),
+            Some("storage_unavailable".to_owned())
+        );
         command_task.abort();
         Ok(())
     }
@@ -3023,7 +3087,7 @@ pub(crate) mod test_support {
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks([Ok::<_, std::io::Error>(fixture_block())])?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::io::Error>(fixture_block())])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
             tip,

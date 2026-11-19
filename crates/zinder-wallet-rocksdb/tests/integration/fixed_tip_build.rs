@@ -1528,7 +1528,7 @@ fn build_ready_canonical_store(
         .enumerate()
         .map(|(index, facts)| canonical_build_block(facts.clone(), index == 2))
         .map(Ok::<_, std::io::Error>);
-    builder.bulk_load_blocks(build_blocks)?;
+    builder.bulk_load_blocks(&inactive_upgrade_activations()?, build_blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
     let tip_checkpoint = CommitmentTreeCheckpoint::new(tip, 3, CommitmentTreeFrontiers::default());
     builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
@@ -1568,7 +1568,7 @@ fn build_ready_checkpointed_canonical_store(
         .enumerate()
         .map(|(index, facts)| canonical_build_block(facts.clone(), index == last_index))
         .map(Ok::<_, std::io::Error>);
-    builder.bulk_load_blocks(build_blocks)?;
+    builder.bulk_load_blocks(&inactive_upgrade_activations()?, build_blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
     let tip_checkpoint =
         CommitmentTreeCheckpoint::new(tip, tip.height.value(), CommitmentTreeFrontiers::default());

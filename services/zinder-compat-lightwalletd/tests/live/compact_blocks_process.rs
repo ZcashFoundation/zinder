@@ -869,6 +869,7 @@ fn build_reorg_process_primary(
         RocksDbResourceBudget::for_local_tests(),
     )?;
     builder.bulk_load_blocks(
+        activations,
         canonical_build_blocks(&baseline_chain, activations)?
             .into_iter()
             .map(Ok::<_, std::convert::Infallible>),

@@ -30,9 +30,17 @@ use zinder_testkit::{
 
 use crate::common::{serving_query_after_live_append, serving_query_from, serving_query_over};
 
-/// Tree-state payload the release store derives from a checkpoint whose
-/// commitment-tree frontiers are all empty.
-const EMPTY_FRONTIER_TREE_STATE_PAYLOAD: &[u8] = b"{}";
+/// Tree-state payload at height 1 of the Regtest fixture, where only Sapling
+/// is active and its tree is empty.
+const EMPTY_SAPLING_TREE_STATE_PAYLOAD: &[u8] =
+    br#"{"sapling":{"commitments":{"finalState":"000000"}}}"#;
+/// Tree-state payload at height 2 of the Regtest fixture, where Sapling and
+/// Orchard are active and both trees are empty.
+const EMPTY_SAPLING_AND_ORCHARD_TREE_STATE_PAYLOAD: &[u8] = concat!(
+    r#"{"orchard":{"commitments":{"finalState":"000000"}},"#,
+    r#""sapling":{"commitments":{"finalState":"000000"}}}"#,
+)
+.as_bytes();
 
 #[tokio::test]
 async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
@@ -265,7 +273,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     );
     assert_eq!(
         decoded_response.payload_bytes,
-        EMPTY_FRONTIER_TREE_STATE_PAYLOAD
+        EMPTY_SAPLING_TREE_STATE_PAYLOAD
     );
 
     Ok(())
@@ -290,7 +298,7 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
     );
     assert_eq!(
         decoded_response.payload_bytes,
-        EMPTY_FRONTIER_TREE_STATE_PAYLOAD
+        EMPTY_SAPLING_AND_ORCHARD_TREE_STATE_PAYLOAD
     );
 
     Ok(())

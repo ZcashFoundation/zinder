@@ -2761,9 +2761,12 @@ mod tests {
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        canonical_builder.bulk_load_blocks([Ok::<_, std::io::Error>(checkpointed_build_block(
-            100, [0x99; 32], [0xa0; 32], true,
-        ))])?;
+        canonical_builder.bulk_load_blocks(
+            &activations,
+            [Ok::<_, std::io::Error>(checkpointed_build_block(
+                100, [0x99; 32], [0xa0; 32], true,
+            ))],
+        )?;
         canonical_builder.load_subtree_roots(std::iter::empty())?;
         canonical_builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             checkpoint_block,

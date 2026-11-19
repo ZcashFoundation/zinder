@@ -36,6 +36,7 @@ use zinder_store::{
 };
 
 use crate::{
+    background_pass::{BackgroundSecondary, write_progress_record},
     runtime_config::{
         HistoricalWorkGate, sleep_or_cancel, wait_until_historical_work_or_cancelled,
     },
@@ -60,9 +61,6 @@ pub const DEFAULT_TREE_STATE_COMMITMENT_BUDGET: u32 = 1_024;
 const CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_mins(5);
 /// How long the pass waits before retrying after a store or writer error.
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
-/// How often the pass reopens its canonical secondary when no store is
-/// published yet.
-const OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// File, inside the canonical store directory, in which the pass records its
 /// progress.
 pub const TREE_STATE_DENSIFICATION_WATERMARK_FILE: &str = "tree-state-densification-watermark.json";
@@ -208,7 +206,22 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         );
         return;
     }
-    let Some(secondary) = open_secondary_when_published(&context, &cancel).await else {
+    let Some(secondary) = BackgroundSecondary {
+        canonical_primary_path: &context.canonical_primary_path,
+        secondary_path: &context.secondary_path,
+        network_upgrade_activations: &context.network_upgrade_activations,
+        workload: context.workload,
+        raw_blob_retention: context.raw_blob_retention,
+        reorg_policy: context.reorg_policy,
+        resource_budget: context.resource_budget,
+    }
+    .open_when_published(
+        &context.gate,
+        &cancel,
+        "tree_state_densification_secondary_unavailable",
+    )
+    .await
+    else {
         return;
     };
     tracing::info!(
@@ -246,61 +259,6 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         };
         if sleep_or_cancel(pause, &cancel).await {
             return;
-        }
-    }
-}
-
-async fn open_secondary_when_published<Writer: TreeStateStrideWriter>(
-    context: &TreeStateDensificationContext<Writer>,
-    cancel: &CancellationToken,
-) -> Option<RocksDbCanonicalSecondary> {
-    let mut waiting_logged = false;
-    loop {
-        // Opening catches the secondary up and admits the store, which reads
-        // retained history, so it waits for the gate and runs off the async
-        // workers live ingest uses.
-        if wait_until_historical_work_or_cancelled(&context.gate, cancel).await {
-            return None;
-        }
-        let primary_path = context.canonical_primary_path.clone();
-        let secondary_path = context.secondary_path.clone();
-        let activations = Arc::clone(&context.network_upgrade_activations);
-        let (workload, raw_blob_retention, reorg_policy, resource_budget) = (
-            context.workload,
-            context.raw_blob_retention,
-            context.reorg_policy,
-            context.resource_budget,
-        );
-        let opened = tokio::task::spawn_blocking(move || {
-            RocksDbCanonicalSecondary::open_ready(
-                primary_path,
-                secondary_path,
-                &activations,
-                workload,
-                raw_blob_retention,
-                reorg_policy,
-                resource_budget,
-            )
-            .map_err(|error| error.to_string())
-        })
-        .await
-        .unwrap_or_else(|error| Err(error.to_string()));
-        match opened {
-            Ok(secondary) => return Some(secondary),
-            Err(error) if !waiting_logged => {
-                waiting_logged = true;
-                tracing::info!(
-                    target: "zinder::ingest",
-                    event = "tree_state_densification_secondary_unavailable",
-                    error = %error,
-                    retry_interval_seconds = OPEN_RETRY_INTERVAL.as_secs(),
-                    "waiting for a published canonical store before densifying tree states"
-                );
-            }
-            Err(_) => {}
-        }
-        if sleep_or_cancel(OPEN_RETRY_INTERVAL, cancel).await {
-            return None;
         }
     }
 }
@@ -777,27 +735,19 @@ impl WatermarkFile {
 
     /// Replaces the file atomically with `height`.
     fn write(&self, height: BlockHeight) -> std::io::Result<()> {
-        use std::io::Write as _;
         let Some((selection, commitment_budget)) = self.selection_fields() else {
             return Ok(());
         };
-        let record = WatermarkRecord {
-            version: WATERMARK_VERSION,
-            construction_manifest_sha256: self.construction_manifest_sha256.clone(),
-            selection,
-            commitment_budget,
-            through_height: height.value(),
-        };
-        let encoded = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-        let staged = self.path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        std::fs::rename(&staged, &self.path)?;
-        if let Some(directory) = self.path.parent() {
-            std::fs::File::open(directory)?.sync_all()?;
-        }
-        Ok(())
+        write_progress_record(
+            &self.path,
+            &WatermarkRecord {
+                version: WATERMARK_VERSION,
+                construction_manifest_sha256: self.construction_manifest_sha256.clone(),
+                selection,
+                commitment_budget,
+                through_height: height.value(),
+            },
+        )
     }
 }
 

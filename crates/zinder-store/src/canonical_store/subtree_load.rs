@@ -1129,7 +1129,10 @@ mod tests {
             BUILD_TIP.height.value(),
             tip_frontiers,
         ));
-        builder.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok::<_, std::io::Error>(tip)])?;
+        builder.bulk_load_blocks(
+            &activations,
+            [Ok::<_, std::io::Error>(first), Ok::<_, std::io::Error>(tip)],
+        )?;
         Ok(builder)
     }
 

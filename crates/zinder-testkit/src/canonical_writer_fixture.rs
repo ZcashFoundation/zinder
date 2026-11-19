@@ -51,7 +51,6 @@ pub struct CanonicalBaseline<'chain> {
     history_floor: Option<BlockHeight>,
     settled_tip_height: Option<BlockHeight>,
     subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
-    checkpoint_frontiers: CheckpointFrontiers,
 }
 
 impl<'chain> CanonicalBaseline<'chain> {
@@ -64,7 +63,6 @@ impl<'chain> CanonicalBaseline<'chain> {
             history_floor: None,
             settled_tip_height: None,
             subtree_roots: Vec::new(),
-            checkpoint_frontiers: CheckpointFrontiers::ActivePools,
         }
     }
 
@@ -104,26 +102,6 @@ impl<'chain> CanonicalBaseline<'chain> {
         self.subtree_roots.push(subtree_root);
         self
     }
-
-    /// Omits the frontier of every pool whose tree is still empty from each
-    /// checkpoint, which a cold baseline publication accepts.
-    ///
-    /// Live following cannot seed from such a checkpoint, so a writer built
-    /// this way only serves its baseline.
-    #[must_use]
-    pub(crate) const fn omitting_empty_frontiers(mut self) -> Self {
-        self.checkpoint_frontiers = CheckpointFrontiers::NonEmptyPools;
-        self
-    }
-}
-
-/// Pools whose frontier a fixture checkpoint carries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CheckpointFrontiers {
-    /// Every pool active at the checkpoint height, as live following requires.
-    ActivePools,
-    /// Only pools with at least one note commitment.
-    NonEmptyPools,
 }
 
 /// A READY production canonical primary built from [`ChainFixture`] blocks.
@@ -185,14 +163,16 @@ impl CanonicalWriterFixture {
             BaselineRange {
                 first_height: first_retained_height,
                 tip_height,
-                checkpoint_frontiers: baseline.checkpoint_frontiers,
             },
         )?;
         let tip_checkpoint = blocks
             .last()
             .and_then(|block| block.tree_state_checkpoint.clone())
             .ok_or_else(|| eyre!("the baseline tip must carry a tree-state checkpoint"))?;
-        builder.bulk_load_blocks(blocks.into_iter().map(Ok::<_, Infallible>))?;
+        builder.bulk_load_blocks(
+            network_upgrade_activations,
+            blocks.into_iter().map(Ok::<_, Infallible>),
+        )?;
         builder.load_subtree_roots(baseline.subtree_roots.iter().copied())?;
         builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -413,7 +393,6 @@ impl CanonicalWriterFixture {
 struct BaselineRange {
     first_height: BlockHeight,
     tip_height: BlockHeight,
-    checkpoint_frontiers: CheckpointFrontiers,
 }
 
 /// Builds the plan for `baseline` and advances `trees` through its predecessor.
@@ -450,7 +429,7 @@ fn baseline_build_plan(
     let predecessor = CommitmentTreeCheckpoint::new(
         BlockId::new(floor_height, floor_block.hash),
         floor_block.block_time_seconds,
-        trees.frontiers(CheckpointFrontiers::ActivePools)?,
+        trees.frontiers()?,
     );
     let build_plan = CanonicalStoreBuildPlan::checkpointed(
         trees.activations,
@@ -477,9 +456,7 @@ fn baseline_blocks(
             trees.apply_cold(&artifacts.chain, height, artifacts.compact_block(height)?)?;
         let checkpoint_required = height == range.tip_height
             || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
-        let checkpoint_frontiers = checkpoint_required
-            .then(|| trees.frontiers(range.checkpoint_frontiers))
-            .transpose()?;
+        let checkpoint_frontiers = checkpoint_required.then(|| trees.frontiers()).transpose()?;
         blocks.push(artifacts.build_block(height, tip_metadata, checkpoint_frontiers)?);
     }
     Ok(blocks)
@@ -538,7 +515,7 @@ impl FixtureChainArtifacts {
         trees: &mut FixtureCommitmentTrees<'_>,
     ) -> eyre::Result<CanonicalBuildBlock> {
         let tip_metadata = trees.apply_live(&self.chain, height, self.compact_block(height)?)?;
-        let frontiers = trees.frontiers(CheckpointFrontiers::ActivePools)?;
+        let frontiers = trees.frontiers()?;
         self.build_block(height, tip_metadata, Some(frontiers))
     }
 
@@ -717,29 +694,12 @@ impl<'activations> FixtureCommitmentTrees<'activations> {
             })
     }
 
-    fn frontiers(
-        &mut self,
-        presence: CheckpointFrontiers,
-    ) -> eyre::Result<CommitmentTreeFrontiers> {
-        let frontiers = self
-            .accumulator
+    /// Returns the frontiers of every pool active at the current height,
+    /// as the production loader requires of each checkpoint.
+    fn frontiers(&mut self) -> eyre::Result<CommitmentTreeFrontiers> {
+        self.accumulator
             .validated_frontiers()
-            .map_err(|source| eyre!("fixture commitment trees cannot be checkpointed: {source}"))?;
-        Ok(match presence {
-            CheckpointFrontiers::ActivePools => frontiers,
-            CheckpointFrontiers::NonEmptyPools => {
-                let non_empty = |frontier: Option<&zinder_core::CommitmentTreeFrontier>| {
-                    frontier
-                        .filter(|frontier| frontier.tree_size() > 0)
-                        .cloned()
-                };
-                CommitmentTreeFrontiers::from_validated_parts(
-                    non_empty(frontiers.sapling()),
-                    non_empty(frontiers.orchard()),
-                    non_empty(frontiers.ironwood()),
-                )?
-            }
-        })
+            .map_err(|source| eyre!("fixture commitment trees cannot be checkpointed: {source}"))
     }
 }
 

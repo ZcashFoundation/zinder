@@ -1696,6 +1696,32 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 500.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_VERIFICATION__ENABLED",
+        toml_path: "ingest.tree_state_verification.enabled",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Whether ingest verifies its stored tree-state checkpoints in the \
+                      background, in repeated cycles over every settled row: each row must \
+                      derive the roots stored in it and carry a frontier for exactly the \
+                      pools active at its height. A row that fails withdraws ingest \
+                      readiness with `storage_unavailable` until the store is rebuilt. \
+                      Defaults to `true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_VERIFICATION__MAX_ROWS_PER_SECOND",
+        toml_path: "ingest.tree_state_verification.max_rows_per_second",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Average ceiling on stored tree-state checkpoint rows the verification \
+                      pass checks per second, which sets both its cost and how long one \
+                      cycle over settled history takes. A row with three pools costs about \
+                      4.3 ms of CPU, so the default holds the pass near a tenth of one CPU \
+                      and verifies about 2.2 million rows a day. Must be greater than zero. \
+                      Defaults to 25.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",
         toml_path: "ingest.run_overrides.target_height",
         used_by: &["zinder-ingest"],

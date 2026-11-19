@@ -93,8 +93,10 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(second_ranged_block.height, 2);
     assert!(compact_blocks.next().await.is_none());
     assert_eq!(tree_state.height, 2);
-    assert_eq!(tree_state.sapling_tree, "");
-    assert_eq!(tree_state.orchard_tree, "");
+    // Both pools are active and empty at the tip, which the node encodes as
+    // an empty tree rather than an absent one.
+    assert_eq!(tree_state.sapling_tree, "000000");
+    assert_eq!(tree_state.orchard_tree, "000000");
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, visible_tip_block.height);

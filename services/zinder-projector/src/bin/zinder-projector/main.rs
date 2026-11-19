@@ -2538,7 +2538,7 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::convert::Infallible>(block_one)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,
@@ -3381,7 +3381,7 @@ mod tests {
             )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::convert::Infallible>(block_one)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,

@@ -103,8 +103,8 @@ such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 | `zinder-compat-cipherscan` | `network`, `cipherscan`, `ops`, `security` |
 
 `[ingest]` has the subsections `construction`, `follow`, `mempool`,
-`phase_classification`, and `run_overrides`. `[projector]` has `build` and
-`follow`.
+`phase_classification`, `run_overrides`, `tree_state_densification`, and
+`tree_state_verification`. `[projector]` has `build` and `follow`.
 
 ### The node sections
 
@@ -287,6 +287,8 @@ not check descriptions or defaults.
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET` | zinder-ingest | Optional | `ingest.tree_state_densification.commitment_budget` | Note commitments, over every pool, between two stored tree-state checkpoints under the `commitment-budget` selection, which setting it selects when `selection` is unset. Must be greater than zero and is refused with `selection = "every-block"`. Defaults to 1024. |
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__WORKERS` | zinder-ingest | Optional | `ingest.tree_state_densification.workers` | Settled 100-block strides densified at once, each on one CPU. Must be greater than zero. Defaults to 2. |
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__MAX_BLOCKS_PER_SECOND` | zinder-ingest | Optional | `ingest.tree_state_densification.max_blocks_per_second` | Average ceiling on stored blocks the tree-state densification pass replays per second, with a scan charged one block for every two reads it makes, counting each checkpoint row it visits and each compact block it reads as one read. Each block costs about two reads and adds at most one row, so this bounds the pass's reads and writes. Must be greater than zero. Defaults to 500. |
+| `ZINDER_INGEST__TREE_STATE_VERIFICATION__ENABLED` | zinder-ingest | Optional | `ingest.tree_state_verification.enabled` | Whether ingest verifies its stored tree-state checkpoints in the background, in repeated cycles over every settled row: each row must derive the roots stored in it and carry a frontier for exactly the pools active at its height. A row that fails withdraws ingest readiness with `storage_unavailable` until the store is rebuilt. Defaults to `true`. |
+| `ZINDER_INGEST__TREE_STATE_VERIFICATION__MAX_ROWS_PER_SECOND` | zinder-ingest | Optional | `ingest.tree_state_verification.max_rows_per_second` | Average ceiling on stored tree-state checkpoint rows the verification pass checks per second, which sets both its cost and how long one cycle over settled history takes. A row with three pools costs about 4.3 ms of CPU, so the default holds the pass near a tenth of one CPU and verifies about 2.2 million rows a day. Must be greater than zero. Defaults to 25. |
 | `ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT` | zinder-ingest | Optional | `ingest.run_overrides.target_height` | One-shot stop-at modifier; the loop exits 0 after committing this height. |
 | `ZINDER_INGEST__RUN_OVERRIDES__CHECKPOINT_HEIGHT` | zinder-ingest | Optional | `ingest.run_overrides.checkpoint_height` | Construct an empty store from an upstream-supplied checkpoint at this height. |
 | `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE` | zinder-ingest | Optional | `ingest.run_overrides.coverage` | Ingest coverage mode: `"explicit"` or `"wallet-serving"`. Defaults to `"explicit"`. |

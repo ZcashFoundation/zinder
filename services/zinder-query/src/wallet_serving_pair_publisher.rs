@@ -7724,7 +7724,7 @@ mod tests {
             )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks(blocks.into_iter().map(Ok::<_, std::io::Error>))?;
+        builder.bulk_load_blocks(activations, blocks.into_iter().map(Ok::<_, std::io::Error>))?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             tip,

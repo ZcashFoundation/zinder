@@ -60,7 +60,10 @@ newest blocks one at a time, as in
 
 Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
 them in order. It rebuilds the note commitment trees from the blocks and stores
-a tree-state checkpoint every 100 blocks and at the build tip.
+a tree-state checkpoint every 100 blocks and at the build tip. The loader
+refuses a checkpoint that does not carry a frontier for exactly the pools the
+node's activation table makes active at its height, including a pool whose
+tree is still empty.
 
 Before publishing, construction compares its derived tree state at the build
 tip, and every subtree root the loaded blocks complete, with the node's. A
@@ -206,8 +209,9 @@ the selected checkpoints; otherwise it ignores the file, logs
 `tree_state_densification_watermark_discarded`, and scans from the start, as
 it does after a change of selection. The file is written only after the
 commits it covers are durable. Only the stride that ends at the recorded
-height is checked again on start, so damage below it is not looked for again;
-a read there serves its stored row as written, as every stored read does
+height is checked again on start, so the pass does not look for damage below
+it; the [verification pass](#tree-state-verification) does. A read there
+serves its stored row as written, as every stored read does
 ([Wallet data plane](wallet-data-plane.md#tree-states-and-subtree-roots)). A
 missing densification row only makes that read replay, but a missing cadence
 checkpoint is store damage: a read at its height is refused, as is any read
@@ -230,6 +234,80 @@ repeated failures stay within the configured rate. Progress is reported by the
 `zinder_ingest_tree_state_densification_*` metrics in
 [Metrics](../reference/metrics.md). A canonical rebuild returns history to the
 100-block cadence until the pass runs again.
+
+### Tree-state verification
+
+A stored tree-state read serves its row after checking only the row's
+framing, so a row rests on the checks made when it was written and on
+RocksDB block checksums. A second background pass checks every settled row
+again, as a writer checks a row it stores:
+
+- Each frontier parses with the official Zcash codec and is its canonical
+  encoding.
+- Each frontier derives the root stored beside it.
+- The row carries a frontier for exactly the pools active at its height, even
+  when a pool's tree is still empty.
+
+The pass starts when densification does: once ingest follows the tip, and
+Explorer views have caught up when they are enabled. It reads through its own
+canonical secondary and writes nothing to the store, so it runs without
+`ingest_control.listen_addr`.
+
+The pass works in cycles. A cycle checks every row from the history
+predecessor through the settled tip, including rows that densification or
+live following added since the previous cycle. The next cycle starts 5
+minutes after one ends. A row above the settled tip is checked in the first
+cycle that starts after the tip passes it.
+
+`ingest.tree_state_verification.max_rows_per_second` (25 by default) bounds
+how many rows the pass checks per second, on average. The pass reads 100 rows
+at a time and then waits until it is back under that rate. A row with three
+pools costs about 4.3 ms of CPU to check, so the default holds the pass near a
+tenth of one CPU and checks about 2.2 million rows a day. The rate also sets
+the detection bound: a damaged row is found within one cycle after it is
+written or damaged, and a cycle takes the settled row count divided by the
+rate, plus 5 minutes. A Mainnet store with a row for each of about 3.5 million
+blocks takes an estimated 39 hours per cycle at the default rate.
+
+The pass records the height its current cycle continues from in
+`tree-state-verification-watermark.json` inside the canonical store
+directory, together with the store's construction manifest digest. It writes
+the file at most once a minute and at the end of each cycle, so a restart
+checks again at most a minute of rows. When ingest starts, the pass resumes at
+that height if the file names this store. Otherwise it logs
+`tree_state_verification_watermark_discarded` and starts a new cycle.
+
+A row that fails a check is store damage. The pass then does four things:
+
+1. It logs `tree_state_verification_mismatch` with the row's height, the pool
+   whose frontier failed (`sapling`, `orchard`, `ironwood`, or `none` when the
+   row fails outside any frontier), and the check that failed.
+2. It counts the row in
+   `zinder_ingest_tree_state_verification_mismatches_total`.
+3. It withdraws ingest readiness with `storage_unavailable`. Ingest stays
+   not ready until it stops.
+4. It records the damaged row's height as its progress and stops, so the next
+   start finds the row again at once.
+
+The writer keeps following the tip. While ingest reports `storage_unavailable`,
+it refuses `CanonicalControl.WriterStatus`, so no reader attests the store
+again. Wallet-serving readers, and compatibility in compact-blocks mode, keep
+serving the pair the writer last attested until
+`storage.serving_pair_staleness_ceiling_ms` passes, and then refuse traffic
+with `writer_status_unavailable`. The projector stops converging for the same
+reason. Rebuild the canonical store, as
+[Recovery](service-operations.md#recovery) describes.
+
+The pass checks each row on its own and does not replay blocks. It cannot see
+two kinds of damage:
+
+- A row that holds valid trees of another height.
+- An Orchard frontier stored in the Ironwood position with its own root, or
+  the reverse, because both pools hash alike.
+
+The write-time checks prevent those. Live following compares each row with
+the node's tree state, and densification replays each stride before it writes
+rows.
 
 ## Node endpoint failover
 
