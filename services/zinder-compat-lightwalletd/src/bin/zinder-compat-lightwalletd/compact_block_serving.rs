@@ -2403,7 +2403,7 @@ mod tests {
             catchup_interval: Duration::from_millis(1),
             convergence_timeout: Duration::from_secs(2),
             convergence_attempts: 4,
-            staleness_ceiling: Duration::from_millis(50),
+            staleness_ceiling: Duration::from_mins(1),
             lag_threshold: 0,
         };
         let (mut publisher, slot) =
@@ -2476,8 +2476,21 @@ mod tests {
             readiness.report().cause.metric_label(),
             "serving_pair_stale"
         );
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // A writer that has not confirmed its tip withdraws the staleness
+        // allowance, as passing the ceiling does. The allowance is withdrawn
+        // by status rather than by sleeping past a short ceiling, so a loaded
+        // machine cannot expire it before the assertions above read it. The
+        // ceiling itself is covered by
+        // `a_writer_that_never_answers_its_status_reaches_the_staleness_ceiling`.
         control.set_available(true);
+        let mut unconfirmed = lifecycle_writer_status(&primary);
+        unconfirmed.tip_unconfirmed = true;
+        control.set_writer_status(unconfirmed);
+        publisher.refresh().await;
+        assert_eq!(
+            readiness.report().cause.metric_label(),
+            "canonical_tip_unconfirmed"
+        );
         control.set_writer_status(lifecycle_writer_status(&primary));
         publisher.refresh().await;
         assert_eq!(readiness.report().cause.metric_label(), "replica_lagging");

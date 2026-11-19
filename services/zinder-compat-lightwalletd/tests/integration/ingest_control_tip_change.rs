@@ -33,7 +33,6 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
 const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(
@@ -50,7 +49,7 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
     let cancel = CancellationToken::new();
     let writer_readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let (canonical, commands) = canonical_control_channel();
-    let writer = tokio::spawn(
+    let mut writer = tokio::spawn(
         CanonicalWriterTask {
             source: source.clone(),
             activations: activations.clone(),
@@ -61,9 +60,16 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
         }
         .run(),
     );
-    let writer_status = tokio::time::timeout(TEST_TIMEOUT, canonical.writer_status())
-        .await
-        .map_err(|_| eyre::eyre!("canonical writer did not begin serving control requests"))?;
+    // Each wait below ends on the condition it needs or on the task that
+    // would satisfy it stopping. A machine too loaded to finish is bounded by
+    // the nextest slow-timeout, not by a wall-clock guess in the test.
+    let writer_status = tokio::select! {
+        writer_status = canonical.writer_status() => writer_status,
+        writer_outcome = &mut writer => return match writer_outcome? {
+            Ok(()) => Err(eyre::eyre!("canonical writer stopped before serving control requests")),
+            Err(writer_error) => Err(writer_error.into()),
+        },
+    };
     let initial_event_sequence = match writer_status {
         Ok(status) => {
             status
@@ -89,7 +95,7 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
         writer_readiness,
     );
     let server_cancel = cancel.clone();
-    let server = tokio::spawn(async move {
+    let mut server = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter.into_server())
             .serve_with_incoming_shutdown(
@@ -98,7 +104,7 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
             )
             .await
     });
-    wait_for_ingest_control(&endpoint).await?;
+    wait_for_ingest_control(&endpoint, &mut server).await?;
     let (watcher, publisher) =
         spawn_ingest_control_tip_change_publisher(endpoint, None, cancel.clone());
     let (waiting_sender, waiting_receiver) = oneshot::channel();
@@ -109,19 +115,15 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
             .await
     });
     waiting_receiver.await?;
-    let mut observed_height = None;
-    for height_value in 3..=10 {
-        source.set_tip_height(BlockHeight::new(height_value));
-        if let Ok(waiting_result) =
-            tokio::time::timeout(Duration::from_millis(500), &mut waiting).await
-        {
-            waiting_result??;
-            observed_height = Some(height_value);
-            break;
+    let observed_height = 3;
+    source.set_tip_height(BlockHeight::new(observed_height));
+    tokio::select! {
+        waiting_result = &mut waiting => waiting_result??,
+        writer_outcome = &mut writer => {
+            writer_outcome??;
+            return Err(eyre::eyre!("canonical writer stopped before the tip-change watcher observed an event"));
         }
     }
-    let observed_height = observed_height
-        .ok_or_else(|| eyre::eyre!("tip-change watcher did not observe a canonical event"))?;
     let status = canonical.writer_status().await?;
     let writer_fence = status
         .fence
@@ -183,8 +185,11 @@ impl CanonicalWriterTask {
     }
 }
 
-async fn wait_for_ingest_control(endpoint: &str) -> eyre::Result<()> {
-    tokio::time::timeout(TEST_TIMEOUT, async {
+async fn wait_for_ingest_control(
+    endpoint: &str,
+    server: &mut tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) -> eyre::Result<()> {
+    let ready = async {
         loop {
             if let Ok(mut client) = IngestControlClient::connect(endpoint.to_owned()).await
                 && client.writer_status(WriterStatusRequest {}).await.is_ok()
@@ -193,10 +198,14 @@ async fn wait_for_ingest_control(endpoint: &str) -> eyre::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .map_err(|_| eyre::eyre!("ingest-control endpoint did not become ready"))?;
-    Ok(())
+    };
+    tokio::select! {
+        () = ready => Ok(()),
+        server_outcome = server => {
+            server_outcome??;
+            Err(eyre::eyre!("ingest-control server stopped before it became ready"))
+        }
+    }
 }
 
 #[derive(Clone)]
