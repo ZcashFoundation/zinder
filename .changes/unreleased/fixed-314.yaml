@@ -1,6 +1,0 @@
-kind: fixed
-body: Zinder's gRPC clients now negotiate TLS when a configured endpoint uses `https://`, such as the ingest-control address `zinder-compat-lightwalletd` and `zinder-projector` dial, or the wallet-query and explorer endpoints `zinder-explorer` and `zinder-compat-cipherscan` dial. Previously such an address opened a plaintext connection and could not reach a TLS server. `http://` endpoints are unchanged.
-time: 2026-11-19T03:22:05.068454959Z
-custom:
-    Bump: patch
-    PR: "314"

@@ -1,6 +1,0 @@
-kind: changed
-body: lightwalletd `GetLightdInfo.estimatedHeight` now reports the network height estimated from the served tip, as Zebra does, instead of the served tip itself. When the served tip is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`, 25 minutes by default, 0 disables) and the writer cannot confirm it as its node's tip, because the node is unreachable, ahead of the writer, or shown behind by its peers, `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale chain. A quiet chain's tip that the node still reports keeps answering, and every other call keeps serving stored data. Refusals are counted in `zinder_compat_stale_tip_refusals_total`.
-time: 2026-11-19T03:22:05.659242961Z
-custom:
-    Bump: minor
-    PR: "318"
