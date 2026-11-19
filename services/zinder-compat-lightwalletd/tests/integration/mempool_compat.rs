@@ -206,7 +206,7 @@ async fn lightwalletd_get_mempool_tx_uniquely_excludes_match_with_other_match_ou
         .await?
         .into_inner();
     let collected = collect_compact_txids(response).await?;
-    assert!(collected.is_empty());
+    assert_eq!(collected, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

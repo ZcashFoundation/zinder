@@ -3,8 +3,8 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 generated_dir="$repository_root/crates/zinder-proto/generated"
-buf_version="1.68.2"
-protoc_version="29.3"
+buf_version="1.75.0"
+protoc_version="36.2"
 mode="${1:---check}"
 
 case "$mode" in

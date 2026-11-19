@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn empty_filter_decodes_to_empty_vec() -> Result<(), QueryError> {
         let filter = decode_address_filter(Vec::new(), Network::ZcashRegtest)?;
-        assert!(filter.is_empty());
+        assert_eq!(filter, [] as [zinder_core::TransparentAddressScriptHash; 0]);
         Ok(())
     }
 

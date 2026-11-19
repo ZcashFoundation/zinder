@@ -147,8 +147,8 @@ whether compact blocks can carry transparent inputs and outputs.
 
 Zebra labels its whole lightwalletd gRPC listener experimental.[^zebra-lwd-exp]
 ztreamer serves the same methods in both modes. In its default `wallet` serving
-mode, Zinder serves every method except `GetStandardFee`, which its vendored
-protocol lacks, and answers `Ping` only with `compat.ping_very_insecure`.
+mode, Zinder serves every method except `GetStandardFee` (which returns
+`UNIMPLEMENTED`), and answers `Ping` only with `compat.ping_very_insecure`.
 [Runtime serving selection](lightwalletd-compatibility.md#runtime-serving-selection)
 describes Zinder's narrower `compact-blocks` mode.
 
@@ -447,7 +447,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-ping]: Needs `compat.ping_very_insecure = true` or `--ping-very-insecure`, which Zinder says to enable only on a server under load testing, and otherwise both serving modes refuse `Ping` with `FAILED_PRECONDITION` ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L162-L175), [main.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-compat-lightwalletd/src/bin/zinder-compat-lightwalletd/main.rs#L101-L103)).
 
-[^zinder-standard-fee]: Zinder vendors lightwalletd protocol v0.5.0, whose `service.proto` has no `GetStandardFee` method ([VERSION](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/crates/zinder-proto/proto/compat/lightwalletd/VERSION), [service.proto](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/crates/zinder-proto/proto/compat/lightwalletd/service.proto)).
+[^zinder-standard-fee]: Zinder vendors `lightwallet-protocol` v0.6.0 and returns `UNIMPLEMENTED` from `GetStandardFee` as specified for backends without a `getstandardfee` estimator ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#methods-served)).
 
 [^transparent-pool]: In `GetBlockRange`, only when the request names the transparent pool type, while Zingod's `GetBlock` always includes it and ztreamer fetches each full block from its validator ([ztreamer](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/service/src/compact/blocks/mod.rs#L92-L137), [Zingod](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/book/src/wallets/methods.md#L25-L26), [Go lightwalletd](https://github.com/zcash/lightwalletd/blob/faaf7aa1f917f41ad41def61d7095330078c8a8d/common/common.go#L617-L668), [Zinder](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L194-L204)).
 

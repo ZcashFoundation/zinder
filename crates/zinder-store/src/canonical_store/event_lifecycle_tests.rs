@@ -37,7 +37,7 @@ fn wallet_event_history_returns_bounded_pages_that_resume_after_the_last_cursor(
         ChainEventStreamFamily::Visible,
         2,
     )?;
-    assert!(quiet_page.is_empty());
+    assert_eq!(quiet_page, []);
     Ok(())
 }
 
@@ -139,14 +139,14 @@ fn live_tail_start_skips_prior_events_and_delivers_later_commits()
     let head_cursor = resume
         .cursor
         .ok_or("live tail over retained events must mint a head cursor")?;
-    assert!(
+    assert_eq!(
         wallet_history(
             &secondary,
             Some(&head_cursor),
             ChainEventStreamFamily::Visible,
             10
-        )?
-        .is_empty()
+        )?,
+        []
     );
 
     let _store = append_block(store, &activations, 6, BlockHeight::new(4), 3)?;

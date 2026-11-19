@@ -923,8 +923,8 @@ mod tests {
         let empty_digest: [u8; 32] = digest.finalize().into();
 
         for files in [writer_files, sorter_files] {
-            assert!(files.paths.is_empty());
-            assert!(files.files.is_empty());
+            assert_eq!(files.paths, [] as [std::path::PathBuf; 0]);
+            assert_eq!(files.files, []);
             assert_eq!(files.file_bytes, 0);
             assert_eq!(files.logical_family_evidence.row_count, 0);
             assert_eq!(files.logical_family_evidence.logical_bytes, 0);

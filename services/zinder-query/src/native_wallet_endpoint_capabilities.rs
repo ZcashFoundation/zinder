@@ -27,7 +27,6 @@ impl NativeWalletEndpointCapabilities {
     }
 
     /// Iterates capability identifiers in stable registry order.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &'static str> + '_ {
         self.ordered.iter().copied()
     }

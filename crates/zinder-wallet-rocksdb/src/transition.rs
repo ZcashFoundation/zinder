@@ -2682,7 +2682,10 @@ mod tests {
                 undo.created_outpoints,
                 vec![WalletOutpointKey::new(created_outpoint)]
             );
-            assert!(undo.spent_outpoints.is_empty());
+            assert_eq!(
+                undo.spent_outpoints,
+                [] as [zinder_wallet_projection::WalletOutpointKey; 0]
+            );
             assert_eq!(undo.address_transaction_keys.len(), 1);
             assert_eq!(
                 undo.source_sequence_digest_after,

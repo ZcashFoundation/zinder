@@ -5,12 +5,12 @@ check the exact `No release note required` declaration in the pull request
 template. Add a fragment for any change that affects operators, API consumers,
 deployment behavior, compatibility, security, or supported workflows.
 
-Zinder uses Changie v1.25.1 to keep each pull request's note independent until
+Zinder uses Changie v1.26.0 to keep each pull request's note independent until
 release preparation. Install that version, then create a fragment from the
 repository root:
 
 ```console
-go install github.com/miniscruff/changie@v1.25.1
+go install github.com/miniscruff/changie@v1.26.0
 changie new
 ```
 

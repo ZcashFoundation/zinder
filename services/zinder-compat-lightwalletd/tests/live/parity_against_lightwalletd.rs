@@ -1162,10 +1162,22 @@ async fn address_utxos_match_reference_for_unused_address() -> Result<()> {
     )
     .await?;
 
-    assert!(zinder_utxo_list.address_utxos.is_empty());
-    assert!(reference_utxo_list.address_utxos.is_empty());
-    assert!(zinder_utxo_stream.is_empty());
-    assert!(reference_utxo_stream.is_empty());
+    assert_eq!(
+        zinder_utxo_list.address_utxos,
+        [] as [zinder_proto::compat::lightwalletd::GetAddressUtxosReply; 0]
+    );
+    assert_eq!(
+        reference_utxo_list.address_utxos,
+        [] as [zinder_proto::compat::lightwalletd::GetAddressUtxosReply; 0]
+    );
+    assert_eq!(
+        zinder_utxo_stream,
+        [] as [zinder_proto::compat::lightwalletd::GetAddressUtxosReply; 0]
+    );
+    assert_eq!(
+        reference_utxo_stream,
+        [] as [zinder_proto::compat::lightwalletd::GetAddressUtxosReply; 0]
+    );
     Ok(())
 }
 
@@ -1225,10 +1237,22 @@ async fn taddress_history_matches_reference_for_unused_address() -> Result<()> {
     )
     .await?;
 
-    assert!(zinder_txids.is_empty());
-    assert!(reference_txids.is_empty());
-    assert!(zinder_transactions.is_empty());
-    assert!(reference_transactions.is_empty());
+    assert_eq!(
+        zinder_txids,
+        [] as [zinder_proto::compat::lightwalletd::RawTransaction; 0]
+    );
+    assert_eq!(
+        reference_txids,
+        [] as [zinder_proto::compat::lightwalletd::RawTransaction; 0]
+    );
+    assert_eq!(
+        zinder_transactions,
+        [] as [zinder_proto::compat::lightwalletd::RawTransaction; 0]
+    );
+    assert_eq!(
+        reference_transactions,
+        [] as [zinder_proto::compat::lightwalletd::RawTransaction; 0]
+    );
     Ok(())
 }
 

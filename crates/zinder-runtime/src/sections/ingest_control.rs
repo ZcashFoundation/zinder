@@ -173,7 +173,7 @@ impl IngestControlWriterToml {
         checkpoint_staging_root: &Path,
     ) -> Self {
         Self {
-            listen_addr: listen_addr.map(|addr| addr.to_string()).unwrap_or_default(),
+            listen_addr: listen_addr.map_or_default(|addr| addr.to_string()),
             bearer_token_path: bearer_token_path.map(|path| path.display().to_string()),
             checkpoint_bearer_token_path: checkpoint_bearer_token_path
                 .map(|path| path.display().to_string()),

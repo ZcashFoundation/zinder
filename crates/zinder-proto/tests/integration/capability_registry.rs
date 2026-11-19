@@ -29,7 +29,7 @@ fn wallet_registry_preserves_table_order_and_unique_identifiers() {
         .collect();
     let unique_wallet_capabilities: BTreeSet<&str> = wallet_capabilities.iter().copied().collect();
 
-    assert!(!wallet_capabilities.is_empty());
+    assert_ne!(wallet_capabilities, [] as [&str; 0]);
     assert_eq!(wallet_capabilities, registry_wallet_capabilities);
     assert_eq!(
         wallet_capabilities.len(),

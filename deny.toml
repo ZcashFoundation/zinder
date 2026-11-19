@@ -26,8 +26,8 @@ allow = [
 ]
 confidence-threshold = 0.8
 exceptions = [
-    # Zcash parser stack transitively uses `arrayref` through BLAKE2b/Equihash.
-    { allow = ["BSD-2-Clause"], name = "arrayref" },
+    # RocksDB pulls `zstd-sys`, whose 2.1.3+ SPDX expression includes BSD-2-Clause.
+    { allow = ["BSD-2-Clause"], name = "zstd-sys" },
     # Zcash script parser transitively uses `bounded-vec`.
     { allow = ["CC0-1.0"], name = "bounded-vec" },
     # Zcash transparent parsing transitively uses RustCrypto secp256k1 crates.

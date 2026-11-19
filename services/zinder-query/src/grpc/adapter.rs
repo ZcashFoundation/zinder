@@ -739,8 +739,7 @@ where
         ));
         let next_cursor_bytes = response
             .next_cursor
-            .map(|cursor| cursor.as_bytes().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|cursor| cursor.as_bytes().to_vec());
         let last_index = response.artifacts.len().saturating_sub(1);
         let items = response
             .artifacts
@@ -848,8 +847,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             .server_info
             .common
             .as_ref()
-            .map(|common| common.network.as_str())
-            .unwrap_or_default();
+            .map_or_default(|common| common.network.as_str());
         decode_zinder_native_chain_name(network)
             .ok()
             .ok_or_else(|| {

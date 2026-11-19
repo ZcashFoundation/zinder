@@ -300,10 +300,9 @@ impl IndexerError {
         }
 
         if matches!(&zinder_reason, ErrorReason::ReorgWindowExceeded) {
-            let halt = details
-                .error_info()
-                .map(|error_info| decode_reorg_window_exceeded_metadata(&error_info.metadata))
-                .unwrap_or_default();
+            let halt = details.error_info().map_or_default(|error_info| {
+                decode_reorg_window_exceeded_metadata(&error_info.metadata)
+            });
             return Self::ReorgWindowExceeded {
                 replacement_depth_blocks: halt.replacement_depth_blocks,
                 reorg_window_blocks: halt.reorg_window_blocks,

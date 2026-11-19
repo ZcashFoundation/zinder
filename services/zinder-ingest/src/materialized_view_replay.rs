@@ -71,7 +71,7 @@ const MATERIALIZED_VIEW_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const MATERIALIZED_VIEW_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
 const MATERIALIZED_VIEW_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
 const MATERIALIZED_VIEW_WRITE_SOURCE_CHAIN_EVENT: &str = "chain_event";
-static MATERIALIZED_VIEW_WRITE_LOCK: Mutex<()> = parking_lot::const_mutex(());
+static MATERIALIZED_VIEW_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn materialized_view_write_guard() -> MutexGuard<'static, ()> {
     MATERIALIZED_VIEW_WRITE_LOCK.lock()

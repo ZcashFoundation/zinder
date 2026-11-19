@@ -2045,7 +2045,7 @@ pub(crate) mod test_support {
         );
         assert_eq!(checkpoint.workload, "wallet");
         assert_eq!(checkpoint.network_name, "zcash-testnet");
-        assert!(!checkpoint.database_identity.is_empty());
+        assert_ne!(checkpoint.database_identity, [] as [u8; 0]);
         let ready_evidence = checkpoint
             .ready_evidence
             .ok_or("checkpoint response omitted ready evidence")?;

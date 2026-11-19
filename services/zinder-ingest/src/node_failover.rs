@@ -262,8 +262,7 @@ impl NodeFailover {
             genesis_hash: admissions.genesis_hash(),
             value_pool_capabilities: admissions
                 .active()
-                .map(|active| ValuePoolCapabilities::of(active.capabilities))
-                .unwrap_or_default(),
+                .map_or_default(|active| ValuePoolCapabilities::of(active.capabilities)),
             fence: watch::Sender::new(None),
             board: Mutex::new(FailoverBoard {
                 records,

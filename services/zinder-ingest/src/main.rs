@@ -1880,10 +1880,7 @@ source = "zebra-json-rpc"
             "\n[ingest.construction]\nsource_fetch_max_in_flight_bytes = 134217728\n",
         );
 
-        let refusal = loaded
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+        let refusal = loaded.err().map_or_default(|error| error.to_string());
         assert!(
             refusal
                 .contains("source fetch watermark 134217728 is below maximum response 268435456"),
@@ -1934,7 +1931,10 @@ source = "zebra-json-rpc"
         .await;
 
         let report = readiness.report();
-        assert!(report.materialized_view_identities.is_empty());
+        assert_eq!(
+            report.materialized_view_identities,
+            [] as [std::string::String; 0]
+        );
         assert!(materialized_view_path.is_dir());
         assert_eq!(fs::read(&sentinel_path)?, b"leave this store untouched");
         assert!(

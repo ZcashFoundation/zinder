@@ -78,7 +78,10 @@ async fn build_mempool_entry_decodes_real_zebra_coinbase_into_canonical_form() -
     }
 
     let scan_data = mempool_entry.compact_transaction_data();
-    assert!(scan_data.transparent_inputs.is_empty());
+    assert_eq!(
+        scan_data.transparent_inputs,
+        [] as [zinder_core::CompactTransparentInput; 0]
+    );
     assert_eq!(
         scan_data.transparent_outputs.len(),
         mempool_entry.transparent_outputs().len()

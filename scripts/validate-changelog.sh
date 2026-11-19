@@ -35,7 +35,7 @@ validate_pending_fragments() {
   (
     cd "$repository_root"
     "$changie_bin" batch auto --dry-run --allow-no-changes=false >/dev/null
-  ) || fail "pending fragments are not valid Changie v1.25.1 changes"
+  ) || fail "pending fragments are not valid Changie v1.26.0 changes"
 }
 
 validate_repository() {

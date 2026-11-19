@@ -3,6 +3,7 @@
 ///
 /// Reused for every `{role}_tip` in the chain-view family (`visible_tip`,
 /// `settled_tip`, `indexed_tip`) so the height/hash pairing has one shape.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockTip {
     /// Block height for this tip.
@@ -15,6 +16,7 @@ pub struct BlockTip {
 }
 /// A visible, internally consistent chain snapshot used to answer a wallet
 /// query.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainEpoch {
     /// Monotonic Zinder chain epoch identifier.
@@ -54,6 +56,7 @@ pub struct ChainEpoch {
 /// replays canonical chain events asynchronously and trails the canonical tip
 /// while catching up. This is the height every materialized-view-backed read response can
 /// actually answer for.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IndexedTip {
     /// Materialized block tip.
@@ -70,6 +73,7 @@ pub struct IndexedTip {
 /// Both fields are optional because the source-plane probe is async; a response
 /// that fires before the first probe leaves them unset. Consumers MUST treat an
 /// absent value as "unknown", not zero.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpstreamTip {
     /// Highest block height the upstream node has locally committed (Zebra's
@@ -88,6 +92,7 @@ pub struct UpstreamTip {
 /// Folds the epoch identity, the reorg-vs-replay tips, the upstream view, and
 /// the materialized-view status into one shape so a consumer reads chain state the
 /// same way on every surface. See ADR-0019.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainView {
     /// Chain epoch this response was produced from.
@@ -112,6 +117,7 @@ pub struct ChainView {
 /// Written by the view owner and surfaced on `ChainView.materialized_views` and
 /// `ExplorerServerInfo`. The `observed_at_millis` stamp lets a consumer detect a
 /// status record that has itself gone stale.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MaterializedViewStatus {
     #[prost(enumeration = "MaterializedViewHealth", tag = "1")]
@@ -124,6 +130,7 @@ pub struct MaterializedViewStatus {
     pub observed_at_millis: u64,
 }
 /// Identity of one canonical block.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockId {
     /// Height of the block.
@@ -135,6 +142,7 @@ pub struct BlockId {
     pub block_hash: ::prost::alloc::string::String,
 }
 /// Visible-tip block identity response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VisibleTipBlockResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -145,6 +153,7 @@ pub struct VisibleTipBlockResponse {
     pub visible_tip_block: ::core::option::Option<BlockId>,
 }
 /// Visible-tip block identity request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VisibleTipBlockRequest {
     /// Optional chain-epoch id that must be used to answer the request. When
@@ -154,6 +163,7 @@ pub struct VisibleTipBlockRequest {
 }
 /// Settled-tip block metadata response bound to one chain epoch. Returns the
 /// block at the chain epoch's settlement watermark.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SettledTipBlockResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -164,6 +174,7 @@ pub struct SettledTipBlockResponse {
     pub settled_tip_block: ::core::option::Option<BlockId>,
 }
 /// Settled-tip block metadata request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SettledTipBlockRequest {
     /// Optional chain-epoch id that must be used to answer the request. When
@@ -177,6 +188,7 @@ pub struct SettledTipBlockRequest {
 /// `height` arm and receive a normalized response that includes the resolved
 /// hash. Non-best-chain `(txid, block_hash)` lookup is a separate operation,
 /// not a third oneof arm.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockSelector {
     #[prost(oneof = "block_selector::Selector", tags = "1, 2")]
@@ -184,6 +196,7 @@ pub struct BlockSelector {
 }
 /// Nested message and enum types in `BlockSelector`.
 pub mod block_selector {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Selector {
         /// Address the block at this height in the canonical best chain.
@@ -198,6 +211,7 @@ pub mod block_selector {
 }
 /// Block-selector resolver request, shared by the block-identity and
 /// block-header reads that both resolve a `BlockSelector`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockSelectorRequest {
     /// Typed selector for the requested block.
@@ -209,6 +223,7 @@ pub struct BlockSelectorRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Block-identity resolver response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockIdResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -220,6 +235,7 @@ pub struct BlockIdResponse {
 }
 /// Typed block-header read-model response. The shape is Zinder-native and
 /// does not re-export upstream-node JSON-RPC fields.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockHeader {
     /// Resolved block identity.
@@ -252,6 +268,7 @@ pub struct BlockHeader {
     pub version: u32,
 }
 /// Block-header read response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockHeaderResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -262,6 +279,7 @@ pub struct BlockHeaderResponse {
     pub block_header: ::core::option::Option<BlockHeader>,
 }
 /// A wallet-facing compact block from one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlock {
     /// Height of the source block.
@@ -287,6 +305,7 @@ pub struct CompactBlock {
     pub chain_metadata: ::core::option::Option<CompactChainMetadata>,
 }
 /// Commitment-tree sizes after one compact block.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactChainMetadata {
     /// Sapling note-commitment tree size after this block.
@@ -300,6 +319,7 @@ pub struct CompactChainMetadata {
     pub ironwood_commitment_tree_size: u32,
 }
 /// Wallet-relevant transaction data within a compact block.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactTransaction {
     /// Zero-based transaction position in consensus block order.
@@ -314,6 +334,7 @@ pub struct CompactTransaction {
     pub data: ::core::option::Option<CompactTransactionData>,
 }
 /// Wallet scan fields shared by mined and mempool transactions.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactTransactionData {
     /// Transaction fee in zatoshis when known. Absence means unknown and MUST
@@ -340,12 +361,14 @@ pub struct CompactTransactionData {
     #[prost(message, repeated, tag = "7")]
     pub transparent_outputs: ::prost::alloc::vec::Vec<CompactTransparentOutput>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactSaplingSpend {
     /// Sapling nullifier as exactly 32 consensus bytes.
     #[prost(bytes = "vec", tag = "1")]
     pub nullifier: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactSaplingOutput {
     /// Sapling note commitment as exactly 32 consensus bytes.
@@ -358,6 +381,7 @@ pub struct CompactSaplingOutput {
     #[prost(bytes = "vec", tag = "3")]
     pub ciphertext: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactShieldedAction {
     /// Action nullifier as exactly 32 consensus bytes.
@@ -373,6 +397,7 @@ pub struct CompactShieldedAction {
     #[prost(bytes = "vec", tag = "4")]
     pub ciphertext: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactTransparentInput {
     /// Spent transaction identifier as exactly 32 bytes in Zcash protocol byte
@@ -383,6 +408,7 @@ pub struct CompactTransparentInput {
     #[prost(uint32, tag = "2")]
     pub previous_output_index: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactTransparentOutput {
     /// Output value in zatoshis.
@@ -393,6 +419,7 @@ pub struct CompactTransparentOutput {
     pub script_pub_key: ::prost::alloc::vec::Vec<u8>,
 }
 /// Inclusive compact block range request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactBlocksInRangeRequest {
     /// First requested block height.
@@ -407,6 +434,7 @@ pub struct CompactBlocksInRangeRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Single compact block request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactBlockRequest {
     /// Requested block height.
@@ -418,6 +446,7 @@ pub struct CompactBlockRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Single compact block response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlockResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -434,6 +463,7 @@ pub struct CompactBlockResponse {
 /// shielded trial-decryption. The bytes are present only when the writer
 /// deployment retains block blobs (`storage.raw_blob_policy = "all"`);
 /// reads for unretained heights return gRPC NOT_FOUND.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlock {
     /// Height of the source block.
@@ -452,6 +482,7 @@ pub struct FullBlock {
     pub parent_block_hash: ::prost::alloc::string::String,
 }
 /// Single full block request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlockRequest {
     /// Requested block height.
@@ -463,6 +494,7 @@ pub struct FullBlockRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Single full block response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlockResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -473,6 +505,7 @@ pub struct FullBlockResponse {
     pub full_block: ::core::option::Option<FullBlock>,
 }
 /// Inclusive full block range request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlocksInRangeRequest {
     /// First requested block height.
@@ -487,6 +520,7 @@ pub struct FullBlocksInRangeRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Streamed full block range chunk bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlocksInRangeChunk {
     /// Cross-plane chain-state envelope for this chunk (ADR-0019, field tag 1).
@@ -497,6 +531,7 @@ pub struct FullBlocksInRangeChunk {
     pub full_block: ::core::option::Option<FullBlock>,
 }
 /// Single transaction request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionRequest {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -509,6 +544,7 @@ pub struct TransactionRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Block coordinates of a mined transaction.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MinedBlockLocation {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -535,6 +571,7 @@ pub struct MinedBlockLocation {
 /// height; `consensus_branch_id` and `block_time` are derived from the
 /// source-aware layer that owns Zcash consensus parameters and block-header
 /// parsing.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MinedTransactionChainContext {
     /// Consensus branch identifier in effect at the mined height.
@@ -550,6 +587,7 @@ pub struct MinedTransactionChainContext {
 }
 /// Mined-transaction response carrier: the durable `MinedBlockLocation`
 /// plus epoch-bound enrichment.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MinedTransaction {
     /// Mined-transaction block coordinates.
@@ -577,6 +615,7 @@ pub struct MinedTransaction {
 /// errors do not consume oneof slots. `WalletQuery.Transaction` and
 /// `ExplorerQuery.TransactionDetail` both embed this message so a consumer
 /// writes the match once.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionLocation {
     #[prost(oneof = "transaction_location::Location", tags = "1, 2")]
@@ -584,6 +623,7 @@ pub struct TransactionLocation {
 }
 /// Nested message and enum types in `TransactionLocation`.
 pub mod transaction_location {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Location {
         /// Transaction is mined in the canonical chain.
@@ -598,6 +638,7 @@ pub mod transaction_location {
 ///
 /// `NotFound` is conveyed as gRPC `NOT_FOUND`, not as a location arm,
 /// because typed errors do not consume oneof slots.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionStatusResponse {
     /// Chain epoch used to answer this response.
@@ -614,6 +655,7 @@ pub struct TransactionStatusResponse {
 /// `end_height`. The header carries the single chain epoch that answers the
 /// whole range; items carry no per-block epoch. A consumer reads the epoch once
 /// and binds every later block to it.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlocksInRangeChunk {
     #[prost(oneof = "compact_blocks_in_range_chunk::Body", tags = "1, 2")]
@@ -621,6 +663,7 @@ pub struct CompactBlocksInRangeChunk {
 }
 /// Nested message and enum types in `CompactBlocksInRangeChunk`.
 pub mod compact_blocks_in_range_chunk {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch that answers the entire range
@@ -633,6 +676,7 @@ pub mod compact_blocks_in_range_chunk {
     }
 }
 /// Tree-state request for one exact block height.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TreeStateAtHeightRequest {
     /// Exact block height to return the tree state for. The response height
@@ -648,6 +692,7 @@ pub struct TreeStateAtHeightRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Latest checkpoint tree-state request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LatestTreeStateCheckpointRequest {
     /// Optional chain-epoch id that must be used to answer the request. When
@@ -656,6 +701,7 @@ pub struct LatestTreeStateCheckpointRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Checkpoint tree-state response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TreeStateResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -683,6 +729,7 @@ pub struct TreeStateResponse {
 /// admitted from its node's `getblockchaininfo.upgrades` response. Unknown
 /// future branch ids remain representable so wallet clients can fail closed
 /// before consensus diverges.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeActivation {
     /// Consensus branch identifier assigned to this upgrade.
@@ -696,10 +743,12 @@ pub struct NetworkUpgradeActivation {
     pub activation_height: u32,
 }
 /// Writer-admitted network-upgrade activation-table request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeActivationsRequest {}
 /// Writer-admitted network-upgrade schedule served with the current serving
 /// pair.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkUpgradeActivationsResponse {
     /// Entries ordered by ascending activation height.
@@ -708,6 +757,7 @@ pub struct NetworkUpgradeActivationsResponse {
 }
 /// Inclusive-start bounded subtree-root request. One request may return at
 /// most 1024 subtree roots.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubtreeRootsRequest {
     /// Shielded protocol to read.
@@ -727,6 +777,7 @@ pub struct SubtreeRootsRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// A complete shielded subtree root.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubtreeRoot {
     /// Subtree index within the requested shielded protocol.
@@ -747,6 +798,7 @@ pub struct SubtreeRoot {
     pub completing_block_height: u32,
 }
 /// Subtree-root range response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubtreeRootsResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -763,6 +815,7 @@ pub struct SubtreeRootsResponse {
     pub subtree_roots: ::prost::alloc::vec::Vec<SubtreeRoot>,
 }
 /// Raw transaction broadcast request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastTransactionRequest {
     /// Serialized transaction bytes submitted by the wallet.
@@ -774,6 +827,7 @@ pub struct BroadcastTransactionRequest {
 /// A query that fails over past an unreachable node endpoint, which may have
 /// accepted the transaction, reports a later endpoint's duplicate or queued
 /// answer as accepted.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastAccepted {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -784,6 +838,7 @@ pub struct BroadcastAccepted {
     pub transaction_id: ::prost::alloc::string::String,
 }
 /// Duplicate transaction broadcast details.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastDuplicate {
     /// Node error code when one was supplied.
@@ -794,6 +849,7 @@ pub struct BroadcastDuplicate {
     pub message: ::prost::alloc::string::String,
 }
 /// Invalid transaction encoding details.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastInvalidEncoding {
     /// Node error code when one was supplied.
@@ -804,6 +860,7 @@ pub struct BroadcastInvalidEncoding {
     pub message: ::prost::alloc::string::String,
 }
 /// Rejected transaction broadcast details.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastRejected {
     /// Node error code when one was supplied.
@@ -820,6 +877,7 @@ pub struct BroadcastRejected {
 ///
 /// Benign duplicate of a transaction the local caller submitted earlier:
 /// the node will eventually accept or reject it.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastQueued {
     /// Operator-facing node message describing the queued state.
@@ -827,6 +885,7 @@ pub struct BroadcastQueued {
     pub message: ::prost::alloc::string::String,
 }
 /// Unclassified transaction broadcast details.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastUnknown {
     /// Node error code when one was supplied.
@@ -837,6 +896,7 @@ pub struct BroadcastUnknown {
     pub message: ::prost::alloc::string::String,
 }
 /// Typed transaction broadcast outcome.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BroadcastTransactionResponse {
     #[prost(
@@ -847,6 +907,7 @@ pub struct BroadcastTransactionResponse {
 }
 /// Nested message and enum types in `BroadcastTransactionResponse`.
 pub mod broadcast_transaction_response {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Outcome {
         #[prost(message, tag = "1")]
@@ -864,12 +925,15 @@ pub mod broadcast_transaction_response {
     }
 }
 /// Marker for the earliest-retained start position of an event stream.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EarliestRetained {}
 /// Marker for the live-tail start position of an event stream.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LiveTail {}
 /// Explicit start position shared by every replayable event-stream request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EventStreamStart {
     /// Required start position; an unset oneof is rejected with
@@ -881,6 +945,7 @@ pub struct EventStreamStart {
 pub mod event_stream_start {
     /// Required start position; an unset oneof is rejected with
     /// `INVALID_ARGUMENT`.
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Position {
         /// Resumes strictly after this opaque cursor. The cursor's encoded
@@ -901,6 +966,7 @@ pub mod event_stream_start {
     }
 }
 /// Replayable chain-event stream request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainEventsRequest {
     /// Required start position. `after_cursor` carries the opaque cursor
@@ -923,6 +989,7 @@ pub struct ChainEventsRequest {
     pub address_filter: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Durable range committed by one chain event.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainEpochCommitted {
     /// Chain epoch visible after the commit.
@@ -936,6 +1003,7 @@ pub struct ChainEpochCommitted {
     pub end_height: u32,
 }
 /// Durable range reverted by one chain event.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainRangeReverted {
     /// Chain epoch that contained the reverted range.
@@ -954,6 +1022,7 @@ pub struct ChainRangeReverted {
 /// prefix. The architectural-spine name; preferred over "tip-advance"
 /// because Zinder commits to either the visible tip or the settled tip under
 /// the same event variant.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainCommitted {
     #[prost(message, optional, tag = "1")]
@@ -961,6 +1030,7 @@ pub struct ChainCommitted {
 }
 /// Reorg chain event: a range that had not yet reached the settled tip was
 /// replaced.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainReorged {
     #[prost(message, optional, tag = "1")]
@@ -969,6 +1039,7 @@ pub struct ChainReorged {
     pub committed: ::core::option::Option<ChainEpochCommitted>,
 }
 /// Cursor-bound chain event envelope.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainEventEnvelope {
     /// Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
@@ -988,6 +1059,7 @@ pub struct ChainEventEnvelope {
 }
 /// Nested message and enum types in `ChainEventEnvelope`.
 pub mod chain_event_envelope {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag = "10")]
@@ -1003,6 +1075,7 @@ pub mod chain_event_envelope {
 /// describe operator configuration that constrains a wallet consumer's
 /// behavior (reorg depth, upstream-node capability snapshot and canonical
 /// artifact schema version).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WalletServerInfo {
     /// Cross-service identity and capability descriptor.
@@ -1023,6 +1096,7 @@ pub struct WalletServerInfo {
 }
 /// Broadcast node endpoint capability descriptor. Empty while no endpoint has
 /// passed first-contact verification, and when no node is configured.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeCapabilitiesDescriptor {
     /// Node-reported semantic version, when available.
@@ -1033,9 +1107,11 @@ pub struct NodeCapabilitiesDescriptor {
     pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Server descriptor request.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoRequest {}
 /// Server descriptor response.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoResponse {
     #[prost(message, optional, tag = "1")]
@@ -1043,6 +1119,7 @@ pub struct ServerInfoResponse {
 }
 /// Reference to a transparent transaction output by
 /// `(transaction_id, output_index)`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OutPoint {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1055,6 +1132,7 @@ pub struct OutPoint {
     pub output_index: u32,
 }
 /// Transparent output visible in the live mempool index.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentMempoolOutput {
     /// SHA-256 of the transparent address scriptPubKey.
@@ -1071,6 +1149,7 @@ pub struct TransparentMempoolOutput {
     pub value_zat: u64,
 }
 /// Transparent input visible in the live mempool index.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentMempoolSpend {
     /// Outpoint of the previously-known output that this mempool input spends.
@@ -1083,6 +1162,7 @@ pub struct TransparentMempoolSpend {
     pub spending_transaction_id: ::prost::alloc::string::String,
 }
 /// Hydrated record describing a mempool transaction observed by the indexer.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1114,6 +1194,7 @@ pub struct MempoolEntry {
     pub transparent_spends: ::prost::alloc::vec::Vec<TransparentMempoolSpend>,
 }
 /// Bounded request for a snapshot of the live mempool.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolSnapshotRequest {
     /// Server-enforced maximum number of entries the response may carry. The
@@ -1126,6 +1207,7 @@ pub struct MempoolSnapshotRequest {
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// Snapshot response bound to one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolSnapshotResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -1157,6 +1239,7 @@ pub struct MempoolSnapshotResponse {
 ///
 /// Names the spending transaction, the input index within it, and the block
 /// that mined the spend.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentSpend {
     /// Outpoint that was spent.
@@ -1177,6 +1260,7 @@ pub struct TransparentSpend {
 /// Intrinsic value and scriptPubKey of one transparent output, carried by
 /// `zinder.v1.explorer.TransactionDetail` outputs. Identifying fields stay on
 /// the enclosing message.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutput {
     /// Output value in zatoshis.
@@ -1187,6 +1271,7 @@ pub struct TransparentOutput {
     pub script_pub_key: ::prost::alloc::vec::Vec<u8>,
 }
 /// Replayable mempool-event stream request.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolEventsRequest {
     /// Required start position. `after_cursor` carries the opaque cursor
@@ -1195,6 +1280,7 @@ pub struct MempoolEventsRequest {
     pub start: ::core::option::Option<EventStreamStart>,
 }
 /// New mempool transaction observed.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolAddedEvent {
     /// Hydrated entry observed by the indexer.
@@ -1202,6 +1288,7 @@ pub struct MempoolAddedEvent {
     pub entry: ::core::option::Option<MempoolEntry>,
 }
 /// Mempool transaction removed without being mined.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolInvalidatedEvent {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1213,6 +1300,7 @@ pub struct MempoolInvalidatedEvent {
     pub reason: i32,
 }
 /// Mempool transaction observed mined into a block.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolMinedEvent {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1232,6 +1320,7 @@ pub struct MempoolMinedEvent {
     pub block_hash: ::prost::alloc::string::String,
 }
 /// Cursor-bound mempool event envelope.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolEventEnvelope {
     /// Opaque StreamCursorTokenV1 bytes for resuming strictly after this event.
@@ -1249,6 +1338,7 @@ pub struct MempoolEventEnvelope {
 }
 /// Nested message and enum types in `MempoolEventEnvelope`.
 pub mod mempool_event_envelope {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag = "10")]
@@ -1265,6 +1355,7 @@ pub mod mempool_event_envelope {
 /// and debug callers use the string form. The native adapter parses string
 /// addresses through ZebraTransparentAddress and SHA-256-hashes them; the
 /// in-process WalletQueryApi only sees the typed script hash.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddressLookup {
     #[prost(oneof = "address_lookup::Selector", tags = "1, 2")]
@@ -1272,6 +1363,7 @@ pub struct AddressLookup {
 }
 /// Nested message and enum types in `AddressLookup`.
 pub mod address_lookup {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Selector {
         /// SHA-256 of the transparent address scriptPubKey, in canonical 32-byte
@@ -1289,6 +1381,7 @@ pub mod address_lookup {
 /// chain epoch and streams every unspent output. The response stream is
 /// always complete: there is no cursor and no entry cap, so a client cannot
 /// silently truncate the set by ignoring pagination.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressUnspentOutputsRequest {
     /// Selector for the transparent address being queried.
@@ -1305,6 +1398,7 @@ pub struct TransparentAddressUnspentOutputsRequest {
 }
 /// One unspent transparent output streamed by
 /// \[`TransparentAddressUnspentOutputs`\].
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentUnspentOutput {
     /// SHA-256 of the transparent address scriptPubKey.
@@ -1335,6 +1429,7 @@ pub struct TransparentUnspentOutput {
 /// epoch for the whole stream; payload items carry no per-element epoch. This
 /// makes the stream-wide single-epoch guarantee structural: a consumer reads
 /// the epoch once from the leading header and never reconciles it across items.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentUnspentOutputsChunk {
     #[prost(oneof = "transparent_unspent_outputs_chunk::Body", tags = "1, 2")]
@@ -1342,6 +1437,7 @@ pub struct TransparentUnspentOutputsChunk {
 }
 /// Nested message and enum types in `TransparentUnspentOutputsChunk`.
 pub mod transparent_unspent_outputs_chunk {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
@@ -1355,6 +1451,7 @@ pub mod transparent_unspent_outputs_chunk {
 }
 /// Request for the spend status of a batch of transparent outpoints at one
 /// chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentOutpointSpendStatusRequest {
     /// Outpoints to classify. The response repeats them in this order. A request
@@ -1369,6 +1466,7 @@ pub struct TransparentOutpointSpendStatusRequest {
     pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// Spend status of every requested outpoint, read at one chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentOutpointSpendStatusResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -1384,6 +1482,7 @@ pub struct TransparentOutpointSpendStatusResponse {
 /// The status covers mined transactions from height 1 through the epoch's
 /// visible tip. A spend that is only in the mempool leaves the output
 /// `unspent`; `MempoolSnapshot` and `MempoolEvents` carry pending spends.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutpointSpendStatusEntry {
     /// Requested outpoint.
@@ -1394,6 +1493,7 @@ pub struct TransparentOutpointSpendStatusEntry {
 }
 /// Nested message and enum types in `TransparentOutpointSpendStatusEntry`.
 pub mod transparent_outpoint_spend_status_entry {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Status {
         /// A mined transaction created the output and no mined transaction
@@ -1410,9 +1510,11 @@ pub mod transparent_outpoint_spend_status_entry {
     }
 }
 /// Marker for an outpoint that is unspent at the response epoch.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutpointUnspent {}
 /// Mined spend of a transparent outpoint.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutpointSpentBy {
     /// Transaction id in RPC byte order (64 lowercase hex characters) of the
@@ -1430,9 +1532,11 @@ pub struct TransparentOutpointSpentBy {
 /// Marker for an outpoint that no mined transaction created at the response
 /// epoch, including the coinbase input sentinel and the unspendable genesis
 /// coinbase output.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutpointNotFound {}
 /// One upstream `getblockchaininfo.valuePools` entry.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainValuePool {
     /// Stable upstream pool identifier, such as "transparent", "sapling",
@@ -1449,9 +1553,11 @@ pub struct ChainValuePool {
 }
 /// Wallet-plane request for chain-wide value-pool totals at the upstream
 /// node's current tip.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainValuePoolsAtTipRequest {}
 /// Wallet-plane response for chain-wide value-pool totals.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChainValuePoolsAtTipResponse {
     /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
@@ -1472,6 +1578,7 @@ pub struct ChainValuePoolsAtTipResponse {
 ///
 /// History is ascending only. Newest-first address history is
 /// `ExplorerQuery.TransparentAddressActivity`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressTxIdsInRangeRequest {
     /// Selector for the transparent address being queried.
@@ -1494,6 +1601,7 @@ pub struct TransparentAddressTxIdsInRangeRequest {
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
 }
 /// One indexed transparent-address tx-history entry.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressTxId {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1523,6 +1631,7 @@ pub struct TransparentAddressTxId {
 /// epoch for the whole stream; payload items carry no per-element epoch. This
 /// makes the stream-wide single-epoch guarantee structural rather than a
 /// per-item repetition.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressTxIdsChunk {
     #[prost(oneof = "transparent_address_tx_ids_chunk::Body", tags = "1, 2")]
@@ -1530,6 +1639,7 @@ pub struct TransparentAddressTxIdsChunk {
 }
 /// Nested message and enum types in `TransparentAddressTxIdsChunk`.
 pub mod transparent_address_tx_ids_chunk {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
@@ -1543,6 +1653,7 @@ pub mod transparent_address_tx_ids_chunk {
 }
 /// Materialized-view lifecycle. Separates healthy replay from stalled replay,
 /// which a block-count lag alone cannot express.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum MaterializedViewHealth {
@@ -1580,6 +1691,7 @@ impl MaterializedViewHealth {
     }
 }
 /// Shielded note commitment protocol for subtree roots.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ShieldedProtocol {
@@ -1618,6 +1730,7 @@ impl ShieldedProtocol {
 }
 /// Typed rejection reason carried by BroadcastRejected. Callers match on
 /// this enum instead of substring-checking the operator-facing message.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum BroadcastRejectionReason {
@@ -1689,6 +1802,7 @@ impl BroadcastRejectionReason {
 }
 /// Chain-event stream family. Visible receives every chain event. Settled
 /// receives only non-reorg commits entirely at or below the settled tip.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ChainEventStreamFamily {
@@ -1716,6 +1830,7 @@ impl ChainEventStreamFamily {
     }
 }
 /// Reason a mempool transaction was removed without being mined.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum MempoolEvictionReason {

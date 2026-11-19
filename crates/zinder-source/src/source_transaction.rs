@@ -611,7 +611,7 @@ mod tests {
         for raw_transaction in minimal_transaction_encodings()? {
             let mut trailing_bytes = raw_transaction.clone();
             trailing_bytes.push(0);
-            let mut truncated_bytes = raw_transaction.clone();
+            let mut truncated_bytes = raw_transaction;
             truncated_bytes.truncate(truncated_bytes.len().saturating_sub(1));
 
             for malformed_bytes in [&trailing_bytes, &truncated_bytes] {

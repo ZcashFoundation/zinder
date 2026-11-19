@@ -439,16 +439,12 @@ fn mined_consensus_branch_id(
 pub(crate) fn encode_public_facts(facts: &CoreFacts) -> WireFacts {
     WireFacts {
         transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
-        auth_digest: facts
-            .auth_digest
-            .map(encode_rpc_auth_digest_hex)
-            .unwrap_or_default(),
-        wtxid: facts.wtxid.map(encode_rpc_wtxid_hex).unwrap_or_default(),
+        auth_digest: facts.auth_digest.map_or_default(encode_rpc_auth_digest_hex),
+        wtxid: facts.wtxid.map_or_default(encode_rpc_wtxid_hex),
         version: Some(encode_transaction_version(facts.version)),
         consensus_branch_id_hex: facts
             .consensus_branch_id
-            .map(encode_branch_id_hex)
-            .unwrap_or_default(),
+            .map_or_default(encode_branch_id_hex),
         lock_time: Some(encode_lock_time(facts.lock_time)),
         expiry_height: facts.expiry_height.map_or(0, BlockHeight::value),
         size_bytes: facts.size_bytes,
@@ -669,7 +665,10 @@ mod tests {
             Some(encode_rpc_transaction_id_hex(spending_transaction_id()))
         );
         assert!(response.transparent_outputs[1].spent_by.is_none());
-        assert!(spent_by_markers(&response).is_empty());
+        assert_eq!(
+            spent_by_markers(&response),
+            [] as [zinder_proto::v1::explorer::UnavailableField; 0]
+        );
         Ok(())
     }
 
@@ -851,7 +850,10 @@ mod tests {
 
         let encoded = encode_unresolved_transparent_inputs(&inputs, None);
 
-        assert!(encoded.is_empty());
+        assert_eq!(
+            encoded,
+            [] as [zinder_proto::v1::explorer::TransparentInput; 0]
+        );
     }
 
     fn resolve_mined_transparent_transaction() -> eyre::Result<ResolvedTransactionDetail> {

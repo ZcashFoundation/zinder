@@ -8,9 +8,9 @@ usage() {
 
 [[ $# -eq 1 && -n "$1" ]] || usage
 bin_directory="$1"
-gh_version=2.94.0
+gh_version=2.105.0
 gh_archive="gh_${gh_version}_linux_amd64.tar.gz"
-gh_sha256=a757f1ba6db18f4de8cbadb244843a5f89bc75b5e7c6fc127d2bd77fbd12ed62
+gh_sha256=79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f
 gh_url="https://github.com/cli/cli/releases/download/v${gh_version}/${gh_archive}"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/zinder-release-tools.XXXXXX")"

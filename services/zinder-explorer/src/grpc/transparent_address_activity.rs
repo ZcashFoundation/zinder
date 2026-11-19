@@ -576,7 +576,6 @@ fn network_matches(
 mod tests {
     use std::{collections::HashMap, error::Error, sync::Arc};
 
-    use prost::Message as _;
     use tempfile::{TempDir, tempdir};
     use tonic::Code;
     use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_block_hash_hex};

@@ -595,12 +595,12 @@ mod tests {
         let (added, removed) = diff_known_state(&admission, &observed);
 
         assert_eq!(added, vec![transaction_id_with_byte(0xAA)]);
-        assert!(removed.is_empty());
+        assert_eq!(removed, [] as [zinder_core::TransactionId; 0]);
         assert!(admission.lock().transaction_ids().next().is_none());
 
         let (retry_added, retry_removed) = diff_known_state(&admission, &observed);
         assert_eq!(retry_added, vec![transaction_id_with_byte(0xAA)]);
-        assert!(retry_removed.is_empty());
+        assert_eq!(retry_removed, [] as [zinder_core::TransactionId; 0]);
 
         let admission_outcome = admission.lock().admit_added_entry(&MempoolSourceEntry {
             transaction_id: transaction_id_with_byte(0xAA),
@@ -610,8 +610,8 @@ mod tests {
         });
         assert!(admission_outcome.is_ok());
         let (after_emit_added, after_emit_removed) = diff_known_state(&admission, &observed);
-        assert!(after_emit_added.is_empty());
-        assert!(after_emit_removed.is_empty());
+        assert_eq!(after_emit_added, [] as [zinder_core::TransactionId; 0]);
+        assert_eq!(after_emit_removed, [] as [zinder_core::TransactionId; 0]);
     }
 
     #[test]
@@ -620,7 +620,7 @@ mod tests {
         let observed = HashSet::new();
 
         let (added, removed) = diff_known_state(&admission, &observed);
-        assert!(added.is_empty());
+        assert_eq!(added, [] as [zinder_core::TransactionId; 0]);
         assert_eq!(removed, vec![transaction_id_with_byte(0xBB)]);
         assert!(
             admission
@@ -629,15 +629,15 @@ mod tests {
         );
 
         let (retry_added, retry_removed) = diff_known_state(&admission, &observed);
-        assert!(retry_added.is_empty());
+        assert_eq!(retry_added, [] as [zinder_core::TransactionId; 0]);
         assert_eq!(retry_removed, vec![transaction_id_with_byte(0xBB)]);
 
         admission
             .lock()
             .remove_transaction(transaction_id_with_byte(0xBB));
         let (after_emit_added, after_emit_removed) = diff_known_state(&admission, &observed);
-        assert!(after_emit_added.is_empty());
-        assert!(after_emit_removed.is_empty());
+        assert_eq!(after_emit_added, [] as [zinder_core::TransactionId; 0]);
+        assert_eq!(after_emit_removed, [] as [zinder_core::TransactionId; 0]);
     }
 
     #[test]
@@ -647,8 +647,8 @@ mod tests {
 
         let (added, removed) = diff_known_state(&admission, &initial);
 
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
+        assert_eq!(added, [] as [zinder_core::TransactionId; 0]);
+        assert_eq!(removed, [] as [zinder_core::TransactionId; 0]);
     }
 
     #[tokio::test]

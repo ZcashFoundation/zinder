@@ -84,7 +84,7 @@ Install the repository-pinned Changie version and run `changie new` to create a
 fragment:
 
 ```bash
-go install github.com/miniscruff/changie@v1.25.1
+go install github.com/miniscruff/changie@v1.26.0
 changie new
 ```
 
@@ -178,7 +178,7 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Coding Constraints
 
-The workspace MSRV is Rust 1.95. Public crates inherit that version alongside
+The workspace MSRV is Rust 1.100. Public crates inherit that version alongside
 the internal crates and release binaries. Keep `Cargo.toml`,
 `rust-toolchain.toml`, `clippy.toml`, CI toolchain actions, and Docker
 `RUST_VERSION` args aligned whenever it changes.
@@ -213,7 +213,7 @@ Practical effects:
 `zinder-proto` compiles from checked-in Rust modules and descriptor sets under
 `crates/zinder-proto/generated/`; package consumers do not need `protoc` or a
 build script. The private `zinder-proto-codegen` tool regenerates those files
-with Buf 1.68.2 and protoc 29.3. Run
+with Buf 1.75.0 and protoc 36.2. Run
 `PROTOC="$(command -v protoc)" scripts/regenerate-zinder-proto.sh --check` to
 detect drift or replace `--check` with `--write` after an intentional protocol
 change. Only repository maintainers run this tool; it is not part of the
@@ -244,4 +244,4 @@ ADRs are written in present tense and describe the current decision. When a deci
 
 ## Consensus Dependency Pins
 
-`zebra-chain` is pinned to `16.0.0`, the release Zebra 7.1.0 uses, with the matching published librustzcash stack (`zcash_address 0.14.0`, `zcash_protocol 0.11.0`, `zcash_primitives 0.31.0`, `zcash_transparent 0.11.0`, `orchard 0.16.0`, `sapling-crypto 0.9.0`, `incrementalmerkletree 0.9.0`, `zip32 0.3.0`, and `secp256k1 0.33.1`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. This cohort decodes version-6 transactions under Ironwood (NU6.3, consensus branch ID `0x37a5165b`) and NU7 (consensus branch ID `0x77190ad9`). Zinder certifies two node runtimes, which the live and parity lanes run side by side: Zebra 7.1.0 (`docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`) and Zakura 1.8.6 (`docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`). `scripts/check-zcash-upstream-alignment.sh` fails when `zebra-chain` resolves to a version other than `16.0.0`, when any of these crates resolves to a version other than the one `zebra-chain` uses, or when either runtime image differs from its pinned digest anywhere the lanes or their docs name it. Advance the crate cohort with the Zebra pin, because `zebra-chain` selects it. Zakura builds on its own crate stack and can advance separately, but a protocol change, such as a new network upgrade or consensus branch ID, needs both runtimes certified on versions that speak it. Keep both lanes green. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.
+`zebra-chain` is pinned to `16.0.0`, the release Zebra 7.1.0 uses, with the matching published librustzcash stack (`zcash_address 0.14.0`, `zcash_protocol 0.11.0`, `zcash_primitives 0.31.1`, `zcash_transparent 0.11.1`, `orchard 0.16.0`, `sapling-crypto 0.9.0`, `incrementalmerkletree 0.9.0`, `zip32 0.3.0`, and `secp256k1 0.33.1`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. This cohort decodes version-6 transactions under Ironwood (NU6.3, consensus branch ID `0x37a5165b`) and NU7 (consensus branch ID `0x77190ad9`). Zinder certifies two node runtimes, which the live and parity lanes run side by side: Zebra 7.1.0 (`docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`) and Zakura 1.8.6 (`docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`). `scripts/check-zcash-upstream-alignment.sh` fails when `zebra-chain` resolves to a version other than `16.0.0`, when any of these crates resolves to a version other than the one `zebra-chain` uses, or when either runtime image differs from its pinned digest anywhere the lanes or their docs name it. Advance the crate cohort with the Zebra pin, because `zebra-chain` selects it. Zakura builds on its own crate stack and can advance separately, but a protocol change, such as a new network upgrade or consensus branch ID, needs both runtimes certified on versions that speak it. Keep both lanes green. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.

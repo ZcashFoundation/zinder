@@ -14,7 +14,8 @@ use zinder_proto::compat::lightwalletd::{
     Address, AddressList, Balance, BlockId, BlockRange, ChainSpec, CompactBlock, CompactTx,
     Duration as PingDuration, Empty, GetAddressUtxosArg, GetAddressUtxosReply,
     GetAddressUtxosReplyList, GetMempoolTxRequest, GetSubtreeRootsArg, LightdInfo, PingResponse,
-    RawTransaction, SendResponse, SubtreeRoot, TransparentAddressBlockFilter, TreeState, TxFilter,
+    RawTransaction, SendResponse, StandardFee, SubtreeRoot, TransparentAddressBlockFilter,
+    TreeState, TxFilter,
     compact_tx_streamer_server::{CompactTxStreamer, CompactTxStreamerServer},
 };
 
@@ -268,6 +269,10 @@ impl CompactTxStreamer for MockStreamer {
     }
 
     async fn get_lightd_info(&self, _: Request<Empty>) -> Result<Response<LightdInfo>, Status> {
+        unimplemented()
+    }
+
+    async fn get_standard_fee(&self, _: Request<Empty>) -> Result<Response<StandardFee>, Status> {
         unimplemented()
     }
 

@@ -405,7 +405,7 @@ fn certificate_free_ca_file_is_a_typed_error() -> Result<()> {
         ),
         "{error:?}"
     );
-    let rendered = error.map(|error| error.to_string()).unwrap_or_default();
+    let rendered = error.map_or_default(|error| error.to_string());
     assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
     Ok(())
 }

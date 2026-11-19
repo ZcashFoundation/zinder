@@ -9,8 +9,8 @@
 # x86_64 Linux. No job that installs a tool runs on arm64.
 #
 # name            version  url                                                                                                                                       sha256
-cargo-nextest     0.9.116  https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.116/cargo-nextest-0.9.116-x86_64-unknown-linux-gnu.tar.gz        091d5a09af17fba9df5d3aebc5964d731c3a044525c963a98c31d6d4506a7ee3
-cargo-deny        0.19.4   https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.4/cargo-deny-0.19.4-x86_64-unknown-linux-musl.tar.gz                   3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f
-cargo-machete     0.9.2    https://github.com/bnjbvr/cargo-machete/releases/download/v0.9.2/cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz                    48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9
-cargo-llvm-cov    0.8.5    https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.5/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz                        7e62d664f5133d43d33a3b11138c93feff98bd71e953ddc260ea8ddf360a37c6
-cargo-mutants     27.0.0   https://github.com/sourcefrog/cargo-mutants/releases/download/v27.0.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz                      5083ce59bf9195ce9bb218278b609bbd183be897ca53671bad4df588fc7a9d7d
+cargo-nextest     0.9.152  https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz        d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
+cargo-deny        0.21.0   https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/cargo-deny-0.21.0-x86_64-unknown-linux-musl.tar.gz                   a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903
+cargo-machete     0.10.1   https://github.com/bnjbvr/cargo-machete/releases/download/v0.10.1/cargo-machete-v0.10.1-x86_64-unknown-linux-musl.tar.gz                  785d381985140ffa172246d82089adeb7f2eb9c774d961c48f77a4494023afb5
+cargo-llvm-cov    0.9.1    https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz                        b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+cargo-mutants     27.1.0   https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz                      dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e

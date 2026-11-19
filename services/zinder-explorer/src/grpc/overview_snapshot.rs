@@ -487,7 +487,7 @@ const fn clamp(requested: u32, default: u32, min: u32, max: u32) -> u32 {
 mod tests {
     use std::collections::HashMap;
 
-    use tonic_types::{ErrorDetails, StatusExt as _};
+    use tonic_types::ErrorDetails;
 
     use super::*;
 

@@ -789,7 +789,7 @@ fn decode_outpoint_list(
         return Err(WalletProjectionContractError::DurableLengthPrefixMismatch { field });
     };
     let mut keys = Vec::with_capacity(count);
-    for encoded_outpoint in list_bytes.chunks_exact(OUTPOINT_KEY_LEN) {
+    for encoded_outpoint in list_bytes.as_chunks::<OUTPOINT_KEY_LEN>().0 {
         let key = WalletOutpointKey::decode(encoded_outpoint)?;
         keys.push(key);
     }
@@ -814,7 +814,7 @@ fn decode_address_transaction_list(
         return Err(WalletProjectionContractError::DurableLengthPrefixMismatch { field });
     };
     let mut keys = Vec::with_capacity(count);
-    for encoded_address_transaction in list_bytes.chunks_exact(ADDRESS_TRANSACTION_KEY_LEN) {
+    for encoded_address_transaction in list_bytes.as_chunks::<ADDRESS_TRANSACTION_KEY_LEN>().0 {
         let key = WalletAddressTransactionKey::decode(encoded_address_transaction)?;
         keys.push(key);
     }

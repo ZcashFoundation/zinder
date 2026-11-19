@@ -235,7 +235,7 @@ impl BlockKeyedConsumer for CommitmentRootSearchConsumer {
         let index_cf = ctx
             .store
             .consumer_column_family(COMMITMENT_ROOT_SEARCH_INDEX_COLUMN_FAMILY)?;
-        for key in index_payload.chunks_exact(ROOT_KEY_LEN) {
+        for key in index_payload.as_chunks::<ROOT_KEY_LEN>().0 {
             ctx.batch.delete_cf(&root_cf, key);
         }
         ctx.batch.delete_cf(&index_cf, index_key);
@@ -573,9 +573,18 @@ mod tests {
 
         revert_block(&store, &mut consumer, BlockHeight::new(100))?;
 
-        assert!(CommitmentRootSearchConsumer::search(&store, root(1), 10)?.is_empty());
-        assert!(CommitmentRootSearchConsumer::search(&store, root(2), 10)?.is_empty());
-        assert!(CommitmentRootSearchConsumer::search(&store, root(3), 10)?.is_empty());
+        assert_eq!(
+            CommitmentRootSearchConsumer::search(&store, root(1), 10)?,
+            []
+        );
+        assert_eq!(
+            CommitmentRootSearchConsumer::search(&store, root(2), 10)?,
+            []
+        );
+        assert_eq!(
+            CommitmentRootSearchConsumer::search(&store, root(3), 10)?,
+            []
+        );
         Ok(())
     }
 

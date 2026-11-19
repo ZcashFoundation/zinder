@@ -80,7 +80,7 @@ fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
         .chain_metadata
         .ok_or_else(|| eyre!("decoded compact block is missing chain metadata"))?;
 
-    assert!(decoded_compact_block.header.is_empty());
+    assert_eq!(decoded_compact_block.header, [] as [u8; 0]);
     assert_eq!(compact_transaction.txid, transaction_id);
     assert_eq!(
         transparent_input.prevout_txid,

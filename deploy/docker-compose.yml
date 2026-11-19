@@ -212,7 +212,7 @@ services:
       retries: 3
 
   zinder-prometheus:
-    image: prom/prometheus:v3.2.0
+    image: prom/prometheus:v3.16.0
     mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: unless-stopped
     networks: [observability]
@@ -234,7 +234,7 @@ services:
       retries: 3
 
   zinder-grafana:
-    image: grafana/grafana:11.5.1
+    image: grafana/grafana:13.3.1
     mem_limit: ${ZINDER_GRAFANA_MEMORY_LIMIT:-512m}
     restart: unless-stopped
     profiles: [observability]

@@ -630,14 +630,15 @@ struct UnavailableWriter {
 }
 
 impl TreeStateStrideWriter for UnavailableWriter {
-    async fn commit_tree_state_stride(
+    fn commit_tree_state_stride(
         &self,
         _stride: DensifiedTreeStateStride,
-    ) -> Result<TreeStateStrideCommit, TreeStateStrideWriteError> {
+    ) -> impl std::future::Future<Output = Result<TreeStateStrideCommit, TreeStateStrideWriteError>> + Send
+    {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        Err(TreeStateStrideWriteError::Unavailable {
+        std::future::ready(Err(TreeStateStrideWriteError::Unavailable {
             reason: "the test writer is unavailable".to_owned(),
-        })
+        }))
     }
 }
 
@@ -1030,50 +1031,53 @@ impl TreeStateStrideWriter for FixtureWriter {
         clippy::significant_drop_tightening,
         reason = "holding the fixture through the live append and the commit serializes them as the writer's queue does"
     )]
-    async fn commit_tree_state_stride(
+    fn commit_tree_state_stride(
         &self,
         stride: DensifiedTreeStateStride,
-    ) -> Result<TreeStateStrideCommit, TreeStateStrideWriteError> {
-        let unavailable = |reason: String| TreeStateStrideWriteError::Unavailable { reason };
-        if self
-            .hooks
-            .refuse_seed_height
-            .is_some_and(|height| stride.stride().seed_height().value() == height)
-        {
-            return Err(TreeStateStrideWriteError::Integrity {
-                reason: "refused by the test writer".to_owned(),
-            });
-        }
-        let mut fixture = self.fixture.lock();
-        let fixture = fixture
-            .as_mut()
-            .ok_or_else(|| unavailable("the canonical fixture was closed".to_owned()))?;
-        if self.hooks.append_live_blocks_before_commit {
-            fixture
-                .append_live_block(&self.chain)
-                .map_err(|error| unavailable(error.to_string()))?;
-        }
-        let commit = fixture
-            .canonical_primary()
-            .map_err(|error| unavailable(error.to_string()))?
-            .commit_tree_state_stride(&stride)
-            .map_err(|error| {
-                if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
-                    TreeStateStrideWriteError::Integrity {
-                        reason: error.to_string(),
+    ) -> impl std::future::Future<Output = Result<TreeStateStrideCommit, TreeStateStrideWriteError>> + Send
+    {
+        std::future::ready((|| {
+            let unavailable = |reason: String| TreeStateStrideWriteError::Unavailable { reason };
+            if self
+                .hooks
+                .refuse_seed_height
+                .is_some_and(|height| stride.stride().seed_height().value() == height)
+            {
+                return Err(TreeStateStrideWriteError::Integrity {
+                    reason: "refused by the test writer".to_owned(),
+                });
+            }
+            let mut fixture = self.fixture.lock();
+            let fixture = fixture
+                .as_mut()
+                .ok_or_else(|| unavailable("the canonical fixture was closed".to_owned()))?;
+            if self.hooks.append_live_blocks_before_commit {
+                fixture
+                    .append_live_block(&self.chain)
+                    .map_err(|error| unavailable(error.to_string()))?;
+            }
+            let commit = fixture
+                .canonical_primary()
+                .map_err(|error| unavailable(error.to_string()))?
+                .commit_tree_state_stride(&stride)
+                .map_err(|error| {
+                    if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
+                        TreeStateStrideWriteError::Integrity {
+                            reason: error.to_string(),
+                        }
+                    } else {
+                        unavailable(error.to_string())
                     }
-                } else {
-                    unavailable(error.to_string())
-                }
-            })?;
-        let mut commits = self.commits.lock();
-        commits.push(commit);
-        if let Some((limit, cancel)) = &self.hooks.cancel_after_commits
-            && commits.len() >= *limit
-        {
-            cancel.cancel();
-        }
-        Ok(commit)
+                })?;
+            let mut commits = self.commits.lock();
+            commits.push(commit);
+            if let Some((limit, cancel)) = &self.hooks.cancel_after_commits
+                && commits.len() >= *limit
+            {
+                cancel.cancel();
+            }
+            Ok(commit)
+        })())
     }
 }
 

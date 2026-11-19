@@ -1810,7 +1810,10 @@ mod tests {
             .common
             .ok_or("explorer server info missing common descriptor")?;
         assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
-        assert!(info.materialized_view_identities.is_empty());
+        assert_eq!(
+            info.materialized_view_identities,
+            [] as [std::string::String; 0]
+        );
         let outcome = adapter
             .transaction_history(Request::new(TransactionHistoryRequest::default()))
             .await;

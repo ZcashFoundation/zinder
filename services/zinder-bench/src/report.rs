@@ -1797,7 +1797,7 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
     measurements: RocksDbCanonicalFixtureReplayMeasurements,
     exposition: Option<&str>,
 ) -> BenchmarkReport {
-    let samples = exposition.map(parse_prometheus_samples).unwrap_or_default();
+    let samples = exposition.map_or_default(parse_prometheus_samples);
     let block_count = measurements.source_load.block_count;
     let blocks_per_second = if measurements.total_seconds > 0.0 {
         u64_to_f64(block_count) / measurements.total_seconds

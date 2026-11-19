@@ -545,13 +545,17 @@ mod tests {
     impl CanonicalFenceProbe for ScriptedProbe {
         type Error = ProbeFailure;
 
-        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProbeFailure> {
+        fn catch_up(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, ProbeFailure>> {
             self.catch_ups += 1;
             self.secondary_sequence = self.writer_sequence;
-            Ok(Some(fence(self.secondary_sequence, 7)))
+            std::future::ready(Ok(Some(fence(self.secondary_sequence, 7))))
         }
 
-        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProbeFailure> {
+        fn writer_status(
+            &mut self,
+        ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, ProbeFailure>> {
             match &mut self.commits_remaining {
                 Some(0) => {}
                 Some(remaining) => {
@@ -560,7 +564,7 @@ mod tests {
                 }
                 None => self.writer_sequence += 1,
             }
-            Ok(status(fence(self.writer_sequence, 7)))
+            std::future::ready(Ok(status(fence(self.writer_sequence, 7))))
         }
 
         fn attests_writer_schedule(&self, _status: &CanonicalWriterStatusResponse) -> bool {
@@ -586,13 +590,17 @@ mod tests {
     impl CanonicalFenceProbe for FixedProbe {
         type Error = ProbeFailure;
 
-        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProbeFailure> {
+        fn catch_up(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, ProbeFailure>> {
             self.catch_ups += 1;
-            Ok(self.local.clone())
+            std::future::ready(Ok(self.local.clone()))
         }
 
-        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProbeFailure> {
-            Ok(self.writer.clone())
+        fn writer_status(
+            &mut self,
+        ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, ProbeFailure>> {
+            std::future::ready(Ok(self.writer.clone()))
         }
     }
 
@@ -602,8 +610,10 @@ mod tests {
     impl CanonicalFenceProbe for StalledStatusProbe {
         type Error = ProbeFailure;
 
-        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProbeFailure> {
-            Ok(Some(fence(5, 1)))
+        fn catch_up(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, ProbeFailure>> {
+            std::future::ready(Ok(Some(fence(5, 1))))
         }
 
         async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProbeFailure> {
@@ -939,14 +949,18 @@ mod tests {
         impl CanonicalFenceProbe for FailingProbe {
             type Error = ProbeFailure;
 
-            async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProbeFailure> {
-                Err(ProbeFailure)
+            fn catch_up(
+                &mut self,
+            ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, ProbeFailure>>
+            {
+                std::future::ready(Err(ProbeFailure))
             }
 
-            async fn writer_status(
+            fn writer_status(
                 &mut self,
-            ) -> Result<CanonicalWriterStatusResponse, ProbeFailure> {
-                Err(ProbeFailure)
+            ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, ProbeFailure>>
+            {
+                std::future::ready(Err(ProbeFailure))
             }
         }
 

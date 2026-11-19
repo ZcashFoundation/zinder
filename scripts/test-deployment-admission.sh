@@ -756,7 +756,7 @@ awk '
   /^  compare-binaries:/ { in_reproduction = 0 }
   in_reproduction && $0 == "      - name: Set up Docker Buildx" {
     print "      - name: Log in to GHCR"
-    print "        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3"
+    print "        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0"
     print "        with:"
     print "          registry: ghcr.io"
     print "          username: ${{ github.actor }}"
@@ -869,7 +869,7 @@ awk '
   /^  reproduce:/ { in_compile = 0 }
   in_compile && $0 == "      - name: Set up Docker Buildx" {
     print "      - name: Log in to GHCR"
-    print "        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3"
+    print "        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0"
     print ""
   }
   { print }
@@ -1093,7 +1093,7 @@ expect_rejected \
   --release-workflow "$untrusted_crate_publication_workflow"
 
 unpinned_crate_auth_workflow="$temporary_directory/unpinned-crate-auth-release.yml"
-sed 's#rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 #rust-lang/crates-io-auth-action@main #' \
+sed 's#rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 #rust-lang/crates-io-auth-action@main #' \
   "$repository_root/.github/workflows/release.yml" \
   > "$unpinned_crate_auth_workflow"
 expect_rejected \
@@ -1101,7 +1101,7 @@ expect_rejected \
   --release-workflow "$unpinned_crate_auth_workflow"
 
 unpinned_cargo_release_workflow="$temporary_directory/unpinned-cargo-release.yml"
-sed 's#ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac#ZcashFoundation/cargo-release@main#g' \
+sed 's#ZcashFoundation/cargo-release@f212e2569995d569baeb6cdeb7ed99b7602303a4#ZcashFoundation/cargo-release@main#g' \
   "$repository_root/.github/workflows/release.yml" \
   > "$unpinned_cargo_release_workflow"
 expect_rejected \
@@ -1198,7 +1198,7 @@ expect_rejected \
   --release-workflow "$early_oidc_workflow"
 
 unpinned_attestation_workflow="$temporary_directory/unpinned-attestation-release.yml"
-sed 's#actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 #actions/attest@main #' \
+sed 's#actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #actions/attest@main #' \
   "$repository_root/.github/workflows/release.yml" \
   > "$unpinned_attestation_workflow"
 expect_rejected \

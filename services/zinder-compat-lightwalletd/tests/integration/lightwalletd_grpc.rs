@@ -147,7 +147,10 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         latest_tree_state_checkpoint.sapling_tree,
         tree_state.sapling_tree
     );
-    assert!(subtree_roots.is_empty());
+    assert_eq!(
+        subtree_roots,
+        [] as [zinder_proto::compat::lightwalletd::SubtreeRoot; 0]
+    );
     assert_eq!(lightd_info.vendor, "Zinder");
     // Regtest collapses to "test" per BIP70 (Zebra's NetworkKind::bip70_network_name).
     // Wallet SDKs match `chainName` against ID_TESTNET, which is "test".
@@ -542,8 +545,8 @@ async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Re
 /// zingolib refuses to sync unless the field parses as
 /// `vMAJOR.MINOR.PATCH` and is at least 0.5.0 (zingolabs/zingolib `f930d80`,
 /// `pepper-sync/src/client.rs:104-143`, checked at `sync.rs:464`). The pinned
-/// reference lightwalletd v0.6.0 reports `v0.5.0` here
-/// (`common/common.go:51`), so Zinder reports the vendored protocol tag.
+/// reference lightwalletd reports the vendored `lightwallet-protocol` tag here,
+/// so Zinder reports `LIGHTWALLETD_PROTOCOL_VERSION` (`v0.6.0`).
 #[tokio::test]
 async fn lightd_info_protocol_version_satisfies_zingolib_minimum() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
@@ -569,6 +572,21 @@ async fn lightd_info_protocol_version_satisfies_zingolib_minimum() -> eyre::Resu
         version >= (0, 5, 0),
         "zingolib requires protocol 0.5.0 or later, got {version:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_standard_fee_returns_unimplemented() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    let status = adapter
+        .get_standard_fee(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected GetStandardFee to return UNIMPLEMENTED"))?;
+
+    assert_eq!(status.code(), Code::Unimplemented);
     Ok(())
 }
 
@@ -3009,8 +3027,7 @@ async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node(
             checkpoint
                 .frontiers
                 .get(protocol)
-                .map(|frontier| hex::encode(frontier.final_state_bytes()))
-                .unwrap_or_default()
+                .map_or_default(|frontier| hex::encode(frontier.final_state_bytes()))
         };
 
         assert_eq!(tree_state.height, u64::from(height));

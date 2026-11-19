@@ -727,7 +727,7 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
                 inner.start_height == 1 && inner.end_height == 1
             })
     ));
-    assert!(!first_event.cursor.is_empty());
+    assert_ne!(first_event.cursor, [] as [u8; 0]);
 
     Ok(())
 }

@@ -913,7 +913,7 @@ fn synthetic_block_hash(height: u32, branch_salt: u32) -> BlockHash {
     let mixed_word = height.wrapping_mul(FIXTURE_HASH_HEIGHT_MIX) ^ branch_salt;
     let mixed_bytes = mixed_word.to_be_bytes();
     let mut hash_bytes = [0u8; 32];
-    for hash_chunk in hash_bytes.chunks_exact_mut(4) {
+    for hash_chunk in hash_bytes.as_chunks_mut::<4>().0 {
         hash_chunk.copy_from_slice(&mixed_bytes);
     }
     BlockHash::from_bytes(hash_bytes)

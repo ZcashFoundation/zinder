@@ -2178,7 +2178,7 @@ mod tests {
             &frontiers,
             &activations,
         )?;
-        assert!(accumulator.completed_subtree_roots().is_empty());
+        assert_eq!(accumulator.completed_subtree_roots(), []);
 
         // Sapling completes subtree 0 with its last commitment, Orchard
         // completes subtree 0 with the first of two, and Ironwood completes
@@ -2216,7 +2216,7 @@ mod tests {
         );
 
         accumulator.append_block_commitments(BlockHeight::new(11), &[commitment(6)], &[], &[])?;
-        assert!(accumulator.completed_subtree_roots().is_empty());
+        assert_eq!(accumulator.completed_subtree_roots(), []);
         Ok(())
     }
 

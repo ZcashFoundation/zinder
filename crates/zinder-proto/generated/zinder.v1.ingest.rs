@@ -2,6 +2,7 @@
 /// IngestControl ServerInfo request. Same shape as every Zinder ServerInfo;
 /// orchestrators that probe the writer's identity and capability set use
 /// this rpc.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoRequest {}
 /// IngestControl ServerInfo response.
@@ -9,6 +10,7 @@ pub struct ServerInfoRequest {}
 /// Carries the cross-service `ops.ServerInfo` message. Operators probing
 /// the writer get the same descriptor shape they get from WalletQuery,
 /// without the wallet-specific retention or reorg-window fields.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoResponse {
     #[prost(message, optional, tag = "1")]
@@ -16,10 +18,12 @@ pub struct ServerInfoResponse {
 }
 /// Private ingest control-plane request for the writer's latest committed
 /// chain epoch.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriterStatusRequest {}
 /// Private ingest control-plane response used by colocated secondary readers
 /// to compute RocksDB-secondary replica lag.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriterStatusResponse {
     /// Cross-plane chain-state envelope. The writer's latest committed chain
@@ -68,12 +72,14 @@ pub struct WriterStatusResponse {
 }
 /// Private point lookup for one transaction in the writer's live mempool
 /// index. Transaction ids use canonical RPC byte order.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MempoolTransactionRequest {
     #[prost(string, tag = "1")]
     pub transaction_id: ::prost::alloc::string::String,
 }
 /// Exact authenticated fence published by the canonical writer.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalWriterFence {
     #[prost(uint64, tag = "1")]
@@ -90,9 +96,11 @@ pub struct CanonicalWriterFence {
     pub visible_block_count: u64,
 }
 /// Status request for the canonical writer.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalWriterStatusRequest {}
 /// Status used by projectors and secondary readers to authenticate their view.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanonicalWriterStatusResponse {
     #[prost(string, tag = "1")]
@@ -129,6 +137,7 @@ pub struct CanonicalWriterStatusResponse {
     pub tip_unconfirmed: bool,
 }
 /// One node-advertised network-upgrade activation in an admitted schedule.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalNetworkUpgradeActivation {
     #[prost(uint32, tag = "1")]
@@ -141,6 +150,7 @@ pub struct CanonicalNetworkUpgradeActivation {
 /// Writer-admitted network-upgrade schedule bound to canonical store control.
 /// The revision increases each time the writer admits a changed table; the
 /// fingerprint is the V1 activation-table fingerprint of `activations`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanonicalNetworkUpgradeSchedule {
     #[prost(uint64, tag = "1")]
@@ -154,6 +164,7 @@ pub struct CanonicalNetworkUpgradeSchedule {
     pub activations: ::prost::alloc::vec::Vec<CanonicalNetworkUpgradeActivation>,
 }
 /// Inclusive block-height range carried by one canonical transition.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalEventBlockRange {
     #[prost(uint32, tag = "1")]
@@ -162,6 +173,7 @@ pub struct CanonicalEventBlockRange {
     pub end_height: u32,
 }
 /// One validated event returned in durable sequence order.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalRetainedEvent {
     #[prost(bytes = "vec", tag = "1")]
@@ -182,6 +194,7 @@ pub struct CanonicalRetainedEvent {
     pub resulting_fence: ::core::option::Option<CanonicalWriterFence>,
 }
 /// Bounded page request. An empty cursor starts at the retention floor.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalEventPageRequest {
     #[prost(bytes = "vec", tag = "1")]
@@ -190,6 +203,7 @@ pub struct CanonicalEventPageRequest {
     pub max_events: u32,
 }
 /// Ordered retained events and the writer fence that bounded the page.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanonicalEventPageResponse {
     #[prost(message, repeated, tag = "1")]
@@ -200,6 +214,7 @@ pub struct CanonicalEventPageResponse {
     pub oldest_retained_event_sequence: u64,
 }
 /// Durable lease identity protecting one projection-construction anchor.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalProjectionBuildLease {
     #[prost(bytes = "vec", tag = "1")]
@@ -213,30 +228,36 @@ pub struct CanonicalProjectionBuildLease {
     #[prost(uint64, tag = "5")]
     pub generation: u64,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AcquireCanonicalProjectionBuildLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub lease: ::core::option::Option<CanonicalProjectionBuildLease>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenewCanonicalProjectionBuildLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub lease: ::core::option::Option<CanonicalProjectionBuildLease>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReleaseCanonicalProjectionBuildLeaseRequest {
     #[prost(message, optional, tag = "1")]
     pub lease: ::core::option::Option<CanonicalProjectionBuildLease>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalProjectionBuildLeaseResponse {
     #[prost(message, optional, tag = "1")]
     pub lease: ::core::option::Option<CanonicalProjectionBuildLease>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReleaseCanonicalProjectionBuildLeaseResponse {}
 /// An opaque block identifier carried in checkpoint admission evidence. Hash
 /// bytes use Zinder's native canonical block-hash byte order.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalCheckpointBlockId {
     #[prost(uint32, tag = "1")]
@@ -246,6 +267,7 @@ pub struct CanonicalCheckpointBlockId {
 }
 /// Authenticated replay prefix retained at the settled checkpoint of a
 /// cold-admitted canonical checkpoint.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalCheckpointSequenceEvidence {
     #[prost(message, optional, tag = "1")]
@@ -258,6 +280,7 @@ pub struct CanonicalCheckpointSequenceEvidence {
     pub logical_replay_bytes: u64,
 }
 /// One validated predecessor frontier committed by a canonical build plan.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalCheckpointFrontier {
     #[prost(bytes = "vec", tag = "1")]
@@ -266,6 +289,7 @@ pub struct CanonicalCheckpointFrontier {
     pub final_state: ::prost::alloc::vec::Vec<u8>,
 }
 /// Typed predecessor checkpoint that seeds retained canonical history.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalCheckpointHistoryPredecessor {
     #[prost(message, optional, tag = "1")]
@@ -283,6 +307,7 @@ pub struct CanonicalCheckpointHistoryPredecessor {
 /// This includes the exact activation table, retention boundary, predecessor,
 /// and fixed build tip; consumers need no pre-checkpoint status response to
 /// bind a state-bundle manifest to this canonical artifact.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalOwnerCheckpointBuildPlanEvidence {
     #[prost(uint32, tag = "1")]
@@ -307,6 +332,7 @@ pub struct CanonicalOwnerCheckpointBuildPlanEvidence {
 /// checkpoint. This is intentionally evidence, not a filesystem handle or
 /// path: consumers pair independently owned checkpoint artifacts by the
 /// returned identity and authenticated canonical state.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalOwnerCheckpointReadyEvidence {
     #[prost(message, optional, tag = "1")]
@@ -333,6 +359,7 @@ pub struct CanonicalOwnerCheckpointReadyEvidence {
 /// Requests a canonical owner checkpoint by an opaque, operator-selected
 /// candidate id. The writer resolves this identifier below its configured
 /// checkpoint staging root; arbitrary filesystem paths are never accepted.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateCanonicalOwnerCheckpointRequest {
     #[prost(string, tag = "1")]
@@ -348,6 +375,7 @@ pub struct CreateCanonicalOwnerCheckpointRequest {
 }
 /// Cold-admitted canonical identity and READY evidence for one checkpoint.
 /// `candidate_id` names the operator-selected staging entry; it is not a path.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateCanonicalOwnerCheckpointResponse {
     #[prost(string, tag = "1")]
@@ -388,6 +416,7 @@ pub struct CreateCanonicalOwnerCheckpointResponse {
 /// returned from CreateOwnerCheckpoint. The owner cold-opens the immutable
 /// checkpoint again and rejects any path, identity, or fence drift before a
 /// wallet checkpoint can be published.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadmitCanonicalOwnerCheckpointRequest {
     #[prost(string, tag = "1")]
@@ -406,6 +435,7 @@ pub struct ReadmitCanonicalOwnerCheckpointRequest {
 /// Requests a coherent, capture-only checkpoint bundle from the wallet
 /// projection owner. `candidate_id` is opaque: it is never interpreted as a
 /// filesystem path by the service.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateStateBundleCaptureRequest {
     #[prost(string, tag = "1")]
@@ -414,6 +444,7 @@ pub struct CreateStateBundleCaptureRequest {
 /// Identifies a state bundle that was fully captured and whose manifest was
 /// published last. Archive, restore, and serving-lane activation are outside
 /// this RPC's contract.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateStateBundleCaptureResponse {
     #[prost(string, tag = "1")]
@@ -436,6 +467,7 @@ pub struct CreateStateBundleCaptureResponse {
 /// Current phase of the phase-driven ingest loop. Orthogonal to readiness
 /// `cause`: a writer in `WRITER_PHASE_BULK_CATCHUP` may report `syncing`
 /// (normal) or `upstream_not_ready` (Zebra itself is behind). See ADR-0009.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WriterPhase {
@@ -481,6 +513,7 @@ impl WriterPhase {
     }
 }
 /// Exact transition category in the retained canonical event log.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum CanonicalRetainedEventKind {

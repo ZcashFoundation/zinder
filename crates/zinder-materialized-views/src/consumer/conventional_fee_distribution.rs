@@ -1174,7 +1174,7 @@ fn decode_distribution_value(
         return Err(malformed_distribution(payload));
     }
     let mut frequencies = Vec::with_capacity(frequency_count);
-    for pair in payload[VALUE_HEADER_LEN..].chunks_exact(FREQUENCY_LEN) {
+    for pair in payload[VALUE_HEADER_LEN..].as_chunks::<FREQUENCY_LEN>().0 {
         frequencies.push(ConventionalFeeFrequency {
             zip317_conventional_fee_zat: u64::from_be_bytes(
                 pair[..size_of::<u64>()]

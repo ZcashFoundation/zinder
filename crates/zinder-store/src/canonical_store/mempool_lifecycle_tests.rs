@@ -80,7 +80,7 @@ fn mempool_event_history_resumes_strictly_after_its_cursor()
     let from_latest = store.mempool_event_history(
         MempoolEventHistoryRequest::with_default_limit(Some(&second.cursor)),
     )?;
-    assert!(from_latest.is_empty());
+    assert_eq!(from_latest, []);
     Ok(())
 }
 
@@ -192,12 +192,11 @@ fn mempool_live_tail_start_skips_prior_events_and_delivers_later_appends()
         .resolve_mempool_event_stream_start(&EventStreamStartPosition::LiveTail)?
         .ok_or("live tail over retained events must resolve to a cursor")?;
     assert_eq!(head_cursor, second.cursor);
-    assert!(
-        store
-            .mempool_event_history(MempoolEventHistoryRequest::with_default_limit(Some(
-                &head_cursor
-            )))?
-            .is_empty()
+    assert_eq!(
+        store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(Some(
+            &head_cursor
+        )))?,
+        []
     );
 
     let third = append_added(&store, 0xA2, UnixTimestampMillis::new(3_000))?;

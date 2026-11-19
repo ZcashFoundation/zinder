@@ -155,7 +155,7 @@ pub mod compat {
         ));
 
         /// Upstream `lightwallet-protocol` release tag that
-        /// [`LIGHTWALLETD_PROTOCOL_COMMIT`] points to, such as `v0.5.0`.
+        /// [`LIGHTWALLETD_PROTOCOL_COMMIT`] points to, such as `v0.6.0`.
         ///
         /// `LightdInfo.lightwalletProtocolVersion` carries this tag, as
         /// lightwalletd does, because wallets parse that field as

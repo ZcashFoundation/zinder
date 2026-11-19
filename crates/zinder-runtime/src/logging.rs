@@ -141,8 +141,7 @@ mod tests {
     fn invalid_log_filter_error_names_the_variable_and_value() {
         let message = log_filter_from_directives(Some("zinder=bogus"))
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             message.starts_with("RUST_LOG=\"zinder=bogus\""),
             "{message}"

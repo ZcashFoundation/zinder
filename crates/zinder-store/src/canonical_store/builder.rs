@@ -597,7 +597,7 @@ mod tests {
         let mut tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32]);
         add_tree_state_checkpoint(&mut tip)?;
         store.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
-        assert!(store.required_subtree_root_ranges()?.is_empty());
+        assert_eq!(store.required_subtree_root_ranges()?, []);
 
         let unexpected_root = CanonicalBuildSubtreeRoot {
             protocol: zinder_core::ShieldedProtocol::Sapling,
