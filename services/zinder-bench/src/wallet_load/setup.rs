@@ -3,7 +3,8 @@
 //! It finds the tree-state heights and transaction IDs a `point-reads` run
 //! cycles through, and observes what `GetSubtreeRoots` returns. It runs on a
 //! connector that records into a throwaway recorder, so setup calls stay out
-//! of the run's report, and every call has the deadlines in [`SETUP_LIMITS`].
+//! of the run's report, and every call has the deadlines in [`SETUP_LIMITS`],
+//! including a total deadline for each stream.
 //!
 //! The lightwalletd protocol lets a client set `poolTypes` only after it
 //! checks that the server can filter by pool, and the Ironwood pool exists
@@ -16,7 +17,7 @@
 //! discovered transactions would silently leave out transparent-only ones.
 //! Against a server below `v0.5.0`, setup never names Ironwood.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, ops::ControlFlow, time::Duration};
 
 use serde::Serialize;
 use zinder_bench::BenchError;
@@ -39,18 +40,21 @@ use super::{
 
 /// Blocks read per `GetBlockRange` while discovering from the tip downward.
 const DISCOVERY_WINDOW_BLOCKS: u64 = 2_000;
+/// Deadlines for every setup call. The total stream deadline ends a stream
+/// that keeps delivering messages, which the idle limit never would.
 const SETUP_LIMITS: CallLimits = CallLimits {
     unary: Duration::from_secs(30),
     stream_open: Duration::from_secs(30),
     stream_idle: Some(Duration::from_secs(30)),
-    stream_total: None,
-};
-/// Limits for one `GetSubtreeRoots` request. The total deadline ends a stream
-/// that keeps delivering roots, which the idle limit never would.
-const SUBTREE_ROOTS_LIMITS: CallLimits = CallLimits {
     stream_total: Some(Duration::from_secs(120)),
-    ..SETUP_LIMITS
 };
+/// Most roots one `GetSubtreeRoots` request retains.
+///
+/// The protocol caps a pool at 65,536 subtrees, so 2^20 leaves room for a
+/// faulty server's repeats while bounding memory at a few dozen MiB.
+const MAX_RETAINED_ROOTS: usize = 1 << 20;
+/// Bytes in a valid `SubtreeRoot.rootHash`.
+const ROOT_HASH_BYTES: usize = 32;
 /// Most times the subtree-root check runs while the chain tip keeps moving.
 const SUBTREE_ROOTS_ATTEMPTS: u32 = 3;
 /// `GetSubtreeRoots` returns roots of subtrees of 2^16 note commitments, so a
@@ -83,8 +87,10 @@ pub(crate) struct SubtreeRootsRequestError {
 pub(crate) struct PoolSubtreeRoots {
     /// Roots the `max_entries = 0` request delivered, repeats included.
     returned_with_zero_max: u32,
-    /// Different `rootHash` values among them.
+    /// Different 32-byte `rootHash` values among them.
     distinct_roots: u32,
+    /// Roots whose `rootHash` is not 32 bytes. They are counted, not kept.
+    malformed_root_hashes: u32,
     /// Indexes whose root repeated one at a lower index.
     repeated_root_indexes: Vec<u32>,
     /// Whether a request for one root at index `returned_with_zero_max`
@@ -522,14 +528,22 @@ async fn observe_pool(
         shielded_protocol: protocol as i32,
         max_entries,
     };
-    let first = read_subtree_roots(connector, client, &SUBTREE_ROOTS_LIMITS, request(0, 0)).await;
+    let first = read_subtree_roots(
+        connector,
+        client,
+        &SETUP_LIMITS,
+        MAX_RETAINED_ROOTS,
+        request(0, 0),
+    )
+    .await;
     let (root_at_returned_index, follow_up_error) = if first.error.is_some() {
         (None, None)
     } else {
         let follow_up = read_subtree_roots(
             connector,
             client,
-            &SUBTREE_ROOTS_LIMITS,
+            &SETUP_LIMITS,
+            MAX_RETAINED_ROOTS,
             request(first.delivered, 1),
         )
         .await;
@@ -538,6 +552,7 @@ async fn observe_pool(
     PoolSubtreeRoots {
         returned_with_zero_max: first.delivered,
         distinct_roots: u32::try_from(first.seen.len()).unwrap_or(u32::MAX),
+        malformed_root_hashes: first.malformed,
         repeated_root_indexes: first.repeated_indexes,
         root_at_returned_index,
         completed_subtrees_at_tip,
@@ -548,37 +563,79 @@ async fn observe_pool(
 
 /// What one `GetSubtreeRoots` request delivered.
 ///
-/// Roots are tallied as they arrive and only each distinct `rootHash` is
-/// kept, so a stream that repeats roots does not grow memory with its
-/// length. A request that fails mid-stream, or runs past its total deadline,
-/// still reports the roots before the failure beside its error.
-#[derive(Default)]
+/// Roots are tallied as they arrive. Only each distinct 32-byte `rootHash`
+/// and each repeat position is kept, and together they never exceed
+/// `budget`, so a faulty stream cannot grow memory with its length. A root
+/// of another length is counted, not kept. A request that fails mid-stream,
+/// runs past its total deadline, or reaches the budget still reports the
+/// roots before it beside its error.
 struct RootTally {
     delivered: u32,
+    malformed: u32,
     seen: BTreeSet<Vec<u8>>,
     repeated_indexes: Vec<u32>,
+    budget: usize,
     error: Option<SubtreeRootsRequestError>,
 }
 
 impl RootTally {
-    fn record(&mut self, root_hash: Vec<u8>) {
-        if self.seen.contains(&root_hash) {
+    fn new(budget: usize) -> Self {
+        Self {
+            delivered: 0,
+            malformed: 0,
+            seen: BTreeSet::new(),
+            repeated_indexes: Vec::new(),
+            budget,
+            error: None,
+        }
+    }
+
+    /// Tallies one root, and breaks, recording a resource-limit error, when
+    /// keeping it would exceed the budget.
+    fn record(&mut self, root_hash: Vec<u8>) -> ControlFlow<()> {
+        if root_hash.len() != ROOT_HASH_BYTES {
+            self.malformed = self.malformed.saturating_add(1);
+        } else if self.seen.contains(&root_hash) {
+            if self.retained() >= self.budget {
+                return self.exhaust_budget();
+            }
             self.repeated_indexes.push(self.delivered);
         } else {
+            if self.retained() >= self.budget {
+                return self.exhaust_budget();
+            }
             self.seen.insert(root_hash);
         }
         self.delivered = self.delivered.saturating_add(1);
+        ControlFlow::Continue(())
+    }
+
+    fn retained(&self) -> usize {
+        self.seen.len() + self.repeated_indexes.len()
+    }
+
+    fn exhaust_budget(&mut self) -> ControlFlow<()> {
+        self.error = Some(SubtreeRootsRequestError {
+            error: format!(
+                "resource_limit: more than {} distinct roots and repeats",
+                self.budget
+            ),
+            roots_before_error: self.delivered,
+        });
+        ControlFlow::Break(())
     }
 }
 
-/// Reads one `GetSubtreeRoots` request within `limits`.
+/// Reads one `GetSubtreeRoots` request within `limits`, retaining at most
+/// `budget` distinct roots and repeat positions.
 async fn read_subtree_roots(
     connector: &Connector,
     client: &mut LwdClient,
     limits: &CallLimits,
+    budget: usize,
     arg: GetSubtreeRootsArg,
 ) -> RootTally {
-    let mut tally = RootTally::default();
+    let mut tally = RootTally::new(budget);
     let outcome = calls::stream_each(
         connector.recorder(),
         "GetSubtreeRoots",
@@ -587,10 +644,12 @@ async fn read_subtree_roots(
         |root: SubtreeRoot| tally.record(root.root_hash),
     )
     .await;
-    tally.error = outcome.err().map(|failure| SubtreeRootsRequestError {
-        error: failure_text(&failure),
-        roots_before_error: tally.delivered,
-    });
+    if tally.error.is_none() {
+        tally.error = outcome.err().map(|failure| SubtreeRootsRequestError {
+            error: failure_text(&failure),
+            roots_before_error: tally.delivered,
+        });
+    }
     tally
 }
 
@@ -744,8 +803,13 @@ async fn discover_mempool_txids(
             pool_types: pool_types(pools),
         }),
         |tx| {
-            if txids.len() < target && !tx.txid.is_empty() && seen.insert(tx.txid.clone()) {
+            if !tx.txid.is_empty() && seen.insert(tx.txid.clone()) {
                 txids.push(tx.txid);
+            }
+            if txids.len() >= target {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
         },
     )
@@ -775,8 +839,9 @@ mod tests {
     use zinder_proto::compat::lightwalletd::{GetSubtreeRootsArg, PoolType};
 
     use super::{
-        CallLimits, ObservedBlock, RootTally, SETUP_LIMITS, ServedProtocol, WalletPlan,
-        decode_rpc_txids, dedup_in_order, read_subtree_roots, windows_newest_first,
+        CallLimits, MAX_RETAINED_ROOTS, ObservedBlock, RootTally, SETUP_LIMITS, ServedProtocol,
+        WalletPlan, decode_rpc_txids, dedup_in_order, discover_mempool_txids, read_subtree_roots,
+        windows_newest_first,
     };
     use crate::wallet_load::{
         calls::{CallRecorder, Connector},
@@ -928,9 +993,9 @@ mod tests {
 
     #[test]
     fn a_tally_keeps_each_distinct_root_once_and_names_repeat_positions() {
-        let mut tally = RootTally::default();
-        for root in [[1], [2], [1], [1]] {
-            tally.record(root.to_vec());
+        let mut tally = RootTally::new(MAX_RETAINED_ROOTS);
+        for root in [1, 2, 1, 1] {
+            assert!(tally.record(vec![root; 32]).is_continue());
         }
 
         assert_eq!(tally.delivered, 4);
@@ -962,6 +1027,7 @@ mod tests {
             &connector,
             &mut client,
             &limits,
+            MAX_RETAINED_ROOTS,
             GetSubtreeRootsArg {
                 start_index: 0,
                 shielded_protocol: 0,
@@ -981,6 +1047,115 @@ mod tests {
         assert!(tally.delivered > 0);
         assert_eq!(error.roots_before_error, tally.delivered);
         assert_eq!(tally.seen.len(), usize::try_from(tally.delivered)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tally_counts_roots_that_are_not_32_bytes_without_keeping_them() {
+        let mut tally = RootTally::new(MAX_RETAINED_ROOTS);
+        for root in [vec![1; 31], vec![2; 32], vec![], vec![1; 33], vec![2; 32]] {
+            assert!(tally.record(root).is_continue());
+        }
+
+        assert_eq!(tally.delivered, 5);
+        assert_eq!(tally.malformed, 3);
+        assert_eq!(tally.seen.len(), 1);
+        assert_eq!(tally.repeated_indexes, [4]);
+        assert!(tally.error.is_none());
+    }
+
+    #[test]
+    fn a_tally_stops_with_a_resource_limit_error_when_its_budget_is_spent()
+    -> Result<(), Box<dyn Error>> {
+        let mut tally = RootTally::new(3);
+        assert!(tally.record(vec![1; 32]).is_continue());
+        assert!(tally.record(vec![1; 32]).is_continue());
+        assert!(tally.record(vec![2; 32]).is_continue());
+        assert!(tally.record(vec![1; 32]).is_break());
+
+        let error = tally
+            .error
+            .as_ref()
+            .ok_or("the exhausted budget must be reported")?;
+        assert!(
+            error.error.starts_with("resource_limit:"),
+            "{}",
+            error.error
+        );
+        assert_eq!(error.roots_before_error, 3);
+        assert_eq!(tally.delivered, 3);
+        assert_eq!(tally.retained(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_endless_root_stream_stops_at_the_budget_with_a_resource_limit_error()
+    -> Result<(), Box<dyn Error>> {
+        let mut streamer = MockStreamer::new(RangeEnding::Clean);
+        streamer.subtree_root_endless = true;
+        let server = mock_streamer::serve(streamer).await?;
+        let connector = Connector::new(
+            &server.url,
+            Arc::new(CallRecorder::default()),
+            &TlsOptions::default(),
+        )?;
+        let mut client = connector
+            .connect()
+            .await
+            .map_err(|failure| failure.detail)?;
+
+        let tally = tokio::time::timeout(
+            Duration::from_secs(20),
+            read_subtree_roots(
+                &connector,
+                &mut client,
+                &SETUP_LIMITS,
+                8,
+                GetSubtreeRootsArg {
+                    start_index: 0,
+                    shielded_protocol: 0,
+                    max_entries: 0,
+                },
+            ),
+        )
+        .await?;
+
+        let error = tally.error.ok_or("the budget must end the stream")?;
+        assert!(
+            error.error.starts_with("resource_limit:"),
+            "{}",
+            error.error
+        );
+        assert_eq!(tally.delivered, 8);
+        assert_eq!(error.roots_before_error, 8);
+        assert_eq!(tally.seen.len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_streams_have_a_total_deadline() {
+        assert!(SETUP_LIMITS.stream_total.is_some());
+    }
+
+    #[tokio::test]
+    async fn mempool_discovery_stops_at_its_target_while_the_stream_keeps_producing()
+    -> Result<(), Box<dyn Error>> {
+        let mut streamer = MockStreamer::new(RangeEnding::Clean);
+        streamer.mempool_endless = true;
+        let server = mock_streamer::serve(streamer).await?;
+        let connector = Connector::new(
+            &server.url,
+            Arc::new(CallRecorder::default()),
+            &TlsOptions::default(),
+        )?;
+
+        let txids = tokio::time::timeout(
+            Duration::from_secs(20),
+            discover_mempool_txids(&connector, 3, &[]),
+        )
+        .await??;
+
+        assert_eq!(txids.len(), 3);
         Ok(())
     }
 

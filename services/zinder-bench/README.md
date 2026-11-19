@@ -750,8 +750,11 @@ source:
 
 The `point-reads` settings below, and the setup they run, apply only to that
 workload. `--workload` values that download blocks refuse them. Setup calls
-have the same 30-second deadlines as the rounds' calls, so a server that
-stops answering fails the run instead of stalling it.
+have the same 30-second deadlines as the rounds' calls, and every setup
+stream also ends at 120 seconds in total, so a server that stops answering,
+or keeps sending messages without end, fails or finishes setup instead of
+stalling it. Mempool discovery stops reading as soon as it has `<count>`
+transaction IDs.
 
 Settings that cycle through a list, such as distinct frontiers and transaction
 IDs, share one position in each list across all wallets. A wallet takes the
@@ -917,9 +920,11 @@ identity, the workload's constants, and, over all wallets:
   holds observations only. For `sapling`, `orchard`, and `ironwood`:
   - `returned_with_zero_max`: the roots the `max_entries` of 0 request
     delivered, repeats included.
-  - `distinct_roots`: the different `rootHash` values among them.
+  - `distinct_roots`: the different 32-byte `rootHash` values among them.
     `SubtreeRoot` carries no index, so a root's position in the response is
     the subtree index it stands for.
+  - `malformed_root_hashes`: the roots whose `rootHash` is not 32 bytes. They
+    count in `returned_with_zero_max` but are not kept.
   - `repeated_root_indexes`: the zero-based positions in the response whose
     root repeated one at a lower position. They equal subtree indexes only
     when the response starts at index 0 and skips nothing.
@@ -931,7 +936,10 @@ identity, the workload's constants, and, over all wallets:
     (`chain_metadata_block_is_tip`) or when it carried no `chainMetadata`.
   - `zero_max_error` and `follow_up_error`: present when that request failed,
     with the status in `error` and the roots delivered before it in
-    `roots_before_error`.
+    `roots_before_error`. A request retains at most 1,048,576 distinct roots
+    plus repeat positions, 16 times the protocol's 65,536 subtrees per pool.
+    Past that it stops reading and reports a `resource_limit` error with the
+    partial tally.
 
   `ironwood` is absent against a server below protocol `v0.5.0`. `attempts`
   is how many times the probe ran. `tip_before` and `tip_after` are the

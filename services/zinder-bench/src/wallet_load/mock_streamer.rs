@@ -131,6 +131,9 @@ pub(super) struct MockStreamer {
     /// Whether a `GetSubtreeRoots` stream sends distinct roots without end,
     /// pausing briefly between them.
     pub(super) subtree_root_endless: bool,
+    /// Whether a `GetMempoolTx` stream sends distinct transactions without
+    /// end, pausing briefly between them.
+    pub(super) mempool_endless: bool,
     /// The `chainMetadata` of every block `GetBlock` returns.
     pub(super) block_chain_metadata: BlockChainMetadata,
     /// `GetBlock` calls, from the first, answered with `NOT_FOUND`, as if
@@ -172,6 +175,7 @@ impl MockStreamer {
             subtree_root_failure_after: None,
             subtree_root_page_failure: false,
             subtree_root_endless: false,
+            mempool_endless: false,
             block_chain_metadata: BlockChainMetadata::FromStoredRoots,
             block_not_found_reads: 0,
             block_reads: Arc::default(),
@@ -244,6 +248,13 @@ pub(super) fn transparent_txid(height: u64) -> Vec<u8> {
 fn replay<Reply: Clone + Send + 'static>(replies: &[Reply]) -> Response<Replies<Reply>> {
     let replies = replies.iter().cloned().map(Ok).collect::<Vec<_>>();
     Response::new(stream::iter(replies).boxed())
+}
+
+/// A 32-byte value that differs for each `index`.
+fn distinct_hash(index: u32) -> Vec<u8> {
+    let mut hash = vec![0; 32];
+    hash[..4].copy_from_slice(&index.to_be_bytes());
+    hash
 }
 
 fn unimplemented<Reply>() -> Result<Response<Reply>, Status> {
@@ -442,6 +453,17 @@ impl CompactTxStreamer for MockStreamer {
             .mempool_pool_types
             .lock()
             .push(request.into_inner().pool_types);
+        if self.mempool_endless {
+            let txs = stream::unfold(0_u32, |index| async move {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let tx = CompactTx {
+                    txid: distinct_hash(index),
+                    ..CompactTx::default()
+                };
+                Some((Ok(tx), index.wrapping_add(1)))
+            });
+            return Ok(Response::new(txs.boxed()));
+        }
         let mempool = self
             .mempool_txids
             .iter()
@@ -480,7 +502,7 @@ impl CompactTxStreamer for MockStreamer {
             let roots = stream::unfold(0_u32, |index| async move {
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 let root = SubtreeRoot {
-                    root_hash: index.to_be_bytes().to_vec(),
+                    root_hash: distinct_hash(index),
                     ..SubtreeRoot::default()
                 };
                 Some((Ok(root), index.wrapping_add(1)))

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    ops::ControlFlow,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -660,21 +661,26 @@ where
     Reply: prost::Message + Default,
     Open: Future<Output = Result<tonic::Response<tonic::Streaming<Reply>>, Status>>,
 {
-    stream_each(recorder, method, limits, open, drop).await
+    stream_each(recorder, method, limits, open, |reply| {
+        drop(reply);
+        ControlFlow::Continue(())
+    })
+    .await
 }
 
 /// Opens a server stream with `open` and hands each reply to `on_reply`,
 /// recording the stream under `method`.
 ///
-/// The stream fails as a client timeout when it outlasts
-/// `limits.stream_total`, after `on_reply` saw every reply that arrived
-/// before.
+/// The stream ends successfully, without reading the rest, as soon as
+/// `on_reply` returns `ControlFlow::Break`. It fails as a client timeout when
+/// it outlasts `limits.stream_total`, after `on_reply` saw every reply that
+/// arrived before.
 pub(super) async fn stream_each<Reply, Open>(
     recorder: &CallRecorder,
     method: &'static str,
     limits: &CallLimits,
     open: Open,
-    mut on_reply: impl FnMut(Reply),
+    mut on_reply: impl FnMut(Reply) -> ControlFlow<()>,
 ) -> Result<u64, CallFailure>
 where
     Reply: prost::Message + Default,
@@ -685,7 +691,9 @@ where
         let mut replies = open_stream(limits, open).await?;
         while let Some(reply) = next_reply(limits, &mut replies).await? {
             pending.note_message(u64::try_from(reply.encoded_len()).unwrap_or(u64::MAX));
-            on_reply(reply);
+            if on_reply(reply).is_break() {
+                break;
+            }
         }
         Ok(pending.messages)
     };
