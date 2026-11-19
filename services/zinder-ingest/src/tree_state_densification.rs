@@ -6,9 +6,13 @@
 //! those reads become stored-checkpoint reads. A canonical secondary replays
 //! the stride on a bounded number of blocking threads, and the writer commits
 //! the rows through its command queue between live commits. The pass runs only
-//! while historical work may run, and resumes from the first stride whose
-//! stored checkpoints do not satisfy the selection, so a restart neither
-//! repeats committed strides nor needs a progress record.
+//! while historical work may run. It records its progress as a watermark in
+//! [`TREE_STATE_DENSIFICATION_WATERMARK_FILE`] in the canonical store
+//! directory, bound to the store's construction manifest and the selection. A
+//! restart resumes at that watermark once the stride ending there still
+//! satisfies the selection, and otherwise scans from the first stride. A
+//! stride skipped as an integrity failure holds the watermark below it, so the
+//! next run examines it again.
 
 use std::{
     collections::VecDeque,
