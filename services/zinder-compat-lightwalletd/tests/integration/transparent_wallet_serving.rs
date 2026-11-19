@@ -19,7 +19,8 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_compat_lightwalletd::{
-    LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
+    BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS, LightwalletdAdmissionError, LightwalletdGrpcAdapter,
+    LightwalletdResponseLimits,
 };
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, CompactBlockArtifact,
@@ -1352,6 +1353,44 @@ async fn production_pair_get_block_range_outside_retained_history_keeps_lightwal
     }
 }
 
+/// A range fails before its stream opens when one of the first 1,000 heights
+/// it would send is outside retained history, even though its first chunk
+/// keeps only retained blocks.
+#[tokio::test]
+async fn production_pair_get_block_range_checks_the_first_1000_heights_before_the_stream()
+-> eyre::Result<()> {
+    let tip_height = BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS.get() + 8;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(tip_height);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
+
+    // Descending, the first chunk keeps the highest blocks and the span it
+    // checks reaches unretained height 0.
+    let request = lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: u64::from(tip_height),
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: 0,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+    match adapter.get_block_range(Request::new(request)).await {
+        Err(status) => {
+            assert_eq!(status.code(), Code::NotFound, "{}", status.message());
+            Ok(())
+        }
+        Ok(_) => Err(eyre::eyre!(
+            "the call must fail before its stream opens, not open a stream"
+        )),
+    }
+}
+
 async fn first_block_range_status(
     adapter: &WalletServingAdapter,
     start_height: u64,
@@ -1875,10 +1914,10 @@ impl CanonicalReader for InstrumentedCanonicalReader {
         &self,
         range: BlockHeightRange,
         order: zinder_store::HeightOrder,
-        max_bytes: usize,
+        budget: zinder_store::CompactBlockReadBudget,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
         self.canonical_reader
-            .compact_blocks_in_range_up_to(range, order, max_bytes)
+            .compact_blocks_in_range_up_to(range, order, budget)
             .await
     }
 

@@ -2700,8 +2700,8 @@ mod tests {
             .await?
             .into_inner();
         let mut blocks = Vec::new();
-        // Block 1,001 opens the second chunk, so that chunk has been read and
-        // the stream now waits on this client.
+        // Block 1,001 lies in the second chunk, so the third has been read
+        // ahead, and the stream now waits on this client.
         read_blocks(&mut stream, &mut blocks, 1_001).await?;
 
         harness.writer.append_live_block(&chain)?;
@@ -2755,9 +2755,10 @@ mod tests {
             .await?
             .into_inner();
         let mut blocks = Vec::new();
-        // The chunks are 2,100 to 1,101, 1,100 to 101, and 100 to 1. Block
-        // 1,100 opens the second chunk, so it is read before the publication,
-        // and the third waits for this client and is read after it.
+        // The chunks are 2,100 to 2,037, 2,036 to 1,037, 1,036 to 37, and 36
+        // to 1. Block 1,100 lies in the second chunk, so the third is read
+        // before the publication, and the fourth waits until the second is
+        // queued for this client and is read after it.
         read_blocks(&mut stream, &mut blocks, 1_001).await?;
         harness.writer.append_live_block(&chain)?;
         harness.refresh_at_writer_fence().await?;
@@ -2774,7 +2775,12 @@ mod tests {
         harness.stop().await
     }
 
-    /// What a stream over heights 1 through 2,050 sent across a reorg.
+    /// Last height of the second chunk of an ascending stream of small blocks
+    /// from height 1.
+    const SECOND_CHUNK_END: u32 =
+        zinder_compat_lightwalletd::BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS.get() + 1_000;
+
+    /// What a stream over heights 1 through 1,100 sent across a reorg.
     ///
     /// The reorg is a live replacement from `fork_height` through
     /// `replacement_tip_height`, published while the stream waits on its
@@ -2788,7 +2794,7 @@ mod tests {
         fork_height: u32,
         replacement_tip_height: u32,
     ) -> Result<ReorgedStream, Box<dyn std::error::Error>> {
-        const TIP_HEIGHT: u32 = 2_050;
+        const TIP_HEIGHT: u32 = 1_100;
         let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(TIP_HEIGHT);
@@ -2822,9 +2828,10 @@ mod tests {
             .await?
             .into_inner();
         let mut blocks = Vec::new();
-        // The second chunk is read before the replacement and the third
-        // after it.
-        read_blocks(&mut stream, &mut blocks, 1_001).await?;
+        // The chunks are 1 to 64, 65 to 1,064, and 1,065 to 1,100. The second
+        // is read while the first is sent, and the third once the first is
+        // queued for this client, so the third is read after the replacement.
+        read_blocks(&mut stream, &mut blocks, 40).await?;
         harness
             .writer
             .replace_live_blocks(&replacement_chain, BlockHeight::new(fork_height))?;
@@ -2844,8 +2851,8 @@ mod tests {
     #[tokio::test]
     async fn a_block_range_stream_ends_aborted_when_a_sent_block_is_replaced()
     -> Result<(), Box<dyn std::error::Error>> {
-        let reorged = stream_across_reorg(1_990, 2_050).await?;
-        assert_linked_from_genesis(&reorged.blocks, 2_000);
+        let reorged = stream_across_reorg(1_050, 1_100).await?;
+        assert_linked_from_genesis(&reorged.blocks, SECOND_CHUNK_END);
         assert_eq!(
             reorged.ending.as_ref().map(tonic::Status::code),
             Some(Code::Aborted),
@@ -2866,7 +2873,7 @@ mod tests {
         let metrics_handle = metrics_recorder.handle();
         let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
 
-        let reorged = stream_across_reorg(1_990, 2_050).await?;
+        let reorged = stream_across_reorg(1_050, 1_100).await?;
         assert_eq!(
             reorged.ending.as_ref().map(tonic::Status::code),
             Some(Code::Aborted)
@@ -2876,7 +2883,7 @@ mod tests {
         let rendered = metrics_handle.render();
         assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
         assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(2));
-        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(1));
+        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(2));
         Ok(())
     }
 
@@ -2886,8 +2893,8 @@ mod tests {
     #[tokio::test]
     async fn a_block_range_stream_ends_out_of_range_when_the_tip_falls_below_the_range()
     -> Result<(), Box<dyn std::error::Error>> {
-        let reorged = stream_across_reorg(2_020, 2_030).await?;
-        assert_linked_from_genesis(&reorged.blocks, 2_000);
+        let reorged = stream_across_reorg(1_070, 1_080).await?;
+        assert_linked_from_genesis(&reorged.blocks, SECOND_CHUNK_END);
         assert_eq!(
             reorged.ending.as_ref().map(tonic::Status::code),
             Some(Code::OutOfRange),
@@ -3157,6 +3164,31 @@ mod tests {
         drop(pinned);
         assert_eq!(Arc::strong_count(&retired), 1);
         Ok(())
+    }
+
+    /// A range fails before its stream opens when one of the first 1,000
+    /// heights it would send is outside retained history, even though its
+    /// first chunk keeps only retained blocks.
+    #[tokio::test]
+    async fn get_block_range_checks_the_first_1000_heights_before_the_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tip_height = zinder_compat_lightwalletd::BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS.get() + 8;
+        let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
+            .extend_blocks(tip_height);
+        let (reader, _fixture) = large_block_reader(&chain)?;
+
+        // Descending, the first chunk keeps the highest blocks and the span
+        // it checks reaches unretained height 0.
+        match adapter_serving(&reader)
+            .get_block_range(Request::new(block_range(tip_height, 0)))
+            .await
+        {
+            Err(status) => {
+                assert_eq!(status.code(), Code::NotFound, "{}", status.message());
+                Ok(())
+            }
+            Ok(_) => Err("the call must fail before its stream opens".into()),
+        }
     }
 
     /// Compact-block serving keeps the lightwalletd range status contract:
@@ -3501,8 +3533,8 @@ mod tests {
         CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(Arc::clone(reader)))
     }
 
-    /// Returns how many blocks of `1..=LARGE_BLOCK_TIP` one byte-capped chunk
-    /// read of `reader` keeps.
+    /// Returns how many blocks of `1..=LARGE_BLOCK_TIP` the read of a stream's
+    /// first chunk keeps from `reader`.
     fn first_chunk_blocks(
         reader: &RocksDbCanonicalReader,
     ) -> Result<u32, Box<dyn std::error::Error>> {
@@ -3512,7 +3544,10 @@ mod tests {
                 BlockHeight::new(LARGE_BLOCK_TIP),
             ),
             zinder_store::HeightOrder::Ascending,
-            zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES,
+            zinder_store::CompactBlockReadBudget::bytes(
+                zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES,
+            )
+            .with_max_blocks(zinder_compat_lightwalletd::BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS),
         )?;
         Ok(u32::try_from(first_chunk.len())?)
     }
@@ -3620,7 +3655,9 @@ mod tests {
                 BlockHeight::new(TIP_HEIGHT),
             ),
             zinder_store::HeightOrder::Ascending,
-            zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES,
+            zinder_store::CompactBlockReadBudget::bytes(
+                zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES,
+            ),
         )?;
         assert_eq!(first_chunk.len(), 1, "each chunk must keep one block");
         let adapter = adapter_serving(&reader);
@@ -3954,10 +3991,8 @@ mod tests {
     }
 
     /// Each chunk records how long it took to read and to convert, although
-    /// both run on the blocking pool.
-    ///
-    /// Each chunk after the first also records how long its reader waited to
-    /// queue it for the client.
+    /// both run on the blocking pool, and how long its reader waited to queue
+    /// it for the client.
     #[tokio::test]
     async fn get_block_range_times_each_chunk_stage() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_recorder =
@@ -3982,10 +4017,7 @@ mod tests {
             block_range_stage_samples(&rendered, "convert"),
             Some(chunks)
         );
-        assert_eq!(
-            block_range_stage_samples(&rendered, "send"),
-            Some(chunks - 1)
-        );
+        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(chunks));
         Ok(())
     }
 

@@ -26,9 +26,9 @@ use zinder_core::{
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
     CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    RocksDbCanonicalSecondary, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
-    TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventStreamResume, CompactBlockReadBudget, EventStreamStartPosition, HeightOrder,
+    RawBlobRetention, RocksDbCanonicalSecondary, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -206,9 +206,9 @@ impl CanonicalReader for RocksDbCanonicalReader {
         &self,
         range: BlockHeightRange,
         order: HeightOrder,
-        max_bytes: usize,
+        budget: CompactBlockReadBudget,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
-        self.read(move |secondary| secondary.compact_blocks_in_range_up_to(range, order, max_bytes))
+        self.read(move |secondary| secondary.compact_blocks_in_range_up_to(range, order, budget))
             .await
     }
 

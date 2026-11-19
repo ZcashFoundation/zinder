@@ -29,9 +29,9 @@ use zinder_core::{
 };
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
-    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
-    TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, CompactBlockReadBudget,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -122,11 +122,11 @@ pub trait CanonicalReader: Send + Sync + 'static {
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError>;
 
     /// Reads compact blocks from the end of `range` that `order` visits
-    /// first, until the next block would take their stored bytes past
-    /// `max_bytes`.
+    /// first, until they number `budget.max_blocks` or the next block would
+    /// take their stored bytes past `budget.max_bytes`.
     ///
-    /// The read always keeps one block, so a block larger than `max_bytes`
-    /// comes back alone. The blocks come back in ascending height order and
+    /// The read always keeps one block, so a block larger than
+    /// `budget.max_bytes` comes back alone. The blocks come back in ascending height order and
     /// cover consecutive heights at the starting end. The whole of `range`
     /// is checked as [`Self::compact_blocks_in_range`] checks it, even where
     /// the budget would stop the read first.
@@ -134,7 +134,7 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         range: BlockHeightRange,
         order: HeightOrder,
-        max_bytes: usize,
+        budget: CompactBlockReadBudget,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError>;
 
     /// Reads the retained raw block at `height`, or `None` when the store

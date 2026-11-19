@@ -22,8 +22,8 @@ mod request_limits;
 mod stale_tip;
 
 pub use block_range::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
-    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BLOCKS,
+    DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use compact_blocks_grpc::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
 pub use grpc::{
