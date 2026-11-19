@@ -160,9 +160,7 @@ pub(super) async fn sync_wallet(
             Err(failure) => (start, Err(failure)),
         };
         if let Err(failure) = downloaded {
-            for batch in std::mem::take(&mut queue) {
-                batch.download.abort();
-            }
+            cancel_queued(&mut queue).await;
             sync_attempt += 1;
             if sync_attempt > SYNC_RETRIES {
                 return Err(failure);
@@ -194,6 +192,18 @@ pub(super) async fn sync_wallet(
         }
     }
     Ok(())
+}
+
+/// Aborts every queued download and waits until each has stopped, so none
+/// records a call after the wallet reports.
+async fn cancel_queued(queue: &mut VecDeque<Prefetch>) {
+    for batch in queue.iter() {
+        batch.download.abort();
+    }
+    for batch in queue.drain(..) {
+        // A cancelled download's error is the cancellation itself.
+        let _ = batch.download.await;
+    }
 }
 
 /// Takes the queued batch starting at `start`, or downloads one inline when
@@ -317,7 +327,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchSizing, WalletPlan, reads_tree_state_locally};
+    use std::{collections::VecDeque, time::Duration};
+
+    use tonic::Status;
+    use zinder_proto::compat::lightwalletd::CompactBlock;
+
+    use super::{BatchSizing, Prefetch, WalletPlan, cancel_queued, reads_tree_state_locally};
+    use crate::wallet_load::calls::{self, CallRecorder};
 
     fn plan(mainnet: bool) -> WalletPlan {
         WalletPlan {
@@ -349,5 +365,42 @@ mod tests {
         assert!(!reads_tree_state_locally(&plan(true), 1_000_101));
         assert!(!reads_tree_state_locally(&plan(true), 3_580_001));
         assert!(reads_tree_state_locally(&plan(false), 419_200));
+    }
+
+    #[tokio::test]
+    async fn cancelled_downloads_have_recorded_their_calls_when_cancelling_returns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = std::sync::Arc::new(CallRecorder::default());
+        let mut queue = VecDeque::new();
+        for start in [1, 11] {
+            let recorder = std::sync::Arc::clone(&recorder);
+            queue.push_back(Prefetch {
+                start,
+                end: start + 9,
+                download: tokio::spawn(async move {
+                    calls::unary(
+                        &recorder,
+                        "GetBlockRange",
+                        Duration::from_mins(1),
+                        std::future::pending::<Result<tonic::Response<CompactBlock>, Status>>(),
+                    )
+                    .await
+                    .map(drop)
+                }),
+            });
+        }
+        // Let both downloads start their calls.
+        tokio::task::yield_now().await;
+
+        cancel_queued(&mut queue).await;
+
+        assert!(queue.is_empty());
+        let summaries = serde_json::to_value(recorder.rpc_summaries())?;
+        assert_eq!(
+            summaries.pointer("/GetBlockRange/statuses/client_cancelled"),
+            Some(&serde_json::Value::from(2)),
+            "{summaries}"
+        );
+        Ok(())
     }
 }
