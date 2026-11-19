@@ -1,6 +1,0 @@
-kind: changed
-body: Explorer's transaction-component and conventional-fee backfills and its transparent-address ranking build no longer derive note-commitment roots, which none of them use, so they no longer read compact blocks or replay tree states for that work.
-time: 2026-11-19T03:22:05.871091719Z
-custom:
-    Bump: patch
-    PR: "320"

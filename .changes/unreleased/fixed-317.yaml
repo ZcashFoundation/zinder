@@ -1,6 +1,0 @@
-kind: fixed
-body: lightwalletd `GetTaddressTxids`, `GetTaddressTransactions`, `GetAddressUtxos`, and `GetAddressUtxosStream` now hold bounded memory however long an address's history is and however many addresses a request lists, and read a repeated address once. `GetAddressUtxos` and `GetAddressUtxosStream` return a repeated address's rows once, as lightwalletd does, instead of once for each time the request lists it. The history calls and `GetAddressUtxosStream` send results as they read them, so a failure after the first result ends the stream with its status after the results already sent; a `GetAddressUtxosStream` response that would exceed 100,000 rows sends the first 100,000 and then ends with `RESOURCE_EXHAUSTED`.
-time: 2026-11-19T03:22:05.498416471Z
-custom:
-    Bump: patch
-    PR: "317"

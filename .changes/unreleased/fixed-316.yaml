@@ -1,6 +1,0 @@
-kind: fixed
-body: '`ChainEpoch.artifact_schema_version` now reports the artifact schema version (20), the same value as `WalletServerInfo.schema_version`. It previously reported the store layout version (7).'
-time: 2026-11-19T03:22:05.318023659Z
-custom:
-    Bump: patch
-    PR: "316"

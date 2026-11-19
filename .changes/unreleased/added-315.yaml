@@ -1,6 +1,0 @@
-kind: added
-body: Fresh construction now reports where its time goes. `zinder_ingest_canonical_construction_phase_duration_seconds{phase}` times picking the build tip, loading blocks, checking subtree roots and the tip against the node, and publication. `zinder_ingest_canonical_block_load_stage_duration_seconds{stage}` times each block on the loader, including idle wait (`receive_wait`) and commitment-tree hashing (the `tree_hashing_*` stages), and `zinder_store_canonical_block_load_stage_duration_seconds{stage}` and `zinder_store_canonical_block_load_finish_duration_seconds{step,family}` time the store's per-block work and its per-family finish. Construction also encodes each staged block value once instead of twice; stored data is unchanged.
-time: 2026-11-19T03:22:05.166093955Z
-custom:
-    Bump: minor
-    PR: "315"
