@@ -679,8 +679,18 @@ lightwalletd-compatible endpoint the way a real wallet engine does, for many
 simulated wallets at once. The endpoint can be `zinder-compat-lightwalletd`, Go
 lightwalletd, or any other `CompactTxStreamer` server, over `http://` or, through
 a TLS proxy such as the Caddy front of the wallet image, over `https://` with
-the host's trusted roots. Run the same command against each server to compare
-them under the same load.
+the host's trusted roots. To measure through a proxy that uses a private CA,
+pass `--tls-ca-cert` with the CA's PEM file, which must hold at least one
+usable CA certificate. When the endpoint is a loopback address or an IP, pass
+`--tls-domain-name` with the proxy's site name. The connection dials the
+endpoint's address and sends that name both as the TLS server name and as the
+HTTP/2 `:authority`, with the endpoint's port when it is not 443, so a proxy
+that routes by host, such as the Caddy site in
+[`deploy/compat-lightwalletd.Caddyfile`](../../deploy/compat-lightwalletd.Caddyfile),
+matches the requests. Both flags need an `https://` endpoint. With
+`--tls-ca-cert`, the connection trusts only that CA, not the host's roots, so
+it also works on a host whose platform trust store is empty. Run the same command against each
+server to compare them under the same load.
 
 ```bash
 zinder-bench lightwalletd-wallet-load \
@@ -735,52 +745,248 @@ source:
   blocks, and, for each `--transparent-address`, `GetTaddressTxids` over the
   range plus one `GetAddressUtxosStream` for all of them. The two tree states
   are reported as `GetTreeState(stored checkpoint)` and
-  `GetTreeState(replay)`. Calls are not retried.
+  `GetTreeState(replay)`. Calls are not retried. The settings below add
+  further reads and are off unless set.
+
+The `point-reads` settings below, and the setup they run, apply only to that
+workload. `--workload` values that download blocks refuse them. Setup calls
+have the same 30-second deadlines as the rounds' calls, and every setup
+stream also ends at 120 seconds in total, so a server that stops answering,
+or keeps sending messages without end, fails or finishes setup instead of
+stalling it. Mempool discovery stops reading as soon as it has `<count>`
+transaction IDs.
+
+Settings that cycle through a list, such as distinct frontiers and transaction
+IDs, share one position in each list across all wallets. A wallet takes the
+next entry when it sends the read, so the run reads every entry once before it
+reads any entry twice, even when `--wallet-start-interval-millis` lets one
+wallet finish its rounds before the next starts. With 16 wallets, 2 rounds,
+and 32 distinct frontiers, each frontier is read exactly once.
+
+The lightwalletd protocol lets a client name pools in `poolTypes` only after
+it checks that the server filters by pool, which lightwallet-protocol
+`v0.4.0` added together with `GetLightdInfo.lightwalletProtocolVersion`. The
+Ironwood pool exists from `v0.5.0`. Setup reads that version, and the report
+shows it in `server.lightwallet_protocol_version`. A version must be
+`vMAJOR.MINOR.PATCH` with an optional semantic-version pre-release or build
+suffix, and a pre-release counts as below its release. Setup treats any
+other value, such as `v0.4.0garbage`, as no version. Against a server that
+advertises a version below `v0.4.0`, or none, `--distinct-frontiers` scans
+with an empty `poolTypes`, which such a server reads as the shielded pools,
+and `--discover-mined-txids` and `--discover-mempool-txids` are refused,
+because the server may leave out transactions that touch only transparent
+addresses. Name the transactions with `--mined-txid` and `--pending-txid`
+instead. Against a server below `v0.5.0`, setup never names Ironwood in
+`poolTypes` or `GetSubtreeRoots`.
+
+- `--distinct-frontiers <count>`: before the run, scans the range from the
+  tip down and keeps up to `<count>` heights whose tree states have different
+  Sapling, Orchard, and, from `v0.5.0`, Ironwood frontiers. The candidates are the blocks
+  with shielded outputs and the range's first height, whose frontier holds
+  the outputs below the range. Each round then reads one of them
+  as `GetTreeState(distinct frontier)`. The stored and replay heights repeat
+  every round, so a server that caches recent tree states can answer them
+  from the cache. Set `<count>` above the size of that cache to keep the
+  requests spread over frontiers it does not hold.
+- `--mined-txid <txid>`, `--pending-txid <txid>`: transaction IDs that each
+  round reads with `GetTransaction`. Give each as the 64 hex characters a
+  block explorer or `zcash-cli` shows, without a `0x` prefix; the load client
+  reverses it into the byte order the protocol sends. A read is reported
+  under the list it came from and where the answer placed the transaction:
+  `GetTransaction(mined)` and `GetTransaction(pending)` when the answer
+  matches, or, for example, `GetTransaction(pending, answered mined)` for a
+  pending transaction mined before the read, and `answered fork` for one the
+  server places on a fork. A failed read keeps its list's name.
+- `--discover-mined-txids <count>`, `--discover-mempool-txids <count>`: before
+  the run, find up to `<count>` mined transaction IDs from the range, newest
+  first, or pending ones from `GetMempoolTx`, and add them to the lists above.
+  Discovery selects every pool the server's version names, so it also finds
+  transactions that touch only transparent addresses. Each list then keeps
+  only the first occurrence of a transaction ID, so a transaction both named
+  and discovered takes one place in the cycle, and the report's
+  `parameters.mined_txids` and `parameters.pending_txids` count distinct
+  transactions. An empty mempool leaves the pending list empty.
+- `--missing-tx-checks <count>`: each round also asks `GetTransaction` for
+  `<count>` transaction IDs that no chain contains, reported as
+  `GetTransaction(missing)`. A `not_found` status is the expected answer, and
+  its latency is in that method's `expected_miss_seconds`.
+- `--include-taddress-transactions`, `--include-taddress-balance`,
+  `--include-address-utxos-unary`: each round also reads
+  `GetTaddressTransactions` per `--transparent-address`, and
+  `GetTaddressBalance` and the unary `GetAddressUtxos` across all of them.
+  Each needs at least one `--transparent-address`.
+
+For example, this run reads through a Caddy proxy with a private CA, cycling
+across 32 distinct frontiers with a mix of mined, pending, and missing
+transactions:
+
+```bash
+zinder-bench lightwalletd-wallet-load \
+  --endpoint https://127.0.0.1:443 \
+  --tls-ca-cert ./caddy-root.crt \
+  --tls-domain-name wallet.example \
+  --workload point-reads \
+  --wallets 16 \
+  --rounds 50 \
+  --from-height 3424811 \
+  --distinct-frontiers 32 \
+  --discover-mined-txids 8 \
+  --discover-mempool-txids 4 \
+  --missing-tx-checks 2 \
+  --verify-subtree-roots \
+  --report ./reports/point-reads-16.json
+```
+
+`--verify-subtree-roots` applies to every workload. Before the run it
+observes what `GetSubtreeRoots` returns, and reports what it saw without
+judging it. It reads the chain tip, then asks `GetBlock` for the block at the
+tip's height, whose `chainMetadata` gives each pool's commitment tree size. A
+subtree root covers 2^16 note commitments, so a tree of `size` commitments
+has `size >> 16` completed subtrees. It then asks `GetSubtreeRoots` for every
+Sapling, Orchard, and, from protocol `v0.5.0`, Ironwood root with
+`max_entries` of 0, and asks for one more root at the index after the last
+one returned, starting at index 0 when none was. Finally it reads the chain
+tip again. When the tip changed, it repeats the probe, up to 3 times, because
+a new block can complete a subtree during the probe, and it reports the last
+attempt. A failed `GetBlock`, such as `NOT_FOUND` after a rollback, is
+recorded rather than ending the run, and the tip read after it decides
+whether the probe repeats. The result is `subtree_roots_verification`. Setup
+requests are not counted in `rpcs`.
+
+Read the observations together:
+
+- A root at the index after the returned ones shows that the later request
+  delivered a root beyond the first response. It indicates that the first
+  response stopped early only when `tip_before` equals `tip_after`, so the
+  tip did not move between the two requests. When the tip moved, a new
+  subtree can have completed in between.
+- Fewer roots than `completed_subtrees_at_tip` with no root after them can
+  mean the server's subtree index lags its tip, or that it truncated the
+  response and also drops the follow-up root.
+- A comparison with `completed_subtrees_at_tip` holds only when
+  `chain_metadata_block_is_tip` is true and `tip_before` equals `tip_after`.
+  Otherwise the sizes and the roots may describe different blocks, and
+  `completed_subtrees_at_tip` is `null` unless the block is the tip.
+- A size of zero cannot be told apart from a size the server left unset,
+  because the protocol encodes both the same way.
+- Repeated roots inflate `returned_with_zero_max`; `distinct_roots` and
+  `repeated_root_indexes` show them.
+
+Zinder streams every remaining root for `max_entries` of 0, as the
+[lightwalletd compatibility reference](../../docs/reference/lightwalletd-compatibility.md#getsubtreeroots)
+describes. Against Zinder, a root at the index after the returned ones with
+an unchanged tip is therefore worth reporting, and a root that appears only
+when the tip moved is not evidence of early termination.
+
+Each `GetSubtreeRoots` request has a total deadline of 120 seconds, so a
+stream that keeps delivering roots cannot hold setup open. A request that
+reaches it reports the deadline as its error, with the roots delivered before
+it in `roots_before_error`.
 
 The report, `lightwalletd-wallet-load`, records the endpoint's `GetLightdInfo`
 identity, the workload's constants, and, over all wallets:
 
 - `rpcs`: for each method, requests by client-observed status, latency of
-  successful calls, and for `GetBlockRange` the time to first block. A
+  successful calls, latency of expected misses in `expected_miss_seconds`,
+  each measured to the moment the call's outcome is known,
+  and for `GetBlockRange` the time to first block. A
   `connect` entry counts every connection the run opened: one for the
   probe that reads the endpoint's identity and tip, and the rest by wallets.
   A status is a gRPC
   status name, `client_timeout`, `client_cancelled` for a call the wallet
   dropped, `connect_failed`, `out_of_sequence`, or `incomplete_stream`.
   `status_examples` keeps the first message received with each failed
-  status.
+  status. For streams, `first_message_seconds` and `last_message_seconds`
+  are the time from opening the stream to its first and last message, the
+  latter over successful calls. `messages` and `bytes` include a block a
+  stream sent out of order, which the wallet then rejects. `incomplete_streams`
+  counts streams that failed after delivering a message, that ended short or
+  out of order, or that the wallet dropped after a message.
+  `cancelled_after_messages` counts that last kind, which keeps the
+  `client_cancelled` status.
 - `time_to_first_block_seconds` and `wallet_sync_seconds` per wallet,
-  `blocks_per_second` and `bytes_per_second` over the run, `retries`, and the
-  status that ended each failed wallet, or `client_task_failed` for a wallet
-  whose task panicked. Bytes are the protobuf-encoded size of the received
-  blocks, not bytes on the wire.
+  `blocks_received`, `bytes_received`, `blocks_per_second`, and
+  `bytes_per_second` over the run, `retries`, and the status that ended each
+  failed wallet, or `client_task_failed` for a wallet whose task panicked.
+  `blocks_received` and `bytes_received` equal the `GetBlockRange` entry's
+  `messages` and `bytes`, so they count blocks received again on retry and
+  blocks a wallet rejected as out of order or past its range, which the
+  wallet does not process. Bytes are the protobuf-encoded size of the
+  received blocks, not bytes on the wire. `total_rpc_bytes` is the same measure over
+  every response the wallets received, without the probe's `GetLightdInfo`
+  and `GetLatestBlock`, which `rpcs` still counts. `incomplete_streams` is the
+  sum of the per-method counts.
+- `subtree_roots_verification`: present with `--verify-subtree-roots`. It
+  holds observations only. For `sapling`, `orchard`, and `ironwood`:
+  - `returned_with_zero_max`: the roots the `max_entries` of 0 request
+    delivered, repeats included.
+  - `distinct_roots`: the different 32-byte `rootHash` values among them.
+    `SubtreeRoot` carries no index, so a root's position in the response is
+    the subtree index it stands for.
+  - `malformed_root_hashes`: the roots whose `rootHash` is not 32 bytes. They
+    count in `returned_with_zero_max` but are not kept.
+  - `repeated_root_indexes`: the zero-based positions in the response whose
+    root repeated one at a lower position. They equal subtree indexes only
+    when the response starts at index 0 and skips nothing.
+  - `root_at_returned_index`: whether a request for one root at index
+    `returned_with_zero_max` delivered one, or `null` when the first request
+    failed and the follow-up was not sent.
+  - `completed_subtrees_at_tip`: `size >> 16` from the `chainMetadata` of
+    `chain_metadata_block`, or `null` unless that block is the tip
+    (`chain_metadata_block_is_tip`) or when it carried no `chainMetadata`.
+  - `zero_max_error` and `follow_up_error`: present when that request failed,
+    with the status in `error` and the roots delivered before it in
+    `roots_before_error`. A request retains at most 1,048,576 distinct roots
+    plus repeat positions, 16 times the protocol's 65,536 subtrees per pool.
+    Past that it stops reading and reports a `resource_limit` error with the
+    partial tally.
+
+  `ironwood` is absent against a server below protocol `v0.5.0`. `attempts`
+  is how many times the probe ran. `tip_before` and `tip_after` are the
+  `GetLatestBlock` height and `hash_hex` read around the last attempt.
+  `chain_metadata_block` is the height and `hash_hex` of the block `GetBlock`
+  returned for `tip_before`'s height, absent when `GetBlock` failed, and
+  `chain_metadata_error` then holds its status.
+  `chain_metadata_block_is_tip` is true only when that block has
+  `tip_before`'s height and the same 32-byte hash; it is false when a hash is
+  missing or not 32 bytes, because the identity cannot be shown. A `hash_hex` is in RPC byte order, as block explorers show
+  it, or the bytes as sent when the server's hash is not 32 bytes.
 - `tree_state_heights`: how many requested heights sit on Zinder's 100-block
   checkpoint stride, and each other height's offset from it. Below the
   first-sync tip, that offset is the number of blocks Zinder replays. Above
   it, and on a store whose checkpoint pass has run, every settled block has a
   stored checkpoint and nothing is replayed, so the offsets are an upper
-  bound. With `--server-metrics-url` set to a Zinder server's `/metrics`
-  endpoint, `server_observed` adds what that server counted during the run:
-  tree states it read from a stored checkpoint or rebuilt, the blocks it
-  replayed, the time requests waited for a rebuild or block-range slot, the
-  tree states, block ranges, and requests it refused, stale-tip refusals,
-  and the time block-range chunks spent in each stage. A metric the server
-  does not export reads as zero. If the read after the run fails, the report
-  keeps its client-side results, leaves `server_observed` out, and gives the
-  reason in `server_metrics_error`. A scrape reads at most 64 MiB.
+  bound. `distinct_heights` and `distinct_frontiers` count the different
+  heights requested and the different frontiers the answers carried, so a
+  run whose requests all hit one frontier is visible. With
+  `--server-metrics-url` set to a Zinder server's `/metrics` endpoint,
+  `server_observed` adds what that server counted during the run: tree
+  states it read from a stored checkpoint or rebuilt, the blocks it replayed,
+  the time requests waited for a rebuild or block-range slot, the tree
+  states, block ranges, and requests it refused, stale-tip refusals, and the
+  time block-range chunks spent in each stage. The stored and rebuilt tree
+  state reads are also split by `height_band`, the first height of the
+  250,000-block band that holds the requested height, in
+  `tree_state_stored_reads_by_band` and `tree_state_replayed_reads_by_band`.
+  A metric the server does not export reads as zero. If the read after the
+  run fails, or a counter series went down or disappeared because the server
+  restarted during the run, the report keeps its client-side results, leaves
+  `server_observed` out, and gives the reason in `server_metrics_error`. A
+  scrape reads at most 64 MiB.
 
 The simulated wallets do not scan, so each asks for its next blocks as soon as
 the last ones arrive, or, for Slipstream, as soon as its chunk queue has room:
 the load is the most an engine of that shape sends, not an average. They also
 omit what a sync does besides blocks and tree states: `GetSubtreeRoots`,
-transparent address queries, mempool streams, and tip polls.
+mempool streams, and tip polls, and, outside `point-reads`, transparent
+address queries.
 Vizor sizes batches from compiled Mainnet tree sizes; the simulated wallet
 uses the density it has received, so its first batch is 10 blocks. When no
 block has arrived by the end of Slipstream's density wait, the simulated
 wallet asks for another 64-block chunk, where Slipstream asks for the full
 10,000 blocks.
-Each connection gives up after 10 seconds and sends no HTTP/2 keep-alive
-pings. Go lightwalletd's grpc-go server closes a connection whose client pings
+Each connection gives up when the TCP connection and any TLS handshake have
+not finished within 10 seconds, and sends no HTTP/2 keep-alive pings. Go lightwalletd's grpc-go server closes a connection whose client pings
 more often than every five minutes, so pinging would end streams a real
 wallet keeps.
 

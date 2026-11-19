@@ -1,8 +1,9 @@
 //! Timed `CompactTxStreamer` calls and the samples they leave behind.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
+    ops::ControlFlow,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,15 +11,18 @@ use std::{
 use parking_lot::Mutex;
 use prost::Message as _;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tonic::{
     Code, Status,
     transport::{Channel, Endpoint},
 };
 use zinder_proto::compat::lightwalletd::{
-    BlockId, BlockRange, CompactBlock, TxFilter,
+    BlockId, BlockRange, CompactBlock, TreeState, TxFilter,
     compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_store::TREE_STATE_CHECKPOINT_STRIDE;
+
+use super::transport::TlsOptions;
 
 /// Client for one HTTP/2 connection to the endpoint under test.
 pub(super) type LwdClient = CompactTxStreamerClient<Channel>;
@@ -57,16 +61,30 @@ pub(super) struct Connector {
 }
 
 impl Connector {
-    /// Checks `url` and returns a connector for it.
-    pub(super) fn new(url: &str, recorder: Arc<CallRecorder>) -> Result<Self, String> {
+    /// Checks `url` and returns a connector for it, applying the TLS
+    /// overrides to an `https` endpoint.
+    pub(super) fn new(
+        url: &str,
+        recorder: Arc<CallRecorder>,
+        tls_options: &TlsOptions,
+    ) -> Result<Self, String> {
         Ok(Self {
-            endpoint: super::transport::wallet_endpoint(url, CONNECT_TIMEOUT)?,
+            endpoint: super::transport::wallet_endpoint(url, CONNECT_TIMEOUT, tls_options)?,
             recorder,
         })
     }
 
     pub(super) fn recorder(&self) -> &CallRecorder {
         &self.recorder
+    }
+
+    /// The same endpoint recording into `recorder`, so setup calls stay out
+    /// of the run's samples.
+    pub(super) fn with_recorder(&self, recorder: Arc<CallRecorder>) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            recorder,
+        }
     }
 
     /// Returns the connection in `slot`, opening one first when the slot is
@@ -85,7 +103,7 @@ impl Connector {
     /// Opens one new HTTP/2 connection, as a wallet does after an error.
     pub(super) async fn connect(&self) -> Result<LwdClient, CallFailure> {
         let mut pending = PendingCall::new(&self.recorder, "connect");
-        let outcome = super::transport::connect(&self.endpoint)
+        let outcome = super::transport::connect(&self.endpoint, CONNECT_TIMEOUT)
             .await
             .map_err(|detail| CallFailure {
                 label: "connect_failed",
@@ -131,8 +149,15 @@ pub(super) struct CallSample {
     status: &'static str,
     elapsed: Duration,
     first_message: Option<Duration>,
+    last_message: Option<Duration>,
     messages: u64,
     bytes: u64,
+    incomplete_stream: bool,
+    /// Whether the call ended with the status its method expects to miss
+    /// with, such as `not_found` for a transaction no chain contains.
+    expected_miss: bool,
+    /// Whether the client dropped the call after it delivered a message.
+    cancelled_after_messages: bool,
 }
 
 /// Every call sample of one run, shared by all simulated wallets.
@@ -145,6 +170,7 @@ pub(super) struct CallRecorder {
 struct RecorderState {
     calls: BTreeMap<&'static str, CallSamples>,
     tree_state_heights: Vec<u64>,
+    tree_state_frontiers: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -152,9 +178,13 @@ struct CallSamples {
     statuses: BTreeMap<&'static str, u64>,
     status_examples: BTreeMap<&'static str, String>,
     ok_seconds: Vec<f64>,
+    expected_miss_seconds: Vec<f64>,
     first_message_seconds: Vec<f64>,
+    last_message_seconds: Vec<f64>,
     messages: u64,
     bytes: u64,
+    incomplete_streams: u64,
+    cancelled_after_messages: u64,
 }
 
 impl CallRecorder {
@@ -164,6 +194,15 @@ impl CallRecorder {
         *samples.statuses.entry(sample.status).or_default() += 1;
         if sample.status == "ok" {
             samples.ok_seconds.push(sample.elapsed.as_secs_f64());
+            if let Some(last_message) = sample.last_message {
+                samples
+                    .last_message_seconds
+                    .push(last_message.as_secs_f64());
+            }
+        } else if sample.expected_miss {
+            samples
+                .expected_miss_seconds
+                .push(sample.elapsed.as_secs_f64());
         }
         if let Some(first_message) = sample.first_message {
             samples
@@ -172,6 +211,12 @@ impl CallRecorder {
         }
         samples.messages = samples.messages.saturating_add(sample.messages);
         samples.bytes = samples.bytes.saturating_add(sample.bytes);
+        if sample.incomplete_stream {
+            samples.incomplete_streams = samples.incomplete_streams.saturating_add(1);
+        }
+        if sample.cancelled_after_messages {
+            samples.cancelled_after_messages = samples.cancelled_after_messages.saturating_add(1);
+        }
         drop(state);
     }
 
@@ -192,6 +237,11 @@ impl CallRecorder {
         self.state.lock().tree_state_heights.push(height);
     }
 
+    fn note_tree_state_frontier(&self, tree_state: &TreeState) {
+        let digest = tree_state_frontier_digest(tree_state);
+        self.state.lock().tree_state_frontiers.insert(digest);
+    }
+
     /// Summarizes every recorded call by method.
     pub(super) fn rpc_summaries(&self) -> BTreeMap<&'static str, RpcSummary> {
         let state = self.state.lock();
@@ -206,21 +256,79 @@ impl CallRecorder {
                         statuses: samples.statuses.clone(),
                         status_examples: samples.status_examples.clone(),
                         ok_seconds: Percentiles::of(samples.ok_seconds.iter().copied()),
+                        expected_miss_seconds: (!samples.expected_miss_seconds.is_empty()).then(
+                            || Percentiles::of(samples.expected_miss_seconds.iter().copied()),
+                        ),
                         first_message_seconds: (!samples.first_message_seconds.is_empty()).then(
                             || Percentiles::of(samples.first_message_seconds.iter().copied()),
                         ),
+                        last_message_seconds: (!samples.last_message_seconds.is_empty())
+                            .then(|| Percentiles::of(samples.last_message_seconds.iter().copied())),
                         messages: samples.messages,
                         bytes: samples.bytes,
+                        incomplete_streams: samples.incomplete_streams,
+                        cancelled_after_messages: samples.cancelled_after_messages,
                     },
                 )
             })
             .collect()
     }
 
+    /// Total protobuf-encoded bytes delivered across all recorded RPC responses.
+    pub(super) fn total_rpc_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .calls
+            .values()
+            .map(|samples| samples.bytes)
+            .sum()
+    }
+
+    /// Blocks every `GetBlockRange` stream delivered and their encoded bytes,
+    /// counting blocks a wallet rejected as out of sequence or past its
+    /// range.
+    pub(super) fn block_range_totals(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .calls
+            .get("GetBlockRange")
+            .map_or((0, 0), |samples| (samples.messages, samples.bytes))
+    }
+
+    /// Total streams that ended early, failed after delivering at least one
+    /// message, or that the client dropped after one.
+    pub(super) fn incomplete_streams(&self) -> u64 {
+        self.state
+            .lock()
+            .calls
+            .values()
+            .map(|samples| samples.incomplete_streams)
+            .sum()
+    }
+
     /// Summarizes the heights wallets asked tree states for.
     pub(super) fn tree_state_heights(&self) -> TreeStateHeights {
-        TreeStateHeights::of(&self.state.lock().tree_state_heights)
+        let state = self.state.lock();
+        TreeStateHeights::of(
+            &state.tree_state_heights,
+            u64::try_from(state.tree_state_frontiers.len()).unwrap_or(u64::MAX),
+        )
     }
+}
+
+/// Digests a `TreeState`'s Sapling, Orchard, and Ironwood frontiers, so
+/// heights that share one frontier count once.
+pub(super) fn tree_state_frontier_digest(tree_state: &TreeState) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for tree in [
+        &tree_state.sapling_tree,
+        &tree_state.orchard_tree,
+        &tree_state.ironwood_tree,
+    ] {
+        hasher.update(u64::try_from(tree.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(tree.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Client-observed outcome of one RPC method over the run.
@@ -238,13 +346,27 @@ pub(crate) struct RpcSummary {
     status_examples: BTreeMap<&'static str, String>,
     /// Latency of successful calls. A stream counts until its last block.
     ok_seconds: Percentiles,
-    /// Time from opening a stream to its first block.
+    /// Latency of calls that ended with the status their method expects,
+    /// such as `not_found` for `GetTransaction(missing)`. The calls keep
+    /// that status in `statuses`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_miss_seconds: Option<Percentiles>,
+    /// Time from opening a stream to its first message.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_message_seconds: Option<Percentiles>,
+    /// Time from opening a stream to its last message before trailing EOF.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_message_seconds: Option<Percentiles>,
     /// Messages received: each block of a stream, or a unary response.
     messages: u64,
     /// Protobuf-encoded size of the messages received, not bytes on the wire.
     bytes: u64,
+    /// Streams that ended before the requested range, failed mid-stream, or
+    /// that the client dropped after a message.
+    incomplete_streams: u64,
+    /// Calls the client dropped after receiving a message, which keep the
+    /// `client_cancelled` status and also count in `incomplete_streams`.
+    cancelled_after_messages: u64,
 }
 
 /// Requested tree-state heights against Zinder's construction checkpoints.
@@ -259,6 +381,8 @@ pub(crate) struct RpcSummary {
 #[derive(Debug, Serialize)]
 pub(crate) struct TreeStateHeights {
     requested: u64,
+    distinct_heights: u64,
+    distinct_frontiers: u64,
     on_cadence: u64,
     off_cadence: u64,
     off_cadence_offset_blocks: Percentiles,
@@ -278,7 +402,9 @@ impl TreeStateHeights {
 }
 
 impl TreeStateHeights {
-    fn of(heights: &[u64]) -> Self {
+    fn of(heights: &[u64], distinct_frontiers: u64) -> Self {
+        let distinct_heights =
+            u64::try_from(heights.iter().collect::<BTreeSet<_>>().len()).unwrap_or(u64::MAX);
         let offsets = heights
             .iter()
             .map(|height| height % u64::from(TREE_STATE_CHECKPOINT_STRIDE))
@@ -288,6 +414,8 @@ impl TreeStateHeights {
         let off_cadence = u64::try_from(offsets.len()).unwrap_or(u64::MAX);
         Self {
             requested,
+            distinct_heights,
+            distinct_frontiers,
             on_cadence: requested.saturating_sub(off_cadence),
             off_cadence,
             off_cadence_offset_blocks: Percentiles::of(offsets.into_iter().map(count_as_f64)),
@@ -348,7 +476,22 @@ where
     Call: Future<Output = Result<tonic::Response<Response>, Status>>,
 {
     let mut pending = PendingCall::new(recorder, method);
-    let outcome = match tokio::time::timeout(deadline, call).await {
+    let outcome = await_unary(&mut pending, deadline, call).await;
+    pending.finish(outcome.as_ref().map(drop));
+    outcome
+}
+
+/// Awaits one unary response within `deadline`, counting it on `pending`.
+async fn await_unary<Response, Call>(
+    pending: &mut PendingCall<'_>,
+    deadline: Duration,
+    call: Call,
+) -> Result<Response, CallFailure>
+where
+    Response: prost::Message,
+    Call: Future<Output = Result<tonic::Response<Response>, Status>>,
+{
+    match tokio::time::timeout(deadline, call).await {
         Ok(Ok(response)) => {
             let response = response.into_inner();
             pending.messages = 1;
@@ -356,10 +499,8 @@ where
             Ok(response)
         }
         Ok(Err(status)) => Err(CallFailure::from_status(&status)),
-        Err(_) => Err(CallFailure::client_timeout(method, deadline)),
-    };
-    pending.finish(outcome.as_ref().map(drop));
-    outcome
+        Err(_) => Err(CallFailure::client_timeout(pending.method, deadline)),
+    }
 }
 
 /// Requests the tree state at `height` and records the height.
@@ -381,7 +522,7 @@ pub(super) async fn get_tree_state_as(
     height: u64,
 ) -> Result<(), CallFailure> {
     recorder.note_tree_state_height(height);
-    unary(
+    let tree_state = unary(
         recorder,
         method,
         limits.unary,
@@ -390,8 +531,9 @@ pub(super) async fn get_tree_state_as(
             hash: Vec::new(),
         }),
     )
-    .await
-    .map(drop)
+    .await?;
+    recorder.note_tree_state_frontier(&tree_state);
+    Ok(())
 }
 
 /// Requests one full transaction by its compact-block transaction ID.
@@ -405,14 +547,106 @@ pub(super) async fn get_transaction(
         recorder,
         "GetTransaction",
         limits.unary,
-        client.get_transaction(TxFilter {
-            block: None,
-            index: 0,
-            hash: txid,
-        }),
+        client.get_transaction(transaction_filter(txid)),
     )
     .await
     .map(drop)
+}
+
+fn transaction_filter(txid: Vec<u8>) -> TxFilter {
+    TxFilter {
+        block: None,
+        index: 0,
+        hash: txid,
+    }
+}
+
+/// Which transaction a `GetTransaction` point read asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TransactionRead {
+    /// A transaction mined in the range.
+    Mined,
+    /// A transaction that was in the mempool when the run started.
+    Pending,
+    /// A transaction no chain contains, which the server should not find.
+    Missing,
+}
+
+/// Where a `GetTransaction` answer placed the transaction, from its
+/// `RawTransaction.height`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionAnswer {
+    /// Height 0: in the mempool.
+    Pending,
+    /// Height `u64::MAX`: mined on a fork that is not the main chain.
+    Fork,
+    /// Any other height: mined in the main chain.
+    Mined,
+}
+
+impl TransactionAnswer {
+    const fn of_height(height: u64) -> Self {
+        match height {
+            0 => Self::Pending,
+            u64::MAX => Self::Fork,
+            _ => Self::Mined,
+        }
+    }
+}
+
+impl TransactionRead {
+    const fn requested_method(self) -> &'static str {
+        match self {
+            Self::Mined => "GetTransaction(mined)",
+            Self::Pending => "GetTransaction(pending)",
+            Self::Missing => "GetTransaction(missing)",
+        }
+    }
+
+    /// The method an answered read is recorded under: the requested kind,
+    /// plus where the answer placed the transaction when that differs, so a
+    /// pending transaction that was mined during the run is reported apart.
+    const fn answered_method(self, answer: TransactionAnswer) -> &'static str {
+        match (self, answer) {
+            (Self::Mined, TransactionAnswer::Mined) => "GetTransaction(mined)",
+            (Self::Mined, TransactionAnswer::Pending) => "GetTransaction(mined, answered pending)",
+            (Self::Mined, TransactionAnswer::Fork) => "GetTransaction(mined, answered fork)",
+            (Self::Pending, TransactionAnswer::Pending) => "GetTransaction(pending)",
+            (Self::Pending, TransactionAnswer::Mined) => "GetTransaction(pending, answered mined)",
+            (Self::Pending, TransactionAnswer::Fork) => "GetTransaction(pending, answered fork)",
+            (
+                Self::Missing,
+                TransactionAnswer::Pending | TransactionAnswer::Fork | TransactionAnswer::Mined,
+            ) => "GetTransaction(missing, answered)",
+        }
+    }
+}
+
+/// Requests one full transaction for a point read. A `Missing` read that
+/// ends with `not_found` keeps that status and records its latency as the
+/// expected miss.
+pub(super) async fn read_transaction(
+    recorder: &CallRecorder,
+    mut client: LwdClient,
+    limits: CallLimits,
+    read: TransactionRead,
+    txid: Vec<u8>,
+) -> Result<(), CallFailure> {
+    let mut pending = PendingCall::new(recorder, read.requested_method());
+    if read == TransactionRead::Missing {
+        pending.expected_miss = Some(status_label(Code::NotFound));
+    }
+    let outcome = await_unary(
+        &mut pending,
+        limits.unary,
+        client.get_transaction(transaction_filter(txid)),
+    )
+    .await
+    .map(|transaction| {
+        pending.method = read.answered_method(TransactionAnswer::of_height(transaction.height));
+    });
+    pending.finish(outcome.as_ref().map(drop));
+    outcome
 }
 
 /// Opens a server stream with `open` and reads it to its end, recording it
@@ -427,36 +661,74 @@ where
     Reply: prost::Message + Default,
     Open: Future<Output = Result<tonic::Response<tonic::Streaming<Reply>>, Status>>,
 {
+    stream_each(recorder, method, limits, open, |reply| {
+        drop(reply);
+        ControlFlow::Continue(())
+    })
+    .await
+}
+
+/// Opens a server stream with `open` and hands each reply to `on_reply`,
+/// recording the stream under `method`.
+///
+/// The stream ends successfully, without reading the rest, as soon as
+/// `on_reply` returns `ControlFlow::Break`. It fails as a client timeout when
+/// it outlasts `limits.stream_total`, after `on_reply` saw every reply that
+/// arrived before.
+pub(super) async fn stream_each<Reply, Open>(
+    recorder: &CallRecorder,
+    method: &'static str,
+    limits: &CallLimits,
+    open: Open,
+    mut on_reply: impl FnMut(Reply) -> ControlFlow<()>,
+) -> Result<u64, CallFailure>
+where
+    Reply: prost::Message + Default,
+    Open: Future<Output = Result<tonic::Response<tonic::Streaming<Reply>>, Status>>,
+{
     let mut pending = PendingCall::new(recorder, method);
-    let started = pending.started;
-    let outcome = async {
-        let mut replies = tokio::time::timeout(limits.stream_open, open)
-            .await
-            .map_err(|_| CallFailure::client_timeout("stream open", limits.stream_open))?
-            .map_err(|status| CallFailure::from_status(&status))?
-            .into_inner();
-        loop {
-            let next = match limits.stream_idle {
-                Some(idle) => tokio::time::timeout(idle, replies.message())
-                    .await
-                    .map_err(|_| CallFailure::client_timeout("stream idle", idle))?,
-                None => replies.message().await,
+    let stream = async {
+        let mut replies = open_stream(limits, open).await?;
+        while let Some(reply) = next_reply(limits, &mut replies).await? {
+            pending.note_message(u64::try_from(reply.encoded_len()).unwrap_or(u64::MAX));
+            if on_reply(reply).is_break() {
+                break;
             }
-            .map_err(|status| CallFailure::from_status(&status))?;
-            let Some(reply) = next else { break };
-            pending
-                .first_message
-                .get_or_insert_with(|| started.elapsed());
-            pending.messages = pending.messages.saturating_add(1);
-            pending.bytes = pending
-                .bytes
-                .saturating_add(u64::try_from(reply.encoded_len()).unwrap_or(u64::MAX));
         }
         Ok(pending.messages)
-    }
-    .await;
+    };
+    let outcome = match limits.stream_total {
+        Some(total) => tokio::time::timeout(total, stream)
+            .await
+            .unwrap_or_else(|_| Err(CallFailure::client_timeout("stream", total))),
+        None => stream.await,
+    };
     pending.finish(outcome.as_ref().map(drop));
     outcome
+}
+
+async fn open_stream<Reply>(
+    limits: &CallLimits,
+    open: impl Future<Output = Result<tonic::Response<tonic::Streaming<Reply>>, Status>>,
+) -> Result<tonic::Streaming<Reply>, CallFailure> {
+    Ok(tokio::time::timeout(limits.stream_open, open)
+        .await
+        .map_err(|_| CallFailure::client_timeout("stream open", limits.stream_open))?
+        .map_err(|status| CallFailure::from_status(&status))?
+        .into_inner())
+}
+
+async fn next_reply<Reply>(
+    limits: &CallLimits,
+    replies: &mut tonic::Streaming<Reply>,
+) -> Result<Option<Reply>, CallFailure> {
+    match limits.stream_idle {
+        Some(idle) => tokio::time::timeout(idle, replies.message())
+            .await
+            .map_err(|_| CallFailure::client_timeout("stream idle", idle))?,
+        None => replies.message().await,
+    }
+    .map_err(|status| CallFailure::from_status(&status))
 }
 
 /// One `GetBlockRange` request.
@@ -470,9 +742,10 @@ pub(super) struct BlockRangeCall {
 /// and awaiting the future it returns before reading the next block.
 ///
 /// The stream fails as `out_of_sequence` when a block is not the next height
-/// or lies past `range.end`,
-/// and as `incomplete_stream` when it ends before `range.end`, because wallet
-/// engines reject both.
+/// or lies past `range.end`, and as `incomplete_stream` when it ends before
+/// `range.end`, because wallet engines reject both. A rejected block still
+/// counts as received in the call's messages and bytes, but never reaches
+/// `on_block`.
 pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
     recorder: &CallRecorder,
     client: &mut LwdClient,
@@ -493,34 +766,17 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
         pool_types: range.pool_types,
     };
     let stream = async {
-        let response = tokio::time::timeout(limits.stream_open, client.get_block_range(request))
-            .await
-            .map_err(|_| CallFailure::client_timeout("stream open", limits.stream_open))?
-            .map_err(|status| CallFailure::from_status(&status))?;
-        let mut blocks = response.into_inner();
+        let mut blocks = open_stream(limits, client.get_block_range(request)).await?;
         let mut expected = range.start;
-        loop {
-            let next = match limits.stream_idle {
-                Some(idle) => tokio::time::timeout(idle, blocks.message())
-                    .await
-                    .map_err(|_| CallFailure::client_timeout("stream idle", idle))?,
-                None => blocks.message().await,
-            }
-            .map_err(|status| CallFailure::from_status(&status))?;
-            let Some(block) = next else { break };
+        while let Some(block) = next_reply(limits, &mut blocks).await? {
+            let encoded_bytes = u64::try_from(block.encoded_len()).unwrap_or(u64::MAX);
+            pending.note_message(encoded_bytes);
             if block.height != expected || block.height > range.end {
                 return Err(CallFailure {
                     label: "out_of_sequence",
                     detail: format!("expected block {expected}, received {}", block.height),
                 });
             }
-            let encoded_bytes = u64::try_from(block.encoded_len()).unwrap_or(u64::MAX);
-            let started = pending.started;
-            pending
-                .first_message
-                .get_or_insert_with(|| started.elapsed());
-            pending.messages = pending.messages.saturating_add(1);
-            pending.bytes = pending.bytes.saturating_add(encoded_bytes);
             expected = expected.saturating_add(1);
             on_block(&block, encoded_bytes).await;
         }
@@ -545,16 +801,24 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
 /// One call's counters, recorded when the call ends or the client drops it.
 ///
 /// Vizor drops a batch's block stream when its tree-state request fails, and
-/// aborts queued batches when a sync attempt fails.
+/// aborts queued batches when a sync attempt fails. A call dropped after it
+/// delivered a message keeps the `client_cancelled` status and counts as an
+/// incomplete stream.
 struct PendingCall<'run> {
     recorder: &'run CallRecorder,
     method: &'static str,
+    expected_miss: Option<&'static str>,
     started: Instant,
+    /// When the outcome was known, taken before the shared recorder lock so
+    /// contention between wallets never counts toward a call's latency.
+    ended: Option<Duration>,
     status: Option<&'static str>,
     detail: Option<String>,
     first_message: Option<Duration>,
+    last_message: Option<Duration>,
     messages: u64,
     bytes: u64,
+    incomplete_stream: bool,
 }
 
 impl<'run> PendingCall<'run> {
@@ -562,16 +826,35 @@ impl<'run> PendingCall<'run> {
         Self {
             recorder,
             method,
+            expected_miss: None,
             started: Instant::now(),
+            ended: None,
             status: None,
             detail: None,
             first_message: None,
+            last_message: None,
             messages: 0,
             bytes: 0,
+            incomplete_stream: false,
         }
     }
 
+    fn note_message(&mut self, encoded_bytes: u64) {
+        let elapsed = self.started.elapsed();
+        self.first_message.get_or_insert(elapsed);
+        self.last_message = Some(elapsed);
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(encoded_bytes);
+    }
+
+    /// Records the call's status. A stream that fails after delivering
+    /// messages, or that a wallet engine would reject as short or out of
+    /// order, counts as incomplete.
     fn finish(&mut self, outcome: Result<(), &CallFailure>) {
+        self.ended = Some(self.started.elapsed());
+        self.incomplete_stream = outcome.is_err_and(|failure| {
+            self.messages > 0 || matches!(failure.label, "incomplete_stream" | "out_of_sequence")
+        });
         self.status = Some(outcome.map_or_else(|failure| failure.label, |()| "ok"));
         self.detail = outcome.err().map(|failure| failure.detail.clone());
     }
@@ -579,7 +862,9 @@ impl<'run> PendingCall<'run> {
 
 impl Drop for PendingCall<'_> {
     fn drop(&mut self) {
+        let elapsed = self.ended.unwrap_or_else(|| self.started.elapsed());
         let status = self.status.unwrap_or("client_cancelled");
+        let cancelled_after_messages = self.status.is_none() && self.messages > 0;
         if let Some(detail) = &self.detail {
             self.recorder
                 .note_status_example(self.method, status, detail);
@@ -588,10 +873,14 @@ impl Drop for PendingCall<'_> {
             self.method,
             CallSample {
                 status,
-                elapsed: self.started.elapsed(),
+                elapsed,
                 first_message: self.first_message,
+                last_message: self.last_message,
                 messages: self.messages,
                 bytes: self.bytes,
+                incomplete_stream: self.incomplete_stream || cancelled_after_messages,
+                expected_miss: self.expected_miss == Some(status),
+                cancelled_after_messages,
             },
         );
     }
@@ -647,13 +936,167 @@ fn serialize_optional_seconds<S: serde::Serializer>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{error::Error, sync::Arc, time::Duration};
 
     use prost::Message as _;
     use tonic::Status;
     use zinder_proto::compat::lightwalletd::TreeState;
 
-    use super::{CallRecorder, Percentiles, TreeStateHeights, unary};
+    use super::{
+        BlockRangeCall, CallLimits, CallRecorder, Connector, PendingCall, Percentiles,
+        TreeStateHeights, get_block_range, tree_state_frontier_digest, unary,
+    };
+    use crate::wallet_load::{
+        mock_streamer::{self, MockStreamer, RangeEnding},
+        transport::TlsOptions,
+    };
+
+    const LIMITS: CallLimits = CallLimits {
+        unary: Duration::from_secs(5),
+        stream_open: Duration::from_secs(5),
+        stream_idle: Some(Duration::from_secs(5)),
+        stream_total: None,
+    };
+
+    #[tokio::test]
+    async fn a_block_past_the_range_counts_as_received_but_not_handled()
+    -> Result<(), Box<dyn Error>> {
+        let server = mock_streamer::serve(MockStreamer::new(RangeEnding::ExtraBlock)).await?;
+        let recorder = Arc::new(CallRecorder::default());
+        let connector = Connector::new(&server.url, Arc::clone(&recorder), &TlsOptions::default())?;
+        let mut client = connector
+            .connect()
+            .await
+            .map_err(|failure| failure.detail)?;
+        let mut handled = Vec::new();
+
+        let streamed = get_block_range(
+            &recorder,
+            &mut client,
+            &LIMITS,
+            BlockRangeCall {
+                start: 1,
+                end: 5,
+                pool_types: Vec::new(),
+            },
+            |block, _| {
+                handled.push(block.height);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            streamed.err().map(|failure| failure.label),
+            Some("out_of_sequence")
+        );
+        assert_eq!(handled, [1, 2, 3, 4, 5]);
+        let summary = &recorder.rpc_summaries()["GetBlockRange"];
+        let block_bytes = u64::try_from(mock_streamer::block(1).encoded_len())?;
+        assert_eq!(summary.messages, 6);
+        assert_eq!(summary.bytes, 6 * block_bytes);
+        assert_eq!(summary.incomplete_streams, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stream_dropped_after_a_message_counts_as_an_incomplete_cancellation() {
+        let recorder = CallRecorder::default();
+        let mut partial = PendingCall::new(&recorder, "GetBlockRange");
+        partial.note_message(10);
+        drop(partial);
+        drop(PendingCall::new(&recorder, "GetBlockRange"));
+
+        let summary = &recorder.rpc_summaries()["GetBlockRange"];
+        assert_eq!(summary.statuses["client_cancelled"], 2);
+        assert_eq!(summary.cancelled_after_messages, 1);
+        assert_eq!(summary.incomplete_streams, 1);
+        assert_eq!(recorder.incomplete_streams(), 1);
+        assert_eq!(summary.bytes, 10);
+    }
+
+    /// Records `pending` while another thread holds the recorder lock for
+    /// `held`, and returns the latencies recorded under `method`.
+    fn record_under_contention(
+        recorder: &Arc<CallRecorder>,
+        pending: PendingCall<'_>,
+        held: Duration,
+    ) -> Result<(Vec<f64>, Vec<f64>), Box<dyn Error>> {
+        let method = pending.method;
+        let (locked, lock_taken) = std::sync::mpsc::channel();
+        let holder = {
+            let recorder = Arc::clone(recorder);
+            std::thread::spawn(move || {
+                let state = recorder.state.lock();
+                let _ = locked.send(());
+                std::thread::sleep(held);
+                drop(state);
+            })
+        };
+        lock_taken.recv()?;
+        drop(pending);
+        holder.join().map_err(|_| "lock holder panicked")?;
+        let state = recorder.state.lock();
+        let samples = state
+            .calls
+            .get(method)
+            .map(|samples| {
+                (
+                    samples.expected_miss_seconds.clone(),
+                    samples.ok_seconds.clone(),
+                )
+            })
+            .ok_or("call not recorded");
+        drop(state);
+        Ok(samples?)
+    }
+
+    #[test]
+    fn recorder_lock_contention_stays_out_of_call_latency() -> Result<(), Box<dyn Error>> {
+        let held = Duration::from_millis(300);
+        let recorder = Arc::new(CallRecorder::default());
+
+        let mut miss = PendingCall::new(&recorder, "GetTransaction(missing)");
+        miss.expected_miss = Some("not_found");
+        miss.finish(Err(&super::CallFailure {
+            label: "not_found",
+            detail: "no such transaction".to_owned(),
+        }));
+        let (miss_seconds, _) = record_under_contention(&recorder, miss, held)?;
+
+        let mut answered = PendingCall::new(&recorder, "GetTreeState");
+        answered.finish(Ok(()));
+        let (_, ok_seconds) = record_under_contention(&recorder, answered, held)?;
+
+        let held_seconds = held.as_secs_f64();
+        assert!(
+            miss_seconds.len() == 1 && miss_seconds.iter().all(|&seconds| seconds < held_seconds),
+            "{miss_seconds:?}"
+        );
+        assert!(
+            ok_seconds.len() == 1 && ok_seconds.iter().all(|&seconds| seconds < held_seconds),
+            "{ok_seconds:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_frontier_digest_covers_every_shielded_pool() {
+        let base = TreeState {
+            sapling_tree: "aa".to_owned(),
+            orchard_tree: "bb".to_owned(),
+            ..TreeState::default()
+        };
+        let with_ironwood = TreeState {
+            ironwood_tree: "cc".to_owned(),
+            ..base.clone()
+        };
+
+        assert_ne!(
+            tree_state_frontier_digest(&base),
+            tree_state_frontier_digest(&with_ironwood)
+        );
+    }
 
     #[tokio::test]
     async fn a_unary_response_counts_as_one_message_of_its_encoded_size() {
@@ -681,17 +1124,43 @@ mod tests {
         assert_eq!(summary.messages, 1);
         assert_eq!(summary.bytes, encoded_bytes);
         assert!(summary.first_message_seconds.is_none());
+        assert!(summary.last_message_seconds.is_none());
     }
 
     #[test]
-    fn tree_state_heights_count_replay_depth_off_the_checkpoint_cadence() {
-        let heights = TreeStateHeights::of(&[1_000, 1_099, 3_424_810, 3_424_809]);
+    fn tree_state_heights_count_replay_depth_and_distinct_frontiers() {
+        let heights = TreeStateHeights::of(&[1_000, 1_099, 3_424_810, 3_424_809], 0);
 
         assert_eq!(heights.requested, 4);
+        assert_eq!(heights.distinct_heights, 4);
         assert_eq!(heights.on_cadence, 1);
         assert_eq!(heights.off_cadence, 3);
         assert!((heights.off_cadence_offset_blocks.max - 99.0).abs() < f64::EPSILON);
         assert!((heights.off_cadence_offset_blocks.p50 - 10.0).abs() < f64::EPSILON);
+
+        let recorder = CallRecorder::default();
+        recorder.note_tree_state_height(100);
+        recorder.note_tree_state_frontier(&TreeState {
+            height: 100,
+            sapling_tree: "aa".to_owned(),
+            ..TreeState::default()
+        });
+        recorder.note_tree_state_height(101);
+        recorder.note_tree_state_frontier(&TreeState {
+            height: 101,
+            sapling_tree: "aa".to_owned(),
+            ..TreeState::default()
+        });
+        recorder.note_tree_state_height(102);
+        recorder.note_tree_state_frontier(&TreeState {
+            height: 102,
+            sapling_tree: "bb".to_owned(),
+            ..TreeState::default()
+        });
+        let summary = recorder.tree_state_heights();
+        assert_eq!(summary.requested, 3);
+        assert_eq!(summary.distinct_heights, 3);
+        assert_eq!(summary.distinct_frontiers, 2);
     }
 
     #[test]

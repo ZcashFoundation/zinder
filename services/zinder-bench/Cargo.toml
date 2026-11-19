@@ -23,6 +23,7 @@ parking_lot.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
 rustix = { workspace = true, features = ["time"] }
+rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -51,8 +52,11 @@ workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+http.workspace = true
+rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
+tower.workspace = true
 zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true

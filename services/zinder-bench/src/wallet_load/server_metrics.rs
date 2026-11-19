@@ -33,6 +33,25 @@ const BLOCK_RANGE_STAGE_COUNT: &str = "zinder_compat_block_range_stage_duration_
 const RECEIVE_REFUSALS: &str = "zinder_grpc_request_receive_refusals_total";
 const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 
+/// Every counter the observation subtracts, checked for a reset.
+const OBSERVED_COUNTERS: [&str; 15] = [
+    TREE_STATE_RECONSTRUCTIONS,
+    TREE_STATE_REPLAYED_BLOCKS,
+    TREE_STATE_READS,
+    TREE_STATE_REPLAY_ADMISSIONS,
+    TREE_STATE_REPLAY_REFUSALS,
+    TREE_STATE_REPLAY_WAIT_SUM,
+    TREE_STATE_REPLAY_WAIT_COUNT,
+    BLOCK_RANGE_ADMISSIONS,
+    BLOCK_RANGE_REFUSALS,
+    BLOCK_RANGE_SLOT_WAIT_SUM,
+    BLOCK_RANGE_SLOT_WAIT_COUNT,
+    BLOCK_RANGE_STAGE_SUM,
+    BLOCK_RANGE_STAGE_COUNT,
+    RECEIVE_REFUSALS,
+    STALE_TIP_REFUSALS,
+];
+
 /// Longest one scrape may take, from connecting to the end of the response.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -51,6 +70,12 @@ pub(crate) struct ServerObserved {
     tree_state_replayed_blocks: u64,
     tree_state_stored_reads: u64,
     tree_state_replayed_reads: u64,
+    /// Tree states read per `height_band`, the first height of the 250,000
+    /// block band that holds the requested height.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tree_state_stored_reads_by_band: BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tree_state_replayed_reads_by_band: BTreeMap<String, u64>,
     tree_state_replay_admissions: u64,
     tree_state_replay_refusals: u64,
     /// Total time tree-state rebuilds waited for a rebuild slot.
@@ -76,7 +101,17 @@ pub(crate) struct StageTime {
 
 impl ServerObserved {
     /// The counter increases from `before` to `after`.
-    pub(super) fn between(before: &[MetricSample], after: &[MetricSample]) -> Self {
+    ///
+    /// Fails when a counter series went down or disappeared, as it does when
+    /// the server restarts during the run: the increases would then mix two
+    /// processes' counts, and a per-band count could exceed its total.
+    pub(super) fn between(before: &[MetricSample], after: &[MetricSample]) -> Result<Self, String> {
+        if let Some(series) = reset_series(before, after) {
+            return Err(format!(
+                "server counter {series} went down during the run, so the server likely \
+                 restarted; its counts over the run are unavailable"
+            ));
+        }
         let delta = |name| after_minus_before(before, after, name, None);
         let count = |name| counter_value(delta(name));
         let labeled =
@@ -104,11 +139,13 @@ impl ServerObserved {
                 (stage, time)
             })
             .collect();
-        Self {
+        Ok(Self {
             tree_state_reconstructions: count(TREE_STATE_RECONSTRUCTIONS),
             tree_state_replayed_blocks: count(TREE_STATE_REPLAYED_BLOCKS),
             tree_state_stored_reads: labeled(TREE_STATE_READS, ("source", "stored")),
             tree_state_replayed_reads: labeled(TREE_STATE_READS, ("source", "replayed")),
+            tree_state_stored_reads_by_band: reads_by_band(before, after, "stored"),
+            tree_state_replayed_reads_by_band: reads_by_band(before, after, "replayed"),
             tree_state_replay_admissions: count(TREE_STATE_REPLAY_ADMISSIONS),
             tree_state_replay_refusals: count(TREE_STATE_REPLAY_REFUSALS),
             tree_state_replay_wait_seconds: delta(TREE_STATE_REPLAY_WAIT_SUM).max(0.0),
@@ -120,8 +157,62 @@ impl ServerObserved {
             block_range_stages,
             receive_refusals: count(RECEIVE_REFUSALS),
             stale_tip_refusals: count(STALE_TIP_REFUSALS),
-        }
+        })
     }
+}
+
+/// The first observed counter series, rendered with its labels, whose
+/// reading in `after` is below its reading in `before` or missing.
+fn reset_series(before: &[MetricSample], after: &[MetricSample]) -> Option<String> {
+    let series_key = |sample: &MetricSample| {
+        let mut labels = sample
+            .labels
+            .iter()
+            .map(|(key, label)| format!("{key}=\"{label}\""))
+            .collect::<Vec<_>>();
+        labels.sort();
+        format!("{}{{{}}}", sample.name, labels.join(","))
+    };
+    let observed = |sample: &&MetricSample| OBSERVED_COUNTERS.contains(&sample.name.as_str());
+    let after_readings = after
+        .iter()
+        .filter(observed)
+        .map(|sample| (series_key(sample), sample.reading))
+        .collect::<BTreeMap<_, _>>();
+    before.iter().filter(observed).find_map(|sample| {
+        let key = series_key(sample);
+        let went_down = after_readings
+            .get(&key)
+            .is_none_or(|reading| *reading < sample.reading);
+        went_down.then_some(key)
+    })
+}
+
+/// Tree-state reads from `source` during the run, by `height_band` label.
+fn reads_by_band(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    source: &str,
+) -> BTreeMap<String, u64> {
+    let totals = |samples: &[MetricSample]| {
+        let mut totals = BTreeMap::<String, f64>::new();
+        for sample in samples.iter().filter(|sample| {
+            sample.name == TREE_STATE_READS && sample.label("source") == Some(source)
+        }) {
+            if let Some(band) = sample.label("height_band") {
+                *totals.entry(band.to_owned()).or_default() += sample.reading;
+            }
+        }
+        totals
+    };
+    let before = totals(before);
+    totals(after)
+        .into_iter()
+        .filter_map(|(band, total)| {
+            let reads = counter_value(total - before.get(&band).copied().unwrap_or(0.0));
+            (reads > 0).then_some((band, reads))
+        })
+        .collect()
 }
 
 /// The increase of `name`, summed over every series or only those whose
@@ -143,7 +234,7 @@ fn after_minus_before(
     total(after) - total(before)
 }
 
-/// Rounds a counter increase to a whole count; a reset reads as zero.
+/// Rounds a counter increase to a whole count.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -267,7 +358,7 @@ mod tests {
     use super::{ServerObserved, scrape, scrape_within};
 
     #[test]
-    fn counts_are_increases_over_the_run() {
+    fn counts_are_increases_over_the_run() -> Result<(), String> {
         let before = parse_prometheus_samples(
             "zinder_query_tree_state_replayed_blocks_count 4\n\
              zinder_query_tree_state_replayed_blocks_sum 300\n",
@@ -280,17 +371,48 @@ mod tests {
              zinder_grpc_request_receive_refusals_total{pool=\"client_stream\"} 1\n",
         );
 
-        let observed = ServerObserved::between(&before, &after);
+        let observed = ServerObserved::between(&before, &after)?;
 
         assert_eq!(observed.tree_state_reconstructions, 6);
         assert_eq!(observed.tree_state_replayed_blocks, 420);
         assert_eq!(observed.tree_state_replay_refusals, 3);
         assert_eq!(observed.receive_refusals, 2);
         assert_eq!(observed.block_range_refusals, 0);
+        Ok(())
     }
 
     #[test]
-    fn labeled_reads_waits_and_stages_are_split_by_label() {
+    fn a_counter_that_went_down_makes_the_observation_unavailable() {
+        // The server restarted: one band's reads restarted from zero while
+        // another band's new process count already exceeds its old one.
+        let before = parse_prometheus_samples(
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 50\n\
+             zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"b\"} 1\n",
+        );
+        let restarted = parse_prometheus_samples(
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 3\n\
+             zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"b\"} 9\n",
+        );
+        let missing = parse_prometheus_samples(
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"b\"} 9\n",
+        );
+
+        for after in [restarted, missing] {
+            let refused = ServerObserved::between(&before, &after).err();
+
+            assert!(
+                refused.is_some_and(|reason| reason.contains("height_band=\"a\"")),
+                "the reason names the series that went down"
+            );
+        }
+        // A metric the observation does not read may go down.
+        let unrelated_before = parse_prometheus_samples("process_resident_memory_bytes 9\n");
+        let unrelated_after = parse_prometheus_samples("process_resident_memory_bytes 1\n");
+        assert!(ServerObserved::between(&unrelated_before, &unrelated_after).is_ok());
+    }
+
+    #[test]
+    fn labeled_reads_waits_and_stages_are_split_by_label() -> Result<(), String> {
         let before = parse_prometheus_samples(
             "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 2\n\
              zinder_compat_block_range_stage_duration_seconds_sum{stage=\"read\"} 1.5\n\
@@ -307,16 +429,19 @@ mod tests {
              zinder_compat_block_range_stage_duration_seconds_count{stage=\"send\"} 9\n",
         );
 
-        let observed = ServerObserved::between(&before, &after);
+        let observed = ServerObserved::between(&before, &after)?;
 
         assert_eq!(observed.tree_state_stored_reads, 5);
         assert_eq!(observed.tree_state_replayed_reads, 4);
+        assert_eq!(observed.tree_state_stored_reads_by_band["a"], 5);
+        assert_eq!(observed.tree_state_replayed_reads_by_band["a"], 4);
         assert_eq!(observed.tree_state_replay_waits, 4);
         assert!((observed.tree_state_replay_wait_seconds - 0.25).abs() < 1e-9);
         let read = &observed.block_range_stages["read"];
         assert!((read.seconds - 2.5).abs() < 1e-9);
         assert_eq!(read.chunks, 10);
         assert_eq!(observed.block_range_stages["send"].chunks, 9);
+        Ok(())
     }
 
     #[tokio::test]
@@ -340,7 +465,7 @@ mod tests {
         server.await??;
 
         assert_eq!(
-            ServerObserved::between(&[], &samples).tree_state_replay_refusals,
+            ServerObserved::between(&[], &samples)?.tree_state_replay_refusals,
             5
         );
         assert!(scrape("https://127.0.0.1:1/metrics").await.is_err());
