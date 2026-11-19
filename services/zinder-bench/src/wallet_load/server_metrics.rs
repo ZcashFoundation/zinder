@@ -6,7 +6,7 @@
 //! run given the server's metrics endpoint reports the server's own counts
 //! over the run instead of inferring them from the 100-block stride.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Serialize;
 use tokio::{
@@ -32,6 +32,9 @@ const BLOCK_RANGE_STAGE_SUM: &str = "zinder_compat_block_range_stage_duration_se
 const BLOCK_RANGE_STAGE_COUNT: &str = "zinder_compat_block_range_stage_duration_seconds_count";
 const RECEIVE_REFUSALS: &str = "zinder_grpc_request_receive_refusals_total";
 const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
+
+/// Longest one scrape may take, from connecting to the end of the response.
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the server counted between the start and the end of a run.
 ///
@@ -148,6 +151,23 @@ fn counter_value(increase: f64) -> u64 {
 
 /// Reads the Prometheus exposition at an `http://host:port/path` URL.
 pub(super) async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
+    scrape_within(url, SCRAPE_TIMEOUT).await
+}
+
+/// Reads the exposition at `url`, failing when the whole exchange takes
+/// longer than `deadline`.
+async fn scrape_within(url: &str, deadline: Duration) -> Result<Vec<MetricSample>, String> {
+    tokio::time::timeout(deadline, read_exposition(url))
+        .await
+        .map_err(|_| {
+            format!(
+                "{url}: no complete response within {}s",
+                deadline.as_secs_f64()
+            )
+        })?
+}
+
+async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
     let without_scheme = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("{url}: the metrics URL must start with http://"))?;
@@ -190,7 +210,9 @@ mod tests {
     };
     use zinder_bench::metrics_scrape::parse_prometheus_samples;
 
-    use super::{ServerObserved, scrape};
+    use std::time::Duration;
+
+    use super::{ServerObserved, scrape, scrape_within};
 
     #[test]
     fn counts_are_increases_over_the_run() {
@@ -270,6 +292,33 @@ mod tests {
             5
         );
         assert!(scrape("https://127.0.0.1:1/metrics").await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scrape_gives_up_on_an_endpoint_that_never_finishes_its_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request).await?;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nzinder_")
+                .await?;
+            // Hold the connection open without finishing the response.
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let scraped = scrape_within(&url, Duration::from_millis(200)).await;
+        server.abort();
+
+        let error = scraped
+            .err()
+            .ok_or("a stalled endpoint must fail the scrape")?;
+        assert!(error.contains("no complete response"), "{error}");
         Ok(())
     }
 }
