@@ -529,6 +529,54 @@ async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<(
     Ok(())
 }
 
+/// Opening the secondary admits the store, which reads retained history, so
+/// the pass opens it only once historical work may run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pass_opens_its_secondary_only_once_historical_work_may_run() -> eyre::Result<()> {
+    const CLOSED_FOR: Duration = Duration::from_millis(500);
+    let harness = Harness::new()?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::BulkCatchup));
+    let secondary_path = next_secondary_path(harness.secondary_root.path());
+    let cancel = CancellationToken::new();
+    let task = spawn_tree_state_densification_task(
+        TreeStateDensificationContext {
+            canonical_primary_path: harness.primary_path()?,
+            secondary_path: secondary_path.clone(),
+            network_upgrade_activations: Arc::new(harness.activations.clone()),
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::None,
+            reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            writer: UnavailableWriter::default(),
+            gate: HistoricalWorkGate::without_materialized_views(readiness.clone()),
+            config: TreeStateDensificationConfig::default(),
+        },
+        cancel.clone(),
+    );
+
+    tokio::time::sleep(CLOSED_FOR).await;
+    let opened_while_closed = secondary_path.exists();
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+    let deadline = std::time::Instant::now() + PASS_DEADLINE;
+    while !secondary_path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let opened_once_open = secondary_path.exists();
+    cancel.cancel();
+    task.await?;
+
+    eyre::ensure!(
+        !opened_while_closed,
+        "the pass opened its secondary while historical work was held"
+    );
+    eyre::ensure!(
+        opened_once_open,
+        "the pass never opened its secondary once historical work could run"
+    );
+    Ok(())
+}
+
 /// Strides the pass replays are charged against its rate even when the
 /// writer cannot commit them, so retries stay under the configured ceiling.
 #[tokio::test(flavor = "current_thread", start_paused = true)]

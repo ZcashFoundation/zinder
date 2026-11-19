@@ -249,7 +249,11 @@ async fn open_secondary_when_published<Writer: TreeStateStrideWriter>(
     let mut waiting_logged = false;
     loop {
         // Opening catches the secondary up and admits the store, which reads
-        // retained history, so it runs off the async workers live ingest uses.
+        // retained history, so it waits for the gate and runs off the async
+        // workers live ingest uses.
+        if wait_until_historical_work_or_cancelled(&context.gate, cancel).await {
+            return None;
+        }
         let primary_path = context.canonical_primary_path.clone();
         let secondary_path = context.secondary_path.clone();
         let activations = Arc::clone(&context.network_upgrade_activations);
