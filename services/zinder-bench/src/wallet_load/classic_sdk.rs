@@ -89,7 +89,10 @@ pub(super) async fn sync_wallet(
                         end,
                         pool_types: Vec::new(),
                     },
-                    |block, encoded_bytes| progress.note_block(block, encoded_bytes),
+                    |block, encoded_bytes| {
+                        progress.note_block(block, encoded_bytes);
+                        std::future::ready(())
+                    },
                 )
                 .await
             }

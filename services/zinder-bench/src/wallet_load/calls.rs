@@ -466,18 +466,19 @@ pub(super) struct BlockRangeCall {
     pub(super) pool_types: Vec<i32>,
 }
 
-/// Streams `range`, handing each block and its encoded size to `on_block`.
+/// Streams `range`, handing each block and its encoded size to `on_block`
+/// and awaiting the future it returns before reading the next block.
 ///
 /// The stream fails as `out_of_sequence` when a block is not the next height
 /// or lies past `range.end`,
 /// and as `incomplete_stream` when it ends before `range.end`, because wallet
 /// engines reject both.
-pub(super) async fn get_block_range(
+pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
     recorder: &CallRecorder,
     client: &mut LwdClient,
     limits: &CallLimits,
     range: BlockRangeCall,
-    mut on_block: impl FnMut(&CompactBlock, u64),
+    mut on_block: impl FnMut(&CompactBlock, u64) -> Handled,
 ) -> Result<(), CallFailure> {
     let mut pending = PendingCall::new(recorder, "GetBlockRange");
     let request = BlockRange {
@@ -521,7 +522,7 @@ pub(super) async fn get_block_range(
             pending.messages = pending.messages.saturating_add(1);
             pending.bytes = pending.bytes.saturating_add(encoded_bytes);
             expected = expected.saturating_add(1);
-            on_block(&block, encoded_bytes);
+            on_block(&block, encoded_bytes).await;
         }
         if expected <= range.end {
             return Err(CallFailure {

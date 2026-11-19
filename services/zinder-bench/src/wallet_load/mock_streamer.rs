@@ -1,10 +1,12 @@
-//! A `CompactTxStreamer` test server that answers block ranges and tree
-//! states and ends its streams the way a test asks. Every other method is
-//! unimplemented.
+//! A `CompactTxStreamer` test server for block ranges and tree states.
+//!
+//! It ends its streams the way a test asks and counts the tree-state
+//! requests it holds at once. Every other method is unimplemented.
 
-use std::error::Error;
+use std::{error::Error, sync::Arc, time::Duration};
 
 use futures_util::stream::{self, BoxStream, StreamExt as _};
+use parking_lot::Mutex;
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Response, Status, Streaming, transport::Server};
@@ -29,10 +31,47 @@ pub(super) enum RangeEnding {
     Status(Code),
 }
 
+/// Tree-state requests the server holds, now and at most.
+#[derive(Default)]
+pub(super) struct HeldRequests {
+    counts: Mutex<(u64, u64)>,
+}
+
+impl HeldRequests {
+    /// The most tree-state requests the server held at once.
+    pub(super) fn peak(&self) -> u64 {
+        self.counts.lock().1
+    }
+
+    fn enter(&self) {
+        let mut counts = self.counts.lock();
+        counts.0 += 1;
+        counts.1 = counts.1.max(counts.0);
+    }
+
+    fn leave(&self) {
+        let mut counts = self.counts.lock();
+        counts.0 = counts.0.saturating_sub(1);
+    }
+}
+
 /// The server's behaviour.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct MockStreamer {
     pub(super) range_ending: RangeEnding,
+    /// How long each tree-state request is held before it is answered.
+    pub(super) tree_state_delay: Duration,
+    pub(super) held_tree_states: Arc<HeldRequests>,
+}
+
+impl MockStreamer {
+    pub(super) fn new(range_ending: RangeEnding) -> Self {
+        Self {
+            range_ending,
+            tree_state_delay: Duration::ZERO,
+            held_tree_states: Arc::default(),
+        }
+    }
 }
 
 /// A running mock server, stopped when dropped.
@@ -113,6 +152,9 @@ impl CompactTxStreamer for MockStreamer {
         &self,
         request: Request<BlockId>,
     ) -> Result<Response<TreeState>, Status> {
+        self.held_tree_states.enter();
+        tokio::time::sleep(self.tree_state_delay).await;
+        self.held_tree_states.leave();
         Ok(Response::new(TreeState {
             height: request.into_inner().height,
             ..TreeState::default()

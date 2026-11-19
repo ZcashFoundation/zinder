@@ -707,14 +707,16 @@ source:
   then runs 4 block workers, each on its own connection. The first request is
   a 64-block probe. Later requests are sized to 16 MiB at the density received
   so far, at most 10,000 blocks. Each 8 MiB piece of a stream (`--split-bytes`)
-  except the range's last asks for the tree state at its last block. A failed
-  request hands on the blocks it received and resumes after them on a fresh
-  connection after 0.25, 0.5, and 1 seconds. Only a stream that ends cleanly
-  after the request's last block completes it, so a stream that sends a block
-  past the request or fails after its last block is retried from the start of
-  that block's piece. A failed tree state is retried after 1 and 3 seconds.
-  Once the blocks are in, the wallet fetches `--transactions-per-wallet`
-  transactions from them, 8 at a time.
+  except the range's last asks for the tree state at its last block. Pieces
+  waiting on their tree states hold at most 256 MiB, Slipstream's chunk-queue
+  budget, so a worker whose piece does not fit stops reading its stream until
+  a tree state arrives. A failed request hands on the blocks it received and
+  resumes after them on a fresh connection after 0.25, 0.5, and 1 seconds.
+  Only a stream that ends cleanly after the request's last block completes
+  it, so a stream that sends a block past the request or fails after its last
+  block is retried from the start of that block's piece. A failed tree state
+  is retried after 1 and 3 seconds. Once the blocks are in, the wallet fetches
+  `--transactions-per-wallet` transactions from them, 8 at a time.
 - `vizor`: the Vizor wallet. Each batch streams its blocks with a pool filter
   naming Sapling, Orchard, and Ironwood and asks for the tree state below its
   first block at the same time. After each batch arrives, up to 4 more download
@@ -766,9 +768,10 @@ identity, the workload's constants, and, over all wallets:
   does not export reads as zero.
 
 The simulated wallets do not scan, so each asks for its next blocks as soon as
-the last ones arrive: the load is the most an engine of that shape sends, not
-an average. They also omit what a sync does besides blocks and tree states:
-`GetSubtreeRoots`, transparent address queries, mempool streams, and tip polls.
+the last ones arrive, or, for Slipstream, as soon as its chunk queue has room:
+the load is the most an engine of that shape sends, not an average. They also
+omit what a sync does besides blocks and tree states: `GetSubtreeRoots`,
+transparent address queries, mempool streams, and tip polls.
 Vizor sizes batches from compiled Mainnet tree sizes; the simulated wallet
 uses the density it has received, so its first batch is 10 blocks. When no
 block has arrived by the end of Slipstream's density wait, the simulated

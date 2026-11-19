@@ -358,6 +358,8 @@ pub(crate) async fn run_lightwalletd_wallet_load(
 pub(super) struct WorkloadSettings {
     pub(super) transactions_per_wallet: usize,
     pub(super) split_bytes: u64,
+    /// Bytes of Slipstream pieces that may wait on their tree states.
+    pub(super) queue_budget_bytes: u64,
     pub(super) vizor_profile: vizor::VizorProfile,
     pub(super) batch_byte_budget: Option<u64>,
     pub(super) rounds: u32,
@@ -370,6 +372,7 @@ impl WorkloadSettings {
             transactions_per_wallet: usize::try_from(args.transactions_per_wallet)
                 .unwrap_or(usize::MAX),
             split_bytes: args.split_bytes.max(1),
+            queue_budget_bytes: slipstream::DEFAULT_QUEUE_BUDGET_BYTES,
             vizor_profile: args.vizor_profile,
             batch_byte_budget: args.batch_byte_budget,
             rounds: args.rounds,

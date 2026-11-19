@@ -264,7 +264,10 @@ async fn download_batch(
                 PoolType::Ironwood as i32,
             ],
         },
-        |block, encoded_bytes| progress.note_block(block, encoded_bytes),
+        |block, encoded_bytes| {
+            progress.note_block(block, encoded_bytes);
+            std::future::ready(())
+        },
     );
     let tree_state = async {
         if reads_tree_state_locally(plan, start) {
