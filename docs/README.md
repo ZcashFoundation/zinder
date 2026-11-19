@@ -30,8 +30,8 @@ Look up:
 
 - [Configuration](reference/configuration.md): settings, environment
   variables, and listener limits
-- [Readiness](reference/readiness.md): `/healthz`, `/readyz`, and every
-  readiness cause
+- [Readiness](reference/readiness.md): `/healthz`, `/readyz`, gRPC health, and
+  every readiness cause
 - [Metrics](reference/metrics.md): metric names, alert signals, and log fields
 - [Service operations](architecture/service-operations.md): security boundary,
   recovery, and supported deployments

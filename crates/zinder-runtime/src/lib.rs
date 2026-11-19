@@ -26,8 +26,9 @@
 //!   ([`public_grpc_server`]), which bounds streams per connection, pings
 //!   idle connections, limits how many requests the process receives at
 //!   once ([`GrpcReceiveLimitLayer`]), and ends responses whose client stops
-//!   reading them ([`GrpcSendStallLayer`]), and the gRPC reflection service those
-//!   listeners serve ([`public_grpc_reflection`]).
+//!   reading them ([`GrpcSendStallLayer`]), and the gRPC reflection and
+//!   health services those listeners serve ([`public_grpc_reflection`],
+//!   [`public_grpc_health`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -57,6 +58,7 @@ mod memory_budget;
 mod metrics;
 mod ops_endpoint;
 mod ops_healthcheck;
+mod public_grpc_health;
 mod public_grpc_server;
 mod readiness;
 mod repeated_field_limits;
@@ -114,6 +116,7 @@ pub use ops_healthcheck::{
     OpsHealthcheckArgs, OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint,
     resolve_ops_healthcheck_addr,
 };
+pub use public_grpc_health::public_grpc_health;
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,
     GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,

@@ -28,8 +28,11 @@ together.
 | `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC | 9067 | 9107 |
 | `zinder-explorer` (optional) | `ExplorerQuery` gRPC | 9068 | 9069 |
 
-Each ops port serves `/healthz`, `/readyz`, and `/metrics`. These are the
-Mainnet ports. The Compose files add 10000 on Testnet and 20000 on Regtest, so
+Each ops port serves `/healthz`, `/readyz`, and `/metrics`. The two wallet
+gRPC ports also serve `grpc.health.v1.Health`, which a gRPC load balancer or a
+Kubernetes `grpc` probe can call directly; see
+[gRPC health](../reference/readiness.md#grpc-health) for the probe. These are
+the Mainnet ports. The Compose files add 10000 on Testnet and 20000 on Regtest, so
 the Testnet native query port is 19102. Compose publishes every port on host
 loopback only.
 

@@ -280,8 +280,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let publisher_handle = pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
     let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
     let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
+    let wallet_query_server = grpc_adapter.into_server();
+    let health_service =
+        zinder_runtime::public_grpc_health(readiness.clone(), cancel.clone(), &wallet_query_server);
     let grpc_service = tonic::service::interceptor::InterceptedService::new(
-        grpc_adapter.into_server(),
+        wallet_query_server,
         traffic_readiness,
     );
     let reflection_service = tonic::service::interceptor::InterceptedService::new(
@@ -302,6 +305,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let server = zinder_runtime::public_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
+        .add_service(health_service)
         .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned());
     supervise_query_runtime(
         server,

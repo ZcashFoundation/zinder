@@ -373,8 +373,14 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 
     let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
     let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
+    let compact_tx_streamer_server = grpc_adapter.into_server();
+    let health_service = zinder_runtime::public_grpc_health(
+        readiness.clone(),
+        cancel.clone(),
+        &compact_tx_streamer_server,
+    );
     let grpc_service = tonic::service::interceptor::InterceptedService::new(
-        grpc_adapter.into_server(),
+        compact_tx_streamer_server,
         traffic_readiness,
     );
     let reflection_service = tonic::service::interceptor::InterceptedService::new(
@@ -385,6 +391,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         zinder_runtime::public_grpc_server()
             .add_service(grpc_service)
             .add_service(reflection_service)
+            .add_service(health_service)
             .serve_with_shutdown(
                 lightwalletd_config.listen_addr,
                 cancel.clone().cancelled_owned(),
@@ -579,8 +586,14 @@ async fn run_compact_blocks(
     StartupPhase::Ready.start().complete();
     let traffic_readiness = TrafficReadinessInterceptor::new(serving_readiness.runtime());
     let reflection_readiness = TrafficReadinessInterceptor::new(serving_readiness.runtime());
+    let compact_tx_streamer_server = grpc_adapter.into_server();
+    let health_service = zinder_runtime::public_grpc_health(
+        serving_readiness.runtime(),
+        cancel.clone(),
+        &compact_tx_streamer_server,
+    );
     let grpc_service = tonic::service::interceptor::InterceptedService::new(
-        grpc_adapter.into_server(),
+        compact_tx_streamer_server,
         traffic_readiness,
     );
     let reflection_service = tonic::service::interceptor::InterceptedService::new(
@@ -591,6 +604,7 @@ async fn run_compact_blocks(
         zinder_runtime::public_grpc_server()
             .add_service(grpc_service)
             .add_service(reflection_service)
+            .add_service(health_service)
             .serve_with_shutdown(
                 lightwalletd_config.listen_addr,
                 cancel.clone().cancelled_owned(),

@@ -179,7 +179,9 @@ port private, as [Exposing over TLS](exposing-over-tls.md) sets up.
 - From another host, the wallet ports answer only through the proxy, and no
   other Zinder port answers.
 - The proxy stops sending new requests when compatibility `/readyz` returns
-  503.
+  503. A gRPC-aware proxy can instead call `grpc.health.v1.Health` on the
+  wallet port, as [gRPC health](../reference/readiness.md#grpc-health)
+  describes.
 - Monitoring alerts on readiness and on `zinder_readiness_served_epoch_age_seconds`,
   which grows while the served chain stops advancing. See
   [Metrics](../reference/metrics.md).

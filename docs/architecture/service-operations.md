@@ -60,6 +60,11 @@ accepting new requests. It then cancels background tasks, waits for its
 servers and owned tasks, and closes its operational endpoint. Only the owner
 of a store closes it, and readers make no final writes.
 
+`zinder-query` and `zinder-compat-lightwalletd` also answer `NOT_SERVING` on
+their [gRPC health service](../reference/readiness.md#grpc-health) from the
+moment shutdown starts, before their listener drains, so gRPC load balancers
+and Kubernetes `grpc` probes stop routing to them while the drain runs.
+
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
 streams never end on their own. `zinder-query` and
