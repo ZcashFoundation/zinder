@@ -2,12 +2,15 @@ use std::num::NonZeroU32;
 
 use rust_rocksdb::{DEFAULT_COLUMN_FAMILY_NAME, statistics::Ticker};
 use tempfile::TempDir;
-use zinder_core::{BlockHash, BlockHeight, BlockId, Network, UnixTimestampMillis};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, UnixTimestampMillis,
+};
 
 use super::{
     CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError,
     CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState, TreeStateLookup,
+    TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::{
         open_store, open_store_with_retention, published_store, published_store_with_retention,
@@ -15,7 +18,9 @@ use super::{
     },
     rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
 };
-use crate::{RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache};
+use crate::{
+    HeightOrder, RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache,
+};
 
 const REORG_WINDOW: u32 = 2;
 
@@ -161,6 +166,16 @@ fn a_stale_secondary_reports_a_compacted_away_table_file_until_it_catches_up()
         .ok_or("a scan over the compacted-away files must fail")?;
     assert!(crate::is_missing_table_file_error(&scan_failure));
     drop(family);
+    // A range read whose rows are in compacted-away files reports one too,
+    // through the point lookups that fetch them.
+    let failure = secondary
+        .compact_blocks_in_range(split_heights())
+        .err()
+        .ok_or("a range read over the compacted-away files must fail")?;
+    assert!(
+        failure.is_missing_table_file(),
+        "only a missing table file may fail the stale range read, got {failure:?}"
+    );
 
     secondary.try_catch_up()?;
     for height in (1..=SPLIT_HEIGHTS).map(BlockHeight::new) {
@@ -170,6 +185,271 @@ fn a_stale_secondary_reports_a_compacted_away_table_file_until_it_catches_up()
         );
     }
     Ok(())
+}
+
+/// A byte-bounded read that its first block fills fetches only that block.
+///
+/// A stale secondary therefore answers it while the table files of the other
+/// heights of the range are gone. The compaction leaves the table files of
+/// both starting ends in place, so the read of an end never depends on a
+/// cached table handle. Each row has a level-0 and a bottom-level file of its
+/// own so that the compaction can leave the ends' files alone. Each end gets a
+/// secondary of its own.
+#[test]
+fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(SPLIT_HEIGHTS),
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let mut stale = Vec::new();
+    for (order, first) in [
+        (HeightOrder::Ascending, BlockHeight::new(1)),
+        (HeightOrder::Descending, BlockHeight::new(SPLIT_HEIGHTS)),
+    ] {
+        let secondary = open_secondary(
+            &store_path,
+            temporary.path().join(format!("{order:?}")),
+            &activations,
+            RawBlobRetention::Transactions,
+        )??;
+        stale.push((secondary, order, first));
+    }
+
+    compact_away_rows_in(
+        &store.bounded_open.db,
+        COMPACT_BLOCK_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(SPLIT_HEIGHTS - 1)),
+    )?;
+    for (secondary, order, first) in &stale {
+        let first_block = store
+            .compact_block_at(*first)?
+            .ok_or("the primary must hold the first block")?;
+        assert_eq!(
+            secondary.compact_block_at(*first)?.as_ref(),
+            Some(&first_block),
+            "the {order:?} read's first block must stay readable"
+        );
+        let later_failures = split_heights()
+            .into_iter()
+            .filter(|height| height != first)
+            .filter_map(|height| secondary.compact_block_at(height).err())
+            .collect::<Vec<_>>();
+        assert!(
+            !later_failures.is_empty()
+                && later_failures
+                    .iter()
+                    .all(CanonicalStoreError::is_missing_table_file),
+            "another height of the {order:?} read must be in a missing table file, \
+             got {later_failures:?}"
+        );
+        let first_row_bytes = crate::encode_compact_block_artifact(&first_block).len();
+        for max_bytes in [0, first_row_bytes] {
+            let before = range_read_tickers(secondary);
+            assert_eq!(
+                secondary.compact_blocks_in_range_up_to(split_heights(), *order, max_bytes)?,
+                std::slice::from_ref(&first_block),
+                "a {order:?} read with a {max_bytes}-byte budget"
+            );
+            assert_eq!(
+                range_read_tickers(secondary).since(before),
+                RangeReadTickers {
+                    multi_get_calls: 1,
+                    multi_get_keys: 1,
+                    iterator_seeks: 0,
+                },
+                "a {order:?} read with a {max_bytes}-byte budget must fetch one row"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Low heights whose table files a partial compaction leaves in place.
+const KEPT_HEIGHTS: u32 = 2;
+
+/// The heights from 1 through [`KEPT_HEIGHTS`].
+fn kept_heights() -> BlockHeightRange {
+    BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(KEPT_HEIGHTS))
+}
+
+/// A range read on a stale secondary does not depend on a deleted table file
+/// that holds none of its heights.
+///
+/// An iterator bounded to a kept height fails on the stale secondary, while
+/// point lookups of the kept heights succeed. Every range read of the kept
+/// heights fetches its rows with point lookups and moves no iterator, so it
+/// succeeds within each byte budget. So do the tree-state replay over the kept
+/// heights and a byte-bounded read of every height whose budget the kept rows
+/// spend exactly.
+#[test]
+fn a_range_read_does_not_depend_on_a_deleted_table_file_outside_its_range()
+-> Result<(), Box<dyn std::error::Error>> {
+    use HeightOrder::{Ascending, Descending};
+
+    let temporary = TempDir::new()?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let (store, secondary) = stale_secondary_over_kept_heights(&temporary, &activations)?;
+    let kept = kept_heights();
+    let expected = store.compact_blocks_in_range(kept)?;
+    for (height, block) in kept.into_iter().zip(&expected) {
+        assert_eq!(secondary.compact_block_at(height)?.as_ref(), Some(block));
+    }
+
+    let before = range_read_tickers(&secondary);
+    assert_eq!(secondary.compact_blocks_in_range(kept)?, expected);
+    assert_eq!(
+        range_read_tickers(&secondary).since(before),
+        RangeReadTickers {
+            multi_get_calls: 1,
+            multi_get_keys: u64::from(KEPT_HEIGHTS),
+            iterator_seeks: 0,
+        },
+        "the read must fetch the kept rows with one multi-get"
+    );
+    let [low, high] = &expected[..] else {
+        return Err("the kept range must hold two compact blocks".into());
+    };
+    let row_bytes = |block| crate::encode_compact_block_artifact(block).len();
+    assert!(
+        row_bytes(high) < 2 * row_bytes(low),
+        "the second kept row must fit the budget left only once, so a read whose \
+         budget the kept rows spend fetches it alone"
+    );
+    let both_bytes = row_bytes(low) + row_bytes(high);
+    for (range, order, max_bytes, kept_blocks) in [
+        (kept, Ascending, usize::MAX, &expected[..]),
+        (kept, Descending, usize::MAX, &expected[..]),
+        (kept, Ascending, both_bytes, &expected[..]),
+        (kept, Descending, both_bytes, &expected[..]),
+        (
+            kept,
+            Ascending,
+            row_bytes(low) + 1,
+            std::slice::from_ref(low),
+        ),
+        (
+            kept,
+            Descending,
+            row_bytes(high) + 1,
+            std::slice::from_ref(high),
+        ),
+        (split_heights(), Ascending, both_bytes, &expected[..]),
+    ] {
+        let before = range_read_tickers(&secondary);
+        assert_eq!(
+            secondary.compact_blocks_in_range_up_to(range, order, max_bytes)?,
+            kept_blocks,
+            "a {order:?} read of {range:?} with a {max_bytes}-byte budget"
+        );
+        assert_eq!(
+            range_read_tickers(&secondary).since(before).iterator_seeks,
+            0,
+            "a {order:?} read of {range:?} must move no iterator"
+        );
+    }
+    assert_eq!(
+        secondary.tree_state_checkpoint_at(kept.end, &activations)?,
+        store.tree_state_checkpoint_at(kept.end, &activations)?
+    );
+    assert_eq!(
+        replayed_tree_state(&secondary, kept.end, &activations)?,
+        replayed_tree_state(&store, kept.end, &activations)?
+    );
+    Ok(())
+}
+
+/// A range read on a stale secondary that needs a deleted table file fails as
+/// a missing table file, so a reader can replace the secondary.
+#[test]
+fn a_range_read_still_reports_a_deleted_table_file_it_needs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use HeightOrder::{Ascending, Descending};
+
+    let temporary = TempDir::new()?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let (_store, secondary) = stale_secondary_over_kept_heights(&temporary, &activations)?;
+    for (read, outcome) in [
+        (
+            "unbounded",
+            secondary.compact_blocks_in_range(split_heights()),
+        ),
+        (
+            "ascending",
+            secondary.compact_blocks_in_range_up_to(split_heights(), Ascending, usize::MAX),
+        ),
+        (
+            "descending",
+            secondary.compact_blocks_in_range_up_to(split_heights(), Descending, usize::MAX),
+        ),
+        (
+            "replay",
+            secondary
+                .tree_state_checkpoint_at(BlockHeight::new(SPLIT_HEIGHTS - 1), &activations)
+                .map(|_| Vec::new()),
+        ),
+    ] {
+        let failure = outcome
+            .err()
+            .ok_or("a read that needs a deleted table file must fail")?;
+        assert!(failure.is_missing_table_file(), "{read} read: {failure:?}");
+    }
+    Ok(())
+}
+
+/// Opens a secondary on a primary whose rows each have a level-0 and a
+/// bottom-level table file of their own, then compacts away the rows above
+/// [`KEPT_HEIGHTS`] on the primary.
+///
+/// The stale secondary's view still names the deleted files. `RocksDB` opens
+/// every level-0 file to build an iterator, so an iterator bounded to a kept
+/// height fails on one of them, which this checks. A range read of the kept
+/// heights must therefore not build an iterator.
+fn stale_secondary_over_kept_heights(
+    temporary: &TempDir,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary), Box<dyn std::error::Error>> {
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(SPLIT_HEIGHTS),
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    let db = &store.bounded_open.db;
+    split_rows_into_bottom_level_files(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        activations,
+        RawBlobRetention::Transactions,
+    )??;
+
+    compact_away_rows_in(
+        db,
+        COMPACT_BLOCK_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(BlockHeight::new(KEPT_HEIGHTS + 1), split_heights().end),
+    )?;
+    let kept_end = kept_heights().end;
+    let (passed_rows, iterator_status) =
+        walk_iterator(&secondary, BlockHeightRange::inclusive(kept_end, kept_end))?;
+    assert!(
+        passed_rows == 0
+            && iterator_status
+                .as_ref()
+                .is_err_and(crate::is_missing_table_file_error),
+        "an iterator bounded to a kept height must open a deleted level-0 file, \
+         passed {passed_rows} and got {iterator_status:?}"
+    );
+    Ok((store, secondary))
 }
 
 /// A shared block cache that holds a compacted-away file's blocks does not
@@ -919,6 +1199,11 @@ fn test_block_cache() -> SharedBlockCache {
     SharedBlockCache::new(RocksDbResourceBudget::for_local_tests().block_cache_bytes)
 }
 
+/// Every height of the split store.
+fn split_heights() -> BlockHeightRange {
+    BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(SPLIT_HEIGHTS))
+}
+
 fn read_every_compact_block(
     secondary: &RocksDbCanonicalSecondary,
 ) -> Result<(), CanonicalStoreError> {
@@ -1005,8 +1290,43 @@ fn compact_away_table_files(
         .collect::<Vec<_>>();
     assert!(!replaced.is_empty(), "the family must hold L0 table files");
     db.compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
-    // The primary deletes obsolete files after the compaction job, which can
-    // finish just after the call returns.
+    wait_until_deleted(&replaced)
+}
+
+/// Compacts the rows of `family` keyed by `heights` on the primary and waits
+/// until every table file holding one of them is deleted.
+///
+/// The compaction takes every level-0 file overlapping `heights` and every
+/// file of the level it writes to that overlaps them, so with each row in a
+/// file of its own it leaves the files of the other rows in place.
+fn compact_away_rows_in(
+    db: &rust_rocksdb::DB,
+    family: &str,
+    heights: BlockHeightRange,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = db.cf_handle(family).ok_or("the family must exist")?;
+    let start = encode_block_position(heights.start);
+    let end = encode_block_position(heights.end);
+    let replaced = db
+        .live_files()?
+        .into_iter()
+        .filter(|file| {
+            file.column_family_name == family
+                && file.start_key.as_deref() <= Some(end.as_slice())
+                && file.end_key.as_deref() >= Some(start.as_slice())
+        })
+        .map(|file| table_file_path(&file))
+        .collect::<Vec<_>>();
+    assert!(!replaced.is_empty(), "the rows must be in table files");
+    db.compact_range_cf(&handle, Some(start), Some(end));
+    wait_until_deleted(&replaced)
+}
+
+/// Waits until the primary deletes every file of `replaced`.
+///
+/// The primary deletes obsolete files after the compaction job, which can
+/// finish just after the compaction call returns.
+fn wait_until_deleted(replaced: &[std::path::PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while replaced.iter().any(|path| path.exists()) {
         if std::time::Instant::now() >= deadline {
@@ -1015,6 +1335,105 @@ fn compact_away_table_files(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// Rewrites `family` on the primary so that every row is in a bottom-level
+/// table file of its own, and no level-0 file remains.
+fn split_rows_into_bottom_level_files(
+    db: &rust_rocksdb::DB,
+    family: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = db.cf_handle(family).ok_or("the family must exist")?;
+    // A one-byte target counted with the estimated table tail ends a
+    // compaction output file after every row.
+    db.set_options_cf(
+        &handle,
+        &[
+            ("target_file_size_base", "1"),
+            ("target_file_size_is_upper_bound", "true"),
+        ],
+    )?;
+    split_rows_into_table_files(db, family)?;
+    compact_away_table_files(db, family)
+}
+
+/// Walks an iterator over the compact-block rows of `secondary` bounded to
+/// `heights` in ascending order, and returns how many rows it passed and its
+/// status once it stops.
+fn walk_iterator(
+    secondary: &RocksDbCanonicalSecondary,
+    heights: BlockHeightRange,
+) -> Result<(usize, Result<(), rust_rocksdb::Error>), Box<dyn std::error::Error>> {
+    let db = &secondary.bounded_open.db;
+    let family = db
+        .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+        .ok_or("the family must exist")?;
+    let mut read_options = rust_rocksdb::ReadOptions::default();
+    read_options.set_iterate_lower_bound(encode_block_position(heights.start));
+    read_options.set_iterate_upper_bound(encode_block_position(
+        heights
+            .end
+            .next()
+            .ok_or("the range must end below u32::MAX")?,
+    ));
+    let mut rows = db.raw_iterator_cf_opt(&family, read_options);
+    rows.seek(encode_block_position(heights.start));
+    let mut passed_rows = 0;
+    while rows.valid() {
+        passed_rows += 1;
+        rows.next();
+    }
+    Ok((passed_rows, rows.status()))
+}
+
+/// How a secondary has fetched rows: its multi-get calls, the keys they
+/// requested, and its iterator seeks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RangeReadTickers {
+    multi_get_calls: u64,
+    multi_get_keys: u64,
+    iterator_seeks: u64,
+}
+
+impl RangeReadTickers {
+    /// The fetches recorded after `before`.
+    fn since(self, before: Self) -> Self {
+        Self {
+            multi_get_calls: self.multi_get_calls - before.multi_get_calls,
+            multi_get_keys: self.multi_get_keys - before.multi_get_keys,
+            iterator_seeks: self.iterator_seeks - before.iterator_seeks,
+        }
+    }
+}
+
+/// The fetches `secondary` has recorded so far.
+fn range_read_tickers(secondary: &RocksDbCanonicalSecondary) -> RangeReadTickers {
+    let statistics = &secondary.bounded_open.statistics;
+    RangeReadTickers {
+        multi_get_calls: statistics.get_ticker_count(Ticker::NumberMultigetCalls),
+        multi_get_keys: statistics.get_ticker_count(Ticker::NumberMultigetKeysRead),
+        iterator_seeks: statistics.get_ticker_count(Ticker::NumberDbSeek),
+    }
+}
+
+/// Looks up the tree state at `height`, which `store` stores no checkpoint
+/// for, and returns the tree state its replay produces.
+fn replayed_tree_state(
+    store: &impl super::reader::CanonicalServingRead,
+    height: BlockHeight,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<ServedTreeState, Box<dyn std::error::Error>> {
+    let Some(TreeStateLookup::Replay(replay)) =
+        super::tree_state_replay::lookup_tree_state(store, height, activations)?
+    else {
+        return Err("the height must replay from a checkpoint below it".into());
+    };
+    let Some(TreeStateReplayOutcome::Replayed { tree_state, .. }) =
+        super::tree_state_replay::replay_tree_state(store, &replay, activations)?
+    else {
+        return Err("the replay must rebuild the tree state".into());
+    };
+    Ok(tree_state)
 }
 
 fn table_file_path(file: &rust_rocksdb::LiveFile) -> std::path::PathBuf {

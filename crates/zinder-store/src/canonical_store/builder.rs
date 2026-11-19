@@ -885,50 +885,218 @@ mod tests {
     }
 
     #[test]
-    fn compact_block_range_refuses_missing_interior_payload_or_header()
+    fn compact_block_range_refuses_a_missing_row_inside_retained_history()
     -> Result<(), Box<dyn std::error::Error>> {
-        for family_name in [COMPACT_BLOCK_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY] {
+        use crate::HeightOrder::{Ascending, Descending};
+
+        // Deleting the first, an interior, and the last row covers a gap in
+        // the first batch of a byte-bounded read in either order, and one in
+        // a later batch.
+        for missing in [1, 2, 3] {
             let temporary = TempDir::new()?;
             let store_path = temporary.path().join("canonical");
             let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
             let range =
                 zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
-
-            let before = store.compact_blocks_in_range(range)?;
-            assert_eq!(
-                before
-                    .iter()
-                    .map(|block| block.height().value())
-                    .collect::<Vec<_>>(),
-                [1, 2, 3]
-            );
-
             let family = store
                 .bounded_open
                 .db
-                .cf_handle(family_name)
-                .ok_or("compact-block test family is absent")?;
+                .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+                .ok_or("compact-block family is absent")?;
             store.bounded_open.db.delete_cf(
                 &family,
-                crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
+                crate::canonical_store::block_load::encode_block_position(BlockHeight::new(
+                    missing,
+                )),
             )?;
 
-            let error = store
-                .compact_blocks_in_range(range)
-                .err()
-                .ok_or("an interior compact-block gap must fail closed")?;
-            let expected_reason = if family_name == COMPACT_BLOCK_COLUMN_FAMILY {
-                "compact block at height 2 is absent"
-            } else {
-                "compact block header is absent"
-            };
-            assert!(
-                matches!(
-                    &error,
-                    CanonicalStoreError::PublicationRefused { reason }
-                        if reason.contains(expected_reason)
+            let expected_reason = format!("compact block at height {missing} is absent");
+            for (read, outcome) in [
+                ("unbounded", store.compact_blocks_in_range(range)),
+                (
+                    "ascending",
+                    store.compact_blocks_in_range_up_to(range, Ascending, usize::MAX),
                 ),
-                "a missing row inside retained history must stay an integrity failure: {error:?}"
+                (
+                    "descending",
+                    store.compact_blocks_in_range_up_to(range, Descending, usize::MAX),
+                ),
+            ] {
+                let error = outcome
+                    .err()
+                    .ok_or("a compact-block gap inside retained history must fail closed")?;
+                assert!(
+                    matches!(
+                        &error,
+                        CanonicalStoreError::PublicationRefused { reason }
+                            if reason.contains(&expected_reason)
+                    ),
+                    "{read} read with height {missing} missing must stay an integrity failure: \
+                     {error:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_range_reads_only_compact_block_rows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::HeightOrder::{Ascending, Descending};
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+        let range =
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+        let before = store.compact_blocks_in_range(range)?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("block-header family is absent")?;
+        store.bounded_open.db.delete_cf(
+            &family,
+            crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
+        )?;
+
+        assert_eq!(store.compact_blocks_in_range(range)?, before);
+        for order in [Ascending, Descending] {
+            assert_eq!(
+                store.compact_blocks_in_range_up_to(range, order, usize::MAX)?,
+                before,
+                "{order:?} read"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_range_refuses_a_stored_row_above_the_visible_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::HeightOrder::{Ascending, Descending};
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+        let tip = store
+            .compact_block_at(BlockHeight::new(3))?
+            .ok_or("the tip compact block is absent")?;
+        let stray_height = BlockHeight::new(4);
+        let stray = CompactBlockArtifact::new(
+            BlockId::new(stray_height, BlockHash::from_bytes([4; 32])),
+            tip.block_hash(),
+            tip.time(),
+            Vec::new(),
+            tip.chain_metadata(),
+        )?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+            .ok_or("compact-block family is absent")?;
+        store.bounded_open.db.put_cf(
+            &family,
+            crate::canonical_store::block_load::encode_block_position(stray_height),
+            crate::encode_compact_block_artifact(&stray),
+        )?;
+        drop(family);
+        assert_eq!(
+            store.compact_block_at(stray_height)?,
+            Some(stray),
+            "the stray row must decode as a block at its height"
+        );
+
+        for (start, end) in [(4, 4), (3, 4)] {
+            let range = zinder_core::BlockHeightRange::inclusive(
+                BlockHeight::new(start),
+                BlockHeight::new(end),
+            );
+            for (read, outcome) in [
+                ("unbounded", store.compact_blocks_in_range(range)),
+                (
+                    "ascending",
+                    store.compact_blocks_in_range_up_to(range, Ascending, usize::MAX),
+                ),
+                (
+                    "descending",
+                    store.compact_blocks_in_range_up_to(range, Descending, usize::MAX),
+                ),
+            ] {
+                let error = outcome
+                    .err()
+                    .ok_or("a row above the visible tip must not be served")?;
+                assert!(
+                    matches!(
+                        error,
+                        CanonicalStoreError::ArtifactUnavailable {
+                            family: crate::ArtifactFamily::CompactBlock,
+                            height,
+                        } if height == stray_height
+                    ),
+                    "{read} read of {start}..={end}: unexpected error {error:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A range read fetches its rows with one multi-get per batch and moves no
+    /// iterator, so it opens no table file beyond those its point lookups
+    /// open.
+    #[test]
+    fn compact_block_range_reads_fetch_rows_with_multi_gets_and_no_iterator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::HeightOrder::{Ascending, Descending};
+        use rust_rocksdb::statistics::Ticker;
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+        let range =
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+        let tickers = || {
+            let statistics = &store.bounded_open.statistics;
+            [
+                Ticker::NumberMultigetCalls,
+                Ticker::NumberMultigetKeysRead,
+                Ticker::NumberDbSeek,
+                Ticker::NumberDbNext,
+                Ticker::NumberDbPrev,
+            ]
+            .map(|ticker| statistics.get_ticker_count(ticker))
+        };
+        let lookups_of =
+            |read: &dyn Fn() -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>,
+             expected_blocks: usize|
+             -> Result<[u64; 5], CanonicalStoreError> {
+                let before = tickers();
+                assert_eq!(read()?.len(), expected_blocks);
+                let after = tickers();
+                Ok([0, 1, 2, 3, 4].map(|ticker| after[ticker] - before[ticker]))
+            };
+
+        // Each entry counts multi-get calls, keys requested, and iterator
+        // seeks, nexts, and prevs.
+        assert_eq!(
+            lookups_of(&|| store.compact_blocks_in_range(range), 3)?,
+            [1, 3, 0, 0, 0]
+        );
+        // A byte-bounded read fetches one row to learn its size, then the
+        // rest of the range in one batch.
+        for order in [Ascending, Descending] {
+            assert_eq!(
+                lookups_of(
+                    &|| store.compact_blocks_in_range_up_to(range, order, usize::MAX),
+                    3
+                )?,
+                [2, 3, 0, 0, 0],
+                "a {order:?} read of the whole range"
+            );
+            assert_eq!(
+                lookups_of(&|| store.compact_blocks_in_range_up_to(range, order, 0), 1)?,
+                [1, 1, 0, 0, 0],
+                "a {order:?} read its first block fills"
             );
         }
         Ok(())
@@ -1037,18 +1205,21 @@ mod tests {
             &family,
             crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
         )?;
+        assert_eq!(read_heights(Ascending, 0)?, [1]);
         assert_eq!(read_heights(Descending, 0)?, [3]);
-        let error = read_heights(Descending, usize::MAX)
-            .err()
-            .ok_or("an interior compact-block gap must fail closed")?;
-        assert!(
-            matches!(
-                &error,
-                CanonicalStoreError::PublicationRefused { reason }
-                    if reason.contains("compact block at height 2 is absent")
-            ),
-            "unexpected error {error:?}"
-        );
+        for order in [Ascending, Descending] {
+            let error = read_heights(order, usize::MAX)
+                .err()
+                .ok_or("an interior compact-block gap must fail closed")?;
+            assert!(
+                matches!(
+                    &error,
+                    CanonicalStoreError::PublicationRefused { reason }
+                        if reason.contains("compact block at height 2 is absent")
+                ),
+                "{order:?} read: unexpected error {error:?}"
+            );
+        }
         Ok(())
     }
 

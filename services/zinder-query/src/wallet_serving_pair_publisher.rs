@@ -6911,10 +6911,11 @@ mod tests {
     ///
     /// With the test budget's 64 open files, a secondary keeps at most 77
     /// table files open: a 54-entry table cache over 64 one-entry shards, plus
-    /// up to 13 handles pinned at open. A range read over these blocks touches
-    /// a compact-block and a header row per block, 96 files in all, so it must
-    /// reopen a file whatever the cache's hash seed.
-    const SPLIT_TIP_HEIGHT: u32 = 48;
+    /// up to 13 handles pinned at open. A range read over these blocks looks
+    /// up only the compact-block row of each block, which sits in a level-0
+    /// file of its own, so the read needs 96 files and must reopen one
+    /// whatever the cache's hash seed.
+    const SPLIT_TIP_HEIGHT: u32 = 96;
 
     /// A read that finds a table file of its pair deleted by the writer's
     /// compaction is answered by a replacement pair the publisher publishes
