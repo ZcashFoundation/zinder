@@ -5,16 +5,15 @@ use std::mem::size_of;
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
-    BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CompactBlockArtifact, Network, NetworkUpgradeActivations, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-    UnixTimestampMillis,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
+    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore,
     block_load::{
         BLOCK_HEADER_VALUE_LEN, decode_tree_state_checkpoint, encode_block_position,
@@ -30,6 +29,7 @@ use super::{
     subtree_load::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
     },
+    tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome},
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
@@ -315,6 +315,50 @@ macro_rules! impl_canonical_typed_reads {
                 )
             }
 
+            /// Finds how the tree state at `height` is answered: by the
+            /// checkpoint stored there, or by a reconstruction from the
+            /// newest stored checkpoint below it.
+            ///
+            /// Applies every check of [`Self::tree_state_checkpoint_at`]
+            /// that precedes the replay, with the same errors, and returns
+            /// `Ok(None)` for the same heights. Pass a
+            /// [`TreeStateLookup::Replay`] to [`Self::replay_tree_state`] to
+            /// reconstruct it without reading the seed again.
+            pub fn tree_state_lookup(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                super::tree_state_replay::lookup_tree_state(
+                    self,
+                    height,
+                    network_upgrade_activations,
+                )
+            }
+
+            /// Reconstructs the tree state a [`Self::tree_state_lookup`]
+            /// found no checkpoint for, applying every check of
+            /// [`Self::tree_state_checkpoint_at`], and reports how it was
+            /// answered.
+            ///
+            /// Replays from the seed the lookup read. When this store shows
+            /// another visible chain than the store that issued `replay`, it
+            /// answers exactly as [`Self::tree_state_checkpoint_at`] does for
+            /// [`TreeStateReplay::height`], including `Ok(None)`: from the
+            /// checkpoint it stores there, or by a replay from the seed it
+            /// reads itself, which the outcome names.
+            pub fn replay_tree_state(
+                &self,
+                replay: &TreeStateReplay,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+                super::tree_state_replay::replay_tree_state(
+                    self,
+                    replay,
+                    network_upgrade_activations,
+                )
+            }
+
             /// Reads the contiguous subtree-root rows requested by `range`.
             ///
             /// In a store loaded with retained-range coverage, an absent root
@@ -525,6 +569,37 @@ fn read_compact_blocks_up_to(
         blocks.reverse();
     }
     Ok(blocks)
+}
+
+/// Passes each compact block of `range` to `visit` in ascending height order,
+/// reading rows in multi-get batches of at most
+/// [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`].
+///
+/// Each block is checked against its canonical header as a range read checks
+/// it, and only one batch of rows is held at a time. A height outside retained
+/// history fails with [`CanonicalStoreError::ArtifactUnavailable`], and a
+/// missing row inside it fails as store damage.
+pub(super) fn visit_compact_blocks_in_range(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+    mut visit: impl FnMut(CompactBlockArtifact) -> Result<(), CanonicalStoreError>,
+) -> Result<(), CanonicalStoreError> {
+    let retained_span = retained_compact_block_span(store);
+    let heights = range.into_iter().collect::<Vec<_>>();
+    for batch in heights.chunks(BOUNDED_COMPACT_BLOCK_BATCH_SIZE) {
+        let rows = CompactBlockRows::fetch(store, batch)?;
+        for ((height, compact_row), header_row) in
+            batch.iter().copied().zip(rows.compact).zip(rows.headers)
+        {
+            let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
+            visit(decode_compact_block_row(
+                height,
+                &encoded_compact_block,
+                header_row,
+            )?)?;
+        }
+    }
+    Ok(())
 }
 
 /// Rows the next batch of a byte-bounded read fetches.
@@ -986,7 +1061,10 @@ fn decode_chain_epoch(
         visible_tip_hash: BlockHash::from_bytes(read_array(encoded, 5)?),
         settled_tip_height: BlockHeight::new(read_u32_le(encoded, 37)?),
         settled_tip_hash: BlockHash::from_bytes(read_array(encoded, 41)?),
-        artifact_schema_version: ArtifactSchemaVersion::new(CANONICAL_STORE_SCHEMA_VERSION),
+        // The epoch row stores no version, so an epoch reports the artifact
+        // schema version of this binary, the value `ServerInfo` reports, not
+        // the store layout version.
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(
             read_u32_le(encoded, 73)?,
             read_u32_le(encoded, 77)?,
@@ -1075,7 +1153,38 @@ fn read_array<const LENGTH: usize>(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+    use zinder_core::BlockHeight;
+
     use super::{BOUNDED_COMPACT_BLOCK_BATCH_SIZE, bounded_batch_len};
+    use crate::{
+        CURRENT_ARTIFACT_SCHEMA_VERSION, canonical_store::live_replacement_tests::published_store,
+    };
+
+    /// A canonical epoch names the artifact schema its artifacts use, the
+    /// version `ServerInfo` reports, not the store's own layout version.
+    #[test]
+    fn a_chain_epoch_carries_the_artifact_schema_version() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store = published_store(
+            &temporary.path().join("canonical"),
+            2,
+            BlockHeight::new(5),
+            BlockHeight::new(5),
+        )?;
+        let visible = store.chain_epoch()?;
+
+        assert_eq!(
+            visible.artifact_schema_version,
+            CURRENT_ARTIFACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store.chain_epoch_at(visible.id)?.artifact_schema_version,
+            CURRENT_ARTIFACT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_bounded_batch_fits_the_budget_left_at_the_largest_row_read() {

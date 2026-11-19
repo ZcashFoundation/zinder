@@ -11,18 +11,108 @@
 //! [`TREE_STATE_CHECKPOINT_STRIDE`] blocks or fails as store damage.
 
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
-    CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, CompactBlockArtifact,
-    NetworkUpgradeActivations,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpochId, ChainTipMetadata,
+    CommitmentTreeAccumulator, CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint,
+    CompactBlockArtifact, NetworkUpgradeActivations,
 };
 
 use super::{
-    CanonicalStoreError, TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, TREE_STATE_CHECKPOINT_STRIDE,
     reader::{
-        CanonicalServingRead, read_block_header_at, read_compact_block_at,
-        read_tree_state_checkpoint_at_or_before,
+        CanonicalServingRead, read_block_header_at, read_tree_state_checkpoint_at_or_before,
+        visit_compact_blocks_in_range,
     },
 };
+
+/// How the store answers the tree state at one retained height.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreeStateLookup {
+    /// A checkpoint is stored at the height.
+    Stored(CommitmentTreeCheckpoint),
+    /// No checkpoint is stored at the height, so it must be reconstructed.
+    Replay(TreeStateReplay),
+}
+
+/// A pending reconstruction of the tree state at one height from the seed
+/// checkpoint the store found below it.
+///
+/// Only a store lookup issues one, so its seed is a validated stored
+/// checkpoint. It remembers the visible chain of the store that read the
+/// seed, and a store showing another chain reads the seed again before it
+/// replays.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeStateReplay {
+    seed: CommitmentTreeCheckpoint,
+    height: BlockHeight,
+    seed_chain: VisibleChain,
+}
+
+/// How a store answered a [`TreeStateReplay`].
+///
+/// A store showing another visible chain than the one that issued the replay
+/// looks the height up again, so it can answer from a checkpoint it stores
+/// there or replay from another seed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreeStateReplayOutcome {
+    /// The store holds a checkpoint at the height, so nothing was replayed.
+    Stored(CommitmentTreeCheckpoint),
+    /// The store rebuilt the tree state from the seed `replay` names.
+    Replayed {
+        /// The reconstruction the store ran.
+        replay: Box<TreeStateReplay>,
+        /// The tree state it produced.
+        checkpoint: CommitmentTreeCheckpoint,
+    },
+}
+
+impl TreeStateReplayOutcome {
+    /// Returns the tree state at the replayed height.
+    #[must_use]
+    pub const fn checkpoint(&self) -> &CommitmentTreeCheckpoint {
+        match self {
+            Self::Stored(checkpoint) | Self::Replayed { checkpoint, .. } => checkpoint,
+        }
+    }
+}
+
+/// The visible chain a store's READY evidence names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisibleChain {
+    epoch: ChainEpochId,
+    tip: BlockId,
+    sequence_digest: [u8; 32],
+}
+
+impl VisibleChain {
+    fn of(store: &impl CanonicalServingRead) -> Self {
+        let evidence: CanonicalStoreReadyEvidence = store.serving_ready_evidence();
+        Self {
+            epoch: evidence.visible_epoch,
+            tip: evidence.visible_tip,
+            sequence_digest: evidence.visible_sequence_digest,
+        }
+    }
+}
+
+impl TreeStateReplay {
+    /// Returns the stored checkpoint the reconstruction starts from.
+    #[must_use]
+    pub const fn seed(&self) -> &CommitmentTreeCheckpoint {
+        &self.seed
+    }
+
+    /// Returns the height whose tree state the reconstruction produces.
+    #[must_use]
+    pub const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Returns how many compact blocks the reconstruction replays.
+    #[must_use]
+    pub const fn replayed_blocks(&self) -> u32 {
+        self.height.value() - self.seed.block_id.height.value()
+    }
+}
 
 /// Reads the stored checkpoint at `height`, or reconstructs it from the newest
 /// checkpoint below `height` and the stored compact blocks above that one.
@@ -31,12 +121,26 @@ pub(super) fn read_tree_state_checkpoint_at(
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-    if !store.serving_admits_activations_through(activations, height) {
-        return Err(CanonicalStoreError::admission(
-            store.serving_open().db.path(),
-            "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
-        ));
+    match lookup_tree_state(store, height, activations)? {
+        None => Ok(None),
+        Some(TreeStateLookup::Stored(checkpoint)) => Ok(Some(checkpoint)),
+        Some(TreeStateLookup::Replay(replay)) => {
+            reconstruct(store, &replay.seed, height, activations).map(Some)
+        }
     }
+}
+
+/// Finds the stored checkpoint at `height`, or the seed a reconstruction of
+/// `height` starts from.
+///
+/// Returns `Ok(None)` for a height above the visible tip or below the history
+/// predecessor. A seed below [`required_seed_height`] is store damage.
+pub(super) fn lookup_tree_state(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+    refuse_unadmitted_activations(store, height, activations)?;
     let history_predecessor_height = store
         .serving_build_plan()
         .history_predecessor()
@@ -57,9 +161,69 @@ pub(super) fn read_tree_state_checkpoint_at(
             ))
         })?;
     if seed.block_id.height == height {
-        return Ok(Some(seed));
+        return Ok(Some(TreeStateLookup::Stored(seed)));
     }
-    let (mut accumulator, tip) = replay_compact_blocks(store, &seed, height, activations)?;
+    Ok(Some(TreeStateLookup::Replay(TreeStateReplay {
+        seed,
+        height,
+        seed_chain: VisibleChain::of(store),
+    })))
+}
+
+/// Reconstructs the tree state `replay` names, reporting how it was
+/// answered.
+///
+/// A store showing another visible chain than the one that issued `replay`
+/// answers as [`read_tree_state_checkpoint_at`] does, so `Ok(None)` means the
+/// height left that store's retained history.
+pub(super) fn replay_tree_state(
+    store: &impl CanonicalServingRead,
+    replay: &TreeStateReplay,
+    activations: &NetworkUpgradeActivations,
+) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    let replay = if replay.seed_chain == VisibleChain::of(store) {
+        refuse_unadmitted_activations(store, replay.height, activations)?;
+        replay.clone()
+    } else {
+        match lookup_tree_state(store, replay.height, activations)? {
+            None => return Ok(None),
+            Some(TreeStateLookup::Stored(checkpoint)) => {
+                return Ok(Some(TreeStateReplayOutcome::Stored(checkpoint)));
+            }
+            Some(TreeStateLookup::Replay(reread)) => reread,
+        }
+    };
+    let checkpoint = reconstruct(store, &replay.seed, replay.height, activations)?;
+    Ok(Some(TreeStateReplayOutcome::Replayed {
+        replay: Box::new(replay),
+        checkpoint,
+    }))
+}
+
+fn refuse_unadmitted_activations(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(), CanonicalStoreError> {
+    if store.serving_admits_activations_through(activations, height) {
+        Ok(())
+    } else {
+        Err(CanonicalStoreError::admission(
+            store.serving_open().db.path(),
+            "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
+        ))
+    }
+}
+
+/// Replays the stored compact blocks above `seed` through `height` and checks
+/// the result against the canonical block at `height`.
+fn reconstruct(
+    store: &impl CanonicalServingRead,
+    seed: &CommitmentTreeCheckpoint,
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+    let (mut accumulator, tip) = replay_compact_blocks(store, seed, height, activations)?;
     let header = read_block_header_at(store, height)?.ok_or_else(|| {
         CanonicalStoreError::publication(format!(
             "tree-state reconstruction header at height {} is absent",
@@ -81,11 +245,11 @@ pub(super) fn read_tree_state_checkpoint_at(
     let frontiers = accumulator
         .cross_checked_frontiers()
         .map_err(|source| replay_refused(height, &source))?;
-    Ok(Some(CommitmentTreeCheckpoint::new(
+    Ok(CommitmentTreeCheckpoint::new(
         tip,
         block_time_seconds,
         frontiers,
-    )))
+    ))
 }
 
 /// Returns the lowest checkpoint height a reconstruction of `height` may seed
@@ -103,7 +267,7 @@ fn required_seed_height(height: BlockHeight, history_predecessor: BlockHeight) -
 }
 
 /// Seeds the trees from `seed` and appends each stored compact block through
-/// `height`, one height at a time.
+/// `height` in ascending order, reading the blocks in multi-get batches.
 ///
 /// Every block must extend the one before it, starting from `seed`'s block,
 /// and reach the tree sizes its compact block records. Returns the trees and
@@ -121,39 +285,41 @@ fn replay_compact_blocks(
     )
     .map_err(|source| replay_refused(seed.block_id.height, &source))?;
     let mut tip = seed.block_id;
-    while tip.height < height {
-        let next_height = tip.height.next().ok_or_else(|| {
-            CanonicalStoreError::publication("tree-state reconstruction height exceeds u32::MAX")
-        })?;
-        let compact_block = read_compact_block_at(store, next_height)?.ok_or_else(|| {
-            CanonicalStoreError::publication(format!(
-                "compact block at height {} is absent",
-                next_height.value()
-            ))
-        })?;
-        if compact_block.previous_block_hash() != tip.hash {
-            return Err(CanonicalStoreError::publication(format!(
-                "compact block at height {} does not extend the block below it",
-                next_height.value()
-            )));
-        }
-        append_compact_block_commitments(&mut accumulator, &compact_block)
-            .map_err(|source| replay_refused(next_height, &source))?;
-        let recorded = compact_block.chain_metadata();
-        if accumulator.tip_metadata()
-            != ChainTipMetadata::new(
-                recorded.sapling_commitment_tree_size,
-                recorded.orchard_commitment_tree_size,
-                recorded.ironwood_commitment_tree_size,
-            )
-        {
-            return Err(CanonicalStoreError::publication(format!(
-                "compact block at height {} records tree sizes its note commitments do not reach",
-                next_height.value()
-            )));
-        }
-        tip = BlockId::new(next_height, compact_block.block_hash());
-    }
+    let Some(first_height) = tip.height.next() else {
+        return Err(CanonicalStoreError::publication(
+            "tree-state reconstruction height exceeds u32::MAX",
+        ));
+    };
+    visit_compact_blocks_in_range(
+        store,
+        BlockHeightRange::inclusive(first_height, height),
+        |compact_block| {
+            let next_height = compact_block.height();
+            if compact_block.previous_block_hash() != tip.hash {
+                return Err(CanonicalStoreError::publication(format!(
+                    "compact block at height {} does not extend the block below it",
+                    next_height.value()
+                )));
+            }
+            append_compact_block_commitments(&mut accumulator, &compact_block)
+                .map_err(|source| replay_refused(next_height, &source))?;
+            let recorded = compact_block.chain_metadata();
+            if accumulator.tip_metadata()
+                != ChainTipMetadata::new(
+                    recorded.sapling_commitment_tree_size,
+                    recorded.orchard_commitment_tree_size,
+                    recorded.ironwood_commitment_tree_size,
+                )
+            {
+                return Err(CanonicalStoreError::publication(format!(
+                    "compact block at height {} records tree sizes its note commitments do not reach",
+                    next_height.value()
+                )));
+            }
+            tip = BlockId::new(next_height, compact_block.block_hash());
+            Ok(())
+        },
+    )?;
     Ok((accumulator, tip))
 }
 

@@ -1,0 +1,6 @@
+kind: added
+body: '`zinder-query` now reports tree-state replay work: replay depth, replayed note commitments per pool, stored versus replayed reads per 250,000-block height band, rebuild-slot admissions, slot wait time, and rebuild duration. The metrics reference lists the series.'
+time: 2026-11-19T03:22:05.319440309Z
+custom:
+    Bump: minor
+    PR: "316"

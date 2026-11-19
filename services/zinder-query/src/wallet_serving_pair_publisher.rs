@@ -274,6 +274,13 @@ impl WalletServingPairSlot {
             )
     }
 
+    /// Makes `pair` current as the publisher would, for tests outside this
+    /// module that replace the pair under a running read.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, pair: Arc<WalletServingReadPair>) {
+        let _released = self.publish(pair, Instant::now());
+    }
+
     fn retained_pair_count(&self) -> usize {
         self.published.load().retained.len()
     }

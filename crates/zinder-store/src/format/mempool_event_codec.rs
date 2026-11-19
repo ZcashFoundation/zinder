@@ -5,13 +5,16 @@
 
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
-    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, MempoolEntry,
-    MempoolEvictionReason, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,
+    CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEvictionReason,
+    Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
 
-use crate::{ArtifactFamily, MempoolEvent, MempoolEventEnvelope, StoreError, StreamCursorTokenV1};
+use crate::{
+    ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEvent, MempoolEventEnvelope,
+    StoreError, StreamCursorTokenV1,
+};
 
 use super::StoreKey;
 
@@ -516,15 +519,10 @@ pub(super) fn decode_chain_epoch_record(
         visible_tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
         settled_tip_height: BlockHeight::new(record.settled_tip_height),
         settled_tip_hash: decode_block_hash(family, key, &record.settled_tip_hash)?,
-        artifact_schema_version: ArtifactSchemaVersion::new(
-            u16::try_from(record.artifact_schema_version).map_err(|_| {
-                StoreError::ArtifactCorrupt {
-                    family,
-                    key: key.clone().into(),
-                    reason: "artifact schema version does not fit u16",
-                }
-            })?,
-        ),
+        // An epoch reports the artifact schema version of this binary, as a
+        // canonical epoch does. The saved version is ignored, because events
+        // written by earlier releases saved the store layout version there.
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(
             record.sapling_commitment_tree_size,
             record.orchard_commitment_tree_size,
@@ -715,6 +713,8 @@ struct MempoolMinedRecord {
 mod tests {
     use std::fmt::Write as _;
 
+    use zinder_core::ArtifactSchemaVersion;
+
     use super::*;
 
     const GOLDEN_NETWORK: Network = Network::ZcashRegtest;
@@ -754,17 +754,24 @@ mod tests {
     #[test]
     fn mempool_event_envelope_bytes_match_persisted_contract()
     -> Result<(), Box<dyn std::error::Error>> {
-        let cases = [
-            (
-                golden_envelope(
-                    3,
-                    1_700_000_000_600,
-                    MempoolEvent::Added {
-                        entry: golden_added_entry()?,
-                    },
-                )?,
-                GOLDEN_ADDED_ENVELOPE_HEX,
-            ),
+        // The golden added event was saved with the store layout version (7)
+        // in its first-seen epoch, as events written before the artifact
+        // schema version rule were; it decodes with the current version.
+        let added = |artifact_schema_version| {
+            golden_envelope(
+                3,
+                1_700_000_000_600,
+                MempoolEvent::Added {
+                    entry: golden_added_entry(artifact_schema_version)?,
+                },
+            )
+        };
+        let cases = [(
+            added(ArtifactSchemaVersion::new(7))?,
+            GOLDEN_ADDED_ENVELOPE_HEX,
+            added(CURRENT_ARTIFACT_SCHEMA_VERSION)?,
+        )];
+        let unchanged = [
             (
                 golden_envelope(
                     4,
@@ -789,8 +796,13 @@ mod tests {
                 GOLDEN_MINED_ENVELOPE_HEX,
             ),
         ];
+        let cases = cases.into_iter().chain(
+            unchanged
+                .into_iter()
+                .map(|(envelope, expected_hex)| (envelope.clone(), expected_hex, envelope)),
+        );
 
-        for (envelope, expected_hex) in cases {
+        for (envelope, expected_hex, expected_decoded) in cases {
             let encoded = encode_mempool_event_envelope(&envelope)?;
             assert_eq!(
                 lower_hex(&encoded)?,
@@ -804,12 +816,14 @@ mod tests {
                 GOLDEN_NETWORK,
                 GOLDEN_CURSOR_AUTH_KEY,
             )?;
-            assert_eq!(decoded, envelope);
+            assert_eq!(decoded, expected_decoded);
         }
         Ok(())
     }
 
-    fn golden_added_entry() -> Result<MempoolEntry, Box<dyn std::error::Error>> {
+    fn golden_added_entry(
+        artifact_schema_version: ArtifactSchemaVersion,
+    ) -> Result<MempoolEntry, Box<dyn std::error::Error>> {
         let first_seen_chain_epoch = ChainEpoch {
             id: ChainEpochId::new(7),
             network: GOLDEN_NETWORK,
@@ -817,7 +831,7 @@ mod tests {
             visible_tip_hash: BlockHash::from_bytes([0x11; 32]),
             settled_tip_height: BlockHeight::new(20),
             settled_tip_hash: BlockHash::from_bytes([0x12; 32]),
-            artifact_schema_version: ArtifactSchemaVersion::new(7),
+            artifact_schema_version,
             tip_metadata: ChainTipMetadata::new(1, 2, 3),
             created_at: UnixTimestampMillis::new(1_700_000_000_000),
         };

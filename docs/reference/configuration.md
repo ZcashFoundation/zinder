@@ -231,6 +231,8 @@ not check descriptions or defaults.
 | `ZINDER_QUERY__LISTEN_ADDR` | zinder-query | Optional | `query.listen_addr` | Listen address for the native WalletQuery gRPC endpoint. Defaults to `127.0.0.1:9102`. |
 | `ZINDER_QUERY__REORG_WINDOW_BLOCKS` | zinder-query | Optional | `query.reorg_window_blocks` | Exact canonical replacement-depth identity expected by native query. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
+| `ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS` | zinder-query | Optional | `query.tree_state_replay_wait_ms` | Milliseconds a tree-state rebuild waits for a rebuild slot before it is refused with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
+| `ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-query | Optional | `query.tree_state_replay_waiters_per_slot` | Tree-state rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken is refused at once with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 1..=256; defaults to 64, enough for one slot to serve its waiters at a 30 ms rebuild within the default 2-second wait. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
 | `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
@@ -380,7 +382,8 @@ has a bound.
 | Transparent balance, lightwalletd only | 256 distinct addresses | `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`; an empty list is a plain `INVALID_ARGUMENT` |
 | Raw transaction for broadcast | 2,000,000 bytes | `BROADCAST_TRANSACTION_TOO_LARGE` |
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
-| Tree states rebuilt at once for heights without a stored checkpoint | One per CPU | `TREE_STATE_REPLAY_LIMIT_REACHED` |
+| Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `RESOURCE_EXHAUSTED`, no reason |
+| Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` |
 
 The broadcast budget covers native `BroadcastTransaction` and lightwalletd
 `SendTransaction`. A broadcast holds its transaction's bytes until the node

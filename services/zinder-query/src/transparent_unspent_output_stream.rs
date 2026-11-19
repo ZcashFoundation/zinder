@@ -7,6 +7,13 @@
 //! fails the stream when the publisher revokes reads on the stream's pair. A
 //! page read that finds a table file of the pair deleted continues on the
 //! pair that replaces it only at the stream's epoch.
+//!
+//! An on-demand stream reads nothing until its caller first polls it and
+//! never reads ahead: it asks for the next page only once the caller has
+//! consumed the previous one. Its first page holds the number of outputs its
+//! caller chooses, at most [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`], and each
+//! later page doubles up to that size as the caller consumes, so a caller
+//! that merges many streams holds at most one page per stream.
 
 use std::{
     num::NonZeroU16,
@@ -42,7 +49,9 @@ const BUFFERED_PAGES: usize = 1;
 /// The stream yields outputs in ascending `(block_height, outpoint)` order.
 /// It ends after the address's last output or with one terminal error, and
 /// never ends early without one. Storage reads advance only as the caller
-/// consumes outputs, and dropping the stream stops them.
+/// consumes outputs, and dropping the stream stops them. An eager stream
+/// starts reading when it opens and keeps up to three pages ahead of its
+/// caller; an on-demand stream reads one page at a time, only when polled.
 ///
 /// A stream that keeps reading after its pair has been released for longer
 /// than the released-pair read limit fails with
@@ -57,6 +66,23 @@ pub struct TransparentAddressUnspentOutputs {
     pages: mpsc::Receiver<Result<UnspentOutputPage, QueryError>>,
     page: std::vec::IntoIter<TransparentUnspentOutput>,
     finished: bool,
+    on_demand: Option<OnDemandPages>,
+}
+
+/// The read requests of an on-demand stream.
+#[derive(Debug)]
+struct OnDemandPages {
+    requests: mpsc::Sender<NonZeroU16>,
+    next_page_size: NonZeroU16,
+    requested: bool,
+}
+
+/// How a producer decides when to read its next page.
+enum Pacing {
+    /// Read the next page as soon as the previous one is queued.
+    Eager(NonZeroU16),
+    /// Read a page only when the stream requests one, at the requested size.
+    OnDemand(mpsc::Receiver<NonZeroU16>),
 }
 
 impl TransparentAddressUnspentOutputs {
@@ -88,14 +114,61 @@ impl TransparentAddressUnspentOutputs {
     ) -> Self {
         let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
         tokio::spawn(
-            produce_pages(slot, pair, request.clone(), page_size, pages).in_current_span(),
+            produce_pages(slot, pair, request.clone(), Pacing::Eager(page_size), pages)
+                .in_current_span(),
         );
         Self {
             chain_epoch,
             pages: receiver,
             page: Vec::new().into_iter(),
             finished: false,
+            on_demand: None,
         }
+    }
+
+    /// Opens a stream of the outputs `request` selects from `pair` that
+    /// reads a page only when its caller polls it with no output left, the
+    /// first of `first_page_size` outputs, at most
+    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`].
+    ///
+    /// Opening reads no storage. The producer still ends the stream when the
+    /// publisher revokes reads on `pair`, polled or not.
+    pub(crate) fn spawn_on_demand(
+        slot: WalletServingPairSlot,
+        pair: Arc<WalletServingReadPair>,
+        request: &TransparentAddressUnspentOutputsRequest,
+        chain_epoch: ChainEpoch,
+        first_page_size: NonZeroU16,
+    ) -> Self {
+        let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
+        let (requests, request_receiver) = mpsc::channel(1);
+        tokio::spawn(
+            produce_pages(
+                slot,
+                pair,
+                request.clone(),
+                Pacing::OnDemand(request_receiver),
+                pages,
+            )
+            .in_current_span(),
+        );
+        Self {
+            chain_epoch,
+            pages: receiver,
+            page: Vec::new().into_iter(),
+            finished: false,
+            on_demand: Some(OnDemandPages {
+                requests,
+                next_page_size: first_page_size.min(TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE),
+                requested: false,
+            }),
+        }
+    }
+
+    /// Outputs read from storage and not yet returned to the caller.
+    #[cfg(test)]
+    fn buffered_outputs(&self) -> usize {
+        self.page.len()
     }
 }
 
@@ -111,10 +184,23 @@ impl Stream for TransparentAddressUnspentOutputs {
             if this.finished {
                 return Poll::Ready(None);
             }
+            if let Some(on_demand) = this.on_demand.as_mut().filter(|pages| !pages.requested) {
+                // A failed request means the producer ended; its pages
+                // channel then reports why.
+                let _ = on_demand.requests.try_send(on_demand.next_page_size);
+                on_demand.requested = true;
+            }
             match ready!(this.pages.poll_recv(context)) {
                 Some(Ok(page)) => {
                     this.finished = page.last;
                     this.page = page.outputs.into_iter();
+                    if let Some(on_demand) = this.on_demand.as_mut() {
+                        on_demand.requested = false;
+                        on_demand.next_page_size = on_demand
+                            .next_page_size
+                            .saturating_mul(NonZeroU16::MIN.saturating_add(1))
+                            .min(TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE);
+                    }
                 }
                 Some(Err(error)) => {
                     this.finished = true;
@@ -151,7 +237,7 @@ async fn produce_pages(
     slot: WalletServingPairSlot,
     mut pair: Arc<WalletServingReadPair>,
     request: TransparentAddressUnspentOutputsRequest,
-    page_size: NonZeroU16,
+    mut pacing: Pacing,
     pages: mpsc::Sender<Result<UnspentOutputPage, QueryError>>,
 ) {
     let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
@@ -161,6 +247,20 @@ async fn produce_pages(
     } = request;
     let mut after = None;
     loop {
+        let page_size = match &mut pacing {
+            Pacing::Eager(page_size) => *page_size,
+            // An idle on-demand stream still releases its pair when reads
+            // are revoked or its caller leaves.
+            Pacing::OnDemand(requests) => tokio::select! {
+                biased;
+                () = pair.reads_revoked() => return fail(pair, &pages).await,
+                () = pages.closed() => return,
+                requested = requests.recv() => match requested {
+                    Some(page_size) => page_size,
+                    None => return,
+                },
+            },
+        };
         if pair.are_reads_revoked() {
             return fail(pair, &pages).await;
         }
@@ -263,10 +363,11 @@ mod tests {
         time::Duration,
     };
 
+    use parking_lot::Mutex;
     use tokio_stream::StreamExt as _;
     use zinder_core::{
-        BlockHeight, BlockHeightRange, Network, TransactionId, TransparentAddressScriptHash,
-        TransparentOutPoint, TransparentUnspentOutput,
+        BlockHeight, BlockHeightRange, ChainEpochId, Network, TransactionId,
+        TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
     };
     use zinder_testkit::{
         ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
@@ -289,6 +390,8 @@ mod tests {
     /// Page size the paged tests read with, so a few dozen outputs span
     /// several pages.
     const TEST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(7);
+    /// First page size of the on-demand tests that watch pages grow.
+    const SMALL_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
     const OTHER_SCRIPT_PUB_KEY: &[u8] = &[0x52];
     const WAIT_LIMIT: Duration = Duration::from_secs(10);
     /// Holders of a pair no read holds: the test and the query's slot.
@@ -441,6 +544,199 @@ mod tests {
         fixture.wait_until_released().await
     }
 
+    /// Streams opened on demand and never polled read no storage, however
+    /// many of them a caller holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_demand_streams_read_nothing_until_polled() -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(40)?;
+        let mut streams = Vec::new();
+        for _ in 0..256 {
+            streams.push(fixture.open_on_demand().await?);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(fixture.page_reads(), 0, "an unpolled stream read storage");
+        assert!(
+            streams
+                .iter()
+                .all(|stream| stream.chain_epoch.id
+                    == fixture.pair.canonical_fence().chain_epoch_id())
+        );
+        drop(streams);
+        fixture.wait_until_released().await
+    }
+
+    /// An on-demand stream reads a page only when its caller has consumed
+    /// the previous one, starting at 16 outputs and doubling, so a slow
+    /// caller holds at most the one page it is reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_on_demand_stream_reads_one_growing_page_at_a_time() -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(100)?;
+        let mut stream = fixture.open_on_demand().await?;
+
+        stream
+            .next()
+            .await
+            .ok_or("the stream ended before its first output")??;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fixture.page_sizes(), [16], "the stream read ahead");
+        assert_eq!(stream.buffered_outputs(), 15);
+
+        for _ in 1..16 {
+            stream.next().await.ok_or("the first page ended early")??;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.page_sizes(),
+            [16],
+            "a consumed page must not trigger a read until the caller asks again"
+        );
+
+        stream
+            .next()
+            .await
+            .ok_or("the stream ended after its first page")??;
+        assert_eq!(fixture.page_sizes(), [16, 32]);
+        assert_eq!(stream.buffered_outputs(), 31);
+        drop(stream);
+        fixture.wait_until_released().await
+    }
+
+    /// Opening an on-demand stream needs no blocking thread, and a pin the
+    /// query does not serve is refused at open.
+    #[test]
+    fn on_demand_streams_open_without_the_blocking_pool() -> Result<(), Box<dyn Error>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(open_on_demand_streams_while_the_blocking_pool_is_held())
+    }
+
+    async fn open_on_demand_streams_while_the_blocking_pool_is_held() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = CountedPair::with_outputs(3)?;
+        let (pool_held, pool_held_receiver) = tokio::sync::oneshot::channel();
+        let (release_pool, pool_released) = tokio::sync::oneshot::channel::<()>();
+        let held_pool = tokio::task::spawn_blocking(move || {
+            let _ = pool_held.send(());
+            let _ = pool_released.blocking_recv();
+        });
+        pool_held_receiver.await?;
+
+        let streams = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut streams = Vec::new();
+            for _ in 0..64 {
+                streams.push(fixture.open_on_demand().await?);
+            }
+            Ok::<_, QueryError>(streams)
+        })
+        .await
+        .map_err(|_| "opening an on-demand stream waited for the blocking pool")??;
+        let unserved = ChainEpochId::new(u64::MAX);
+        let refused = fixture
+            .query
+            .transparent_address_unspent_outputs_on_demand(
+                TransparentAddressUnspentOutputsRequest {
+                    address_script_hash: fixture.address,
+                    start_height: BlockHeight::new(0),
+                },
+                SMALL_FIRST_PAGE_SIZE,
+                Some(unserved),
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id }) if chain_epoch_id == unserved
+        ));
+        assert_eq!(fixture.page_reads(), 0);
+
+        release_pool
+            .send(())
+            .map_err(|()| "the held blocking thread stopped waiting")?;
+        held_pool.await?;
+        drop(streams);
+        Ok(())
+    }
+
+    /// The on-demand mode yields the eager mode's outputs in the eager
+    /// mode's order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_demand_and_eager_streams_yield_the_same_outputs_in_order()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(300)?;
+
+        let eager: Vec<_> = fixture
+            .open(fixture.address)
+            .await?
+            .collect::<Result<_, _>>()
+            .await?;
+        let eager_reads = fixture.page_reads();
+        let on_demand: Vec<_> = fixture
+            .open_on_demand()
+            .await?
+            .collect::<Result<_, _>>()
+            .await?;
+
+        assert_eq!(eager.len(), 300);
+        assert_eq!(on_demand, eager);
+        assert_eq!(eager_reads, 1);
+        assert_eq!(
+            fixture.page_sizes().get(eager_reads..),
+            Some([16, 32, 64, 128, 256].as_slice())
+        );
+        fixture.wait_until_released().await
+    }
+
+    /// An on-demand stream's first page holds the outputs its caller asks
+    /// for, at most the eager page size, and later pages double from there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_on_demand_stream_starts_at_the_first_page_size_its_caller_chooses()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(300)?;
+        let first_page_sizes = [
+            (NonZeroU16::MIN.saturating_add(119), vec![120, 240]),
+            (NonZeroU16::MIN.saturating_add(511), vec![512]),
+            (NonZeroU16::MAX, vec![1_024]),
+        ];
+
+        for (first_page_size, expected_page_sizes) in first_page_sizes {
+            let reads_before = fixture.page_sizes().len();
+            let outputs: Vec<_> = fixture
+                .open_on_demand_from(first_page_size)
+                .await?
+                .collect::<Result<_, _>>()
+                .await?;
+            assert_eq!(outputs.len(), 300);
+            assert_eq!(
+                fixture.page_sizes().get(reads_before..),
+                Some(expected_page_sizes.as_slice()),
+                "first page size {first_page_size}"
+            );
+        }
+        fixture.wait_until_released().await
+    }
+
+    /// Revocation releases the pair of an on-demand stream that was never
+    /// polled, and the stream then ends with its epoch unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_reads_releases_an_idle_on_demand_stream() -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(40)?;
+        let mut stream = fixture.open_on_demand().await?;
+        let epoch = stream.chain_epoch.id;
+
+        assert!(fixture.pair.revoke_reads());
+        fixture.wait_until_released().await?;
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id })) if chain_epoch_id == epoch
+        ));
+        assert!(stream.next().await.is_none());
+        assert_eq!(fixture.page_reads(), 0);
+        Ok(())
+    }
+
     fn page_size() -> usize {
         usize::from(TEST_PAGE_SIZE.get())
     }
@@ -453,6 +749,7 @@ mod tests {
         query: WalletServingQuery<()>,
         address: TransparentAddressScriptHash,
         page_reads: Arc<AtomicUsize>,
+        page_sizes: Arc<Mutex<Vec<u16>>>,
         _store: WalletServingStoreFixture,
     }
 
@@ -480,9 +777,11 @@ mod tests {
             let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
             let (canonical, wallet) = store.take_readers()?;
             let page_reads = Arc::new(AtomicUsize::new(0));
+            let page_sizes = Arc::new(Mutex::new(Vec::new()));
             let wallet = CountingWalletReader {
                 inner: Arc::new(wallet),
                 page_reads: Arc::clone(&page_reads),
+                page_sizes: Arc::clone(&page_sizes),
             };
             let pair = Arc::new(WalletServingReadPair::new(
                 Arc::new(canonical),
@@ -496,8 +795,35 @@ mod tests {
                 query,
                 address,
                 page_reads,
+                page_sizes,
                 _store: store,
             })
+        }
+
+        async fn open_on_demand(&self) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+            self.open_on_demand_from(SMALL_FIRST_PAGE_SIZE).await
+        }
+
+        /// Opens an on-demand stream of the fixture address whose first page
+        /// asks for `first_page_size` outputs.
+        async fn open_on_demand_from(
+            &self,
+            first_page_size: NonZeroU16,
+        ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+            self.query
+                .transparent_address_unspent_outputs_on_demand(
+                    TransparentAddressUnspentOutputsRequest {
+                        address_script_hash: self.address,
+                        start_height: BlockHeight::new(0),
+                    },
+                    first_page_size,
+                    None,
+                )
+                .await
+        }
+
+        fn page_sizes(&self) -> Vec<u16> {
+            self.page_sizes.lock().clone()
         }
 
         async fn open(
@@ -566,6 +892,7 @@ mod tests {
     struct CountingWalletReader {
         inner: Arc<dyn WalletProjectionReader>,
         page_reads: Arc<AtomicUsize>,
+        page_sizes: Arc<Mutex<Vec<u16>>>,
     }
 
     impl WalletProjectionReader for CountingWalletReader {
@@ -596,6 +923,7 @@ mod tests {
             page_size: NonZeroU16,
         ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
             self.page_reads.fetch_add(1, Ordering::AcqRel);
+            self.page_sizes.lock().push(page_size.get());
             self.inner.address_unspent_outputs_page_from_height(
                 address_script_hash,
                 start_height,

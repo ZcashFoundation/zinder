@@ -21,6 +21,7 @@ use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -148,6 +149,42 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
+
+    /// Finds how the tree state at `height` is answered, as
+    /// [`RocksDbCanonicalSecondary::tree_state_lookup`] does.
+    ///
+    /// The default answers every height through
+    /// [`Self::tree_state_checkpoint_at`] as stored, so a reader that keeps it
+    /// rebuilds inline, outside the query's replay-slot limit.
+    fn tree_state_lookup(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+        self.tree_state_checkpoint_at(height, network_upgrade_activations)
+            .map(|checkpoint| checkpoint.map(TreeStateLookup::Stored))
+    }
+
+    /// Reconstructs the tree state a [`Self::tree_state_lookup`] found no
+    /// checkpoint for, and reports how it was answered, as
+    /// [`RocksDbCanonicalSecondary::replay_tree_state`] does.
+    ///
+    /// The default reads the height through
+    /// [`Self::tree_state_checkpoint_at`] and reports it replayed from the
+    /// seed `replay` names.
+    fn replay_tree_state(
+        &self,
+        replay: &TreeStateReplay,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+        self.tree_state_checkpoint_at(replay.height(), network_upgrade_activations)
+            .map(|checkpoint| {
+                checkpoint.map(|checkpoint| TreeStateReplayOutcome::Replayed {
+                    replay: Box::new(replay.clone()),
+                    checkpoint,
+                })
+            })
+    }
 
     /// Reads a contiguous range of subtree roots.
     fn subtree_roots(
@@ -396,6 +433,22 @@ macro_rules! impl_canonical_read {
                 self.tree_state_checkpoint_at(height, network_upgrade_activations)
             }
 
+            fn tree_state_lookup(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                self.tree_state_lookup(height, network_upgrade_activations)
+            }
+
+            fn replay_tree_state(
+                &self,
+                replay: &TreeStateReplay,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+                self.replay_tree_state(replay, network_upgrade_activations)
+            }
+
             fn subtree_roots(
                 &self,
                 range: SubtreeRootRange,
@@ -524,6 +577,7 @@ pub struct WalletServingReadPair {
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
     network_upgrade_activations: NetworkUpgradeActivations,
+    chain_epoch: ChainEpoch,
     reads_revoked: CancellationToken,
     table_file_missing: AtomicBool,
 }
@@ -534,7 +588,7 @@ impl WalletServingReadPair {
         canonical: Arc<dyn CanonicalReader>,
         wallet: Arc<dyn WalletProjectionReader>,
     ) -> Result<Self, QueryError> {
-        Self::validate_readers(canonical.as_ref(), wallet.as_ref())
+        let chain_epoch = Self::validated_chain_epoch(canonical.as_ref(), wallet.as_ref())
             .map_err(|error| pair_admission_query_error(&error))?;
         let network_upgrade_activations = canonical
             .network_upgrade_schedule()
@@ -550,6 +604,7 @@ impl WalletServingReadPair {
                 wallet.ready_evidence(),
             ),
             network_upgrade_activations,
+            chain_epoch,
             canonical,
             wallet,
             reads_revoked: CancellationToken::new(),
@@ -566,6 +621,15 @@ impl WalletServingReadPair {
         canonical: &(dyn CanonicalReader + 'static),
         wallet: &(dyn WalletProjectionReader + 'static),
     ) -> Result<(), WalletServingAdmissionError> {
+        Self::validated_chain_epoch(canonical, wallet).map(drop)
+    }
+
+    /// Validates the readers as [`Self::validate_readers`] does and returns
+    /// the canonical epoch they agree on.
+    fn validated_chain_epoch(
+        canonical: &(dyn CanonicalReader + 'static),
+        wallet: &(dyn WalletProjectionReader + 'static),
+    ) -> Result<ChainEpoch, WalletServingAdmissionError> {
         if canonical.network() != wallet.network() {
             return Err(WalletServingAdmissionError::NetworkMismatch {
                 canonical: canonical.network(),
@@ -609,7 +673,7 @@ impl WalletServingReadPair {
                 wallet: Box::new(wallet_source),
             });
         }
-        Ok(())
+        Ok(canonical_epoch)
     }
 
     /// Returns the canonical reader frozen for this pair's entire lifetime.
@@ -641,6 +705,13 @@ impl WalletServingReadPair {
     #[must_use]
     pub const fn network_upgrade_activations(&self) -> &NetworkUpgradeActivations {
         &self.network_upgrade_activations
+    }
+
+    /// Returns the canonical epoch this pair serves, read and validated
+    /// against both readers when the pair was admitted.
+    #[must_use]
+    pub const fn chain_epoch(&self) -> ChainEpoch {
+        self.chain_epoch
     }
 
     /// Tells the reads still holding this pair to stop, returning `true` the

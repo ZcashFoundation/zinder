@@ -13,7 +13,7 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore,
+    RocksDbCanonicalStore, TreeStateLookup, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
     publication::column_family,
@@ -223,6 +223,146 @@ fn a_secondary_reconstructs_with_a_node_table_its_writer_has_not_admitted_yet()
     let historical_edit = NetworkUpgradeActivations::new(Network::ZcashTestnet, historical_edit)?;
     assert!(matches!(
         secondary.tree_state_checkpoint_at(BlockHeight::new(120), &historical_edit),
+        Err(CanonicalStoreError::AdmissionRefused { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_lookup_answers_stored_heights_and_seeds_the_rest() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+    for stored in [0, 100, TIP_HEIGHT] {
+        let height = BlockHeight::new(stored);
+        assert_eq!(
+            store.tree_state_lookup(height, &activations)?,
+            Some(TreeStateLookup::Stored(expected_checkpoint(
+                &activations,
+                height
+            )?))
+        );
+    }
+    let Some(TreeStateLookup::Replay(replay)) =
+        store.tree_state_lookup(BlockHeight::new(137), &activations)?
+    else {
+        return Err("height 137 has no stored checkpoint".into());
+    };
+    assert_eq!(
+        replay.seed(),
+        &expected_checkpoint(&activations, BlockHeight::new(100))?
+    );
+    assert_eq!(replay.height(), BlockHeight::new(137));
+    assert_eq!(replay.replayed_blocks(), 37);
+    assert_eq!(
+        store.tree_state_lookup(BlockHeight::new(TIP_HEIGHT + 1), &activations)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_replay_starts_from_the_seed_its_lookup_read() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let height = BlockHeight::new(137);
+    let Some(TreeStateLookup::Replay(replay)) = store.tree_state_lookup(height, &activations)?
+    else {
+        return Err("height 137 has no stored checkpoint".into());
+    };
+
+    delete_checkpoint(&store, BlockHeight::new(100))?;
+
+    assert_eq!(
+        store.replay_tree_state(&replay, &activations)?,
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(replay.clone()),
+            checkpoint: expected_checkpoint(&activations, height)?,
+        })
+    );
+    assert_publication_refused(&store, height, &activations)
+}
+
+#[test]
+fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let issuing_directory = TempDir::new()?;
+    let issuing = gapped_store(&issuing_directory)?;
+    let other_directory = TempDir::new()?;
+    let other = published_store(
+        &other_directory.path().join("canonical"),
+        2,
+        BlockHeight::new(140),
+        BlockHeight::new(140),
+    )?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let replay_at = |height| -> Result<_, Box<dyn std::error::Error>> {
+        match issuing.tree_state_lookup(BlockHeight::new(height), &activations)? {
+            Some(TreeStateLookup::Replay(replay)) => Ok(replay),
+            other => Err(format!("height {height} looked up as {other:?}").into()),
+        }
+    };
+    let within_both = replay_at(120)?;
+    let stored_by_other = replay_at(140)?;
+    let above_other_tip = replay_at(145)?;
+    let Some(TreeStateLookup::Replay(other_seed)) =
+        other.tree_state_lookup(BlockHeight::new(120), &activations)?
+    else {
+        return Err("height 120 has no stored checkpoint in the other store".into());
+    };
+
+    assert_eq!(
+        other.replay_tree_state(&within_both, &activations)?,
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(other_seed),
+            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+        })
+    );
+    assert_eq!(
+        other.replay_tree_state(&stored_by_other, &activations)?,
+        Some(TreeStateReplayOutcome::Stored(expected_checkpoint(
+            &activations,
+            BlockHeight::new(140)
+        )?))
+    );
+    assert_eq!(
+        other.replay_tree_state(&above_other_tip, &activations)?,
+        None
+    );
+    delete_checkpoint(&other, BlockHeight::new(100))?;
+    assert!(matches!(
+        other.replay_tree_state(&within_both, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    assert_eq!(
+        issuing.replay_tree_state(&within_both, &activations)?,
+        Some(TreeStateReplayOutcome::Replayed {
+            replay: Box::new(within_both.clone()),
+            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_replay_refuses_an_activation_table_the_store_did_not_admit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let admitted = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let Some(TreeStateLookup::Replay(replay)) =
+        store.tree_state_lookup(BlockHeight::new(120), &admitted)?
+    else {
+        return Err("height 120 has no stored checkpoint".into());
+    };
+    let mut edited = admitted.activations().to_vec();
+    edited[0].name = "Changed historical upgrade".to_owned();
+    let edited = NetworkUpgradeActivations::new(Network::ZcashTestnet, edited)?;
+
+    assert!(matches!(
+        store.replay_tree_state(&replay, &edited),
         Err(CanonicalStoreError::AdmissionRefused { .. })
     ));
     Ok(())

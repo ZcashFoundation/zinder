@@ -18,8 +18,9 @@ use zinder_proto::v1::wallet;
 use zinder_query::{
     ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-    compact_blocks_in_range_chunks, latest_tree_state_checkpoint_response, subtree_roots_response,
-    tree_state_at_response, visible_tip_block_response,
+    compact_blocks_in_range_header, compact_blocks_in_range_item,
+    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 use zinder_store::{ArtifactFamily, CanonicalBuildSubtreeRoot, RawBlobRetention};
 use zinder_testkit::{
@@ -127,7 +128,13 @@ async fn compact_block_range_stream_sends_one_header_then_blocks() -> eyre::Resu
         .first()
         .cloned()
         .ok_or_else(|| eyre!("missing compact block"))?;
-    let decoded_chunks = compact_blocks_in_range_chunks(compact_block_range)
+    let decoded_chunks = std::iter::once(compact_blocks_in_range_header(chain_epoch))
+        .chain(
+            compact_block_range
+                .compact_blocks
+                .iter()
+                .map(compact_blocks_in_range_item),
+        )
         .map(|chunk| wallet::CompactBlocksInRangeChunk::decode(chunk.encode_to_vec().as_slice()))
         .collect::<Result<Vec<_>, _>>()?;
     let [header_chunk, item_chunk] = decoded_chunks.as_slice() else {
@@ -683,4 +690,58 @@ fn fixture_block_identities(chain: &ChainFixture) -> Vec<(BlockHeight, BlockHash
         .iter()
         .map(|block| (block.height, block.hash))
         .collect()
+}
+
+/// An adapter refuses a `CompactBlocksInRange` stream past its limit with
+/// `RESOURCE_EXHAUSTED` until an open stream ends, and a finished stream
+/// sends its header and every block.
+#[tokio::test]
+async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyre::Result<()> {
+    use tokio_stream::StreamExt as _;
+    use zinder_proto::v1::wallet::wallet_query_server::WalletQuery as WalletQueryService;
+
+    let activations = sample_regtest_upgrade_activations();
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let adapter = zinder_query::WalletQueryGrpcAdapter::new(
+        WalletServingQuery::from_admitted_native_serving_pair(
+            WalletServingPairSlot::new(pair),
+            ingest_control,
+        ),
+        zinder_query::WalletEndpointMetadata::default(),
+    )
+    .with_max_concurrent_compact_block_streams(NonZeroU32::MIN);
+    let request = || {
+        tonic::Request::new(wallet::CompactBlocksInRangeRequest {
+            start_height: 1,
+            end_height: 3,
+            at_epoch_id: None,
+        })
+    };
+
+    let open = WalletQueryService::compact_blocks_in_range(&adapter, request()).await?;
+    let refused = WalletQueryService::compact_blocks_in_range(&adapter, request()).await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(tonic::Code::ResourceExhausted)
+    );
+
+    let chunks = open.into_inner().collect::<Vec<_>>().await;
+    assert_eq!(chunks.len(), 4, "one header and three blocks");
+    assert!(matches!(
+        chunks.first(),
+        Some(Ok(wallet::CompactBlocksInRangeChunk {
+            body: Some(wallet::compact_blocks_in_range_chunk::Body::Header(_))
+        }))
+    ));
+    let reopened = WalletQueryService::compact_blocks_in_range(&adapter, request()).await?;
+    assert_eq!(reopened.into_inner().collect::<Vec<_>>().await.len(), 4);
+    Ok(())
 }

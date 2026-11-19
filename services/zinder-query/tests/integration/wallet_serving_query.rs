@@ -56,9 +56,9 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
         let _ = reactor_progressed.send(());
     });
 
-    let visible_tip_block = query.visible_tip_block(None).await?;
+    let compact_block = query.compact_block_at(BlockHeight::new(2), None).await?;
 
-    assert_eq!(visible_tip_block.height, BlockHeight::new(2));
+    assert_eq!(compact_block.compact_block.height(), BlockHeight::new(2));
     assert!(
         reactor_gate.observed_reactor_progress(),
         "the canonical read held the reactor for its whole duration"
@@ -88,7 +88,7 @@ async fn wallet_serving_reads_run_inside_the_request_span() -> eyre::Result<()> 
     )));
 
     query
-        .visible_tip_block(None)
+        .compact_block_at(BlockHeight::new(2), None)
         .instrument(tracing::info_span!("wallet_request"))
         .await?;
 
@@ -323,6 +323,24 @@ impl CanonicalReader for GatedCanonicalReader {
     ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
         self.canonical_reader
             .tree_state_checkpoint_at(height, network_upgrade_activations)
+    }
+
+    fn tree_state_lookup(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<Option<zinder_store::TreeStateLookup>, CanonicalStoreError> {
+        self.canonical_reader
+            .tree_state_lookup(height, network_upgrade_activations)
+    }
+
+    fn replay_tree_state(
+        &self,
+        replay: &zinder_store::TreeStateReplay,
+        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, CanonicalStoreError> {
+        self.canonical_reader
+            .replay_tree_state(replay, network_upgrade_activations)
     }
 
     fn subtree_roots(

@@ -5,7 +5,10 @@
 //! upstream nodes as a fallback for indexed history. Transaction broadcast is
 //! the only operation that contacts an upstream node.
 
-use std::{num::NonZeroU32, time::Instant};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -41,17 +44,19 @@ mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
 pub use grpc::{
-    TransactionStatusLookup, WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata,
-    WalletQueryGrpcAdapter, address_lookup_to_script_hash, block_header_by_selector_response,
+    DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS, TransactionStatusLookup,
+    WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
     build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
-    compact_block_response, compact_blocks_in_range_chunks, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    status_from_query_error, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
+    compact_block_response, compact_blocks_in_range_header, compact_blocks_in_range_item,
+    full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outpoint_spend_status_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{
     AdmittedIngestControl, IngestControlAdmissionError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
@@ -63,6 +68,10 @@ pub use native_wallet_endpoint_capabilities::{
 pub use node_broadcast::OrderedBroadcaster;
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
+};
+pub use tree_state_replay_limit::{
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
@@ -144,6 +153,36 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Streams compact block artifacts for an inclusive height range under
+    /// one chain epoch.
+    ///
+    /// Validation and errors are those of [`Self::compact_blocks_in_range`],
+    /// and they surface as the returned error, before any block is
+    /// delivered. Blocks arrive ascending and contiguous; a store failure
+    /// after the first block ends the stream with one terminal `Err`.
+    ///
+    /// The default reads the whole range with
+    /// [`Self::compact_blocks_in_range`] and queues every block.
+    async fn compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        let compact_block_range = self
+            .compact_blocks_in_range(block_range, at_epoch_id)
+            .await?;
+        let (blocks, receiver) = mpsc::channel(compact_block_range.compact_blocks.len().max(1));
+        for compact_block in compact_block_range.compact_blocks {
+            if blocks.try_send(Ok(compact_block)).is_err() {
+                break;
+            }
+        }
+        Ok(CompactBlockStream {
+            chain_epoch: compact_block_range.chain_epoch,
+            blocks: receiver,
+        })
+    }
 
     /// Reads compact block artifacts from one end of an inclusive height
     /// range, up to a byte budget.
@@ -242,6 +281,32 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
 
+    /// Streams the outputs [`Self::transparent_address_unspent_outputs`]
+    /// streams, in the same order and at the same pinned epoch, reading
+    /// storage only on demand.
+    ///
+    /// The stream reads nothing until it is first polled and never reads
+    /// ahead: it reads a page only when the caller polls it with no output
+    /// left. The first page holds `first_page_size` outputs, at most
+    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`], and each later page doubles
+    /// up to that size as the caller consumes them, so a caller that merges
+    /// many of these streams holds at most one page per stream. Use it when
+    /// one request opens many streams at once, and size the first page from
+    /// how many streams the request holds.
+    ///
+    /// The default opens the eager stream, so an implementation that wraps
+    /// another must forward this method to keep its reads on demand.
+    async fn transparent_address_unspent_outputs_on_demand(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        first_page_size: NonZeroU16,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        let _ = first_page_size;
+        self.transparent_address_unspent_outputs(request, at_epoch_id)
+            .await
+    }
+
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts.
     ///
@@ -298,8 +363,8 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ///
     /// A height above the visible tip or below retained history fails with
     /// [`QueryError::BlockNotInBestChain`]. A rebuild requested while the
-    /// query already runs its limit of them fails with
-    /// [`QueryError::TreeStateReplayLimitReached`].
+    /// query already runs its limit of them waits a bounded time for a slot
+    /// and then fails with [`QueryError::TreeStateReplayLimitReached`].
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -346,6 +411,16 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 
 /// Default maximum compact-block count returned by one range call.
 pub const DEFAULT_MAX_COMPACT_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Stored compact-block bytes one read of a compact-block stream keeps.
+///
+/// Each read stops before the block that would take its stored bytes past
+/// this budget, and always keeps one block, so a stream holds about one
+/// budget of blocks plus its channel no matter how wide its range is.
+pub const COMPACT_BLOCK_STREAM_SUB_READ_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bounded depth, in blocks, of the compact-block stream channel.
+pub const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 
 /// Default maximum full-block count returned by one range call.
 ///
@@ -413,6 +488,7 @@ pub fn describe_request_metrics() {
          by status. Used to monitor request fan-out and page sizing."
     );
     tree_state_replay_limit::describe_metrics();
+    grpc::describe_compact_block_stream_metrics();
     broadcast_byte_budget::describe_metrics();
 }
 
@@ -625,6 +701,21 @@ pub struct FullBlockStream {
     pub chain_epoch: ChainEpoch,
     /// Ascending block blobs, then optionally one terminal error.
     pub blocks: mpsc::Receiver<Result<BlockBlobArtifact, QueryError>>,
+}
+
+/// Demand-driven compact-block range stream bound to one chain epoch.
+///
+/// [`chain_epoch`](Self::chain_epoch) is resolved once and describes every
+/// delivered block. [`blocks`](Self::blocks) yields compact blocks in
+/// ascending, contiguous height order until the range is exhausted; a store
+/// failure arrives as a terminal `Err` after the blocks already delivered,
+/// and dropping the receiver stops the backing producer.
+#[derive(Debug)]
+pub struct CompactBlockStream {
+    /// Chain epoch every delivered block is read under.
+    pub chain_epoch: ChainEpoch,
+    /// Ascending compact blocks, then optionally one terminal error.
+    pub blocks: mpsc::Receiver<Result<CompactBlockArtifact, QueryError>>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by
@@ -998,7 +1089,8 @@ pub enum QueryError {
     },
 
     /// A tree state at a height without a stored checkpoint needs a
-    /// reconstruction, and the query already runs its limit of them.
+    /// reconstruction, the query already runs its limit of them, and either
+    /// no slot freed within the wait or every waiting place was taken.
     #[error(
         "tree-state reconstruction limit reached: this server already reconstructs {max_concurrent_replays} tree states at once"
     )]

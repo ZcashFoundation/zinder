@@ -2,6 +2,7 @@
 
 mod adapter;
 mod chain_events;
+mod compact_block_stream_limit;
 mod native;
 mod request_limits;
 mod shutdown_stream;
@@ -16,14 +17,17 @@ use zinder_store::status_from_store_error;
 use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
+pub(crate) use compact_block_stream_limit::CompactBlockStreamSlot;
+pub use compact_block_stream_limit::DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS;
+pub(crate) use compact_block_stream_limit::describe_metrics as describe_compact_block_stream_metrics;
 pub use native::{
     TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
     block_header_by_selector_response, block_id_by_selector_response,
     broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
-    chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_chunks,
-    full_block_response, latest_tree_state_checkpoint_response,
+    chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_header,
+    compact_blocks_in_range_item, full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, subtree_roots_response, transaction_response,
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,

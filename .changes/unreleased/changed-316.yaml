@@ -1,0 +1,6 @@
+kind: changed
+body: "A native tree-state request that needs a rebuild while every rebuild slot is busy now waits up to 2 seconds for a slot instead of failing at once; set the wait with `query.tree_state_replay_wait_ms` (`ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms). Up to 64 requests wait per rebuild slot by default (`query.tree_state_replay_waiters_per_slot`, `ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256), and the rest still fail with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `zinder_query_tree_state_replay_refusals_total` gains a `reason` label, so alerts that match the unlabelled series need updating. Native `CompactBlocksInRange` now streams its range in 2 MiB reads, so the first block arrives sooner and memory per stream is bounded; each process serves at most 100 such streams and refuses more with `RESOURCE_EXHAUSTED`."
+time: 2026-11-19T03:22:05.316073043Z
+custom:
+    Bump: minor
+    PR: "316"

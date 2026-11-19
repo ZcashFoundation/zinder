@@ -26,7 +26,7 @@ A replaced epoch stays readable for one minute after a newer one replaces it, ho
 
 A retained epoch still answers after a reorg replaces its blocks, because a pin promises that epoch's view, not the current best chain.
 
-`TransparentAddressUnspentOutputs` and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
+`TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
 A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds.
 
@@ -58,7 +58,7 @@ The service advertises a method's capability string only when this deployment ca
 
 ## Compact blocks
 
-`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`).
+`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range of at most 1,000 blocks: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED`; retry after a short delay. A stream the client cancels or drops keeps its place until the read it has already started ends.
 
 Ingest builds compact blocks when it commits a block. Query never fetches a block from the node or builds one on demand.
 
@@ -96,10 +96,10 @@ Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at t
 | Condition | Status and reason |
 | --- | --- |
 | Height above the visible tip, or below the parent of the store's first retained block | `NOT_FOUND`, `BLOCK_NOT_IN_BEST_CHAIN` |
-| A rebuild is needed while the query already runs one rebuild per available CPU | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
+| A rebuild is needed, the query already runs one rebuild per available CPU, and no slot frees within the wait or every waiting place is taken | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
 | A seed checkpoint is missing, or replayed history does not link or reach the recorded tree sizes | `UNAVAILABLE`, `STORAGE_UNAVAILABLE` (store damage) |
 
-A height with a stored checkpoint is never refused for the rebuild limit. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals.
+A height with a stored checkpoint is never refused for the rebuild limit and never waits for a slot. A rebuild that finds every slot taken waits for one, up to 2 seconds by default and at most 5 (`query.tree_state_replay_wait_ms` in `zinder-query`). At most 64 requests wait per slot by default, and 1 to 256 when set (`query.tree_state_replay_waiters_per_slot`); a rebuild that finds every waiting place taken is refused at once. At a 30 ms rebuild, about the 99th percentile measured on Testnet, one slot serves 64 waiting requests in 1.92 s, inside the default wait, so a burst of a few hundred wallets waits instead of being refused. A request whose client goes away gives up its waiting place at once. A full rebuild in the densest history can take longer than 2 seconds, so expect some refusals there under load. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals by reason.
 
 `LatestTreeStateCheckpoint(at_epoch_id)` returns the newest stored checkpoint at or below the visible tip.
 
@@ -177,6 +177,8 @@ These reads come from the wallet store that `zinder-projector` writes. Its histo
 `TransparentAddressUnspentOutputs(address, start_height, at_epoch_id)` streams every unspent output of one address mined at or above `start_height`: first a `ChainView` header, then one `TransparentUnspentOutput` per output. There is no cursor and no entry cap, so a client cannot truncate the set by ignoring pagination.
 
 The server reads the set in pages of 1,024 outputs and reads the next page only when the client has taken the previous one. It holds at most three pages per stream. A client that stops reading stalls the storage reads. Cancelling the stream releases them. A stream ends without an error only after the address's last output.
+
+An in-process caller that opens many of these streams for one request can use `WalletQueryApi::transparent_address_unspent_outputs_on_demand` instead. It returns the same outputs in the same order at the same pinned epoch, but reads nothing until the stream is first polled and never reads ahead: it reads the next page only when the caller has taken every output of the previous one. The caller chooses the first page's size, at most 1,024 outputs, from how many streams it holds. Later pages double up to 1,024 as the caller consumes them, so such a stream holds at most the page its caller is reading, and a stream not yet polled holds none.
 
 ### Transaction history
 
