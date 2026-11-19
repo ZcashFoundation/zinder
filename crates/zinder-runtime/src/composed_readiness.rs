@@ -202,6 +202,19 @@ impl ComposedReadiness {
         self.composition.lock().inputs.get(&input).cloned()
     }
 
+    /// Returns the admission state as it was last published.
+    ///
+    /// Shutdown and refusing required inputs replace the cause and clear the
+    /// target height of [`Self::runtime_readiness`]; this accessor still
+    /// reports both, such as the node tip a canonical writer follows while
+    /// its node-health probe reports not ready, or a follower's
+    /// `node_unavailable` during a shutdown drain. It reads them under one
+    /// lock, so the cause and target belong to the same publication.
+    #[must_use]
+    pub fn admission_state(&self) -> ReadinessState {
+        self.composition.lock().admission.clone()
+    }
+
     /// Replaces one input's latest cause.
     pub fn publish_input(&self, input: ReadinessInput, cause: ReadinessCause) {
         self.publish_with(|composition| {

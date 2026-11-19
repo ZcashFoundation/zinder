@@ -17,10 +17,11 @@ use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
     BlockRangeStage, BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdPing, compact_transaction_has_payload,
+    LightwalletdPing, NodeTipWitness, StaleTipLimit, TipBlockTime, TipBlockTimeCache,
+    compact_transaction_has_payload, estimated_network_height, unix_now_seconds,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, CompactBlockArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
     CompactTransaction, CompactTransactionData, Network, NetworkUpgradeActivations,
     wire::{encode_branch_id_hex, encode_internal_block_hash, encode_internal_transaction_id},
 };
@@ -696,6 +697,9 @@ async fn converge_candidate(
 pub(crate) struct CompactBlockAdapter {
     slot: CompactBlockServingSlot,
     block_range_streams: BlockRangeStreamLimit,
+    stale_tip_limit: StaleTipLimit,
+    tip_block_times: TipBlockTimeCache,
+    node_tip_witness: NodeTipWitness,
     ping: LightwalletdPing,
 }
 
@@ -706,8 +710,25 @@ impl CompactBlockAdapter {
             block_range_streams: BlockRangeStreamLimit::new(
                 DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
             ),
+            stale_tip_limit: StaleTipLimit::DISABLED,
+            tip_block_times: TipBlockTimeCache::default(),
+            node_tip_witness: NodeTipWitness::default(),
             ping: LightwalletdPing::default(),
         }
+    }
+
+    /// Sets how old the served tip may be before `GetLatestBlock` and
+    /// `GetLightdInfo` fail with `UNAVAILABLE`.
+    pub(crate) const fn with_stale_tip_limit(mut self, stale_tip_limit: StaleTipLimit) -> Self {
+        self.stale_tip_limit = stale_tip_limit;
+        self
+    }
+
+    /// Sets the witness whose report of the writer's node decides whether an
+    /// old served tip is the chain tip or a stale one.
+    pub(crate) fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
+        self.node_tip_witness = node_tip_witness;
+        self
     }
 
     /// Sets how this adapter answers `Ping`.
@@ -739,6 +760,39 @@ impl CompactBlockAdapter {
 
     fn reader(&self) -> Arc<RocksDbCanonicalSecondary> {
         self.slot.capture()
+    }
+
+    /// Reads the served generation's chain epoch and the times of its tip
+    /// for the tip call `method`, and refuses the tip when it is older than
+    /// the stale-tip limit.
+    fn served_tip(
+        &self,
+        reader: &RocksDbCanonicalSecondary,
+        method: &'static str,
+    ) -> Result<(ChainEpoch, TipBlockTime, i64), Status> {
+        let epoch = reader.chain_epoch().map_err(store_status)?;
+        let now = unix_now_seconds();
+        let cached = self
+            .tip_block_times
+            .cached(epoch.id, epoch.visible_tip_height);
+        let tip = if let Some(cached) = cached {
+            cached
+        } else {
+            let block_time = reader
+                .block_header_at(epoch.visible_tip_height)
+                .map_err(store_status)?
+                .ok_or_else(|| Status::unavailable("the served tip has no stored block header"))?
+                .block_time;
+            self.tip_block_times
+                .store(epoch.id, epoch.visible_tip_height, block_time, now)
+        };
+        self.stale_tip_limit.check(
+            method,
+            tip.aged_from_unix_seconds,
+            now,
+            self.node_tip_witness.vouches_for(epoch.visible_tip_height),
+        )?;
+        Ok((epoch, tip, now))
     }
 
     fn unsupported(method: &'static str) -> Status {
@@ -791,11 +845,18 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let reader = self.reader();
-        let epoch = reader.chain_epoch().map_err(store_status)?;
+        let (epoch, tip, now) = self.served_tip(&reader, "get_lightd_info")?;
         let activations = writer_admitted_activations(&reader)?;
+        let estimated_height = estimated_network_height(
+            activations,
+            epoch.visible_tip_height,
+            tip.block_time_unix_seconds,
+            now,
+        );
         Ok(Response::new(lightd_info(
             activations,
             epoch.visible_tip_height.value(),
+            estimated_height,
             false,
         )))
     }
@@ -805,7 +866,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         _request: Request<lightwalletd::ChainSpec>,
     ) -> Result<Response<lightwalletd::BlockId>, Status> {
         let reader = self.reader();
-        let epoch = reader.chain_epoch().map_err(store_status)?;
+        let (epoch, _, _) = self.served_tip(&reader, "get_latest_block")?;
         Ok(Response::new(lightwalletd::BlockId {
             height: u64::from(epoch.visible_tip_height.value()),
             hash: encode_internal_block_hash(epoch.visible_tip_hash).to_vec(),
@@ -1389,6 +1450,7 @@ fn compact_transaction_data_to_lightwalletd(
 fn lightd_info(
     activations: &NetworkUpgradeActivations,
     height: u32,
+    estimated_height: BlockHeight,
     taddr_support: bool,
 ) -> lightwalletd::LightdInfo {
     let tip_height = BlockHeight::new(height);
@@ -1421,7 +1483,7 @@ fn lightd_info(
         branch: String::new(),
         build_date: String::new(),
         build_user: String::new(),
-        estimated_height: u64::from(height),
+        estimated_height: u64::from(estimated_height.max(tip_height).value()),
         zcashd_build: String::new(),
         zcashd_subversion: String::new(),
         donation_address: String::new(),
@@ -4144,6 +4206,10 @@ mod tests {
             .find(|activation| activation.name == "NU6.2")
             .map(|activation| zinder_core::wire::encode_branch_id_hex(activation.branch_id))
             .ok_or("the sample table must include NU6.2")?;
+        let tip_block_time = canonical
+            .block_header_at(tip.height)?
+            .ok_or("the fixture tip must have a header")?
+            .block_time;
         let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
 
         let info = adapter
@@ -4167,7 +4233,8 @@ mod tests {
             branch: String::new(),
             build_date: String::new(),
             build_user: String::new(),
-            estimated_height: 4,
+            // Checked against the network estimate below.
+            estimated_height: info.estimated_height,
             zcashd_build: String::new(),
             zcashd_subversion: String::new(),
             donation_address: String::new(),
@@ -4177,12 +4244,124 @@ mod tests {
                 zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
         };
         assert_eq!(info, expected);
+        // The fixture tip is old, so the network estimate runs ahead of it,
+        // as Zebra's estimate from the same tip would.
+        let estimate = zinder_compat_lightwalletd::estimated_network_height(
+            &activations,
+            tip.height,
+            tip_block_time,
+            unix_now()?,
+        );
+        assert!(
+            info.estimated_height.abs_diff(u64::from(estimate.value())) <= 1,
+            "estimated {} where {} was expected",
+            info.estimated_height,
+            estimate.value()
+        );
+        assert!(info.estimated_height > info.block_height);
         assert_eq!(latest.height, info.block_height);
         assert_eq!(
             latest.hash,
             zinder_core::wire::encode_internal_block_hash(tip.hash).to_vec()
         );
         assert_eq!(latest.hash.len(), 32);
+        Ok(())
+    }
+
+    fn unix_now() -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )?)
+    }
+
+    /// Tip calls refuse a stale tip the writer's node does not report.
+    ///
+    /// A served tip older than the stale-tip limit fails `GetLatestBlock`
+    /// and `GetLightdInfo` with `UNAVAILABLE` unless the writer's node
+    /// reports that tip, while block ranges keep serving. A disabled limit
+    /// serves the old tip.
+    #[tokio::test]
+    async fn tip_calls_refuse_a_stale_tip_unless_the_limit_is_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(4);
+        let (reader, _fixture) = large_block_reader(&chain)?;
+        // The fixture's blocks are months old.
+        let limited = adapter_serving(&reader).with_stale_tip_limit(
+            zinder_compat_lightwalletd::StaleTipLimit::after(Duration::from_mins(25)),
+        );
+        let latest = limited
+            .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+            .await
+            .err()
+            .map(|status| status.code());
+        let info = limited
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await
+            .err()
+            .map(|status| status.code());
+        assert_eq!(latest, Some(Code::Unavailable));
+        assert_eq!(info, Some(Code::Unavailable));
+        let blocks = range_parity_blocks(&limited, 1, 4, Vec::new()).await?;
+        assert_eq!(blocks.len(), 4);
+
+        // The writer's node reports the served tip: the chain is only quiet.
+        let node_tip_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let vouched = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(node_tip_witness.clone());
+        node_tip_witness.observe(Some(BlockHeight::new(4)));
+        vouched
+            .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+            .await?;
+        vouched
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?;
+        // The writer is behind a node that has a newer block.
+        let behind_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let behind = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(behind_witness.clone());
+        behind_witness.observe(Some(BlockHeight::new(9)));
+        assert_eq!(
+            behind
+                .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        // The node has been unreachable since the witness started.
+        let unreachable_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let unreachable = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(unreachable_witness.clone());
+        unreachable_witness.observe(None);
+        assert_eq!(
+            unreachable
+                .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+
+        let unlimited = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::DISABLED);
+        unlimited
+            .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+            .await?;
+        unlimited
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?;
         Ok(())
     }
 

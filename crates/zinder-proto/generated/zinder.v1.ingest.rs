@@ -24,8 +24,16 @@ pub struct WriterStatusRequest {}
 pub struct WriterStatusResponse {
     /// Cross-plane chain-state envelope. The writer's latest committed chain
     /// epoch (with its visible and settled tips) rides on
-    /// `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the upstream
-    /// observation. Absent when the writer has not committed a chain epoch yet.
+    /// `chain_view.chain_epoch`; `chain_view.upstream_tip` carries the node tip
+    /// the writer last observed. Its committed height is the larger of the
+    /// node-health probe's not-ready report and the follower's admission target,
+    /// and its estimated height, present only when the probe reports one, is
+    /// never below that target, so a report the probe kept from before an outage
+    /// never names an older tip. `upstream_tip` is absent while the writer's node
+    /// admission reports the node unavailable, even after a shutdown drain
+    /// starts, or before it observes a node tip. Absent when the writer
+    /// has not committed a chain epoch yet, or while a parked writer can no
+    /// longer read its epoch.
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<super::wallet::ChainView>,
     /// Stable public network name, such as "zcash-regtest". Carried outside
@@ -36,8 +44,8 @@ pub struct WriterStatusResponse {
     #[prost(enumeration = "WriterPhase", tag = "5")]
     pub phase: i32,
     /// Distance from the writer's visible tip to the observed upstream tip
-    /// when known. Drives phase classification; populated whenever the writer
-    /// has both a store tip and an upstream tip observation.
+    /// when known. Drives phase classification; populated when `chain_view` and
+    /// `chain_view.upstream_tip.committed_height` are both present.
     #[prost(uint32, optional, tag = "7")]
     pub gap_blocks: ::core::option::Option<u32>,
     /// Last upstream-health observation. Unset when no probe has produced a

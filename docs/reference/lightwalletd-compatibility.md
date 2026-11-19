@@ -67,12 +67,40 @@ Both methods describe the serving process and its current tip. Whole messages re
 | `blockHeight` | The served visible tip. Compare with a tolerance of one block. |
 | `vendor`, `version`, `gitCommit` | `Zinder`, the crate version, and the build commit. Never compare. |
 | `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress` | Always empty. Never compare. |
-| `estimatedHeight` | Always equal to `blockHeight`, even during a node outage. Operators read `served_epoch_age_seconds` on `/readyz` instead. |
+| `estimatedHeight` | The network height estimated from the served tip, as [Stale tip](#stale-tip) describes. Never below `blockHeight`, and at most a few blocks above it while the tip advances. Never compare. |
 | `taddrSupport` | `true` in wallet serving, `false` in compact-blocks serving. Fixed when the process starts. |
 
 The upgrade fields come from the network-upgrade schedule that ingest admitted, never from a node. A newly admitted upgrade shows as pending until the tip reaches it. A store without an admitted schedule is not served: the process retries until `storage.initial_catchup_timeout_ms` passes, then exits.
 
 `GetLatestBlock` returns the visible tip height and its hash in internal byte order, the reverse of the hex Zebra's JSON-RPC prints. Compare hashes across servers only at equal heights.
+
+#### Stale tip
+
+`estimatedHeight` is the height Zebra would report as `estimatedheight` for the served tip: the tip, plus the blocks the target spacing would have produced since the tip's block time. Each era uses the spacing of its network upgrade in the admitted schedule: 150 seconds before Blossom, 75 seconds from Blossom, and 25 seconds from NU7. Go lightwalletd forwards Zebra's value, which Zebra computes the same way from its own tip. During a node outage the served tip stands still and `estimatedHeight` keeps rising.
+
+An old tip is not always a stale one: the network may simply not have produced a block. So `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE` only when both hold:
+
+- The served tip is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`). Its age counts from its block time, or from when this process first served it since it started if that is earlier, so a block time ahead of the local clock, which consensus accepts, delays a refusal only until the first tip call after the tip changes or the process restarts.
+- The writer cannot vouch that the served tip is the network's tip: its node is unreachable, the node reports that its peers show it behind the network, the node has a block above the served tip because the writer is behind it (catching up or restored from an old snapshot), the writer is starting or parked, or ingest control does not answer.
+
+While the writer's node is reachable, reports itself in sync, and has no block above the served tip, the tip calls answer however old that tip is, and `estimatedHeight` tells wallets the chain is quiet. Go lightwalletd fails these calls only while its node is down, and keeps answering while its node is reachable but behind the network.
+
+A node counts as behind the network when Zebra's `/ready` reports `syncing`, `insufficient peers`, or `no tip`, which come from its peers and its syncer. Zebra's other not-ready reports, `tip_age=…` and `lag=…`, and both reports of the JSON-RPC health fallback are computed from how old the node's tip is. A quiet chain raises them too, so they do not stop the node vouching, and a node that has stalled but keeps one peer, which reports only `tip_age=…`, looks the same as a quiet chain. On Testnet and Regtest, Zebra's `/ready` reports ready unless `enforce_on_test_networks` is set. Without a node health probe, only the node's reachability and its tip count.
+
+The process reads the writer's status from ingest control every `storage.secondary_catchup_interval_ms`, 1 second by default. A writer that reaches its node reports the node's committed tip there and reports none while the node is unreachable. A reading vouches for 30 seconds or three reading intervals, whichever is longer, so a stopped ingest control stops vouching within that time. Readings that fail or report no node tip stop the vouching once they have lasted 5 seconds or two reading intervals, whichever is longer, and never more than a minute, so one failed reading does not refuse a quiet chain's tip unless readings are a minute or more apart. Once the node reports a block above a tip, that tip keeps vouching for 10 seconds or three reading intervals, whichever is longer, while the reader catches up, and further blocks in that time do not shorten it. The tip calls answer again as soon as the node reports the served tip or a newer tip is served. Every other method keeps serving stored data. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
+
+- The limit defaults to 25 minutes on every network. On a quiet Regtest chain, which mines on demand, the reachable node vouches for the tip.
+- 0 turns the limit off, for a private deployment that wants its wallets to keep syncing through a long outage. Its wallets then build transactions that expire on arrival once the tip is about 50 minutes old. Any other value must be at least 5 minutes.
+- Every wallet engine below expires a transaction 40 blocks after the tip it was told, plus one, and 120 blocks from NU7: 50 minutes of target time either way. The default limit is half that window, so a wallet stops on the stale tip well before a transaction built on it would expire.
+
+How each engine uses the tip calls:
+
+| Engine | Reads `estimatedHeight` | When `GetLatestBlock` or `GetLightdInfo` fails | Transaction expiry |
+| --- | --- | --- | --- |
+| Slipstream, in the ZODL Android and iOS apps (`zodl-inc/slipstream` `245a2d2`, `zodl-android-wallet-sdk` `ea01b96`, `zodl-swift-wallet-sdk` `0571cb4`) | Server ranking only: a server whose tip is more than 6 hours of target time behind its `estimatedHeight` is left out. Sync never reads it. | Each sync pass stops at `GetLatestBlock` and retries. The follow loop polls every 10 to 30 seconds and, after 5 failures, reports the endpoint unreachable while it keeps polling. Ranking leaves out a server whose tip calls fail. | Wallet tip plus 1 plus 40 blocks, or 120 from NU7. |
+| Zcash Android SDK (`zcash/zcash-android-wallet-sdk` `a95780a`) | Server ranking only: a server whose `estimatedHeight` is 288 or more blocks above `blockHeight` is left out. | After 3 attempts the synchronizer reports `DISCONNECTED` and reconnects to the same server about every 5 seconds, without giving up. A failing `GetLightdInfo` at sync setup ends in a `ClassCastException` in `CompactBlockProcessor.verifySetup`, as it does against lightwalletd with its node down. | Rust backend default: tip plus 1 plus 40 blocks. |
+| Vizor (`chainapsis/vizor-wallet` `a69183b`) | Never. | Retries after 2, 4, and 8 seconds, then shows "Network connection lost. We'll keep trying automatically." In Automatic mode it sets the server aside for a minute and switches; a custom endpoint retries every 10 seconds. A send fails while the tip call fails. Automatic mode also leaves a server whose tip has not advanced for 5 minutes when another is higher. | Server tip plus 1 plus 40 blocks, or 120 from NU7. |
+| Zingo (`zingolabs/zingolib` `658dea0`, pepper-sync) | Never. | The sync pass ends with an error it classes as recoverable; a failing `GetLightdInfo` stops a sync before it starts. | Wallet tip plus 1 plus 40 blocks, or 120 from NU7. |
 
 ### `GetBlock` and `GetBlockNullifiers`
 
