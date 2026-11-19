@@ -88,6 +88,22 @@ fn derived_series_of_documented_metrics_count_as_listed() {
 }
 
 #[test]
+fn a_dashboard_name_with_a_trailing_underscore_is_checked() {
+    let reference = DocumentedMetrics::parse(
+        "| `zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs` | gauge |",
+    );
+    let names = metric_names("max(zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs_)");
+
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs_".to_owned()
+        ])
+    );
+    assert!(names.iter().all(|name| !reference.lists(name)));
+}
+
+#[test]
 fn a_family_named_in_prose_lists_none_of_its_members() {
     let reference = DocumentedMetrics::parse(
         "| `zinder_store_rocksdb_property` | gauge |\n\
@@ -126,10 +142,7 @@ impl DocumentedMetrics {
 }
 
 fn metric_names(expression: &str) -> BTreeSet<String> {
-    metric_tokens(expression)
-        .map(|(name, _)| name)
-        .filter(|name| !name.ends_with('_'))
-        .collect()
+    metric_tokens(expression).map(|(name, _)| name).collect()
 }
 
 /// Every `zinder_` identifier in `text`, and whether a `*` follows it.
