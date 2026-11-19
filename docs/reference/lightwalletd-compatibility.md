@@ -242,7 +242,7 @@ On a direct connection, none of the three engines treats one gRPC status differe
 
 Slipstream is the sync engine in the ZODL Android and iOS apps. On a direct connection it does the following:
 
-- A failed `GetBlockRange` resumes from the first height not yet received, on a new connection, after 0.25, 0.5, and 1 seconds. After three retries that receive no block, the sync pass fails.
+- A failed `GetBlockRange` resumes from the first height not yet received, on a new connection, after 0.25, 0.5, and 1 seconds. A stream that fails after the request's last block, or sends a block past it, is retried from the start of that block's piece, so Slipstream asks again for blocks it already received. After three retries that receive no block, the sync pass fails.
 - A failed `GetTreeState` is retried on a new connection after 1 and 3 seconds. A third failure fails the sync pass.
 - A failed sync pass runs again, up to three passes in all.
 - Through an OHTTP gateway only, `INVALID_ARGUMENT` on `GetBlockRange` halves the requested range and retries. On a direct connection it takes the same path as any other status.
@@ -251,12 +251,12 @@ Slipstream asks for a tree state below its start height, then one at the end of 
 
 Vizor does the following:
 
-- It requests each batch's blocks and the tree state below the batch together. If either call fails, it cancels the other.
+- It requests each batch's blocks and the tree state below the batch together. It skips the tree-state request when it knows that state locally: for a batch that starts at or below Sapling activation, and for a Mainnet checkpoint compiled into the app. If either call fails, it cancels the other.
 - A batch downloading ahead of the scan that fails within 10 seconds is retried after 1 and 4 seconds. If it still fails, Vizor downloads the batch again when the scan reaches it.
 - A failure of that download ends the sync attempt. Vizor tries again after 2, 4, and 8 seconds.
 - In Automatic endpoint mode, a failed call excludes the endpoint for one minute and selects another endpoint. A custom endpoint does not fail over.
 
-Vizor downloads up to four batches ahead of the one it scans, and each batch asks for its own tree state.
+Vizor downloads up to four batches ahead of the one it scans, and each batch whose tree state it does not know locally asks for its own.
 
 The classic Zcash Android SDK, `CompactBlockProcessor`, downloads one batch at a time. It gives each `GetTreeState` and `GetBlockRange` call five attempts, 0.5, 1, 2, and 4 seconds apart. A retried `GetBlockRange` requests the whole batch again.
 
