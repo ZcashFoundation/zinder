@@ -36,6 +36,10 @@ const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 /// Longest one scrape may take, from connecting to the end of the response.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most bytes a scrape reads. A Zinder `/metrics` page is far smaller; an
+/// endpoint that sends more fails the scrape instead of filling memory.
+const MAX_SCRAPE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// What the server counted between the start and the end of a run.
 ///
 /// A server that does not export a metric reports zero for it.
@@ -151,13 +155,17 @@ fn counter_value(increase: f64) -> u64 {
 
 /// Reads the Prometheus exposition at an `http://host:port/path` URL.
 pub(super) async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
-    scrape_within(url, SCRAPE_TIMEOUT).await
+    scrape_within(url, SCRAPE_TIMEOUT, MAX_SCRAPE_BYTES).await
 }
 
 /// Reads the exposition at `url`, failing when the whole exchange takes
 /// longer than `deadline`.
-async fn scrape_within(url: &str, deadline: Duration) -> Result<Vec<MetricSample>, String> {
-    tokio::time::timeout(deadline, read_exposition(url))
+async fn scrape_within(
+    url: &str,
+    deadline: Duration,
+    max_bytes: u64,
+) -> Result<Vec<MetricSample>, String> {
+    tokio::time::timeout(deadline, read_exposition(url, max_bytes))
         .await
         .map_err(|_| {
             format!(
@@ -167,7 +175,7 @@ async fn scrape_within(url: &str, deadline: Duration) -> Result<Vec<MetricSample
         })?
 }
 
-async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
+async fn read_exposition(url: &str, max_bytes: u64) -> Result<Vec<MetricSample>, String> {
     let without_scheme = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("{url}: the metrics URL must start with http://"))?;
@@ -188,10 +196,14 @@ async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
         .await
         .map_err(|error| format!("{url}: {error}"))?;
     let mut response = String::new();
-    stream
+    (&mut stream)
+        .take(max_bytes.saturating_add(1))
         .read_to_string(&mut response)
         .await
         .map_err(|error| format!("{url}: {error}"))?;
+    if u64::try_from(response.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(format!("{url}: the response exceeds {max_bytes} bytes"));
+    }
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| format!("{url}: response has no header end"))?;
@@ -352,7 +364,8 @@ mod tests {
             Ok::<_, std::io::Error>(())
         });
 
-        let scraped = scrape_within(&url, Duration::from_millis(200)).await;
+        let scraped =
+            scrape_within(&url, Duration::from_millis(200), super::MAX_SCRAPE_BYTES).await;
         server.abort();
 
         let error = scraped
@@ -388,6 +401,33 @@ mod tests {
             .err()
             .ok_or("a body shorter than its Content-Length must fail the scrape")?;
         assert!(error.contains("ended after"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scrape_refuses_a_response_larger_than_its_byte_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request).await?;
+            let body = "zinder_query_tree_state_replay_refusals_total 5\n".repeat(64);
+            let response = format!("HTTP/1.0 200 OK\r\n\r\n{body}");
+            // The client stops reading at its limit and closes, so a write
+            // past it may fail.
+            let _ = socket.write_all(response.as_bytes()).await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let scraped = scrape_within(&url, Duration::from_secs(5), 1024).await;
+        server.await??;
+
+        let error = scraped
+            .err()
+            .ok_or("a response past the byte limit must fail the scrape")?;
+        assert!(error.contains("exceeds 1024 bytes"), "{error}");
         Ok(())
     }
 

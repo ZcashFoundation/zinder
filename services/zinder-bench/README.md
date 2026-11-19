@@ -765,7 +765,9 @@ identity, the workload's constants, and, over all wallets:
   replayed, the time requests waited for a rebuild or block-range slot, the
   tree states, block ranges, and requests it refused, stale-tip refusals,
   and the time block-range chunks spent in each stage. A metric the server
-  does not export reads as zero.
+  does not export reads as zero. If the read after the run fails, the report
+  keeps its client-side results, leaves `server_observed` out, and gives the
+  reason in `server_metrics_error`. A scrape reads at most 64 MiB.
 
 The simulated wallets do not scan, so each asks for its next blocks as soon as
 the last ones arrive, or, for Slipstream, as soon as its chunk queue has room:

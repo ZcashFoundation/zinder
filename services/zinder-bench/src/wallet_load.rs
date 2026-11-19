@@ -148,6 +148,10 @@ pub(crate) struct LightwalletdWalletLoadReport {
     wallet_sync_seconds: Percentiles,
     rpcs: BTreeMap<&'static str, RpcSummary>,
     tree_state_heights: TreeStateHeights,
+    /// Why the server's metrics could not be read after the run, which
+    /// leaves `server_observed` out and keeps the client-side results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_metrics_error: Option<String>,
 }
 
 /// The endpoint's `GetLightdInfo` identity at the start of the run.
@@ -328,14 +332,9 @@ pub(crate) async fn run_lightwalletd_wallet_load(
         );
     }
     let wall = started.elapsed();
-    let server_observed = match (&args.server_metrics_url, metrics_before) {
-        (Some(url), Some(before)) => {
-            let after = server_metrics::scrape(url)
-                .await
-                .map_err(BenchError::wallet_load_endpoint)?;
-            Some(server_metrics::ServerObserved::between(&before, &after))
-        }
-        _ => None,
+    let (server_observed, server_metrics_error) = match (&args.server_metrics_url, metrics_before) {
+        (Some(url), Some(before)) => observe_after_run(url, &before).await,
+        _ => (None, None),
     };
     Ok(LightwalletdWalletLoadOutput {
         report: LightwalletdWalletLoadReport::new(
@@ -348,6 +347,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
                 outcomes: &outcomes,
                 recorder: &recorder,
                 server_observed,
+                server_metrics_error,
             },
         ),
         report_path: args.report,
@@ -482,6 +482,23 @@ struct RunEvidence<'run> {
     outcomes: &'run [WalletOutcome],
     recorder: &'run CallRecorder,
     server_observed: Option<server_metrics::ServerObserved>,
+    server_metrics_error: Option<String>,
+}
+
+/// Reads the server's metrics after the run. A failed read keeps the run's
+/// results and reports why the server's counts are missing, because the
+/// wallets' work is already done and would otherwise be lost.
+async fn observe_after_run(
+    url: &str,
+    before: &[zinder_bench::metrics_scrape::MetricSample],
+) -> (Option<server_metrics::ServerObserved>, Option<String>) {
+    match server_metrics::scrape(url).await {
+        Ok(after) => (
+            Some(server_metrics::ServerObserved::between(before, &after)),
+            None,
+        ),
+        Err(error) => (None, Some(error)),
+    }
 }
 
 impl LightwalletdWalletLoadReport {
@@ -494,6 +511,7 @@ impl LightwalletdWalletLoadReport {
             outcomes,
             recorder,
             server_observed,
+            server_metrics_error,
         } = run;
         let mut wallet_failures = BTreeMap::new();
         for failure in outcomes
@@ -549,6 +567,7 @@ impl LightwalletdWalletLoadReport {
                 || recorder.tree_state_heights(),
                 |observed| recorder.tree_state_heights().with_server_observed(observed),
             ),
+            server_metrics_error,
         }
     }
 }
@@ -854,6 +873,22 @@ mod tests {
         assert!(
             (1 + 1 + 1 + 3..=1 + 1 + 2 + 3).contains(&connects),
             "{report}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_scrape_after_the_run_keeps_the_report() -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        drop(listener);
+
+        let (observed, error) = super::observe_after_run(&url, &[]).await;
+
+        assert!(observed.is_none());
+        assert!(
+            error.is_some_and(|error| error.contains(&url)),
+            "the error names the metrics URL"
         );
         Ok(())
     }
