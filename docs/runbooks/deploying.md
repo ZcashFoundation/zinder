@@ -89,9 +89,11 @@ surface.
 | Deployment | What runs | What it serves | What it requires |
 | --- | --- | --- | --- |
 | Wallet endpoint | Ingest, projector, and `zinder-compat-lightwalletd`. Compose and the single-volume image also run `zinder-query`. | lightwalletd `CompactTxStreamer` on port 9067, to existing light wallets | The chain store and the wallet store, with `storage.raw_blob_policy` set to `transactions` or `all`. The shipped configurations set `transactions`. |
-| Native wallet backend | Ingest, projector, and `zinder-query` | `WalletQuery` on port 9102, with reads pinned to one chain snapshot and typed errors, to clients built on `zinder-client` or the native API | The chain store and the wallet store |
-| Wallet plus explorer | The wallet processes plus `zinder-explorer` | Both wallet surfaces, and `ExplorerQuery` on port 9068 | Set `ingest.explorer_views = true`. Ingest then also builds the Explorer view store. |
-| Block feed | Ingest and `zinder-compat-lightwalletd` in compact-blocks mode | `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the chain store, to consumers that read compact blocks | The chain store only. Start `zinder-compat-lightwalletd` with `ZINDER_COMPAT__SERVING=compact-blocks` and no `[node]` or `[wallet]` settings. |
+| Native wallet backend | Ingest, projector, and `zinder-query` | `WalletQuery` on port 9102, with reads pinned to one chain snapshot and typed errors, to clients built on `zinder-client` or the native API | The chain store and the wallet store, with `storage.raw_blob_policy` set to `transactions` or `all`, as for the wallet endpoint. |
+| Wallet plus explorer | The wallet processes plus `zinder-explorer` | Both wallet surfaces, and `ExplorerQuery` on port 9068 | Set `ingest.explorer_views = true` on a chain store whose history starts at genesis or at the authenticated `checkpoint_height = 0`. Ingest refuses the setting on a store built from a later checkpoint, and otherwise also builds the Explorer view store. |
+| Block feed | Ingest and `zinder-compat-lightwalletd` in compact-blocks mode | `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the chain store, to consumers that read compact blocks | The chain store only. Start `zinder-compat-lightwalletd` with `ZINDER_COMPAT__SERVING=compact-blocks`. That process refuses to start with any `[node]`, `[node_fallbacks.N]`, or `[wallet]` setting, any `ZINDER_NODE__*`, `ZINDER_NODE_FALLBACKS__*`, or `ZINDER_WALLET__*` variable, or `compat.tree_state_replay_wait_ms`. Ingest keeps its node settings. |
+
+Every process reads `storage.raw_blob_policy` as an exact expectation of the store it opens. The first commit fixes the policy, so a store built with `none` must be rebuilt to serve transactions.
 
 Then choose how to package it:
 

@@ -238,7 +238,7 @@ The protocol has no lossless way to page past the cap. A single block with more 
 
 This section describes how three wallet sync engines react when a `GetBlockRange` or `GetTreeState` call fails, as read in their source. Use it to predict the load a refusal causes. It is not a support claim for these wallets; the [claim boundary](#claim-boundary) still applies.
 
-None of the three engines treats one gRPC status differently from another on these calls. `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `ABORTED`, `OUT_OF_RANGE`, `NOT_FOUND`, and `INVALID_ARGUMENT` all take the same retry path. A refused request therefore comes back within seconds, often on a new connection, and a refusal does not slow the client down.
+On a direct connection, none of the three engines treats one gRPC status differently from another on these calls. `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `ABORTED`, `OUT_OF_RANGE`, `NOT_FOUND`, and `INVALID_ARGUMENT` all take the same retry path. A refused request therefore comes back within seconds, often on a new connection, so a refusal adds load instead of shedding it. Each engine's retries are bounded, and a sync attempt that exhausts them fails, as listed below.
 
 Slipstream is the sync engine in the ZODL Android and iOS apps. On a direct connection it does the following:
 
