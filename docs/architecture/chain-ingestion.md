@@ -182,7 +182,11 @@ there keep replaying.
 
 Only settled history is densified, so no reorg reaches a densified row. A
 stride commits whole or not at all, and its commit is synced before the writer
-answers. The pass scans settled strides in bounded chunks, checking every gap
+answers. A stride commit leaves the writer's fence where it is, so a reader
+that already has the store open sees the new rows from its next refresh after
+the commit, which for the wallet-serving pair follows the next live commit.
+Until then its reads in that stride replay from the cadence checkpoint and
+return the same tree states. The pass scans settled strides in bounded chunks, checking every gap
 between stored checkpoints, and queues the strides that do not satisfy the
 selection. It records how far every stride satisfies the selection in
 `tree-state-densification-watermark.json` inside the canonical store
