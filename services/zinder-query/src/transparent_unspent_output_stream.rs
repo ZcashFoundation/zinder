@@ -10,10 +10,10 @@
 //!
 //! An on-demand stream reads nothing until its caller first polls it and
 //! never reads ahead: it asks for the next page only once the caller has
-//! consumed the previous one. Its first page holds
-//! [`ON_DEMAND_FIRST_PAGE_SIZE`] outputs and each later page doubles, up to
-//! [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`] as the caller consumes, so a
-//! caller that merges many streams holds at most one page per stream.
+//! consumed the previous one. Its first page holds the number of outputs its
+//! caller chooses, at most [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`], and each
+//! later page doubles up to that size as the caller consumes, so a caller
+//! that merges many streams holds at most one page per stream.
 
 use std::{
     num::NonZeroU16,
@@ -43,9 +43,6 @@ pub const TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.sat
 
 /// Pages buffered between the storage reader and the caller.
 const BUFFERED_PAGES: usize = 1;
-
-/// Outputs the first page of an on-demand stream reads.
-const ON_DEMAND_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
 
 /// Unspent transparent outputs of one address, read at one chain epoch.
 ///
@@ -130,7 +127,9 @@ impl TransparentAddressUnspentOutputs {
     }
 
     /// Opens a stream of the outputs `request` selects from `pair` that
-    /// reads a page only when its caller polls it with no output left.
+    /// reads a page only when its caller polls it with no output left, the
+    /// first of `first_page_size` outputs, at most
+    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`].
     ///
     /// Opening reads no storage. The producer still ends the stream when the
     /// publisher revokes reads on `pair`, polled or not.
@@ -139,6 +138,7 @@ impl TransparentAddressUnspentOutputs {
         pair: Arc<WalletServingReadPair>,
         request: &TransparentAddressUnspentOutputsRequest,
         chain_epoch: ChainEpoch,
+        first_page_size: NonZeroU16,
     ) -> Self {
         let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
         let (requests, request_receiver) = mpsc::channel(1);
@@ -159,7 +159,7 @@ impl TransparentAddressUnspentOutputs {
             finished: false,
             on_demand: Some(OnDemandPages {
                 requests,
-                next_page_size: ON_DEMAND_FIRST_PAGE_SIZE,
+                next_page_size: first_page_size.min(TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE),
                 requested: false,
             }),
         }
@@ -390,6 +390,8 @@ mod tests {
     /// Page size the paged tests read with, so a few dozen outputs span
     /// several pages.
     const TEST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(7);
+    /// First page size of the on-demand tests that watch pages grow.
+    const SMALL_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
     const OTHER_SCRIPT_PUB_KEY: &[u8] = &[0x52];
     const WAIT_LIMIT: Duration = Duration::from_secs(10);
     /// Holders of a pair no read holds: the test and the query's slot.
@@ -639,6 +641,7 @@ mod tests {
                     address_script_hash: fixture.address,
                     start_height: BlockHeight::new(0),
                 },
+                SMALL_FIRST_PAGE_SIZE,
                 Some(unserved),
             )
             .await;
@@ -682,6 +685,35 @@ mod tests {
             fixture.page_sizes().get(eager_reads..),
             Some([16, 32, 64, 128, 256].as_slice())
         );
+        fixture.wait_until_released().await
+    }
+
+    /// An on-demand stream's first page holds the outputs its caller asks
+    /// for, at most the eager page size, and later pages double from there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_on_demand_stream_starts_at_the_first_page_size_its_caller_chooses()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_outputs(300)?;
+        let first_page_sizes = [
+            (NonZeroU16::MIN.saturating_add(119), vec![120, 240]),
+            (NonZeroU16::MIN.saturating_add(511), vec![512]),
+            (NonZeroU16::MAX, vec![1_024]),
+        ];
+
+        for (first_page_size, expected_page_sizes) in first_page_sizes {
+            let reads_before = fixture.page_sizes().len();
+            let outputs: Vec<_> = fixture
+                .open_on_demand_from(first_page_size)
+                .await?
+                .collect::<Result<_, _>>()
+                .await?;
+            assert_eq!(outputs.len(), 300);
+            assert_eq!(
+                fixture.page_sizes().get(reads_before..),
+                Some(expected_page_sizes.as_slice()),
+                "first page size {first_page_size}"
+            );
+        }
         fixture.wait_until_released().await
     }
 
@@ -769,12 +801,22 @@ mod tests {
         }
 
         async fn open_on_demand(&self) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+            self.open_on_demand_from(SMALL_FIRST_PAGE_SIZE).await
+        }
+
+        /// Opens an on-demand stream of the fixture address whose first page
+        /// asks for `first_page_size` outputs.
+        async fn open_on_demand_from(
+            &self,
+            first_page_size: NonZeroU16,
+        ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
             self.query
                 .transparent_address_unspent_outputs_on_demand(
                     TransparentAddressUnspentOutputsRequest {
                         address_script_hash: self.address,
                         start_height: BlockHeight::new(0),
                     },
+                    first_page_size,
                     None,
                 )
                 .await

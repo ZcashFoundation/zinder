@@ -1025,6 +1025,7 @@ where
     async fn transparent_address_unspent_outputs_on_demand(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
+        first_page_size: NonZeroU16,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         // The pair validated its epoch when it was admitted, so opening the
@@ -1041,6 +1042,7 @@ where
                     pair,
                     &request,
                     chain_epoch,
+                    first_page_size,
                 ))
             },
         )

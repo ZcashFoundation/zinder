@@ -5,7 +5,10 @@
 //! upstream nodes as a fallback for indexed history. Transaction broadcast is
 //! the only operation that contacts an upstream node.
 
-use std::{num::NonZeroU32, time::Instant};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -281,18 +284,22 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ///
     /// The stream reads nothing until it is first polled and never reads
     /// ahead: it reads a page only when the caller polls it with no output
-    /// left. Pages start at 16 outputs and double up to
-    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`] as the caller consumes
-    /// them, so a caller that merges many of these streams holds at most one
-    /// page per stream. Use it when one request opens many streams at once.
+    /// left. The first page holds `first_page_size` outputs, at most
+    /// [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`], and each later page doubles
+    /// up to that size as the caller consumes them, so a caller that merges
+    /// many of these streams holds at most one page per stream. Use it when
+    /// one request opens many streams at once, and size the first page from
+    /// how many streams the request holds.
     ///
     /// The default opens the eager stream, so an implementation that wraps
     /// another must forward this method to keep its reads on demand.
     async fn transparent_address_unspent_outputs_on_demand(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
+        first_page_size: NonZeroU16,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        let _ = first_page_size;
         self.transparent_address_unspent_outputs(request, at_epoch_id)
             .await
     }
