@@ -55,7 +55,19 @@ Restrict the private key and its directory to the account that runs Caddy.
 2. Load it into your Caddy service, for example with `caddy reload` or by
    restarting the service.
 
-The template does three things:
+3. Tell Zinder to trust the client address Caddy forwards. Add this line to
+   the env file you pass to Compose, then recreate the compatibility
+   container:
+
+   ```bash
+   ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true
+   ```
+
+   Outside Compose, set `compat.trust_proxy_client_address = true` in the
+   compatibility config file instead. Running the binary with
+   `--print-config` shows the resolved value.
+
+The template does four things:
 
 - It serves TLS on `:443` for the exact name, with your certificate, and
   offers only HTTP/2 (`alpn h2`), which gRPC needs. Its `auto_https off`
@@ -66,8 +78,44 @@ The template does three things:
   which a gRPC client reports as `UNAVAILABLE`.
 - `reverse_proxy h2c://127.0.0.1:...` forwards admitted calls to the
   plaintext gRPC listener on loopback.
+- `header_up X-Zinder-Client-Address {http.request.remote}` names, on every
+  forwarded call, the wallet connection it came from, as an IP address and
+  port. Caddy replaces any value the wallet sent.
 
 When you renew the certificate, replace the files and reload Caddy.
+
+## Keep wallets apart in the receive limit
+
+Zinder admits at most 32 requests whose message is still arriving, as
+[Configuration](../reference/configuration.md#public-grpc-listeners)
+describes. When that pool is full, a request from a client holding fewer
+slots takes a slot from the client holding the most. Caddy reaches Zinder over
+a few pooled connections, so without a client address every wallet looks like
+the same client, and one wallet that opens many slow requests gets the others
+refused with `UNAVAILABLE`.
+
+With the header set and `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true`,
+Zinder counts each wallet connection as its own client, as it does for a
+direct connection. One wallet connection that holds many slots then loses its
+own oldest slots to other wallets, and refusals fall on it alone.
+
+This guarantee depends on these proxy settings:
+
+- Caddy sets `X-Zinder-Client-Address` to `{http.request.remote}` on every
+  forwarded call, replacing any value the client sent. The value must be an
+  IP address and port, such as `203.0.113.7:51234` or `[2001:db8::7]:51234`.
+  Zinder counts a call without a valid value against Caddy's own connection.
+- Only Caddy can reach the gRPC listener. Zinder trusts the header from any
+  client once the setting is on, so a client that reaches the listener
+  directly could name another wallet's connection. The Compose deployment
+  publishes the listener on loopback only.
+- Zinder identifies wallets by connection, not by IP address, because wallets
+  behind Tor share exit addresses. A client that opens many connections still
+  counts as many clients, so keep the per-client connection limit described
+  in [Add access control and rate limits](#add-access-control-and-rate-limits).
+
+Leave the setting off when wallets connect to Zinder without a proxy. With it
+off, Zinder ignores the header.
 
 ## How readiness reaches wallets
 
@@ -121,7 +169,10 @@ with a scan from outside.
 Add your client authentication and rate limits before you announce a public
 endpoint. Put a policy in Caddy or in front of it that limits connections,
 requests, and concurrent streams per client. Leave room for normal wallet
-sync, which streams many blocks in a row.
+sync, which streams many blocks in a row. Zinder's receive limit tells
+connections apart, not addresses, so only a per-client connection limit at
+the proxy stops one client from spreading its requests over many
+connections.
 
 ## Expose the native endpoint too
 
@@ -129,7 +180,8 @@ To expose the native `WalletQuery` endpoint as well, add a second site block
 to the template, with its own DNS name and certificate. Point its `forward_auth` at the query ops port
 (`ZINDER_QUERY_OPS_HOST_PORT`, 9106 on Mainnet) and its `reverse_proxy` at
 `h2c://127.0.0.1:` plus the query gRPC port (`ZINDER_QUERY_HOST_PORT`, 9102 on
-Mainnet). Verify it the same way, calling
+Mainnet). Keep the same `header_up X-Zinder-Client-Address` line, and set
+`ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true`. Verify it the same way, calling
 `zinder.v1.wallet.WalletQuery/ServerInfo`. How native clients connect is in
 [Integration surfaces](../reference/integration-surfaces.md).
 

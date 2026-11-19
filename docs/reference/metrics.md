@@ -63,7 +63,10 @@ Other signals that need attention when they keep rising:
   `zinder_grpc_request_receive_timeouts_total`, and
   `zinder_grpc_response_send_stalls_total` while traffic is light: clients
   open streams and send or read slowly. Limit connections per client at your
-  proxy.
+  proxy. Behind a proxy, also set the listener's
+  `trust_proxy_client_address`, as
+  [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
+  describes, so that refusals fall on the slow client.
 - `zinder_wallet_serving_missing_table_file_pairs_total` rising with most
   publications: store files are replaced faster than serving pairs, as during
   a manual compaction.

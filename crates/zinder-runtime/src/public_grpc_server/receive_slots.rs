@@ -2,11 +2,11 @@
 //! every slot is held.
 //!
 //! A full pool admits a new request by evicting the oldest slot of the client
-//! connection holding the most, as long as that connection holds more slots
-//! than the requester's. One connection that opens streams and sends nothing
-//! therefore cannot lock other connections out; it only loses its own oldest
-//! slots to them. A request whose connection already holds as many slots as
-//! any other is refused.
+//! holding the most, as long as that client holds more slots than the
+//! requester. One client that opens streams and sends nothing therefore
+//! cannot lock other clients out; it only loses its own oldest slots to them.
+//! A request whose client already holds as many slots as any other is
+//! refused.
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
 
@@ -37,10 +37,11 @@ struct HeldSlot {
 /// Whose slots count together when the pool picks one to evict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Holder {
-    /// A client connection, identified by its remote address.
-    Connection(SocketAddr),
+    /// A client, identified by its connection's remote address or by the
+    /// client connection a trusted proxy names.
+    Client(SocketAddr),
     /// A request whose transport reported no remote address. It counts as a
-    /// connection of its own.
+    /// client of its own.
     Unidentified { slot_id: u64 },
 }
 
@@ -49,7 +50,7 @@ enum Holder {
 pub(super) struct Admission {
     /// The slot the request holds until it is dropped.
     pub(super) slot: ReceiveSlot,
-    /// Whether another connection's request lost its slot to admit this one.
+    /// Whether another client's request lost its slot to admit this one.
     pub(super) evicted_another: bool,
 }
 
@@ -69,14 +70,13 @@ impl ReceiveSlots {
         })
     }
 
-    /// Claims a slot for a request from `remote_address`, evicting another
-    /// connection's oldest slot when the pool is full and the fairness rule
-    /// allows it. Returns `None` when the request is refused.
-    pub(super) fn claim(self: &Arc<Self>, remote_address: Option<SocketAddr>) -> Option<Admission> {
+    /// Claims a slot for a request from `client`, evicting another client's
+    /// oldest slot when the pool is full and the fairness rule allows it.
+    /// Returns `None` when the request is refused.
+    pub(super) fn claim(self: &Arc<Self>, client: Option<SocketAddr>) -> Option<Admission> {
         let mut table = self.table.lock();
         let id = table.next_slot_id;
-        let holder =
-            remote_address.map_or(Holder::Unidentified { slot_id: id }, Holder::Connection);
+        let holder = client.map_or(Holder::Unidentified { slot_id: id }, Holder::Client);
         let evicted_another = table.held.len() >= self.capacity.get();
         if evicted_another {
             let index = table.eviction_candidate(holder)?;
@@ -143,12 +143,12 @@ impl SlotTable {
 }
 
 impl ReceiveSlot {
-    /// Completes once another connection's request has taken this slot.
+    /// Completes once another client's request has taken this slot.
     pub(super) fn evicted(&self) -> WaitForCancellationFutureOwned {
         self.eviction.clone().cancelled_owned()
     }
 
-    /// The token cancelled when another connection's request takes this
+    /// The token cancelled when another client's request takes this
     /// slot.
     pub(super) fn eviction_token(&self) -> CancellationToken {
         self.eviction.clone()

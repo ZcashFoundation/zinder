@@ -233,6 +233,7 @@ not check descriptions or defaults.
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS` | zinder-query | Optional | `query.tree_state_replay_wait_ms` | Milliseconds a tree-state rebuild waits for a rebuild slot before it is refused with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-query | Optional | `query.tree_state_replay_waiters_per_slot` | Tree-state rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken is refused at once with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 1..=256; defaults to 64, enough for one slot to serve its waiters at a 30 ms rebuild within the default 2-second wait. |
+| `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS` | zinder-query | Optional | `query.trust_proxy_client_address` | Counts each WalletQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
 | `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
@@ -242,6 +243,7 @@ not check descriptions or defaults.
 | `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 1..=256; defaults to 64. |
 | `ZINDER_COMPAT__STALE_TIP_LIMIT_MS` | zinder-compat-lightwalletd | Optional | `compat.stale_tip_limit_ms` | Milliseconds the served tip may age, counted from its block time or from when the process first served it, whichever is earlier, while the writer cannot vouch for it because its node is unreachable, behind the network, or ahead of the writer, before lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale tip. A tip the node still reports is never refused. 0 disables it; otherwise at least 300000. Defaults to 1500000 (25 minutes). |
 | `ZINDER_COMPAT__PING_VERY_INSECURE` | zinder-compat-lightwalletd | Optional | `compat.ping_very_insecure` | Answers the lightwalletd `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only on a server you are load testing. Defaults to false, which refuses `Ping` with `FAILED_PRECONDITION`. |
+| `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS` | zinder-compat-lightwalletd | Optional | `compat.trust_proxy_client_address` | Counts each lightwalletd-compatible request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.block_cache_bytes` | Materialized-view store RocksDB block cache budget in bytes. Defaults to 268435456 for writers and 67108864 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_wal_bytes` | Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_open_files` | Materialized-view store RocksDB open SST file cap. Defaults to 512 for writers and 64 for readers. |
@@ -296,6 +298,7 @@ not check descriptions or defaults.
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_encoded_bytes_per_step` | Target maximum encoded event bytes examined by one bounded mempool-retention step. The first row may exceed the target to guarantee progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
+| `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS` | zinder-explorer | Optional | `explorer.trust_proxy_client_address` | Counts each ExplorerQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
 | `ZINDER_CIPHERSCAN__LISTEN_ADDR` | zinder-compat-cipherscan | Optional | `cipherscan.listen_addr` | Listen address for the Cipherscan-compatible REST endpoint. Defaults to 127.0.0.1:9070. A public or unspecified address needs `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`. |
 | `ZINDER_CIPHERSCAN__EXPLORER_QUERY_ENDPOINT` | zinder-compat-cipherscan | Optional | `cipherscan.explorer_query_endpoint` | ExplorerQuery gRPC endpoint the adapter reads explorer views from. Defaults to http://127.0.0.1:9068. |
@@ -332,12 +335,25 @@ transport policy.
 A unary or server-streaming call holds its receive slot only until its request
 has arrived. Long response streams such as `ChainEvents`,
 `CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a
-pool is full, a request from a connection that holds fewer slots takes the
-oldest slot of the connection that holds the most. The request that loses its
+pool is full, a request from a client that holds fewer slots takes the
+oldest slot of the client that holds the most. The request that loses its
 slot fails with `UNAVAILABLE`. Retry these refusals with backoff.
 
-These limits count all clients together. Behind a proxy, Zinder sees the
-proxy's connections, so enforce per-client limits in the proxy.
+A client is the connection a request arrives on. A proxy reaches Zinder over
+a few pooled connections, so behind one every client looks like the same few.
+Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`,
+or `explorer.trust_proxy_client_address` to `true` when the listener is
+reachable only through a proxy that sets the `x-zinder-client-address`
+request header to the client connection's IP address and port. Zinder then
+counts each request against that connection, and against the proxy's own
+connection when the header is missing or invalid. With the setting off, the
+default, Zinder ignores the header.
+[Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
+lists the proxy settings this depends on.
+
+These limits count all clients together, and a client that opens many
+connections counts as many clients. Limit connections per client in the
+proxy.
 
 A response that the client stops reading, by withholding HTTP/2 flow-control
 window, ends after 60 seconds. A response that is waiting for the server to

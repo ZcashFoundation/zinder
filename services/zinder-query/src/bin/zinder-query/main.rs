@@ -266,6 +266,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        query_config.client_address_source,
         &readiness,
     )?;
 

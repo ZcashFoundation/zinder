@@ -20,6 +20,11 @@ https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
 			uri /readyz
 		}
 
-		reverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT}
+		# Name the wallet's own connection, so that Zinder's receive limit
+		# tells wallets apart over Caddy's pooled upstream connections. Set
+		# ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true on Zinder to use it.
+		reverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT} {
+			header_up X-Zinder-Client-Address {http.request.remote}
+		}
 	}
 }

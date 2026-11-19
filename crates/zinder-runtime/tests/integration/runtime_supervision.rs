@@ -22,7 +22,8 @@ use tonic_reflection::pb::v1::{
 };
 use tonic_types::StatusExt as _;
 use zinder_runtime::{
-    Readiness, ReadinessCause, ReadinessState, RuntimeService, SupervisedRuntime, SupervisedTasks,
+    ClientAddressSource, Readiness, ReadinessCause, ReadinessState, RuntimeService,
+    SupervisedRuntime, SupervisedTasks,
 };
 use zinder_testkit::{next_watch_status, watch_ends};
 
@@ -64,6 +65,7 @@ fn serve_wallet_listener(
     let router = runtime.public_grpc_router(
         stand_in_wallet_service,
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ClientAddressSource::Connection,
         readiness,
     )?;
     Ok(router.serve_with_incoming_shutdown(

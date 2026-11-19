@@ -14,8 +14,8 @@ use tonic_reflection::pb::v1alpha::{
     server_reflection_request::MessageRequest,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, RuntimeService,
-    ShutdownRequest, SupervisedRuntime, SupervisedTasks, spawn_ops_endpoint,
+    ClientAddressSource, OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState,
+    RuntimeService, ShutdownRequest, SupervisedRuntime, SupervisedTasks, spawn_ops_endpoint,
 };
 use zinder_testkit::{PublicListenerProbe, next_watch_status, watch_ends};
 
@@ -66,6 +66,7 @@ async fn serve(initial: ReadinessState) -> Result<TestListener> {
     let router = runtime.public_grpc_router(
         gated,
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ClientAddressSource::Connection,
         &readiness,
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

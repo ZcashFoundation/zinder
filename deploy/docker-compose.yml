@@ -169,6 +169,7 @@ services:
       ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9106"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "zinder-query", "healthcheck"]
       interval: 30s
@@ -204,6 +205,7 @@ services:
       ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "zinder-compat-lightwalletd", "healthcheck"]
       interval: 30s

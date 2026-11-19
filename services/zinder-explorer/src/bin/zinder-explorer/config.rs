@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
+    BearerToken, BearerTokenError, ClientAddressSource, ConfigError, ConfigLoader, NetworkSection,
+    NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
     SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
     guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
     require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
@@ -24,6 +24,8 @@ pub(crate) struct ExplorerConfig {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
+    /// How the gRPC listener tells clients apart for its receive limit.
+    pub(crate) client_address_source: ClientAddressSource,
     pub(crate) bearer_token_path: Option<PathBuf>,
     pub(crate) bearer_token: Option<BearerToken>,
     /// Wallet-query endpoint that backs the explorer's wallet-composed reads
@@ -146,6 +148,7 @@ struct ExplorerSection {
     listen_addr: Option<String>,
     bearer_token_path: Option<PathBuf>,
     wallet_query_endpoint: Option<String>,
+    trust_proxy_client_address: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +166,7 @@ struct ExplorerToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
     wallet_query_endpoint: String,
+    trust_proxy_client_address: bool,
 }
 
 impl ExplorerConfigToml {
@@ -179,6 +183,9 @@ impl ExplorerConfigToml {
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
+                trust_proxy_client_address: config
+                    .client_address_source
+                    .trust_proxy_client_address(),
             },
         }
     }
@@ -210,6 +217,9 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         listen_addr,
         ops_listen_addr,
         allow_public_bind,
+        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
+            raw.explorer.trust_proxy_client_address.unwrap_or(false),
+        ),
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,
