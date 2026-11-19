@@ -88,6 +88,19 @@ fn derived_series_of_documented_metrics_count_as_listed() {
 }
 
 #[test]
+fn only_histograms_and_summaries_export_derived_series() {
+    let reference = DocumentedMetrics::parse(
+        "| `zinder_query_request_duration_seconds` | histogram |\n\
+         | `zinder_wallet_serving_writer_status_available` | gauge |\n\
+         | `zinder_query_request_total` | counter |",
+    );
+
+    assert!(reference.lists("zinder_query_request_duration_seconds_count"));
+    assert!(!reference.lists("zinder_wallet_serving_writer_status_available_bucket"));
+    assert!(!reference.lists("zinder_query_request_total_sum"));
+}
+
+#[test]
 fn a_dashboard_name_with_a_trailing_underscore_is_checked() {
     let reference = DocumentedMetrics::parse(
         "| `zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs` | gauge |",
@@ -120,24 +133,37 @@ fn a_family_named_in_prose_lists_none_of_its_members() {
 /// prose lists nothing, so a misspelled member still fails the gate.
 struct DocumentedMetrics {
     names: BTreeSet<String>,
+    /// Names whose reference row gives them a histogram or summary type, the
+    /// only kinds that export `_bucket`, `_sum`, and `_count` series.
+    with_derived_series: BTreeSet<String>,
 }
 
 impl DocumentedMetrics {
     fn parse(reference: &str) -> Self {
+        let with_derived_series = reference
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').map(str::trim).skip(1);
+                let name = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
+                matches!(cells.next()?, "histogram" | "summary").then(|| name.to_owned())
+            })
+            .collect();
         Self {
             names: metric_tokens(reference)
                 .filter(|(name, followed_by_star)| !followed_by_star && !name.ends_with('_'))
                 .map(|(name, _)| name)
                 .collect(),
+            with_derived_series,
         }
     }
 
     fn lists(&self, metric: &str) -> bool {
-        let base = DERIVED_SERIES_SUFFIXES
-            .iter()
-            .find_map(|suffix| metric.strip_suffix(suffix))
-            .unwrap_or(metric);
-        self.names.contains(metric) || self.names.contains(base)
+        self.names.contains(metric)
+            || DERIVED_SERIES_SUFFIXES.iter().any(|suffix| {
+                metric
+                    .strip_suffix(suffix)
+                    .is_some_and(|base| self.with_derived_series.contains(base))
+            })
     }
 }
 
