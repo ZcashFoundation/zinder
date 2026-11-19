@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU16, NonZeroU32},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -2450,11 +2450,12 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn transparent_address_unspent_outputs_on_demand(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
+        first_page_size: NonZeroU16,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         self.record(at_epoch_id);
         self.inner
-            .transparent_address_unspent_outputs_on_demand(request, at_epoch_id)
+            .transparent_address_unspent_outputs_on_demand(request, first_page_size, at_epoch_id)
             .await
     }
 

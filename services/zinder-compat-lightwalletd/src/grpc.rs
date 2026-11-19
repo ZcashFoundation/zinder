@@ -3,7 +3,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
-    num::NonZeroU32,
+    num::{NonZeroU16, NonZeroU32},
     pin::Pin,
     time::Duration,
 };
@@ -33,9 +33,9 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     ArtifactKey, CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError,
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
-    address_lookup_to_script_hash, status_from_query_error,
+    SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
@@ -80,6 +80,11 @@ const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 const TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY: usize = 8;
 /// Rows a `GetAddressUtxosStream` response merges ahead of its client.
 const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
+/// Outputs the first pages of one UTXO request's address streams share, so
+/// up to eight distinct addresses read full 1,024-output first pages.
+const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
+/// Fewest outputs the first page of one address's UTXO stream reads.
+const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
@@ -437,11 +442,13 @@ where
                 .map(|query_request| (address, copies, query_request))
             })
             .collect::<Result<Vec<_>, Status>>()?;
+        let first_page_size = address_utxo_first_page_size(listings.len(), max_entries);
         for (address, copies, query_request) in listings {
             let outputs = self
                 .query_api
                 .transparent_address_unspent_outputs_on_demand(
                     query_request,
+                    first_page_size,
                     Some(visible_tip_block.chain_epoch.id),
                 )
                 .await
@@ -1187,14 +1194,42 @@ where
     }
 }
 
+/// The first page size of every address stream of a UTXO request that lists
+/// `distinct_addresses` distinct addresses and returns at most `max_entries`
+/// rows.
+///
+/// Each address gets an even share of [`ADDRESS_UTXO_FIRST_PAGE_BUDGET`],
+/// capped at the 1,024-output page and at `max_entries`, but never fewer than
+/// [`ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE`] outputs. A request of up to eight
+/// addresses with at most 1,024 outputs each then reads each address in one
+/// page, and a request of many addresses keeps small first pages.
+fn address_utxo_first_page_size(
+    distinct_addresses: usize,
+    max_entries: Option<usize>,
+) -> NonZeroU16 {
+    let share = ADDRESS_UTXO_FIRST_PAGE_BUDGET / distinct_addresses.max(1);
+    let wanted = max_entries.map_or(share, |max_entries| share.min(max_entries));
+    NonZeroU16::new(u16::try_from(wanted).unwrap_or(u16::MAX))
+        .unwrap_or(NonZeroU16::MIN)
+        .clamp(
+            ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE,
+            TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE,
+        )
+}
+
 /// The unspent outputs of several addresses, merged into the order of one
 /// lightwalletd UTXO response: height, txid, output index, then address.
 ///
 /// Each address's stream is already in that order for its own outputs, so
 /// the merge holds only the next output of each address. The streams read
-/// on demand at the one chain epoch the request resolved, a small page at a
-/// time, so the outputs held stay within about twice the rows sent plus a
-/// small page for each distinct address.
+/// on demand at the one chain epoch the request resolved, starting at the
+/// first page [`address_utxo_first_page_size`] chooses. A later page holds at
+/// most the outputs the merge has taken from that address plus one first
+/// page, and the merge has taken at most one output more than it has sent.
+/// So the outputs read stay within about twice the rows sent, plus 2 outputs
+/// and one first page for each distinct address, and the first pages
+/// together hold at most 8,192 outputs, or 16 for each distinct address past
+/// 512.
 struct AddressUtxoMerge {
     addresses: Vec<MergedAddress>,
     next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
@@ -2537,6 +2572,47 @@ mod tests {
             confirmed_zat,
             address_count: 1,
             chain_epoch: test_chain_epoch(),
+        }
+    }
+
+    /// Up to eight addresses read full first pages, more addresses share the
+    /// budget down to 16 outputs each, and `maxEntries` caps the share.
+    #[test]
+    fn address_utxo_first_pages_share_the_request_budget() {
+        let cases = [
+            (0, None, 1_024),
+            (1, None, 1_024),
+            (8, None, 1_024),
+            (9, None, 910),
+            (60, None, 136),
+            (60, Some(30), 30),
+            (1, Some(3), 16),
+            (1, Some(100_000), 1_024),
+            (512, None, 16),
+            (513, None, 16),
+            (10_000, None, 16),
+        ];
+        for (distinct_addresses, max_entries, expected) in cases {
+            assert_eq!(
+                address_utxo_first_page_size(distinct_addresses, max_entries).get(),
+                expected,
+                "{distinct_addresses} addresses, maxEntries {max_entries:?}"
+            );
+        }
+    }
+
+    /// The first pages of one request hold at most 8,192 outputs together,
+    /// or 16 for each distinct address past 512, the bound the merge states.
+    #[test]
+    fn address_utxo_first_pages_stay_within_the_stated_bound() {
+        for distinct_addresses in 1..=10_000 {
+            let first_page =
+                usize::from(address_utxo_first_page_size(distinct_addresses, None).get());
+            assert!(
+                distinct_addresses * first_page
+                    <= ADDRESS_UTXO_FIRST_PAGE_BUDGET.max(16 * distinct_addresses),
+                "{distinct_addresses} addresses read first pages of {first_page} outputs"
+            );
         }
     }
 

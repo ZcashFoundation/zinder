@@ -188,7 +188,9 @@ One response returns at most 100,000 outputs, the same cap Zebra puts on `getadd
 - `GetAddressUtxos` reads every row before it answers, so a request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
 - `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. Any other failure after the first row also ends the stream with its status after the rows already sent, such as `CHAIN_EPOCH_PIN_UNAVAILABLE` for a client still reading one minute after a new block replaces the request's epoch. A wallet must treat a stream that ends with an error as incomplete and must not add up its rows.
 
-Both methods read each distinct address once, at one chain epoch, and merge the addresses' outputs in response order as they send them. Each address is read in pages that start at 16 outputs and double only as its rows are sent, so a request holds at most about twice the rows it has sent plus 18 outputs for each distinct address. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
+Both methods read each distinct address once, at one chain epoch, and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
+
+A request holds at most about twice the rows it has sent, plus 2 outputs and one first page for each distinct address. Its first pages together hold at most 8,192 outputs, or 16 for each distinct address when it lists more than 512. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
 
 The protocol has no lossless way to page past the cap. A single block with more matching outputs than the cap always fails with `RESOURCE_EXHAUSTED`.
 
