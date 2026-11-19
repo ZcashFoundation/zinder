@@ -46,7 +46,7 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetMempoolStream` | Served | `UNIMPLEMENTED` | |
 | `GetTreeState` | Served | `UNIMPLEMENTED` | Every height from Zinder's store |
 | `GetLatestTreeState` | Served | `UNIMPLEMENTED` | |
-| `GetSubtreeRoots` | Served | `UNIMPLEMENTED` | `maxEntries = 0` returns at most 1,000 |
+| `GetSubtreeRoots` | Served | `UNIMPLEMENTED` | `maxEntries = 0` streams every remaining root |
 | `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | At most 100,000 outputs per response |
 | `GetStandardFee` | `UNIMPLEMENTED` | `UNIMPLEMENTED` | Zinder does not expose a backend `getstandardfee` estimator |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
@@ -150,7 +150,11 @@ Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild 
 
 ### `GetSubtreeRoots`
 
-lightwalletd treats `maxEntries = 0` as "every root". Zinder returns at most 1,000 roots for `maxEntries = 0`, and a client reads the rest by paging with `startIndex`. A positive `maxEntries` above 1,024 fails with `INVALID_ARGUMENT`. `completingBlockHash` is in RPC byte order, as lightwalletd sends it.
+lightwalletd treats `maxEntries = 0` as "every root", and Zinder does the same: it streams every root from `startIndex` to the last completed subtree. A positive `maxEntries` streams that many roots, or fewer when the store holds fewer. Zinder honors the full `uint32` range of `maxEntries`, where lightwalletd with Zebra rejects a value above 65,535 with `INVALID_ARGUMENT`, and native `SubtreeRoots` has its own cap. Zinder reads the roots in pages of at most 1,000, all at the chain epoch the call started on, so a long stream never mixes two chains.
+
+If that epoch is retired before the last page, the stream ends with `UNAVAILABLE` after the roots already sent. A stream that has already sent its last completed root ends with `OK` without another read. To retry after `UNAVAILABLE`, restart from the original `startIndex`, or resume after a root whose `completingBlockHash` the wallet has verified on the new chain. Resuming at the index after the last delivered root is unsafe, because a reorg that replaced that root's completing block also replaces the root, and the resumed stream would skip its replacement and combine roots from two forks.
+
+An absent root under retained-range coverage is `NOT_FOUND`, which includes a root below the history floor of a checkpointed store that was not loaded with its roots. A store loaded with complete-prefix subtree-root coverage retains the roots below its floor and serves them. `completingBlockHash` is in RPC byte order, as lightwalletd sends it.
 
 ### `GetTransaction`
 

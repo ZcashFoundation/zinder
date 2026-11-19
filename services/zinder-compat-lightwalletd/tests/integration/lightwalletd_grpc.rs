@@ -59,7 +59,7 @@ use zinder_store::{
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FIXTURE_NOTE_COMMITMENT, FixtureBlock,
     FixtureTransactionRows, LogCapture, MockTransactionBroadcaster, WalletServingStoreFixture,
-    commitment_tree_checkpoints, completed_subtree_frontier, one_leaf_frontier,
+    commitment_tree_checkpoints, completed_subtree_frontier, frontier_of_size, one_leaf_frontier,
     sample_regtest_upgrade_activations, synthetic_transaction_public_facts, with_note_commitments,
 };
 
@@ -2253,6 +2253,7 @@ struct EpochPinRecorder<Inner> {
     /// Real queries that replace `inner` as the served view, in order.
     later_views: Arc<[Inner]>,
     completed_compact_block_reads: Arc<AtomicUsize>,
+    completed_subtree_reads: Arc<AtomicUsize>,
     /// Epoch of the view that answered each successful compact-block range read.
     served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
     /// Holds every unpinned compact-block range read, the read of a later
@@ -2298,6 +2299,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             synthetic_views: None,
             later_views: Arc::from(Vec::new()),
             completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
+            completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
             first_chunk_gate: Arc::new(Mutex::new(None)),
@@ -2867,7 +2869,8 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
         self.record(at_epoch_id);
-        self.inner
+        let read_index = self.completed_subtree_reads.fetch_add(1, Ordering::SeqCst);
+        self.served_inner(read_index)
             .subtree_roots(subtree_root_range, at_epoch_id)
             .await
     }
@@ -4061,6 +4064,256 @@ async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Resu
     Ok(())
 }
 
+fn fixture_subtree_root_hash(index: u32) -> SubtreeRootHash {
+    let mut bytes = [0_u8; 32];
+    bytes[..4].copy_from_slice(&index.to_be_bytes());
+    SubtreeRootHash::from_bytes(bytes)
+}
+
+/// A store whose completing block closes `sapling_root_count` Sapling subtrees.
+fn store_with_sapling_subtree_roots(
+    sapling_root_count: u32,
+) -> eyre::Result<(AcceptanceStore, BlockHeight)> {
+    let activations = sample_regtest_upgrade_activations();
+    let completing_height = activations
+        .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+        .ok_or_else(|| eyre!("regtest activations must activate Ironwood"))?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(completing_height.value());
+    let completing_block = fixture_block(&chain, completing_height)?;
+    let sapling_tree_size = sapling_root_count.saturating_mul(SUBTREE_LEAF_COUNT);
+    let chain = chain
+        .with_compact_block_artifact(CompactBlockArtifact::empty(
+            BlockId::new(completing_block.height, completing_block.hash),
+            completing_block.parent_hash,
+            completing_block.block_time_seconds,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: sapling_tree_size,
+                orchard_commitment_tree_size: SUBTREE_LEAF_COUNT,
+                ironwood_commitment_tree_size: SUBTREE_LEAF_COUNT,
+            },
+        ))
+        .with_commitment_tree_frontiers_at(
+            completing_height,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(frontier_of_size(
+                    ShieldedProtocol::Sapling,
+                    sapling_tree_size,
+                )?),
+                Some(completed_subtree_frontier(ShieldedProtocol::Orchard)?),
+                Some(completed_subtree_frontier(ShieldedProtocol::Ironwood)?),
+            ),
+        );
+    let mut baseline = CanonicalBaseline::new(&chain);
+    for (protocol, root_count) in [
+        (ShieldedProtocol::Sapling, sapling_root_count),
+        (ShieldedProtocol::Orchard, 1),
+        (ShieldedProtocol::Ironwood, 1),
+    ] {
+        for index in 0..root_count {
+            baseline = baseline.with_subtree_root(CanonicalBuildSubtreeRoot {
+                protocol,
+                subtree_index: SubtreeRootIndex::new(index),
+                root_hash: fixture_subtree_root_hash(index),
+                completing_block_height: completing_height,
+            });
+        }
+    }
+    let store =
+        acceptance_store_from_writer(CanonicalWriterFixture::publish(&baseline, &activations)?)?;
+    Ok((store, completing_height))
+}
+
+fn sapling_subtree_roots_request(
+    start_index: u32,
+    max_entries: u32,
+) -> lightwalletd::GetSubtreeRootsArg {
+    lightwalletd::GetSubtreeRootsArg {
+        start_index,
+        shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+        max_entries,
+    }
+}
+
+/// Reads a `GetSubtreeRoots` stream to its end, keeping the roots that arrived
+/// before any error.
+async fn drain_subtree_roots<Stream>(
+    mut stream: Stream,
+) -> (Vec<lightwalletd::SubtreeRoot>, Option<Status>)
+where
+    Stream: tonic::codegen::tokio_stream::Stream<Item = Result<lightwalletd::SubtreeRoot, Status>>
+        + Unpin,
+{
+    use tonic::codegen::tokio_stream::StreamExt;
+
+    let mut roots = Vec::new();
+    while let Some(stream_item) = stream.next().await {
+        match stream_item {
+            Ok(root) => roots.push(root),
+            Err(status) => return (roots, Some(status)),
+        }
+    }
+    (roots, None)
+}
+
+/// `maxEntries = 0` means every remaining root, so a store with more roots
+/// than one native page (1,024) streams them all at one chain epoch, and a
+/// positive `maxEntries` above the native cap is honored.
+#[tokio::test]
+async fn get_subtree_roots_streams_every_root_past_the_native_page_limit() -> eyre::Result<()> {
+    let (store, completing_height) = store_with_sapling_subtree_roots(1_030)?;
+    let recorder = EpochPinRecorder::new(store.query());
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let (roots, status) = drain_subtree_roots(
+        adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(0, 0)))
+            .await?
+            .into_inner(),
+    )
+    .await;
+    assert!(status.is_none(), "stream ended with {status:?}");
+    assert_eq!(roots.len(), 1_030);
+    for (index, root) in (0_u32..).zip(&roots) {
+        assert_eq!(root.root_hash, fixture_subtree_root_hash(index).as_bytes());
+        assert_eq!(
+            root.completing_block_height,
+            u64::from(completing_height.value())
+        );
+    }
+    let pinned_epochs = recorder.recorded_epoch_ids();
+    assert_eq!(pinned_epochs.len(), 2, "1,030 roots take two native pages");
+    assert!(pinned_epochs[0].is_some());
+    assert_eq!(pinned_epochs[0], pinned_epochs[1]);
+
+    for (start_index, max_entries, expected_count) in [
+        (500, 0, 530),
+        (0, 1_025, 1_025),
+        (1_000, 100, 30),
+        (1_030, 0, 0),
+        (9_999, 0, 0),
+    ] {
+        let stream = adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(
+                start_index,
+                max_entries,
+            )))
+            .await?
+            .into_inner();
+        let (roots, status) = drain_subtree_roots(stream).await;
+        assert!(
+            status.is_none(),
+            "start {start_index}, max {max_entries}: {status:?}"
+        );
+        assert_eq!(
+            roots.len(),
+            expected_count,
+            "start {start_index}, max {max_entries}"
+        );
+    }
+    Ok(())
+}
+
+/// A stream that loses its entry epoch after the first page keeps the roots
+/// already sent and ends with a retryable `UNAVAILABLE`, not an `OK`
+/// truncation.
+#[tokio::test]
+async fn get_subtree_roots_ends_with_unavailable_when_the_entry_epoch_is_lost() -> eyre::Result<()>
+{
+    let (store, _) = store_with_sapling_subtree_roots(1_030)?;
+    // A live append publishes a second chain epoch and retires the first.
+    let advanced_store = AcceptanceStore::from_store_fixture(
+        WalletServingStoreFixture::from_chain_after_live_append(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+            &sample_regtest_upgrade_activations(),
+        )?,
+        Vec::new(),
+    )?;
+    let recorder =
+        EpochPinRecorder::new(store.query()).with_later_views(vec![advanced_store.query()]);
+    let adapter = LightwalletdGrpcAdapter::new(recorder);
+
+    let (roots, status) = drain_subtree_roots(
+        adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(0, 0)))
+            .await?
+            .into_inner(),
+    )
+    .await;
+
+    assert_eq!(roots.len(), 1_000);
+    let status = status.ok_or_else(|| eyre!("a stream cut off by epoch loss ended with OK"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    Ok(())
+}
+
+/// A full page that reaches the last completed root ends the stream without a
+/// further read, so a client that drains the page slowly never sees the entry
+/// epoch's retirement as `UNAVAILABLE`.
+#[tokio::test]
+async fn get_subtree_roots_ends_without_another_read_after_the_last_full_page() -> eyre::Result<()>
+{
+    let (store, _) = store_with_sapling_subtree_roots(1_030)?;
+    let advanced_store = AcceptanceStore::from_store_fixture(
+        WalletServingStoreFixture::from_chain_after_live_append(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+            &sample_regtest_upgrade_activations(),
+        )?,
+        Vec::new(),
+    )?;
+    let adapter_after_epoch_loss = || {
+        let recorder =
+            EpochPinRecorder::new(store.query()).with_later_views(vec![advanced_store.query()]);
+        (LightwalletdGrpcAdapter::new(recorder.clone()), recorder)
+    };
+    let (adapter, recorder) = adapter_after_epoch_loss();
+
+    // Roots 30 through 1,029 fill exactly one 1,000-root page.
+    let (roots, status) = drain_subtree_roots(
+        adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(30, 0)))
+            .await?
+            .into_inner(),
+    )
+    .await;
+    assert!(status.is_none(), "complete stream ended with {status:?}");
+    assert_eq!(roots.len(), 1_000);
+    assert_eq!(recorder.recorded_epoch_ids().len(), 1, "one native read");
+
+    // Roots 29 through 1,029 need a second read for the last root, which the
+    // lost epoch refuses.
+    let (adapter, _) = adapter_after_epoch_loss();
+    let (roots, status) = drain_subtree_roots(
+        adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(29, 0)))
+            .await?
+            .into_inner(),
+    )
+    .await;
+    assert_eq!(roots.len(), 1_000);
+    let status = status.ok_or_else(|| eyre!("a stream cut off by epoch loss ended with OK"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    Ok(())
+}
+
+/// `maxEntries` honors the full `uint32` range. Go lightwalletd with Zebra
+/// rejects values above 65,535 with `INVALID_ARGUMENT`; Zinder serves them.
+#[tokio::test]
+async fn get_subtree_roots_honors_max_entries_above_the_reference_limit() -> eyre::Result<()> {
+    let (store, _) = store_with_sapling_subtree_roots(1_030)?;
+    let adapter = LightwalletdGrpcAdapter::new(store.query());
+
+    for max_entries in [65_535, 65_536, u32::MAX] {
+        let stream = adapter
+            .get_subtree_roots(Request::new(sapling_subtree_roots_request(0, max_entries)))
+            .await?
+            .into_inner();
+        let (roots, status) = drain_subtree_roots(stream).await;
+        assert!(status.is_none(), "max {max_entries}: {status:?}");
+        assert_eq!(roots.len(), 1_030, "max {max_entries}");
+    }
+    Ok(())
+}
+
 /// A checkpointed store holds nothing at or below its history floor except
 /// the floor's authenticated tree state.
 #[tokio::test]
@@ -4108,16 +4361,14 @@ async fn retained_history_floor_unavailable_artifacts_return_not_found() -> eyre
     ));
     observed.push((
         "GetSubtreeRoots",
-        first_stream_status(
-            adapter
-                .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
-                    start_index: 0,
-                    shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
-                    max_entries: 1,
-                }))
-                .await,
-        )
-        .await,
+        adapter
+            .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+                start_index: 0,
+                shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+                max_entries: 1,
+            }))
+            .await
+            .err(),
     ));
     let mismatches = observed
         .into_iter()
