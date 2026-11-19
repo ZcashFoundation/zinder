@@ -36,11 +36,13 @@ use zinder_source::{
 /// control lets the readings expire.
 pub const NODE_TIP_OBSERVATION_MAX_AGE: Duration = Duration::from_secs(30);
 
-/// How long a node tip keeps vouching after the node reports a newer one.
+/// Shortest time a node tip keeps vouching after the node reports a newer
+/// one.
 ///
 /// A reader serves a new block up to one catch-up interval after the writer
 /// commits it, so without this grace the first block after a long gap would
-/// briefly refuse the tip it replaces.
+/// briefly refuse the tip it replaces. The grace lasts three poll intervals
+/// when that is longer.
 const SUPERSEDED_NODE_TIP_GRACE: Duration = Duration::from_secs(10);
 
 /// The writer's latest report of its node's committed tip, shared by every
@@ -52,6 +54,7 @@ const SUPERSEDED_NODE_TIP_GRACE: Duration = Duration::from_secs(10);
 pub struct NodeTipWitness {
     latest: Arc<ArcSwapOption<NodeTipObservation>>,
     max_age: Duration,
+    superseded_grace: Duration,
 }
 
 impl Default for NodeTipWitness {
@@ -59,6 +62,7 @@ impl Default for NodeTipWitness {
         Self {
             latest: Arc::default(),
             max_age: NODE_TIP_OBSERVATION_MAX_AGE,
+            superseded_grace: SUPERSEDED_NODE_TIP_GRACE,
         }
     }
 }
@@ -70,15 +74,18 @@ struct NodeTipObservation {
     /// one.
     node_tip_height: Option<BlockHeight>,
     observed_at: Instant,
-    /// The node tip this reading replaced and when, while the node stays
-    /// reachable.
+    /// The oldest node tip a newer one replaced and when, while its grace
+    /// runs.
     superseded: Option<(BlockHeight, Instant)>,
 }
 
 impl NodeTipWitness {
-    /// Returns a witness whose readings, polled every `poll_interval`,
-    /// vouch for three intervals or [`NODE_TIP_OBSERVATION_MAX_AGE`],
-    /// whichever is longer.
+    /// Returns a witness for readings polled every `poll_interval`.
+    ///
+    /// A reading vouches for three intervals or
+    /// [`NODE_TIP_OBSERVATION_MAX_AGE`], whichever is longer. A superseded
+    /// node tip keeps vouching for three intervals or 10 seconds, whichever
+    /// is longer.
     #[must_use]
     pub fn for_poll_interval(poll_interval: Duration) -> Self {
         Self {
@@ -86,6 +93,9 @@ impl NodeTipWitness {
             max_age: poll_interval
                 .saturating_mul(3)
                 .max(NODE_TIP_OBSERVATION_MAX_AGE),
+            superseded_grace: poll_interval
+                .saturating_mul(3)
+                .max(SUPERSEDED_NODE_TIP_GRACE),
         }
     }
 
@@ -95,12 +105,10 @@ impl NodeTipWitness {
         let now = Instant::now();
         let previous = self.latest.load_full();
         let superseded = node_tip_height.and_then(|height| {
-            let previous = previous.as_deref()?;
-            match previous.node_tip_height {
-                Some(previous_height) if previous_height < height => Some((previous_height, now)),
-                Some(_) => previous.superseded,
-                None => None,
-            }
+            let previous = previous
+                .as_deref()
+                .filter(|previous| previous.observed_at.elapsed() <= self.max_age)?;
+            self.superseded_by(previous, height, now)
         });
         self.latest.store(Some(Arc::new(NodeTipObservation {
             node_tip_height,
@@ -109,9 +117,31 @@ impl NodeTipWitness {
         })));
     }
 
+    /// Returns the superseded node tip to keep when a reading at `height`
+    /// follows `previous`: the oldest one whose grace still runs.
+    fn superseded_by(
+        &self,
+        previous: &NodeTipObservation,
+        height: BlockHeight,
+        now: Instant,
+    ) -> Option<(BlockHeight, Instant)> {
+        let previous_height = previous.node_tip_height?;
+        if previous_height >= height {
+            return previous.superseded;
+        }
+        Some(
+            previous
+                .superseded
+                .filter(|&(_, superseded_at)| {
+                    now.duration_since(superseded_at) <= self.superseded_grace
+                })
+                .unwrap_or((previous_height, now)),
+        )
+    }
+
     /// Returns whether the latest reading, within its maximum age, shows a
     /// reachable node with no block above `served_tip_height`, or one that
-    /// passed that height within the last few seconds, so the served tip is
+    /// passed that height within the superseded grace, so the served tip is
     /// the node's tip.
     #[must_use]
     pub fn vouches_for(&self, served_tip_height: BlockHeight) -> bool {
@@ -127,7 +157,7 @@ impl NodeTipWitness {
                     .superseded
                     .is_some_and(|(superseded_height, superseded_at)| {
                         superseded_height <= served_tip_height
-                            && superseded_at.elapsed() <= SUPERSEDED_NODE_TIP_GRACE
+                            && superseded_at.elapsed() <= self.superseded_grace
                     })
         })
     }
@@ -350,6 +380,8 @@ mod tests {
         assert!(!witness.vouches_for(served));
         // The writer is behind a node that has had a newer block for a while.
         witness.observe(Some(BlockHeight::new(125)));
+        tokio::time::sleep(SUPERSEDED_NODE_TIP_GRACE + Duration::from_secs(1)).await;
+        witness.observe(Some(BlockHeight::new(125)));
         assert!(!witness.vouches_for(served));
 
         witness.observe(Some(BlockHeight::new(120)));
@@ -385,6 +417,62 @@ mod tests {
         witness.observe(None);
         witness.observe(Some(BlockHeight::new(122)));
         assert!(!witness.vouches_for(BlockHeight::new(121)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_node_tip_vouches_for_three_poll_intervals() {
+        let witness = NodeTipWitness::for_poll_interval(Duration::from_secs(20));
+        let served = BlockHeight::new(120);
+        witness.observe(Some(BlockHeight::new(120)));
+        witness.observe(Some(BlockHeight::new(121)));
+        // The reader catches up only once per poll interval.
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        witness.observe(Some(BlockHeight::new(121)));
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        witness.observe(Some(BlockHeight::new(121)));
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        witness.observe(Some(BlockHeight::new(121)));
+        assert!(!witness.vouches_for(served));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_two_blocks_behind_keeps_the_grace_of_the_first() {
+        let witness = NodeTipWitness::default();
+        let served = BlockHeight::new(120);
+        witness.observe(Some(BlockHeight::new(120)));
+        witness.observe(Some(BlockHeight::new(121)));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        witness.observe(Some(BlockHeight::new(122)));
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        witness.observe(Some(BlockHeight::new(122)));
+        assert!(witness.vouches_for(served));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        witness.observe(Some(BlockHeight::new(122)));
+        assert!(
+            !witness.vouches_for(served),
+            "the grace runs from the first block past the served tip"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_reading_starts_no_grace() {
+        let witness = NodeTipWitness::default();
+        // A hung call lets the reading expire before the node moves on.
+        witness.observe(Some(BlockHeight::new(121)));
+        tokio::time::sleep(NODE_TIP_OBSERVATION_MAX_AGE + Duration::from_secs(1)).await;
+        witness.observe(None);
+        witness.observe(Some(BlockHeight::new(125)));
+        assert!(!witness.vouches_for(BlockHeight::new(121)));
+        tokio::time::sleep(NODE_TIP_OBSERVATION_MAX_AGE + Duration::from_secs(1)).await;
+        witness.observe(Some(BlockHeight::new(126)));
+        assert!(!witness.vouches_for(BlockHeight::new(125)));
+
+        // A reorg to a lower tip vouches for that tip.
+        witness.observe(Some(BlockHeight::new(124)));
+        assert!(witness.vouches_for(BlockHeight::new(124)));
     }
 
     #[test]
