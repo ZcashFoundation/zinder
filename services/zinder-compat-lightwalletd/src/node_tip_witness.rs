@@ -22,7 +22,7 @@ use zinder_proto::v1::{
     },
     ops::UpstreamNotReadyDetail,
 };
-use zinder_query::wallet_ingest_control_request;
+use zinder_query::{WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, wallet_ingest_control_request};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_source::{
     UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS, UPSTREAM_HEALTH_REASON_NO_TIP,
@@ -324,6 +324,10 @@ pub fn spawn_node_tip_witness(
 
 /// Reads one `WriterStatus`, dialing ingest control first when no channel is
 /// open, and returns the node tip it reports.
+///
+/// The dial and the call are each bounded by
+/// [`WALLET_INGEST_CONTROL_REQUEST_TIMEOUT`], so a stalled connection attempt
+/// records a failed reading and the next poll dials again.
 async fn read_node_tip(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
@@ -331,10 +335,14 @@ async fn read_node_tip(
     client: &mut Option<IngestControlClient<AuthenticatedChannel>>,
 ) -> Option<BlockHeight> {
     if client.is_none() {
-        *client = connect_zinder_grpc(endpoint, bearer_token)
-            .await
-            .ok()
-            .map(IngestControlClient::new);
+        *client = tokio::time::timeout(
+            WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
+            connect_zinder_grpc(endpoint, bearer_token),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(IngestControlClient::new);
     }
     let writer_status = client
         .as_mut()?
@@ -356,9 +364,11 @@ mod tests {
         wallet::{ChainView, UpstreamTip},
     };
 
+    use zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT;
+
     use super::{
         NODE_TIP_OBSERVATION_MAX_AGE, NodeTipWitness, SUPERSEDED_NODE_TIP_GRACE,
-        node_tip_from_writer_status,
+        node_tip_from_writer_status, read_node_tip,
     };
 
     const NETWORK: Network = Network::ZcashTestnet;
@@ -623,6 +633,27 @@ mod tests {
             !witness.vouches_for(BlockHeight::new(120)),
             "the delay stays far below the stale-tip limit"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_dial_records_a_failed_reading_and_leaves_the_next_poll_to_redial()
+    -> Result<(), std::io::Error> {
+        // The listener's backlog accepts the TCP connection, but nothing
+        // answers the TLS handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("https://{}", listener.local_addr()?);
+        let mut client = None;
+        let node_tip_height = tokio::time::timeout(
+            WALLET_INGEST_CONTROL_REQUEST_TIMEOUT.saturating_mul(2),
+            read_node_tip(&endpoint, None, NETWORK, &mut client),
+        )
+        .await;
+        assert!(
+            matches!(node_tip_height, Ok(None)),
+            "the dial gives up within the ingest-control request timeout"
+        );
+        assert!(client.is_none(), "the next poll dials again");
+        Ok(())
     }
 
     #[test]
