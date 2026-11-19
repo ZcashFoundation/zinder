@@ -75,36 +75,45 @@ fn metric_names_are_read_from_promql_expressions() {
 }
 
 #[test]
-fn derived_series_and_documented_families_count_as_listed() {
+fn derived_series_of_documented_metrics_count_as_listed() {
     let reference = DocumentedMetrics::parse(
         "| `zinder_query_request_duration_seconds` | histogram |\n\
-         The `zinder_readiness_*` series carry `service`.",
+         | `zinder_store_rocksdb_property` | gauge |",
     );
 
     assert!(reference.lists("zinder_query_request_duration_seconds_bucket"));
-    assert!(reference.lists("zinder_readiness_state"));
+    assert!(reference.lists("zinder_store_rocksdb_property"));
     assert!(!reference.lists("zinder_query_request_total"));
     assert!(!reference.lists("zinder_compat_lightwalletd_writer_status_total"));
 }
 
-/// Metric names and `name_*` families the reference lists.
+#[test]
+fn a_family_named_in_prose_lists_none_of_its_members() {
+    let reference = DocumentedMetrics::parse(
+        "| `zinder_store_rocksdb_property` | gauge |\n\
+         The projector exports no `zinder_store_*` metrics, and the `zinder_readiness_*` \
+         series carry `service`.",
+    );
+
+    assert!(reference.lists("zinder_store_rocksdb_property"));
+    assert!(!reference.lists("zinder_store_rocksdb_proprety"));
+    assert!(!reference.lists("zinder_readiness_state"));
+}
+
+/// Metric names the reference lists in full. A `name_*` family mentioned in
+/// prose lists nothing, so a misspelled member still fails the gate.
 struct DocumentedMetrics {
     names: BTreeSet<String>,
-    families: BTreeSet<String>,
 }
 
 impl DocumentedMetrics {
     fn parse(reference: &str) -> Self {
-        let mut names = BTreeSet::new();
-        let mut families = BTreeSet::new();
-        for (name, followed_by_star) in metric_tokens(reference) {
-            if followed_by_star && name.ends_with('_') {
-                families.insert(name);
-            } else {
-                names.insert(name);
-            }
+        Self {
+            names: metric_tokens(reference)
+                .filter(|(name, followed_by_star)| !followed_by_star && !name.ends_with('_'))
+                .map(|(name, _)| name)
+                .collect(),
         }
-        Self { names, families }
     }
 
     fn lists(&self, metric: &str) -> bool {
@@ -112,13 +121,7 @@ impl DocumentedMetrics {
             .iter()
             .find_map(|suffix| metric.strip_suffix(suffix))
             .unwrap_or(metric);
-        [metric, base].iter().any(|candidate| {
-            self.names.contains(*candidate)
-                || self
-                    .families
-                    .iter()
-                    .any(|family| candidate.starts_with(family.as_str()))
-        })
+        self.names.contains(metric) || self.names.contains(base)
     }
 }
 
