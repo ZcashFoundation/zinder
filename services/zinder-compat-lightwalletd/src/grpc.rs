@@ -1081,16 +1081,28 @@ trait ResponseSource: Send + 'static {
 ///
 /// The response ends after the first status `source` returns, so a client
 /// that received rows before a failure sees the failure as the response's
-/// status. The task stops once the client drops the response.
+/// status. The task stops and drops `source` once the client drops the
+/// response, even while a read is in progress.
 fn spawn_response_stream<Source: ResponseSource>(
     mut source: Source,
     capacity: usize,
 ) -> GrpcStream<Source::Message> {
     let (messages, queued_messages) = tokio::sync::mpsc::channel(capacity);
     tokio::spawn(async move {
-        while let Some(message) = source.next().await {
+        // Reserving the slot before reading keeps the messages read but not
+        // yet received within `capacity`.
+        while let Ok(slot) = messages.reserve().await {
+            let message = tokio::select! {
+                biased;
+                () = messages.closed() => return,
+                message = source.next() => message,
+            };
+            let Some(message) = message else {
+                return;
+            };
             let is_terminal = message.is_err();
-            if messages.send(message).await.is_err() || is_terminal {
+            slot.send(message);
+            if is_terminal {
                 return;
             }
         }
@@ -2496,6 +2508,10 @@ fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use zinder_core::{
         ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, CompactSaplingOutput,
         CompactSaplingSpend, CompactShieldedAction, CompactTransparentInput,
@@ -2522,6 +2538,80 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    /// A response source that counts its reads, can stop answering after a
+    /// number of reads, and reports when it is dropped.
+    struct ObservedSource {
+        reads: Arc<AtomicUsize>,
+        answered_reads: usize,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl ObservedSource {
+        fn new(
+            answered_reads: usize,
+        ) -> (Self, Arc<AtomicUsize>, tokio::sync::oneshot::Receiver<()>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (dropped, on_drop) = tokio::sync::oneshot::channel();
+            let source = Self {
+                reads: Arc::clone(&reads),
+                answered_reads,
+                dropped: Some(dropped),
+            };
+            (source, reads, on_drop)
+        }
+    }
+
+    impl ResponseSource for ObservedSource {
+        type Message = usize;
+
+        async fn next(&mut self) -> Option<Result<usize, Status>> {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            if read >= self.answered_reads {
+                std::future::pending::<()>().await;
+            }
+            Some(Ok(read))
+        }
+    }
+
+    impl Drop for ObservedSource {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_reads_no_further_ahead_of_an_unread_client_than_its_capacity() {
+        const CAPACITY: usize = 8;
+        let (source, reads, _on_drop) = ObservedSource::new(usize::MAX);
+
+        let _response = spawn_response_stream(source, CAPACITY);
+        // The source answers at once, so the reader task reaches its bound
+        // during this sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(reads.load(Ordering::SeqCst), CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn response_stream_drops_its_source_when_the_client_leaves_during_a_read()
+    -> Result<(), Status> {
+        let (source, reads, on_drop) = ObservedSource::new(1);
+        let mut response = spawn_response_stream(source, 8);
+        assert_eq!(response.next().await.transpose()?, Some(0));
+        while reads.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(response);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("the source outlived its client"))?
+            .map_err(|_| Status::internal("the source must report its drop"))
     }
 
     #[tokio::test]
