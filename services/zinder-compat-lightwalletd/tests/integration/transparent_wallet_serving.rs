@@ -713,6 +713,69 @@ async fn taddress_history_streams_and_reads_each_transaction_once() -> eyre::Res
     Ok(())
 }
 
+/// The transparent history calls send the first transaction before they
+/// read the next page of the address's history.
+///
+/// The second history page stays blocked until the first transaction
+/// arrives, so a response that read the whole history index first would
+/// never send it.
+#[tokio::test]
+async fn taddress_history_sends_a_transaction_before_reading_the_next_history_page()
+-> eyre::Result<()> {
+    const HISTORY: u32 = 1_001;
+    let (mut store_fixture, address_text) = many_utxo_fixture(0x38, HISTORY)?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let (gate, release) = HistoryPageGate::new();
+    let adapter = build_wallet_serving_adapter_from_readers(
+        Arc::new(canonical_reader),
+        Arc::new(CountingWalletReader {
+            wallet_reader,
+            unspent_outputs_read: Arc::new(AtomicUsize::new(0)),
+            history_page_gate: Some(Arc::clone(&gate)),
+        }),
+    )?;
+    let request = transparent_history_filter(address_text, 2, 2);
+
+    for deprecated in [true, false] {
+        gate.pages_requested.store(0, Ordering::SeqCst);
+        let first_transaction = async {
+            let mut stream = if deprecated {
+                adapter
+                    .get_taddress_txids(Request::new(request.clone()))
+                    .await?
+                    .into_inner()
+            } else {
+                adapter
+                    .get_taddress_transactions(Request::new(request.clone()))
+                    .await?
+                    .into_inner()
+            };
+            let first = stream.next().await.transpose()?;
+            Ok::<_, tonic::Status>((stream, first))
+        };
+        let (stream, first) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), first_transaction)
+                .await
+                .map_err(|_| {
+                    eyre::eyre!("the first transaction must arrive before the second history page")
+                })??;
+        assert_eq!(
+            first.map(|transaction| transaction.data),
+            Some(history_transaction_bytes(0))
+        );
+
+        release.send(())?;
+        let rest = collect_stream(stream).await?;
+        assert_eq!(rest.len() + 1, u32_to_usize(HISTORY));
+        assert_eq!(
+            rest.last().map(|transaction| transaction.data.clone()),
+            Some(history_transaction_bytes(HISTORY - 1))
+        );
+        assert_eq!(gate.pages_requested.load(Ordering::SeqCst), 2);
+    }
+    Ok(())
+}
+
 /// Outputs one on-demand per-address stream reads in its first page.
 const ON_DEMAND_FIRST_PAGE_OUTPUTS: usize = 16;
 
@@ -1308,6 +1371,7 @@ fn counting_utxo_adapter(
     let wallet_reader: Arc<dyn WalletProjectionReader> = Arc::new(CountingWalletReader {
         wallet_reader,
         unspent_outputs_read: Arc::clone(&outputs_read),
+        history_page_gate: None,
     });
     let adapter = match response_limit {
         None => {
@@ -1521,10 +1585,37 @@ where
     }
 }
 
-/// A wallet reader that counts the unspent outputs its pages return.
+/// A wallet reader that counts the unspent outputs its pages return and can
+/// hold back a history page.
 struct CountingWalletReader {
     wallet_reader: zinder_wallet_rocksdb::RocksDbWalletSecondary,
     unspent_outputs_read: Arc<AtomicUsize>,
+    history_page_gate: Option<Arc<HistoryPageGate>>,
+}
+
+/// Holds the second history page a request reads until the test releases it.
+struct HistoryPageGate {
+    pages_requested: AtomicUsize,
+    release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl HistoryPageGate {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
+        let (release, released) = std::sync::mpsc::channel();
+        let gate = Arc::new(Self {
+            pages_requested: AtomicUsize::new(0),
+            release: parking_lot::Mutex::new(released),
+        });
+        (gate, release)
+    }
+
+    /// Blocks the second page request since the last reset until released,
+    /// or until the test drops its release sender.
+    fn before_page(&self) {
+        if self.pages_requested.fetch_add(1, Ordering::SeqCst) == 1 {
+            let _ = self.release.lock().recv();
+        }
+    }
 }
 
 impl WalletProjectionReader for CountingWalletReader {
@@ -1601,6 +1692,9 @@ impl WalletProjectionReader for CountingWalletReader {
         zinder_wallet_rocksdb::WalletAddressTransactionHistoryPage,
         zinder_wallet_rocksdb::RocksDbWalletError,
     > {
+        if let Some(gate) = &self.history_page_gate {
+            gate.before_page();
+        }
         self.wallet_reader.address_transaction_history_range_page(
             address_script_hash,
             height_range,
