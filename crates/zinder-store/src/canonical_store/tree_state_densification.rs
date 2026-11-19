@@ -159,7 +159,7 @@ pub struct TreeStateStrideScan {
     /// Height the next scan continues from.
     pub next_from: BlockHeight,
     /// Whether the scan stopped at the first stride above the settled tip
-    /// rather than at its limit.
+    /// rather than at its read budget.
     pub reached_unsettled: bool,
 }
 
@@ -173,15 +173,20 @@ pub struct TreeStateStrideCommit {
 }
 
 impl RocksDbCanonicalSecondary {
-    /// Examines up to `limit` settled strides from `from` against
-    /// `selection`, so a caller can pace a scan of a long history.
+    /// Examines settled strides from `from` against `selection` until the
+    /// reads the scan has made reach `read_budget`, so a caller can pace a
+    /// scan of a long history by the reads it makes.
+    ///
+    /// The scan always examines at least one stride and stops after the
+    /// stride that reaches the budget, so it overshoots by at most one
+    /// stride's reads.
     pub fn scan_tree_state_strides(
         &self,
         from: BlockHeight,
         selection: TreeStateCheckpointSelection,
-        limit: NonZeroU32,
+        read_budget: NonZeroU32,
     ) -> Result<TreeStateStrideScan, CanonicalStoreError> {
-        scan_tree_state_strides(self, from, selection, limit)
+        scan_tree_state_strides(self, from, selection, read_budget)
     }
 
     /// Returns whether the settled stride that ends at `end` holds the
@@ -226,15 +231,15 @@ impl RocksDbCanonicalSecondary {
 }
 
 impl RocksDbCanonicalStore {
-    /// Examines up to `limit` settled strides from `from`; see
-    /// [`RocksDbCanonicalSecondary::scan_tree_state_strides`].
+    /// Examines settled strides from `from` until the scan's reads reach
+    /// `read_budget`; see [`RocksDbCanonicalSecondary::scan_tree_state_strides`].
     pub fn scan_tree_state_strides(
         &self,
         from: BlockHeight,
         selection: TreeStateCheckpointSelection,
-        limit: NonZeroU32,
+        read_budget: NonZeroU32,
     ) -> Result<TreeStateStrideScan, CanonicalStoreError> {
-        scan_tree_state_strides(self, from, selection, limit)
+        scan_tree_state_strides(self, from, selection, read_budget)
     }
 
     /// Returns whether the settled stride that ends at `end` holds the
@@ -346,7 +351,7 @@ fn scan_tree_state_strides(
     store: &impl CanonicalServingRead,
     from: BlockHeight,
     selection: TreeStateCheckpointSelection,
-    limit: NonZeroU32,
+    read_budget: NonZeroU32,
 ) -> Result<TreeStateStrideScan, CanonicalStoreError> {
     let predecessor_height = store
         .serving_build_plan()
@@ -367,7 +372,7 @@ fn scan_tree_state_strides(
         next_from: seed_height,
         reached_unsettled: false,
     };
-    while scan.examined < limit.get() {
+    while scan.examined == 0 || scan.reads < read_budget.get() {
         let stride = TreeStateStride::after_seed(seed_height)?;
         if stride.end_height > settled_height {
             scan.reached_unsettled = true;

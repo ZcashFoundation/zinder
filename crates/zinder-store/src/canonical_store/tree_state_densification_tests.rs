@@ -626,10 +626,11 @@ fn a_stride_reports_satisfied_only_when_its_stored_rows_satisfy_the_selection() 
 }
 
 #[test]
-fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> TestResult {
+fn a_bounded_scan_stops_after_the_stride_that_reaches_its_read_budget_and_reports_where_to_continue()
+-> TestResult {
     let temporary = TempDir::new()?;
     let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
-    let one = std::num::NonZeroU32::new(1).ok_or("limit must be nonzero")?;
+    let one = std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?;
 
     let first = store.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, one)?;
     assert_eq!(first.incomplete, vec![stride(0, 100)]);

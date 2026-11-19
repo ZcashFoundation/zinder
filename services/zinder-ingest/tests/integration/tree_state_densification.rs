@@ -197,6 +197,44 @@ async fn a_completed_pass_records_its_progress_and_a_restart_commits_nothing() -
     Ok(())
 }
 
+/// A scan stops after the stride that brings its reads to the budget, so a
+/// densified history is examined a stride or two at a time and the pass can
+/// pace each increment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scan_chunk_stops_once_its_reads_reach_the_budget() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+    harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    let budget = |reads: u32| NonZeroU32::new(reads).ok_or_else(|| eyre::eyre!("zero budget"));
+
+    harness.with_primary(|primary| {
+        let one_stride =
+            primary.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, budget(1)?)?;
+        eyre::ensure!(
+            one_stride.examined == 1 && one_stride.reads == 100,
+            "a budget of one read examined {} strides and read {}",
+            one_stride.examined,
+            one_stride.reads
+        );
+        let two_strides =
+            primary.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, budget(150)?)?;
+        eyre::ensure!(
+            two_strides.examined == 2 && two_strides.next_from == BlockHeight::new(200),
+            "a budget of 150 reads examined {} strides",
+            two_strides.examined
+        );
+        let all =
+            primary.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, budget(10_000)?)?;
+        eyre::ensure!(
+            all.examined == 3 && all.reached_unsettled,
+            "a budget past the settled history examined {} strides",
+            all.examined
+        );
+        Ok(())
+    })
+}
+
 /// A verified watermark is trusted for every stride below it, so a restart
 /// does not scan them again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
