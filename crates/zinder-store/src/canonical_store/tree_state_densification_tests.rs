@@ -580,6 +580,15 @@ fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> 
     assert_eq!(first.next_from, BlockHeight::new(100));
     assert!(!first.reached_unsettled);
 
+    // A densified stride costs a read for every checkpoint row it holds.
+    let densified_store = TempDir::new()?;
+    let densified = densification_store(&densified_store, BlockHeight::new(TIP_HEIGHT))?;
+    densify_all(&densified, &activations()?, EVERY_BLOCK)?;
+    let dense = densified.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, one)?;
+    assert!(dense.incomplete.is_empty() && dense.damaged.is_empty());
+    assert_eq!(dense.examined, 1);
+    assert_eq!(dense.reads, 100);
+
     let second = store.scan_tree_state_strides(first.next_from, EVERY_BLOCK, one)?;
     assert!(second.incomplete.is_empty());
     assert_eq!(second.examined, 0);

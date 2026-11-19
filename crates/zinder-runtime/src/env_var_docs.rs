@@ -1653,7 +1653,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Average ceiling on stored blocks the tree-state densification pass \
-                      replays per second, with a scan charged one block for every two reads it makes. \
+                      replays per second, with a scan charged one block for every two reads it makes, \
+                      counting each checkpoint row it visits and each compact block it reads as one read. \
                       Each block costs about two reads and adds at most one row, so this \
                       bounds the pass's reads and writes. Must be greater than zero. \
                       Defaults to 500.",

@@ -153,7 +153,8 @@ pub struct TreeStateStrideScan {
     pub damaged: Vec<(TreeStateStride, String)>,
     /// Number of settled strides the scan examined.
     pub examined: u32,
-    /// Range scans and compact-block reads the scan made.
+    /// Reads the scan made: each checkpoint row it visited, at least one per
+    /// examined stride, and each compact block it read.
     pub reads: u32,
     /// Height the next scan continues from.
     pub next_from: BlockHeight,
@@ -478,16 +479,20 @@ fn stride_satisfies(
     stride_satisfies_counting_reads(store, stride, selection, &mut 0)
 }
 
-/// [`stride_satisfies`], adding to `reads` the range scan and the compact
-/// blocks it read.
+/// [`stride_satisfies`], adding to `reads` the checkpoint rows it visited, at
+/// least one, and the compact blocks it read.
 fn stride_satisfies_counting_reads(
     store: &impl CanonicalServingRead,
     stride: TreeStateStride,
     selection: TreeStateCheckpointSelection,
     reads: &mut u32,
 ) -> Result<bool, CanonicalStoreError> {
-    *reads = reads.saturating_add(1);
     let stored_heights = stored_heights_through_end(store, stride)?;
+    *reads = reads.saturating_add(
+        u32::try_from(stored_heights.len())
+            .unwrap_or(u32::MAX)
+            .max(1),
+    );
     if stored_heights.last() != Some(&stride.end_height) {
         return Err(stride_mismatch(
             stride,

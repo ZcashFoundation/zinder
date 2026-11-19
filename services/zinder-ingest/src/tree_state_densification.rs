@@ -46,9 +46,10 @@ use crate::{
 pub const DEFAULT_TREE_STATE_DENSIFICATION_WORKERS: u32 = 2;
 /// Default average ceiling on stored blocks the pass replays per second.
 ///
-/// Replaying a block reads its compact block and header, and each scanned
-/// stride is charged as a few blocks, so this also bounds the pass's reads,
-/// and the rows it writes, which never exceed the blocks it replays.
+/// Replaying a block reads its compact block and header, and a scan is
+/// charged for every checkpoint row and compact block it reads, so this also
+/// bounds the pass's reads, and the rows it writes, which never exceed the
+/// blocks it replays.
 pub const DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND: u32 = 500;
 /// Default commitment budget of the budgeted selection.
 pub const DEFAULT_TREE_STATE_COMMITMENT_BUDGET: u32 = 1_024;
@@ -69,8 +70,10 @@ const WATERMARK_VERSION: u32 = 1;
 const WATERMARK_WRITE_INTERVAL: Duration = Duration::from_secs(10);
 /// Settled strides one scan chunk examines.
 const SCAN_CHUNK_STRIDES: u32 = 64;
-/// Reads charged as one replayed block against the replay rate, the compact
-/// block and header a replay reads for each block.
+/// Scan reads charged as one replayed block against the replay rate.
+///
+/// A replay reads a compact block and a header for each block, and a scan
+/// counts each checkpoint row it visits and each compact block it reads.
 const SCAN_READS_PER_BLOCK: u32 = 2;
 
 /// Resolved `[ingest.tree_state_densification]` settings.
