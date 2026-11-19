@@ -180,6 +180,8 @@ The server reads the set in pages of 1,024 outputs and reads the next page only 
 
 An in-process caller that opens many of these streams for one request can use `WalletQueryApi::transparent_address_unspent_outputs_on_demand` instead. It returns the same outputs in the same order at the same pinned epoch, but reads nothing until the stream is first polled and never reads ahead: it reads the next page only when the caller has taken every output of the previous one. The caller chooses the first page's size, at most 1,024 outputs, from how many streams it holds. Later pages double up to 1,024 as the caller consumes them, so such a stream holds at most the page its caller is reading, and a stream not yet polled holds none.
 
+The lightwalletd adapter's `GetAddressUtxos` and `GetAddressUtxosStream` merge uses these on-demand streams, one for each distinct address, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream) describes.
+
 ### Transaction history
 
 `TransparentAddressTxIdsInRange(address, start_height, end_height, max_entries, from_cursor)` streams the transactions that touch an address within an inclusive height range, in ascending mined order: a `ChainView` header, then one `TransparentAddressTxId` per transaction.
