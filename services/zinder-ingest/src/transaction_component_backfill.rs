@@ -377,12 +377,17 @@ fn next_backfill_height(
 }
 
 /// Hydrates one connected settled range into ordered block contexts.
+///
+/// The contexts carry no final note-commitment roots: the
+/// transaction-component and conventional-fee backfills and tail seeds that
+/// call this never read them.
 pub(crate) fn read_canonical_context_batch(
     canonical: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
     range: BlockHeightRange,
 ) -> Result<Vec<BlockCommitContext>, IngestError> {
     let contexts = CanonicalBlockContextReader::new(canonical, activations)
+        .without_final_roots()
         .read_ordered_block_commit_contexts(range)?;
     if contexts.len() != range.into_iter().len() {
         return Err(IngestError::MaterializedViewDispatch(format!(

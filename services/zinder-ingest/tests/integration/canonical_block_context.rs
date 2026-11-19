@@ -13,6 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use parking_lot::RwLock;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
@@ -29,11 +30,24 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalBlockContextReader, CanonicalConstructionConfig, CanonicalFollowConfig,
-    CanonicalFollower, DEFAULT_MAX_REPLACEMENT_BYTES, IngestError, PrevoutCache, RawBlobPolicy,
+    CanonicalFollower, ConventionalFeeDistributionBackfillConfig,
+    ConventionalFeeDistributionBackfillContext, DEFAULT_MAX_REPLACEMENT_BYTES, IngestError,
+    MaterializedViewReplayConfig, MaterializedViewTailer, PrevoutCache, RawBlobPolicy,
+    ReplayPrevoutCaches, TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
     follow_canonical_tip, load_fresh_canonical, prepare_canonical_block,
-    require_genesis_complete_history,
+    require_genesis_complete_history, spawn_conventional_fee_distribution_backfill_task,
+    spawn_transaction_component_backfill_task,
 };
-use zinder_materialized_views::BlockCommitContext;
+use zinder_materialized_views::{
+    BLOCK_SUMMARY_SCHEMA, BlockCommitContext, COMMITMENT_ROOT_SEARCH_SCHEMA,
+    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, CommitmentRootSearchConsumer,
+    ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
+    MaterializedViewConsumerSchema, MaterializedViewStore, MaterializedViewStoreOptions,
+    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
+    TRANSPARENT_OUTPOINT_SPEND_SCHEMA, TransactionComponentBackfillCoverage,
+    TransactionComponentSummaryConsumer, TransparentAddressRankingConsumer,
+    bundled_materialized_view_consumer_definitions,
+};
 use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
@@ -41,17 +55,21 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::{
-    P2pkhSpendArgs, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    LogCapture, P2pkhSpendArgs, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
     sample_regtest_upgrade_activations,
 };
 
 use super::fixture_block::{
     fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
 };
+use super::materialized_view_replay::{
+    clear_transparent_address_ranking, transparent_address_ranking, view_rows, view_store,
+};
+use super::tree_state_densification::following_tip_gate;
 
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
@@ -65,6 +83,15 @@ const SPEND_OUTPUT_VALUE_ZAT: u64 = 12_345;
 const REORG_WINDOW_BLOCKS: u32 = 100;
 const FORK_PARENT_HEIGHT: u32 = 2;
 const REPLACEMENT_TIP_HEIGHT: u32 = 5;
+const ROOT_SEARCH_MAX_MATCHES: usize = 8;
+const ROOT_AND_RANKING_CONSUMERS: &[MaterializedViewConsumerSchema] = &[
+    BLOCK_SUMMARY_SCHEMA,
+    COMMITMENT_ROOT_SEARCH_SCHEMA,
+    TRANSPARENT_ADDRESS_RANKING_SCHEMA,
+    TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+];
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(10);
+const RANKING_ACTIVATED_EVENT: &str = "transparent_address_ranking_activated";
 
 #[tokio::test]
 async fn canonical_block_contexts_carry_header_transaction_and_intrinsic_facts()
@@ -169,6 +196,171 @@ async fn derived_final_note_commitment_roots_match_independent_accumulation()
             expected.get(&height)
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reader_without_final_roots_hydrates_the_same_facts_without_reading_tree_state()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = sample_regtest_upgrade_activations();
+    let with_roots = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_ordered_block_commit_contexts(chain_range())?;
+    assert!(
+        with_roots
+            .iter()
+            .any(|context| context.final_note_commitment_roots.is_some()),
+        "the fixture chain must produce note-commitment roots"
+    );
+
+    // The store refuses tree-state reads under an activation table it did not
+    // admit, and tree state is the only read hydration makes through the
+    // table, so a reader that succeeds with it never read tree state.
+    let unadmitted = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+    let refused = CanonicalBlockContextReader::new(harness.secondary(), &unadmitted)
+        .read_ordered_block_commit_contexts(chain_range());
+    assert!(
+        matches!(
+            refused,
+            Err(IngestError::CanonicalStore(
+                CanonicalStoreError::AdmissionRefused { .. }
+            ))
+        ),
+        "deriving roots must read tree state, got {:?}",
+        refused.err()
+    );
+    let without_roots = CanonicalBlockContextReader::new(harness.secondary(), &unadmitted)
+        .without_final_roots()
+        .read_ordered_block_commit_contexts(chain_range())?;
+
+    assert_eq!(without_roots.len(), with_roots.len());
+    for (without, with) in without_roots.iter().zip(&with_roots) {
+        assert_eq!(without.final_note_commitment_roots, None);
+        assert_same_facts_except_roots(without, with);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_shared_replay_indexes_final_roots_for_root_search() -> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let expected = independent_final_roots(&harness.blocks, &sample_regtest_upgrade_activations())?;
+    let directory = TempDir::new()?;
+    let view = open_root_and_ranking_view_store(directory.path())?;
+    harness.tailer(&view, "replay-secondary")?.catch_up()?;
+
+    for (protocol, height) in [
+        (ShieldedProtocol::Sapling, SAPLING_BLOCK_HEIGHT),
+        (ShieldedProtocol::Orchard, ORCHARD_BLOCK_HEIGHT),
+    ] {
+        let height = BlockHeight::new(height);
+        let roots = expected
+            .get(&height)
+            .ok_or_else(|| format!("the chain must contain height {}", height.value()))?;
+        let root = match protocol {
+            ShieldedProtocol::Sapling => roots.sapling,
+            ShieldedProtocol::Orchard => roots.orchard,
+            ShieldedProtocol::Ironwood | _ => roots.ironwood,
+        }
+        .ok_or_else(|| format!("height {} must carry a {protocol:?} root", height.value()))?;
+        let matches = CommitmentRootSearchConsumer::search(&view, root, ROOT_SEARCH_MAX_MATCHES)?;
+        assert!(
+            matches
+                .iter()
+                .any(|entry| entry.protocol == protocol && entry.block_height == height),
+            "root search must index the {protocol:?} root of height {}, found {matches:?}",
+            height.value()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_ranking_build_writes_the_ranking_the_shared_replay_writes()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let replayed_directory = TempDir::new()?;
+    let replayed = open_root_and_ranking_view_store(replayed_directory.path())?;
+    harness
+        .tailer(&replayed, "replayed-secondary")?
+        .catch_up()?;
+
+    let built_directory = TempDir::new()?;
+    let built = open_root_and_ranking_view_store(built_directory.path())?;
+    harness.tailer(&built, "built-secondary")?.catch_up()?;
+    drop(built);
+    clear_transparent_address_ranking(built_directory.path())?;
+    let built = open_root_and_ranking_view_store(built_directory.path())?;
+    assert!(TransparentAddressRankingConsumer::active_metadata(&built)?.is_none());
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    // The other views are already at the tip, so this catch-up hydrates only
+    // for the ranking build. Under a table the store did not admit, a build
+    // that derived roots would fail its tree-state read.
+    let mut rebuild = harness.tailer(&built, "rebuilt-secondary")?;
+    rebuild.activations = Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest));
+    rebuild.catch_up()?;
+
+    assert!(
+        capture.any(|event| event.field("event") == Some(RANKING_ACTIVATED_EVENT)),
+        "the ranking must be rebuilt by its own build, not by the shared replay"
+    );
+    assert_eq!(
+        transparent_address_ranking(&built)?,
+        transparent_address_ranking(&replayed)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_historical_backfills_write_the_rows_root_bearing_contexts_write()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let tail_boundary = BlockHeight::new(CHAIN_TIP_HEIGHT + 1);
+
+    let (_backfilled_directory, backfilled) = view_store()?;
+    TransactionComponentSummaryConsumer::initialize_tail_boundary(&backfilled, tail_boundary)?;
+    ConventionalFeeDistributionConsumer::initialize_tail_boundary(&backfilled, tail_boundary)?;
+    // Under a table the store did not admit, a backfill that derived roots
+    // would fail its tree-state read and never reach the tip.
+    let unadmitted = Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest));
+    run_historical_backfills(&harness, &unadmitted, &backfilled).await?;
+
+    let (_written_directory, written) = view_store()?;
+    TransactionComponentSummaryConsumer::initialize_tail_boundary(&written, tail_boundary)?;
+    ConventionalFeeDistributionConsumer::initialize_tail_boundary(&written, tail_boundary)?;
+    let contexts = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_ordered_block_commit_contexts(chain_range())?;
+    assert!(
+        contexts
+            .iter()
+            .any(|context| context.final_note_commitment_roots.is_some()),
+        "the reference contexts must carry roots"
+    );
+    write_backfill_batches(&written, &contexts)?;
+
+    let mut compared_rows = 0;
+    for definition in bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter(|definition| {
+            [
+                TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+                CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+            ]
+            .contains(&definition.schema.name)
+        })
+    {
+        for &column_family in definition.schema.column_families {
+            let rows = view_rows(&backfilled, column_family)?;
+            compared_rows += rows.len();
+            assert_eq!(
+                rows,
+                view_rows(&written, column_family)?,
+                "{column_family} must hold the rows root-bearing contexts write"
+            );
+        }
+    }
+    assert!(compared_rows > 0, "the backfills must write rows");
     Ok(())
 }
 
@@ -535,6 +727,132 @@ fn assert_same_spends(
     Ok(())
 }
 
+/// Runs the transaction-component and conventional-fee historical backfills
+/// until both cover the settled tip.
+async fn run_historical_backfills(
+    harness: &CanonicalHarness,
+    activations: &Arc<NetworkUpgradeActivations>,
+    view: &MaterializedViewStore,
+) -> Result<(), Box<dyn Error>> {
+    let tip_height = BlockHeight::new(CHAIN_TIP_HEIGHT);
+    let canonical = harness.shared_secondary("backfill-secondary")?;
+    let cancel = CancellationToken::new();
+    let tasks = [
+        spawn_transaction_component_backfill_task(
+            TransactionComponentBackfillConfig::DEFAULT,
+            TransactionComponentBackfillContext::new(
+                Arc::clone(&canonical),
+                Arc::clone(activations),
+                view.clone(),
+            ),
+            following_tip_gate(),
+            cancel.clone(),
+        ),
+        spawn_conventional_fee_distribution_backfill_task(
+            ConventionalFeeDistributionBackfillConfig::DEFAULT,
+            ConventionalFeeDistributionBackfillContext::new(
+                Arc::clone(&canonical),
+                Arc::clone(activations),
+                view.clone(),
+            ),
+            following_tip_gate(),
+            cancel.clone(),
+        ),
+    ];
+    let completed = tokio::time::timeout(BACKFILL_TIMEOUT, async {
+        loop {
+            let components = TransactionComponentSummaryConsumer::backfill_coverage(view)
+                .map_err(|error| error.to_string())?;
+            let fees = ConventionalFeeDistributionConsumer::backfill_coverage(view)
+                .map_err(|error| error.to_string())?;
+            if components.is_some_and(|coverage| coverage.complete_through_height == tip_height)
+                && fees.is_some_and(|coverage| coverage.complete_through_height == tip_height)
+            {
+                return Ok::<_, String>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    cancel.cancel();
+    for task in tasks {
+        task.await?;
+    }
+    completed.map_err(|_| "both backfills must reach the settled tip")??;
+    Ok(())
+}
+
+/// Writes `contexts` as one historical batch of each backfill-owned view.
+fn write_backfill_batches(
+    view: &MaterializedViewStore,
+    contexts: &[BlockCommitContext],
+) -> Result<(), Box<dyn Error>> {
+    let first = contexts.first().ok_or("the chain must not be empty")?;
+    let last = contexts.last().ok_or("the chain must not be empty")?;
+    TransactionComponentSummaryConsumer::new()
+        .write_backfill_batch(
+            view,
+            contexts,
+            TransactionComponentBackfillCoverage {
+                complete_from_height: first.height,
+                complete_through_height: last.height,
+                complete_from_time_unix_seconds: first.block_time_unix_seconds,
+                complete_through_time_unix_seconds: last.block_time_unix_seconds,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    ConventionalFeeDistributionConsumer::new()
+        .write_backfill_batch(
+            view,
+            contexts,
+            ConventionalFeeDistributionBackfillCoverage::new(
+                first.height,
+                last.height,
+                first.block_time_unix_seconds,
+                last.block_time_unix_seconds,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Opens a view store with only the views the shared replay can build from the
+/// fixture chain, whose shielded transactions carry synthetic value balances
+/// the fee views reject.
+fn open_root_and_ranking_view_store(path: &Path) -> Result<MaterializedViewStore, Box<dyn Error>> {
+    Ok(MaterializedViewStore::open(
+        path,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: ROOT_AND_RANKING_CONSUMERS,
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
+        },
+    )?)
+}
+
+/// Asserts that two hydrations of one block agree on every fact but roots.
+fn assert_same_facts_except_roots(actual: &BlockCommitContext, expected: &BlockCommitContext) {
+    assert_eq!(actual.height, expected.height);
+    assert_eq!(actual.block_hash, expected.block_hash);
+    assert_eq!(actual.previous_block_hash, expected.previous_block_hash);
+    assert_eq!(
+        actual.block_time_unix_seconds,
+        expected.block_time_unix_seconds
+    );
+    assert_eq!(actual.block_size_bytes, expected.block_size_bytes);
+    assert_eq!(actual.transactions, expected.transactions);
+    assert_eq!(actual.transparent_spends(), expected.transparent_spends());
+    assert_eq!(
+        actual.transaction_intrinsic_value_balances(),
+        expected.transaction_intrinsic_value_balances()
+    );
+    assert_eq!(
+        actual.block_value_pool_balances(),
+        expected.block_value_pool_balances()
+    );
+}
+
 const fn chain_range() -> BlockHeightRange {
     BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(CHAIN_TIP_HEIGHT))
 }
@@ -544,7 +862,7 @@ struct CanonicalHarness {
     blocks: BTreeMap<BlockHeight, SourceBlock>,
     secondary: RocksDbCanonicalSecondary,
     store: Option<RocksDbCanonicalStore>,
-    _temporary: TempDir,
+    temporary: TempDir,
 }
 
 impl CanonicalHarness {
@@ -639,7 +957,7 @@ impl CanonicalHarness {
             blocks,
             secondary,
             store: Some(store),
-            _temporary: temporary,
+            temporary,
         })
     }
 
@@ -690,6 +1008,42 @@ impl CanonicalHarness {
 
     const fn secondary(&self) -> &RocksDbCanonicalSecondary {
         &self.secondary
+    }
+
+    /// Opens another secondary on the published store, for runtimes that
+    /// share one behind a lock.
+    fn shared_secondary(
+        &self,
+        secondary_name: &str,
+    ) -> Result<Arc<RwLock<RocksDbCanonicalSecondary>>, Box<dyn Error>> {
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            self.temporary.path().join("canonical"),
+            self.temporary.path().join(secondary_name),
+            &sample_regtest_upgrade_activations(),
+            CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        Ok(Arc::new(RwLock::new(secondary)))
+    }
+
+    fn tailer(
+        &self,
+        view: &MaterializedViewStore,
+        secondary_name: &str,
+    ) -> Result<MaterializedViewTailer, Box<dyn Error>> {
+        Ok(MaterializedViewTailer {
+            canonical: self.shared_secondary(secondary_name)?,
+            materialized_view_store: view.clone(),
+            config: MaterializedViewReplayConfig::DEFAULT,
+            activations: Arc::new(sample_regtest_upgrade_activations()),
+            reorg_window_blocks: REORG_WINDOW_BLOCKS,
+            chain_event_retention_window: Some(Duration::from_hours(168)),
+            cursor_at_risk_warning: Duration::from_hours(24),
+            prevout_caches: ReplayPrevoutCaches::default(),
+            volume_space_guard: None,
+        })
     }
 
     fn block_at(&self, height: BlockHeight) -> Result<&SourceBlock, Box<dyn Error>> {

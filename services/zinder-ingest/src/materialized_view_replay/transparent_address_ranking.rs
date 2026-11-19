@@ -569,7 +569,8 @@ impl<'build> RankingBuild<'build> {
                 canonical,
                 &tailer.activations,
                 prevouts,
-            ),
+            )
+            .without_final_roots(),
             chain_epoch,
             generation,
             resumed_through,

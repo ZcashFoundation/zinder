@@ -1088,7 +1088,7 @@ fn recorded_under(watermark: &serde_json::Value, selection: TreeStateCheckpointS
     }
 }
 
-fn following_tip_gate() -> HistoricalWorkGate {
+pub(super) fn following_tip_gate() -> HistoricalWorkGate {
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     HistoricalWorkGate::without_materialized_views(readiness)
