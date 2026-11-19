@@ -181,7 +181,7 @@ Both methods return the confirmed balance, the sum of unspent outputs, of up to 
 
 Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent output at or above `startHeight`, and a positive value returns at most that many, oldest first. Within one block, Zinder orders rows by transaction id and output index, where Zebra uses block position; this matters only when `maxEntries` splits a block.
 
-A request that lists an address more than once gets that address's rows once for each listing, as lightwalletd returns them.
+A request that lists an address more than once gets that address's rows once, as lightwalletd v0.6.2 does. A wallet that adds up the rows counts each output once, and duplicate rows never use up `maxEntries`.
 
 One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
 

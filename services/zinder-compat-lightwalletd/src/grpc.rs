@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashSet},
     num::{NonZeroU16, NonZeroU32},
     pin::Pin,
     time::Duration,
@@ -398,8 +398,9 @@ where
     /// visible chain epoch, and reads the first output of each, so a request
     /// that cannot be served fails before any row is sent.
     ///
-    /// Each distinct address is read once, however often the request lists
-    /// it, and its rows are sent once for each listing.
+    /// Each distinct address is read once and its rows are sent once, however
+    /// often the request lists it, as lightwalletd drops a repeated address
+    /// before it queries the node.
     async fn address_utxo_merge(
         &self,
         request: lightwalletd::GetAddressUtxosArg,
@@ -419,31 +420,22 @@ where
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let mut listings: Vec<(String, usize)> = Vec::new();
-        let mut positions = HashMap::new();
-        for address in request.addresses {
-            if let Some(&position) = positions.get(&address) {
-                if let Some((_, copies)) = listings.get_mut(position) {
-                    *copies += 1;
-                }
-                continue;
-            }
-            positions.insert(address.clone(), listings.len());
-            listings.push((address, 1));
-        }
-        let listings = listings
+        let mut seen_addresses = HashSet::new();
+        let distinct_addresses = request
+            .addresses
             .into_iter()
-            .map(|(address, copies)| {
+            .filter(|address| seen_addresses.insert(address.clone()))
+            .map(|address| {
                 transparent_address_unspent_outputs_request(
                     &address,
                     visible_tip_block.chain_epoch.network,
                     BlockHeight::new(start_height),
                 )
-                .map(|query_request| (address, copies, query_request))
+                .map(|query_request| (address, query_request))
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let first_page_size = address_utxo_first_page_size(listings.len(), max_entries);
-        for (address, copies, query_request) in listings {
+        let first_page_size = address_utxo_first_page_size(distinct_addresses.len(), max_entries);
+        for (address, query_request) in distinct_addresses {
             let outputs = self
                 .query_api
                 .transparent_address_unspent_outputs_on_demand(
@@ -453,7 +445,7 @@ where
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            merge.add_address(address, copies, outputs).await?;
+            merge.add_address(address, outputs).await?;
         }
         Ok(merge)
     }
@@ -1225,17 +1217,13 @@ fn address_utxo_first_page_size(
 /// on demand at the one chain epoch the request resolved, starting at the
 /// first page [`address_utxo_first_page_size`] chooses. A later page holds at
 /// most the outputs the merge has taken from that address plus one first
-/// page, and the merge has taken at most one output more than it has sent.
-/// So the outputs read stay within about twice the rows sent, plus 2 outputs
-/// and one first page for each distinct address, and the first pages
-/// together hold at most 8,192 outputs, or 16 for each distinct address past
-/// 512.
+/// page, and every output the merge takes is sent as one row. So the outputs
+/// read stay within about twice the rows sent, plus 2 outputs and one first
+/// page for each distinct address, and the first pages together hold at most
+/// 8,192 outputs, or 16 for each distinct address past 512.
 struct AddressUtxoMerge {
     addresses: Vec<MergedAddress>,
     next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
-    /// The row being sent once for each listing of its address, and how many
-    /// copies remain.
-    repeating: Option<(lightwalletd::GetAddressUtxosReply, usize)>,
     /// The address whose last row was taken and whose next output is read
     /// only when the response needs another row, so a response never reads
     /// past the last row it sends.
@@ -1249,8 +1237,6 @@ struct AddressUtxoMerge {
 /// One distinct address of an [`AddressUtxoMerge`].
 struct MergedAddress {
     address: String,
-    /// How many times the request lists the address.
-    copies: usize,
     outputs: TransparentAddressUnspentOutputs,
 }
 
@@ -1297,7 +1283,6 @@ impl AddressUtxoMerge {
         Self {
             addresses: Vec::new(),
             next_outputs: BinaryHeap::new(),
-            repeating: None,
             awaiting_next_output: None,
             max_entries,
             response_limit,
@@ -1306,19 +1291,13 @@ impl AddressUtxoMerge {
         }
     }
 
-    /// Adds one distinct address, listed `copies` times, and reads its first
-    /// output.
+    /// Adds one distinct address and reads its first output.
     async fn add_address(
         &mut self,
         address: String,
-        copies: usize,
         outputs: TransparentAddressUnspentOutputs,
     ) -> Result<(), Status> {
-        self.addresses.push(MergedAddress {
-            address,
-            copies,
-            outputs,
-        });
+        self.addresses.push(MergedAddress { address, outputs });
         self.read_next_output(self.addresses.len() - 1).await
     }
 
@@ -1340,35 +1319,19 @@ impl AddressUtxoMerge {
         }
     }
 
-    /// Reads the next output of the address whose last row was taken, once
-    /// every copy of that row has been sent.
+    /// Reads the next output of the address whose last row was taken.
     async fn read_awaited_output(&mut self) -> Result<(), Status> {
-        if self.repeating.is_some() {
-            return Ok(());
-        }
         match self.awaiting_next_output.take() {
             Some(address_position) => self.read_next_output(address_position).await,
             None => Ok(()),
         }
     }
 
-    /// Takes the next row to send: another copy of the row being repeated,
-    /// or the lowest next output.
+    /// Takes the lowest next output as the next row to send.
     fn take_next_row(&mut self) -> Option<lightwalletd::GetAddressUtxosReply> {
-        if self.repeating.is_none() {
-            let Reverse(next_output) = self.next_outputs.pop()?;
-            let copies = self
-                .addresses
-                .get(next_output.address_position)
-                .map_or(1, |merged| merged.copies);
-            self.awaiting_next_output = Some(next_output.address_position);
-            self.repeating = Some((next_output.reply, copies));
-        }
-        let (reply, copies) = self.repeating.take()?;
-        if copies > 1 {
-            self.repeating = Some((reply.clone(), copies - 1));
-        }
-        Some(reply)
+        let Reverse(next_output) = self.next_outputs.pop()?;
+        self.awaiting_next_output = Some(next_output.address_position);
+        Some(next_output.reply)
     }
 }
 
@@ -1390,7 +1353,7 @@ impl ResponseSource for AddressUtxoMerge {
             self.ended = true;
             return Some(Err(status));
         }
-        if self.repeating.is_none() && self.next_outputs.is_empty() {
+        if self.next_outputs.is_empty() {
             return None;
         }
         if self.sent >= self.response_limit {

@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    collections::HashSet,
     num::{NonZeroU16, NonZeroU32},
     sync::{
         Arc,
@@ -782,13 +783,15 @@ const MIN_FIRST_PAGE_OUTPUTS: usize = 16;
 const FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 
 /// A request that lists one busy address many times reads that address once,
-/// in one first page, whatever `maxEntries` asks for and however many times
-/// the address is listed.
+/// in one first page, and returns each of its outputs once, as lightwalletd
+/// does, whether or not `maxEntries` is set.
 #[tokio::test]
 async fn address_utxos_read_a_busy_address_listed_many_times_once() -> eyre::Result<()> {
     const LISTINGS: usize = 1_000;
     const OUTPUTS: u32 = 100;
-    let response_limit = NonZeroU32::MIN.saturating_add(9_999);
+    // The response limit admits each output once, so a copy for any repeated
+    // listing would fail the response with `RESOURCE_EXHAUSTED`.
+    let response_limit = NonZeroU32::new(OUTPUTS).ok_or_else(|| eyre::eyre!("OUTPUTS is 0"))?;
     let (mut store_fixture, address_text) = many_utxo_fixture(0x51, OUTPUTS)?;
     let (adapter, reads) = counting_utxo_adapter(&mut store_fixture, Some(response_limit))?;
     let request = |max_entries| lightwalletd::GetAddressUtxosArg {
@@ -797,48 +800,40 @@ async fn address_utxos_read_a_busy_address_listed_many_times_once() -> eyre::Res
         max_entries,
     };
 
-    // Each listing repeats each output, so the first 500 rows are copies of
-    // the address's first output.
-    for streamed in [false, true] {
+    // A `maxEntries` above the address's outputs, or none, returns every
+    // output once, so the repeated listings do not spend it on copies.
+    for (max_entries, streamed) in [(500, false), (500, true), (0, false), (0, true)] {
         reads.take_outputs();
         let rows = if streamed {
             collect_stream(
                 adapter
-                    .get_address_utxos_stream(Request::new(request(500)))
+                    .get_address_utxos_stream(Request::new(request(max_entries)))
                     .await?
                     .into_inner(),
             )
             .await?
         } else {
             adapter
-                .get_address_utxos(Request::new(request(500)))
+                .get_address_utxos(Request::new(request(max_entries)))
                 .await?
                 .into_inner()
                 .address_utxos
         };
-        assert_eq!(rows.len(), 500);
-        let first_output = history_transaction_id(0).as_bytes().to_vec();
-        assert!(rows.iter().all(|row| row.txid == first_output));
+        let distinct_outputs = rows
+            .iter()
+            .map(|row| (row.txid.as_slice(), row.index))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            (rows.len(), distinct_outputs.len()),
+            (u32_to_usize(OUTPUTS), u32_to_usize(OUTPUTS)),
+            "each output must be returned once, maxEntries {max_entries}"
+        );
         assert_eq!(
             (reads.pages(), reads.outputs()),
             (1, u32_to_usize(OUTPUTS)),
             "a repeated address must be read once, in its first page"
         );
     }
-
-    // Without `maxEntries`, the 10,001st copy exceeds the response limit.
-    reads.take_outputs();
-    let refused = adapter
-        .get_address_utxos(Request::new(request(0)))
-        .await
-        .err()
-        .map(|status| status.code());
-    assert_eq!(refused, Some(Code::ResourceExhausted));
-    assert_eq!(
-        (reads.pages(), reads.outputs()),
-        (1, u32_to_usize(OUTPUTS)),
-        "the refused request must read the address once"
-    );
     Ok(())
 }
 
@@ -1037,8 +1032,8 @@ async fn taddress_history_ends_with_the_status_of_a_failure_after_partial_delive
 /// output index, and then address, in the list and the stream alike.
 ///
 /// The addresses receive in interleaved blocks and one transaction pays
-/// both. A repeated address is served once for each time it is listed, as
-/// before.
+/// both. A repeated address is served once, as lightwalletd drops a repeated
+/// address, so its rows do not count twice against `maxEntries`.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -1092,25 +1087,6 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
     let mut store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let adapter = build_wallet_serving_adapter(&mut store_fixture)?;
-    let request = lightwalletd::GetAddressUtxosArg {
-        addresses: vec![second.to_string(), first.to_string(), second.to_string()],
-        start_height: 0,
-        max_entries: 0,
-    };
-
-    let list = adapter
-        .get_address_utxos(Request::new(request.clone()))
-        .await?
-        .into_inner()
-        .address_utxos;
-    let streamed = collect_stream(
-        adapter
-            .get_address_utxos_stream(Request::new(request))
-            .await?
-            .into_inner(),
-    )
-    .await?;
-
     let row = |height: u64, transaction: u32, index: i32, address: &ZebraTransparentAddress| {
         (
             height,
@@ -1119,15 +1095,12 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
             address.to_string(),
         )
     };
-    let expected = vec![
+    let expected = [
         row(1, 1, 0, &first),
         row(1, 3, 0, &second),
-        row(1, 3, 0, &second),
-        row(2, 2, 0, &second),
         row(2, 2, 0, &second),
         row(2, 2, 1, &first),
         row(3, 4, 0, &first),
-        row(3, 5, 0, &second),
         row(3, 5, 0, &second),
     ];
     let observed = |replies: &[lightwalletd::GetAddressUtxosReply]| {
@@ -1143,8 +1116,31 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(observed(&list), expected);
-    assert_eq!(observed(&streamed), expected);
+
+    // Every row, then only the first 3: a repeated `second` must not spend
+    // `maxEntries` on a second copy of its row.
+    for (max_entries, expected_rows) in [(0, expected.len()), (3, 3)] {
+        let request = lightwalletd::GetAddressUtxosArg {
+            addresses: vec![second.to_string(), first.to_string(), second.to_string()],
+            start_height: 0,
+            max_entries,
+        };
+        let list = adapter
+            .get_address_utxos(Request::new(request.clone()))
+            .await?
+            .into_inner()
+            .address_utxos;
+        let streamed = collect_stream(
+            adapter
+                .get_address_utxos_stream(Request::new(request))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let expected = expected.get(..expected_rows).unwrap_or_default();
+        assert_eq!(observed(&list), expected, "maxEntries {max_entries}");
+        assert_eq!(observed(&streamed), expected, "maxEntries {max_entries}");
+    }
     Ok(())
 }
 
