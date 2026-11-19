@@ -32,11 +32,13 @@ pub use canonical_store::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
     CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
     CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
-    DEFAULT_REORG_WINDOW_BLOCKS, DisplacedBlockCursor, DisplacedBlockPage, HeightOrder,
-    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
-    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, ValidatedRocksDbCanonicalBuild,
+    DEFAULT_REORG_WINDOW_BLOCKS, DensifiedTreeStateStride, DisplacedBlockCursor,
+    DisplacedBlockPage, HeightOrder, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    PreparedCanonicalBaselinePublication, ProjectionBuildAnchor, ProjectionBuildLease,
+    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, TreeStateStride,
+    TreeStateStrideCommit, TreeStateStrideScan, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

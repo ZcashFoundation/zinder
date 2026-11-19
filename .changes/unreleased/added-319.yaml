@@ -1,0 +1,6 @@
+kind: added
+body: Ingest now fills history built by a first sync with stored tree-state checkpoints in the background, so `GetTreeState` and `TreeStateAtHeight` at a settled height replay at most a bounded number of note commitments instead of up to 99 blocks. By default it stores a checkpoint each time 1,024 note commitments accumulate, an estimated 0.13 GB on Mainnet; `selection = "every-block"` stores one per block, an estimated 2.4 GB, so no read replays. Configure it under `[ingest.tree_state_densification]` (`ZINDER_INGEST__TREE_STATE_DENSIFICATION__*`), where `workers` (2) and `max_blocks_per_second` (500) bound its load. The pass starts once ingest follows the tip and, when Explorer views are enabled, they have caught up; it needs `ingest_control.listen_addr`, checks each 100-block stride against the stored checkpoint that ends it before writing, and resumes after a restart. Progress appears in the `zinder_ingest_tree_state_densification_*` metrics, where an `integrity_failure` outcome means stored history is damaged.
+time: 2026-11-19T03:22:05.805662782Z
+custom:
+    Bump: minor
+    PR: "319"

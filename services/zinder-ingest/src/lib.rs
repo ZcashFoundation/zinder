@@ -17,6 +17,7 @@ mod phase;
 mod runtime_config;
 mod source_recovery;
 mod transaction_component_backfill;
+mod tree_state_densification;
 mod upstream_health_probe;
 mod writer;
 
@@ -65,6 +66,12 @@ pub use runtime_config::{
 pub use transaction_component_backfill::{
     TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
     spawn_transaction_component_backfill_task,
+};
+pub use tree_state_densification::{
+    DEFAULT_TREE_STATE_COMMITMENT_BUDGET, DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND,
+    DEFAULT_TREE_STATE_DENSIFICATION_WORKERS, TREE_STATE_DENSIFICATION_WATERMARK_FILE,
+    TreeStateDensificationConfig, TreeStateDensificationContext, TreeStateStrideWriteError,
+    TreeStateStrideWriter, spawn_tree_state_densification_task,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
 pub use writer::construction::{

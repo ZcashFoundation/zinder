@@ -148,6 +148,75 @@ While it waits on the node, the follower still answers read-only control
 commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
 (up to 64) and apply when the wait ends.
 
+### Tree-state densification
+
+A first sync stores a tree-state checkpoint only every 100 blocks, so a
+tree-state read between two of them replays stored blocks. Once ingest follows
+the tip, and Explorer views have caught up when they are enabled, a background
+pass fills settled history with stored checkpoints. Live following already
+stores one per block, so only history from a first sync needs the pass. The
+`ingest.tree_state_densification.selection` setting decides which blocks get
+one:
+
+- `commitment-budget`, the default, stores one each time
+  `commitment_budget` note commitments (1,024 by default) have accumulated
+  since the previous checkpoint. A read between two of them replays fewer than
+  that many commitments. On Mainnet this adds an estimated 0.13 GB.
+- `every-block` stores one for every block, so a tree-state read at any
+  settled height is a stored read with no replay. On Mainnet this adds an
+  estimated 2.4 GB uncompressed and about 4 to 5 CPU-hours of one-time work.
+  It is the intended default once its Mainnet cost is measured.
+
+The pass works one stride at a time, from one stored checkpoint to the next
+multiple of 100. It replays the stride's compact blocks from the first
+checkpoint with the checks a tree-state rebuild applies, and accepts the result
+only when the replay reproduces every checkpoint already stored in the stride,
+including the one that ends it, byte for byte. The writer then adds the stride's rows in one batch between live
+commits, after checking that the stride ends at or below the settled tip, that
+the replay ended at the block stored at the stride's end, that both stored
+checkpoints are unchanged, and that a row already stored at one of its heights
+holds the same bytes. A checkpoint row holds no block hash, so the end block is
+what ties the replayed blocks to the writer's chain. A stride that fails a check is not written:
+ingest logs `tree_state_densification_integrity_failure`, counts it, and reads
+there keep replaying.
+
+Only settled history is densified, so no reorg reaches a densified row. A
+stride commits whole or not at all, and its commit is synced before the writer
+answers. A stride commit leaves the writer's fence where it is, so a reader
+that already has the store open sees the new rows from its next refresh after
+the commit, which for the wallet-serving pair follows the next live commit.
+Until then its reads in that stride replay from the cadence checkpoint and
+return the same tree states. The pass scans settled strides in bounded chunks, checking every gap
+between stored checkpoints, and queues the strides that do not satisfy the
+selection. It records how far every stride satisfies the selection in
+`tree-state-densification-watermark.json` inside the canonical store
+directory, together with the store's construction manifest digest and the
+selection, and never past a stride it has not committed or found satisfied,
+or one it skipped as damaged.
+
+When ingest starts, the pass resumes at that height if the file names this
+store and the configured selection and the stride that ends at it still holds
+the selected checkpoints; otherwise it ignores the file, logs
+`tree_state_densification_watermark_discarded`, and scans from the start, as
+it does after a change of selection. The file is written only after the
+commits it covers are durable. Only the stride that ends at the recorded
+height is checked again on start, so damage below it is not looked for again;
+a read there checks its stored row against its roots as always, and a missing
+row only makes that read replay. The writer commits through its command queue,
+so the pass runs only when `ingest_control.listen_addr` is set, as it is for
+wallet serving.
+
+`ingest.tree_state_densification.workers` (2 by default) bounds how many
+strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
+(500 by default) bounds, on average, how many stored blocks it replays per
+second, including replays the writer could not commit and the pass retries; a scan is charged one block for every two reads it makes, counting each checkpoint row it visits and each compact block it reads as one read. A replayed block costs
+about two reads, its compact block and its header, and adds at most one row,
+so the defaults hold the pass near 1,000 reads per second on average, with
+short bursts of up to one stride per worker. Progress is reported by the
+`zinder_ingest_tree_state_densification_*` metrics in
+[Metrics](../reference/metrics.md). A canonical rebuild returns history to the
+100-block cadence until the pass runs again.
+
 ## Node endpoint failover
 
 You can list fallback nodes after `[node]` as `[node_fallbacks.1]`,

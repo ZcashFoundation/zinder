@@ -29,6 +29,9 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod subtree_load;
+mod tree_state_densification;
+#[cfg(test)]
+mod tree_state_densification_tests;
 mod tree_state_replay;
 #[cfg(test)]
 mod tree_state_replay_tests;
@@ -85,6 +88,10 @@ pub use rocksdb::{
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
+};
+pub use tree_state_densification::{
+    DensifiedTreeStateStride, TreeStateCheckpointSelection, TreeStateStride, TreeStateStrideCommit,
+    TreeStateStrideScan,
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
 
@@ -711,6 +718,22 @@ pub enum CanonicalStoreError {
     /// Persisted replay rows differ from the prepared canonical block sequence.
     #[error("canonical block replay readback does not match the prepared version-1 block sequence")]
     BlockLoadReadbackMismatch,
+
+    /// Densifying the tree-state checkpoints of one settled stride did not
+    /// reproduce the stored history, so nothing was written for it.
+    #[error(
+        "tree-state stride {}..={} cannot be densified: {reason}",
+        .seed_height.value(),
+        .end_height.value()
+    )]
+    TreeStateStrideMismatch {
+        /// Height of the stored checkpoint the stride replays from.
+        seed_height: BlockHeight,
+        /// Height of the stored cadence checkpoint that ends the stride.
+        end_height: BlockHeight,
+        /// Exact check that failed.
+        reason: String,
+    },
 
     /// Subtree roots were requested before the canonical block families were complete.
     #[error("canonical subtree roots require completed canonical block families")]

@@ -41,7 +41,7 @@ use zinder_store::{
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventPosition,
     MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
     ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalStore,
-    RocksDbResourceBudget, StreamCursorTokenV1,
+    RocksDbResourceBudget, StreamCursorTokenV1, TreeStateStrideCommit,
 };
 
 /// Bounded number of RPCs that may wait for the follower to receive them, and
@@ -406,6 +406,21 @@ impl CanonicalControlHandle {
         .await
     }
 
+    /// Commits one densified tree-state stride through the writer.
+    ///
+    /// A stride whose replay no longer matches the stored checkpoints fails
+    /// with `DATA_LOSS`; any other refusal is transient.
+    pub(crate) async fn commit_tree_state_stride(
+        &self,
+        stride: zinder_store::DensifiedTreeStateStride,
+    ) -> Result<TreeStateStrideCommit, Status> {
+        self.request(|reply| CanonicalControlCommand::CommitTreeStateStride {
+            stride: Box::new(stride),
+            reply,
+        })
+        .await
+    }
+
     /// Enqueues one bounded retained-event page read.
     pub async fn event_page(
         &self,
@@ -599,6 +614,13 @@ pub enum CanonicalControlCommand {
         /// One-shot response carrying the resulting retention report.
         reply: oneshot::Sender<Result<MempoolEventRetentionStepOutcome, Status>>,
     },
+    /// Add one densified stride's tree-state checkpoint rows.
+    CommitTreeStateStride {
+        /// Rows a checked replay of one settled stride produced.
+        stride: Box<zinder_store::DensifiedTreeStateStride>,
+        /// One-shot response carrying the rows written.
+        reply: oneshot::Sender<Result<TreeStateStrideCommit, Status>>,
+    },
     /// Read one ordered bounded retained-event page.
     EventPage {
         /// Validated bounded-page input received from the gRPC adapter.
@@ -695,6 +717,10 @@ pub(crate) fn apply_following_canonical_control_command(
         }
         CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
             append_mempool_events(store, events, reply);
+        }
+        CanonicalControlCommand::CommitTreeStateStride { stride, reply } => {
+            commit_tree_state_stride(store, &stride, reply);
+            return CanonicalControlScheduling::YieldToCanonical;
         }
         CanonicalControlCommand::PruneMempoolEvents {
             now,
@@ -827,6 +853,7 @@ pub(crate) fn answer_canonical_control_read(
         }
         write @ (CanonicalControlCommand::AppendMempoolEvent { .. }
         | CanonicalControlCommand::AppendMempoolEvents { .. }
+        | CanonicalControlCommand::CommitTreeStateStride { .. }
         | CanonicalControlCommand::PruneMempoolEvents { .. }
         | CanonicalControlCommand::CreateOwnerCheckpoint { .. }
         | CanonicalControlCommand::AcquireLease { .. }
@@ -901,6 +928,9 @@ pub(crate) fn apply_parked_canonical_control_command(
             send_control_response(reply, Err(halt.status()));
         }
         CanonicalControlCommand::PruneMempoolEvents { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::CommitTreeStateStride { reply, .. } => {
             send_control_response(reply, Err(halt.status()));
         }
         command @ (CanonicalControlCommand::ChainEpoch { .. }
@@ -1019,6 +1049,23 @@ fn prune_mempool_events(
         store
             .advance_mempool_event_retention(now, retention, budget)
             .map_err(|error| map_store_error(&error)),
+    );
+}
+
+fn commit_tree_state_stride(
+    store: &RocksDbCanonicalStore,
+    stride: &zinder_store::DensifiedTreeStateStride,
+    reply: oneshot::Sender<Result<TreeStateStrideCommit, Status>>,
+) {
+    send_control_response(
+        reply,
+        store.commit_tree_state_stride(stride).map_err(|error| {
+            if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
+                Status::data_loss(error.to_string())
+            } else {
+                map_store_error(&error)
+            }
+        }),
     );
 }
 

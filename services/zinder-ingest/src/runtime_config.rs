@@ -53,6 +53,17 @@ impl HistoricalWorkGate {
         }
     }
 
+    /// Creates a gate for a runtime that materializes no views, so only the
+    /// canonical phase decides when historical work may run.
+    #[must_use]
+    pub fn without_materialized_views(readiness: ComposedReadiness) -> Self {
+        metrics::gauge!("zinder_ingest_historical_work_gate_open").set(0.0);
+        Self {
+            readiness,
+            materialized_views_caught_up: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// Returns the writer's readiness composition, whose projected phase drives
     /// materialized-view replay's bulk-catchup phase gate.
     #[must_use]
@@ -367,6 +378,16 @@ mod tests {
         readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
         let outcome = tokio::time::timeout(Duration::from_secs(2), waiter).await;
         assert!(matches!(outcome, Ok(Ok(false))));
+    }
+
+    #[test]
+    fn a_gate_without_materialized_views_opens_once_the_writer_follows_the_tip() {
+        let readiness = composed_in_phase(IngestPhase::BulkCatchup);
+        let gate = HistoricalWorkGate::without_materialized_views(readiness.clone());
+
+        assert!(!gate.is_open());
+        readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+        assert!(gate.is_open());
     }
 
     #[tokio::test]
