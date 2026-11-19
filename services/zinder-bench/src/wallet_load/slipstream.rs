@@ -518,6 +518,8 @@ mod tests {
         WalletProgress, WorkloadSettings,
         calls::{CallFailure, CallRecorder, Connector},
         mock_streamer::{self, MockStreamer, RangeEnding},
+        point_reads::ReadRotation,
+        transport::TlsOptions,
         vizor::VizorProfile,
     };
 
@@ -532,7 +534,7 @@ mod tests {
     ) -> Result<(Result<(), CallFailure>, Arc<CallRecorder>), Box<dyn std::error::Error>> {
         let server = mock_streamer::serve(server).await?;
         let recorder = Arc::new(CallRecorder::default());
-        let connector = Connector::new(&server.url, Arc::clone(&recorder))?;
+        let connector = Connector::new(&server.url, Arc::clone(&recorder), &TlsOptions::default())?;
         let plan = Arc::new(WalletPlan {
             from_height: 1,
             to_height,
@@ -546,7 +548,15 @@ mod tests {
             vizor_profile: VizorProfile::Mobile,
             batch_byte_budget: None,
             rounds: 0,
+            distinct_frontier_heights: Vec::new(),
+            mined_txids: Vec::new(),
+            pending_txids: Vec::new(),
+            missing_tx_checks: 0,
             transparent_addresses: Vec::new(),
+            include_taddress_transactions: false,
+            include_taddress_balance: false,
+            include_address_utxos_unary: false,
+            read_rotation: ReadRotation::default(),
         };
         adjust(&mut settings);
         let synced = sync_wallet(
