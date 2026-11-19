@@ -159,7 +159,7 @@ pub(super) async fn sync_wallet(
     };
     let mut boundaries = std::mem::take(&mut *wallet.boundaries.lock());
     let boundaries_done = match fetched {
-        Ok(()) => join_boundaries(&mut boundaries).await,
+        Ok(()) => join_boundaries(&mut boundaries, &mut failed_boundaries).await,
         Err(failure) => Err(failure),
     };
     // Stop tree-state requests still running before the wallet reports.
@@ -177,9 +177,17 @@ pub(super) async fn sync_wallet(
     Ok(())
 }
 
+/// Waits for the tree-state tasks still running once the blocks are in.
+///
+/// A failed task that `reap_boundaries` already dropped left its failure only
+/// in `failed`, so the channel is checked before the tasks are joined.
 async fn join_boundaries(
     boundaries: &mut JoinSet<Result<(), CallFailure>>,
+    failed: &mut mpsc::UnboundedReceiver<CallFailure>,
 ) -> Result<(), CallFailure> {
+    if let Ok(failure) = failed.try_recv() {
+        return Err(failure);
+    }
     while let Some(joined) = boundaries.join_next().await {
         joined.map_err(|error| CallFailure {
             label: "client_task_failed",
@@ -503,8 +511,8 @@ mod tests {
 
     use super::{
         CHUNK_BLOCKS, CHUNK_RETRIES, DEFAULT_QUEUE_BUDGET_BYTES, DEFAULT_SPLIT_BYTES, DENSITY_WAIT,
-        Dispatcher, Piece, PieceSplitter, WalletPlan, chunk_target_bytes, reap_boundaries,
-        sync_wallet,
+        Dispatcher, Piece, PieceSplitter, WalletPlan, chunk_target_bytes, join_boundaries,
+        reap_boundaries, sync_wallet,
     };
     use crate::wallet_load::{
         WalletProgress, WorkloadSettings,
@@ -608,6 +616,34 @@ mod tests {
 
         assert!(boundaries.is_empty());
         assert!(failed.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tree_state_failure_already_reaped_fails_the_wallet_after_its_blocks() -> TestResult {
+        let (failures, mut failed) = mpsc::unbounded_channel();
+        let mut boundaries = JoinSet::new();
+        let task_failures = failures.clone();
+        boundaries.spawn(async move {
+            let failure = CallFailure {
+                label: "unavailable",
+                detail: "tree state retries exhausted".to_owned(),
+            };
+            let _ = task_failures.send(failure.clone());
+            Err(failure)
+        });
+        // Idle long enough for the failed task to finish, then reap it as a
+        // later piece would.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reap_boundaries(&mut boundaries, &failures);
+        assert!(boundaries.is_empty());
+
+        let joined = join_boundaries(&mut boundaries, &mut failed).await;
+
+        assert_eq!(
+            joined.err().map(|failure| failure.label),
+            Some("unavailable")
+        );
         Ok(())
     }
 
