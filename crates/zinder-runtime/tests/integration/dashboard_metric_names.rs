@@ -19,8 +19,14 @@ const METRICS_REFERENCE: &str = include_str!("../../../../docs/reference/metrics
 const DASHBOARD_DIRECTORY: &str = "../../observability/grafana/dashboards";
 const METRIC_PREFIX: &str = "zinder_";
 
-/// Series suffixes Prometheus adds to a histogram or summary name.
-const DERIVED_SERIES_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count"];
+/// Series suffixes a summary, and a histogram exported as one, adds to its
+/// name.
+const SUMMARY_SERIES_SUFFIXES: &[&str] = &["_sum", "_count"];
+
+/// Histogram names whose recorder configures buckets, as
+/// `crates/zinder-runtime/src/metrics.rs` does; every other histogram exports
+/// as a summary and has no `_bucket` series.
+const BUCKETED_HISTOGRAM_SUFFIX: &str = "_duration_seconds";
 
 #[test]
 fn dashboard_expressions_name_only_documented_metrics() -> Result<()> {
@@ -101,6 +107,19 @@ fn only_histograms_and_summaries_export_derived_series() {
 }
 
 #[test]
+fn only_duration_histograms_export_buckets() {
+    let reference = DocumentedMetrics::parse(
+        "| `zinder_query_request_duration_seconds` | histogram |\n\
+         | `zinder_query_compact_block_range_block_count` | histogram |",
+    );
+
+    assert!(reference.lists("zinder_query_request_duration_seconds_bucket"));
+    assert!(reference.lists("zinder_query_compact_block_range_block_count_count"));
+    assert!(reference.lists("zinder_query_compact_block_range_block_count_sum"));
+    assert!(!reference.lists("zinder_query_compact_block_range_block_count_bucket"));
+}
+
+#[test]
 fn a_dashboard_name_with_a_trailing_underscore_is_checked() {
     let reference = DocumentedMetrics::parse(
         "| `zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs` | gauge |",
@@ -134,7 +153,8 @@ fn a_family_named_in_prose_lists_none_of_its_members() {
 struct DocumentedMetrics {
     names: BTreeSet<String>,
     /// Names whose reference row gives them a histogram or summary type, the
-    /// only kinds that export `_bucket`, `_sum`, and `_count` series.
+    /// only kinds that export `_sum` and `_count` series, and, for a
+    /// bucketed histogram, `_bucket`.
     with_derived_series: BTreeSet<String>,
 }
 
@@ -158,12 +178,14 @@ impl DocumentedMetrics {
     }
 
     fn lists(&self, metric: &str) -> bool {
+        let derived_from = |base: &str| self.with_derived_series.contains(base);
         self.names.contains(metric)
-            || DERIVED_SERIES_SUFFIXES.iter().any(|suffix| {
-                metric
-                    .strip_suffix(suffix)
-                    .is_some_and(|base| self.with_derived_series.contains(base))
-            })
+            || metric
+                .strip_suffix("_bucket")
+                .is_some_and(|base| base.ends_with(BUCKETED_HISTOGRAM_SUFFIX) && derived_from(base))
+            || SUMMARY_SERIES_SUFFIXES
+                .iter()
+                .any(|suffix| metric.strip_suffix(suffix).is_some_and(derived_from))
     }
 }
 
