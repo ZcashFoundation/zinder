@@ -40,7 +40,7 @@ On this page:
 | Fact | Zebra | Zakura | ztreamer | Zingod | Go lightwalletd | Zinder |
 | --- | --- | --- | --- | --- | --- | --- |
 | Kind | Validator with built-in serving | Validator with built-in serving | Indexer on a Zakura validator, which it can also run in its own process (embedded mode, the default) | Indexer on a validator | Indexer on a validator | Indexer on a validator |
-| Version reviewed | zebrad 7.1.0 | zakurad 1.8.9 | 0.1.0, bundling Zakura 1.8.4 | 1.1.0 | 0.6.1 | 0.18.0, unreleased |
+| Version reviewed | zebrad 7.1.0 | zakurad 1.8.9 | 0.1.0, bundling Zakura 1.8.4 | 1.1.0 | 0.6.1 | 0.19.0 |
 
 ztreamer runs in one of two modes. Embedded mode, the default, runs a Zakura
 validator inside the ztreamer process. Remote mode follows one separate Zakura
@@ -369,7 +369,7 @@ restore, and send flows before you rely on a compatibility claim.
 [Zinder compatibility evidence](lightwalletd-compatibility.md#claim-boundary)
 describes the levels of evidence behind Zinder's own compatibility claims.
 
-- [Zinder 0.18.0, unreleased, at `c293095`](https://github.com/ZcashFoundation/zinder/commit/c293095dfab045e731cbe3e6e7f8b5dce4576fdb), and at [`ddd90e8`](https://github.com/ZcashFoundation/zinder/commit/ddd90e89def3376cc77ccff3b5806383585718fc) for the tree-state, request-limit, and transparent-streaming footnotes
+- [Zinder 0.19.0](https://github.com/ZcashFoundation/zinder/releases/tag/v0.19.0): the tree-state, request-limit, and transparent-streaming footnotes at [`ddd90e8`](https://github.com/ZcashFoundation/zinder/commit/ddd90e89def3376cc77ccff3b5806383585718fc), whose code `v0.19.0` releases unchanged, and the other cells at [`c293095`](https://github.com/ZcashFoundation/zinder/commit/c293095dfab045e731cbe3e6e7f8b5dce4576fdb)
 - [Zebra `main` at `86f3ac7`](https://github.com/ZcashFoundation/zebra/commit/86f3ac7e4dcf7644a88222b8678790ed68734e63)
 - [Zakura `main` at `dd25aa4`](https://github.com/zakura-core/zakura/commit/dd25aa429cd97eb1af903b7bc6375fe208132015)
 - [ztreamer `master` at `39b2d12`](https://github.com/zcashlabs/ztreamer/commit/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4)
