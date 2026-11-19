@@ -65,6 +65,35 @@ batch. The batch advances the facts, indexes, chain epoch, chain event, and
 sequence digest together, so a reader never sees part of a transition.
 [Chain ingestion](chain-ingestion.md) describes construction and following.
 
+Construction and every transition check a block's compact block against its
+header before they write either row. A compact-block range read therefore
+reads only `compact_block` and does not read `block_header`. The read first
+checks every requested height against retained history. A height below the
+first retained block or above the visible tip fails the read as an unavailable
+artifact, even when a row is stored for it.
+
+The read then fetches rows with batched point lookups (`MultiGet`):
+
+- An unbounded range read fetches up to 1,024 heights per batch.
+- The tree-state replay fetches up to 16 heights per batch.
+- A byte-bounded read fetches one row first. Each later batch holds as many
+  rows as the budget left fits at the size of the largest row read so far,
+  from 1 to 16.
+
+Each row must decode to the block at its key's height. A height missing inside
+retained history fails the read as store damage.
+
+The read never builds an iterator. `RocksDB` opens every level-0 table file of
+a family to build an iterator, including files that hold no requested height.
+A point lookup checks each level-0 file's key range before it opens the file,
+unless level 0 is the only non-empty level and holds at most three files. A
+point lookup can still open a file that does not hold its key. That happens
+when the file's key range covers the key, or when `RocksDB` skips the range
+check. On a secondary that the primary's compaction has overtaken, a range
+read fails with the missing-table-file error only when one of its lookups
+opens a deleted file. `zinder-query` answers that error by replacing the pair,
+as [ADR-0015](../adrs/0015-wallet-runtime-composition.md) records.
+
 ## Wallet store
 
 The wallet store holds transparent address data. Shielded data, such as

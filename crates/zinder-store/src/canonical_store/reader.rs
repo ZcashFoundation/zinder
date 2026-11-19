@@ -188,10 +188,13 @@ macro_rules! impl_canonical_typed_reads {
 
             /// Reads an inclusive compact-block range in ascending height order.
             ///
-            /// A requested height below the first retained block or above the
-            /// visible tip fails with [`CanonicalStoreError::ArtifactUnavailable`]
-            /// naming that height. A missing row inside that span is store
-            /// damage and fails as [`CanonicalStoreError::PublicationRefused`].
+            /// Every height of `range` is checked against retained history
+            /// before any row is read. A height below the first retained block
+            /// or above the visible tip fails with
+            /// [`CanonicalStoreError::ArtifactUnavailable`] naming the lowest
+            /// such height, even where a row is stored for it. A missing row
+            /// inside that span is store damage and fails as
+            /// [`CanonicalStoreError::PublicationRefused`].
             pub fn compact_blocks_in_range(
                 &self,
                 range: zinder_core::BlockHeightRange,
@@ -463,49 +466,30 @@ pub(super) fn read_compact_block_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-    let Some(encoded_compact_block) = read_optional(
+    read_optional(
         store,
         COMPACT_BLOCK_COLUMN_FAMILY,
         &encode_block_position(height),
         "compact block read",
     )?
-    else {
-        return Ok(None);
-    };
-    let compact_block =
-        crate::decode_compact_block_artifact(&encoded_compact_block).map_err(|_| {
-            CanonicalStoreError::publication(format!(
-                "compact block at height {} is invalid",
-                height.value()
-            ))
-        })?;
-    if compact_block.height() != height {
-        return Err(CanonicalStoreError::publication(
-            "compact block row has the wrong height",
-        ));
-    }
-    Ok(Some(compact_block))
+    .map(|encoded_compact_block| decode_compact_block_row(height, &encoded_compact_block))
+    .transpose()
 }
 
 fn read_compact_blocks_in_range(
     store: &impl CanonicalServingRead,
     range: zinder_core::BlockHeightRange,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-    let ready_evidence = store.serving_ready_evidence();
-    let retained_span = BlockHeightRange::inclusive(
-        ready_evidence.first_retained_block.height,
-        ready_evidence.visible_tip.height,
-    );
     let mut blocks = Vec::new();
-    let mut heights = Vec::with_capacity(COMPACT_BLOCK_MULTI_GET_BATCH_SIZE);
-    for height in range {
-        heights.push(height);
-        if heights.len() == COMPACT_BLOCK_MULTI_GET_BATCH_SIZE {
-            append_compact_block_batch(store, retained_span, &heights, &mut blocks)?;
-            heights.clear();
-        }
-    }
-    append_compact_block_batch(store, retained_span, &heights, &mut blocks)?;
+    visit_compact_block_batches(
+        store,
+        range,
+        COMPACT_BLOCK_MULTI_GET_BATCH_SIZE,
+        |compact_block| {
+            blocks.push(compact_block);
+            Ok(())
+        },
+    )?;
     Ok(blocks)
 }
 
@@ -531,13 +515,7 @@ fn read_compact_blocks_up_to(
     order: HeightOrder,
     max_bytes: usize,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-    let retained_span = retained_compact_block_span(store);
-    if let Some(height) = first_unretained_height(range, retained_span) {
-        return Err(CanonicalStoreError::ArtifactUnavailable {
-            family: crate::ArtifactFamily::CompactBlock,
-            height,
-        });
-    }
+    require_retained_compact_blocks(store, range)?;
     let mut unread = range.start.value()..=range.end.value();
     let mut next_height = || {
         match order {
@@ -560,25 +538,19 @@ fn read_compact_blocks_up_to(
         if batch.is_empty() {
             break;
         }
-        let rows = CompactBlockRows::fetch(store, &batch)?;
-        for ((height, compact_row), header_row) in
-            batch.iter().copied().zip(rows.compact).zip(rows.headers)
-        {
+        let rows = fetch_compact_block_rows(store, &batch)?;
+        for (height, row) in batch.iter().copied().zip(rows) {
             if is_budget_spent(&blocks, kept_bytes) {
                 break 'batches;
             }
-            let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
+            let encoded_compact_block = present_compact_row(height, row)?;
             let row_bytes = encoded_compact_block.len();
             if !blocks.is_empty() && kept_bytes.saturating_add(row_bytes) > max_bytes {
                 break 'batches;
             }
             kept_bytes = kept_bytes.saturating_add(row_bytes);
             largest_row_bytes = largest_row_bytes.max(row_bytes);
-            blocks.push(decode_compact_block_row(
-                height,
-                &encoded_compact_block,
-                header_row,
-            )?);
+            blocks.push(decode_compact_block_row(height, &encoded_compact_block)?);
         }
     }
     if order == HeightOrder::Descending {
@@ -589,33 +561,45 @@ fn read_compact_blocks_up_to(
 
 /// Passes each compact block of `range` to `visit` in ascending height order,
 /// reading rows in multi-get batches of at most
-/// [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`].
+/// [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`], so only one batch of rows is held at
+/// a time.
 ///
-/// Each block is checked against its canonical header as a range read checks
-/// it, and only one batch of rows is held at a time. A height outside retained
-/// history fails with [`CanonicalStoreError::ArtifactUnavailable`], and a
+/// A height outside retained history fails with
+/// [`CanonicalStoreError::ArtifactUnavailable`] before any row is read, and a
 /// missing row inside it fails as store damage.
 pub(super) fn visit_compact_blocks_in_range(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
+    visit: impl FnMut(CompactBlockArtifact) -> Result<(), CanonicalStoreError>,
+) -> Result<(), CanonicalStoreError> {
+    visit_compact_block_batches(store, range, BOUNDED_COMPACT_BLOCK_BATCH_SIZE, visit)
+}
+
+/// Passes each compact block of `range` to `visit` in ascending height order,
+/// reading rows in multi-get batches of at most `batch_len`.
+///
+/// A height outside retained history fails with
+/// [`CanonicalStoreError::ArtifactUnavailable`] before any row is read, and a
+/// missing row inside it fails as store damage.
+fn visit_compact_block_batches(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+    batch_len: usize,
     mut visit: impl FnMut(CompactBlockArtifact) -> Result<(), CanonicalStoreError>,
 ) -> Result<(), CanonicalStoreError> {
-    let retained_span = retained_compact_block_span(store);
-    let heights = range.into_iter().collect::<Vec<_>>();
-    for batch in heights.chunks(BOUNDED_COMPACT_BLOCK_BATCH_SIZE) {
-        let rows = CompactBlockRows::fetch(store, batch)?;
-        for ((height, compact_row), header_row) in
-            batch.iter().copied().zip(rows.compact).zip(rows.headers)
-        {
-            let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
-            visit(decode_compact_block_row(
-                height,
-                &encoded_compact_block,
-                header_row,
-            )?)?;
+    require_retained_compact_blocks(store, range)?;
+    let mut heights = range.into_iter();
+    loop {
+        let batch = heights.by_ref().take(batch_len).collect::<Vec<_>>();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let rows = fetch_compact_block_rows(store, &batch)?;
+        for (height, row) in batch.iter().copied().zip(rows) {
+            let encoded_compact_block = present_compact_row(height, row)?;
+            visit(decode_compact_block_row(height, &encoded_compact_block)?)?;
         }
     }
-    Ok(())
 }
 
 /// Rows the next batch of a byte-bounded read fetches.
@@ -633,6 +617,25 @@ fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize 
         .checked_div(largest_row_bytes)
         .unwrap_or(1)
         .clamp(1, BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
+}
+
+/// Fails with [`CanonicalStoreError::ArtifactUnavailable`] naming the lowest
+/// height of `range` below the first retained block or above the visible tip.
+///
+/// A range read checks this before it reads any row, so a row stored outside
+/// that span, such as one above the visible tip of the admitted epoch, is
+/// never served.
+fn require_retained_compact_blocks(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+) -> Result<(), CanonicalStoreError> {
+    if let Some(height) = first_unretained_height(range, retained_compact_block_span(store)) {
+        return Err(CanonicalStoreError::ArtifactUnavailable {
+            family: crate::ArtifactFamily::CompactBlock,
+            height,
+        });
+    }
+    Ok(())
 }
 
 /// Heights from the first retained block through the visible tip.
@@ -661,90 +664,52 @@ fn first_unretained_height(
     }
 }
 
-/// The compact-block and header rows of one batch of heights, in batch order.
-struct CompactBlockRows<'db> {
-    compact: Vec<Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>>,
-    headers: Vec<Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>>,
-}
+/// One fetched compact-block row: absent, present, or the lookup's failure.
+type CompactBlockRow<'db> = Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>;
 
-impl<'db> CompactBlockRows<'db> {
-    fn fetch(
-        store: &'db impl CanonicalServingRead,
-        heights: &[BlockHeight],
-    ) -> Result<Self, CanonicalStoreError> {
-        let db = &store.serving_open().db;
-        let compact_family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-        let header_family = column_family(db, BLOCK_HEADER_COLUMN_FAMILY)?;
-        let keys = heights
-            .iter()
-            .copied()
-            .map(encode_block_position)
-            .collect::<Vec<_>>();
-        let is_sorted = heights.is_sorted();
-        Ok(Self {
-            compact: db.batched_multi_get_cf_slice(
-                &compact_family,
-                keys.iter().map(<[u8; 4]>::as_slice),
-                is_sorted,
-            ),
-            headers: db.batched_multi_get_cf_slice(
-                &header_family,
-                keys.iter().map(<[u8; 4]>::as_slice),
-                is_sorted,
-            ),
-        })
-    }
-}
-
-fn append_compact_block_batch(
-    store: &impl CanonicalServingRead,
-    retained_span: BlockHeightRange,
+/// Fetches the `compact_block` rows of one batch of heights with one multi-get,
+/// in batch order, reading no other family.
+fn fetch_compact_block_rows<'db>(
+    store: &'db impl CanonicalServingRead,
     heights: &[BlockHeight],
-    blocks: &mut Vec<CompactBlockArtifact>,
-) -> Result<(), CanonicalStoreError> {
-    if heights.is_empty() {
-        return Ok(());
-    }
-    let rows = CompactBlockRows::fetch(store, heights)?;
-    for ((height, compact_row), header_row) in
-        heights.iter().copied().zip(rows.compact).zip(rows.headers)
-    {
-        let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
-        blocks.push(decode_compact_block_row(
-            height,
-            &encoded_compact_block,
-            header_row,
-        )?);
-    }
-    Ok(())
+) -> Result<Vec<CompactBlockRow<'db>>, CanonicalStoreError> {
+    let db = &store.serving_open().db;
+    let family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let keys = heights
+        .iter()
+        .copied()
+        .map(encode_block_position)
+        .collect::<Vec<_>>();
+    Ok(db.batched_multi_get_cf_slice(
+        &family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        heights.is_sorted(),
+    ))
 }
 
+/// Returns a fetched row, failing on its lookup error or, since the range was
+/// checked against retained history first, as store damage when it is absent.
 fn present_compact_row(
-    retained_span: BlockHeightRange,
     height: BlockHeight,
-    compact_row: Result<Option<rust_rocksdb::DBPinnableSlice<'_>>, rust_rocksdb::Error>,
+    row: CompactBlockRow<'_>,
 ) -> Result<rust_rocksdb::DBPinnableSlice<'_>, CanonicalStoreError> {
-    compact_row
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "compact block read",
-            source,
-        })?
-        .ok_or_else(|| absent_compact_block(retained_span, height))
+    row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+        operation: "compact block read",
+        source,
+    })?
+    .ok_or_else(|| missing_compact_block_row(height))
 }
 
-/// Decodes one compact-block row and checks it against its canonical header.
+/// Decodes one compact-block row and checks it holds the block at its key's
+/// height.
+///
+/// The row is not checked against the `block_header` row: construction and
+/// every live transition write the two only after checking that they name the
+/// same block, so a serving read takes the compact block on its own.
 fn decode_compact_block_row(
     height: BlockHeight,
     encoded_compact_block: &[u8],
-    header_row: Result<Option<rust_rocksdb::DBPinnableSlice<'_>>, rust_rocksdb::Error>,
 ) -> Result<CompactBlockArtifact, CanonicalStoreError> {
-    let encoded_header = header_row
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block header read",
-            source,
-        })?
-        .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
-    let header = decode_block_header(height, &encoded_header)?;
     let compact_block =
         crate::decode_compact_block_artifact(encoded_compact_block).map_err(|_| {
             CanonicalStoreError::publication(format!(
@@ -752,33 +717,23 @@ fn decode_compact_block_row(
                 height.value()
             ))
         })?;
-    if compact_block.height() != height || compact_block.block_hash() != header.block_hash {
+    if compact_block.height() != height {
         return Err(CanonicalStoreError::publication(
-            "compact block row does not match its canonical header",
+            "compact block row has the wrong height",
         ));
     }
     Ok(compact_block)
 }
 
-/// Classifies a missing compact-block row by the retained span it falls in.
+/// Reports a missing compact-block row at a height inside retained history.
 ///
-/// Outside the span the store never held the height. Inside it, publication
-/// and live commits write a row for every height, so absence is store damage.
-fn absent_compact_block(
-    retained_span: BlockHeightRange,
-    height: BlockHeight,
-) -> CanonicalStoreError {
-    if height < retained_span.start || height > retained_span.end {
-        CanonicalStoreError::ArtifactUnavailable {
-            family: crate::ArtifactFamily::CompactBlock,
-            height,
-        }
-    } else {
-        CanonicalStoreError::publication(format!(
-            "compact block at height {} is absent",
-            height.value()
-        ))
-    }
+/// Publication and live commits write a row for every retained height, so
+/// absence there is store damage.
+fn missing_compact_block_row(height: BlockHeight) -> CanonicalStoreError {
+    CanonicalStoreError::publication(format!(
+        "compact block at height {} is absent",
+        height.value()
+    ))
 }
 
 fn read_transaction_location(
