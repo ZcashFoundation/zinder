@@ -42,6 +42,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `WalletServingPairPublisher` | The reader-process owner that catches up, admits, and publishes serving pairs. | `zinder-query` |
 | `WalletQueryApi` | The wallet read and broadcast trait that the gRPC adapters call. | `zinder-query` |
 | `WalletServingQuery` | The `WalletQueryApi` implementation over a replaceable serving pair. The native and lightwalletd-compatible runtimes share it. | `zinder-query` |
+| `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload, and the lightwalletd adapter hex-encodes each pool, so neither parses the other's encoding. | `zinder-query` |
 | `NativeWalletEndpointCapabilities` | The immutable capability set a native query derives once storage and providers are admitted. | `zinder-query` |
 | `MaterializedViewConsumer` | An explorer view builder that applies retained chain events. | `zinder-materialized-views` |
 | `MaterializedViewStore` | The separate store for materialized-view rows, cursors, coverage, and schemas. | `zinder-materialized-views` |

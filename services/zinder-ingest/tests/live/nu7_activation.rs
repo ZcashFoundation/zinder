@@ -519,7 +519,7 @@ impl ServedChain {
                 .tree_state_at(BlockHeight::new(height), None)
                 .await?;
             let zinder_payload: serde_json::Value =
-                serde_json::from_slice(&tree_state.payload_bytes)?;
+                serde_json::from_slice(&tree_state.encode_json_payload()?)?;
             let node_payload = regtest_json_rpc_call(
                 env,
                 "z_gettreestate",

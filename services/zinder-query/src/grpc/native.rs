@@ -264,7 +264,7 @@ pub async fn tree_state_at_response<Q: WalletQueryApi + ?Sized>(
     query_api
         .tree_state_at(height, at_epoch_id)
         .await
-        .map(build_tree_state_response)
+        .and_then(|tree_state| build_tree_state_response(&tree_state))
 }
 
 /// Reads the latest tree-state and encodes the native wallet response.
@@ -275,7 +275,7 @@ pub async fn latest_tree_state_checkpoint_response<Q: WalletQueryApi + ?Sized>(
     query_api
         .latest_tree_state_checkpoint(at_epoch_id)
         .await
-        .map(build_tree_state_response)
+        .and_then(|tree_state| build_tree_state_response(&tree_state))
 }
 
 /// Reads subtree roots in `subtree_root_range` and encodes the native wallet response.
@@ -628,14 +628,17 @@ fn build_mined_block_location_message(
     }
 }
 
-fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse {
-    wallet::TreeStateResponse {
+fn build_tree_state_response(
+    tree_state: &TreeState,
+) -> Result<wallet::TreeStateResponse, QueryError> {
+    let payload_bytes = tree_state.encode_json_payload()?;
+    Ok(wallet::TreeStateResponse {
         chain_view: Some(build_chain_view_message(tree_state.chain_epoch)),
         height: tree_state.height.value(),
         block_hash: encode_rpc_block_hash_hex(tree_state.block_hash),
-        payload_bytes: tree_state.payload_bytes,
+        payload_bytes,
         block_time_seconds: Some(tree_state.block_time_seconds),
-    }
+    })
 }
 
 fn build_subtree_roots_response(

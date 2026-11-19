@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
@@ -1034,7 +1033,7 @@ where
             .await
             .map_err(|error| tree_state_status(&error))?;
 
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
+        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
     }
 
     async fn get_latest_tree_state(
@@ -1047,7 +1046,7 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
+        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
     }
 
     type GetSubtreeRootsStream = GrpcStream<lightwalletd::SubtreeRoot>;
@@ -2251,39 +2250,28 @@ fn subtree_roots_status(error: &QueryError) -> Status {
     status_from_query_error(error)
 }
 
-fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeState, Status> {
-    let payload: Value = serde_json::from_slice(&tree_state.payload_bytes).map_err(|source| {
-        Status::data_loss(format!("indexed tree-state payload is not JSON: {source}"))
-    })?;
-
-    Ok(lightwalletd::TreeState {
+fn lightwalletd_tree_state(tree_state: &TreeState) -> lightwalletd::TreeState {
+    lightwalletd::TreeState {
         network: encode_bip70_chain_name(tree_state.chain_epoch.network).to_owned(),
         height: u64::from(tree_state.height.value()),
         hash: encode_rpc_block_hash_hex(tree_state.block_hash),
         time: tree_state.block_time_seconds,
-        sapling_tree: tree_state_pool_final_state(&payload, "sapling")?,
-        orchard_tree: tree_state_pool_final_state(&payload, "orchard")?,
-        ironwood_tree: tree_state_pool_final_state(&payload, "ironwood")?,
-    })
-}
-
-/// Returns one pool's `finalState`, or an empty string for a pool the tree
-/// state omits because it is not active yet.
-///
-/// The payload is the one `WalletServingQuery` derives from stored frontiers,
-/// which gives every active pool a `commitments.finalState` string.
-fn tree_state_pool_final_state(payload: &Value, pool_name: &'static str) -> Result<String, Status> {
-    let Some(pool) = payload.get(pool_name) else {
-        return Ok(String::new());
-    };
-    pool.pointer("/commitments/finalState")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            Status::data_loss(format!(
-                "{pool_name} tree state is missing its commitments.finalState string"
-            ))
-        })
+        sapling_tree: tree_state
+            .frontiers
+            .sapling_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+        orchard_tree: tree_state
+            .frontiers
+            .orchard_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+        ironwood_tree: tree_state
+            .frontiers
+            .ironwood_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+    }
 }
 
 fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd::SubtreeRoot> {
@@ -2926,21 +2914,25 @@ mod tests {
         assert_eq!(none_pending.upgrade_height, 0);
     }
 
-    fn tree_state_with_payload(payload: &[u8]) -> TreeState {
+    fn tree_state_with_frontiers(frontiers: zinder_query::TreeStateFrontiers) -> TreeState {
         TreeState {
             chain_epoch: test_chain_epoch(),
             height: BlockHeight::new(1),
             block_hash: BlockHash::from_bytes([1; 32]),
             block_time_seconds: 1_774_668_401,
-            payload_bytes: payload.to_vec(),
+            frontiers,
         }
     }
 
     #[test]
-    fn tree_state_maps_every_pool_final_state_and_the_typed_identity() -> Result<(), Status> {
-        let tree_state = lightwalletd_tree_state(&tree_state_with_payload(
-            br#"{"sapling":{"commitments":{"finalState":"aa"}},"orchard":{"commitments":{"finalState":"bb"}},"ironwood":{"commitments":{"finalState":"cc"}}}"#,
-        ))?;
+    fn tree_state_maps_every_pool_final_state_and_the_typed_identity() {
+        let tree_state = lightwalletd_tree_state(&tree_state_with_frontiers(
+            zinder_query::TreeStateFrontiers {
+                sapling_final_state: Some(vec![0xaa]),
+                orchard_final_state: Some(vec![0xbb]),
+                ironwood_final_state: Some(vec![0xcc]),
+            },
+        ));
 
         assert_eq!(
             tree_state.network,
@@ -2955,37 +2947,21 @@ mod tests {
         assert_eq!(tree_state.sapling_tree, "aa");
         assert_eq!(tree_state.orchard_tree, "bb");
         assert_eq!(tree_state.ironwood_tree, "cc");
-        Ok(())
     }
 
     #[test]
-    fn tree_state_reports_an_inactive_pool_as_an_empty_tree() -> Result<(), Status> {
-        let tree_state = lightwalletd_tree_state(&tree_state_with_payload(
-            br#"{"sapling":{"commitments":{"finalState":"000000"}}}"#,
-        ))?;
+    fn tree_state_reports_an_inactive_pool_as_an_empty_tree() {
+        let tree_state = lightwalletd_tree_state(&tree_state_with_frontiers(
+            zinder_query::TreeStateFrontiers {
+                sapling_final_state: Some(vec![0x00, 0x00, 0x00]),
+                orchard_final_state: None,
+                ironwood_final_state: None,
+            },
+        ));
 
         assert_eq!(tree_state.sapling_tree, "000000");
         assert_eq!(tree_state.orchard_tree, "");
         assert_eq!(tree_state.ironwood_tree, "");
-        Ok(())
-    }
-
-    #[test]
-    fn tree_state_reports_a_malformed_payload_as_data_loss() {
-        for payload in [
-            b"not json".as_slice(),
-            br#"{"sapling":[]}"#,
-            br#"{"sapling":{"commitments":[]}}"#,
-            br#"{"sapling":{"commitments":{}}}"#,
-            br#"{"orchard":{"commitments":{"finalState":7}}}"#,
-        ] {
-            let outcome = lightwalletd_tree_state(&tree_state_with_payload(payload));
-            assert!(
-                matches!(&outcome, Err(status) if status.code() == tonic::Code::DataLoss),
-                "payload {} must be refused as data loss, got {outcome:?}",
-                String::from_utf8_lossy(payload)
-            );
-        }
     }
 
     #[test]

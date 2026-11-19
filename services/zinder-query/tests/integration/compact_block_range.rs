@@ -99,10 +99,10 @@ async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin()
     assert_eq!(response.height, tip.height);
     assert_eq!(response.block_hash, tip.hash);
     assert_eq!(response.block_time_seconds, tip.block_time_seconds);
-    let payload: serde_json::Value = serde_json::from_slice(&response.payload_bytes)?;
     assert!(
-        payload.get("sapling").is_some(),
-        "the live-appended checkpoint must carry the active Sapling frontier, got {payload}"
+        response.frontiers.sapling_final_state.is_some(),
+        "the live-appended checkpoint must carry the active Sapling frontier, got {:?}",
+        response.frontiers
     );
     Ok(())
 }

@@ -20,7 +20,6 @@ hex.workspace = true
 prost.workspace = true
 metrics.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
@@ -44,6 +43,7 @@ eyre.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 secrecy.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
