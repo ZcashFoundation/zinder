@@ -237,7 +237,9 @@ not check descriptions or defaults.
 | `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS` | zinder-compat-lightwalletd | Optional | `compat.pair_convergence_attempts` | Maximum bounded attempts to converge and admit compatibility's wallet-serving pair or compact-serving canonical secondary. Must be in 1..=64; defaults to 12. |
-| `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; defaults to 100. |
+| `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must be in 1..=65536; defaults to 100. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 1..=256; defaults to 64. |
 | `ZINDER_COMPAT__PING_VERY_INSECURE` | zinder-compat-lightwalletd | Optional | `compat.ping_very_insecure` | Answers the lightwalletd `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only on a server you are load testing. Defaults to false, which refuses `Ping` with `FAILED_PRECONDITION`. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.block_cache_bytes` | Materialized-view store RocksDB block cache budget in bytes. Defaults to 268435456 for writers and 67108864 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_wal_bytes` | Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 16777216 for readers. |
@@ -383,7 +385,7 @@ has a bound.
 | Raw transaction for broadcast | 2,000,000 bytes | `BROADCAST_TRANSACTION_TOO_LARGE` |
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
 | Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `RESOURCE_EXHAUSTED`, no reason |
-| Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` |
+| Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`, `compat.tree_state_replay_wait_ms` in wallet-serving `zinder-compat-lightwalletd`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot` and `compat.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd `GetTreeState` |
 
 The broadcast budget covers native `BroadcastTransaction` and lightwalletd
 `SendTransaction`. A broadcast holds its transaction's bytes until the node
@@ -391,7 +393,8 @@ answers or the broadcast times out. One that does not fit is refused at once,
 without reaching any node. The budget always fits one maximum-size
 transaction.
 
-`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`
+`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`,
+`compat.tree_state_replay_wait_ms`, `compat.tree_state_replay_waiters_per_slot`,
 and `compat.ping_very_insecure`, which
 [Lightwalletd compatibility](lightwalletd-compatibility.md) describes with the
 methods they govern.

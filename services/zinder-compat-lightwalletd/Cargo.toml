@@ -53,6 +53,7 @@ zcash_protocol = { workspace = true, features = ["std"] }
 zinder-ingest.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true
+zinder-wallet-projection.workspace = true
 
 [[bin]]
 name = "zinder-compat-lightwalletd"

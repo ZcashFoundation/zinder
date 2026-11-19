@@ -33,8 +33,8 @@ listen_addr = "0.0.0.0:9067"
 reorg_window_blocks = 1000
 pair_convergence_attempts = 12
 # Maximum concurrent GetBlockRange and GetBlockRangeNullifiers streams the
-# compatibility server serves; a valid request past it fails with
-# RESOURCE_EXHAUSTED. Size it to the container memory as
+# compatibility server serves; a valid request past it waits up to 10 seconds
+# for a slot, then fails with UNAVAILABLE. Size it to the container memory as
 # docs/reference/lightwalletd-compatibility.md describes.
 max_concurrent_block_range_streams = 100
 # Answer the lightwalletd Ping load-testing RPC, as lightwalletd

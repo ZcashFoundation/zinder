@@ -1,0 +1,6 @@
+kind: changed
+body: "A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` request past `compat.max_concurrent_block_range_streams` now waits up to 10 seconds for a slot and then fails with `UNAVAILABLE`, instead of failing at once with `RESOURCE_EXHAUSTED`, as lightwalletd does; at most as many requests wait as the limit has slots. A lightwalletd `GetTreeState` whose rebuild finds no free slot within `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default) also fails with `UNAVAILABLE`, and one that finds every waiting place taken fails at once; `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` keeps `RESOURCE_EXHAUSTED`. `zinder_compat_block_range_stream_refusals_total` gains a `reason` label, and new series time each block-range chunk's read, conversion, and wait for the client."
+time: 2026-11-19T03:22:05.496681742Z
+custom:
+    Bump: minor
+    PR: "317"

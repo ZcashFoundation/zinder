@@ -1164,8 +1164,30 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` \
                       streams the compatibility server serves. A valid request past the limit \
-                      fails with `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; \
-                      defaults to 100.",
+                      waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must \
+                      be in 1..=65536; defaults to 100.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
+        toml_path: "compat.tree_state_replay_wait_ms",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot \
+                      before it is refused with `UNAVAILABLE`. Wallet serving only; \
+                      compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at \
+                      once; defaults to 2000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+        toml_path: "compat.tree_state_replay_waiters_per_slot",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; \
+                      a rebuild that finds every waiting place taken fails at once with \
+                      `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. \
+                      Must be in 1..=256; defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",
@@ -1912,6 +1934,8 @@ mod tests {
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
+                "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
+                "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
             ]
         );

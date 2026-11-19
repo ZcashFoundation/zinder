@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
-    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdPing,
-    compact_transaction_has_payload,
+    BlockRangeStage, BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    LightwalletdPing, compact_transaction_has_payload,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, CompactBlockArtifact,
@@ -721,7 +721,8 @@ impl CompactBlockAdapter {
         mut self,
         max_streams: NonZeroU32,
     ) -> Self {
-        self.block_range_streams = BlockRangeStreamLimit::new(max_streams);
+        self.block_range_streams = BlockRangeStreamLimit::new(max_streams)
+            .with_max_wait(self.block_range_streams.max_wait());
         self
     }
 
@@ -863,7 +864,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
             BlockHeightRange::inclusive(start, end)
         };
         let pool_selection = pool_selection_from_request(&request.pool_types)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let reader = self.reader();
         let epoch = reader.chain_epoch().map_err(store_status)?;
         if range.end > epoch.visible_tip_height {
@@ -1049,6 +1050,36 @@ struct ChunkEncoding {
 
 type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
 
+/// How long one chunk spent in each stage that runs on the blocking pool,
+/// for the stages that ran.
+///
+/// The blocking closure measures the stages and the async caller records
+/// them, so the samples reach the recorder of the task that serves the
+/// stream.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkTimings {
+    read: Option<Duration>,
+    convert: Option<Duration>,
+}
+
+impl ChunkTimings {
+    fn record(self) {
+        if let Some(read) = self.read {
+            BlockRangeStage::Read.record(read);
+        }
+        if let Some(convert) = self.convert {
+            BlockRangeStage::Convert.record(convert);
+        }
+    }
+}
+
+/// Runs `stage_work` and returns its output and how long it took.
+fn timed<Output>(stage_work: impl FnOnce() -> Output) -> (Output, Duration) {
+    let started_at = std::time::Instant::now();
+    let output = stage_work();
+    (output, started_at.elapsed())
+}
+
 /// Reads and encodes the first chunk of a range at `reader`, the generation
 /// the request's bounds were checked against.
 ///
@@ -1060,38 +1091,52 @@ type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
 /// request.
 async fn read_first_chunk(
     reader: Arc<RocksDbCanonicalSecondary>,
+    chunks: BlockRangeChunks,
+    chain_epoch_id: ChainEpochId,
+    encoding: ChunkEncoding,
+) -> Result<FirstChunk, Status> {
+    let (first_chunk, timings) = tokio::task::spawn_blocking(move || {
+        let mut timings = ChunkTimings::default();
+        let first_chunk =
+            read_and_encode_first_chunk(reader, chunks, chain_epoch_id, encoding, &mut timings);
+        (first_chunk, timings)
+    })
+    .await
+    .map_err(|error| range_worker_failed(&error))?;
+    timings.record();
+    first_chunk
+}
+
+type FirstChunk = (
+    ChunkMessages,
+    Option<(BlockRangeChunks, BlockRangeContinuity)>,
+);
+
+fn read_and_encode_first_chunk(
+    reader: Arc<RocksDbCanonicalSecondary>,
     mut chunks: BlockRangeChunks,
     chain_epoch_id: ChainEpochId,
     encoding: ChunkEncoding,
-) -> Result<
-    (
-        ChunkMessages,
-        Option<(BlockRangeChunks, BlockRangeContinuity)>,
-    ),
-    Status,
-> {
-    tokio::task::spawn_blocking(move || {
-        let Some(chunk) = chunks.next_chunk() else {
-            return Ok((Vec::new(), None));
-        };
-        let blocks = read_chunk_blocks(&reader, chunk, &chunks)?;
-        drop(reader);
-        chunks.advance(blocks.len());
-        let later_chunks = chunks
-            .has_remaining()
-            .then(|| {
-                BlockRangeContinuity::after_first_chunk(
-                    &blocks,
-                    chain_epoch_id,
-                    encoding.descending,
-                )
+    timings: &mut ChunkTimings,
+) -> Result<FirstChunk, Status> {
+    let Some(chunk) = chunks.next_chunk() else {
+        return Ok((Vec::new(), None));
+    };
+    let (blocks, read) = timed(|| read_chunk_blocks(&reader, chunk, &chunks));
+    timings.read = Some(read);
+    let blocks = blocks?;
+    drop(reader);
+    chunks.advance(blocks.len());
+    let later_chunks = chunks
+        .has_remaining()
+        .then(|| {
+            BlockRangeContinuity::after_first_chunk(&blocks, chain_epoch_id, encoding.descending)
                 .map(|continuity| (chunks, continuity))
-            })
-            .transpose()?;
-        Ok((encode_blocks(&blocks, encoding)?, later_chunks))
-    })
-    .await
-    .map_err(|error| range_worker_failed(&error))?
+        })
+        .transpose()?;
+    let (messages, convert) = timed(|| encode_blocks(&blocks, encoding));
+    timings.convert = Some(convert);
+    Ok((messages?, later_chunks))
 }
 
 /// Streams every chunk after the first, each read at the generation current
@@ -1111,18 +1156,22 @@ async fn stream_later_chunks(
         let read = tokio::task::spawn_blocking({
             let slot = slot.clone();
             move || {
-                let messages = read_later_chunk(&slot, &mut chunks, &mut continuity, encoding);
-                (chunks, continuity, messages)
+                let mut timings = ChunkTimings::default();
+                let messages =
+                    read_later_chunk(&slot, &mut chunks, &mut continuity, encoding, &mut timings);
+                (chunks, continuity, messages, timings)
             }
         })
         .await;
         let messages = match read {
-            Ok((next_chunks, next_continuity, Ok(messages))) => {
+            Ok((next_chunks, next_continuity, Ok(messages), timings)) => {
+                timings.record();
                 chunks = next_chunks;
                 continuity = next_continuity;
                 messages
             }
-            Ok((_, _, Err(status))) => {
+            Ok((_, _, Err(status), timings)) => {
+                timings.record();
                 let _ = sink.send(Err(status)).await;
                 return;
             }
@@ -1131,10 +1180,18 @@ async fn stream_later_chunks(
                 return;
             }
         };
-        for message in messages {
-            if sink.send(message).await.is_err() {
-                return;
-            }
+        let sent_chunk = BlockRangeStage::Send
+            .time_async(async {
+                for message in messages {
+                    if sink.send(message).await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await;
+        if !sent_chunk {
+            return;
         }
     }
 }
@@ -1146,6 +1203,7 @@ fn read_later_chunk(
     chunks: &mut BlockRangeChunks,
     continuity: &mut BlockRangeContinuity,
     encoding: ChunkEncoding,
+    timings: &mut ChunkTimings,
 ) -> Result<ChunkMessages, Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok(Vec::new());
@@ -1153,11 +1211,15 @@ fn read_later_chunk(
     let reader = slot.capture();
     let epoch = reader.chain_epoch().map_err(store_status)?;
     continuity.check_view_reaches(chunk, &epoch)?;
-    let blocks = read_chunk_blocks(&reader, chunk, chunks)?;
+    let (blocks, read) = timed(|| read_chunk_blocks(&reader, chunk, chunks));
+    timings.read = Some(read);
+    let blocks = blocks?;
     drop(reader);
     continuity.advance(chunk, &epoch, &blocks)?;
     chunks.advance(blocks.len());
-    encode_blocks(&blocks, encoding)
+    let (messages, convert) = timed(|| encode_blocks(&blocks, encoding));
+    timings.convert = Some(convert);
+    messages
 }
 
 /// Reads the blocks of `chunk` that fit one chunk's byte budget, from the
@@ -3193,6 +3255,31 @@ mod tests {
         Ok(())
     }
 
+    /// A later chunk whose read does not continue the sent chain still
+    /// records its read, as a first chunk and every wallet-serving read do,
+    /// and records no conversion or send, because neither ran.
+    #[tokio::test]
+    async fn a_later_chunk_that_ends_the_stream_records_its_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+
+        let reorged = stream_across_reorg(1_990, 2_050).await?;
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::Aborted)
+        );
+
+        // Chunks 1 and 2 are sent; chunk 3 is read and fails the hash link.
+        let rendered = metrics_handle.render();
+        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
+        assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(2));
+        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(1));
+        Ok(())
+    }
+
     /// A reorg that leaves the visible tip below a height still to send ends
     /// the stream with `OUT_OF_RANGE`, not the `NOT_FOUND` of a read above the
     /// tip.
@@ -3210,13 +3297,13 @@ mod tests {
         Ok(())
     }
 
-    /// Compact-blocks serving refuses a block-range stream past the
-    /// process-wide limit with `RESOURCE_EXHAUSTED`, after it rejects a
-    /// malformed request.
+    /// Compact-blocks serving refuses a block-range stream that waited past
+    /// its admission wait with `UNAVAILABLE`, after it rejects a malformed
+    /// request.
     ///
     /// A stream wider than one chunk keeps its slot while its reader runs.
     /// Once the client drops the stream, the slot returns when the reader
-    /// stops.
+    /// stops, and a waiting request takes it.
     #[tokio::test]
     async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3232,6 +3319,7 @@ mod tests {
             .adapter
             .clone()
             .with_max_concurrent_block_range_streams(std::num::NonZeroU32::MIN);
+        let impatient = impatient_clone(&adapter);
 
         let mut stream = adapter
             .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
@@ -3239,12 +3327,12 @@ mod tests {
             .into_inner();
         let mut blocks = Vec::new();
         read_blocks(&mut stream, &mut blocks, 1).await?;
-        let refused = adapter
+        let refused = impatient
             .get_block_range(Request::new(block_range(1, 4)))
             .await;
         assert_eq!(
             refused.err().map(|status| status.code()),
-            Some(Code::ResourceExhausted)
+            Some(Code::Unavailable)
         );
         // A malformed request is rejected before it takes a slot.
         let malformed = adapter
@@ -3260,36 +3348,38 @@ mod tests {
 
         drop(stream);
         // The test runtime has one thread, so the reader of later chunks has
-        // not run since the stream was dropped. It still holds the slot.
-        let held = adapter
-            .get_block_range(Request::new(block_range(1, 4)))
-            .await;
-        assert_eq!(
-            held.err().map(|status| status.code()),
-            Some(Code::ResourceExhausted),
+        // not run since the stream was dropped. It still holds the slot, so
+        // the next request waits until the reader stops.
+        // Admission takes a free slot on its first poll, so a pending first
+        // poll shows that the slot is still taken, without yielding to the
+        // reader.
+        let mut admission = Box::pin(adapter.block_range_streams.open());
+        assert!(
+            poll_once(&mut admission).is_pending(),
             "the reader of a dropped stream must keep its slot until it stops"
         );
-        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match adapter
-                    .get_block_range(Request::new(block_range(1, 4)))
-                    .await
-                {
-                    Ok(response) => return Ok(response.into_inner()),
-                    Err(status) if status.code() == Code::ResourceExhausted => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-        })
-        .await??;
+        drop(admission);
+        let next = adapter.get_block_range(Request::new(block_range(1, 4)));
+        let admitted = tokio::time::timeout(Duration::from_secs(10), next)
+            .await??
+            .into_inner();
         let mut admitted = admitted;
         let mut short_blocks = Vec::new();
         read_blocks(&mut admitted, &mut short_blocks, usize::MAX).await?;
         assert_linked_from_genesis(&short_blocks, 4);
         drop(admitted);
         harness.stop().await
+    }
+
+    /// Returns a clone of `adapter` that shares its block-range slots but
+    /// waits only briefly for one, so a test can observe a refusal quickly.
+    fn impatient_clone(adapter: &CompactBlockAdapter) -> CompactBlockAdapter {
+        let mut impatient = adapter.clone();
+        impatient.block_range_streams = impatient
+            .block_range_streams
+            .clone()
+            .with_max_wait(Duration::from_millis(50));
+        impatient
     }
 
     /// Polls `call` once, so a test can cancel it where it first waits.
@@ -3345,12 +3435,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let refused = poll_once(&mut adapter.get_block_range(Request::new(block_range(1, 4))));
+        let mut waiting = adapter.get_block_range(Request::new(block_range(1, 4)));
         assert!(
-            matches!(
-                &refused,
-                std::task::Poll::Ready(Err(status)) if status.code() == Code::ResourceExhausted
-            ),
+            poll_once(&mut waiting).is_pending(),
             "a request cancelled during its first read must keep its slot while the read runs"
         );
         assert_eq!(
@@ -3361,21 +3448,9 @@ mod tests {
 
         let _ = release_gate.send(());
         gate_thread.await?;
-        let mut admitted = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match adapter
-                    .get_block_range(Request::new(block_range(1, 4)))
-                    .await
-                {
-                    Ok(response) => return Ok(response.into_inner()),
-                    Err(status) if status.code() == Code::ResourceExhausted => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-        })
-        .await??;
+        let mut admitted = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await??
+            .into_inner();
         assert_eq!(
             generation.strong_count(),
             1,
@@ -3482,6 +3557,27 @@ mod tests {
         } else {
             Err(mismatches.join("\n").into())
         }
+    }
+
+    /// A first chunk whose read fails records the read it attempted and no
+    /// conversion, because nothing was converted.
+    #[tokio::test]
+    async fn a_failed_first_read_records_no_convert_stage() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+        let (reader, _fixture) = large_block_reader(&large_block_chain(None)?)?;
+        let adapter = adapter_serving(&reader);
+
+        let outcome = range_parity_blocks(&adapter, 0, 1, Vec::new()).await;
+        assert!(outcome.is_err(), "unretained height 0 must fail the read");
+
+        let rendered = metrics_handle.render();
+        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(1));
+        assert_eq!(block_range_stage_samples(&rendered, "convert"), None);
+        Ok(())
     }
 
     const RANGE_PARITY_TIP: u32 = 4;
@@ -3779,6 +3875,51 @@ mod tests {
         assert!(
             descending == one_block_reads,
             "a descending stream must send the one-block reads in reverse"
+        );
+        Ok(())
+    }
+
+    /// Returns how many samples `rendered` holds for the block-range `stage`.
+    fn block_range_stage_samples(rendered: &str, stage: &str) -> Option<u64> {
+        let series =
+            format!("zinder_compat_block_range_stage_duration_seconds_count{{stage=\"{stage}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
+    }
+
+    /// Each chunk records how long it took to read and to convert, although
+    /// both run on the blocking pool.
+    ///
+    /// Each chunk after the first also records how long its reader waited to
+    /// queue it for the client.
+    #[tokio::test]
+    async fn get_block_range_times_each_chunk_stage() -> Result<(), Box<dyn std::error::Error>> {
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+        let (reader, _fixture) = large_block_reader(&large_block_chain(None)?)?;
+        let first_chunk_end = u64::from(first_chunk_blocks(&reader)?);
+        let adapter = adapter_serving(&reader);
+
+        let blocks =
+            range_parity_blocks(&adapter, 1, u64::from(LARGE_BLOCK_TIP), Vec::new()).await?;
+        assert_linked_from_genesis(&blocks, LARGE_BLOCK_TIP);
+        // The chunk count is the range divided by the blocks one chunk keeps,
+        // rounded up.
+        let chunks = u64::from(LARGE_BLOCK_TIP).div_ceil(first_chunk_end);
+        assert!(chunks >= 3, "the range must span at least three chunks");
+
+        let rendered = metrics_handle.render();
+        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(chunks));
+        assert_eq!(
+            block_range_stage_samples(&rendered, "convert"),
+            Some(chunks)
+        );
+        assert_eq!(
+            block_range_stage_samples(&rendered, "send"),
+            Some(chunks - 1)
         );
         Ok(())
     }

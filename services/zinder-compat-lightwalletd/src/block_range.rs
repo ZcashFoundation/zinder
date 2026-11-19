@@ -19,13 +19,18 @@
 //! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
 //! its admission until its response is dropped and every chunk read of the
 //! stream has finished, so the number of slots bounds how many streams hold chunks
-//! at once.
+//! at once. A request that finds every slot taken waits in a bounded queue
+//! for a bounded time, then fails with `UNAVAILABLE`, as lightwalletd does.
 
 use std::{
     num::NonZeroU32,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{
@@ -52,6 +57,10 @@ pub const BLOCK_RANGE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// `GetBlockRangeNullifiers` streams.
 pub const DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(99);
+
+/// Default for how long a block-range request waits for a stream slot before
+/// it fails with `UNAVAILABLE`, as in lightwalletd.
+pub const DEFAULT_BLOCK_RANGE_ADMISSION_WAIT: Duration = Duration::from_secs(10);
 
 /// Plans the chunk reads of one block-range stream in wire order.
 ///
@@ -152,6 +161,64 @@ impl BlockRangeChunks {
 
 /// Gauge of the block-range streams that hold a slot.
 const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
+/// Counter of the block-range streams that took a slot.
+const ADMITTED_STREAMS_COUNTER: &str = "zinder_compat_block_range_streams_admitted_total";
+/// Counter of the block-range requests refused a slot, labelled by
+/// `reason`.
+const REFUSED_STREAMS_COUNTER: &str = "zinder_compat_block_range_stream_refusals_total";
+/// Histogram of the time a block-range request waited for a slot, labelled
+/// by `outcome`.
+const SLOT_WAIT_HISTOGRAM: &str = "zinder_compat_block_range_slot_wait_duration_seconds";
+/// Histogram of the time one chunk of a block-range stream spent in one
+/// stage, labelled by `stage`.
+const STAGE_DURATION_HISTOGRAM: &str = "zinder_compat_block_range_stage_duration_seconds";
+
+/// A stage of serving one chunk of a block-range stream, timed in
+/// `zinder_compat_block_range_stage_duration_seconds{stage}`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BlockRangeStage {
+    /// Reading the chunk's compact blocks from storage.
+    Read,
+    /// Converting the chunk's blocks to lightwalletd messages and pruning
+    /// them to the requested pools.
+    Convert,
+    /// Waiting for the client to make room for the chunk's messages. Only the
+    /// chunks after the first have this stage, because the first chunk is
+    /// part of the response itself.
+    Send,
+}
+
+impl BlockRangeStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Convert => "convert",
+            Self::Send => "send",
+        }
+    }
+
+    /// Records that one chunk spent `elapsed` in this stage.
+    pub fn record(self, elapsed: Duration) {
+        metrics::histogram!(STAGE_DURATION_HISTOGRAM, "stage" => self.label()).record(elapsed);
+    }
+
+    /// Runs `stage_work` and records how long it took.
+    pub fn time<Output>(self, stage_work: impl FnOnce() -> Output) -> Output {
+        let started_at = Instant::now();
+        let output = stage_work();
+        self.record(started_at.elapsed());
+        output
+    }
+
+    /// Awaits `stage_work` and records how long it took.
+    pub async fn time_async<Output>(self, stage_work: impl Future<Output = Output>) -> Output {
+        let started_at = Instant::now();
+        let output = stage_work.await;
+        self.record(started_at.elapsed());
+        output
+    }
+}
 
 /// Process-wide limit on concurrent `GetBlockRange` and
 /// `GetBlockRangeNullifiers` streams.
@@ -159,14 +226,21 @@ const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
 /// Clones share one limit. A stream takes a slot after its request passes
 /// validation. It returns the slot when the stream ends, fails, or the client
 /// goes away, and no chunk read of the stream is still running.
+///
+/// A request that finds every slot taken waits for one, first come first
+/// served, for at most [`Self::max_wait`]. At most as many requests wait as
+/// the limit has slots, so a request that finds the queue full fails at once.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamLimit {
     slots: Arc<Semaphore>,
+    waiters: Arc<AtomicUsize>,
     max_streams: NonZeroU32,
+    max_wait: Duration,
 }
 
 impl BlockRangeStreamLimit {
-    /// Creates a limit that admits at most `max_streams` streams at once.
+    /// Creates a limit that admits at most `max_streams` streams at once and
+    /// lets a request wait [`DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`] for a slot.
     #[must_use]
     pub fn new(max_streams: NonZeroU32) -> Self {
         let permits = usize::try_from(max_streams.get())
@@ -177,8 +251,17 @@ impl BlockRangeStreamLimit {
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         Self {
             slots: Arc::new(Semaphore::new(permits)),
+            waiters: Arc::new(AtomicUsize::new(0)),
             max_streams,
+            max_wait: DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
         }
+    }
+
+    /// Sets how long a request waits for a slot before it fails.
+    #[must_use]
+    pub const fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
     }
 
     /// Returns the most streams this limit admits at once.
@@ -187,24 +270,151 @@ impl BlockRangeStreamLimit {
         self.max_streams
     }
 
-    /// Takes a slot for one new stream.
+    /// Returns how long a request waits for a slot before it fails.
+    #[must_use]
+    pub const fn max_wait(&self) -> Duration {
+        self.max_wait
+    }
+
+    /// Takes a slot for one new stream, waiting for one when every slot is
+    /// taken, and counts it in
+    /// `zinder_compat_block_range_streams_admitted_total`.
+    ///
+    /// Dropping the returned future while it waits, as tonic does when the
+    /// client cancels or disconnects, gives up the request's place in the
+    /// queue.
     ///
     /// # Errors
     ///
-    /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
-    /// refusal in `zinder_compat_block_range_stream_refusals_total`.
-    pub fn try_open(&self) -> Result<BlockRangeStreamSlot, Status> {
-        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
-            metrics::counter!("zinder_compat_block_range_stream_refusals_total").increment(1);
-            return Err(Status::resource_exhausted(format!(
-                "this server already serves its limit of {} concurrent block-range streams",
-                self.max_streams
-            )));
+    /// Returns `UNAVAILABLE` when no slot returns within
+    /// [`Self::max_wait`], or at once when as many requests already wait as
+    /// the limit has slots. Each refusal is counted in
+    /// `zinder_compat_block_range_stream_refusals_total{reason}`.
+    pub async fn open(&self) -> Result<BlockRangeStreamSlot, Status> {
+        let started_at = Instant::now();
+        // The semaphore hands a returned slot to the oldest waiter, so a new
+        // request takes a free slot here only when nobody waits.
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+            record_admission(AdmissionOutcome::Admitted, started_at.elapsed());
+            return Ok(BlockRangeStreamSlot::new(permit));
+        }
+        let Some(mut waiter) = QueuedRequest::enter(&self.waiters, self.max_waiters(), started_at)
+        else {
+            record_admission(
+                AdmissionOutcome::Refused(RefusalReason::WaitersFull),
+                started_at.elapsed(),
+            );
+            return Err(self.refusal());
         };
-        Ok(BlockRangeStreamSlot {
-            _open_stream: Arc::new(OpenStream::new(permit)),
+        let acquired =
+            tokio::time::timeout(self.max_wait, Arc::clone(&self.slots).acquire_owned()).await;
+        waiter.resolved = true;
+        // The semaphore is never closed, so only the wait can end it.
+        if let Ok(Ok(permit)) = acquired {
+            record_admission(AdmissionOutcome::Admitted, started_at.elapsed());
+            return Ok(BlockRangeStreamSlot::new(permit));
+        }
+        record_admission(
+            AdmissionOutcome::Refused(RefusalReason::WaitTimeout),
+            started_at.elapsed(),
+        );
+        Err(self.refusal())
+    }
+
+    /// Requests that may wait for a slot at once: one for each slot.
+    fn max_waiters(&self) -> usize {
+        usize::try_from(self.max_streams.get()).unwrap_or(usize::MAX)
+    }
+
+    /// `UNAVAILABLE`, which wallets retry, rather than `RESOURCE_EXHAUSTED`,
+    /// as lightwalletd returns for its own block-range limit.
+    fn refusal(&self) -> Status {
+        Status::unavailable(format!(
+            "this server already serves its limit of {} concurrent block-range streams; retry \
+             shortly",
+            self.max_streams
+        ))
+    }
+}
+
+/// A request's place in the queue for a slot, given back when it is dropped.
+///
+/// A request dropped before it was resolved, because its client went away,
+/// records its wait with `outcome="cancelled"`.
+struct QueuedRequest {
+    waiters: Arc<AtomicUsize>,
+    started_at: Instant,
+    resolved: bool,
+}
+
+impl QueuedRequest {
+    /// Takes a place in the queue, or returns `None` when `max_waiters`
+    /// requests already wait.
+    fn enter(waiters: &Arc<AtomicUsize>, max_waiters: usize, started_at: Instant) -> Option<Self> {
+        waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < max_waiters).then(|| waiting + 1)
+            })
+            .ok()?;
+        Some(Self {
+            waiters: Arc::clone(waiters),
+            started_at,
+            resolved: false,
         })
     }
+}
+
+impl Drop for QueuedRequest {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        if !self.resolved {
+            record_admission(AdmissionOutcome::Cancelled, self.started_at.elapsed());
+        }
+    }
+}
+
+/// How a block-range request left admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionOutcome {
+    Admitted,
+    Refused(RefusalReason),
+    /// The client went away while the request waited.
+    Cancelled,
+}
+
+/// Why a block-range request was refused a slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalReason {
+    /// As many requests already waited as the limit has slots.
+    WaitersFull,
+    /// No slot returned within the limit's wait.
+    WaitTimeout,
+}
+
+impl RefusalReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WaitersFull => "waiters_full",
+            Self::WaitTimeout => "wait_timeout",
+        }
+    }
+}
+
+/// Counts one admission decision and records how long the request waited
+/// for it.
+fn record_admission(outcome: AdmissionOutcome, waited: Duration) {
+    let outcome_label = match outcome {
+        AdmissionOutcome::Admitted => {
+            metrics::counter!(ADMITTED_STREAMS_COUNTER).increment(1);
+            "admitted"
+        }
+        AdmissionOutcome::Refused(reason) => {
+            metrics::counter!(REFUSED_STREAMS_COUNTER, "reason" => reason.label()).increment(1);
+            "refused"
+        }
+        AdmissionOutcome::Cancelled => "cancelled",
+    };
+    metrics::histogram!(SLOT_WAIT_HISTOGRAM, "outcome" => outcome_label).record(waited);
 }
 
 /// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
@@ -245,6 +455,12 @@ pub struct BlockRangeStreamSlot {
 }
 
 impl BlockRangeStreamSlot {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _open_stream: Arc::new(OpenStream::new(permit)),
+        }
+    }
+
     /// Runs `read` on a task of its own that holds this slot until `read`
     /// has finished and its output is dropped, and returns that output.
     ///
@@ -532,10 +748,15 @@ impl BlockRangeContinuity {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Admission tests hold slots and join handles until the step that releases or awaits them."
+)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, time::Duration};
 
-    use tonic::Code;
+    use tokio::time::Instant;
+    use tonic::{Code, Status};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
         ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, Network,
@@ -544,7 +765,10 @@ mod tests {
 
     use zinder_store::HeightOrder;
 
-    use super::{BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit};
+    use super::{
+        BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
+        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+    };
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
     const CURRENT_EPOCH: ChainEpochId = ChainEpochId::new(5);
@@ -785,55 +1009,204 @@ mod tests {
         assert!(!descending.has_remaining());
     }
 
-    #[test]
-    fn the_stream_limit_refuses_past_its_slots_until_one_is_returned() -> Result<(), tonic::Status>
-    {
-        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
-        let response_side = limit.try_open()?;
-        let other_stream = limit.try_open()?;
+    fn join_failed(error: &tokio::task::JoinError) -> Status {
+        Status::internal(format!("admission task failed: {error}"))
+    }
+
+    fn assert_unavailable<T>(outcome: Result<T, Status>) {
         assert_eq!(
-            limit.try_open().err().map(|status| status.code()),
-            Some(Code::ResourceExhausted)
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
         );
+    }
+
+    /// Lets a spawned admission run until it waits for a slot.
+    async fn let_waiters_queue() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stream_limit_admits_up_to_its_slots_until_one_is_returned() -> Result<(), Status> {
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1))
+            .with_max_wait(Duration::ZERO);
+        let response_side = limit.open().await?;
+        let other_stream = limit.open().await?;
+        assert_unavailable(limit.open().await);
 
         // A slot shared by a response and its reader returns only when both
         // are dropped.
         let reader_side = response_side.clone();
         drop(response_side);
-        assert!(limit.try_open().is_err());
+        assert!(limit.open().await.is_err());
         drop(reader_side);
-        let reopened = limit.try_open()?;
+        let reopened = limit.open().await?;
         drop((reopened, other_stream));
         Ok(())
     }
 
-    #[test]
-    fn the_open_streams_gauge_counts_each_slot_until_its_last_holder_drops_it()
-    -> Result<(), tonic::Status> {
+    #[tokio::test(start_paused = true)]
+    async fn a_request_past_the_limit_waits_and_takes_the_next_returned_slot() -> Result<(), Status>
+    {
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        let open_stream = limit.open().await?;
+        let waiting = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        tokio::time::sleep(DEFAULT_BLOCK_RANGE_ADMISSION_WAIT / 2).await;
+        assert!(!waiting.is_finished(), "the request must still wait");
+
+        drop(open_stream);
+        let admitted = waiting.await.map_err(|error| join_failed(&error))??;
+        drop(admitted);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_waits_out_the_limit_is_unavailable() -> Result<(), Status> {
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        let open_stream = limit.open().await?;
+        let started_at = Instant::now();
+        assert_unavailable(limit.open().await);
+        assert_eq!(started_at.elapsed(), DEFAULT_BLOCK_RANGE_ADMISSION_WAIT);
+        drop(open_stream);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_past_the_waiter_cap_is_unavailable_at_once() -> Result<(), Status> {
+        // One slot admits one waiter.
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        let open_stream = limit.open().await?;
+        let waiting = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        let_waiters_queue().await;
+
+        let started_at = Instant::now();
+        assert_unavailable(limit.open().await);
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
+
+        drop(open_stream);
+        drop(waiting.await.map_err(|error| join_failed(&error))??);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiter_gives_back_its_place_in_the_queue() -> Result<(), Status> {
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        let open_stream = limit.open().await?;
+        let cancelled = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        let_waiters_queue().await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
+
+        // The place the cancelled request held is free, so this request waits
+        // instead of being refused, and takes the slot when it returns.
+        let waiting = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        let_waiters_queue().await;
+        assert!(
+            !waiting.is_finished(),
+            "the request must wait, not be refused"
+        );
+        drop(open_stream);
+        drop(waiting.await.map_err(|error| join_failed(&error))??);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_open_streams_gauge_counts_each_slot_until_its_last_holder_drops_it()
+    -> Result<(), Status> {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let open_streams = || {
-            handle.render().lines().find_map(|line| {
-                line.strip_prefix("zinder_compat_block_range_streams_open ")?
-                    .parse::<f64>()
-                    .ok()
-            })
-        };
-        metrics::with_local_recorder(&recorder, || {
-            let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
-            assert_eq!(open_streams(), Some(0.0));
-            let response_side = limit.try_open()?;
-            let other_stream = limit.try_open()?;
-            let reader_side = response_side.clone();
-            // A limit created while streams are open leaves their count alone.
-            let _other_limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
-            assert_eq!(open_streams(), Some(2.0));
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let open_streams =
+            || rendered_sample(&handle.render(), "zinder_compat_block_range_streams_open");
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
+        assert_eq!(open_streams(), Some(0.0));
+        let response_side = limit.open().await?;
+        let other_stream = limit.open().await?;
+        let reader_side = response_side.clone();
+        // A limit created while streams are open leaves their count alone.
+        let _other_limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        assert_eq!(open_streams(), Some(2.0));
 
-            drop((response_side, other_stream));
-            assert_eq!(open_streams(), Some(1.0));
-            drop(reader_side);
-            assert_eq!(open_streams(), Some(0.0));
-            Ok(())
+        drop((response_side, other_stream));
+        assert_eq!(open_streams(), Some(1.0));
+        drop(reader_side);
+        assert_eq!(open_streams(), Some(0.0));
+        Ok(())
+    }
+
+    /// Returns the value of the first sample of `rendered` whose series is
+    /// exactly `series`, name and labels included.
+    fn rendered_sample(rendered: &str, series: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .parse::<f64>()
+                .ok()
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_counts_each_outcome_and_samples_its_slot_wait() -> Result<(), Status> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        let open_stream = limit.open().await?;
+
+        // One request waits out the limit while another finds the queue full.
+        let timed_out = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        let_waiters_queue().await;
+        assert_unavailable(limit.open().await);
+        assert_unavailable(timed_out.await.map_err(|error| join_failed(&error))?);
+
+        // One request gives up while it waits.
+        let cancelled = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.open().await }
+        });
+        let_waiters_queue().await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
+        drop(open_stream);
+
+        let rendered = handle.render();
+        let sample = |series: &str| rendered_sample(&rendered, series);
+        assert_eq!(
+            sample("zinder_compat_block_range_streams_admitted_total"),
+            Some(1.0)
+        );
+        for reason in ["waiters_full", "wait_timeout"] {
+            assert_eq!(
+                sample(&format!(
+                    "zinder_compat_block_range_stream_refusals_total{{reason=\"{reason}\"}}"
+                )),
+                Some(1.0),
+                "one request must be refused for {reason}"
+            );
+        }
+        for (outcome, count) in [("admitted", 1.0), ("refused", 2.0), ("cancelled", 1.0)] {
+            assert_eq!(
+                sample(&format!(
+                    "zinder_compat_block_range_slot_wait_duration_seconds_count{{outcome=\"{outcome}\"}}"
+                )),
+                Some(count),
+                "{outcome} requests must each record one slot-wait sample"
+            );
+        }
+        Ok(())
     }
 }

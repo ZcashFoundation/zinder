@@ -1,6 +1,12 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-use std::{collections::HashSet, num::NonZeroU32, pin::Pin};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashSet},
+    num::{NonZeroU16, NonZeroU32},
+    pin::Pin,
+    time::Duration,
+};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -11,11 +17,10 @@ use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
-    CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
+    CompactBlockArtifact, CompactTransaction, CompactTransactionData, MinedTransaction, Network,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
-    TxStatus,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
         encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_bytes,
@@ -27,17 +32,19 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
+    ArtifactKey, CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError,
+    SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
-use zinder_store::{MempoolEvent, RawBlobRetention};
+use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
-    BlockRangeStreamLimit, BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BlockRangeStage, BlockRangeStreamLimit, BlockRangeStreamSlot,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
@@ -68,6 +75,16 @@ const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
 /// the producer is currently sending.
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
+/// Transactions a `GetTaddressTransactions` or `GetTaddressTxids` response
+/// reads ahead of its client.
+const TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY: usize = 8;
+/// Rows a `GetAddressUtxosStream` response merges ahead of its client.
+const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
+/// Outputs the first pages of one UTXO request's address streams share, so
+/// up to eight distinct addresses read full 1,024-output first pages.
+const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
+/// Fewest outputs the first page of one address's UTXO stream reads.
+const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
@@ -198,11 +215,22 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// Limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams
     /// this adapter and its clones serve at once.
     ///
-    /// A request past the limit fails with `RESOURCE_EXHAUSTED` before any
-    /// read. The default is [`DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS`].
+    /// A request past the limit waits for a slot before any read, and fails
+    /// with `UNAVAILABLE` when none returns in time. The default is
+    /// [`DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS`].
     #[must_use]
     pub fn with_max_concurrent_block_range_streams(mut self, max_streams: NonZeroU32) -> Self {
-        self.block_range_streams = BlockRangeStreamLimit::new(max_streams);
+        self.block_range_streams = BlockRangeStreamLimit::new(max_streams)
+            .with_max_wait(self.block_range_streams.max_wait());
+        self
+    }
+
+    /// Sets how long a block-range request past the limit waits for a slot
+    /// before it fails with `UNAVAILABLE`. The default is
+    /// [`crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`].
+    #[must_use]
+    pub fn with_block_range_admission_wait(mut self, max_wait: Duration) -> Self {
+        self.block_range_streams = self.block_range_streams.with_max_wait(max_wait);
         self
     }
 
@@ -366,12 +394,23 @@ where
         Ok(compact_block)
     }
 
-    async fn address_utxos(
+    /// Opens the merge of every requested address's unspent outputs at the
+    /// visible chain epoch, and reads the first output of each, so a request
+    /// that cannot be served fails before any row is sent.
+    ///
+    /// Each distinct address is read once and its rows are sent once, however
+    /// often the request lists it, as lightwalletd drops a repeated address
+    /// before it queries the node.
+    async fn address_utxo_merge(
         &self,
         request: lightwalletd::GetAddressUtxosArg,
-    ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
+    ) -> Result<AddressUtxoMerge, Status> {
+        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
+        let max_entries =
+            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
+        let mut merge = AddressUtxoMerge::new(max_entries, response_limit);
         if request.addresses.is_empty() {
-            return Ok(Vec::new());
+            return Ok(merge);
         }
 
         let start_height = u32::try_from(request.start_height)
@@ -381,60 +420,34 @@ where
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
-        let max_entries =
-            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
-        // Each address streams its outputs in response order, so it can
-        // contribute at most its first `maxEntries` outputs. Without a
-        // `maxEntries` at or below the response limit, a request that matched
-        // more outputs than one response returns fails, so the read stops
-        // there instead of reading the rest of a large address.
-        let address_output_cap = max_entries.filter(|max_entries| *max_entries <= response_limit);
-        let mut replies = Vec::new();
-
-        for address in request.addresses {
-            let query_request = transparent_address_unspent_outputs_request(
-                &address,
-                visible_tip_block.chain_epoch.network,
-                BlockHeight::new(start_height),
-            )?;
-            let mut address_utxos = self
+        let mut seen_addresses = HashSet::new();
+        let distinct_addresses = request
+            .addresses
+            .into_iter()
+            .filter(|address| seen_addresses.insert(address.clone()))
+            .map(|address| {
+                transparent_address_unspent_outputs_request(
+                    &address,
+                    visible_tip_block.chain_epoch.network,
+                    BlockHeight::new(start_height),
+                )
+                .map(|query_request| (address, query_request))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let first_page_size = address_utxo_first_page_size(distinct_addresses.len(), max_entries);
+        for (address, query_request) in distinct_addresses {
+            let outputs = self
                 .query_api
-                .transparent_address_unspent_outputs(
+                .transparent_address_unspent_outputs_on_demand(
                     query_request,
+                    first_page_size,
                     Some(visible_tip_block.chain_epoch.id),
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            let mut address_output_count = 0;
-            while let Some(utxo) = address_utxos.next().await {
-                let utxo = utxo.map_err(|error| status_from_query_error(&error))?;
-                replies.push(lightwalletd_address_utxo(&address, &utxo)?);
-                address_output_count += 1;
-                match address_output_cap {
-                    Some(cap) if address_output_count == cap => break,
-                    None if replies.len() > response_limit => {
-                        return Err(address_utxo_limit_exceeded(response_limit));
-                    }
-                    Some(_) | None => {}
-                }
-            }
+            merge.add_address(address, outputs).await?;
         }
-
-        replies.sort_by(|left, right| {
-            left.height
-                .cmp(&right.height)
-                .then_with(|| left.txid.cmp(&right.txid))
-                .then_with(|| left.index.cmp(&right.index))
-                .then_with(|| left.address.cmp(&right.address))
-        });
-        if let Some(max_entries) = max_entries {
-            replies.truncate(max_entries);
-        }
-        if replies.len() > response_limit {
-            return Err(address_utxo_limit_exceeded(response_limit));
-        }
-        Ok(replies)
+        Ok(merge)
     }
 
     /// Answers a `GetTransaction` whose canonical read missed from the live
@@ -483,37 +496,32 @@ where
         }
     }
 
-    async fn transparent_address_raw_transactions(
+    /// Starts reading the mined history `filter` selects at the visible
+    /// chain epoch, and reads its first page, so a request that cannot be
+    /// served fails before any transaction is sent.
+    async fn transparent_history(
         &self,
         filter: &lightwalletd::TransparentAddressBlockFilter,
-    ) -> Result<Vec<Result<lightwalletd::RawTransaction, Status>>, Status> {
+    ) -> Result<TransparentHistory<QueryApi>, Status>
+    where
+        QueryApi: Clone,
+    {
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let at_epoch_id = visible_tip_block.chain_epoch.id;
-        let typed_request = transparent_address_tx_history_request(
+        let request = transparent_address_tx_history_request(
             filter,
             visible_tip_block.chain_epoch.network,
             visible_tip_block.height,
         )?;
-        let history =
-            transparent_address_tx_history(&self.query_api, typed_request, at_epoch_id).await?;
-        let mut raw_transactions = Vec::with_capacity(history.len());
-
-        for artifact in history {
-            let response = self
-                .query_api
-                .transaction(artifact.transaction_id, Some(at_epoch_id))
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
-            let location = mined_location_from_status(response.status)?;
-            raw_transactions
-                .push(raw_transaction_from_location(&self.query_api, at_epoch_id, location).await);
-        }
-
-        Ok(raw_transactions)
+        TransparentHistory::start(
+            self.query_api.clone(),
+            request,
+            visible_tip_block.chain_epoch.id,
+        )
+        .await
     }
 
     /// Returns lightwalletd `Balance { value_zat: int64 }` from the wallet
@@ -658,7 +666,7 @@ where
         let block_range_request = request.into_inner();
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(
@@ -685,7 +693,7 @@ where
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(
@@ -727,10 +735,7 @@ where
         let canonical_miss = match lookup {
             Ok(response) => match response.status {
                 TxStatus::Mined(mined) => {
-                    return Ok(Response::new(
-                        raw_transaction_from_location(&self.query_api, at_epoch_id, mined.location)
-                            .await?,
-                    ));
+                    return Ok(Response::new(raw_transaction_from_mined(mined)?));
                 }
                 TxStatus::InMempool(entry) => {
                     return Ok(Response::new(mempool_raw_transaction(&entry)));
@@ -769,9 +774,11 @@ where
         &self,
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        let filter = request.into_inner();
-        let raw_transactions = self.transparent_address_raw_transactions(&filter).await?;
-        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
+        let history = self.transparent_history(&request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            history,
+            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -780,9 +787,11 @@ where
         &self,
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        let filter = request.into_inner();
-        let raw_transactions = self.transparent_address_raw_transactions(&filter).await?;
-        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
+        let history = self.transparent_history(&request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            history,
+            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     async fn get_taddress_balance(
@@ -940,7 +949,7 @@ where
             .query_api
             .tree_state_at(height, Some(chain_view.epoch_id))
             .await
-            .map_err(|error| status_from_query_error(&error))?;
+            .map_err(|error| tree_state_status(&error))?;
 
         Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
     }
@@ -991,7 +1000,11 @@ where
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
-        let replies = self.address_utxos(request.into_inner()).await?;
+        let mut merge = self.address_utxo_merge(request.into_inner()).await?;
+        let mut replies = Vec::new();
+        while let Some(reply) = merge.next().await {
+            replies.push(reply?);
+        }
         Ok(Response::new(lightwalletd::GetAddressUtxosReplyList {
             address_utxos: replies,
         }))
@@ -1003,8 +1016,11 @@ where
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        let replies = self.address_utxos(request.into_inner()).await?;
-        Ok(Response::new(stream_items(replies)))
+        let merge = self.address_utxo_merge(request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            merge,
+            ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     async fn get_lightd_info(
@@ -1048,25 +1064,305 @@ where
     }
 }
 
-async fn transparent_address_tx_history<QueryApi>(
-    query_api: &QueryApi,
-    mut request: TransparentAddressTxIdsInRangeRequest,
+/// Where a server-streaming response produced by a reader task gets its
+/// items, in response order.
+trait ResponseSource: Send + 'static {
+    /// One response message.
+    type Message: Send + 'static;
+
+    /// Reads the next message, or the status that ends the response, or
+    /// `None` once the response is complete.
+    fn next(&mut self) -> impl Future<Output = Option<Result<Self::Message, Status>>> + Send;
+}
+
+/// Returns a response that sends what `source` reads, at most `capacity`
+/// messages ahead of the client, and spawns the task that reads it.
+///
+/// The response ends after the first status `source` returns, so a client
+/// that received rows before a failure sees the failure as the response's
+/// status. The task stops and drops `source` once the client drops the
+/// response, even while a read is in progress.
+fn spawn_response_stream<Source: ResponseSource>(
+    mut source: Source,
+    capacity: usize,
+) -> GrpcStream<Source::Message> {
+    let (messages, queued_messages) = tokio::sync::mpsc::channel(capacity);
+    tokio::spawn(async move {
+        // Reserving the slot before reading keeps the messages read but not
+        // yet received within `capacity`.
+        while let Ok(slot) = messages.reserve().await {
+            let message = tokio::select! {
+                biased;
+                () = messages.closed() => return,
+                message = source.next() => message,
+            };
+            let Some(message) = message else {
+                return;
+            };
+            let is_terminal = message.is_err();
+            slot.send(message);
+            if is_terminal {
+                return;
+            }
+        }
+    });
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
+}
+
+/// One transparent address's mined transactions at one chain epoch, read a
+/// page of history entries at a time and one transaction at a time.
+struct TransparentHistory<QueryApi> {
+    query_api: QueryApi,
+    request: TransparentAddressTxIdsInRangeRequest,
     at_epoch_id: ChainEpochId,
-) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
+    page: std::vec::IntoIter<TransparentAddressTxIndexArtifact>,
+    has_later_pages: bool,
+}
+
+impl<QueryApi> TransparentHistory<QueryApi>
 where
-    QueryApi: WalletQueryApi + ?Sized,
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
-    let mut artifacts = Vec::new();
-    loop {
-        let response = query_api
-            .transparent_address_tx_ids_in_range(request.clone(), Some(at_epoch_id))
+    async fn start(
+        query_api: QueryApi,
+        request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: ChainEpochId,
+    ) -> Result<Self, Status> {
+        let mut history = Self {
+            query_api,
+            request,
+            at_epoch_id,
+            page: Vec::new().into_iter(),
+            has_later_pages: true,
+        };
+        history.read_page().await?;
+        Ok(history)
+    }
+
+    async fn read_page(&mut self) -> Result<(), Status> {
+        let response = self
+            .query_api
+            .transparent_address_tx_ids_in_range(self.request.clone(), Some(self.at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        artifacts.extend(response.artifacts);
-        let Some(next_cursor) = response.next_cursor else {
-            return Ok(artifacts);
+        self.page = response.artifacts.into_iter();
+        self.has_later_pages = response.next_cursor.is_some();
+        self.request.from_cursor = response.next_cursor;
+        Ok(())
+    }
+
+    async fn read_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let response = self
+            .query_api
+            .transaction(transaction_id, Some(self.at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+    }
+}
+
+impl<QueryApi> ResponseSource for TransparentHistory<QueryApi>
+where
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
+{
+    type Message = lightwalletd::RawTransaction;
+
+    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        loop {
+            if let Some(artifact) = self.page.next() {
+                return Some(self.read_transaction(artifact.transaction_id).await);
+            }
+            if !self.has_later_pages {
+                return None;
+            }
+            if let Err(status) = self.read_page().await {
+                self.has_later_pages = false;
+                return Some(Err(status));
+            }
+        }
+    }
+}
+
+/// The first page size of every address stream of a UTXO request that lists
+/// `distinct_addresses` distinct addresses and returns at most `max_entries`
+/// rows.
+///
+/// Each address gets an even share of [`ADDRESS_UTXO_FIRST_PAGE_BUDGET`],
+/// capped at the 1,024-output page and at `max_entries`, but never fewer than
+/// [`ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE`] outputs. A request of up to eight
+/// addresses with at most 1,024 outputs each then reads each address in one
+/// page, and a request of many addresses keeps small first pages.
+fn address_utxo_first_page_size(
+    distinct_addresses: usize,
+    max_entries: Option<usize>,
+) -> NonZeroU16 {
+    let share = ADDRESS_UTXO_FIRST_PAGE_BUDGET / distinct_addresses.max(1);
+    let wanted = max_entries.map_or(share, |max_entries| share.min(max_entries));
+    NonZeroU16::new(u16::try_from(wanted).unwrap_or(u16::MAX))
+        .unwrap_or(NonZeroU16::MIN)
+        .clamp(
+            ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE,
+            TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE,
+        )
+}
+
+/// The unspent outputs of several addresses, merged into the order of one
+/// lightwalletd UTXO response: height, txid, output index, then address.
+///
+/// Each address's stream is already in that order for its own outputs, so
+/// the merge holds only the next output of each address. The streams read
+/// on demand at the one chain epoch the request resolved, starting at the
+/// first page [`address_utxo_first_page_size`] chooses. A later page holds at
+/// most the outputs the merge has taken from that address plus one first
+/// page, and every output the merge takes is sent as one row. So the outputs
+/// read stay within about twice the rows sent, plus 2 outputs and one first
+/// page for each distinct address, and the first pages together hold at most
+/// 8,192 outputs, or 16 for each distinct address past 512.
+struct AddressUtxoMerge {
+    addresses: Vec<MergedAddress>,
+    next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
+    /// The address whose last row was taken and whose next output is read
+    /// only when the response needs another row, so a response never reads
+    /// past the last row it sends.
+    awaiting_next_output: Option<usize>,
+    max_entries: Option<usize>,
+    response_limit: usize,
+    sent: usize,
+    ended: bool,
+}
+
+/// One distinct address of an [`AddressUtxoMerge`].
+struct MergedAddress {
+    address: String,
+    outputs: TransparentAddressUnspentOutputs,
+}
+
+/// The next output of one address in an [`AddressUtxoMerge`].
+struct NextAddressUtxo {
+    reply: lightwalletd::GetAddressUtxosReply,
+    address_position: usize,
+}
+
+impl NextAddressUtxo {
+    fn order_key(&self) -> (u64, &[u8], i32, &str, usize) {
+        (
+            self.reply.height,
+            self.reply.txid.as_slice(),
+            self.reply.index,
+            self.reply.address.as_str(),
+            self.address_position,
+        )
+    }
+}
+
+impl PartialEq for NextAddressUtxo {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_key() == other.order_key()
+    }
+}
+
+impl Eq for NextAddressUtxo {}
+
+impl PartialOrd for NextAddressUtxo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NextAddressUtxo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+
+impl AddressUtxoMerge {
+    const fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
+        Self {
+            addresses: Vec::new(),
+            next_outputs: BinaryHeap::new(),
+            awaiting_next_output: None,
+            max_entries,
+            response_limit,
+            sent: 0,
+            ended: false,
+        }
+    }
+
+    /// Adds one distinct address and reads its first output.
+    async fn add_address(
+        &mut self,
+        address: String,
+        outputs: TransparentAddressUnspentOutputs,
+    ) -> Result<(), Status> {
+        self.addresses.push(MergedAddress { address, outputs });
+        self.read_next_output(self.addresses.len() - 1).await
+    }
+
+    async fn read_next_output(&mut self, address_position: usize) -> Result<(), Status> {
+        let Some(merged) = self.addresses.get_mut(address_position) else {
+            return Ok(());
         };
-        request.from_cursor = Some(next_cursor);
+        match merged.outputs.next().await {
+            Some(Ok(utxo)) => {
+                let reply = lightwalletd_address_utxo(&merged.address, &utxo)?;
+                self.next_outputs.push(Reverse(NextAddressUtxo {
+                    reply,
+                    address_position,
+                }));
+                Ok(())
+            }
+            Some(Err(error)) => Err(status_from_query_error(&error)),
+            None => Ok(()),
+        }
+    }
+
+    /// Reads the next output of the address whose last row was taken.
+    async fn read_awaited_output(&mut self) -> Result<(), Status> {
+        match self.awaiting_next_output.take() {
+            Some(address_position) => self.read_next_output(address_position).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Takes the lowest next output as the next row to send.
+    fn take_next_row(&mut self) -> Option<lightwalletd::GetAddressUtxosReply> {
+        let Reverse(next_output) = self.next_outputs.pop()?;
+        self.awaiting_next_output = Some(next_output.address_position);
+        Some(next_output.reply)
+    }
+}
+
+impl ResponseSource for AddressUtxoMerge {
+    type Message = lightwalletd::GetAddressUtxosReply;
+
+    /// Sends at most `maxEntries` rows. Without a `maxEntries` within the
+    /// response limit, a row past the limit fails the response with
+    /// `RESOURCE_EXHAUSTED` instead of ending it as if it were complete.
+    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        if self.ended
+            || self
+                .max_entries
+                .is_some_and(|max_entries| self.sent >= max_entries)
+        {
+            return None;
+        }
+        if let Err(status) = self.read_awaited_output().await {
+            self.ended = true;
+            return Some(Err(status));
+        }
+        if self.next_outputs.is_empty() {
+            return None;
+        }
+        if self.sent >= self.response_limit {
+            self.ended = true;
+            return Some(Err(address_utxo_limit_exceeded(self.response_limit)));
+        }
+        let row = self.take_next_row()?;
+        self.sent += 1;
+        Some(Ok(row))
     }
 }
 
@@ -1201,11 +1497,20 @@ async fn drive_compact_block_range<QueryApi>(
                 }
             };
         chunks.advance(compact_blocks.len());
-        for message in encode_compact_block_chunk(compact_blocks, window) {
-            let is_terminal = message.is_err();
-            if sink.send(message).await.is_err() || is_terminal {
-                return;
-            }
+        let messages = encode_compact_block_chunk(compact_blocks, window);
+        let sent_chunk = BlockRangeStage::Send
+            .time_async(async {
+                for message in messages {
+                    let is_terminal = message.is_err();
+                    if sink.send(message).await.is_err() || is_terminal {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await;
+        if !sent_chunk {
+            return;
         }
     }
 }
@@ -1250,13 +1555,13 @@ async fn read_compact_block_chunk<QueryApi>(
 where
     QueryApi: WalletQueryApi + Send + Sync,
 {
-    query_api
-        .compact_blocks_in_range_up_to(
+    BlockRangeStage::Read
+        .time_async(query_api.compact_blocks_in_range_up_to(
             chunk,
             chunks.order(),
             BLOCK_RANGE_CHUNK_MAX_BYTES,
             at_epoch_id,
-        )
+        ))
         .await
         .map_err(|error| status_from_query_error(&error))
 }
@@ -1265,17 +1570,19 @@ fn encode_compact_block_chunk(
     mut compact_blocks: Vec<CompactBlockArtifact>,
     window: CompactBlockWindow,
 ) -> Vec<Result<lightwalletd::CompactBlock, Status>> {
-    if window.is_descending {
-        compact_blocks.reverse();
-    }
-    compact_blocks
-        .iter()
-        .map(|compact_block| {
-            compact_block_to_lightwalletd(compact_block).map(|compact_block| {
-                prune_compact_block(compact_block, window.pool_selection, window.payload_mode)
+    BlockRangeStage::Convert.time(|| {
+        if window.is_descending {
+            compact_blocks.reverse();
+        }
+        compact_blocks
+            .iter()
+            .map(|compact_block| {
+                compact_block_to_lightwalletd(compact_block).map(|compact_block| {
+                    prune_compact_block(compact_block, window.pool_selection, window.payload_mode)
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 fn compact_block_to_lightwalletd(
@@ -1521,9 +1828,9 @@ fn block_range_from_request(
     clippy::wildcard_enum_match_arm,
     reason = "TxStatus is #[non_exhaustive]; non-mined statuses map to gRPC NOT_FOUND on the lightwalletd wire because lightwalletd's RawTransaction shape is mined-only."
 )]
-fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, Status> {
+fn mined_transaction_from_status(status: TxStatus) -> Result<MinedTransaction, Status> {
     match status {
-        TxStatus::Mined(mined) => Ok(mined.location),
+        TxStatus::Mined(mined) => Ok(mined),
         TxStatus::NotFound | TxStatus::InMempool(_) => Err(Status::not_found(
             "transaction is not mined in the canonical chain",
         )),
@@ -1533,22 +1840,20 @@ fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, S
     }
 }
 
-async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    chain_epoch_id: ChainEpochId,
-    location: TransactionLocation,
+/// Returns a mined transaction's bytes as lightwalletd sends them, from the
+/// read that located it.
+fn raw_transaction_from_mined(
+    mined: MinedTransaction,
 ) -> Result<lightwalletd::RawTransaction, Status> {
-    let raw_transaction = query_api
-        .raw_transaction(location.transaction_id, Some(chain_epoch_id))
-        .await
-        .map_err(|error| status_from_query_error(&error))?;
-    if raw_transaction.transaction.location != location {
-        return Err(Status::data_loss(
-            "stored raw transaction location does not match the indexed transaction location",
-        ));
-    }
+    let location = mined.location;
+    let raw_transaction_bytes = mined.raw_transaction_bytes.ok_or_else(|| {
+        status_from_query_error(&QueryError::ArtifactUnavailable {
+            family: ArtifactFamily::TransactionBlob,
+            key: ArtifactKey::TransactionId(location.transaction_id),
+        })
+    })?;
     Ok(lightwalletd::RawTransaction {
-        data: raw_transaction.transaction.raw_transaction_bytes,
+        data: raw_transaction_bytes,
         height: u64::from(location.block_height.value()),
     })
 }
@@ -1726,6 +2031,19 @@ fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
     Status::resource_exhausted(format!(
         "more unspent outputs match than the {response_limit} one response returns"
     ))
+}
+
+/// Maps a tree-state read failure to the lightwalletd status.
+///
+/// A rebuild refused for want of a rebuild slot is `UNAVAILABLE`, as a full
+/// block-range limit is, so a wallet retries both admission limits the same
+/// way. Native `TreeStateAtHeight` keeps `RESOURCE_EXHAUSTED` with its typed
+/// reason.
+fn tree_state_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
+        return Status::unavailable(format!("{error}; retry shortly"));
+    }
+    status_from_query_error(error)
 }
 
 fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeState, Status> {
@@ -2188,6 +2506,10 @@ fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use zinder_core::{
         ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, CompactSaplingOutput,
         CompactSaplingSpend, CompactShieldedAction, CompactTransparentInput,
@@ -2214,6 +2536,121 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    /// Up to eight addresses read full first pages, more addresses share the
+    /// budget down to 16 outputs each, and `maxEntries` caps the share.
+    #[test]
+    fn address_utxo_first_pages_share_the_request_budget() {
+        let cases = [
+            (0, None, 1_024),
+            (1, None, 1_024),
+            (8, None, 1_024),
+            (9, None, 910),
+            (60, None, 136),
+            (60, Some(30), 30),
+            (1, Some(3), 16),
+            (1, Some(100_000), 1_024),
+            (512, None, 16),
+            (513, None, 16),
+            (10_000, None, 16),
+        ];
+        for (distinct_addresses, max_entries, expected) in cases {
+            assert_eq!(
+                address_utxo_first_page_size(distinct_addresses, max_entries).get(),
+                expected,
+                "{distinct_addresses} addresses, maxEntries {max_entries:?}"
+            );
+        }
+    }
+
+    /// The first pages of one request hold at most 8,192 outputs together,
+    /// or 16 for each distinct address past 512, the bound the merge states.
+    #[test]
+    fn address_utxo_first_pages_stay_within_the_stated_bound() {
+        for distinct_addresses in 1..=10_000 {
+            let first_page =
+                usize::from(address_utxo_first_page_size(distinct_addresses, None).get());
+            assert!(
+                distinct_addresses * first_page
+                    <= ADDRESS_UTXO_FIRST_PAGE_BUDGET.max(16 * distinct_addresses),
+                "{distinct_addresses} addresses read first pages of {first_page} outputs"
+            );
+        }
+    }
+
+    /// A response source that counts its reads, can stop answering after a
+    /// number of reads, and reports when it is dropped.
+    struct ObservedSource {
+        reads: Arc<AtomicUsize>,
+        answered_reads: usize,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl ObservedSource {
+        fn new(
+            answered_reads: usize,
+        ) -> (Self, Arc<AtomicUsize>, tokio::sync::oneshot::Receiver<()>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (dropped, on_drop) = tokio::sync::oneshot::channel();
+            let source = Self {
+                reads: Arc::clone(&reads),
+                answered_reads,
+                dropped: Some(dropped),
+            };
+            (source, reads, on_drop)
+        }
+    }
+
+    impl ResponseSource for ObservedSource {
+        type Message = usize;
+
+        async fn next(&mut self) -> Option<Result<usize, Status>> {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            if read >= self.answered_reads {
+                std::future::pending::<()>().await;
+            }
+            Some(Ok(read))
+        }
+    }
+
+    impl Drop for ObservedSource {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_reads_no_further_ahead_of_an_unread_client_than_its_capacity() {
+        const CAPACITY: usize = 8;
+        let (source, reads, _on_drop) = ObservedSource::new(usize::MAX);
+
+        let _response = spawn_response_stream(source, CAPACITY);
+        // The source answers at once, so the reader task reaches its bound
+        // during this sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(reads.load(Ordering::SeqCst), CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn response_stream_drops_its_source_when_the_client_leaves_during_a_read()
+    -> Result<(), Status> {
+        let (source, reads, on_drop) = ObservedSource::new(1);
+        let mut response = spawn_response_stream(source, 8);
+        assert_eq!(response.next().await.transpose()?, Some(0));
+        while reads.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(response);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("the source outlived its client"))?
+            .map_err(|_| Status::internal("the source must report its drop"))
     }
 
     #[tokio::test]

@@ -87,7 +87,7 @@ These outcomes fail the call before any block is sent:
 | Condition | Status |
 | --- | --- |
 | Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
-| The process already serves its limit of block-range streams | `RESOURCE_EXHAUSTED` |
+| No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
 | A block missing inside retained history | `UNAVAILABLE` |
@@ -106,17 +106,20 @@ A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, c
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 
-- A stream holds its slot from validation until it ends, fails, or is cancelled. A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any read. `zinder_compat_block_range_stream_refusals_total` counts refusals, and `zinder_compat_block_range_streams_open` reports open streams.
-- The Zcash Android SDK retries a refused batch. Other clients should retry `RESOURCE_EXHAUSTED` with backoff.
-- Every client shares the limit. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
+- A stream holds its slot from validation until it ends, fails, or is cancelled.
+- A valid request past the limit waits for a slot, first come first served, for up to 10 seconds, and reads nothing while it waits. If no slot returns in time, it fails with `UNAVAILABLE`. lightwalletd waits and fails the same way.
+- At most as many requests wait as the limit has slots, 100 by default. A request that finds the queue full fails with `UNAVAILABLE` at once. A client that cancels, disconnects, or reaches its deadline while it waits gives up its place.
+- The Zcash Android SDK, Slipstream, and Vizor retry a failed block-range request after a short backoff, so an occasional refusal delays a sync. Repeated refusals can still end a sync attempt.
+- `zinder_compat_block_range_streams_open` reports open streams, `zinder_compat_block_range_slot_wait_duration_seconds` how long requests waited, and `zinder_compat_block_range_stream_refusals_total` the refusals, as [Metrics](metrics.md#zinder-compat-lightwalletd) lists.
+- Every client shares the limit and the queue. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects, and one that also sends as many more requests fills the queue. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
 
-The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd sets no stream limit.
+The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd v0.6.2 limits block-range requests with `--max-concurrent-blockrange`, 200 by default.
 
 ### `GetTreeState` and `GetLatestTreeState`
 
-`GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns.
+`GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns, and a refused rebuild is `UNAVAILABLE`.
 
-Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. Retry a `RESOURCE_EXHAUSTED` from `GetTreeState` with backoff. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
+Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `UNAVAILABLE`, the code a full block-range limit returns, so a wallet retries both limits the same way. It fails at once when every waiting place is taken. `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` refuses the same rebuild with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
 
 ### `GetSubtreeRoots`
 
@@ -161,7 +164,9 @@ Both methods resolve `range` the way lightwalletd does on Zebra:
 
 lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end to the tip and serves it, because wallets such as WebZjs send `end = u64::MAX`.
 
-All reads of one request are pinned to one epoch. If the request is still reading one minute after a new block replaces that epoch, it fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. The server reads the whole history in the range, with every transaction's bytes, before it sends the first one, so memory grows with the address's history.
+All reads of one request are pinned to one epoch. The server reads the history 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client, so memory does not grow with the address's history.
+
+A failure after the first transaction ends the stream with its status, after the transactions already sent, as lightwalletd does when a transaction read fails. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`, which a client that reads a long history slowly can meet. A client must treat a stream that ends with an error as incomplete and request the range again.
 
 ### `GetTaddressBalance` and `GetTaddressBalanceStream`
 
@@ -176,7 +181,16 @@ Both methods return the confirmed balance, the sum of unspent outputs, of up to 
 
 Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent output at or above `startHeight`, and a positive value returns at most that many, oldest first. Within one block, Zinder orders rows by transaction id and output index, where Zebra uses block position; this matters only when `maxEntries` splits a block.
 
-One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. A request that would return more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
+A request that lists an address more than once gets that address's rows once, as lightwalletd v0.6.2 does. A wallet that adds up the rows counts each output once, and duplicate rows never use up `maxEntries`.
+
+One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
+
+- `GetAddressUtxos` reads every row before it answers, so a request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
+- `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. Any other failure after the first row also ends the stream with its status after the rows already sent, such as `CHAIN_EPOCH_PIN_UNAVAILABLE` for a client still reading one minute after a new block replaces the request's epoch. A wallet must treat a stream that ends with an error as incomplete and must not add up its rows.
+
+Both methods read each distinct address once, at one chain epoch, and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
+
+A request holds at most about twice the rows it has sent, plus 2 outputs and one first page for each distinct address. Its first pages together hold at most 8,192 outputs, or 16 for each distinct address when it lists more than 512. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
 
 The protocol has no lossless way to page past the cap. A single block with more matching outputs than the cap always fails with `RESOURCE_EXHAUSTED`.
 

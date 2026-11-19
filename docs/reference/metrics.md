@@ -54,9 +54,11 @@ Other signals that need attention when they keep rising:
   states faster than the host can rebuild them.
 - `zinder_query_broadcast_budget_refusals_total`: clients send many large
   transactions, or a slow node holds broadcasts until they time out.
-- `zinder_compat_block_range_stream_refusals_total`: wallets wait for a
-  block-range stream slot. Raise `compat.max_concurrent_block_range_streams`
-  if memory allows, or limit streams per client at your proxy.
+- `zinder_compat_block_range_stream_refusals_total`, or
+  `zinder_compat_block_range_slot_wait_duration_seconds{outcome="admitted"}`
+  samples near 10 seconds: wallets wait for a block-range stream slot. Raise
+  `compat.max_concurrent_block_range_streams` if memory allows, or limit
+  streams per client at your proxy.
 - `zinder_grpc_request_receive_refusals_total`,
   `zinder_grpc_request_receive_timeouts_total`, and
   `zinder_grpc_response_send_stalls_total` while traffic is light: clients
@@ -346,7 +348,10 @@ bidirectional calls.
 | --- | --- | --- | --- |
 | `zinder_compat_serving_info` | gauge | `serving` | 1 for the serving mode: `wallet` or `compact-blocks`. |
 | `zinder_compat_block_range_streams_open` | gauge | | Block-range streams holding a slot of `compat.max_concurrent_block_range_streams`. |
-| `zinder_compat_block_range_stream_refusals_total` | counter | | Block-range requests refused with `RESOURCE_EXHAUSTED`. |
+| `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
+| `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when as many requests already waited as the limit has slots. |
+| `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
+| `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for the client to make room for it (`send`). |
 | `zinder_compat_block_range_reorg_endings_total` | counter | `cause` | Streams ended early by a reorg: `chain_replaced` or `tip_lowered`. Clients retry. |
 | `zinder_compat_compact_refresh_failures_total` | counter | `cause` | Compact-blocks mode: failed refreshes, by readiness cause. |
 
