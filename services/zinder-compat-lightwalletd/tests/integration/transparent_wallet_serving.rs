@@ -925,9 +925,12 @@ async fn address_utxos_read_each_address_of_a_small_request_in_one_page() -> eyr
 /// `maxEntries`, rather than every address's outputs up to `maxEntries`.
 #[tokio::test]
 async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::Result<()> {
+    // `maxEntries` above each address's share of the first-page budget, so
+    // the first pages are budget-sized, and high enough that reading every
+    // address up to `maxEntries` exceeds the bound.
     const ADDRESSES: u32 = 60;
-    const OUTPUTS_PER_ADDRESS: u32 = 60;
-    const MAX_ENTRIES: u32 = 30;
+    const OUTPUTS_PER_ADDRESS: u32 = 150;
+    const MAX_ENTRIES: u32 = 150;
     let (mut store_fixture, addresses) =
         busy_addresses_fixture(0x60, ADDRESSES, OUTPUTS_PER_ADDRESS)?;
     let (adapter, reads) = counting_utxo_adapter(&mut store_fixture, None)?;
@@ -976,8 +979,13 @@ async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::R
     );
     let bound = u32_to_usize(2 * MAX_ENTRIES) + u32_to_usize(ADDRESSES) * (first_page + 2);
     assert!(
-        bound < u32_to_usize(ADDRESSES * OUTPUTS_PER_ADDRESS),
-        "the bound of {bound} outputs must be below every output the request could read"
+        first_page < u32_to_usize(MAX_ENTRIES),
+        "the first pages must be the budget share, not `maxEntries`"
+    );
+    assert!(
+        bound < u32_to_usize(ADDRESSES * OUTPUTS_PER_ADDRESS.min(MAX_ENTRIES)),
+        "the bound of {bound} outputs must be below what reading each address up to \
+         `maxEntries` would read"
     );
     for outputs in [list_outputs_read, stream_outputs_read] {
         assert!(
