@@ -75,6 +75,31 @@ still open then, such as a block-range stream to a client that reads slowly,
 are abandoned. The single-volume entrypoint allows its processes 20 seconds to
 exit.
 
+### Background task failure
+
+Each background task of `zinder-query` and `zinder-compat-lightwalletd` runs
+until shutdown cancels it, so a task that ends earlier has failed. A task that
+ended quietly would leave the server answering from that task's last state:
+readiness would stop tracking its dependency, and a serving pair published as
+ready would stay ready past `storage.serving_pair_staleness_ceiling_ms`.
+
+Each runtime therefore watches its tasks next to its gRPC server. When one
+exits, or the server stops without a shutdown request, the runtime reports
+`shutting_down`, cancels the other tasks, drains the server, and exits with an
+error that names the task. It leaves the restart to the platform. The server
+drains before the serving generations are released, so a retired generation
+is never torn down under a live reader. A requested shutdown follows the same
+order and exits successfully.
+
+| Runtime | Watched tasks |
+| --- | --- |
+| `zinder-query` | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, and operational endpoint |
+| `zinder-compat-lightwalletd`, wallet serving | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, tip-change publisher, and node-tip witness |
+| `zinder-compat-lightwalletd`, compact-blocks serving | Compact-block publisher and node-tip witness |
+
+The compatibility runtime closes its operational endpoint after the server
+stops, and does not watch it.
+
 ## Memory allocator
 
 On Linux, every service binary allocates through jemalloc, and jemalloc also
