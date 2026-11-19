@@ -15,8 +15,9 @@ use std::{collections::BTreeMap, num::NonZeroU32};
 
 use rust_rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 use zinder_core::{
-    BlockHeight, ChainTipMetadata, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
-    CompactBlockArtifact, NetworkUpgradeActivations, wire::decode_height_key_ascending,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
+    CommitmentTreeAccumulatorError, CompactBlockArtifact, NetworkUpgradeActivations,
+    wire::decode_height_key_ascending,
 };
 
 use super::{
@@ -103,6 +104,9 @@ impl TreeStateStride {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DensifiedTreeStateStride {
     stride: TreeStateStride,
+    /// Block the replay ended at, which binds every replayed block to it
+    /// through the parent links the replay checked.
+    end_block: BlockId,
     seed_row: Vec<u8>,
     end_row: Vec<u8>,
     rows: Vec<(BlockHeight, Vec<u8>)>,
@@ -266,10 +270,11 @@ impl RocksDbCanonicalStore {
 
     /// Adds a densified stride's checkpoint rows in one batch.
     ///
-    /// The stride must still end at or below the settled tip, its seed and end
-    /// checkpoints must still hold the bytes the replay started from and
-    /// reproduced, and a row already stored at one of its heights must hold
-    /// identical bytes. Otherwise nothing is written.
+    /// The stride must still end at or below the settled tip, at the
+    /// canonical block the replay ended at, its seed and end checkpoints must
+    /// still hold the bytes the replay started from and reproduced, and a row
+    /// already stored at one of its heights must hold identical bytes.
+    /// Otherwise nothing is written.
     pub fn commit_tree_state_stride(
         &self,
         densified: &DensifiedTreeStateStride,
@@ -277,6 +282,14 @@ impl RocksDbCanonicalStore {
         let settled_height = self.ready_evidence.sequence_checkpoint.through().height;
         if densified.stride.end_height > settled_height {
             return Err(densified.mismatch("the stride ends above the settled tip"));
+        }
+        // Checkpoint rows hold no block hash, so only the end block binds the
+        // replayed blocks to this store's chain.
+        let canonical_end = read_block_header_at(self, densified.stride.end_height)
+            .map_err(|error| within_stride(densified.stride, error))?
+            .map(|header| header.block_hash);
+        if canonical_end != Some(densified.end_block.hash) {
+            return Err(densified.mismatch("the stride was replayed on another chain"));
         }
         let db = &self.bounded_open.db;
         let family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
@@ -605,7 +618,7 @@ fn replay_stride(
         })?;
         let (block_time_seconds, block_hash) =
             append_stored_block(store, stride, &mut accumulator, tip)?;
-        tip = zinder_core::BlockId::new(height, block_hash);
+        tip = BlockId::new(height, block_hash);
         let commitments = commitment_count(accumulator.tip_metadata());
         let stored = stored_rows.at(height);
         let selected = height < stride.end_height
@@ -634,6 +647,7 @@ fn replay_stride(
     }
     Ok(DensifiedTreeStateStride {
         stride,
+        end_block: tip,
         seed_row: stored_rows.seed_row,
         end_row: stored_rows.end_row,
         rows,
@@ -651,7 +665,7 @@ fn append_stored_block(
     store: &impl CanonicalServingRead,
     stride: TreeStateStride,
     accumulator: &mut CommitmentTreeAccumulator,
-    tip: zinder_core::BlockId,
+    tip: BlockId,
 ) -> Result<(u32, zinder_core::BlockHash), CanonicalStoreError> {
     let height = tip.height.next().ok_or_else(|| {
         CanonicalStoreError::publication("tree-state densification height exceeds u32::MAX")

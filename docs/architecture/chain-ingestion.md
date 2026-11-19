@@ -173,8 +173,10 @@ checkpoint with the checks a tree-state rebuild applies, and accepts the result
 only when the replay reproduces every checkpoint already stored in the stride,
 including the one that ends it, byte for byte. The writer then adds the stride's rows in one batch between live
 commits, after checking that the stride ends at or below the settled tip, that
-both stored checkpoints are unchanged, and that a row already stored at one of
-its heights holds the same bytes. A stride that fails a check is not written:
+the replay ended at the block stored at the stride's end, that both stored
+checkpoints are unchanged, and that a row already stored at one of its heights
+holds the same bytes. A checkpoint row holds no block hash, so the end block is
+what ties the replayed blocks to the writer's chain. A stride that fails a check is not written:
 ingest logs `tree_state_densification_integrity_failure`, counts it, and reads
 there keep replaying.
 

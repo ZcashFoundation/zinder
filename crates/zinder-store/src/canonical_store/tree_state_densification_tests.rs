@@ -16,7 +16,7 @@ use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, TreeStateCheckpointSelection, TreeStateStride,
     block_load::{encode_block_position, encode_tree_state_checkpoint},
-    live_replacement_tests::published_store,
+    live_replacement_tests::{published_fork_store, published_store},
     publication::column_family,
     rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
     test_network_upgrade_activations,
@@ -294,6 +294,46 @@ fn a_commit_refuses_a_stride_whose_end_checkpoint_changed_after_its_replay() -> 
         .ok_or("a changed end checkpoint must refuse the commit")?;
 
     assert_stride_mismatch(&error, stride(0, 100), "bounding the stride changed");
+    assert!(stored_row(&store, BlockHeight::new(50))?.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_commit_refuses_a_stride_replayed_on_another_chain_with_the_same_bounding_rows() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    let activations = activations()?;
+    let fork = TempDir::new()?;
+    let fork_store = published_fork_store(
+        &fork.path().join("canonical"),
+        REORG_WINDOW,
+        BlockHeight::new(TIP_HEIGHT),
+        BlockHeight::new(TIP_HEIGHT),
+        0x80,
+    )?;
+    let foreign =
+        fork_store.densify_tree_state_stride(stride(0, 100), EVERY_BLOCK, &activations)?;
+    for height in [0, 100] {
+        let height = BlockHeight::new(height);
+        assert_eq!(
+            stored_row(&store, height)?,
+            stored_row(&fork_store, height)?
+        );
+    }
+    let end = BlockHeight::new(100);
+    assert_ne!(
+        store.block_header_at(end)?.map(|header| header.block_hash),
+        fork_store
+            .block_header_at(end)?
+            .map(|header| header.block_hash)
+    );
+
+    let error = store
+        .commit_tree_state_stride(&foreign)
+        .err()
+        .ok_or("a stride replayed on another chain must be refused")?;
+
+    assert_stride_mismatch(&error, stride(0, 100), "another chain");
     assert!(stored_row(&store, BlockHeight::new(50))?.is_none());
     Ok(())
 }

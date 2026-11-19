@@ -1940,12 +1940,71 @@ pub(super) fn published_store_with_retention(
     settled_height: BlockHeight,
     raw_blob_retention: RawBlobRetention,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_chain_store(
+        path,
+        reorg_window,
+        build_tip_height,
+        settled_height,
+        PublishedChain {
+            raw_blob_retention,
+            fork_tag: 0,
+        },
+    )
+}
+
+/// Publishes the [`published_store`] chain forked from genesis.
+///
+/// Every block keeps its height, time, and transactions, and its hash and
+/// parent hash differ by `fork_tag`, so the fork stores the same tree-state
+/// checkpoint rows under other block hashes.
+pub(super) fn published_fork_store(
+    path: &Path,
+    reorg_window: u32,
+    build_tip_height: BlockHeight,
+    settled_height: BlockHeight,
+    fork_tag: u8,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_chain_store(
+        path,
+        reorg_window,
+        build_tip_height,
+        settled_height,
+        PublishedChain {
+            raw_blob_retention: RawBlobRetention::Transactions,
+            fork_tag,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PublishedChain {
+    raw_blob_retention: RawBlobRetention,
+    fork_tag: u8,
+}
+
+fn fork_block_hash(height: u32, fork_tag: u8) -> Result<[u8; 32], std::num::TryFromIntError> {
+    let mut hash = [u8::try_from(height)?; 32];
+    hash[0] ^= fork_tag;
+    Ok(hash)
+}
+
+fn published_chain_store(
+    path: &Path,
+    reorg_window: u32,
+    build_tip_height: BlockHeight,
+    settled_height: BlockHeight,
+    chain: PublishedChain,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let PublishedChain {
+        raw_blob_retention,
+        fork_tag,
+    } = chain;
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let tip_byte = u8::try_from(build_tip_height.value())?;
+    let tip_hash = fork_block_hash(build_tip_height.value(), fork_tag)?;
     let build_plan = CanonicalStoreBuildPlan::complete(
         &activations,
         0,
-        BlockId::new(build_tip_height, BlockHash::from_bytes([tip_byte; 32])),
+        BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash)),
         raw_blob_retention,
         CanonicalReorgPolicy::new(reorg_window)?,
     )?;
@@ -1962,9 +2021,14 @@ pub(super) fn published_store_with_retention(
         let parent_hash = if height.value() == 1 {
             Network::ZcashTestnet.genesis_hash().as_bytes()
         } else {
-            [u8::try_from(height.value() - 1)?; 32]
+            fork_block_hash(height.value() - 1, fork_tag)?
         };
-        let mut block = canonical_block(height, [hash_byte; 32], parent_hash, 100 + hash_byte);
+        let mut block = canonical_block(
+            height,
+            fork_block_hash(height.value(), fork_tag)?,
+            parent_hash,
+            100 + hash_byte,
+        );
         apply_raw_blob_retention(&mut block, raw_blob_retention, 100 + hash_byte);
         if height == build_tip_height
             || height
@@ -1978,14 +2042,16 @@ pub(super) fn published_store_with_retention(
     builder.bulk_load_blocks(blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
     builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
-        BlockId::new(build_tip_height, BlockHash::from_bytes([tip_byte; 32])),
+        BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash)),
         build_tip_height.value(),
         super::test_checkpoint_frontiers(&activations, build_tip_height),
     ))?;
     let validated = builder.prepare_cold_certified_publication()?;
-    let settled_byte = u8::try_from(settled_height.value())?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-        BlockId::new(settled_height, BlockHash::from_bytes([settled_byte; 32])),
+        BlockId::new(
+            settled_height,
+            BlockHash::from_bytes(fork_block_hash(settled_height.value(), fork_tag)?),
+        ),
         UnixTimestampMillis::new(1_750_000_000_001),
     ))?;
     Ok(validated.publish_baseline(publication)?)
