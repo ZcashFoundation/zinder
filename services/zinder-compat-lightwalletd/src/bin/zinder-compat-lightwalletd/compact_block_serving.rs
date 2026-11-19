@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
     BlockRangeStage, BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdPing, NodeTipWitness, StaleTipLimit, TipBlockTimeCache,
+    LightwalletdPing, NodeTipWitness, StaleTipLimit, TipBlockTime, TipBlockTimeCache,
     compact_transaction_has_payload, estimated_network_height, unix_now_seconds,
 };
 use zinder_core::{
@@ -762,19 +762,20 @@ impl CompactBlockAdapter {
         self.slot.capture()
     }
 
-    /// Reads the served generation's chain epoch and the Unix time of its
-    /// tip block for the tip call `method`, and refuses the tip when that
-    /// block is older than the stale-tip limit.
+    /// Reads the served generation's chain epoch and the times of its tip
+    /// for the tip call `method`, and refuses the tip when it is older than
+    /// the stale-tip limit.
     fn served_tip(
         &self,
         reader: &RocksDbCanonicalSecondary,
         method: &'static str,
-    ) -> Result<(ChainEpoch, i64, i64), Status> {
+    ) -> Result<(ChainEpoch, TipBlockTime, i64), Status> {
         let epoch = reader.chain_epoch().map_err(store_status)?;
+        let now = unix_now_seconds();
         let cached = self
             .tip_block_times
             .cached(epoch.id, epoch.visible_tip_height);
-        let tip_block_time = if let Some(cached) = cached {
+        let tip = if let Some(cached) = cached {
             cached
         } else {
             let block_time = reader
@@ -783,17 +784,15 @@ impl CompactBlockAdapter {
                 .ok_or_else(|| Status::unavailable("the served tip has no stored block header"))?
                 .block_time;
             self.tip_block_times
-                .store(epoch.id, epoch.visible_tip_height, block_time);
-            block_time
+                .store(epoch.id, epoch.visible_tip_height, block_time, now)
         };
-        let now = unix_now_seconds();
         self.stale_tip_limit.check(
             method,
-            tip_block_time,
+            tip.aged_from_unix_seconds,
             now,
             self.node_tip_witness.vouches_for(epoch.visible_tip_height),
         )?;
-        Ok((epoch, tip_block_time, now))
+        Ok((epoch, tip, now))
     }
 
     fn unsupported(method: &'static str) -> Status {
@@ -846,10 +845,14 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let reader = self.reader();
-        let (epoch, tip_block_time, now) = self.served_tip(&reader, "get_lightd_info")?;
+        let (epoch, tip, now) = self.served_tip(&reader, "get_lightd_info")?;
         let activations = writer_admitted_activations(&reader)?;
-        let estimated_height =
-            estimated_network_height(activations, epoch.visible_tip_height, tip_block_time, now);
+        let estimated_height = estimated_network_height(
+            activations,
+            epoch.visible_tip_height,
+            tip.block_time_unix_seconds,
+            now,
+        );
         Ok(Response::new(lightd_info(
             activations,
             epoch.visible_tip_height.value(),

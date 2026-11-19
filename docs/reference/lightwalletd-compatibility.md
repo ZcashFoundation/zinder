@@ -80,7 +80,7 @@ The upgrade fields come from the network-upgrade schedule that ingest admitted, 
 
 An old tip is not always a stale one: the network may simply not have produced a block. So `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE` only when both hold:
 
-- The served tip's block is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`).
+- The served tip is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`). Its age counts from its block time, or from when this process first served it since it started if that is earlier, so a block time ahead of the local clock, which consensus accepts, delays a refusal only until the first tip call after the tip changes or the process restarts.
 - The writer cannot vouch that the served tip is the network's tip: its node is unreachable, the node reports that its peers show it behind the network, the node has a block above the served tip because the writer is behind it (catching up or restored from an old snapshot), the writer is starting or parked, or ingest control does not answer.
 
 While the writer's node is reachable, reports itself in sync, and has no block above the served tip, the tip calls answer however old that tip is, and `estimatedHeight` tells wallets the chain is quiet. Go lightwalletd fails these calls only while its node is down, and keeps answering while its node is reachable but behind the network.

@@ -54,7 +54,7 @@ use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
-use crate::stale_tip::{StaleTipLimit, TipBlockTimeCache, unix_now_seconds};
+use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
 
 type GrpcStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -63,7 +63,7 @@ type GrpcStream<T> =
 /// the time it was read.
 struct ServedTip {
     block: zinder_query::VisibleTipBlock,
-    block_time_unix_seconds: i64,
+    times: TipBlockTime,
     now_unix_seconds: i64,
 }
 
@@ -367,16 +367,15 @@ where
         })
     }
 
-    /// Reads the visible tip and the Unix time of its block for the tip call
-    /// `method`, and refuses it when the block is older than the stale-tip
-    /// limit.
+    /// Reads the visible tip and its times for the tip call `method`, and
+    /// refuses it when the tip is older than the stale-tip limit.
     async fn served_tip(&self, method: &'static str) -> Result<ServedTip, Status> {
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let block_time_unix_seconds = self
+        let times = self
             .tip_block_times
             .block_time(
                 visible_tip_block.chain_epoch.id,
@@ -395,12 +394,12 @@ where
             .await?;
         let served_tip = ServedTip {
             block: visible_tip_block,
-            block_time_unix_seconds,
+            times,
             now_unix_seconds: unix_now_seconds(),
         };
         self.stale_tip_limit.check(
             method,
-            served_tip.block_time_unix_seconds,
+            served_tip.times.aged_from_unix_seconds,
             served_tip.now_unix_seconds,
             self.node_tip_witness.vouches_for(served_tip.block.height),
         )?;
@@ -1123,7 +1122,7 @@ where
         let estimated_height = estimated_network_height(
             &activations,
             visible_tip_block.height,
-            served_tip.block_time_unix_seconds,
+            served_tip.times.block_time_unix_seconds,
             served_tip.now_unix_seconds,
         );
         Ok(Response::new(lightd_info(

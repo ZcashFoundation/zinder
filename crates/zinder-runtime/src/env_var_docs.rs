@@ -1195,7 +1195,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Milliseconds the served tip's block may predate the clock, while the \
+        description: "Milliseconds the served tip may age, counted from its block time or \
+                      from when the process first served it, whichever is earlier, while the \
                       writer cannot vouch for it because its node is unreachable, behind the \
                       network, or ahead of the writer, \
                       before lightwalletd \
