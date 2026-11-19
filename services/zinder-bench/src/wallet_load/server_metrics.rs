@@ -210,7 +210,36 @@ async fn read_exposition(url: &str) -> Result<Vec<MetricSample>, String> {
             "{url}: the response has a Transfer-Encoding, which an HTTP/1.0 request does not allow"
         ));
     }
-    Ok(parse_prometheus_samples(body))
+    Ok(parse_prometheus_samples(declared_body(url, head, body)?))
+}
+
+/// The body a response declared with `Content-Length`, or every byte after
+/// the headers when it declares none and ends by closing the connection.
+///
+/// A connection that closes before the declared length is a failed scrape:
+/// parsing the prefix would read the missing counters as zero.
+fn declared_body<'response>(
+    url: &str,
+    head: &str,
+    body: &'response str,
+) -> Result<&'response str, String> {
+    let declared = head.lines().skip(1).find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .map(|(_, length)| length.trim().parse::<usize>())
+    });
+    match declared {
+        None => Ok(body),
+        Some(Err(_)) => Err(format!(
+            "{url}: the response has an unreadable Content-Length"
+        )),
+        Some(Ok(length)) => body.get(..length).ok_or_else(|| {
+            format!(
+                "{url}: the response ended after {} of its {length} body bytes",
+                body.len()
+            )
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +359,64 @@ mod tests {
             .err()
             .ok_or("a stalled endpoint must fail the scrape")?;
         assert!(error.contains("no complete response"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scrape_refuses_a_body_shorter_than_its_content_length()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request).await?;
+            let body = "zinder_query_tree_state_replay_refusals_total 5\n";
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len() + 40,
+                body
+            );
+            socket.write_all(response.as_bytes()).await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let scraped = scrape(&url).await;
+        server.await??;
+
+        let error = scraped
+            .err()
+            .ok_or("a body shorter than its Content-Length must fail the scrape")?;
+        assert!(error.contains("ended after"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scrape_reads_a_close_delimited_body_and_a_declared_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for declare_length in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/metrics", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0_u8; 512];
+                let _ = socket.read(&mut request).await?;
+                let body = "zinder_query_tree_state_replay_refusals_total 5\n";
+                let length = if declare_length {
+                    format!("Content-Length: {}\r\n", body.len())
+                } else {
+                    String::new()
+                };
+                let response = format!("HTTP/1.0 200 OK\r\n{length}\r\n{body}");
+                socket.write_all(response.as_bytes()).await?;
+                Ok::<_, std::io::Error>(())
+            });
+
+            let samples = scrape(&url).await?;
+            server.await??;
+
+            assert_eq!(samples.len(), 1, "declared length: {declare_length}");
+        }
         Ok(())
     }
 
