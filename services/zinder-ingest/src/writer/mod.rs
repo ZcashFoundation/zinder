@@ -25,7 +25,9 @@ use crate::{
     CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
     follow_canonical_tip, follow_canonical_tip_with_control,
 };
-use construction::{load_fresh_canonical_until_cancelled, record_construction_cancelled};
+use construction::{
+    load_fresh_canonical_until_cancelled, record_construction_cancelled, record_construction_phase,
+};
 
 pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
     match retention {
@@ -48,7 +50,8 @@ pub struct CanonicalWriterConfig {
     pub checkpoint_height: Option<BlockHeight>,
     /// Immutable raw-byte retention contract for fresh construction and reopen.
     pub raw_blob_retention: RawBlobRetention,
-    /// Maximum depth used to select the baseline settled tip.
+    /// Reorg window depth, which also places fresh construction's build tip,
+    /// and so the baseline settled tip, this far below the node's tip.
     pub reorg_window_blocks: u32,
     /// Continuous follower policy.
     pub follow: CanonicalFollowConfig,
@@ -465,6 +468,7 @@ where
     readiness.publish_admission(
         ReadinessState::syncing(None, None, None).with_phase(IngestPhase::BulkCatchup),
     );
+    let range_started_at = std::time::Instant::now();
     let Some(construction_range) = cancel
         .run_until_cancelled(resolve_construction_range(
             source,
@@ -476,14 +480,15 @@ where
         record_construction_cancelled("construction_range");
         return Err(CanonicalWriterError::Cancelled);
     };
-    let (build_plan, settled_tip, observed_tip) = construction_range?;
+    let (build_plan, build_tip) = construction_range?;
+    record_construction_phase("construction_range", range_started_at);
     readiness.publish_admission(
         ReadinessState::syncing(
-            Some(u64::from(observed_tip.height.value().saturating_sub(
+            Some(u64::from(build_tip.height.value().saturating_sub(
                 build_plan.history_bounds().first_available_height().value(),
             ))),
             None,
-            Some(observed_tip.height.value()),
+            Some(build_tip.height.value()),
         )
         .with_phase(IngestPhase::BulkCatchup),
     );
@@ -497,7 +502,7 @@ where
         target: "zinder::ingest",
         event = "canonical_fresh_construction_started",
         staging_path = %staging_path.display(),
-        fixed_tip_height = observed_tip.height.value(),
+        fixed_tip_height = build_tip.height.value(),
         "started canonical construction"
     );
     let loaded =
@@ -510,7 +515,7 @@ where
                     CanonicalWriterError::Construction(error)
                 }
             })?;
-    let published_fence = publish_constructed_baseline(loaded, settled_tip, cancel).await?;
+    let published_fence = publish_constructed_baseline(loaded, build_tip, cancel).await?;
     install_staged_store(staging_path, &config.storage_path)?;
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
@@ -548,12 +553,14 @@ async fn publish_constructed_baseline(
     cancel: &CancellationToken,
 ) -> Result<zinder_store::CanonicalEventFence, CanonicalWriterError> {
     let publication = tokio::task::spawn_blocking(move || {
+        let started_at = std::time::Instant::now();
         let validated = loaded.builder.prepare_trusted_fresh_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
             settled_tip,
             UnixTimestampMillis::now(),
         ))?;
         let staged_ready = validated.publish_baseline(publication)?;
+        record_construction_phase("publication", started_at);
         Ok::<_, CanonicalStoreError>(staged_ready.event_fence())
     });
     let published = publication.await;
@@ -597,39 +604,57 @@ fn validate_first_available_height(
     Ok(())
 }
 
+/// Fixes the build tip and returns the build plan with that tip.
+///
+/// The build tip is also the baseline's settled tip, so without a lower run
+/// target construction publishes the settled height that building to the
+/// node's tip would, and leaves the unsettled newest blocks to the follower.
 async fn resolve_construction_range<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
     config: &CanonicalWriterConfig,
-) -> Result<(CanonicalStoreBuildPlan, BlockId, BlockId), CanonicalWriterError>
+) -> Result<(CanonicalStoreBuildPlan, BlockId), CanonicalWriterError>
 where
     Source: NodeSource,
 {
     let source_tip = source.tip_id().await?;
-    let fixed_tip = match config.follow.target_height {
-        Some(target_height) if target_height < source_tip.height => {
-            let block = source.fetch_block_at(target_height).await?;
-            BlockId::new(target_height, block.hash)
-        }
-        _ => source_tip,
+    let build_tip_height = construction_build_tip_height(
+        source_tip.height,
+        config.follow.target_height,
+        config.reorg_window_blocks,
+        config.checkpoint_height,
+    );
+    let build_tip = if build_tip_height == source_tip.height {
+        source_tip
+    } else {
+        let block = source.fetch_block_at(build_tip_height).await?;
+        BlockId::new(build_tip_height, block.hash)
     };
     let build_plan =
-        resolve_build_plan(source, network_upgrade_activations, config, fixed_tip).await?;
-    let first_retained_height = build_plan.history_bounds().first_available_height();
-    let settled_height = BlockHeight::new(
-        fixed_tip
-            .height
-            .value()
-            .saturating_sub(config.reorg_window_blocks)
-            .max(first_retained_height.value()),
-    );
-    let settled_tip = if settled_height == fixed_tip.height {
-        fixed_tip
-    } else {
-        let block = source.fetch_block_at(settled_height).await?;
-        BlockId::new(settled_height, block.hash)
-    };
-    Ok((build_plan, settled_tip, fixed_tip))
+        resolve_build_plan(source, network_upgrade_activations, config, build_tip).await?;
+    Ok((build_plan, build_tip))
+}
+
+/// Returns the height construction builds to: one reorg window below the
+/// node's tip, so a reorg of the node's newest blocks cannot orphan the build.
+///
+/// A lower run target wins. The result never falls below the first retained
+/// block or rises above the node's tip.
+fn construction_build_tip_height(
+    source_tip_height: BlockHeight,
+    target_height: Option<BlockHeight>,
+    reorg_window_blocks: u32,
+    checkpoint_height: Option<BlockHeight>,
+) -> BlockHeight {
+    let first_retained_height = configured_first_available_height(checkpoint_height);
+    let settled_on_source = source_tip_height
+        .value()
+        .saturating_sub(reorg_window_blocks)
+        .max(first_retained_height.value())
+        .min(source_tip_height.value());
+    BlockHeight::new(target_height.map_or(settled_on_source, |target_height| {
+        target_height.value().min(settled_on_source)
+    }))
 }
 
 async fn resolve_build_plan<Source>(
@@ -721,9 +746,9 @@ mod tests {
 
     use super::{
         CanonicalWriterConfig, CanonicalWriterError, admitted_network_upgrade_activations,
-        discard_unpublished_block_load_staging, open_existing_store,
+        construction_build_tip_height, discard_unpublished_block_load_staging, open_existing_store,
         remove_empty_construction_staging, remove_unpublished_staging, resolve_build_plan,
-        validate_first_available_height,
+        resolve_construction_range, validate_first_available_height,
     };
     use crate::{CanonicalConstructionConfig, CanonicalFollowConfig};
     use zinder_store::{
@@ -1421,6 +1446,94 @@ mod tests {
             plan.history_predecessor().block_id.height,
             BlockHeight::new(0)
         );
+        Ok(())
+    }
+
+    /// A chain whose block at height `h` has hash bytes `h` (little-endian)
+    /// followed by zeros, up to a fixed tip.
+    #[derive(Clone)]
+    struct LinearSource {
+        tip_height: u32,
+    }
+
+    fn linear_block_hash(height: u32) -> BlockHash {
+        let mut hash = [0; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_bytes(hash)
+    }
+
+    #[async_trait]
+    impl NodeSource for LinearSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            NodeCapabilities::new([]).unwrap_or_default()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            if height.value() > self.tip_height {
+                return Err(SourceError::BlockUnavailable {
+                    height,
+                    reason: "linear source has no block above its tip".to_owned(),
+                });
+            }
+            Ok(SourceBlock::new(
+                SourceBlockHeader {
+                    network: Network::ZcashRegtest,
+                    height,
+                    hash: linear_block_hash(height.value()),
+                    parent_hash: linear_block_hash(height.value().saturating_sub(1)),
+                    block_time_seconds: 1_700_000_000 + height.value(),
+                },
+                Vec::new(),
+            ))
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(
+                BlockHeight::new(self.tip_height),
+                linear_block_hash(self.tip_height),
+            ))
+        }
+    }
+
+    #[test]
+    fn construction_builds_one_reorg_window_below_the_node_tip() {
+        let build_tip = |source_tip: u32, target: Option<u32>, checkpoint: Option<u32>| {
+            construction_build_tip_height(
+                BlockHeight::new(source_tip),
+                target.map(BlockHeight::new),
+                1_000,
+                checkpoint.map(BlockHeight::new),
+            )
+            .value()
+        };
+
+        assert_eq!(build_tip(1_500, None, None), 500);
+        assert_eq!(build_tip(1_500, None, Some(0)), 500);
+        // A lower run target wins; a higher one waits for following.
+        assert_eq!(build_tip(1_500, Some(300), None), 300);
+        assert_eq!(build_tip(1_500, Some(800), None), 500);
+        // Construction never builds below the first retained block, nor above
+        // the node's tip.
+        assert_eq!(build_tip(50, None, None), 1);
+        assert_eq!(build_tip(1_200, None, Some(400)), 401);
+        assert_eq!(build_tip(300, None, Some(400)), 300);
+        assert_eq!(build_tip(0, None, None), 0);
+    }
+
+    #[tokio::test]
+    async fn construction_settles_at_its_build_tip_below_the_node_tip() -> Result<(), Box<dyn Error>>
+    {
+        let activations = sample_regtest_upgrade_activations();
+        let mut config = writer_config(std::path::Path::new(""), &activations);
+        config.reorg_window_blocks = 1_000;
+        let source = LinearSource { tip_height: 1_500 };
+
+        let (plan, settled_tip) =
+            resolve_construction_range(&source, &activations, &config).await?;
+
+        let expected_build_tip = BlockId::new(BlockHeight::new(500), linear_block_hash(500));
+        assert_eq!(plan.build_tip(), expected_build_tip);
+        assert_eq!(settled_tip, expected_build_tip);
         Ok(())
     }
 

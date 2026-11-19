@@ -799,3 +799,76 @@ async fn shutdown_before_publication_finishes_publishing_and_the_next_start_inst
     );
     Ok(())
 }
+
+/// Every construction phase and serial loader stage records a duration.
+///
+/// The loader runs on a blocking thread, which a thread-local recorder does
+/// not reach, so this test installs a process-wide one. Other tests in a
+/// shared libtest process may add samples, so counts are lower bounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn construction_times_each_phase_and_serial_loader_stage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    metrics::set_global_recorder(recorder)
+        .map_err(|_| "another test in this process installed a global recorder")?;
+    let (source_block, chain_checkpoint) = held_construction_chain()?;
+    let source = HeldConstructionSource::new(source_block, chain_checkpoint);
+    source.release_chain_segments();
+    let temporary = TempDir::new()?;
+    let config =
+        held_construction_writer_config(temporary.path().join("canonical"), regtest_activations());
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    let rendered = recorded_metrics.render();
+    let sample_count = |series: &str| {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .and_then(|count| count.parse::<u64>().ok())
+    };
+    let mut expected_series = Vec::new();
+    for phase in [
+        "construction_range",
+        "block_load",
+        "source_families",
+        "publication",
+    ] {
+        expected_series.push(format!(
+            "zinder_ingest_canonical_construction_phase_duration_seconds_count{{phase=\"{phase}\"}}"
+        ));
+    }
+    // The one-block chain's only block is the build tip, which carries a
+    // tree-state checkpoint.
+    for stage in [
+        "receive_wait",
+        "commitment_extract",
+        "tree_hashing_append",
+        "position",
+        "tree_hashing_checkpoint",
+    ] {
+        expected_series.push(format!(
+            "zinder_ingest_canonical_block_load_stage_duration_seconds_count{{stage=\"{stage}\"}}"
+        ));
+    }
+    expected_series.push(
+        "zinder_store_canonical_block_load_stage_duration_seconds_count{stage=\"write\"}"
+            .to_owned(),
+    );
+    for series in expected_series {
+        assert!(
+            sample_count(&series).is_some_and(|count| count >= 1),
+            "missing {series}"
+        );
+    }
+    Ok(())
+}

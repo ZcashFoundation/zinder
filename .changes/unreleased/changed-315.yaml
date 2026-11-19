@@ -1,0 +1,6 @@
+kind: changed
+body: Fresh construction now builds to one reorg window (`ingest.reorg_window_blocks`, 1,000 by default) below the node's tip instead of to the tip, so a reorg of the node's newest blocks during a long first sync no longer discards the build. The first published settled tip is the same as before; ingest appends the newest window of blocks before it reports ready, so the first sync spends longer in catch-up. `ingest.run_overrides.target_height` still caps construction when it is lower, and the store then settles at that target.
+time: 2026-11-19T03:22:05.168087963Z
+custom:
+    Bump: minor
+    PR: "315"

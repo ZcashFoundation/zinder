@@ -3,7 +3,10 @@ mod codec;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    time::Instant,
 };
+
+use metrics::Histogram;
 
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
 use zinder_core::{
@@ -44,6 +47,10 @@ use super::{
 
 pub(super) const CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const REVERSE_INDEX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
+    "zinder_store_canonical_block_load_stage_duration_seconds";
+const BLOCK_LOAD_FINISH_DURATION_METRIC: &str =
+    "zinder_store_canonical_block_load_finish_duration_seconds";
 
 /// All source-derived values for one block in a fresh canonical construction.
 ///
@@ -206,6 +213,40 @@ struct CanonicalBlockSstStager<'options> {
     transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
     sequence: Option<BlockSequence>,
     predecessor_checkpoint_logical_bytes: u64,
+    stage_timers: BlockStageTimers,
+}
+
+/// Per-block durations of the serial store stage, resolved once per load.
+struct BlockStageTimers {
+    validate: Histogram,
+    encode: Histogram,
+    sequence: Histogram,
+    write: Histogram,
+}
+
+impl BlockStageTimers {
+    fn register() -> Self {
+        Self {
+            validate: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "validate"),
+            encode: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "encode"),
+            sequence: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "sequence"),
+            write: metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => "write"),
+        }
+    }
+}
+
+/// Runs one once-per-load finish step for `family` and records the duration
+/// of a successful step.
+fn timed_finish_step<T, E>(
+    step: &'static str,
+    family: &'static str,
+    finish: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started_at = Instant::now();
+    let finished = finish()?;
+    metrics::histogram!(BLOCK_LOAD_FINISH_DURATION_METRIC, "step" => step, "family" => family)
+        .record(started_at.elapsed());
+    Ok(finished)
 }
 
 impl<'options> CanonicalBlockSstStager<'options> {
@@ -251,12 +292,23 @@ impl<'options> CanonicalBlockSstStager<'options> {
             config,
             sequence: None,
             predecessor_checkpoint_logical_bytes,
+            stage_timers: BlockStageTimers::register(),
         })
     }
 
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+        let started_at = Instant::now();
         validate_build_block(self.config.workload, self.config.build_plan, &block)?;
-        let row = BlockSequenceRow::from_block(&block)?;
+        let validated_at = Instant::now();
+        self.stage_timers
+            .validate
+            .record(validated_at.duration_since(started_at));
+        let encoded = EncodedBlockValues::encode(&block);
+        let encoded_at = Instant::now();
+        self.stage_timers
+            .encode
+            .record(encoded_at.duration_since(validated_at));
+        let row = BlockSequenceRow::from_validated_block(&block, &encoded)?;
         if let Some(sequence) = &mut self.sequence {
             sequence.append(row)?;
         } else {
@@ -266,8 +318,13 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .map_err(|_| CanonicalStoreError::block_load_sequence("reorg window exceeds usize"))?;
             self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
         }
+        let sequenced_at = Instant::now();
+        self.stage_timers
+            .sequence
+            .record(sequenced_at.duration_since(encoded_at));
         write_build_block(
             block,
+            encoded,
             &mut self.header_writer,
             &mut self.replay_writer,
             &mut self.compact_writer,
@@ -277,7 +334,9 @@ impl<'options> CanonicalBlockSstStager<'options> {
             &mut self.block_final_note_commitment_roots_writer,
             &mut self.block_hash_sorter,
             &mut self.transaction_location_sorter,
-        )
+        )?;
+        self.stage_timers.write.record(sequenced_at.elapsed());
+        Ok(())
     }
 
     fn finish(self) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
@@ -286,22 +345,48 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 "a canonical block load must contain at least one block",
             )
         })?;
+        let options = self.config.options;
+        let sst_target_logical_bytes = self.config.sst_target_logical_bytes;
         let artifacts = CanonicalBlockSstArtifacts {
-            header: self.header_writer.finish()?,
-            block_hash: self
-                .block_hash_sorter
-                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
-            replay: self.replay_writer.finish()?,
-            compact: self.compact_writer.finish()?,
-            transaction_location: self
-                .transaction_location_sorter
-                .finish::<32>(self.config.options, self.config.sst_target_logical_bytes)?,
-            transaction_blob: self.transaction_blob_writer.finish()?,
-            block_blob: self.block_blob_writer.finish()?,
-            tree_state_checkpoint: self.tree_state_checkpoint_writer.finish()?,
-            block_final_note_commitment_roots: self
-                .block_final_note_commitment_roots_writer
-                .finish()?,
+            header: timed_finish_step("sst_finish", BLOCK_HEADER_COLUMN_FAMILY, || {
+                self.header_writer.finish()
+            })?,
+            block_hash: timed_finish_step("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY, || {
+                self.block_hash_sorter
+                    .finish::<32>(options, sst_target_logical_bytes)
+            })?,
+            replay: timed_finish_step("sst_finish", BLOCK_REPLAY_COLUMN_FAMILY, || {
+                self.replay_writer.finish()
+            })?,
+            compact: timed_finish_step("sst_finish", COMPACT_BLOCK_COLUMN_FAMILY, || {
+                self.compact_writer.finish()
+            })?,
+            transaction_location: timed_finish_step(
+                "sort_merge",
+                TRANSACTION_LOCATION_COLUMN_FAMILY,
+                || {
+                    self.transaction_location_sorter
+                        .finish::<32>(options, sst_target_logical_bytes)
+                },
+            )?,
+            transaction_blob: timed_finish_step(
+                "sst_finish",
+                TRANSACTION_BLOB_COLUMN_FAMILY,
+                || self.transaction_blob_writer.finish(),
+            )?,
+            block_blob: timed_finish_step("sst_finish", BLOCK_BLOB_COLUMN_FAMILY, || {
+                self.block_blob_writer.finish()
+            })?,
+            tree_state_checkpoint: timed_finish_step(
+                "sst_finish",
+                TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+                || self.tree_state_checkpoint_writer.finish(),
+            )?,
+            block_final_note_commitment_roots: timed_finish_step(
+                "sst_finish",
+                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+                || self.block_final_note_commitment_roots_writer.finish(),
+            )?,
         };
         prepare_canonical_block_load(
             sequence,
@@ -415,6 +500,7 @@ fn prepare_canonical_block_load(
 )]
 fn write_build_block(
     block: CanonicalBuildBlock,
+    encoded: EncodedBlockValues,
     header_writer: &mut OrderedSstWriter<'_>,
     replay_writer: &mut OrderedSstWriter<'_>,
     compact_writer: &mut OrderedSstWriter<'_>,
@@ -428,11 +514,8 @@ fn write_build_block(
     let CanonicalBuildBlock {
         facts,
         replay_envelope,
-        compact_block,
         transaction_blobs,
         block_blob,
-        tree_state_checkpoint,
-        block_final_note_commitment_roots,
         ..
     } = block;
     let height = facts.block_header.height;
@@ -440,8 +523,7 @@ fn write_build_block(
     let header_value = encode_block_header(&facts.block_header);
     header_writer.put(&height_key, &header_value)?;
     replay_writer.put(&height_key, replay_envelope.as_bytes())?;
-    let encoded_compact_block = crate::encode_compact_block_artifact(&compact_block);
-    compact_writer.put(&height_key, &encoded_compact_block)?;
+    compact_writer.put(&height_key, &encoded.compact_block)?;
 
     let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
     block_hash_sorter.push(block_hash_record)?;
@@ -476,16 +558,36 @@ fn write_build_block(
     if let Some(block_blob) = block_blob {
         block_blob_writer.put(&height_key, &block_blob.raw_block_bytes)?;
     }
-    if let Some(checkpoint) = tree_state_checkpoint {
-        let checkpoint_value =
-            encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers);
+    if let Some(checkpoint_value) = encoded.tree_state_checkpoint {
         tree_state_checkpoint_writer.put(&height_key, &checkpoint_value)?;
     }
-    if let Some(roots) = block_final_note_commitment_roots {
-        let roots_value = encode_block_final_note_commitment_roots(&roots);
+    if let Some(roots_value) = encoded.block_final_note_commitment_roots {
         block_final_note_commitment_roots_writer.put(&height_key, &roots_value)?;
     }
     Ok(())
+}
+
+/// Stored values encoded once per block for both the logical-byte accounting
+/// and the SST writers.
+struct EncodedBlockValues {
+    compact_block: Vec<u8>,
+    tree_state_checkpoint: Option<Vec<u8>>,
+    block_final_note_commitment_roots: Option<Vec<u8>>,
+}
+
+impl EncodedBlockValues {
+    fn encode(block: &CanonicalBuildBlock) -> Self {
+        Self {
+            compact_block: crate::encode_compact_block_artifact(&block.compact_block),
+            tree_state_checkpoint: block.tree_state_checkpoint.as_ref().map(|checkpoint| {
+                encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers)
+            }),
+            block_final_note_commitment_roots: block
+                .block_final_note_commitment_roots
+                .as_ref()
+                .map(encode_block_final_note_commitment_roots),
+        }
+    }
 }
 
 pub(super) fn ingest_canonical_block_ssts(
@@ -508,11 +610,13 @@ pub(super) fn ingest_canonical_block_ssts(
         options.set_snapshot_consistency(true);
         options.set_allow_global_seqno(false);
         options.set_allow_blocking_flush(false);
-        db.ingest_external_file_cf_opts(&column_family, &options, family.paths)
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "canonical block-family external SST ingestion",
-                source,
-            })?;
+        timed_finish_step("ingest", family.name, || {
+            db.ingest_external_file_cf_opts(&column_family, &options, family.paths)
+        })
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "canonical block-family external SST ingestion",
+            source,
+        })?;
         staged_ssts.extend(family.staged_ssts);
     }
     Ok(IngestedCanonicalBlockLoad {
@@ -1168,7 +1272,13 @@ struct BlockFamilyLogicalBytes {
 }
 
 impl BlockSequenceRow {
-    fn from_block(block: &CanonicalBuildBlock) -> Result<Self, CanonicalStoreError> {
+    /// Measures a block that already passed [`validate_build_block`], which
+    /// requires its replay envelope's reference digest to equal its facts
+    /// digest, so the envelope's digest stands in for recomputing it.
+    fn from_validated_block(
+        block: &CanonicalBuildBlock,
+        encoded: &EncodedBlockValues,
+    ) -> Result<Self, CanonicalStoreError> {
         let transaction_count = u64::try_from(block.facts.transactions.len()).map_err(|_| {
             CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
         })?;
@@ -1192,26 +1302,16 @@ impl BlockSequenceRow {
         let block_blob_logical_bytes = block.block_blob.as_ref().map_or(Ok(0), |block_blob| {
             checked_row_bytes(4, block_blob.raw_block_bytes.len())
         })?;
-        let tree_state_checkpoint_logical_bytes =
-            block
-                .tree_state_checkpoint
-                .as_ref()
-                .map_or(Ok(0), |checkpoint| {
-                    checked_row_bytes(
-                        4,
-                        encode_tree_state_checkpoint(
-                            checkpoint.block_time_seconds,
-                            &checkpoint.frontiers,
-                        )
-                        .len(),
-                    )
-                })?;
-        let block_final_note_commitment_roots_logical_bytes = block
+        let tree_state_checkpoint_logical_bytes = encoded
+            .tree_state_checkpoint
+            .as_ref()
+            .map_or(Ok(0), |checkpoint_value| {
+                checked_row_bytes(4, checkpoint_value.len())
+            })?;
+        let block_final_note_commitment_roots_logical_bytes = encoded
             .block_final_note_commitment_roots
             .as_ref()
-            .map_or(Ok(0), |roots| {
-                checked_row_bytes(4, encode_block_final_note_commitment_roots(roots).len())
-            })?;
+            .map_or(Ok(0), |roots_value| checked_row_bytes(4, roots_value.len()))?;
         Ok(Self {
             height: block.facts.block_header.height,
             block_hash: block.facts.block_header.block_hash,
@@ -1228,10 +1328,7 @@ impl BlockSequenceRow {
                 block_header: checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?,
                 block_hash_index: checked_row_bytes(32, 4)?,
                 block_replay: checked_row_bytes(4, block.replay_envelope.as_bytes().len())?,
-                compact_block: checked_row_bytes(
-                    4,
-                    crate::encode_compact_block_artifact(&block.compact_block).len(),
-                )?,
+                compact_block: checked_row_bytes(4, encoded.compact_block.len())?,
                 transaction_location: transaction_location_logical_bytes,
                 transaction_blob: transaction_blob_logical_bytes,
                 block_blob: block_blob_logical_bytes,
@@ -1241,7 +1338,7 @@ impl BlockSequenceRow {
             replay_value_bytes: u64::try_from(block.replay_envelope.as_bytes().len()).map_err(
                 |_| CanonicalStoreError::block_load_sequence("replay byte length exceeds u64::MAX"),
             )?,
-            facts_digest: block.facts.digest(CanonicalBlockFactsDigestVersion::V1),
+            facts_digest: block.replay_envelope.reference_digest(),
         })
     }
 }

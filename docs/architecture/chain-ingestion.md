@@ -9,14 +9,14 @@ at the tip, on a reorg, after a restart, and when a node fails.
 two phases:
 
 1. **Fresh construction.** With no store on disk, ingest bulk-builds one from
-   genesis to the node's tip at that moment, in a staging directory. Readers
-   see nothing until the build is published.
+   genesis to one reorg window below the node's tip at that moment, in a
+   staging directory. Readers see nothing until the build is published.
 2. **Continuous following.** With a published store, ingest polls the node and
    appends one block at a time, or replaces recent blocks after a reorg.
 
 Ingest picks the phase from what is on disk, not from a setting. It moves from
 construction to following once, when it publishes the build. Following then
-appends the blocks mined during construction.
+appends the newest window of blocks and those mined during construction.
 
 ## Startup sequence
 
@@ -44,9 +44,19 @@ revision. A change at or below the tip fails startup. See
 
 ## Fresh construction
 
-Construction fixes its target before it loads data: the node's tip at that
-moment, or `ingest.run_overrides.target_height` if lower. It starts at genesis
-unless `ingest.run_overrides.checkpoint_height` names a checkpoint.
+Construction fixes its target before it loads data: one reorg window
+(`ingest.reorg_window_blocks`) below the node's tip at that moment, or
+`ingest.run_overrides.target_height` if lower. When the node's chain is
+shorter than the window, the target is the first block the store retains. It
+starts at genesis unless `ingest.run_overrides.checkpoint_height` names a
+checkpoint.
+
+Stopping a window below the tip keeps a reorg of the node's newest blocks from
+orphaning the build. The build tip is the published store's settled tip.
+Without a lower run target, that is the settled tip the store would have had if
+construction built to the node's tip. Following then appends the remaining
+newest blocks one at a time, as in
+[Continuous following](#continuous-following), before ingest reports ready.
 
 Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
 them in order. It rebuilds the note commitment trees from the blocks and stores
