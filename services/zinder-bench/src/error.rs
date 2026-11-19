@@ -161,6 +161,12 @@ pub enum BenchError {
         /// Human-readable description of the failure.
         reason: String,
     },
+    /// A wallet-load run could not reach or identify its endpoint.
+    #[error("wallet load endpoint error: {reason}")]
+    WalletLoadEndpoint {
+        /// Status label and message of the failed probe call.
+        reason: String,
+    },
 }
 
 impl From<serde_json::Error> for BenchError {
@@ -318,6 +324,14 @@ impl BenchError {
     #[must_use]
     pub fn tip_replay(reason: impl Into<String>) -> Self {
         Self::TipReplay {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a wallet-load endpoint error from the failed probe call.
+    #[must_use]
+    pub fn wallet_load_endpoint(reason: impl Into<String>) -> Self {
+        Self::WalletLoadEndpoint {
             reason: reason.into(),
         }
     }
