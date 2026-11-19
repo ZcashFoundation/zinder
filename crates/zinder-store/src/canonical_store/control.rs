@@ -500,7 +500,13 @@ fn decode_history_bounds(
         decode_predecessor_frontier(decoder, ShieldedProtocol::Sapling)?,
         decode_predecessor_frontier(decoder, ShieldedProtocol::Orchard)?,
         decode_predecessor_frontier(decoder, ShieldedProtocol::Ironwood)?,
-    );
+    )
+    .map_err(|source| {
+        CanonicalStoreError::admission(
+            decoder.path,
+            format!("store control predecessor frontiers are invalid: {source}"),
+        )
+    })?;
     Ok((
         history_bounds,
         CommitmentTreeCheckpoint::new(history_predecessor, block_time_seconds, frontiers),
@@ -846,7 +852,7 @@ mod tests {
 
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
-        let build_plan = checkpointed_build_plan(checkpoint, history_bounds);
+        let build_plan = checkpointed_build_plan(checkpoint, history_bounds)?;
         let encoded = encode_building_store_control(
             CanonicalStoreWorkload::Wallet,
             &build_plan,
@@ -1214,7 +1220,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
-        let build_plan = checkpointed_build_plan(checkpoint, history_bounds);
+        let build_plan = checkpointed_build_plan(checkpoint, history_bounds)?;
         let encoded = encode_building_store_control(
             CanonicalStoreWorkload::Wallet,
             &build_plan,
@@ -1365,8 +1371,8 @@ mod tests {
     fn checkpointed_build_plan(
         checkpoint: BlockId,
         history_bounds: CanonicalHistoryBounds,
-    ) -> CanonicalStoreBuildPlan {
-        CanonicalStoreBuildPlan {
+    ) -> Result<CanonicalStoreBuildPlan, zinder_core::CommitmentTreeFrontiersError> {
+        Ok(CanonicalStoreBuildPlan {
             network: Network::ZcashTestnet,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
             raw_blob_retention: RawBlobRetention::Transactions,
@@ -1381,9 +1387,9 @@ mod tests {
                     Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
                     Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
                     Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
-                ),
+                )?,
             ),
             build_tip: BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-        }
+        })
     }
 }

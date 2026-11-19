@@ -737,7 +737,7 @@ impl<'activations> FixtureCommitmentTrees<'activations> {
                     non_empty(frontiers.sapling()),
                     non_empty(frontiers.orchard()),
                     non_empty(frontiers.ironwood()),
-                )
+                )?
             }
         })
     }

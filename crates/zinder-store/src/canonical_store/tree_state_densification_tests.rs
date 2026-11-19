@@ -180,6 +180,36 @@ fn a_reader_reopened_after_densification_reads_and_seeds_from_the_new_rows() -> 
     Ok(())
 }
 
+/// Densified rows do not stand in for a missing cadence checkpoint.
+///
+/// Without the checkpoint at 100, a read there and a read above it that would
+/// replay from below it are store damage, while the densified rows below it
+/// still answer.
+#[test]
+fn a_densified_store_refuses_reads_that_need_a_missing_cadence_checkpoint() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    let activations = activations()?;
+    let reconstructed = reconstructed_checkpoints(&store, &activations)?;
+    densify_all(&store, &activations, EVERY_BLOCK)?;
+    delete_row(&store, BlockHeight::new(100))?;
+
+    for height in [100, 120] {
+        assert!(
+            matches!(
+                store.tree_state_checkpoint_at(BlockHeight::new(height), &activations),
+                Err(CanonicalStoreError::PublicationRefused { .. })
+            ),
+            "height {height} needs the cadence checkpoint"
+        );
+    }
+    assert_eq!(
+        store.tree_state_checkpoint_at(BlockHeight::new(99), &activations)?,
+        reconstructed[99]
+    );
+    Ok(())
+}
+
 #[test]
 fn a_block_that_breaks_the_parent_link_leaves_its_stride_unwritten() -> TestResult {
     let temporary = TempDir::new()?;
@@ -223,6 +253,34 @@ fn an_undecodable_compact_block_is_a_stride_failure_in_replay_and_in_a_budget_sc
 
     assert_stride_mismatch(&replay_error, stride(0, 100), "");
     assert_stride_mismatch(&scan_error, stride(0, 100), "");
+    Ok(())
+}
+
+#[test]
+fn a_seed_whose_root_does_not_match_is_refused_before_its_stride_replays() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    let activations = activations()?;
+    densify_all(&store, &activations, EVERY_BLOCK)?;
+    let seed = BlockHeight::new(50);
+    let mut row = stored_row(&store, seed)?.ok_or("checkpoint row is absent")?;
+    // The Sapling root follows the block time and the presence bitmap.
+    let root_byte = row
+        .get_mut(5)
+        .ok_or("checkpoint row holds no Sapling root")?;
+    *root_byte ^= 0xff;
+    replace_row(&store, seed, &row)?;
+
+    let error = store
+        .densify_tree_state_stride(stride(50, 100), EVERY_BLOCK, &activations)
+        .err()
+        .ok_or("a seed with a wrong root must refuse the stride")?;
+
+    assert_stride_mismatch(
+        &error,
+        stride(50, 100),
+        "frontier root does not match finalRoot",
+    );
     Ok(())
 }
 

@@ -201,10 +201,13 @@ the selected checkpoints; otherwise it ignores the file, logs
 it does after a change of selection. The file is written only after the
 commits it covers are durable. Only the stride that ends at the recorded
 height is checked again on start, so damage below it is not looked for again;
-a read there checks its stored row against its roots as always, and a missing
-row only makes that read replay. The writer commits through its command queue,
-so the pass runs only when `ingest_control.listen_addr` is set, as it is for
-wallet serving.
+a read there serves its stored row as written, as every stored read does
+([Wallet data plane](wallet-data-plane.md#tree-states-and-subtree-roots)). A
+missing densification row only makes that read replay, but a missing cadence
+checkpoint is store damage: a read at its height is refused, as is any read
+above it that would replay from below it. The writer commits through its
+command queue, so the pass runs only when `ingest_control.listen_addr` is set,
+as it is for wallet serving.
 
 `ingest.tree_state_densification.workers` (2 by default) bounds how many
 strides the pass replays at once, each on one CPU, and `max_blocks_per_second`

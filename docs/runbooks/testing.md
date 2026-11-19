@@ -103,9 +103,10 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
+  --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node'
 ```
 
 ## Run one test or one tier

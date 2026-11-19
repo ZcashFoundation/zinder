@@ -21,7 +21,7 @@ use zinder_query::{
 use zinder_store::{
     BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
     ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, RawBlobRetention,
+    EventStreamStartPosition, RawBlobRetention, ServedTreeState,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -311,7 +311,7 @@ impl CanonicalReader for GatedCanonicalReader {
     fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
         self.canonical_reader
             .tree_state_checkpoint_at_or_before(height)
     }

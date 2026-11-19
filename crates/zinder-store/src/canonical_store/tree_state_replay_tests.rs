@@ -13,7 +13,7 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, TreeStateLookup, TreeStateReplayOutcome,
+    RocksDbCanonicalStore, ServedTreeState, TreeStateLookup, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
     publication::column_family,
@@ -238,7 +238,7 @@ fn a_lookup_answers_stored_heights_and_seeds_the_rest() -> Result<(), Box<dyn st
         let height = BlockHeight::new(stored);
         assert_eq!(
             store.tree_state_lookup(height, &activations)?,
-            Some(TreeStateLookup::Stored(expected_checkpoint(
+            Some(TreeStateLookup::Stored(expected_tree_state(
                 &activations,
                 height
             )?))
@@ -279,7 +279,7 @@ fn a_replay_starts_from_the_seed_its_lookup_read() -> Result<(), Box<dyn std::er
         store.replay_tree_state(&replay, &activations)?,
         Some(TreeStateReplayOutcome::Replayed {
             replay: Box::new(replay.clone()),
-            checkpoint: expected_checkpoint(&activations, height)?,
+            tree_state: expected_tree_state(&activations, height)?,
         })
     );
     assert_publication_refused(&store, height, &activations)
@@ -317,12 +317,12 @@ fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn 
         other.replay_tree_state(&within_both, &activations)?,
         Some(TreeStateReplayOutcome::Replayed {
             replay: Box::new(other_seed),
-            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+            tree_state: expected_tree_state(&activations, BlockHeight::new(120))?,
         })
     );
     assert_eq!(
         other.replay_tree_state(&stored_by_other, &activations)?,
-        Some(TreeStateReplayOutcome::Stored(expected_checkpoint(
+        Some(TreeStateReplayOutcome::Stored(expected_tree_state(
             &activations,
             BlockHeight::new(140)
         )?))
@@ -340,7 +340,7 @@ fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn 
         issuing.replay_tree_state(&within_both, &activations)?,
         Some(TreeStateReplayOutcome::Replayed {
             replay: Box::new(within_both.clone()),
-            checkpoint: expected_checkpoint(&activations, BlockHeight::new(120))?,
+            tree_state: expected_tree_state(&activations, BlockHeight::new(120))?,
         })
     );
     Ok(())
@@ -364,6 +364,85 @@ fn a_replay_refuses_an_activation_table_the_store_did_not_admit()
     assert!(matches!(
         store.replay_tree_state(&replay, &edited),
         Err(CanonicalStoreError::AdmissionRefused { .. })
+    ));
+    Ok(())
+}
+
+/// A served read of a stored checkpoint neither reads nor re-derives its
+/// roots.
+///
+/// It checks the row's framing, so a root that no longer matches its
+/// frontier does not change what it serves. The lookup decides how to decode
+/// the row only after its seek lands on the requested height.
+#[test]
+fn a_stored_checkpoint_is_served_without_its_roots() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let height = BlockHeight::new(100);
+    flip_first_root_byte(&store, height)?;
+    let expected = expected_tree_state(&activations, height)?;
+
+    assert_eq!(
+        store.tree_state_lookup(height, &activations)?,
+        Some(TreeStateLookup::Stored(expected.clone()))
+    );
+    for read_height in [100, 120] {
+        assert_eq!(
+            store.tree_state_checkpoint_at_or_before(BlockHeight::new(read_height))?,
+            Some(expected.clone())
+        );
+    }
+    Ok(())
+}
+
+/// A served checkpoint whose framing is broken is still store damage.
+#[test]
+fn a_stored_checkpoint_with_broken_framing_is_refused_when_served()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let height = BlockHeight::new(100);
+    let mut row = stored_checkpoint_row(&store, height)?;
+    row.pop();
+    replace_checkpoint_row(&store, height, &row)?;
+
+    assert!(matches!(
+        store.tree_state_lookup(height, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    assert!(matches!(
+        store.tree_state_checkpoint_at_or_before(height),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    Ok(())
+}
+
+/// Every read that builds further tree state from a stored checkpoint parses
+/// it in full and re-derives its roots before using it.
+#[test]
+fn a_checkpoint_whose_root_does_not_match_is_refused_where_it_seeds_tree_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    flip_first_root_byte(&store, BlockHeight::new(100))?;
+    flip_first_root_byte(&store, BlockHeight::new(TIP_HEIGHT))?;
+
+    for height in [100, 120, TIP_HEIGHT] {
+        assert_publication_refused(&store, BlockHeight::new(height), &activations)?;
+    }
+    assert!(
+        matches!(
+            store.tree_state_lookup(BlockHeight::new(120), &activations),
+            Err(CanonicalStoreError::PublicationRefused { .. })
+        ),
+        "a replay seed is refused before the replay starts"
+    );
+    assert!(matches!(
+        store.append_anchor(),
+        Err(CanonicalStoreError::LiveCommitRefused { .. })
     ));
     Ok(())
 }
@@ -413,8 +492,20 @@ fn expected_checkpoint(
     Ok(CommitmentTreeCheckpoint::new(
         BlockId::new(height, hash),
         height.value(),
-        test_checkpoint_frontiers(activations, height),
+        test_checkpoint_frontiers(activations, height)?,
     ))
+}
+
+/// The tree state a wallet read serves at `height`, from the checkpoint
+/// [`expected_checkpoint`] names.
+fn expected_tree_state(
+    activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+) -> Result<ServedTreeState, Box<dyn std::error::Error>> {
+    Ok(ServedTreeState::from(&expected_checkpoint(
+        activations,
+        height,
+    )?))
 }
 
 /// Mutable fields of one stored compact block.
@@ -471,6 +562,45 @@ fn delete_checkpoint(
         .db
         .delete_cf(&family, encode_block_position(height))?;
     Ok(())
+}
+
+fn stored_checkpoint_row(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let family = column_family(&store.bounded_open.db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    Ok(store
+        .bounded_open
+        .db
+        .get_cf(&family, encode_block_position(height))?
+        .ok_or("checkpoint row is absent")?)
+}
+
+fn replace_checkpoint_row(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+    row: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let family = column_family(&store.bounded_open.db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    store
+        .bounded_open
+        .db
+        .put_cf(&family, encode_block_position(height), row)?;
+    Ok(())
+}
+
+/// Flips one byte of the Sapling root stored at `height`, which follows the
+/// block time and the presence bitmap.
+fn flip_first_root_byte(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut row = stored_checkpoint_row(store, height)?;
+    let root_byte = row
+        .get_mut(5)
+        .ok_or("checkpoint row holds no Sapling root")?;
+    *root_byte ^= 0xff;
+    replace_checkpoint_row(store, height, &row)
 }
 
 fn assert_publication_refused(

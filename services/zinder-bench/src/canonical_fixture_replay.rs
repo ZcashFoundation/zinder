@@ -984,13 +984,17 @@ impl CanonicalFixtureReplayCheckpointRecord {
             self.frontiers.ironwood.as_ref(),
             field,
         )?;
+        let frontiers = CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood)
+            .map_err(|source| {
+            BenchError::fixture_format(format!("invalid {field} frontiers: {source}"))
+        })?;
         Ok(CommitmentTreeCheckpoint::new(
             BlockId::new(
                 BlockHeight::new(self.block_id.height),
                 BlockHash::from_bytes(block_hash),
             ),
             self.block_time_seconds,
-            CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood),
+            frontiers,
         ))
     }
 }

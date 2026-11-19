@@ -29,7 +29,7 @@ use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
     ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    StreamCursorTokenV1, TreeStateLookup, TreeStateReplayOutcome,
+    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -1222,7 +1222,7 @@ where
                 TreeStateLookup::Stored(stored) => {
                     let trees = stored.tip_metadata();
                     record_tree_state_read(height, 0, trees, trees);
-                    return Ok(tree_state_from_checkpoint(lookup_epoch, stored));
+                    return Ok(tree_state_response(lookup_epoch, stored));
                 }
                 TreeStateLookup::Replay(replay) => replay,
             };
@@ -1246,24 +1246,24 @@ where
                     Ok((chain_epoch, outcome, started_at.elapsed()))
                 })
                 .await?;
-            let checkpoint = match outcome {
+            let tree_state = match outcome {
                 TreeStateReplayOutcome::Stored(stored) => {
                     let trees = stored.tip_metadata();
                     record_tree_state_read(height, 0, trees, trees);
                     stored
                 }
-                TreeStateReplayOutcome::Replayed { replay, checkpoint } => {
+                TreeStateReplayOutcome::Replayed { replay, tree_state } => {
                     record_replay_duration(height, replay_duration);
                     record_tree_state_read(
                         height,
                         replay.replayed_blocks(),
                         replay.seed().tip_metadata(),
-                        checkpoint.tip_metadata(),
+                        tree_state.tip_metadata(),
                     );
-                    checkpoint
+                    tree_state
                 }
             };
-            Ok(tree_state_from_checkpoint(chain_epoch, checkpoint))
+            Ok(tree_state_response(chain_epoch, tree_state))
         })
         .await
     }
@@ -1286,7 +1286,7 @@ where
                             chain_epoch.visible_tip_height,
                         )
                     })?;
-                Ok(tree_state_from_checkpoint(chain_epoch, checkpoint))
+                Ok(tree_state_response(chain_epoch, checkpoint))
             },
         )
         .await
@@ -1682,28 +1682,19 @@ fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryErr
     }
 }
 
-fn tree_state_from_checkpoint(
-    chain_epoch: ChainEpoch,
-    checkpoint: zinder_core::CommitmentTreeCheckpoint,
-) -> TreeState {
-    let zinder_core::CommitmentTreeCheckpoint {
-        block_id,
-        block_time_seconds,
-        frontiers,
-    } = checkpoint;
-    let (sapling, orchard, ironwood) = frontiers.into_parts();
-    let final_state = |frontier: zinder_core::CommitmentTreeFrontier| {
-        frontier.into_final_state_bytes().into_vec()
-    };
+fn tree_state_response(chain_epoch: ChainEpoch, tree_state: ServedTreeState) -> TreeState {
+    let block_id = tree_state.block_id();
+    let block_time_seconds = tree_state.block_time_seconds();
+    let (sapling, orchard, ironwood) = tree_state.into_final_state_bytes();
     TreeState {
         chain_epoch,
         height: block_id.height,
         block_hash: block_id.hash,
         block_time_seconds,
         frontiers: TreeStateFrontiers {
-            sapling_final_state: sapling.map(final_state),
-            orchard_final_state: orchard.map(final_state),
-            ironwood_final_state: ironwood.map(final_state),
+            sapling_final_state: sapling.map(Vec::from),
+            orchard_final_state: orchard.map(Vec::from),
+            ironwood_final_state: ironwood.map(Vec::from),
         },
     }
 }
@@ -1715,8 +1706,9 @@ mod tree_state_conversion_tests {
         ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
         CommitmentTreeFrontiers, Network, ShieldedProtocol, UnixTimestampMillis,
     };
+    use zinder_store::ServedTreeState;
 
-    use super::tree_state_from_checkpoint;
+    use super::tree_state_response;
 
     fn chain_epoch() -> ChainEpoch {
         ChainEpoch {
@@ -1734,7 +1726,8 @@ mod tree_state_conversion_tests {
 
     /// The response must own the checkpoint's buffers, not copies of them.
     #[test]
-    fn tree_state_from_checkpoint_moves_each_frontier_buffer_into_the_response() {
+    fn tree_state_response_moves_each_frontier_buffer_into_the_response()
+    -> Result<(), zinder_core::CommitmentTreeFrontiersError> {
         let sapling = CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling);
         let orchard = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
         let ironwood = CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood);
@@ -1755,10 +1748,10 @@ mod tree_state_conversion_tests {
                 Some(sapling),
                 Some(orchard),
                 Some(ironwood),
-            ),
+            )?,
         );
 
-        let tree_state = tree_state_from_checkpoint(chain_epoch(), checkpoint);
+        let tree_state = tree_state_response(chain_epoch(), ServedTreeState::from(checkpoint));
         let served = [
             tree_state.frontiers.sapling_final_state,
             tree_state.frontiers.orchard_final_state,
@@ -1774,6 +1767,7 @@ mod tree_state_conversion_tests {
         }
         assert_eq!(tree_state.height, BlockHeight::new(1));
         assert_eq!(tree_state.block_time_seconds, 1_774_668_401);
+        Ok(())
     }
 }
 

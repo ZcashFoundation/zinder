@@ -196,10 +196,11 @@ pub(crate) fn measure_tree_state_replays(
             .ok_or_else(|| {
                 BenchError::report_format(format!("anchor {height} has no checkpoint below it"))
             })?;
-        if seed.block_id.height.value() == height {
+        let seed_height = seed.block_id().height.value();
+        if seed_height == height {
             stored_checkpoint_anchors_skipped = stored_checkpoint_anchors_skipped.saturating_add(1);
         } else {
-            replays.push((height, seed.block_id.height.value(), seed.tip_metadata()));
+            replays.push((height, seed_height, seed.tip_metadata()));
         }
     }
     let replays = spread_evenly(replays, window.max_anchors);

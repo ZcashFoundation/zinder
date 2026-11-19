@@ -224,34 +224,35 @@ fn subtree_root_record(
     }
 }
 
-fn checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
+fn checkpoint_frontiers_at(height: BlockHeight) -> Result<CommitmentTreeFrontiers> {
     CommitmentTreeFrontiers::from_validated_parts(
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
         (height.value() >= 603).then(|| CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
     )
+    .map_err(Into::into)
 }
 
 fn fixture_checkpoint_source(
     fixture: &RegtestFixtureCase,
-) -> (
+) -> Result<(
     CheckpointSource,
     CommitmentTreeCheckpoint,
     CommitmentTreeCheckpoint,
-) {
+)> {
     let predecessor_height = BlockHeight::new(fixture.manifest.from_height - 1);
     let predecessor = CommitmentTreeCheckpoint::new(
         BlockId::new(predecessor_height, fixture.block.parent_hash),
         fixture.block.block_time_seconds.saturating_sub(1),
-        checkpoint_frontiers_at(predecessor_height),
+        checkpoint_frontiers_at(predecessor_height)?,
     );
     let fixed_tip = CommitmentTreeCheckpoint::new(
         BlockId::new(fixture.block.height, fixture.block.hash),
         fixture.block.block_time_seconds,
-        checkpoint_frontiers_at(fixture.block.height),
+        checkpoint_frontiers_at(fixture.block.height)?,
     );
     let source = CheckpointSource::new(vec![predecessor.clone(), fixed_tip.clone()]);
-    (source, predecessor, fixed_tip)
+    Ok((source, predecessor, fixed_tip))
 }
 
 fn fixture_construction_checkpoint_source(
@@ -261,7 +262,7 @@ fn fixture_construction_checkpoint_source(
     CommitmentTreeCheckpoint,
     CommitmentTreeCheckpoint,
 )> {
-    let (_, predecessor, _) = fixture_checkpoint_source(fixture);
+    let (_, predecessor, _) = fixture_checkpoint_source(fixture)?;
     fixture_construction_checkpoint_source_from_predecessor(fixture, predecessor)
 }
 
@@ -280,7 +281,7 @@ fn fixture_construction_checkpoint_source_with_completed_sapling(
             Some(completed_sapling_subtree_frontier()?),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
             None,
-        ),
+        )?,
     );
     fixture_construction_checkpoint_source_from_predecessor(fixture, predecessor)
 }
@@ -550,7 +551,7 @@ async fn canonical_replay_plan_captures_digest_bound_predecessor_and_tip_checkpo
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
     let predecessor_height = BlockHeight::new(fixture.manifest.from_height - 1);
-    let (source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    let (source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture)?;
     let manifest_path = fixture.directory.path().join("manifest.json");
     let original_manifest_bytes = std::fs::read(&manifest_path)?;
 
@@ -600,7 +601,7 @@ async fn canonical_replay_plan_captures_digest_bound_predecessor_and_tip_checkpo
 async fn canonical_fixture_source_serves_only_the_admitted_boundary_checkpoints() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (checkpoint_source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    let (checkpoint_source, predecessor, fixed_tip) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(
         fixture.directory.path(),
         &checkpoint_source,
@@ -630,7 +631,7 @@ async fn canonical_fixture_source_serves_only_the_admitted_boundary_checkpoints(
 async fn canonical_fixture_source_rejects_a_different_activation_fingerprint() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (checkpoint_source, predecessor, _) = fixture_checkpoint_source(&fixture);
+    let (checkpoint_source, predecessor, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(
         fixture.directory.path(),
         &checkpoint_source,
@@ -655,7 +656,7 @@ async fn canonical_fixture_source_rejects_a_different_activation_fingerprint() -
 async fn canonical_fixture_source_rejects_an_unrelated_checkpoint_height() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture);
+    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(
         fixture.directory.path(),
         &checkpoint_source,
@@ -879,7 +880,7 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
 async fn canonical_fixture_rocksdb_replay_preserves_an_existing_store_path() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture);
+    let (checkpoint_source, _, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(
         fixture.directory.path(),
         &checkpoint_source,
@@ -1037,7 +1038,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_manifest_digest_drift_unpublish
 async fn canonical_fixture_checkpoint_capture_preserves_existing_sidecar_bytes() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    let (source, _, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
     let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
     let captured_bytes = std::fs::read(&sidecar_path)?;
@@ -1063,7 +1064,7 @@ async fn canonical_fixture_checkpoint_capture_preserves_existing_sidecar_bytes()
 async fn canonical_fixture_replay_plan_rejects_a_different_manifest_digest() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    let (source, _, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
     let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
     let mut encoded_plan: Value = serde_json::from_slice(&std::fs::read(&sidecar_path)?)?;
@@ -1083,7 +1084,7 @@ async fn canonical_fixture_replay_plan_rejects_a_different_manifest_digest() -> 
 async fn canonical_fixture_checkpoint_capture_rejects_a_different_activation_fingerprint()
 -> Result<()> {
     let fixture = write_regtest_fixture()?;
-    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    let (source, _, _) = fixture_checkpoint_source(&fixture)?;
     let mismatched_activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
 
     let error = capture_canonical_fixture_replay_plan(
@@ -1111,7 +1112,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_a_different_activation_fin
 async fn canonical_fixture_replay_plan_rejects_a_malformed_frontier() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (source, _, _) = fixture_checkpoint_source(&fixture);
+    let (source, _, _) = fixture_checkpoint_source(&fixture)?;
     capture_canonical_fixture_replay_plan(fixture.directory.path(), &source, &activations).await?;
     let sidecar_path = fixture.directory.path().join("canonical-replay-plan.json");
     let mut encoded_plan: Value = serde_json::from_slice(&std::fs::read(&sidecar_path)?)?;
@@ -1136,7 +1137,7 @@ async fn canonical_fixture_replay_plan_rejects_a_malformed_frontier() -> Result<
 async fn canonical_fixture_checkpoint_capture_rejects_a_disconnected_predecessor() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (_, mut predecessor, fixed_tip) = fixture_checkpoint_source(&fixture);
+    let (_, mut predecessor, fixed_tip) = fixture_checkpoint_source(&fixture)?;
     predecessor.block_id = BlockId::new(
         predecessor.block_id.height,
         BlockHash::from_bytes([0x42; 32]),
@@ -1170,7 +1171,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_a_disconnected_predecessor
 async fn canonical_fixture_checkpoint_capture_rejects_a_wrong_source_tip() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
-    let (_, predecessor, mut fixed_tip) = fixture_checkpoint_source(&fixture);
+    let (_, predecessor, mut fixed_tip) = fixture_checkpoint_source(&fixture)?;
     fixed_tip.block_id = BlockId::new(fixed_tip.block_id.height, BlockHash::from_bytes([0x24; 32]));
     let source = CheckpointSource::new(vec![predecessor, fixed_tip]);
 

@@ -1,0 +1,6 @@
+kind: changed
+body: "Tree-state reads at a height with a stored checkpoint no longer recompute each pool's commitment-tree root, which cost several milliseconds of CPU per three-pool request. Checkpoints are validated when they are written and protected at rest by RocksDB block checksums. In `zinder-core`, `CommitmentTreeFrontiers::from_validated_parts` now returns a `Result` and rejects a frontier validated for another pool, and frontier equality includes the pool."
+time: 2026-11-19T20:00:00.000000000Z
+custom:
+    Bump: minor
+    PR: "330"

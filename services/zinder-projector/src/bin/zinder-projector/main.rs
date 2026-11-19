@@ -2516,7 +2516,7 @@ mod tests {
             1,
             zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
             [0x11; 32],
-        );
+        )?;
         let block_one_id = BlockId::new(
             block_one.facts.block_header.height,
             block_one.facts.block_header.block_hash,
@@ -2539,7 +2539,7 @@ mod tests {
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,
             1,
-            regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
+            regtest_checkpoint_frontiers_at(BlockHeight::new(1))?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -2549,7 +2549,7 @@ mod tests {
         let canonical = validated.publish_baseline(publication)?;
         let baseline_fence = canonical.event_fence();
 
-        let old_block_two = empty_canonical_block(2, [0x11; 32], [0x22; 32]);
+        let old_block_two = empty_canonical_block(2, [0x11; 32], [0x22; 32])?;
         let (canonical, old_append_fence) = canonical.commit_live_append(
             CanonicalLiveAppend::new(
                 baseline_fence,
@@ -2560,7 +2560,7 @@ mod tests {
             ),
             &activations,
         )?;
-        let replacement_block_two = empty_canonical_block(2, [0x11; 32], [0x32; 32]);
+        let replacement_block_two = empty_canonical_block(2, [0x11; 32], [0x32; 32])?;
         let replacement_block_two_id = BlockId::new(
             replacement_block_two.facts.block_header.height,
             replacement_block_two.facts.block_header.block_hash,
@@ -2587,7 +2587,7 @@ mod tests {
             let (next, fence) = canonical.commit_live_append(
                 CanonicalLiveAppend::new(
                     current_fence,
-                    empty_canonical_block(height, parent_hash, block_hash),
+                    empty_canonical_block(height, parent_hash, block_hash)?,
                     Vec::new(),
                     settled_tip,
                     UnixTimestampMillis::new(u64::from(height).saturating_add(3)),
@@ -3360,7 +3360,7 @@ mod tests {
             1,
             zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
             [0x11; 32],
-        );
+        )?;
         let block_one_id = BlockId::new(
             block_one.facts.block_header.height,
             block_one.facts.block_header.block_hash,
@@ -3382,7 +3382,7 @@ mod tests {
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,
             1,
-            regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
+            regtest_checkpoint_frontiers_at(BlockHeight::new(1))?,
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -3412,7 +3412,7 @@ mod tests {
             let (next, _) = writer.commit_live_append(
                 CanonicalLiveAppend::new(
                     fence,
-                    empty_canonical_block(height, parent_hash, [block_byte; 32]),
+                    empty_canonical_block(height, parent_hash, [block_byte; 32])?,
                     Vec::new(),
                     settled_tip,
                     UnixTimestampMillis::new(u64::from(height)),
@@ -3451,7 +3451,7 @@ mod tests {
         height: u32,
         parent_hash: [u8; 32],
         block_hash: [u8; 32],
-    ) -> CanonicalBuildBlock {
+    ) -> Result<CanonicalBuildBlock, zinder_core::CommitmentTreeFrontiersError> {
         let height = BlockHeight::new(height);
         let block_hash = BlockHash::from_bytes(block_hash);
         let parent_hash = BlockHash::from_bytes(parent_hash);
@@ -3479,7 +3479,7 @@ mod tests {
             CanonicalBlockReplayFormatVersion::V1,
             CanonicalBlockFactsDigestVersion::V1,
         );
-        CanonicalBuildBlock {
+        Ok(CanonicalBuildBlock {
             facts,
             replay_envelope,
             compact_block: CompactBlockArtifact::empty(
@@ -3496,12 +3496,12 @@ mod tests {
             tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
                 BlockId::new(height, block_hash),
                 height.value(),
-                regtest_checkpoint_frontiers_at(height),
+                regtest_checkpoint_frontiers_at(height)?,
             )),
             block_final_note_commitment_roots: None,
             transaction_blobs: vec![transaction_blob],
             block_blob: None,
-        }
+        })
     }
 
     fn empty_coinbase(
@@ -3546,7 +3546,9 @@ mod tests {
         (facts, blob)
     }
 
-    fn regtest_checkpoint_frontiers_at(height: BlockHeight) -> CommitmentTreeFrontiers {
+    fn regtest_checkpoint_frontiers_at(
+        height: BlockHeight,
+    ) -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
         CommitmentTreeFrontiers::from_validated_parts(
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             (height.value() >= 2).then(|| CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),

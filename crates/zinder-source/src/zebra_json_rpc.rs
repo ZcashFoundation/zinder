@@ -22,10 +22,10 @@ use zinder_core::{
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
     BroadcastUnknown, ChainValuePool, ChainValuePools, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
-    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
-    ValuePoolBalance,
+    CommitmentTreeFrontiersError, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    TransactionId, ValuePoolBalance,
 };
 
 use crate::{
@@ -2060,9 +2060,14 @@ fn decode_zebra_commitment_tree_frontiers(
         network_upgrade_activations,
     )?;
 
-    Ok(CommitmentTreeFrontiers::from_validated_parts(
-        sapling, orchard, ironwood,
-    ))
+    CommitmentTreeFrontiers::from_validated_parts(sapling, orchard, ironwood).map_err(
+        |CommitmentTreeFrontiersError::PoolMismatch { pool, .. }| {
+            SourceError::MalformedCommitmentTreeFrontier {
+                protocol: pool,
+                reason: "frontier was validated for another pool",
+            }
+        },
+    )
 }
 
 fn decode_zebra_commitment_tree_frontier(

@@ -4010,7 +4010,7 @@ async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Resu
                 Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
                 Some(completed_subtree_frontier(ShieldedProtocol::Orchard)?),
                 Some(completed_subtree_frontier(ShieldedProtocol::Ironwood)?),
-            ),
+            )?,
         );
     let mut baseline = CanonicalBaseline::new(&chain);
     for (protocol, root_byte) in [
@@ -4101,7 +4101,7 @@ fn store_with_sapling_subtree_roots(
                 )?),
                 Some(completed_subtree_frontier(ShieldedProtocol::Orchard)?),
                 Some(completed_subtree_frontier(ShieldedProtocol::Ironwood)?),
-            ),
+            )?,
         );
     let mut baseline = CanonicalBaseline::new(&chain);
     for (protocol, root_count) in [
@@ -4605,7 +4605,7 @@ fn floor_with_completed_subtree_writer() -> eyre::Result<CanonicalWriterFixture>
             Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
             None,
             None,
-        ),
+        )?,
     );
     CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_history_floor(FLOOR_HEIGHT),

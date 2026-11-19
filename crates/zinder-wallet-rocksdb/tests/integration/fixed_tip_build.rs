@@ -1500,7 +1500,7 @@ fn ready_canonical_store_serves_wallet_artifacts() -> Result<(), Box<dyn std::er
     let checkpoint = canonical_store
         .tree_state_checkpoint_at_or_before(tip.height)?
         .ok_or("tip tree-state checkpoint must be present")?;
-    assert_eq!(checkpoint.block_id, tip);
+    assert_eq!(checkpoint.block_id(), tip);
     Ok(())
 }
 

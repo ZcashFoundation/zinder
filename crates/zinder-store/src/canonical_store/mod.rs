@@ -28,6 +28,7 @@ mod rocksdb;
 mod secondary;
 #[cfg(test)]
 mod secondary_tests;
+mod served_tree_state;
 mod subtree_load;
 mod tree_state_densification;
 #[cfg(test)]
@@ -86,6 +87,7 @@ pub use rocksdb::{
     CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalReadyStoreSummary,
 };
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
+pub use served_tree_state::ServedTreeState;
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };
@@ -1124,7 +1126,7 @@ pub(crate) fn test_network_upgrade_activations(
 pub(crate) fn test_checkpoint_frontiers(
     network_upgrade_activations: &NetworkUpgradeActivations,
     checkpoint_height: BlockHeight,
-) -> CommitmentTreeFrontiers {
+) -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
     let active_frontier = |protocol: ShieldedProtocol| {
         network_upgrade_activations
             .activation_height_by_name(protocol.activation_upgrade_name())
@@ -1282,7 +1284,7 @@ mod tests {
     fn checkpointed_build_plan_preserves_tree_position() -> Result<(), Box<dyn std::error::Error>> {
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
-        let checkpoint_frontiers = active_empty_frontiers();
+        let checkpoint_frontiers = active_empty_frontiers()?;
         let plan = CanonicalStoreBuildPlan::checkpointed(
             &activations,
             CommitmentTreeCheckpoint::new(checkpoint, 1_234, checkpoint_frontiers.clone()),
@@ -1316,7 +1318,7 @@ mod tests {
                     Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
                     None,
                     None,
-                ),
+                )?,
             ),
             build_tip: BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
         }
@@ -1367,7 +1369,8 @@ mod tests {
         Ok(())
     }
 
-    fn active_empty_frontiers() -> CommitmentTreeFrontiers {
+    fn active_empty_frontiers()
+    -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
         CommitmentTreeFrontiers::from_validated_parts(
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),

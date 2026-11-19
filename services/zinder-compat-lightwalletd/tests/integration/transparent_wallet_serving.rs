@@ -40,6 +40,7 @@ use zinder_runtime::{Readiness, ReadinessCause, ReadinessState, TrafficReadiness
 use zinder_store::{
     CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
+    ServedTreeState,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, WalletServingStoreFixture,
@@ -1945,7 +1946,7 @@ impl CanonicalReader for InstrumentedCanonicalReader {
     fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
         self.canonical_reader
             .tree_state_checkpoint_at_or_before(height)
     }

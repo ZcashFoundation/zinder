@@ -39,18 +39,24 @@ const _: () = assert!(1_u32 << SUBTREE_ROOT_LEVEL == SUBTREE_LEAF_COUNT);
 ///
 /// Following one block validates the visible-tip frontier and the next
 /// frontier of each of the three pools, so the bound covers that working set
-/// with room for a replacement parent or a served tree state.
+/// with room for a replacement parent.
 #[cfg(feature = "commitment-tree-codec")]
 const FRONTIER_ROOT_MEMO_CAPACITY: usize = 16;
 
-/// A validated note-commitment-tree frontier returned by Zebra.
+/// A validated note-commitment-tree frontier of one shielded pool.
 ///
 /// `final_state_bytes` contains the canonical legacy `CommitmentTree`
 /// encoding used by `z_gettreestate`. `final_root` preserves Zebra's RPC
 /// display byte order, which is reversed for Sapling and direct for Orchard
 /// and Ironwood.
+///
+/// The frontier keeps the pool it was validated for, because neither its
+/// bytes nor its root identify that pool: every empty tree encodes as the
+/// same bytes, and Orchard and Ironwood trees share a hash function.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CommitmentTreeFrontier {
+    /// Shielded pool whose tree this frontier encodes.
+    protocol: ShieldedProtocol,
     /// Number of note commitments represented by this frontier.
     tree_size: u32,
     /// Root computed from `final_state_bytes`, in Zebra RPC display order.
@@ -66,10 +72,10 @@ impl CommitmentTreeFrontier {
     pub fn empty(protocol: ShieldedProtocol) -> Self {
         match protocol {
             ShieldedProtocol::Sapling => {
-                empty_frontier::<SaplingNode>(sapling_root_bytes_in_rpc_order)
+                empty_frontier::<SaplingNode>(protocol, sapling_root_bytes_in_rpc_order)
             }
             ShieldedProtocol::Orchard | ShieldedProtocol::Ironwood => {
-                empty_frontier::<MerkleHashOrchard>(orchard_root_bytes_in_rpc_order)
+                empty_frontier::<MerkleHashOrchard>(protocol, orchard_root_bytes_in_rpc_order)
             }
         }
     }
@@ -119,6 +125,12 @@ impl CommitmentTreeFrontier {
         }
     }
 
+    /// Returns the shielded pool whose tree this frontier encodes.
+    #[must_use]
+    pub const fn protocol(&self) -> ShieldedProtocol {
+        self.protocol
+    }
+
     /// Returns the number of note commitments represented by this frontier.
     #[must_use]
     pub const fn tree_size(&self) -> u32 {
@@ -158,6 +170,7 @@ fn orchard_root_bytes_in_rpc_order(root: &MerkleHashOrchard) -> [u8; 32] {
 
 #[cfg(feature = "commitment-tree-codec")]
 fn empty_frontier<Node>(
+    protocol: ShieldedProtocol,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> CommitmentTreeFrontier
 where
@@ -165,6 +178,7 @@ where
 {
     let root = frontier_root(&Frontier::<Node, NOTE_COMMITMENT_TREE_DEPTH>::empty());
     CommitmentTreeFrontier {
+        protocol,
         tree_size: 0,
         final_root: FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&root)),
         final_state_bytes: Box::from([0_u8, 0, 0]),
@@ -245,6 +259,7 @@ where
         root_bytes_in_rpc_order(&frontier_root(&frontier))
     });
     Ok(CommitmentTreeFrontier {
+        protocol,
         tree_size,
         final_root,
         final_state_bytes,
@@ -426,17 +441,25 @@ pub struct CommitmentTreeFrontiers {
 
 impl CommitmentTreeFrontiers {
     /// Creates the frontiers associated with one block.
-    #[must_use]
-    pub const fn from_validated_parts(
+    ///
+    /// Each frontier must have been validated for the pool whose position it
+    /// takes, or this fails with [`CommitmentTreeFrontiersError::PoolMismatch`].
+    /// Nothing that later checks the frontier's bytes or root can detect the
+    /// misplacement, so another pool's tree state would otherwise be stored
+    /// and served as this pool's.
+    pub fn from_validated_parts(
         sapling: Option<CommitmentTreeFrontier>,
         orchard: Option<CommitmentTreeFrontier>,
         ironwood: Option<CommitmentTreeFrontier>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CommitmentTreeFrontiersError> {
+        require_frontier_pool(ShieldedProtocol::Sapling, sapling.as_ref())?;
+        require_frontier_pool(ShieldedProtocol::Orchard, orchard.as_ref())?;
+        require_frontier_pool(ShieldedProtocol::Ironwood, ironwood.as_ref())?;
+        Ok(Self {
             sapling,
             orchard,
             ironwood,
-        }
+        })
     }
 
     /// Returns the frontier for `protocol`, if that pool is active.
@@ -512,6 +535,34 @@ impl CommitmentTreeFrontiers {
                 .as_ref()
                 .map(CommitmentTreeFrontier::final_root),
         )
+    }
+}
+
+/// Invalid assembly of one block's commitment-tree frontiers.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum CommitmentTreeFrontiersError {
+    /// A frontier validated for one pool was given for another pool.
+    #[error("{frontier_protocol:?} commitment-tree frontier cannot be the {pool:?} frontier")]
+    PoolMismatch {
+        /// Pool whose frontier was being set.
+        pool: ShieldedProtocol,
+        /// Pool the frontier was validated for.
+        frontier_protocol: ShieldedProtocol,
+    },
+}
+
+fn require_frontier_pool(
+    pool: ShieldedProtocol,
+    frontier: Option<&CommitmentTreeFrontier>,
+) -> Result<(), CommitmentTreeFrontiersError> {
+    match frontier {
+        Some(frontier) if frontier.protocol != pool => {
+            Err(CommitmentTreeFrontiersError::PoolMismatch {
+                pool,
+                frontier_protocol: frontier.protocol,
+            })
+        }
+        Some(_) | None => Ok(()),
     }
 }
 
@@ -743,8 +794,10 @@ impl CommitmentTreeAccumulator {
     pub fn validated_frontiers(
         &mut self,
     ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
-        Ok(CommitmentTreeFrontiers::from_validated_parts(
-            self.sapling
+        // Each snapshot is encoded and validated for the pool it fills.
+        Ok(CommitmentTreeFrontiers {
+            sapling: self
+                .sapling
                 .as_ref()
                 .map(|pool| {
                     snapshot_pool(
@@ -754,7 +807,8 @@ impl CommitmentTreeAccumulator {
                     )
                 })
                 .transpose()?,
-            self.orchard
+            orchard: self
+                .orchard
                 .as_ref()
                 .map(|pool| {
                     snapshot_pool(
@@ -764,7 +818,8 @@ impl CommitmentTreeAccumulator {
                     )
                 })
                 .transpose()?,
-            self.ironwood
+            ironwood: self
+                .ironwood
                 .as_ref()
                 .map(|pool| {
                     snapshot_pool(
@@ -774,7 +829,7 @@ impl CommitmentTreeAccumulator {
                     )
                 })
                 .transpose()?,
-        ))
+        })
     }
 
     /// Produces the checkpoints of [`Self::validated_frontiers`] after
@@ -1288,6 +1343,80 @@ mod tests {
         }
     }
 
+    /// Neither the bytes nor the root of a frontier identify its pool, so a
+    /// frontier is kept out of another pool's position by the pool it was
+    /// validated for.
+    #[test]
+    fn frontiers_reject_a_frontier_validated_for_another_pool() {
+        let pools = [
+            ShieldedProtocol::Sapling,
+            ShieldedProtocol::Orchard,
+            ShieldedProtocol::Ironwood,
+        ];
+        let [sapling, orchard, ironwood] = pools.map(CommitmentTreeFrontier::empty);
+        assert_eq!(sapling.final_state_bytes(), orchard.final_state_bytes());
+        assert_ne!(sapling.final_root(), orchard.final_root());
+        assert_eq!(orchard.final_state_bytes(), ironwood.final_state_bytes());
+        assert_eq!(orchard.final_root(), ironwood.final_root());
+
+        for pool in pools {
+            for frontier_protocol in pools {
+                let frontier = |position| {
+                    Some(CommitmentTreeFrontier::empty(if position == pool {
+                        frontier_protocol
+                    } else {
+                        position
+                    }))
+                };
+                let frontiers = CommitmentTreeFrontiers::from_validated_parts(
+                    frontier(ShieldedProtocol::Sapling),
+                    frontier(ShieldedProtocol::Orchard),
+                    frontier(ShieldedProtocol::Ironwood),
+                );
+                if pool == frontier_protocol {
+                    let protocols = frontiers.map(|frontiers| {
+                        pools.map(|position| {
+                            frontiers
+                                .get(position)
+                                .map(CommitmentTreeFrontier::protocol)
+                        })
+                    });
+                    assert_eq!(protocols, Ok(pools.map(Some)));
+                } else {
+                    assert_eq!(
+                        frontiers,
+                        Err(CommitmentTreeFrontiersError::PoolMismatch {
+                            pool,
+                            frontier_protocol,
+                        }),
+                        "{frontier_protocol:?} frontier in the {pool:?} position"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_decoded_frontier_keeps_the_pool_it_was_validated_for() -> TestResult {
+        let orchard = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
+        let ironwood = CommitmentTreeFrontier::from_canonical_final_state(
+            ShieldedProtocol::Ironwood,
+            orchard.final_root(),
+            orchard.final_state_bytes(),
+        )?;
+
+        assert_eq!(ironwood.protocol(), ShieldedProtocol::Ironwood);
+        assert_ne!(ironwood, orchard);
+        assert_eq!(
+            CommitmentTreeFrontiers::from_validated_parts(None, None, Some(orchard)),
+            Err(CommitmentTreeFrontiersError::PoolMismatch {
+                pool: ShieldedProtocol::Ironwood,
+                frontier_protocol: ShieldedProtocol::Orchard,
+            })
+        );
+        Ok(())
+    }
+
     #[test]
     fn frontier_validation_rejects_wrong_root_trailing_bytes_and_oversize_state() {
         let frontier = CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard);
@@ -1503,7 +1632,7 @@ mod tests {
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
             None,
             None,
-        );
+        )?;
         assert!(matches!(
             CommitmentTreeAccumulator::from_validated_frontiers(
                 BlockHeight::new(0),
@@ -1560,7 +1689,7 @@ mod tests {
         let full_frontier = full_version_one_sapling_frontier()?;
         assert_eq!(full_frontier.tree_size(), u32::MAX);
         let frontiers =
-            CommitmentTreeFrontiers::from_validated_parts(Some(full_frontier), None, None);
+            CommitmentTreeFrontiers::from_validated_parts(Some(full_frontier), None, None)?;
         let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
             BlockHeight::new(10),
             &frontiers,
@@ -1663,7 +1792,7 @@ mod tests {
                     &self.ironwood,
                     orchard_root_bytes_in_rpc_order,
                 )?),
-            ))
+            )?)
         }
     }
 
@@ -1706,7 +1835,7 @@ mod tests {
             reread(ShieldedProtocol::Sapling)?,
             reread(ShieldedProtocol::Orchard)?,
             reread(ShieldedProtocol::Ironwood)?,
-        ))
+        )?)
     }
 
     fn derive(
@@ -2191,7 +2320,7 @@ mod tests {
                 &orchard_leaf,
                 orchard_root_bytes_in_rpc_order,
             )?),
-        );
+        )?;
         let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
             BlockHeight::new(9),
             &frontiers,
@@ -2252,7 +2381,7 @@ mod tests {
             )?),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
-        );
+        )?;
         let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
             BlockHeight::new(9),
             &frontiers,

@@ -466,7 +466,7 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
         eyre::ensure!(
             secondary
                 .tree_state_checkpoint_at_or_before(BlockHeight::new(height))?
-                .is_some_and(|stored| stored.block_id.height == BlockHeight::new(height)),
+                .is_some_and(|stored| stored.block_id().height == BlockHeight::new(height)),
             "height {height} is not an exact stored checkpoint"
         );
     }
@@ -1127,7 +1127,7 @@ fn stored_checkpoint_heights(
     for candidate in low..=high {
         if primary
             .tree_state_checkpoint_at_or_before(BlockHeight::new(candidate))?
-            .is_some_and(|checkpoint| checkpoint.block_id.height.value() == candidate)
+            .is_some_and(|checkpoint| checkpoint.block_id().height.value() == candidate)
         {
             heights.push(candidate);
         }

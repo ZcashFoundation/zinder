@@ -1040,7 +1040,7 @@ mod tests {
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let tip_frontiers =
-            crate::canonical_store::test_checkpoint_frontiers(&activations, BUILD_TIP.height);
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BUILD_TIP.height)?;
         let mut builder = loaded_checkpointed_builder(path, tip_frontiers)?;
         builder
             .canonical_block_evidence
@@ -1078,8 +1078,8 @@ mod tests {
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         loaded_checkpointed_builder_from(
             path,
-            crate::canonical_store::test_checkpoint_frontiers(&activations, PREDECESSOR.height),
-            crate::canonical_store::test_checkpoint_frontiers(&activations, FIRST_RETAINED.height),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, PREDECESSOR.height)?,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, FIRST_RETAINED.height)?,
             tip_frontiers,
         )
     }
@@ -1210,7 +1210,7 @@ mod tests {
             Some(sapling),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
             Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
-        ))
+        )?)
     }
 
     fn valid_complete_prefix_roots() -> Vec<SubtreeRootArtifact> {

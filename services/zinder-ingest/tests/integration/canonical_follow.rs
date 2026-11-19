@@ -2899,7 +2899,7 @@ impl InterleavedSubtreeChains {
                     SUBTREE_LEAF_COUNT - 1,
                 )?),
                 None,
-            ),
+            )?,
         );
         Ok(Self {
             activations,
@@ -3056,7 +3056,7 @@ fn subtree_completing_siblings() -> Result<SubtreeCompletingSiblings, Box<dyn st
                 SUBTREE_LEAF_COUNT - 1,
             )?),
             None,
-        ),
+        )?,
     );
     let base: BTreeMap<_, _> = parseable
         .range(BlockHeight::new(3)..=SUBTREE_COMPLETION_HEIGHT)

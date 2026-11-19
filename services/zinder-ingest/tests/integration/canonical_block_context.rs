@@ -902,7 +902,7 @@ impl CanonicalHarness {
             CommitmentTreeCheckpoint::new(
                 BlockId::new(BlockHeight::new(1), checkpoint_block.hash),
                 checkpoint_block.block_time_seconds,
-                sapling_only_frontiers(),
+                sapling_only_frontiers()?,
             ),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
             zinder_store::RawBlobRetention::Transactions,
@@ -1247,7 +1247,8 @@ pub(super) fn pool_commitments(
     Ok(commitments)
 }
 
-fn sapling_only_frontiers() -> CommitmentTreeFrontiers {
+fn sapling_only_frontiers()
+-> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
     CommitmentTreeFrontiers::from_validated_parts(
         Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
         None,

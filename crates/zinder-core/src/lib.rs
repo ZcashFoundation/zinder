@@ -70,7 +70,7 @@ pub use chain_value_pools::{
 pub use commitment_tree_codec::{
     CommitmentTreeAccumulator, CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
+    CommitmentTreeFrontiersError, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
 };
 pub use displaced_block::{
     DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,

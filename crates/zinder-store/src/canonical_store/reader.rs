@@ -16,8 +16,8 @@ use super::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore,
     block_load::{
-        BLOCK_HEADER_VALUE_LEN, decode_tree_state_checkpoint, encode_block_position,
-        encode_transaction_position,
+        BLOCK_HEADER_VALUE_LEN, decode_served_tree_state_checkpoint, decode_tree_state_checkpoint,
+        encode_block_position, encode_transaction_position, encode_tree_state_checkpoint,
     },
     publication::column_family,
     rocksdb::{
@@ -26,6 +26,7 @@ use super::{
         TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
+    served_tree_state::ServedTreeState,
     subtree_load::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
     },
@@ -268,12 +269,22 @@ macro_rules! impl_canonical_typed_reads {
                 read_transaction_blob(self, location)
             }
 
-            /// Reads the newest commitment-tree checkpoint at or below `height`.
+            /// Reads the newest commitment-tree checkpoint stored at or below
+            /// `height`, as a wallet read serves it.
+            ///
+            /// Only the row's framing is checked: its frontier bytes are
+            /// returned without decoding or hashing tree nodes, and its roots
+            /// are not read. Every row is validated when it is written, and
+            /// `RocksDB` block checksums detect corruption at rest. Tree state
+            /// that seeds further tree state comes from
+            /// [`Self::tree_state_checkpoint_at`] instead.
             pub fn tree_state_checkpoint_at_or_before(
                 &self,
                 height: BlockHeight,
-            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-                read_tree_state_checkpoint_at_or_before(self, height)
+            ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
+                read_tree_state_checkpoint_row_at_or_before(self, height)?
+                    .map(|row| decode_served_tree_state(self, row.height, &row.encoded))
+                    .transpose()
             }
 
             /// Reads the commitment-tree checkpoint after the canonical block
@@ -291,9 +302,11 @@ macro_rules! impl_canonical_typed_reads {
             /// the one below it and reach the tree sizes its compact block
             /// records, the last must be the canonical block at `height`, and
             /// the resulting frontiers are re-encoded and checked against the
-            /// appended trees. A missing checkpoint or a failed check is store
-            /// damage and fails with
-            /// [`CanonicalStoreError::PublicationRefused`].
+            /// appended trees. A stored checkpoint, whether returned or used
+            /// as a seed, is parsed with the official Zcash codec and its
+            /// roots re-derived, so the result can seed further tree state. A
+            /// missing checkpoint or a failed check is store damage and fails
+            /// with [`CanonicalStoreError::PublicationRefused`].
             ///
             /// `network_upgrade_activations` must agree with the schedule this
             /// store admits at every height through `height`, so a node table
@@ -321,7 +334,10 @@ macro_rules! impl_canonical_typed_reads {
             ///
             /// Applies every check of [`Self::tree_state_checkpoint_at`]
             /// that precedes the replay, with the same errors, and returns
-            /// `Ok(None)` for the same heights. Pass a
+            /// `Ok(None)` for the same heights, except that a checkpoint
+            /// stored at `height` is read as
+            /// [`Self::tree_state_checkpoint_at_or_before`] reads it. A
+            /// replay's seed is checked in full. Pass a
             /// [`TreeStateLookup::Replay`] to [`Self::replay_tree_state`] to
             /// reconstruct it without reading the seed again.
             pub fn tree_state_lookup(
@@ -343,10 +359,10 @@ macro_rules! impl_canonical_typed_reads {
             ///
             /// Replays from the seed the lookup read. When this store shows
             /// another visible chain than the store that issued `replay`, it
-            /// answers exactly as [`Self::tree_state_checkpoint_at`] does for
-            /// [`TreeStateReplay::height`], including `Ok(None)`: from the
-            /// checkpoint it stores there, or by a replay from the seed it
-            /// reads itself, which the outcome names.
+            /// looks [`TreeStateReplay::height`] up again as
+            /// [`Self::tree_state_lookup`] does, including `Ok(None)`, and
+            /// answers from the checkpoint it stores there or by a replay
+            /// from the seed it reads itself, which the outcome names.
             pub fn replay_tree_state(
                 &self,
                 replay: &TreeStateReplay,
@@ -930,10 +946,35 @@ fn append_block_blob_batch(
     Ok(())
 }
 
-pub(super) fn read_tree_state_checkpoint_at_or_before(
+/// Reads and revalidates the checkpoint stored at exactly `height` with one
+/// point read.
+pub(super) fn read_stored_tree_state_checkpoint_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    read_optional(
+        store,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        &encode_block_position(height),
+        "tree-state checkpoint read",
+    )?
+    .map(|encoded| decode_stored_tree_state_checkpoint(store, height, &encoded))
+    .transpose()
+}
+
+/// One stored tree-state checkpoint row, not yet decoded.
+pub(super) struct TreeStateCheckpointRow {
+    /// Height the row is stored at.
+    pub(super) height: BlockHeight,
+    /// The stored checkpoint value.
+    pub(super) encoded: Box<[u8]>,
+}
+
+/// Reads the newest checkpoint row stored at or below `height`.
+pub(super) fn read_tree_state_checkpoint_row_at_or_before(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+) -> Result<Option<TreeStateCheckpointRow>, CanonicalStoreError> {
     let family = column_family(
         &store.serving_open().db,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
@@ -950,30 +991,73 @@ pub(super) fn read_tree_state_checkpoint_at_or_before(
         operation: "tree-state checkpoint read",
         source,
     })?;
-    let checkpoint_height = decode_height_key(&key)?;
-    let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(&encoded)
+    Ok(Some(TreeStateCheckpointRow {
+        height: decode_height_key(&key)?,
+        encoded,
+    }))
+}
+
+/// Decodes and revalidates the checkpoint row stored at `checkpoint_height`.
+pub(super) fn decode_stored_tree_state_checkpoint(
+    store: &impl CanonicalServingRead,
+    checkpoint_height: BlockHeight,
+    encoded: &[u8],
+) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+    let (block_time_seconds, frontiers) = decode_tree_state_checkpoint(encoded)
         .map_err(|source| CanonicalStoreError::publication(source.to_string()))?;
+    let block_id = stored_tree_state_block_id(store, checkpoint_height, encoded)?;
+    Ok(CommitmentTreeCheckpoint::new(
+        block_id,
+        block_time_seconds,
+        frontiers,
+    ))
+}
+
+/// Decodes the checkpoint row stored at `checkpoint_height` for serving,
+/// checking only its framing.
+pub(super) fn decode_served_tree_state(
+    store: &impl CanonicalServingRead,
+    checkpoint_height: BlockHeight,
+    encoded: &[u8],
+) -> Result<ServedTreeState, CanonicalStoreError> {
+    let (block_time_seconds, frontiers) = decode_served_tree_state_checkpoint(encoded)
+        .map_err(|source| CanonicalStoreError::publication(source.to_string()))?;
+    let block_id = stored_tree_state_block_id(store, checkpoint_height, encoded)?;
+    Ok(ServedTreeState::new(
+        block_id,
+        block_time_seconds,
+        frontiers,
+    ))
+}
+
+/// Returns the block the checkpoint row stored at `checkpoint_height` follows.
+///
+/// The history predecessor has no retained header, so its row must hold
+/// exactly the checkpoint the admitted build plan names. Any other row takes
+/// its block hash from the canonical header at its height.
+fn stored_tree_state_block_id(
+    store: &impl CanonicalServingRead,
+    checkpoint_height: BlockHeight,
+    encoded: &[u8],
+) -> Result<BlockId, CanonicalStoreError> {
     let history_predecessor = store.serving_build_plan().history_predecessor();
-    let block_id = if checkpoint_height == history_predecessor.block_id.height {
-        if block_time_seconds != history_predecessor.block_time_seconds
-            || frontiers != history_predecessor.frontiers
+    if checkpoint_height == history_predecessor.block_id.height {
+        if encoded
+            != encode_tree_state_checkpoint(
+                history_predecessor.block_time_seconds,
+                &history_predecessor.frontiers,
+            )
         {
             return Err(CanonicalStoreError::publication(
                 "tree-state history predecessor does not match the admitted build plan",
             ));
         }
-        history_predecessor.block_id
-    } else {
-        let header = read_block_header_at(store, checkpoint_height)?.ok_or_else(|| {
-            CanonicalStoreError::publication("tree-state checkpoint header is absent")
-        })?;
-        BlockId::new(checkpoint_height, header.block_hash)
-    };
-    Ok(Some(CommitmentTreeCheckpoint::new(
-        block_id,
-        block_time_seconds,
-        frontiers,
-    )))
+        return Ok(history_predecessor.block_id);
+    }
+    let header = read_block_header_at(store, checkpoint_height)?.ok_or_else(|| {
+        CanonicalStoreError::publication("tree-state checkpoint header is absent")
+    })?;
+    Ok(BlockId::new(checkpoint_height, header.block_hash))
 }
 
 fn read_subtree_roots(
