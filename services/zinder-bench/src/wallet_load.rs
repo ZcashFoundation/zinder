@@ -697,9 +697,10 @@ mod tests {
         Ok(statuses.get(status).and_then(Value::as_u64).unwrap_or(0))
     }
 
-    /// The tree-state refusal Zinder's replay limit returns. The limit is one
-    /// reconstruction per CPU, so how often it refuses depends on the host.
-    const REPLAY_REFUSAL: (&str, &str) = ("GetTreeState", "resource_exhausted");
+    /// The status the lightwalletd surface returns when Zinder's replay limit
+    /// refuses a tree-state rebuild. The limit is one reconstruction per CPU,
+    /// so how often it refuses depends on the host.
+    const REPLAY_REFUSAL: (&str, &str) = ("GetTreeState", "unavailable");
 
     /// Asserts every wallet synced its whole range, and every request
     /// succeeded except those ending with a `tolerated` method and status.
@@ -834,7 +835,7 @@ mod tests {
         assert_eq!(
             status(&report, "GetTreeState(stored checkpoint)", "ok")?
                 + status(&report, "GetTreeState(replay)", "ok")?
-                + status(&report, "GetTreeState(replay)", "resource_exhausted")?,
+                + status(&report, "GetTreeState(replay)", "unavailable")?,
             4
         );
         // An address with no history streams nothing, successfully.
