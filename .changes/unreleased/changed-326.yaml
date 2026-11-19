@@ -1,0 +1,6 @@
+kind: changed
+body: "Zinder now requires Rust 1.100.0 (up from 1.95.0) across the workspace and published SDK crates (`zinder-core`, `zinder-proto`, and `zinder-client`), upgrades its Rust crate dependencies (including `hmac` 0.13, `sha2` 0.11, `parking_lot` 0.13, `rust-rocksdb` 0.54.1, `tokio` 1.54.1, `tonic` 0.14.9, `prost` 0.14.6, `zcash_primitives` 0.31.1, and `zcash_transparent` 0.11.1), and advances vendored `lightwallet-protocol` from v0.5.0 to v0.6.0. `zinder-proto` now includes the `GetStandardFee` RPC on `CompactTxStreamer`, and `zinder-compat-lightwalletd` answers `GetStandardFee` with `UNIMPLEMENTED` because Zinder's backends do not expose `getstandardfee`. Bundled container and Compose defaults update to Rust 1.100.0 / Debian Bookworm, reference `lightwalletd` v0.6.2, PostgreSQL 18.7, Prometheus v3.16.0, and Grafana 13.3.1."
+time: 2026-11-19T14:06:00.000000000Z
+custom:
+    Bump: minor
+    PR: "326"
