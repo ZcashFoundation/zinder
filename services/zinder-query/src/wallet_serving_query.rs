@@ -5,11 +5,10 @@ use std::{
     future::ready,
     num::{NonZeroU16, NonZeroU32},
     sync::Arc,
-    time::Instant,
 };
 
 use async_trait::async_trait;
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
@@ -29,7 +28,7 @@ use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
-    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    TreeStateLookup,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -42,8 +41,8 @@ use crate::{
     DEFAULT_MAX_FULL_BLOCK_RANGE, FULL_BLOCK_STREAM_CHANNEL_CAPACITY,
     FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError, RawTransaction,
-    SettledTipBlock, SpendStatusReadEnd, StorageReadError, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    SettledTipBlock, SpendStatusReadEnd, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, TreeStateFrontiers, UpstreamNodeCapabilities,
     VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
@@ -52,8 +51,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, TreeStateReplayLimit, record_replay_duration,
-        record_tree_state_read,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, TreeStateReplayLimit, record_stored_tree_state_read,
+        replay_holding_slot,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1289,8 +1288,7 @@ where
                 .await?;
             let replay = match lookup {
                 TreeStateLookup::Stored(stored) => {
-                    let trees = stored.tip_metadata();
-                    record_tree_state_read(height, 0, trees, trees);
+                    record_stored_tree_state_read(height, &stored);
                     return Ok(tree_state_response(lookup_epoch, stored));
                 }
                 TreeStateLookup::Replay(replay) => replay,
@@ -1303,34 +1301,16 @@ where
             // newer chain can answer from a checkpoint it stores or from its
             // own seed, so the metrics record the outcome that read reports.
             let replay_slot = Arc::new(self.tree_state_replays.admit().await?);
-            let (chain_epoch, outcome, replay_duration) =
+            let (chain_epoch, tree_state) =
                 serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    let (outcome, replay_duration) =
-                        replay_holding_slot(pair, replay, replay_slot).await?;
-                    let outcome = outcome
-                        .map_err(QueryError::canonical_read)?
-                        .ok_or(QueryError::BlockNotInBestChain)?;
-                    Ok((chain_epoch, outcome, replay_duration))
+                    let tree_state = replay_holding_slot(height, replay_slot, async move {
+                        pair.canonical().replay_tree_state(replay).await
+                    })
+                    .await?;
+                    Ok((chain_epoch, tree_state))
                 })
                 .await?;
-            let tree_state = match outcome {
-                TreeStateReplayOutcome::Stored(stored) => {
-                    let trees = stored.tip_metadata();
-                    record_tree_state_read(height, 0, trees, trees);
-                    stored
-                }
-                TreeStateReplayOutcome::Replayed { replay, tree_state } => {
-                    record_replay_duration(height, replay_duration);
-                    record_tree_state_read(
-                        height,
-                        replay.replayed_blocks(),
-                        replay.seed().tip_metadata(),
-                        tree_state.tip_metadata(),
-                    );
-                    tree_state
-                }
-            };
             Ok(tree_state_response(chain_epoch, tree_state))
         })
         .await
@@ -1694,39 +1674,6 @@ fn proven_spend_status(
         });
     }
     Ok(status)
-}
-
-/// How a [`crate::CanonicalReader::replay_tree_state`] read answered, and how long
-/// it took.
-type ReplayRead = (
-    Result<Option<TreeStateReplayOutcome>, StorageReadError>,
-    std::time::Duration,
-);
-
-/// Replays `replay` on `pair` in a task of its own that holds `replay_slot`
-/// until the replay ends, even when the request awaiting it is cancelled.
-///
-/// A storage read can outlive the request that started it, such as one on
-/// the blocking pool, so only a slot held by the replay itself bounds the
-/// reconstructions that run at once.
-async fn replay_holding_slot(
-    pair: Arc<WalletServingReadPair>,
-    replay: TreeStateReplay,
-    replay_slot: Arc<OwnedSemaphorePermit>,
-) -> Result<ReplayRead, QueryError> {
-    tokio::spawn(
-        async move {
-            let _replay_slot = replay_slot;
-            let started_at = Instant::now();
-            let outcome = pair.canonical().replay_tree_state(replay).await;
-            (outcome, started_at.elapsed())
-        }
-        .in_current_span(),
-    )
-    .await
-    .map_err(|join_error| QueryError::BlockingTaskFailed {
-        reason: join_error.to_string(),
-    })
 }
 
 const fn unsupported_block_selector() -> QueryError {

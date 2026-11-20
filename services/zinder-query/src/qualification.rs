@@ -7,12 +7,14 @@ use zinder_core::{
     TransactionBroadcastOutcome,
 };
 use zinder_source::{SourceError, TransactionBroadcaster, ZebraJsonRpcSource};
-use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup, TreeStateReplayOutcome};
+use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup};
 
 use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
-    tree_state_replay_limit::TreeStateReplayLimit,
+    tree_state_replay_limit::{
+        TreeStateReplayLimit, record_stored_tree_state_read, replay_holding_slot,
+    },
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
 
@@ -95,7 +97,10 @@ impl QualificationWalletQuery {
             .map_err(QueryError::canonical_read)?
             .ok_or(QueryError::BlockNotInBestChain)?;
         let replay = match lookup {
-            TreeStateLookup::Stored(state) => return Ok(tree_state_response(epoch, state)),
+            TreeStateLookup::Stored(state) => {
+                record_stored_tree_state_read(height, &state);
+                return Ok(tree_state_response(epoch, state));
+            }
             TreeStateLookup::Replay(replay) => replay,
         };
         let block = reader
@@ -105,29 +110,17 @@ impl QualificationWalletQuery {
             .ok_or(QueryError::BlockNotInBestChain)?;
         let expected = BlockId::new(height, block.block_hash);
         drop(reader);
-        let permit = self.replays.admit().await?;
+        let replay_slot = Arc::new(self.replays.admit().await?);
         let reader = (self.capture)();
         let replay_epoch = reader.chain_epoch();
         if !retains_block(&reader, epoch, expected).await? {
             return Err(QueryError::BlockNotInBestChain);
         }
-        let outcome = tokio::spawn(async move {
-            let _permit = permit;
+        replay_holding_slot(height, replay_slot, async move {
             reader.replay_tree_state(replay).await
         })
         .await
-        .map_err(|error| QueryError::BlockingTaskFailed {
-            reason: error.to_string(),
-        })?
-        .map_err(QueryError::canonical_read)?
-        .ok_or(QueryError::BlockNotInBestChain)?;
-        let state = match outcome {
-            TreeStateReplayOutcome::Stored(state)
-            | TreeStateReplayOutcome::Replayed {
-                tree_state: state, ..
-            } => state,
-        };
-        Ok(tree_state_response(replay_epoch, state))
+        .map(|state| tree_state_response(replay_epoch, state))
     }
 
     /// Returns the completed roots in one bounded page as of the captured epoch, while its tip remains canonical.
