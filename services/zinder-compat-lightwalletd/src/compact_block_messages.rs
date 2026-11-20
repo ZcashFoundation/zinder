@@ -63,62 +63,54 @@ impl CompactBlockShape {
         ..Self::FULL_BLOCK
     };
 
-    /// Every shielded pool in nullifier-only form for `GetBlockRangeNullifiers`.
-    pub(crate) const NULLIFIERS: Self = Self {
-        transparent: false,
-        payload: Payload::Nullifiers,
-        ..Self::FULL_BLOCK
-    };
-
-    /// Selects the pools requested by `GetBlockRange`. An empty request selects
-    /// every shielded pool. Unknown pool values return `INVALID_ARGUMENT`.
     pub(crate) fn for_range(pool_types: &[i32]) -> Result<Self, Status> {
-        if pool_types.is_empty() {
-            return Ok(Self {
-                transparent: false,
-                payload: Payload::SelectedPools,
-                ..Self::FULL_BLOCK
-            });
-        }
+        Self::select(pool_types, Payload::SelectedPools)
+    }
+
+    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
+        Self::select(pool_types, Payload::Nullifiers)
+    }
+
+    pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
+        Self::select(pool_types, Payload::Mempool)
+    }
+
+    fn select(pool_types: &[i32], payload: Payload) -> Result<Self, Status> {
         let mut selected = Self {
             sapling: false,
             orchard: false,
             ironwood: false,
             transparent: false,
-            payload: Payload::SelectedPools,
+            payload,
         };
+        let mut use_default = true;
         for &pool_type in pool_types {
             match lightwalletd::PoolType::try_from(pool_type) {
                 Ok(lightwalletd::PoolType::Sapling) => selected.sapling = true,
                 Ok(lightwalletd::PoolType::Orchard) => selected.orchard = true,
                 Ok(lightwalletd::PoolType::Ironwood) => selected.ironwood = true,
-                Ok(lightwalletd::PoolType::Transparent) => selected.transparent = true,
-                Ok(lightwalletd::PoolType::Invalid) | Err(_) => {
-                    return Err(Status::invalid_argument("invalid pool type requested"));
+                Ok(lightwalletd::PoolType::Transparent) if payload == Payload::Nullifiers => {
+                    continue;
                 }
+                Ok(lightwalletd::PoolType::Transparent) => selected.transparent = true,
+                Ok(lightwalletd::PoolType::Invalid) => {
+                    return Err(if payload == Payload::Mempool {
+                        Status::invalid_argument("invalid pool type requested")
+                    } else {
+                        Status::unknown("GetBlockRange: invalid pool type requested")
+                    });
+                }
+                Err(_) => {}
             }
+            // An unknown number selects no pool but still makes the selection explicit.
+            use_default = false;
+        }
+        if use_default {
+            selected.sapling = true;
+            selected.orchard = true;
+            selected.ironwood = true;
         }
         Ok(selected)
-    }
-
-    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
-        let selected = Self::for_range(pool_types)?;
-        if !selected.sapling && !selected.orchard && !selected.ironwood {
-            // lightwalletd removes transparent first, then defaults an empty list to all shielded pools.
-            return Ok(Self::NULLIFIERS);
-        }
-        Ok(Self {
-            transparent: false,
-            payload: Payload::Nullifiers,
-            ..selected
-        })
-    }
-
-    pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
-        Ok(Self {
-            payload: Payload::Mempool,
-            ..Self::for_range(pool_types)?
-        })
     }
 
     /// Converts a stored block and preserves the original indices of selected transactions.
@@ -145,13 +137,15 @@ impl CompactBlockShape {
             time: block.time,
             header: Vec::new(),
             vtx,
-            chain_metadata: (!self.payload.is_nullifiers_only()).then_some(
+            chain_metadata: Some(if self.payload.is_nullifiers_only() {
+                lightwalletd::ChainMetadata::default()
+            } else {
                 lightwalletd::ChainMetadata {
                     sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
                     orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
                     ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
-                },
-            ),
+                }
+            }),
         })
     }
 
@@ -318,9 +312,12 @@ mod tests {
         let block = mixed_block()?;
         let all = CompactBlockShape::FULL_BLOCK.message(block.clone())?;
         let shielded = CompactBlockShape::for_range(&[])?.message(block.clone())?;
-        let transparent =
-            CompactBlockShape::for_range(&[lightwalletd::PoolType::Transparent as i32])?
-                .message(block)?;
+        let transparent = CompactBlockShape::for_range(&[
+            99,
+            lightwalletd::PoolType::Transparent as i32,
+            lightwalletd::PoolType::Transparent as i32,
+        ])?
+        .message(block)?;
         let mut shielded_expected = all.clone();
         shielded_expected.vtx.retain(|tx| matches!(tx.index, 1 | 3));
         let mut transparent_expected = all.clone();
@@ -331,11 +328,17 @@ mod tests {
             all.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
             [0, 1, 2, 3, 4]
         );
-        let nullifiers = CompactBlockShape::NULLIFIERS.message(mixed_block()?)?;
-        assert!(nullifiers.chain_metadata.is_none());
+        let nullifiers = CompactBlockShape::for_nullifier_range(&[])?.message(mixed_block()?)?;
+        assert_eq!(
+            nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
         assert_eq!(nullifiers.vtx, shielded_expected.vtx);
         let block_nullifiers = CompactBlockShape::BLOCK_NULLIFIERS.message(mixed_block()?)?;
-        assert!(block_nullifiers.chain_metadata.is_none());
+        assert_eq!(
+            block_nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
         assert_eq!(
             block_nullifiers
                 .vtx
@@ -388,7 +391,7 @@ mod tests {
             ironwood_actions: vec![action(20)],
             ..CompactTransactionData::default()
         };
-        let nullifiers = CompactBlockShape::NULLIFIERS
+        let nullifiers = CompactBlockShape::for_nullifier_range(&[])?
             .encode_transaction(transaction(0, scan.clone()))?
             .ok_or_else(|| eyre::eyre!("missing nullifier transaction"))?;
         assert_eq!(
@@ -451,12 +454,6 @@ mod tests {
             }]
         );
         Ok(())
-    }
-
-    #[test]
-    fn invalid_pool_request_is_refused() {
-        let selection = CompactBlockShape::for_range(&[99]);
-        assert!(matches!(selection, Err(status) if status.code() == tonic::Code::InvalidArgument));
     }
 
     #[test]

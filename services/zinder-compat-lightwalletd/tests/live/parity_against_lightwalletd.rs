@@ -553,7 +553,7 @@ async fn block_nullifiers_retain_the_same_transactions_and_nullifiers_as_referen
             .await?
             .into_inner();
         let reference_block = reference.get_block_nullifiers(request).await?.into_inner();
-        assert_nullifier_compact_block_matches(zinder_block, reference_block)?;
+        assert_nullifier_compact_block_matches(&zinder_block, &reference_block)?;
     }
     Ok(())
 }
@@ -590,7 +590,7 @@ async fn block_range_nullifiers_match_reference_for_default_and_ironwood_pools()
         )
         .await?;
         assert_miner_prefix_heights(&reference_blocks, pool)?;
-        assert_nullifier_range_matches(zinder_blocks, reference_blocks)?;
+        assert_nullifier_range_matches(&zinder_blocks, &reference_blocks)?;
     }
     Ok(())
 }

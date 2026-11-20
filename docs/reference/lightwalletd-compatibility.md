@@ -107,13 +107,15 @@ A `BlockID` with a height reads that height. Zinder also accepts a 32-byte hash 
 
 `GetBlock` supports these lookups in both serving modes. In compact-blocks serving it returns the stored block without pool filtering. `GetBlockNullifiers` is available only in wallet serving and returns `UNIMPLEMENTED` in compact-blocks serving.
 
-Like Go lightwalletd v0.6.2, `GetBlockNullifiers` retains every stored transaction after clearing non-nullifier payloads. Transparent-only transactions, including a transparent-only coinbase, retain just `index`, `txid`, and `fee`. `GetBlockRangeNullifiers` selects transactions by shielded pool before clearing non-nullifier payloads. Both methods omit commitment-tree sizes. Zinder omits `chainMetadata`, while Go sends the submessage with all sizes set to zero.
+Like Go lightwalletd v0.6.2, `GetBlockNullifiers` retains every stored transaction after clearing non-nullifier payloads. Transparent-only transactions, including a transparent-only coinbase, retain just `index`, `txid`, and `fee`. `GetBlockRangeNullifiers` selects transactions by shielded pool before clearing non-nullifier payloads. Both methods send a present `chainMetadata` submessage with all three commitment-tree sizes set to zero.
 
 ### `GetBlockRange` and `GetBlockRangeNullifiers`
 
 `GetBlockRange` applies the requested `poolTypes` to every transaction and omits any transaction left with no spends, outputs, actions, or transparent inputs and outputs, as lightwalletd does. With no `poolTypes`, it returns the shielded pools, so a transparent-only coinbase is absent unless the request names the transparent pool. Each remaining transaction keeps its block position in `CompactTx.index`, so a gap marks an omitted transaction. A range with start above end is sent in descending order.
 
-`GetBlockRangeNullifiers` returns nullifiers for the shielded pools listed in `poolTypes`. Both an empty list and a list containing only `TRANSPARENT` select all shielded pools. When a request includes a shielded pool, `TRANSPARENT` has no effect. Unknown pool values and `POOL_TYPE_INVALID` return `INVALID_ARGUMENT`.
+`GetBlockRangeNullifiers` returns nullifiers for the shielded pools listed in `poolTypes`. It removes `TRANSPARENT` first. If the list is then empty, it selects all shielded pools.
+
+For both range methods, repeated pool values select a pool once, and unrecognized numeric values select no transactions. A list containing only unrecognized values still returns every requested block with an empty `vtx`. A mixed list selects the recognized pools.
 
 A Sapling-only request includes transactions with Sapling outputs even when they have no Sapling spends. For those transactions, the response contains only the transaction’s position in the block, its ID, and its fee.
 
@@ -123,8 +125,9 @@ These outcomes fail the call before any block is sent:
 
 | Condition | Status |
 | --- | --- |
-| Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
+| Missing bound or height above `uint32` | `INVALID_ARGUMENT` |
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
+| An admitted request includes `POOL_TYPE_INVALID` (0) | `UNKNOWN` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
 | A block missing inside retained history, where the read of the first chunk reaches it | `UNAVAILABLE` |
@@ -262,6 +265,8 @@ The protocol has no lossless way to page past the cap. A single block with more 
 `GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. Zinder and Go lightwalletd v0.6.2 accept up to 20,000 entries in `exclude_txid_suffixes`, each up to 32 bytes long. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
 
 When suffixes overlap, the shortest matching suffix takes precedence, as in Go lightwalletd v0.6.2. A list containing an empty suffix therefore excludes the only transaction in a singleton snapshot. An empty list excludes nothing. [Go mempool filter](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L1019-L1058)
+
+A pool list containing only unrecognized numeric values yields an empty stream. A request containing `POOL_TYPE_INVALID` (0) fails with `INVALID_ARGUMENT` before any transaction is sent.
 
 ### `GetMempoolStream`
 

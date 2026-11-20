@@ -2963,7 +2963,7 @@ mod tests {
         // A malformed request is rejected before it takes a slot.
         let malformed = adapter
             .get_block_range(Request::new(lightwalletd::BlockRange {
-                pool_types: vec![999],
+                start: None,
                 ..block_range(1, 4)
             }))
             .await;

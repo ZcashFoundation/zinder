@@ -185,6 +185,65 @@ async fn a_block_range_with_pool_types_still_streams_every_block() -> Result<()>
     Ok(())
 }
 
+#[tokio::test]
+#[allow(
+    deprecated,
+    reason = "The v0.6.2 wire contract includes GetBlockRangeNullifiers."
+)]
+async fn generated_client_distinguishes_unknown_pool_values_from_the_invalid_sentinel() -> Result<()>
+{
+    let mut client = spawn_compat_server().await?;
+    let pool_types = vec![99, SAPLING, lightwalletd::PoolType::Invalid as i32];
+    let range = lightwalletd::BlockRange {
+        pool_types: pool_types.clone(),
+        ..block_range(1, FIXTURE_TIP_HEIGHT)
+    };
+    for response in [
+        client.get_block_range(range.clone()).await,
+        client.get_block_range_nullifiers(range).await,
+    ] {
+        let status = response
+            .err()
+            .ok_or_else(|| eyre!("invalid pool opened a block stream"))?;
+        assert_eq!(status.code(), Code::Unknown);
+        assert_eq!(
+            status.message(),
+            "GetBlockRange: invalid pool type requested"
+        );
+    }
+    let status = client
+        .get_mempool_tx(lightwalletd::GetMempoolTxRequest {
+            pool_types,
+            exclude_txid_suffixes: Vec::new(),
+        })
+        .await
+        .err()
+        .ok_or_else(|| eyre!("invalid pool opened a mempool stream"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "invalid pool type requested");
+
+    let range = lightwalletd::BlockRange {
+        pool_types: vec![99, -1],
+        ..block_range(1, FIXTURE_TIP_HEIGHT)
+    };
+    for response in [
+        client.get_block_range(range.clone()).await?,
+        client.get_block_range_nullifiers(range).await?,
+    ] {
+        let mut stream = response.into_inner();
+        for expected_height in 1..=FIXTURE_TIP_HEIGHT {
+            let block = stream
+                .message()
+                .await?
+                .ok_or_else(|| eyre!("missing height {expected_height}"))?;
+            assert_eq!(block.height, expected_height);
+            assert_eq!(block.vtx.len(), 0);
+        }
+        assert!(stream.message().await?.is_none());
+    }
+    Ok(())
+}
+
 fn block_range(start: u64, end: u64) -> lightwalletd::BlockRange {
     let block_id = |height| lightwalletd::BlockId {
         height,
