@@ -1629,6 +1629,9 @@ async fn run_materialized_view_tailer(
         );
     loop {
         let effective_limits = budget.evaluate_current();
+        if effective_limits.state.is_paused() {
+            historical_work_gate.set_replay_verification_pending(false);
+        }
         record_materialized_view_replay_budget(
             tailer.config.replay_policy,
             effective_limits,
@@ -1646,7 +1649,13 @@ async fn run_materialized_view_tailer(
         if effective_limits.state.is_paused() {
             tailer.prevout_caches.release_replay();
         } else {
-            budget = run_materialized_view_tailer_pass(&tailer, budget, &ranking_build).await;
+            budget = run_materialized_view_tailer_pass(
+                &tailer,
+                budget,
+                &ranking_build,
+                &historical_work_gate,
+            )
+            .await;
         }
         if let Some(cursor_risk) = cursor_risk.as_mut() {
             cursor_risk.observe(&tailer.materialized_view_store);
@@ -1674,6 +1683,7 @@ async fn run_materialized_view_tailer_pass(
     tailer: &Arc<MaterializedViewTailer>,
     budget: MaterializedViewReplayBudget,
     ranking_build: &Arc<RankingBuildProgress>,
+    gate: &HistoricalWorkGate,
 ) -> MaterializedViewReplayBudget {
     let started_at = Instant::now();
     let pass_tailer = Arc::clone(tailer);
@@ -1694,6 +1704,12 @@ async fn run_materialized_view_tailer_pass(
         ),
     };
     record_materialized_view_tailer_tick(started_at, &outcome);
+    gate.set_replay_verification_pending(matches!(
+        &outcome,
+        Err(IngestError::CanonicalStore(_)
+            | IngestError::CommitmentTreeState { .. }
+            | IngestError::CommitmentTreeCheckpointMissing { .. })
+    ));
     if let Err(error) = outcome {
         tracing::warn!(
             target: "zinder::ingest",

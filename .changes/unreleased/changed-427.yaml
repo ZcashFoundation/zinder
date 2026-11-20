@@ -1,5 +1,5 @@
 kind: changed
-body: Explorer replay reuses the final note-commitment roots of checkpointed blocks. It only reads compact blocks and hashes their commitments for gaps in checkpoint coverage.
+body: Explorer replay reuses the final note-commitment roots of checkpointed blocks. It reads compact blocks and hashes commitments only for gaps. If replay stalls on invalid canonical data, ingest continues checking settled checkpoints and reports confirmed damage through WriterStatus.
 time: 2026-11-20T15:02:48.756106446Z
 custom:
     Bump: patch

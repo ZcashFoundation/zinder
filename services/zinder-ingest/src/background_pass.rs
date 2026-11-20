@@ -15,9 +15,7 @@ use zinder_store::{
     RocksDbCanonicalSecondary, RocksDbResourceBudget, RocksDbTreeStateVerifier,
 };
 
-use crate::runtime_config::{
-    HistoricalWorkGate, sleep_or_cancel, wait_until_historical_work_or_cancelled,
-};
+use crate::runtime_config::{sleep_or_cancel, wait_for_work_or_cancelled};
 
 /// How often a pass reopens its canonical secondary when no store is
 /// published yet.
@@ -86,19 +84,17 @@ impl BackgroundSecondary<'_> {
     ///
     /// Opening catches the secondary up and admits the store, which reads
     /// retained history, so each attempt runs off the async workers live
-    /// ingest uses and, when `gate` is set, waits for it first. The first
+    /// ingest uses and waits for its pass to have work first. The first
     /// failed attempt logs `unavailable_event`.
     pub(crate) async fn open_when_published<Handle: BackgroundSecondaryHandle>(
         &self,
-        gate: Option<&HistoricalWorkGate>,
+        has_work: impl Fn() -> bool,
         cancel: &CancellationToken,
         unavailable_event: &'static str,
     ) -> Option<Handle> {
         let mut waiting_logged = false;
         loop {
-            if let Some(gate) = gate
-                && wait_until_historical_work_or_cancelled(gate, cancel).await
-            {
+            if wait_for_work_or_cancelled(&has_work, cancel).await {
                 return None;
             }
             if cancel.is_cancelled() {

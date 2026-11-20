@@ -32,13 +32,14 @@ pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
 ///
 /// Canonical bulk catch-up owns the storage budget first. Once canonical is
 /// following tip, materialized-view replay owns it until every canonical block is
-/// materialized. Historical backfills and verifiers may run only after both
+/// materialized. Historical backfills run only after both
 /// conditions hold. Keeping this state out of readiness avoids exposing an
 /// internal scheduler concern as part of the service's public health contract.
 #[derive(Clone, Debug)]
 pub struct HistoricalWorkGate {
     readiness: ComposedReadiness,
     materialized_views_caught_up: Arc<AtomicBool>,
+    replay_verification_pending: Arc<AtomicBool>,
 }
 
 impl HistoricalWorkGate {
@@ -50,6 +51,7 @@ impl HistoricalWorkGate {
         Self {
             readiness,
             materialized_views_caught_up: Arc::new(AtomicBool::new(false)),
+            replay_verification_pending: Arc::default(),
         }
     }
 
@@ -61,6 +63,7 @@ impl HistoricalWorkGate {
         Self {
             readiness,
             materialized_views_caught_up: Arc::new(AtomicBool::new(true)),
+            replay_verification_pending: Arc::default(),
         }
     }
 
@@ -104,18 +107,39 @@ impl HistoricalWorkGate {
     /// Returns whether historical work currently owns any storage budget.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        matches!(
-            self.readiness.runtime_readiness().phase(),
-            Some(IngestPhase::FollowingTip)
-        ) && self.materialized_views_caught_up.load(Ordering::Acquire)
+        self.following_tip() && self.materialized_views_caught_up.load(Ordering::Acquire)
     }
 
-    fn record_open_metric(&self) {
-        metrics::gauge!("zinder_ingest_historical_work_gate_open").set(if self.is_open() {
+    fn following_tip(&self) -> bool {
+        self.readiness.runtime_readiness().phase() == Some(IngestPhase::FollowingTip)
+    }
+
+    pub(crate) fn set_replay_verification_pending(&self, pending: bool) {
+        self.replay_verification_pending
+            .store(pending, Ordering::Release);
+    }
+
+    pub(crate) fn admits_verification(&self) -> bool {
+        self.record_open_metric()
+            || (self.following_tip() && self.replay_verification_pending.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn take_verification_step(&self) -> bool {
+        self.record_open_metric()
+            || (self.following_tip()
+                && self
+                    .replay_verification_pending
+                    .swap(false, Ordering::AcqRel))
+    }
+
+    pub(crate) fn record_open_metric(&self) -> bool {
+        let open = self.is_open();
+        metrics::gauge!("zinder_ingest_historical_work_gate_open").set(if open {
             1.0
         } else {
             0.0
         });
+        open
     }
 }
 
@@ -311,9 +335,15 @@ pub(crate) async fn wait_until_historical_work_or_cancelled(
     gate: &HistoricalWorkGate,
     cancel: &CancellationToken,
 ) -> bool {
+    wait_for_work_or_cancelled(|| gate.record_open_metric(), cancel).await
+}
+
+pub(crate) async fn wait_for_work_or_cancelled(
+    has_work: impl Fn() -> bool,
+    cancel: &CancellationToken,
+) -> bool {
     loop {
-        gate.record_open_metric();
-        if gate.is_open() {
+        if has_work() {
             return false;
         }
         if sleep_or_cancel(BACKGROUND_WORK_PHASE_POLL_INTERVAL, cancel).await {
@@ -340,6 +370,28 @@ mod tests {
         let composed = ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]);
         composed.update_admission(|admission| admission.phase = Some(phase));
         composed
+    }
+
+    #[test]
+    fn repeated_canonical_replay_failures_admit_one_verification_step_during_tip_follow() {
+        let readiness = composed_in_phase(IngestPhase::BulkCatchup);
+        let gate = HistoricalWorkGate::new(readiness.clone());
+        gate.set_replay_verification_pending(true);
+        assert!(!gate.admits_verification());
+        assert!(!gate.take_verification_step());
+        readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+        gate.set_replay_verification_pending(true);
+        assert!(gate.admits_verification());
+        assert!(!gate.is_open());
+        assert!(gate.take_verification_step());
+        assert!(!gate.take_verification_step());
+
+        gate.set_replay_verification_pending(true);
+        gate.set_replay_verification_pending(false);
+        assert!(!gate.take_verification_step());
+        gate.set_materialized_views_caught_up(true);
+        assert!(gate.take_verification_step());
+        assert!(gate.take_verification_step());
     }
 
     #[tokio::test]
