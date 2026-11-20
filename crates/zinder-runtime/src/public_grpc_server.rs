@@ -18,13 +18,17 @@
 //! process reads at once across connections. The receive limit does, so
 //! many large requests sent together cannot exhaust memory.
 //!
-//! A wallet listener assembles its services with [`public_grpc_router`]: the
-//! wallet service behind the [`TrafficReadinessInterceptor`], and gRPC
-//! reflection and `grpc.health.v1.Health` outside it, so both keep answering
-//! while the runtime refuses wallet calls. Reflection, built with
+//! A wallet listener, which [`crate::SupervisedRuntime::public_grpc_router`]
+//! assembles, serves the wallet service behind the
+//! [`TrafficReadinessInterceptor`], and gRPC reflection and
+//! `grpc.health.v1.Health` outside it, so both keep answering while the
+//! runtime refuses wallet calls. Reflection, built with
 //! [`public_grpc_reflection`], applies the same request size bound as every
-//! other public service.
+//! other public service. Every call on the listener also passes through
+//! [`GrpcCallTerminationLayer`], outside every other layer, which ends the
+//! calls still open once the runtime's drain deadline passes.
 
+mod call_termination;
 mod message_boundaries;
 mod receive_slots;
 mod send_stall;
@@ -57,10 +61,12 @@ use tonic::{
 };
 use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
 use tower::{
-    Layer, Service,
+    Layer, Service, ServiceBuilder,
     layer::util::{Identity, Stack},
 };
 
+pub(crate) use self::call_termination::OpenGrpcCalls;
+pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 use self::{
@@ -118,8 +124,12 @@ type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, I
 /// The tonic server type that [`public_grpc_server`] returns.
 pub type PublicGrpcServer = Server<PublicGrpcLayers>;
 
-/// The tonic router type that [`public_grpc_router`] returns.
-pub type PublicGrpcRouter = Router<PublicGrpcLayers>;
+/// The layers of a supervised public listener, outermost first: call
+/// termination, the receive limit, and the send stall bound.
+pub(crate) type SupervisedGrpcLayers = Stack<
+    GrpcSendStallLayer,
+    Stack<GrpcReceiveLimitLayer, Stack<GrpcCallTerminationLayer, Identity>>,
+>;
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
 /// default receive limits and send stall timeout.
@@ -144,38 +154,49 @@ pub fn public_grpc_server_with(
     send_stall_timeout: Duration,
 ) -> PublicGrpcServer {
     describe_limit_metrics();
-    Server::builder()
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
-        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+    public_grpc_transport()
         .layer(GrpcReceiveLimitLayer::new(limits))
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
 
-/// Assembles a public Zinder wallet listener that serves `wallet_service`.
+/// The layers of a supervised listener.
 ///
-/// The router serves, on [`public_grpc_server`]'s transport policy:
+/// Call termination wraps the others, so a terminated call drops what the
+/// send stall bound still holds of its response, and a refused call never
+/// takes a receive slot.
+pub(crate) fn supervised_grpc_layers(
+    calls: Arc<OpenGrpcCalls>,
+    limits: GrpcReceiveLimits,
+    send_stall_timeout: Duration,
+) -> SupervisedGrpcLayers {
+    describe_limit_metrics();
+    ServiceBuilder::new()
+        .layer(GrpcCallTerminationLayer::new(calls))
+        .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcSendStallLayer::new(send_stall_timeout))
+        .into_inner()
+}
+
+/// The HTTP/2 transport policy every public listener shares.
+fn public_grpc_transport() -> Server {
+    Server::builder()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
+        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+}
+
+/// Assembles a supervised wallet listener that serves `wallet_service`
+/// behind the traffic gate, and reflection and health outside it.
 ///
-/// - `wallet_service`, behind a [`TrafficReadinessInterceptor`] over
-///   `readiness`;
-/// - gRPC reflection v1, describing `wallet_descriptor_set` and
-///   `grpc.health.v1`; and
-/// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
-///   traffic, as `/readyz` reports it.
-///
-/// Reflection and health stay outside the traffic gate, so they answer while
-/// the runtime refuses wallet calls.
-///
-/// Serve the router with `drain` as its shutdown signal. To stop, publish
-/// `shutting_down` to `readiness` first and cancel `drain` after it: health
-/// then reports `NOT_SERVING` together with `/readyz`, and open health
-/// `Watch` streams end as the drain starts.
-pub fn public_grpc_router<S>(
+/// `calls` can end every call the listener serves, and open health `Watch`
+/// streams end once `drain` is cancelled.
+pub(crate) fn supervised_wallet_router<S>(
+    calls: Arc<OpenGrpcCalls>,
     wallet_service: S,
     wallet_descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
-) -> Result<PublicGrpcRouter, tonic_reflection::server::Error>
+) -> Result<Router<Stack<SupervisedGrpcLayers, Identity>>, tonic_reflection::server::Error>
 where
     S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
         + NamedService
@@ -192,7 +213,12 @@ where
         wallet_service,
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
-    Ok(public_grpc_server()
+    Ok(public_grpc_transport()
+        .layer(supervised_grpc_layers(
+            calls,
+            GrpcReceiveLimits::default(),
+            DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+        ))
         .add_service(gated_wallet_service)
         .add_service(reflection)
         .add_service(health))

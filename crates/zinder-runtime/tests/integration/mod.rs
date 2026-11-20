@@ -6,4 +6,5 @@ mod ops_endpoint;
 mod ops_healthcheck;
 mod public_grpc_health;
 mod public_grpc_server;
+mod runtime_supervision;
 mod startup_phase;

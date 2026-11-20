@@ -6354,6 +6354,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "slab",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",

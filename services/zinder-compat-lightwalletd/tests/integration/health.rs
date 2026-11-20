@@ -8,7 +8,6 @@ use std::{net::SocketAddr, sync::Arc};
 use eyre::Result;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic_health::pb::health_check_response::ServingStatus;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
@@ -19,7 +18,10 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_query::{
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair, WalletServingReadiness,
 };
-use zinder_runtime::{OpsEndpointHandle, OpsServer, Readiness, ReadinessState};
+use zinder_runtime::{
+    OpsEndpointHandle, OpsServer, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
+    SupervisedTasks,
+};
 use zinder_testkit::{
     ChainFixture, PublicListenerProbe, WalletServingStoreFixture, next_watch_status,
     sample_regtest_upgrade_activations, watch_ends,
@@ -30,8 +32,9 @@ const HEALTH_SERVICE: &str = "grpc.health.v1.Health";
 
 /// The wallet-mode listener's health follows `/readyz`.
 ///
-/// The listener is assembled as the runtime assembles it, and the drain
-/// starts separately from the shutdown publication.
+/// The listener is assembled and supervised as the runtime assembles and
+/// supervises it. The test publishes the shutdown itself first, so it can
+/// check health while the listener still answers.
 #[tokio::test]
 async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdown() -> Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
@@ -46,19 +49,25 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
         )));
     let readiness = Readiness::default();
     let serving_readiness = WalletServingReadiness::pair_only(readiness.clone());
-    let drain = CancellationToken::new();
-    let router = zinder_runtime::public_grpc_router(
+    let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+    let router = runtime.public_grpc_router(
         LightwalletdGrpcAdapter::new(wallet_query).into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         &readiness,
-        &drain,
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    tokio::spawn(router.serve_with_incoming_shutdown(
+    let server = router.serve_with_incoming_shutdown(
         TcpListenerStream::new(listener),
-        drain.clone().cancelled_owned(),
-    ));
+        runtime.grpc_server_shutdown(),
+    );
+    let shutdown = runtime.shutdown_request();
+    let supervised = tokio::spawn({
+        let serving_readiness = serving_readiness.clone();
+        runtime.supervise(server, SupervisedTasks::new(), move || {
+            serving_readiness.publish_shutting_down();
+        })
+    });
     let (ops_address, _readyz) = spawn_readyz(&readiness).await?;
     let probe = PublicListenerProbe::connect(listener_address, ops_address).await?;
     let mut streamer = CompactTxStreamerClient::new(probe.channel());
@@ -103,8 +112,10 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
         ServingStatus::NotServing
     );
 
-    drain.cancel();
-    watch_ends(&mut watch).await
+    shutdown.request();
+    watch_ends(&mut watch).await?;
+    supervised.await??;
+    Ok(())
 }
 
 async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {

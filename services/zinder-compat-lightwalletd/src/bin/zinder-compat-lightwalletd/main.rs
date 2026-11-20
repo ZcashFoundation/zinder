@@ -1,12 +1,10 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
 use std::{
-    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
-    time::Duration,
 };
 use zinder_core::wire::encode_zinder_native_chain_name;
 
@@ -17,15 +15,17 @@ use zinder_compat_lightwalletd::{
     spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
 };
 use zinder_runtime::{
-    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TracingSubscriberError, cancel_on_terminating_signal, install_metrics_recorder_for_service,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
+    TracingSubscriberError, install_metrics_recorder_for_service, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
 mod compact_block_serving;
 mod config;
+mod supervision;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
+use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
@@ -35,15 +35,6 @@ use zinder_query::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
-
-/// Longest the gRPC server may drain after shutdown starts before open calls
-/// are abandoned.
-///
-/// A graceful drain waits for every open call, and a block-range stream to a
-/// client that reads slowly stays open until its range ends. This bound keeps
-/// such calls from holding the process past the wallet-serving supervisor's
-/// 20-second grace window, with room left for secondary teardown.
-const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -278,7 +269,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_node_broadcast(node_broadcast.clone())
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
-    let cancel = CancellationToken::new();
+    let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+    let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
@@ -297,7 +289,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         Arc::from([]),
     )
     .await?;
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
         serving_pair_slot,
@@ -320,9 +312,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.storage.secondary_catchup_interval,
         cancel.clone(),
     );
-    let serving_runtime_drained = CancellationToken::new();
     let serving_pair_publisher_handle =
-        serving_pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        serving_pair_publisher.spawn(cancel.clone(), runtime.serving_drained());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "wallet").set(1.0);
     let mempool_surface = Arc::new({
         let mut surface =
@@ -363,30 +354,34 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     // The listener exposes `grpc.reflection.v1.ServerReflection` so legacy
     // lightwalletd wallets and `grpcurl` can discover the served
     // `CompactTxStreamer` surface without an out-of-band proto.
-    let listener_drain = CancellationToken::new();
-    let router = zinder_runtime::public_grpc_router(
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         &readiness,
-        &listener_drain,
     )?;
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
-    let server_result = serve_with_bounded_drain(
-        router.serve_with_shutdown(
-            lightwalletd_config.listen_addr,
-            listener_drain.clone().cancelled_owned(),
-        ),
-        &cancel,
-        &listener_drain,
-        || serving_readiness.publish_shutting_down(),
-    )
-    .await;
-
-    cancel.cancel();
-    serving_runtime_drained.cancel();
+    let server = router.serve_with_shutdown(
+        lightwalletd_config.listen_addr,
+        runtime.grpc_server_shutdown(),
+    );
+    let runtime_outcome = runtime
+        .supervise(
+            server,
+            WalletServingTasks {
+                serving_pair_publisher: serving_pair_publisher_handle,
+                node_readiness_probe: node_readiness_handle,
+                ingest_control_readiness_probe: ingest_control_readiness_handle,
+                tip_change_publisher: tip_publisher_handle,
+                node_tip_witness: node_tip_witness_handle,
+                operations: ops_handle,
+            }
+            .supervised(),
+            || serving_readiness.publish_shutting_down(),
+        )
+        .await;
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -394,81 +389,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         serving = "wallet",
         "lightwalletd-compatible gRPC server stopped"
     );
-
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await?;
-    }
-
-    await_node_tip_witness(node_tip_witness_handle).await;
-
-    // Drain the tip-change publisher so a panic in its task surfaces in
-    // the operator's log instead of vanishing silently. The publisher's
-    // run loop exits when `cancel` fires, so the join completes promptly.
-    match tip_publisher_handle.await {
-        Ok(()) => {}
-        Err(join_error) if join_error.is_panic() => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "tip_change_publisher_panic",
-            error = %join_error,
-            "tip-change publisher task panicked",
-        ),
-        Err(join_error) => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "tip_change_publisher_join_failed",
-            error = %join_error,
-            "tip-change publisher task did not exit cleanly",
-        ),
-    }
-
-    match serving_pair_publisher_handle.await {
-        Ok(()) => {}
-        Err(join_error) if join_error.is_panic() => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "serving_pair_publisher_panic",
-            error = %join_error,
-            "wallet-serving pair publisher task panicked"
-        ),
-        Err(join_error) => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "serving_pair_publisher_join_failed",
-            error = %join_error,
-            "wallet-serving pair publisher task did not exit cleanly"
-        ),
-    }
-
-    match node_readiness_handle.await {
-        Ok(()) => {}
-        Err(join_error) if join_error.is_panic() => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "wallet_node_readiness_probe_panic",
-            error = %join_error,
-            "wallet node-readiness probe task panicked"
-        ),
-        Err(join_error) => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "wallet_node_readiness_probe_join_failed",
-            error = %join_error,
-            "wallet node-readiness probe task did not exit cleanly"
-        ),
-    }
-
-    match ingest_control_readiness_handle.await {
-        Ok(()) => {}
-        Err(join_error) if join_error.is_panic() => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "wallet_ingest_control_readiness_probe_panic",
-            error = %join_error,
-            "wallet ingest-control readiness probe task panicked"
-        ),
-        Err(join_error) => tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "wallet_ingest_control_readiness_probe_join_failed",
-            error = %join_error,
-            "wallet ingest-control readiness probe task did not exit cleanly"
-        ),
-    }
-
-    server_result.map_err(LightwalletdConfigError::Transport)
+    Ok(runtime_outcome?)
 }
 
 #[allow(
@@ -524,7 +445,8 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
-    let cancel = CancellationToken::new();
+    let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+    let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
@@ -543,9 +465,8 @@ async fn run_compact_blocks(
         Arc::from([]),
     )
     .await?;
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let serving_runtime_drained = CancellationToken::new();
-    let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
+    let publisher_handle = publisher.spawn(cancel.clone(), runtime.serving_drained());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "compact-blocks").set(1.0);
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -563,84 +484,36 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let listener_drain = CancellationToken::new();
-    let router = zinder_runtime::public_grpc_router(
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         &serving_readiness.runtime(),
-        &listener_drain,
     )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server_result = serve_with_bounded_drain(
-        router.serve_with_shutdown(
-            lightwalletd_config.listen_addr,
-            listener_drain.clone().cancelled_owned(),
-        ),
-        &cancel,
-        &listener_drain,
-        || serving_readiness.publish_shutting_down(),
-    )
-    .await;
-    cancel.cancel();
-    serving_runtime_drained.cancel();
+    let server = router.serve_with_shutdown(
+        lightwalletd_config.listen_addr,
+        runtime.grpc_server_shutdown(),
+    );
+    let runtime_outcome = runtime
+        .supervise(
+            server,
+            CompactBlocksServingTasks {
+                compact_block_publisher: publisher_handle,
+                node_tip_witness: node_tip_witness_handle,
+                operations: ops_handle,
+            }
+            .supervised(),
+            || serving_readiness.publish_shutting_down(),
+        )
+        .await;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_stopped",
         serving = "compact-blocks",
         "lightwalletd-compatible gRPC server stopped"
     );
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await?;
-    }
-    await_node_tip_witness(node_tip_witness_handle).await;
-    match publisher_handle.await {
-        Ok(()) => {}
-        Err(error) => tracing::error!(
-            target: "zinder::compat_lightwalletd",
-            event = "compact_publisher_join_failed",
-            error = %error,
-            "compact publisher task did not exit cleanly"
-        ),
-    }
-    server_result.map_err(LightwalletdConfigError::Transport)
-}
-
-/// Runs the gRPC server until it stops or `shutdown` is cancelled.
-///
-/// On shutdown it calls `publish_shutting_down` and only then cancels
-/// `listener_drain`, the server's shutdown signal, so `/readyz` and gRPC
-/// health report the shutdown before the listener stops accepting calls. It
-/// abandons the calls still open [`GRPC_SERVER_DRAIN_TIMEOUT`] after that.
-async fn serve_with_bounded_drain<Server>(
-    server: Server,
-    shutdown: &CancellationToken,
-    listener_drain: &CancellationToken,
-    publish_shutting_down: impl FnOnce(),
-) -> Result<(), tonic::transport::Error>
-where
-    Server: Future<Output = Result<(), tonic::transport::Error>>,
-{
-    let mut server = std::pin::pin!(server);
-    tokio::select! {
-        server_outcome = &mut server => {
-            publish_shutting_down();
-            return server_outcome;
-        }
-        () = shutdown.cancelled() => {}
-    }
-    publish_shutting_down();
-    listener_drain.cancel();
-    if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_DRAIN_TIMEOUT, server).await {
-        return server_outcome;
-    }
-    tracing::warn!(
-        target: "zinder::compat_lightwalletd",
-        event = "compat_server_drain_timed_out",
-        timeout_seconds = GRPC_SERVER_DRAIN_TIMEOUT.as_secs(),
-        "lightwalletd-compatible gRPC server did not drain before its shutdown deadline; abandoning open calls"
-    );
-    Ok(())
+    Ok(runtime_outcome?)
 }
 
 /// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`
@@ -739,19 +612,6 @@ fn spawn_configured_node_tip_witness(
     )
 }
 
-/// Joins the node-tip witness so a panic in its task reaches the log.
-async fn await_node_tip_witness(handle: tokio::task::JoinHandle<()>) {
-    if let Err(join_error) = handle.await {
-        tracing::warn!(
-            target: "zinder::compat_lightwalletd",
-            event = "node_tip_witness_join_failed",
-            panicked = join_error.is_panic(),
-            error = %join_error,
-            "node-tip witness task did not exit cleanly",
-        );
-    }
-}
-
 fn configured_ping(
     lightwalletd_config: &config::LightwalletdConfig,
     shutdown: &CancellationToken,
@@ -839,95 +699,5 @@ mod tests {
             build_node_broadcast(Some(&node), &[]),
             Err(LightwalletdConfigError::Source(_))
         ));
-    }
-
-    /// A server whose open calls never finish stops holding the process once
-    /// the drain bound passes.
-    #[tokio::test(start_paused = true)]
-    async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
-        let shutdown = CancellationToken::new();
-        let listener_drain = CancellationToken::new();
-        let server_drain = listener_drain.clone();
-        let server = async move {
-            server_drain.cancelled().await;
-            std::future::pending::<Result<(), tonic::transport::Error>>().await
-        };
-        let started_at = tokio::time::Instant::now();
-        shutdown.cancel();
-
-        let server_outcome =
-            serve_with_bounded_drain(server, &shutdown, &listener_drain, || {}).await;
-
-        assert!(server_outcome.is_ok());
-        assert_eq!(started_at.elapsed(), GRPC_SERVER_DRAIN_TIMEOUT);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_server_that_drains_within_the_bound_stops_when_it_drains() {
-        let shutdown = CancellationToken::new();
-        let listener_drain = CancellationToken::new();
-        let server_drain = listener_drain.clone();
-        let server = async move {
-            server_drain.cancelled().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            Ok(())
-        };
-        let started_at = tokio::time::Instant::now();
-        shutdown.cancel();
-
-        let server_outcome =
-            serve_with_bounded_drain(server, &shutdown, &listener_drain, || {}).await;
-
-        assert!(server_outcome.is_ok());
-        assert_eq!(started_at.elapsed(), Duration::from_secs(2));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_server_that_stops_on_its_own_does_not_wait_for_shutdown() {
-        let shutdown = CancellationToken::new();
-        let listener_drain = CancellationToken::new();
-        let runtime_readiness = Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
-        let serving_readiness =
-            compact_block_serving::CompactServingReadiness::new(runtime_readiness.clone());
-        let server = async { Ok(()) };
-        let started_at = tokio::time::Instant::now();
-
-        let server_outcome = serve_with_bounded_drain(server, &shutdown, &listener_drain, || {
-            serving_readiness.publish_shutting_down();
-        })
-        .await;
-
-        assert!(server_outcome.is_ok());
-        assert_eq!(started_at.elapsed(), Duration::ZERO);
-        assert!(!runtime_readiness.report().is_ready);
-    }
-
-    /// Load balancers read `/readyz` and gRPC health, so both must report
-    /// `shutting_down` before the listener stops accepting calls.
-    #[tokio::test]
-    async fn shutdown_is_published_before_the_listener_drains() {
-        let shutdown = CancellationToken::new();
-        let listener_drain = CancellationToken::new();
-        let runtime_readiness = Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
-        let serving_readiness =
-            compact_block_serving::CompactServingReadiness::new(runtime_readiness.clone());
-        let server_drain = listener_drain.clone();
-        let server_readiness = runtime_readiness.clone();
-        let server = async move {
-            server_drain.cancelled().await;
-            assert!(matches!(
-                server_readiness.report().cause,
-                zinder_runtime::ReadinessCause::ShuttingDown
-            ));
-            Ok(())
-        };
-        shutdown.cancel();
-
-        let server_outcome = serve_with_bounded_drain(server, &shutdown, &listener_drain, || {
-            serving_readiness.publish_shutting_down();
-        })
-        .await;
-
-        assert!(server_outcome.is_ok());
     }
 }

@@ -40,6 +40,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `WalletProjectionReader` | Read-only wallet projection state held at one admitted source identity. | `zinder-query` |
 | `WalletServingReadPair` | A canonical reader and a wallet reader proven to describe the same fence, called a serving pair. A request that reads both captures one pair when it starts. | `zinder-query` |
 | `WalletServingPairPublisher` | The reader-process owner that catches up, admits, and publishes serving pairs. | `zinder-query` |
+| `SupervisedRuntime` | The supervision that stops a wallet-serving runtime's gRPC listener and background tasks together, and ends the calls still open at its drain deadline. | `zinder-runtime` |
 | `WalletQueryApi` | The wallet read and broadcast trait that the gRPC adapters call. | `zinder-query` |
 | `WalletServingQuery` | The `WalletQueryApi` implementation over a replaceable serving pair. The native and lightwalletd-compatible runtimes share it. | `zinder-query` |
 | `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload, and the lightwalletd adapter hex-encodes each pool, so neither parses the other's encoding. | `zinder-query` |

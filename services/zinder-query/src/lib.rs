@@ -78,8 +78,9 @@ pub use wallet_serving_pair::{
 };
 pub use wallet_serving_pair_publisher::{
     WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
-    WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
-    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
+    WalletServingPairPublisher, WalletServingPairSlot, WalletServingPairTeardownError,
+    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
+    spawn_wallet_node_readiness_probe,
 };
 pub use wallet_serving_query::WalletServingQuery;
 /// Wallet-facing read API backed by epoch-bound canonical reads.

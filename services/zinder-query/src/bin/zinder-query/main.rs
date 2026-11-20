@@ -1,16 +1,12 @@
 //! Zinder native wallet-query gRPC server entry point.
 
 use std::{
-    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
-    pin::Pin,
     process::ExitCode,
-    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
     AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
@@ -19,8 +15,8 @@ use zinder_query::{
     spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TracingSubscriberError, cancel_on_terminating_signal, install_metrics_recorder_for_service,
+    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
+    SupervisedTasks, TracingSubscriberError, install_metrics_recorder_for_service,
     install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
@@ -31,14 +27,6 @@ use config::{QueryConfigError, QueryConfigOverrides};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
-
-/// Longest the gRPC server may drain after shutdown starts before open calls
-/// are abandoned.
-///
-/// Open server streams already end when shutdown starts; this bound keeps any
-/// other call from holding the process past the wallet-serving supervisor's
-/// 20-second grace window, with room left for secondary teardown.
-const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "zinder-query")]
@@ -244,8 +232,9 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         advertised_capabilities,
     )
     .await?;
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
+    let cancel = runtime.stopping();
     let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata)
         .with_traffic_readiness(readiness.clone())
         .with_shutdown(cancel.clone());
@@ -273,14 +262,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         ingest_control_health_poll_interval,
         cancel.clone(),
     );
-    let serving_runtime_drained = CancellationToken::new();
-    let publisher_handle = pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
-    let listener_drain = CancellationToken::new();
-    let router = zinder_runtime::public_grpc_router(
+    let publisher_handle = pair_publisher.spawn(cancel, runtime.serving_drained());
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
         &readiness,
-        &listener_drain,
     )?;
 
     tracing::info!(
@@ -293,24 +279,23 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = router.serve_with_shutdown(
-        query_config.listen_addr,
-        listener_drain.clone().cancelled_owned(),
-    );
-    supervise_query_runtime(
-        server,
-        cancel,
-        &serving_readiness,
-        QueryBackgroundTasks {
-            listener_drain,
-            serving_pair_publisher: publisher_handle,
-            serving_runtime_drained,
-            node_readiness_probe: node_readiness_handle,
-            ingest_control_readiness_probe: ingest_control_readiness_handle,
-            operations: ops_handle,
-        },
-    )
-    .await
+    let server =
+        router.serve_with_shutdown(query_config.listen_addr, runtime.grpc_server_shutdown());
+    runtime
+        .supervise(
+            server,
+            SupervisedTasks::new()
+                .with_fallible("serving-pair publisher", publisher_handle)
+                .with("node-readiness probe", node_readiness_handle)
+                .with(
+                    "ingest-control readiness probe",
+                    ingest_control_readiness_handle,
+                )
+                .with_operations_endpoint(ops_handle),
+            || serving_readiness.publish_shutting_down(),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`
@@ -336,253 +321,6 @@ fn build_node_broadcast(
         "transaction broadcast enabled through each node endpoint once it passes first-contact verification"
     );
     Ok(Some(nodes))
-}
-
-struct QueryBackgroundTasks {
-    /// Starts the gRPC listener's drain once shutdown has been published.
-    listener_drain: CancellationToken,
-    serving_pair_publisher: tokio::task::JoinHandle<()>,
-    serving_runtime_drained: CancellationToken,
-    node_readiness_probe: tokio::task::JoinHandle<()>,
-    ingest_control_readiness_probe: tokio::task::JoinHandle<()>,
-    operations: Option<OpsEndpointHandle>,
-}
-
-enum QueryRuntimeExit {
-    ShutdownRequested,
-    GrpcServer(Result<(), tonic::transport::Error>),
-    ServingPairPublisher(Result<(), tokio::task::JoinError>),
-    NodeReadinessProbe(Result<(), tokio::task::JoinError>),
-    IngestControlReadinessProbe(Result<(), tokio::task::JoinError>),
-    Operations(Result<(), OpsServerError>),
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the explicit match keeps every supervised task's fatal-exit and drain ordering auditable"
-)]
-async fn supervise_query_runtime<Server>(
-    server: Server,
-    cancel: CancellationToken,
-    readiness: &WalletServingReadiness,
-    background_tasks: QueryBackgroundTasks,
-) -> Result<(), QueryConfigError>
-where
-    Server: Future<Output = Result<(), tonic::transport::Error>>,
-{
-    let QueryBackgroundTasks {
-        listener_drain,
-        mut serving_pair_publisher,
-        serving_runtime_drained,
-        mut node_readiness_probe,
-        mut ingest_control_readiness_probe,
-        mut operations,
-    } = background_tasks;
-    tokio::pin!(server);
-    let exit = tokio::select! {
-        biased;
-        () = cancel.cancelled() => QueryRuntimeExit::ShutdownRequested,
-        server_outcome = &mut server => QueryRuntimeExit::GrpcServer(server_outcome),
-        publisher_outcome = &mut serving_pair_publisher => {
-            QueryRuntimeExit::ServingPairPublisher(publisher_outcome)
-        }
-        node_probe_outcome = &mut node_readiness_probe => {
-            QueryRuntimeExit::NodeReadinessProbe(node_probe_outcome)
-        }
-        ingest_control_probe_outcome = &mut ingest_control_readiness_probe => {
-            QueryRuntimeExit::IngestControlReadinessProbe(ingest_control_probe_outcome)
-        }
-        operations_outcome = wait_for_operations_exit(&mut operations) => {
-            QueryRuntimeExit::Operations(operations_outcome)
-        }
-    };
-
-    // `/readyz` and gRPC health must report the shutdown before the listener
-    // starts draining.
-    readiness.publish_shutting_down();
-    listener_drain.cancel();
-    cancel.cancel();
-    let operations_shutdown = shutdown_operations(&mut operations).await;
-
-    match exit {
-        QueryRuntimeExit::ShutdownRequested => {
-            let server_result = drain_grpc_server(server.as_mut()).await;
-            serving_runtime_drained.cancel();
-            require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
-            require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
-            require_clean_task_shutdown(
-                "ingest-control-readiness probe",
-                ingest_control_readiness_probe.await,
-            )?;
-            operations_shutdown?;
-            server_result.map_err(QueryConfigError::Transport)
-        }
-        QueryRuntimeExit::GrpcServer(server_result) => {
-            serving_runtime_drained.cancel();
-            require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
-            require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
-            require_clean_task_shutdown(
-                "ingest-control-readiness probe",
-                ingest_control_readiness_probe.await,
-            )?;
-            operations_shutdown?;
-            server_result.map_err(QueryConfigError::Transport)?;
-            Err(QueryConfigError::GrpcServerStopped)
-        }
-        QueryRuntimeExit::ServingPairPublisher(task_result) => {
-            let task_error = unexpected_task_exit("serving-pair publisher", task_result);
-            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
-            serving_runtime_drained.cancel();
-            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
-            drain_task_after_runtime_failure(
-                "ingest-control-readiness probe",
-                ingest_control_readiness_probe.await,
-            );
-            drain_operations_after_runtime_failure(operations_shutdown);
-            Err(task_error)
-        }
-        QueryRuntimeExit::NodeReadinessProbe(task_result) => {
-            let task_error = unexpected_task_exit("node-readiness probe", task_result);
-            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
-            serving_runtime_drained.cancel();
-            drain_task_after_runtime_failure(
-                "serving-pair publisher",
-                serving_pair_publisher.await,
-            );
-            drain_task_after_runtime_failure(
-                "ingest-control-readiness probe",
-                ingest_control_readiness_probe.await,
-            );
-            drain_operations_after_runtime_failure(operations_shutdown);
-            Err(task_error)
-        }
-        QueryRuntimeExit::IngestControlReadinessProbe(task_result) => {
-            let task_error = unexpected_task_exit("ingest-control-readiness probe", task_result);
-            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
-            serving_runtime_drained.cancel();
-            drain_task_after_runtime_failure(
-                "serving-pair publisher",
-                serving_pair_publisher.await,
-            );
-            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
-            drain_operations_after_runtime_failure(operations_shutdown);
-            Err(task_error)
-        }
-        QueryRuntimeExit::Operations(operations_result) => {
-            let task_error = match operations_result {
-                Ok(()) => QueryConfigError::RuntimeTaskStopped {
-                    task: "operations endpoint",
-                },
-                Err(error) => QueryConfigError::Operations(error),
-            };
-            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
-            serving_runtime_drained.cancel();
-            drain_task_after_runtime_failure(
-                "serving-pair publisher",
-                serving_pair_publisher.await,
-            );
-            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
-            drain_task_after_runtime_failure(
-                "ingest-control-readiness probe",
-                ingest_control_readiness_probe.await,
-            );
-            drain_operations_after_runtime_failure(operations_shutdown);
-            Err(task_error)
-        }
-    }
-}
-
-/// Waits for the gRPC server's graceful drain, abandoning calls that are
-/// still open after [`GRPC_SERVER_DRAIN_TIMEOUT`].
-async fn drain_grpc_server<Server>(server: Pin<&mut Server>) -> Result<(), tonic::transport::Error>
-where
-    Server: Future<Output = Result<(), tonic::transport::Error>>,
-{
-    if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_DRAIN_TIMEOUT, server).await {
-        return server_outcome;
-    }
-    tracing::warn!(
-        target: "zinder::query",
-        event = "query_server_drain_timed_out",
-        timeout_seconds = GRPC_SERVER_DRAIN_TIMEOUT.as_secs(),
-        "native query gRPC server did not drain before its shutdown deadline; abandoning open calls"
-    );
-    Ok(())
-}
-
-async fn wait_for_operations_exit(
-    operations: &mut Option<OpsEndpointHandle>,
-) -> Result<(), OpsServerError> {
-    match operations {
-        Some(handle) => handle.wait().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn shutdown_operations(
-    operations: &mut Option<OpsEndpointHandle>,
-) -> Result<(), QueryConfigError> {
-    match operations.take() {
-        Some(handle) => handle
-            .shutdown()
-            .await
-            .map_err(QueryConfigError::Operations),
-        None => Ok(()),
-    }
-}
-
-fn require_clean_task_shutdown(
-    task: &'static str,
-    join_outcome: Result<(), tokio::task::JoinError>,
-) -> Result<(), QueryConfigError> {
-    join_outcome.map_err(|source| QueryConfigError::RuntimeTaskJoin { task, source })
-}
-
-fn unexpected_task_exit(
-    task: &'static str,
-    join_outcome: Result<(), tokio::task::JoinError>,
-) -> QueryConfigError {
-    match join_outcome {
-        Ok(()) => QueryConfigError::RuntimeTaskStopped { task },
-        Err(source) => QueryConfigError::RuntimeTaskJoin { task, source },
-    }
-}
-
-fn drain_server_after_runtime_failure(server_outcome: Result<(), tonic::transport::Error>) {
-    if let Err(error) = server_outcome {
-        tracing::warn!(
-            target: "zinder::query",
-            event = "query_server_drain_failed",
-            error = %error,
-            "native query gRPC server failed while draining after a runtime task failure"
-        );
-    }
-}
-
-fn drain_task_after_runtime_failure(
-    task: &'static str,
-    join_outcome: Result<(), tokio::task::JoinError>,
-) {
-    if let Err(error) = join_outcome {
-        tracing::warn!(
-            target: "zinder::query",
-            event = "query_runtime_task_drain_failed",
-            task,
-            error = %error,
-            "wallet query runtime task failed while draining after another runtime failure"
-        );
-    }
-}
-
-fn drain_operations_after_runtime_failure(operations_outcome: Result<(), QueryConfigError>) {
-    if let Err(error) = operations_outcome {
-        tracing::warn!(
-            target: "zinder::query",
-            event = "query_operations_drain_failed",
-            error = %error,
-            "operations endpoint failed while draining after another runtime failure"
-        );
-    }
 }
 
 #[allow(
@@ -639,11 +377,10 @@ impl From<Cli> for QueryConfigOverrides {
 
 #[cfg(test)]
 mod tests {
-    use std::future;
+    use std::time::Duration;
 
     use super::*;
     use zinder_core::Network;
-    use zinder_runtime::{ReadinessCause, ReadinessState};
     use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget};
 
     fn node_target(json_rpc_addr: &str, node_auth: NodeAuth) -> NodeTarget {
@@ -711,304 +448,6 @@ mod tests {
         assert!(matches!(
             build_node_broadcast(Some(&node), &[]),
             Err(QueryConfigError::Source(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn serving_pair_publisher_exit_drains_the_runtime() {
-        let runtime_readiness = Readiness::default();
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let publisher = tokio::spawn(async {});
-        let node_cancel = cancel.clone();
-        let node_probe = tokio::spawn(async move {
-            node_cancel.cancelled().await;
-        });
-        let ingest_control_cancel = cancel.clone();
-        let ingest_control_probe = tokio::spawn(async move {
-            ingest_control_cancel.cancelled().await;
-        });
-        let listener_drain = CancellationToken::new();
-        let server_cancel = listener_drain.clone();
-        let server = async move {
-            server_cancel.cancelled().await;
-            Ok(())
-        };
-
-        let runtime_outcome = supervise_query_runtime(
-            server,
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain,
-                serving_pair_publisher: publisher,
-                serving_runtime_drained: CancellationToken::new(),
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(matches!(
-            runtime_outcome,
-            Err(QueryConfigError::RuntimeTaskStopped {
-                task: "serving-pair publisher"
-            })
-        ));
-        assert!(matches!(
-            runtime_readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-    }
-
-    #[tokio::test]
-    async fn requested_shutdown_drains_all_runtime_tasks_cleanly() {
-        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let serving_runtime_drained = CancellationToken::new();
-        let publisher_cancel = cancel.clone();
-        let publisher_runtime_drained = serving_runtime_drained.clone();
-        let publisher = tokio::spawn(async move {
-            publisher_cancel.cancelled().await;
-            publisher_runtime_drained.cancelled().await;
-        });
-        let node_cancel = cancel.clone();
-        let node_probe = tokio::spawn(async move {
-            node_cancel.cancelled().await;
-        });
-        let ingest_control_cancel = cancel.clone();
-        let ingest_control_probe = tokio::spawn(async move {
-            ingest_control_cancel.cancelled().await;
-        });
-        let listener_drain = CancellationToken::new();
-        let server_cancel = listener_drain.clone();
-        let server_runtime_drained = serving_runtime_drained.clone();
-        let server = async move {
-            server_cancel.cancelled().await;
-            assert!(!server_runtime_drained.is_cancelled());
-            Ok(())
-        };
-        cancel.cancel();
-
-        let runtime_outcome = supervise_query_runtime(
-            server,
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain,
-                serving_pair_publisher: publisher,
-                serving_runtime_drained,
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(runtime_outcome.is_ok());
-        assert!(matches!(
-            runtime_readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-    }
-
-    /// Load balancers read `/readyz` and gRPC health, so both must report
-    /// `shutting_down` before the listener stops accepting calls.
-    #[tokio::test]
-    async fn requested_shutdown_publishes_shutting_down_before_the_listener_drains() {
-        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let publisher_cancel = cancel.clone();
-        let publisher = tokio::spawn(async move {
-            publisher_cancel.cancelled().await;
-        });
-        let node_cancel = cancel.clone();
-        let node_probe = tokio::spawn(async move {
-            node_cancel.cancelled().await;
-        });
-        let ingest_control_cancel = cancel.clone();
-        let ingest_control_probe = tokio::spawn(async move {
-            ingest_control_cancel.cancelled().await;
-        });
-        let listener_drain = CancellationToken::new();
-        let server_drain = listener_drain.clone();
-        let server_readiness = runtime_readiness.clone();
-        let server = async move {
-            server_drain.cancelled().await;
-            assert!(matches!(
-                server_readiness.report().cause,
-                ReadinessCause::ShuttingDown
-            ));
-            Ok(())
-        };
-        cancel.cancel();
-
-        let runtime_outcome = supervise_query_runtime(
-            server,
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain,
-                serving_pair_publisher: publisher,
-                serving_runtime_drained: CancellationToken::new(),
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(runtime_outcome.is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
-        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let serving_runtime_drained = CancellationToken::new();
-        let publisher_cancel = cancel.clone();
-        let publisher_runtime_drained = serving_runtime_drained.clone();
-        let publisher = tokio::spawn(async move {
-            publisher_cancel.cancelled().await;
-            publisher_runtime_drained.cancelled().await;
-        });
-        let node_cancel = cancel.clone();
-        let node_probe = tokio::spawn(async move {
-            node_cancel.cancelled().await;
-        });
-        let ingest_control_cancel = cancel.clone();
-        let ingest_control_probe = tokio::spawn(async move {
-            ingest_control_cancel.cancelled().await;
-        });
-        cancel.cancel();
-        let shutdown_started = tokio::time::Instant::now();
-
-        let runtime_outcome = supervise_query_runtime(
-            future::pending(),
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain: CancellationToken::new(),
-                serving_pair_publisher: publisher,
-                serving_runtime_drained,
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(runtime_outcome.is_ok());
-        let shutdown_duration = shutdown_started.elapsed();
-        assert!(shutdown_duration >= GRPC_SERVER_DRAIN_TIMEOUT);
-        assert!(shutdown_duration < GRPC_SERVER_DRAIN_TIMEOUT + Duration::from_secs(1));
-        assert!(matches!(
-            runtime_readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-    }
-
-    #[tokio::test]
-    async fn node_probe_join_failure_is_a_typed_runtime_failure() {
-        let runtime_readiness = Readiness::default();
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let publisher_cancel = cancel.clone();
-        let publisher = tokio::spawn(async move {
-            publisher_cancel.cancelled().await;
-        });
-        let node_probe = tokio::spawn(future::pending::<()>());
-        node_probe.abort();
-        let ingest_control_cancel = cancel.clone();
-        let ingest_control_probe = tokio::spawn(async move {
-            ingest_control_cancel.cancelled().await;
-        });
-        let listener_drain = CancellationToken::new();
-        let server_cancel = listener_drain.clone();
-        let server = async move {
-            server_cancel.cancelled().await;
-            Ok(())
-        };
-
-        let runtime_outcome = supervise_query_runtime(
-            server,
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain,
-                serving_pair_publisher: publisher,
-                serving_runtime_drained: CancellationToken::new(),
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(matches!(
-            runtime_outcome,
-            Err(QueryConfigError::RuntimeTaskJoin {
-                task: "node-readiness probe",
-                ..
-            })
-        ));
-        assert!(matches!(
-            runtime_readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-    }
-
-    #[tokio::test]
-    async fn ingest_control_probe_join_failure_is_a_typed_runtime_failure() {
-        let runtime_readiness = Readiness::default();
-        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
-        let cancel = CancellationToken::new();
-        let publisher_cancel = cancel.clone();
-        let publisher = tokio::spawn(async move {
-            publisher_cancel.cancelled().await;
-        });
-        let node_cancel = cancel.clone();
-        let node_probe = tokio::spawn(async move {
-            node_cancel.cancelled().await;
-        });
-        let ingest_control_probe = tokio::spawn(future::pending::<()>());
-        ingest_control_probe.abort();
-        let listener_drain = CancellationToken::new();
-        let server_cancel = listener_drain.clone();
-        let server = async move {
-            server_cancel.cancelled().await;
-            Ok(())
-        };
-
-        let runtime_outcome = supervise_query_runtime(
-            server,
-            cancel,
-            &serving_readiness,
-            QueryBackgroundTasks {
-                listener_drain,
-                serving_pair_publisher: publisher,
-                serving_runtime_drained: CancellationToken::new(),
-                node_readiness_probe: node_probe,
-                ingest_control_readiness_probe: ingest_control_probe,
-                operations: None,
-            },
-        )
-        .await;
-
-        assert!(matches!(
-            runtime_outcome,
-            Err(QueryConfigError::RuntimeTaskJoin {
-                task: "ingest-control-readiness probe",
-                ..
-            })
-        ));
-        assert!(matches!(
-            runtime_readiness.report().cause,
-            ReadinessCause::ShuttingDown
         ));
     }
 }

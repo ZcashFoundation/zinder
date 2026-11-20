@@ -155,6 +155,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error(transparent)]
     Operations(#[from] zinder_runtime::OpsServerError),
+
+    #[error("compatibility runtime stopped: {0}")]
+    Supervision(#[from] zinder_runtime::RuntimeSupervisionError),
 }
 
 /// Loads and validates lightwalletd compat configuration.

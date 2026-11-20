@@ -1,13 +1,12 @@
 //! `grpc.health.v1.Health` and reflection on a listener assembled by
-//! `public_grpc_router`, run against a real server on loopback beside the
-//! `/readyz` endpoint of the same readiness.
+//! `SupervisedRuntime::public_grpc_router`, run against a real server on
+//! loopback beside the `/readyz` endpoint of the same readiness.
 
 use std::{net::SocketAddr, sync::Arc};
 
 use eyre::Result;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
-use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_reflection::pb::v1alpha::{
@@ -15,8 +14,8 @@ use tonic_reflection::pb::v1alpha::{
     server_reflection_request::MessageRequest,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, public_grpc_router,
-    spawn_ops_endpoint,
+    OpsEndpointHandle, OpsServer, Readiness, ReadinessCause, ReadinessState, RuntimeService,
+    ShutdownRequest, SupervisedRuntime, SupervisedTasks, spawn_ops_endpoint,
 };
 use zinder_testkit::{PublicListenerProbe, next_watch_status, watch_ends};
 
@@ -28,7 +27,7 @@ const DESCRIBED_WALLET_SERVICE: &str = "zinder.v1.wallet.WalletQuery";
 
 struct TestListener {
     readiness: Readiness,
-    drain: CancellationToken,
+    shutdown: ShutdownRequest,
     probe: PublicListenerProbe,
     _readyz: OpsEndpointHandle,
 }
@@ -55,29 +54,33 @@ impl TestListener {
 
 /// Serves a gated stand-in wallet service through the production listener
 /// assembly, with `/readyz` over the same readiness.
+///
+/// The runtime publishes nothing to readiness when it stops, so a test can
+/// start the drain while readiness still admits traffic.
 async fn serve(initial: ReadinessState) -> Result<TestListener> {
     let readiness = Readiness::new(initial);
-    let drain = CancellationToken::new();
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
     let gated = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1alpha()?;
-    let router = public_grpc_router(
+    let router = runtime.public_grpc_router(
         gated,
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
         &readiness,
-        &drain,
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    tokio::spawn(router.serve_with_incoming_shutdown(
+    let server = router.serve_with_incoming_shutdown(
         TcpListenerStream::new(listener),
-        drain.clone().cancelled_owned(),
-    ));
+        runtime.grpc_server_shutdown(),
+    );
+    let shutdown = runtime.shutdown_request();
+    tokio::spawn(runtime.supervise(server, SupervisedTasks::new(), || {}));
     let (ops_address, readyz) = spawn_readyz(&readiness).await?;
     let probe = PublicListenerProbe::connect(listener_address, ops_address).await?;
     Ok(TestListener {
         readiness,
-        drain,
+        shutdown,
         probe,
         _readyz: readyz,
     })
@@ -235,7 +238,7 @@ async fn shutdown_turns_health_with_readyz_before_the_drain_ends_watches() -> Re
         ServingStatus::NotServing
     );
 
-    listener.drain.cancel();
+    listener.shutdown.request();
     watch_ends(&mut watch).await
 }
 
@@ -247,7 +250,7 @@ async fn a_drain_reports_not_serving_before_ending_watches() -> Result<()> {
     let mut watch = listener.probe.watch("").await?;
     assert_eq!(next_watch_status(&mut watch).await?, ServingStatus::Serving);
 
-    listener.drain.cancel();
+    listener.shutdown.request();
 
     assert_eq!(
         next_watch_status(&mut watch).await?,
