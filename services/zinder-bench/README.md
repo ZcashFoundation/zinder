@@ -682,7 +682,13 @@ with the three sampling options; omitting it preserves the default sampling and
 stored-checkpoint skipping behavior.
 
 Report format version 3 adds `heights_file_sha256` (null for default sampling)
-and `source` (`stored` or `replayed`) on each anchor. Stored outcomes record zero
+and `source` (`stored` or `replayed`) on each anchor. `read_path` distinguishes
+`wallet-query-store` for explicit heights from the default
+`validated-checkpoint` diagnostic. Explicit reads measure `tree_state_lookup`
+and, when needed, `replay_tree_state` together, matching WalletQuery's storage
+path without repeating final checkpoint root validation. Selection performs no
+seed reads outside that measured region. These counters cover the store calls,
+not RPC admission, scheduling, response encoding, or transport. Stored outcomes record zero
 replayed blocks and commitments while retaining the same cold/warm timing and
 RocksDB counters as replays. Logical key reads and thread-local block read
 counts/bytes come from the existing read measurement primitive. The labels
