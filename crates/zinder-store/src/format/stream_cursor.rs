@@ -46,8 +46,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum ChainEventStreamFamily {
     /// Visible stream: every committed chain event, including reorg events.
     Visible,
-    /// Settled stream: only non-reorg commits entirely at or below the
-    /// settled tip.
+    /// A commit covering each newly settled block range, anchored at its settled tip.
     Settled,
 }
 
