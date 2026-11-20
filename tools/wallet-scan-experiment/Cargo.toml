@@ -31,5 +31,8 @@ zinder-core = { workspace = true, optional = true }
 zinder-proto = { workspace = true, optional = true }
 zinder-store = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rust-rocksdb.workspace = true
+
 [lints]
 workspace = true

@@ -5143,6 +5143,7 @@ dependencies = [
  "eyre",
  "pasta_curves",
  "prost",
+ "rust-rocksdb",
  "serde",
  "serde_json",
  "tempfile",
