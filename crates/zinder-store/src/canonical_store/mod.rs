@@ -21,6 +21,8 @@ mod live_replacement_tests;
 mod mempool_lifecycle;
 #[cfg(test)]
 mod mempool_lifecycle_tests;
+#[cfg(test)]
+mod note_commitment_trees_tests;
 mod publication;
 mod reader;
 mod replay_tail;

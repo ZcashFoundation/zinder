@@ -90,24 +90,45 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
 
 ### Heavy probes
 
-Coverage and mutation testing are slow; mutation often takes more than 30
-minutes. Scheduled CI runs them weekly, with a wider file set in the
-`mutation` job of `.github/workflows/ci-pr.yml`.
+Coverage and mutation testing are slow. Scheduled CI runs them weekly. The
+`mutation` job of `.github/workflows/ci-pr.yml` runs the same file list and
+`--re` filter as the command below, so change all of them together.
+
+`--cap-lints true` stops the workspace's denied warnings from failing a
+mutant's build. Without it, a mutant that replaces a function body leaves the
+parameters unused, fails to compile, and counts as unviable instead of being
+tested.
+
+`cargo mutants --workspace` selects the packages to mutate, but it runs only
+the tests of the package that holds each mutant. A mutant in `zinder-store`
+is therefore caught only by a `zinder-store` test, so put the assertion that
+kills a mutant in the crate that owns the mutated file.
+
+The file list and filter select about 295 mutants. A run with `--jobs 3` on
+a GitHub-hosted runner took 56 minutes for 130 mutants, which puts one
+unsharded run near two hours. The job splits the mutants into three shards
+with `--shard`, about 100 mutants and under an hour each, and keeps a 90-minute
+timeout per shard. Grow the shard count in the workflow matrix, and the
+`--shard` denominator with it, before a shard approaches the timeout. A local
+run can use the same flag to cover one slice, such as `--shard 0/3`.
 
 ```bash
 cargo llvm-cov --workspace --all-features --no-report
-cargo mutants --workspace --all-features \
+cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-store/src/canonical_store/live_commit.rs \
   --file crates/zinder-store/src/canonical_store/live_replacement.rs \
   --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
+  --file crates/zinder-store/src/format/stream_cursor.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
   --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_replay.rs \
+  --file crates/zinder-store/src/canonical_store/tree_state_densification.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+  --file services/zinder-ingest/src/artifact_builder.rs \
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
 ```
 
 ## Run one test or one tier
