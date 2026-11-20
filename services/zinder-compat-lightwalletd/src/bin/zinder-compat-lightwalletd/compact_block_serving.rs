@@ -1864,13 +1864,19 @@ mod tests {
     /// A writer-status read that stalls cannot hold admission past the
     /// staleness ceiling.
     ///
-    /// Each read waits until the wallet ingest-control bound ends it, so a
-    /// read is always in flight when the ceiling passes; the reader stops
-    /// admitting traffic at the ceiling instead of when that read ends.
+    /// The ceiling can expire during the first read or during a later retry.
     #[tokio::test]
     async fn a_stalled_writer_status_read_ends_admission_at_the_staleness_ceiling()
     -> Result<(), Box<dyn std::error::Error>> {
-        let staleness_ceiling = Duration::from_mins(1);
+        for ceiling in [Duration::from_secs(5), Duration::from_mins(1)] {
+            assert_stalled_read_expires_at(ceiling).await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_stalled_read_expires_at(
+        staleness_ceiling: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let activations = lifecycle_activations();
         let (primary, _blocks) =
@@ -1878,8 +1884,9 @@ mod tests {
         let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
         let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
         let readiness = Readiness::default();
+        let config = compact_serving_config(&temporary, Duration::from_secs(1), staleness_ceiling)?;
         let (publisher, slot) = CompactBlockPublisher::bootstrap(
-            compact_serving_config(&temporary, Duration::from_secs(1), staleness_ceiling)?,
+            config,
             CompactServingReadiness::new(readiness.clone()),
             &endpoint,
             None,
@@ -1892,7 +1899,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let drained = CancellationToken::new();
         let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
-        tokio::time::sleep(Duration::from_secs(59)).await;
+        tokio::time::sleep(staleness_ceiling.saturating_sub(Duration::from_secs(1))).await;
         let before_ceiling = readiness.report();
         tokio::time::sleep(Duration::from_secs(2)).await;
         let after_ceiling = readiness.report();

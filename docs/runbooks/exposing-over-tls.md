@@ -121,7 +121,9 @@ This guarantee depends on these settings:
   against Caddy's own connection when the header is missing, appears more
   than once, holds a comma-separated list, or holds anything else.
   `zinder_grpc_proxy_client_address_fallbacks_total` counts these requests by
-  reason, and stays at zero behind this template.
+  reason, and stays at zero behind this template. A local supervisor's
+  headerless `grpc.health.v1.Health/Check` uses its loopback connection for
+  the receive limit and leaves the counter unchanged.
 - Only Caddy can reach the gRPC listener, apart from peers you trust as much
   as Caddy. Zinder reads the header from every connection once the setting is
   on. A peer that reaches the listener without going through Caddy can name

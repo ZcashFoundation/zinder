@@ -126,3 +126,63 @@ async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointH
     .await?;
     Ok((ops_address, handle))
 }
+
+#[tokio::test]
+async fn supervisor_grpc_healthcheck_preserves_the_proxy_fallback_counter() -> Result<()> {
+    let (query, _store, _ingest) =
+        native_serving_query_over(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
+            .await?;
+    let readiness = Readiness::new(ReadinessState::ready(Some(1)));
+    let (ops, _handle) = spawn_readyz(&readiness).await?;
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
+    let router = runtime.public_grpc_router(
+        WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default())
+            .with_traffic_readiness(readiness.clone())
+            .into_server(),
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        zinder_runtime::ClientAddressSource::ProxyHeader,
+        &readiness,
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = router.serve_with_incoming_shutdown(
+        TcpListenerStream::new(listener),
+        runtime.grpc_server_shutdown(),
+    );
+    let shutdown = runtime.shutdown_request();
+    let supervised = tokio::spawn(runtime.supervise(server, SupervisedTasks::new(), || {}));
+    let before = missing_proxy_header_count(ops).await?;
+    let probe = super::grpc_healthcheck::probe(addr).await?;
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let after_check = missing_proxy_header_count(ops).await?;
+    let mut wallet = WalletQueryClient::connect(format!("http://{addr}")).await?;
+    wallet
+        .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+        .await?;
+    let after_wallet = missing_proxy_header_count(ops).await?;
+    assert_eq!(
+        [before, after_check, after_wallet],
+        [before, before, before + 1]
+    );
+    shutdown.request();
+    supervised.await??;
+    Ok(())
+}
+
+async fn missing_proxy_header_count(ops: SocketAddr) -> Result<u64> {
+    let scrape = reqwest::get(format!("http://{ops}/metrics"))
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let series = r#"zinder_grpc_proxy_client_address_fallbacks_total{reason="missing"} "#;
+    Ok(scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(series))
+        .unwrap_or("0")
+        .parse()?)
+}

@@ -159,8 +159,8 @@ pub struct ZebraJsonRpcSource {
     max_response_bytes: NonZeroU64,
     broadcast_timeout: Option<Duration>,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
-    health_config: Option<NodeHealthConfig>,
-    ready_http_client: Option<ZebraReadyClient>,
+    health_floors: (f64, u32),
+    ready_endpoint: Option<(String, ZebraReadyClient)>,
     indexer_target: Option<ZebraIndexerSourceTarget>,
 }
 
@@ -505,8 +505,8 @@ impl ZebraJsonRpcSource {
             max_response_bytes,
             broadcast_timeout,
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
-            health_config: None,
-            ready_http_client: None,
+            health_floors: NodeHealthConfig::default_floors(),
+            ready_endpoint: None,
             indexer_target: None,
         })
     }
@@ -543,22 +543,31 @@ impl ZebraJsonRpcSource {
     /// Installs the upstream-health probe configuration.
     ///
     /// Pass the resolved [`NodeHealthConfig`] from
-    /// [`NodeTarget::health`](crate::NodeTarget::health). With it set, the
-    /// trait method [`NodeSource::poll_upstream_health`] hits Zebra's
-    /// `/ready` endpoint; without it, the same method falls back to
-    /// `getblockchaininfo.verificationprogress` per
-    /// [ADR-0009 §Upstream sync detection].
+    /// [`NodeTarget::health`](crate::NodeTarget::health).
+    /// [`NodeSource::poll_upstream_health`] tries Zebra's `/ready` endpoint
+    /// when configured and uses the JSON-RPC floors whenever it falls back
+    /// to `getblockchaininfo` per [ADR-0009 §Upstream sync detection].
     ///
     /// [ADR-0009 §Upstream sync detection]:
     ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     #[must_use]
     pub fn with_health_config(mut self, health_config: Option<NodeHealthConfig>) -> Self {
-        self.ready_http_client = health_config
-            .as_ref()
-            .map(|config| ZebraReadyClient::new(config.poll_interval));
-        self.health_config = health_config;
+        self.health_floors =
+            health_config
+                .as_ref()
+                .map_or(NodeHealthConfig::default_floors(), |config| {
+                    (
+                        config.verification_progress_floor,
+                        config.estimated_gap_floor_blocks,
+                    )
+                });
+        self.ready_endpoint = health_config.and_then(|config| {
+            config
+                .addr
+                .map(|addr| (addr, ZebraReadyClient::new(config.poll_interval)))
+        });
         let mut cache = self.cached_capabilities.lock();
-        *cache = with_readiness_probe_capability(*cache, self.health_config.is_some());
+        *cache = with_readiness_probe_capability(*cache, self.ready_endpoint.is_some());
         drop(cache);
         self
     }
@@ -1281,7 +1290,7 @@ impl NodeSource for ZebraJsonRpcSource {
             parse_openrpc_capabilities(&method_names, stores_historical_block_bodies);
 
         let probed_capabilities =
-            with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
+            with_readiness_probe_capability(json_rpc_capabilities, self.ready_endpoint.is_some());
         *self.cached_capabilities.lock() = probed_capabilities;
         Ok(probed_capabilities)
     }
@@ -1596,16 +1605,14 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
-        if let (Some(config), Some(client)) =
-            (self.health_config.as_ref(), self.ready_http_client.as_ref())
-        {
-            match client.probe(&config.addr).await {
+        if let Some((addr, client)) = &self.ready_endpoint {
+            match client.probe(addr).await {
                 Ok(snapshot) => return Ok(snapshot),
                 Err(error) => {
                     tracing::warn!(
                         target: "zinder::source",
                         event = "upstream_health_endpoint_unreachable",
-                        addr = %crate::redact_endpoint_url(&config.addr),
+                        addr = %crate::redact_endpoint_url(addr),
                         reason = %error,
                         "ready endpoint probe failed; falling back to verificationprogress"
                     );
@@ -1658,15 +1665,7 @@ impl ZebraJsonRpcSource {
             })
             .await?;
 
-        let (progress_floor, gap_floor) =
-            self.health_config
-                .as_ref()
-                .map_or(NodeHealthConfig::default_floors(), |config| {
-                    (
-                        config.verification_progress_floor,
-                        config.estimated_gap_floor_blocks,
-                    )
-                });
+        let (progress_floor, gap_floor) = self.health_floors;
 
         let progress = snapshot_fields.verification_progress;
         let committed = snapshot_fields.blocks;

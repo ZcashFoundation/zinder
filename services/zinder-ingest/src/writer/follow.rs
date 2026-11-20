@@ -19,7 +19,7 @@ use zinder_core::{
 };
 use zinder_proto::v1::ops::ReorgWindowExceededDetail;
 use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessCause, ReadinessState};
-use zinder_source::{NodeSource, SourceBlock, SourceError, SourceFailureClass};
+use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
     CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReplacementBlock, CanonicalStoreError,
@@ -31,8 +31,7 @@ use crate::{
     MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block,
     prepare_canonical_block,
     source_recovery::{
-        SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
-        detail_for_ongoing_outage,
+        SourceOutage, SourceRecoveryDecision, decide_recovery, default_recovery_backoff,
     },
     writer::construction::{
         canonical_build_block, compact_block_commitments, first_differing_subtree_root,
@@ -291,47 +290,6 @@ fn tip_confirmation_after_switch(switch: &NodeEndpointSwitch) -> TipConfirmation
         TipConfirmation::Unconfirmed
     } else {
         TipConfirmation::Confirmed
-    }
-}
-
-/// The source outage in progress, counted per failure class so a switch
-/// threshold for one class never counts another.
-struct SourceOutage {
-    started_at: std::time::Instant,
-    detail: zinder_runtime::NodeUnavailableDetail,
-    failure_class: SourceFailureClass,
-    consecutive_same_class: u32,
-}
-
-impl SourceOutage {
-    fn record(
-        previous: Option<Self>,
-        failure_class: SourceFailureClass,
-        last_reason: std::borrow::Cow<'static, str>,
-    ) -> Self {
-        match previous {
-            None => Self {
-                started_at: std::time::Instant::now(),
-                detail: detail_for_new_outage(failure_class, last_reason),
-                failure_class,
-                consecutive_same_class: 1,
-            },
-            Some(previous) => Self {
-                detail: detail_for_ongoing_outage(
-                    &previous.detail,
-                    failure_class,
-                    last_reason,
-                    u32::try_from(previous.started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
-                ),
-                consecutive_same_class: if previous.failure_class == failure_class {
-                    previous.consecutive_same_class.saturating_add(1)
-                } else {
-                    1
-                },
-                started_at: previous.started_at,
-                failure_class,
-            },
-        }
     }
 }
 

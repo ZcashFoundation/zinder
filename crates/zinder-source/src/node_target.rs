@@ -94,13 +94,7 @@ pub struct NodeTarget {
     pub broadcast_timeout: Option<Duration>,
     /// Resolved upstream-health probe configuration.
     ///
-    /// `None` means the operator did not set `[node.health].addr`, so the
-    /// upstream-health signal falls back to the JSON-RPC
-    /// `getblockchaininfo.verificationprogress` path per
-    /// [ADR-0009 §Upstream sync detection].
-    ///
-    /// [ADR-0009 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
+    /// `None` uses the default JSON-RPC fallback settings.
     pub health: Option<NodeHealthConfig>,
 }
 
@@ -112,9 +106,8 @@ pub struct NodeTarget {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeHealthConfig {
-    /// Full URL of Zebra's `/ready` endpoint, e.g.
-    /// `http://127.0.0.1:18233/ready`.
-    pub addr: String,
+    /// Full URL of Zebra's `/ready` endpoint. Without it, probes use JSON-RPC.
+    pub addr: Option<String>,
     /// Cadence at which the probe task hits the endpoint.
     pub poll_interval: Duration,
     /// Fallback threshold: the JSON-RPC path treats upstream as not-ready
@@ -135,7 +128,7 @@ impl NodeHealthConfig {
         estimated_gap_floor_blocks: u32,
     ) -> Self {
         Self {
-            addr,
+            addr: Some(addr),
             poll_interval,
             verification_progress_floor,
             estimated_gap_floor_blocks,
@@ -567,15 +560,8 @@ pub struct NodeIndexerClientIdentity {
 
 /// Raw `[node.health]` config section.
 ///
-/// Defaults applied during [`NodeTarget::resolve`]. The probe is opt-in:
-/// omitting [`Self::addr`] leaves the resolved
-/// [`NodeTarget::health`] at `None` and the writer falls back to the
-/// `verificationprogress` JSON-RPC path per
-/// [ADR-0009 §Upstream sync detection].
-///
-/// [ADR-0009 §Upstream sync detection]:
-///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// [`NodeTarget::resolve`] applies defaults to any supplied settings.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeHealthSection {
     /// Full URL of Zebra's `/ready` endpoint when the operator exposes it.
@@ -697,9 +683,9 @@ pub enum NodeConfigError {
 fn resolve_node_health(
     section: NodeHealthSection,
 ) -> Result<Option<NodeHealthConfig>, NodeConfigError> {
-    let Some(addr) = section.addr else {
+    if section == NodeHealthSection::default() {
         return Ok(None);
-    };
+    }
     let poll_interval_ms = section
         .poll_interval_ms
         .unwrap_or(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS);
@@ -720,12 +706,12 @@ fn resolve_node_health(
         .estimated_gap_floor_blocks
         .unwrap_or(DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS);
 
-    Ok(Some(NodeHealthConfig::new(
-        addr,
-        Duration::from_millis(poll_interval_ms),
+    Ok(Some(NodeHealthConfig {
+        addr: section.addr,
+        poll_interval: Duration::from_millis(poll_interval_ms),
         verification_progress_floor,
         estimated_gap_floor_blocks,
-    )))
+    }))
 }
 
 fn resolve_node_indexer_tls(
@@ -1413,7 +1399,7 @@ mod tests {
         let health = target.health.ok_or(NodeConfigError::Invalid {
             reason: "expected resolved health config",
         })?;
-        assert_eq!(health.addr, "http://127.0.0.1:18233/ready");
+        assert_eq!(health.addr.as_deref(), Some("http://127.0.0.1:18233/ready"));
         assert_eq!(
             health.poll_interval,
             Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS)
@@ -1457,28 +1443,24 @@ mod tests {
 
     #[test]
     fn resolve_health_rejects_progress_floor_out_of_range() {
-        for floor in [0.0_f64, 1.0_f64, -0.5_f64, 1.5_f64] {
-            let section = NodeSection {
-                json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
-                indexer_grpc_addr: None,
-                request_timeout_secs: None,
-                max_response_bytes: None,
-                broadcast_timeout_secs: None,
-                indexer_tls: NodeIndexerTlsSection::default(),
-                auth: NodeAuthSection::default(),
-                health: NodeHealthSection {
-                    addr: Some("http://127.0.0.1:18233/ready".to_owned()),
-                    poll_interval_ms: None,
-                    verification_progress_floor: Some(floor),
-                    estimated_gap_floor_blocks: None,
-                },
-            };
-            assert!(matches!(
-                NodeTarget::resolve(Network::ZcashRegtest, section),
-                Err(NodeConfigError::Invalid {
-                    reason: "node.health.verification_progress_floor must be in (0.0, 1.0)",
-                })
-            ));
+        for addr in [None, Some("http://127.0.0.1:18233/ready")] {
+            for floor in [0.0, 1.0, -0.5, 1.5] {
+                let section = NodeSection {
+                    json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+                    health: NodeHealthSection {
+                        addr: addr.map(str::to_owned),
+                        verification_progress_floor: Some(floor),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    NodeTarget::resolve(Network::ZcashRegtest, section),
+                    Err(NodeConfigError::Invalid {
+                        reason: "node.health.verification_progress_floor must be in (0.0, 1.0)",
+                    })
+                ));
+            }
         }
     }
 

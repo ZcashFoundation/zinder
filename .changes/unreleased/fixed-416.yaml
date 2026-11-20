@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallet supervision checks the query and lightwalletd gRPC listeners before admitting traffic. Configured node readiness floors apply whenever the HTTP probe is absent or unreachable, and a failed poll clears the previous upstream sync observation. Rust callers reading the resolved node health address must handle an optional value.
+time: 2026-11-20T13:07:25.702959164Z
+custom:
+    Bump: minor
+    PR: "416"

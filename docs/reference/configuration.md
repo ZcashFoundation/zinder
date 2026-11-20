@@ -356,7 +356,9 @@ counts each request against that connection. A request that carries the
 header more than once, as a comma-separated list, or as anything but one IP
 address and port, or that carries none, counts against the proxy's own
 connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total`
-counts it. With the setting off, the default, Zinder ignores the header.
+counts it. A loopback `grpc.health.v1.Health/Check` with no header uses its
+own connection for the receive limit and leaves the fallback counter unchanged.
+With the setting off, the default, Zinder ignores the header.
 [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
 lists the proxy settings this depends on.
 
