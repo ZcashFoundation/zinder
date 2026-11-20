@@ -470,8 +470,11 @@ only through NU6.2, and the test refuses a tip at or past NU6.3.
 
 Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
 The qualification build serves wallet RPCs with one canonical store and ingest
-control. It uses the node for transparent balances, UTXOs, address history,
-transaction submission, and the recommended fee. Each forwarded request checks
+control. Both `compact-blocks` and `light-wallet-qualification` check the
+writer's canonical fence when admitting a reader. Qualification also requires
+the writer to attest the reader's upgrade schedule. It uses the node for
+transparent balances, UTXOs, address history, transaction submission, and the
+recommended fee. Each forwarded request checks
 that the node holds the served tip on its best chain. If the canonical fence or
 schedule revision changes during verification, the request returns `UNAVAILABLE`.
 Requests share evidence of broadcast support and agreement with the writer's
