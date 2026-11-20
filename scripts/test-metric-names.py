@@ -27,6 +27,7 @@ def production_source(path):
 
 
 def name_from_arg(arg, local_constants, constants):
+    arg = arg.strip()
     if arg.startswith('"') and arg.endswith('"'):
         return arg[1:-1]
     arg = arg.rsplit("::", 1)[-1]
@@ -165,6 +166,21 @@ class MetricNameTests(unittest.TestCase):
             with self.subTest(consumer=str(path.relative_to(ROOT))):
                 self.assertTrue(names)
                 self.assertEqual(sorted(names - self.series), [])
+
+    def test_bucket_matcher_accepts_a_multiline_metric_name(self):
+        source = '''
+            .set_buckets_for_metric(
+                Matcher::Full(
+                    "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds"
+                        .to_owned(),
+                ),
+                buckets,
+            )
+        '''
+        [(mode, arg)] = BUCKET_MATCHER.findall(source)
+        self.assertEqual(mode, "Full")
+        self.assertEqual(name_from_arg(arg, {}, {}),
+                         "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds")
 
 
 if __name__ == "__main__":
