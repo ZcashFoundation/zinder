@@ -17,7 +17,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 
 ## Decision
 
-1. **One bounded open path.** Every RocksDB store, canonical, wallet, and materialized-view, primary or secondary, opens through one path in the storage layer. A typed resource budget sets the block cache, the WAL ceiling, open files, write buffers, and a total memtable budget. Configuration validates each value against a minimum. Operators tune the budget, not raw RocksDB options.
+1. **One bounded open path.** Every RocksDB open—canonical, wallet, and materialized-view, whether primary, secondary, or a short-lived read-only admission probe—routes through one path in the storage layer. A typed resource budget sets the block cache, the WAL ceiling, open files, write buffers, and a total memtable budget. Configuration validates each value against a minimum. Operators tune the budget, not raw RocksDB options. A read-only admission probe that does not share a caller's block cache allocates the 4 MiB minimum block cache instead of a full writer or reader cache, caps open files with the budget, and serializes table-file opens.
 2. **Direct I/O first.** Every production open tries direct reads, and primaries also use direct I/O for flush and compaction. When the filesystem refuses, the open logs the refusal and retries with buffered I/O. There is no operator toggle.
 3. **Total memtable memory is bounded** across all column families of a store by one write-buffer manager.
 4. **Metadata is charged to the cache.** Every column family, including each store's default family, reads through the bounded block cache, and index and filter blocks count against it. The one exception is the tree-state checkpoint family of the canonical secondary that ingest opens to verify stored checkpoints. It reads through no block cache, so every verification read takes its blocks from the table file and checks their checksums.
@@ -49,3 +49,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 - **Removing the arena cap from deployments.** Replay recovers, but throughput would still depend on a variable that operators set for unrelated reasons.
 - **Fewer read threads.** It gives up the overlap of storage waits on network-attached volumes.
 - **mimalloc.** It also avoids shared arena locks, but it was not measured. `tikv-jemallocator` is maintained by a project that runs RocksDB on it.
+
+## Revision history
+
+- 2026-11-20. Decision 1 covers short-lived read-only admission probes, using the 4 MiB minimum block cache unless a shared cache is supplied, and materialized-view secondaries validate through their open secondary handle instead of probing the live primary directory. [Storage backend](../architecture/storage-backend.md#resource-bounds).

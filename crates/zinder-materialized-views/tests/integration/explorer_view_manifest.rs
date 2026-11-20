@@ -137,6 +137,16 @@ fn a_store_with_the_retired_address_history_view_requires_a_rebuild() -> Result<
         Err(MaterializedViewStoreError::ConsumerNotDeclared { consumer, .. })
             if consumer == RETIRED_ADDRESS_HISTORY_NAME.as_str()
     ));
+    let secondary = TempDir::new()?;
+    assert!(matches!(
+        MaterializedViewStore::open_explorer_views_secondary(
+            primary.path(),
+            secondary.path(),
+            options(),
+        ),
+        Err(MaterializedViewStoreError::ConsumerNotDeclared { consumer, .. })
+            if consumer == RETIRED_ADDRESS_HISTORY_NAME.as_str()
+    ));
     let column_families_after =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
     assert_eq!(column_families_after, column_families_before);

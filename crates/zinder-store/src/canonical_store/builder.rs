@@ -67,7 +67,13 @@ impl RocksDbCanonicalBuilder {
             .map_err(|source| CanonicalStoreError::EntropyUnavailable { source })?;
         create_fresh_directory(path)?;
         let store_path = canonical_store_path(path)?;
-        initialize_store_identity(path, workload, &build_plan, cursor_auth_key)?;
+        initialize_store_identity(
+            path,
+            workload,
+            &build_plan,
+            cursor_auth_key,
+            resource_budget,
+        )?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             resource_budget,
