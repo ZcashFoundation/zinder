@@ -1,0 +1,6 @@
+kind: fixed
+body: Explorer advertises ValuePoolSummary only when the connected wallet endpoint supports it. It omits MempoolEventCounts and ValuePoolBalanceHistory from discovery. An empty event-count window is reported as unavailable in OverviewSnapshot and returns ARTIFACT_UNAVAILABLE on a direct call. For native contract revision 12, upgrade zinder-ingest, zinder-query, and wallet-mode zinder-compat-lightwalletd together. Both readers require a matching writer revision.
+time: 2026-11-20T15:05:43.842263139Z
+custom:
+    Bump: minor
+    PR: "428"
