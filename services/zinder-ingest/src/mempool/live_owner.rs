@@ -157,7 +157,7 @@ pub(crate) struct LiveMempoolSnapshotPage {
 }
 
 /// Live mempool ownership state visible to the private control surface.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum MempoolOwnerStatus {
     /// No certified generation exists yet, so the first source generation
     /// builds an in-memory snapshot that must not be exposed until its
@@ -169,6 +169,7 @@ enum MempoolOwnerStatus {
     Serving {
         source_tip: BlockId,
         snapshot_certified_at: UnixTimestampMillis,
+        endpoint: ObservedNodeEndpoint,
     },
     /// A defensive post-append divergence was detected and the index must be reseeded.
     RebuildRequired,
@@ -181,7 +182,7 @@ enum MempoolOwnerStatus {
 impl MempoolOwnerStatus {
     /// Whether the owner still follows its source, so a staged generation may
     /// complete. A rebuild or a halt discards staging instead.
-    const fn follows_source(self) -> bool {
+    const fn follows_source(&self) -> bool {
         matches!(self, Self::Hydrating | Self::Serving { .. })
     }
 
@@ -191,12 +192,14 @@ impl MempoolOwnerStatus {
     /// A hydrating or rebuilding index waits on a node snapshot, so its
     /// refusal carries `NODE_UNAVAILABLE`. The typed reason also tells a
     /// reader that the writer answered, unlike a transport failure.
-    fn serving_anchor(self) -> Result<(BlockId, UnixTimestampMillis), Status> {
+    fn serving_anchor(&self) -> Result<(BlockId, UnixTimestampMillis), Status> {
         match self {
             Self::Serving {
                 source_tip,
                 snapshot_certified_at,
-            } => Ok((source_tip, snapshot_certified_at)),
+                endpoint,
+            } if endpoint.is_active() => Ok((*source_tip, *snapshot_certified_at)),
+            Self::Serving { .. } => Err(inactive_mempool_endpoint()),
             Self::Hydrating => Err(status_for_reason(
                 ErrorReason::NodeUnavailable,
                 "live mempool index is hydrating from an upstream snapshot",
@@ -251,20 +254,18 @@ impl LiveMempoolOwner {
             status_changes: Arc::new(watch::Sender::new(0)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
         };
-        record_mempool_lifecycle_status(MempoolOwnerStatus::Hydrating);
+        record_mempool_lifecycle_status(&MempoolOwnerStatus::Hydrating);
         owner
     }
 
     /// Returns a durable/index consistency error while a source reseed is required.
     pub(crate) fn require_serving(&self) -> Result<(), Status> {
-        let status = *self.status.read();
-        status.serving_anchor().map(|_| ())
+        self.status.read().serving_anchor().map(|_| ())
     }
 
     /// Refuses with the writer's typed halt once the owner is halted.
     fn require_not_halted(&self) -> Result<(), Status> {
-        let status = *self.status.read();
-        match status {
+        match *self.status.read() {
             MempoolOwnerStatus::Halted(halt) => Err(halt.status()),
             MempoolOwnerStatus::Hydrating
             | MempoolOwnerStatus::Serving { .. }
@@ -280,8 +281,7 @@ impl LiveMempoolOwner {
         &self,
         chain_epoch: ChainEpoch,
     ) -> Result<(BlockId, UnixTimestampMillis), Status> {
-        let status = *self.status.read();
-        let (source_tip, snapshot_certified_at) = status.serving_anchor()?;
+        let (source_tip, snapshot_certified_at) = self.status.read().serving_anchor()?;
         let visible_tip =
             BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
         if source_tip != visible_tip {
@@ -377,8 +377,7 @@ impl LiveMempoolOwner {
     /// Whether a refused read at `visible_tip` can succeed once the owner
     /// certifies a generation, rather than failing for a lasting reason.
     fn awaits_tip(&self, visible_tip: BlockId) -> bool {
-        let status = *self.status.read();
-        match status {
+        match *self.status.read() {
             MempoolOwnerStatus::Hydrating => true,
             MempoolOwnerStatus::Serving { source_tip, .. } => source_tip != visible_tip,
             MempoolOwnerStatus::RebuildRequired | MempoolOwnerStatus::Halted(_) => false,
@@ -428,6 +427,7 @@ impl LiveMempoolOwner {
             .saturating_sub(snapshot_certified_at.value());
         metrics::histogram!("zinder_mempool_snapshot_age_seconds")
             .record(Duration::from_millis(snapshot_age_millis));
+        self.require_serving()?;
         Ok(LiveMempoolSnapshotPage {
             source_tip,
             entries: snapshot.entries,
@@ -508,7 +508,7 @@ impl LiveMempoolOwner {
         observed_at: UnixTimestampMillis,
     ) -> Result<Option<GenerationOutran>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        let state = *self.status.read();
+        let state = self.status.read().clone();
         if state.follows_source() && self.staged_generation.lock().is_some() {
             self.stage_event_locked(event, observed_at)?;
             return Ok(None);
@@ -737,11 +737,11 @@ impl LiveMempoolOwner {
         if matches!(*current, MempoolOwnerStatus::Halted(_)) {
             return;
         }
+        record_mempool_lifecycle_status(&status);
         *current = status;
         self.status_changes
             .send_modify(|changes| *changes = changes.wrapping_add(1));
         drop(current);
-        record_mempool_lifecycle_status(status);
     }
 
     /// Starts staging a new source generation and returns whether a certified
@@ -774,6 +774,7 @@ impl LiveMempoolOwner {
         &self,
         canonical: &CanonicalControlHandle,
         source_tip: BlockId,
+        endpoint: &ObservedNodeEndpoint,
     ) -> Result<SnapshotCertification, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         if !self.status.read().follows_source() || self.staged_generation.lock().is_none() {
@@ -810,7 +811,12 @@ impl LiveMempoolOwner {
         self.reconcile_staged_generation_locked(canonical, staged_generation)
             .await
             .inspect_err(|_status| self.mark_rebuild_required())?;
+        if !endpoint.is_active() {
+            self.mark_rebuild_required();
+            return Err(inactive_mempool_endpoint());
+        }
         self.set_status(MempoolOwnerStatus::Serving {
+            endpoint: endpoint.clone(),
             source_tip,
             snapshot_certified_at: UnixTimestampMillis::now(),
         });
@@ -1251,7 +1257,9 @@ async fn certify_source_snapshot(
     source_tip: BlockId,
     observed_endpoint: ObservedNodeEndpoint,
 ) -> Result<SnapshotCertification, Status> {
-    let certification = owner.try_complete_hydration(canonical, source_tip).await?;
+    let certification = owner
+        .try_complete_hydration(canonical, source_tip, &observed_endpoint)
+        .await?;
     match certification {
         SnapshotCertification::PendingCanonicalTip => {
             tracing::debug!(
@@ -1272,6 +1280,13 @@ async fn certify_source_snapshot(
         }
     }
     Ok(certification)
+}
+
+fn inactive_mempool_endpoint() -> Status {
+    status_for_reason(
+        ErrorReason::NodeUnavailable,
+        "live mempool generation belongs to an inactive node endpoint",
+    )
 }
 
 fn tip_transition_read_expired() -> Status {
@@ -1593,7 +1608,7 @@ fn record_mempool_size_gauge(index: &MempoolIndex) {
     metrics::gauge!("zinder_mempool_entries").set(index.entry_count() as f64);
 }
 
-fn record_mempool_lifecycle_status(status: MempoolOwnerStatus) {
+fn record_mempool_lifecycle_status(status: &MempoolOwnerStatus) {
     let active_status = match status {
         MempoolOwnerStatus::Hydrating => "hydrating",
         MempoolOwnerStatus::Serving { .. } => "serving",
@@ -1734,7 +1749,8 @@ mod tests {
         };
 
         metrics::with_local_recorder(&recorder, || {
-            record_mempool_lifecycle_status(MempoolOwnerStatus::Serving {
+            record_mempool_lifecycle_status(&MempoolOwnerStatus::Serving {
+                endpoint: mempool_ready_channel().0.observe_node_endpoint(),
                 source_tip: fixture_source_tip(),
                 snapshot_certified_at: now,
             });
@@ -1842,7 +1858,11 @@ mod tests {
         );
 
         let outcome = owner
-            .try_complete_hydration(&canonical, mismatched_source_tip)
+            .try_complete_hydration(
+                &canonical,
+                mismatched_source_tip,
+                &mempool_ready_channel().0.observe_node_endpoint(),
+            )
             .await?;
 
         assert_eq!(outcome, SnapshotCertification::PendingCanonicalTip);
@@ -1909,7 +1929,11 @@ mod tests {
         let owner = LiveMempoolOwner::default();
         assert_eq!(
             owner
-                .try_complete_hydration(&canonical, fixture_source_tip())
+                .try_complete_hydration(
+                    &canonical,
+                    fixture_source_tip(),
+                    &mempool_ready_channel().0.observe_node_endpoint()
+                )
                 .await?,
             SnapshotCertification::Certified
         );
@@ -1951,6 +1975,7 @@ mod tests {
         let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
         let owner = LiveMempoolOwner::default();
         owner.set_status(MempoolOwnerStatus::Serving {
+            endpoint: mempool_ready_channel().0.observe_node_endpoint(),
             source_tip: fixture_source_tip(),
             snapshot_certified_at: UnixTimestampMillis::new(
                 UnixTimestampMillis::now().value().saturating_sub(5_000),
@@ -2255,7 +2280,11 @@ mod tests {
         owner.apply_event(&canonical, added, observed_at).await?;
         assert_eq!(
             owner
-                .try_complete_hydration(&canonical, fixture_source_tip())
+                .try_complete_hydration(
+                    &canonical,
+                    fixture_source_tip(),
+                    &mempool_ready_channel().0.observe_node_endpoint()
+                )
                 .await?,
             SnapshotCertification::Certified
         );
@@ -2310,7 +2339,11 @@ mod tests {
         let owner = LiveMempoolOwner::default();
         assert_eq!(
             owner
-                .try_complete_hydration(&canonical, fixture_source_tip())
+                .try_complete_hydration(
+                    &canonical,
+                    fixture_source_tip(),
+                    &mempool_ready_channel().0.observe_node_endpoint()
+                )
                 .await?,
             SnapshotCertification::Certified
         );
@@ -2365,6 +2398,7 @@ mod tests {
                 async move {
                     if attempt == 0 {
                         owner_ref.set_status(MempoolOwnerStatus::Serving {
+                            endpoint: mempool_ready_channel().0.observe_node_endpoint(),
                             source_tip: visible_tip(chain_epoch),
                             snapshot_certified_at: UnixTimestampMillis::now(),
                         });
@@ -2382,6 +2416,126 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         command_task.abort();
         let _join_result = command_task.await;
+        Ok(())
+    }
+
+    fn assert_node_unavailable<T>(answer: Result<T, tonic::Status>) -> Result<(), Box<dyn Error>> {
+        let status = answer
+            .err()
+            .ok_or("inactive generation served a live read")?;
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|detail| detail.reason.as_str()),
+            Some(ErrorReason::NodeUnavailable.as_str_name())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_reads_follow_the_certified_endpoint_before_the_source_loop_polls_again()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let epoch = store.chain_epoch()?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let (switch, switches) = tokio::sync::watch::channel(0);
+        let (signal, gate) = mempool_ready_channel();
+        let signal = signal.following_node_endpoints(switches);
+        let endpoint = signal.observe_node_endpoint();
+        let owner = LiveMempoolOwner::default();
+        let tip = visible_tip(epoch);
+        let complete = super::certify_source_snapshot(&canonical, &owner, &signal, tip, endpoint);
+        let serve_epoch = async {
+            apply_canonical_control_command(
+                &mut store,
+                commands.recv().await.ok_or("missing epoch request")?,
+            );
+            Ok::<(), Box<dyn Error>>(())
+        };
+        let (certified, served) = tokio::join!(complete, serve_epoch);
+        served?;
+        assert_eq!(certified?, SnapshotCertification::Certified);
+        assert!(gate.admits_canonical_tip(tip));
+
+        let snapshot = owner.snapshot_page(&canonical, epoch, 1, Vec::new());
+        tokio::pin!(snapshot);
+        assert!(futures_util::poll!(&mut snapshot).is_pending());
+        let anchor_request = commands
+            .recv()
+            .await
+            .ok_or("missing snapshot anchor request")?;
+        let transaction = owner.entry_for(epoch, TransactionId::from_bytes([1; 32]));
+        tokio::pin!(transaction);
+        assert!(futures_util::poll!(&mut transaction).is_pending());
+        switch.send(1)?;
+        assert!(!gate.admits_canonical_tip(tip));
+        apply_canonical_control_command(&mut store, anchor_request);
+        assert_node_unavailable(snapshot.await)?;
+        assert_node_unavailable(transaction.await)?;
+        let page = owner.event_page(&canonical, None);
+        let serve_page = async {
+            apply_canonical_control_command(
+                &mut store,
+                commands.recv().await.ok_or("missing page request")?,
+            );
+            Ok::<(), Box<dyn Error>>(())
+        };
+        let (events, served) = tokio::join!(page, serve_page);
+        served?;
+        assert_node_unavailable(events)
+    }
+
+    #[tokio::test]
+    async fn switch_during_reconciliation_refuses_certification_and_a_queued_read()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let epoch = store.chain_epoch()?;
+        let tip = visible_tip(epoch);
+        let (canonical, mut commands) = canonical_control_channel();
+        let (switch, switches) = tokio::sync::watch::channel(0);
+        let (signal, gate) = mempool_ready_channel();
+        let signal = signal.following_node_endpoints(switches);
+        let endpoint = signal.observe_node_endpoint();
+        let owner = LiveMempoolOwner::default();
+        let initial =
+            super::certify_source_snapshot(&canonical, &owner, &signal, tip, endpoint.clone());
+        tokio::pin!(initial);
+        assert!(futures_util::poll!(&mut initial).is_pending());
+        apply_canonical_control_command(
+            &mut store,
+            commands.recv().await.ok_or("missing epoch request")?,
+        );
+        assert_eq!(initial.await?, SnapshotCertification::Certified);
+        owner.begin_next_generation().await;
+        let (added, observed_at) = added_transition(5, 1, epoch)?;
+        let transaction_id = added.transaction_id();
+        owner.apply_event(&canonical, added, observed_at).await?;
+        let replacement =
+            super::certify_source_snapshot(&canonical, &owner, &signal, tip, endpoint);
+        tokio::pin!(replacement);
+        assert!(futures_util::poll!(&mut replacement).is_pending());
+        apply_canonical_control_command(
+            &mut store,
+            commands.recv().await.ok_or("missing epoch request")?,
+        );
+        assert!(futures_util::poll!(&mut replacement).is_pending());
+        let batch = commands
+            .recv()
+            .await
+            .ok_or("missing reconciliation batch")?;
+        let read = owner.entry_for(epoch, transaction_id);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        switch.send(1)?;
+        apply_canonical_control_command(&mut store, batch);
+        assert_node_unavailable(replacement.await)?;
+        assert_node_unavailable(read.await)?;
+        assert!(!owner.is_serving());
+        assert!(!gate.admits_canonical_tip(tip));
         Ok(())
     }
 
@@ -3630,7 +3784,7 @@ mod tests {
     }
 
     fn assert_serving_at(owner: &LiveMempoolOwner, expected_source_tip: zinder_core::BlockId) {
-        let status = *owner.status.read();
+        let status = owner.status.read().clone();
         assert!(
             matches!(
                 status,

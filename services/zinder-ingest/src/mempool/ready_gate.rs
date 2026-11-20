@@ -75,7 +75,7 @@ pub struct ObservedNodeEndpoint {
 impl ObservedNodeEndpoint {
     /// Returns whether no switch happened since the observation. A closed
     /// switch channel fails closed.
-    fn is_active(&self) -> bool {
+    pub(super) fn is_active(&self) -> bool {
         self.switches
             .as_ref()
             .is_none_or(|switches| matches!(switches.has_changed(), Ok(false)))
