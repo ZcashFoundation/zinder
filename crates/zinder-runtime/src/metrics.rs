@@ -7,7 +7,10 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::{BUILD_GIT_COMMIT, OpsServer, sections::RuntimeService};
+use crate::{
+    BUILD_GIT_COMMIT, OpsServer, public_grpc_server::RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC,
+    sections::RuntimeService,
+};
 
 static PROMETHEUS_HANDLE: OnceLock<MetricsHandle> = OnceLock::new();
 static PROMETHEUS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
@@ -36,6 +39,14 @@ const DURATION_SECONDS_BUCKETS: &[f64] = &[
 const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
     0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
 ];
+
+/// Histogram bucket boundaries for the receive slots a public gRPC pool held
+/// once it admitted a request.
+///
+/// They step up to the default 32-slot pool, so the last bucket holds only
+/// the requests that left the pool full, by taking its last free slot or
+/// another client's slot.
+const RECEIVE_SLOTS_HELD_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 31.0, 32.0];
 
 /// Handle used by `/metrics` to render the process-wide Prometheus snapshot.
 #[derive(Clone, Debug)]
@@ -109,18 +120,8 @@ fn install_metrics_recorder_with_identity(
                 network_name,
             ));
         }
-        let prometheus = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full("zinder_startup_phase_duration_seconds".to_owned()),
-                STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
-            )
-            .map_err(|source| MetricsInstallError::Install { source })?
-            .set_buckets_for_metric(
-                Matcher::Suffix("_duration_seconds".to_owned()),
-                DURATION_SECONDS_BUCKETS,
-            )
-            .map_err(|source| MetricsInstallError::Install { source })?
-            .install_recorder()
+        let prometheus = prometheus_builder()
+            .and_then(PrometheusBuilder::install_recorder)
             .map_err(|source| MetricsInstallError::Install { source })?;
         let installed = MetricsHandle { prometheus };
         let _ = PROMETHEUS_HANDLE.set(installed.clone());
@@ -133,6 +134,24 @@ fn install_metrics_recorder_with_identity(
         service_version,
         network_name,
     ))
+}
+
+/// The Prometheus exporter every Zinder runtime installs, with its histogram
+/// buckets.
+fn prometheus_builder() -> Result<PrometheusBuilder, metrics_exporter_prometheus::BuildError> {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full("zinder_startup_phase_duration_seconds".to_owned()),
+            STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Suffix("_duration_seconds".to_owned()),
+            DURATION_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC.to_owned()),
+            RECEIVE_SLOTS_HELD_BUCKETS,
+        )
 }
 
 fn record_build_info(
@@ -156,4 +175,34 @@ fn record_build_info(
     .set(1.0);
 
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, prometheus_builder};
+
+    #[test]
+    fn receive_slot_occupancy_exports_buckets_that_single_out_a_full_pool()
+    -> Result<(), metrics_exporter_prometheus::BuildError> {
+        let recorder = prometheus_builder()?.build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            for held in [1.0, 3.0, 32.0] {
+                metrics::histogram!(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, "pool" => "request")
+                    .record(held);
+            }
+        });
+
+        let exposition = handle.render();
+        for expected in [
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"1\"} 1",
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"4\"} 2",
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"31\"} 2",
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"32\"} 3",
+        ] {
+            assert!(exposition.contains(expected), "{expected}\n{exposition}");
+        }
+        Ok(())
+    }
 }

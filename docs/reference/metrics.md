@@ -17,7 +17,9 @@ Conventions:
   `zinder_readiness_*` and `zinder_materialized_view_identity_info` series.
   Your scrape configuration supplies the target identity for the rest.
 - A histogram whose name ends in `_duration_seconds` exports Prometheus
-  buckets. Other histograms export as summaries with quantiles.
+  buckets, and so does
+  `zinder_grpc_request_receive_slots_held_at_admission`. Other histograms
+  export as summaries with quantiles.
 - A series appears only after its first sample. For example, a runtime that
   has not broadcast yet exports no broadcast series.
 
@@ -66,7 +68,12 @@ Other signals that need attention when they keep rising:
   proxy. Behind a proxy, also set the listener's
   `trust_proxy_client_address`, as
   [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
-  describes, so that refusals fall on the slow client.
+  describes, so that the receive limit tells the proxy's clients apart.
+- `zinder_grpc_proxy_client_address_fallbacks_total` rising: requests reach a
+  listener with `trust_proxy_client_address` set without one valid client
+  address header, so they count against the proxy's own connection. Check
+  that the proxy replaces the header on every request, and that nothing else
+  reaches the listener.
 - `zinder_wallet_serving_missing_table_file_pairs_total` rising with most
   publications: store files are replaced faster than serving pairs, as during
   a manual compaction.
@@ -349,7 +356,10 @@ bidirectional calls.
 | --- | --- | --- | --- |
 | `zinder_grpc_request_receive_refusals_total` | counter | `pool` | Requests refused with `UNAVAILABLE` because the pool was full. |
 | `zinder_grpc_request_receive_timeouts_total` | counter | `pool` | Requests cancelled because the request or the next client message took more than 20 seconds. |
-| `zinder_grpc_request_receive_evictions_total` | counter | `pool` | Requests cancelled to give their slot to a connection holding fewer. |
+| `zinder_grpc_request_receive_evictions_total` | counter | `pool` | Requests cancelled to give their slot to a client holding fewer. |
+| `zinder_grpc_request_receive_slots_held_at_admission` | histogram | `pool` | Slots the pool held once it admitted a request, the request's own included. Its buckets are 1, 2, 4, 8, 16, 24, 31, and 32, so with the default 32 slots a sample above `le="31"` is a request that left the pool full, by taking its last free slot or another client's slot. |
+| `zinder_grpc_request_receive_slot_hold_duration_seconds` | histogram | `pool` | Time an admitted request held its slot, until its request arrived, its client stream ended, or another client's request took the slot. The per-second rate of `_sum` is the mean number of slots held. |
+| `zinder_grpc_proxy_client_address_fallbacks_total` | counter | `reason` | Requests on a listener with `trust_proxy_client_address` set that counted against the proxy's own connection, because the `x-zinder-client-address` header was `missing`, `repeated` (sent more than once or as a list), or `invalid` (not one IP address and port). |
 | `zinder_grpc_response_send_stalls_total` | counter | | Responses ended because the client stopped reading for 60 seconds. |
 
 ## zinder-compat-lightwalletd

@@ -169,6 +169,10 @@ services:
       ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9106"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      # Trusts the proxy's x-zinder-client-address header from every peer.
+      # This namespace joins the node and observability networks, so their
+      # containers and host processes reach the listener without the proxy;
+      # docs/runbooks/exposing-over-tls.md lists what must hold first.
       ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "zinder-query", "healthcheck"]
@@ -205,6 +209,7 @@ services:
       ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      # Same trust rule as ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS.
       ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "zinder-compat-lightwalletd", "healthcheck"]

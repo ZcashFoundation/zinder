@@ -121,7 +121,7 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
 ];
 
 /// Request header in which a trusted reverse proxy names the client
-/// connection a request arrived on, as `ip:port`.
+/// connection a request arrived on, as one `ip:port` address.
 ///
 /// Read only when the listener uses [`ClientAddressSource::ProxyHeader`].
 pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
@@ -129,6 +129,12 @@ pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
 const RECEIVE_REFUSALS_METRIC: &str = "zinder_grpc_request_receive_refusals_total";
 const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_total";
 const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
+pub(crate) const RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC: &str =
+    "zinder_grpc_request_receive_slots_held_at_admission";
+const RECEIVE_SLOT_HOLD_DURATION_METRIC: &str =
+    "zinder_grpc_request_receive_slot_hold_duration_seconds";
+const PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC: &str =
+    "zinder_grpc_proxy_client_address_fallbacks_total";
 const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
 
 /// The layers every public Zinder listener applies to its requests.
@@ -249,8 +255,10 @@ pub enum ClientAddressSource {
     #[default]
     Connection,
     /// The [`PROXY_CLIENT_ADDRESS_HEADER`] that a reverse proxy sets on every
-    /// request it forwards, falling back to the connection's remote address
-    /// when the header is missing or is not an `ip:port` address.
+    /// request it forwards. A request counts against the connection's remote
+    /// address instead when it carries no such header, carries it more than
+    /// once or as a comma-separated list, or carries a value that is not one
+    /// `ip:port` address.
     ///
     /// Any client that reaches the listener can set the header, so use this
     /// only when the listener is reachable solely through a proxy that
@@ -319,7 +327,26 @@ fn describe_limit_metrics() {
         RECEIVE_EVICTIONS_METRIC,
         metrics::Unit::Count,
         "gRPC requests cancelled with UNAVAILABLE because a full pool gave their slot to a \
-         request from a connection holding fewer slots. Label: pool (request|client_stream)."
+         request from a client holding fewer slots. Label: pool (request|client_stream)."
+    );
+    metrics::describe_histogram!(
+        RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC,
+        metrics::Unit::Count,
+        "Receive slots a pool held once it admitted a gRPC request, the request's own slot \
+         included. Label: pool (request|client_stream)."
+    );
+    metrics::describe_histogram!(
+        RECEIVE_SLOT_HOLD_DURATION_METRIC,
+        metrics::Unit::Seconds,
+        "Time an admitted gRPC request held its receive slot, until its request arrived, its \
+         client stream ended, or another client's request took the slot. \
+         Label: pool (request|client_stream)."
+    );
+    metrics::describe_counter!(
+        PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+        metrics::Unit::Count,
+        "gRPC requests on a listener that trusts its proxy's client address that counted \
+         against the proxy's own connection. Label: reason (missing|repeated|invalid)."
     );
     metrics::describe_counter!(
         SEND_STALLS_METRIC,
@@ -403,8 +430,8 @@ impl GrpcReceiveLimitLayer {
     pub fn new(limits: GrpcReceiveLimits, client_address: ClientAddressSource) -> Self {
         Self {
             pools: ReceivePools {
-                requests: ReceiveSlots::new(limits.slots_per_pool),
-                client_streams: ReceiveSlots::new(limits.slots_per_pool),
+                requests: ReceiveSlots::new(limits.slots_per_pool, ReceivePool::Request),
+                client_streams: ReceiveSlots::new(limits.slots_per_pool, ReceivePool::ClientStream),
                 receive_timeout: limits.receive_timeout,
                 client_address,
             },
@@ -484,15 +511,60 @@ fn client_address<B>(
     request: &http::Request<B>,
     source: ClientAddressSource,
 ) -> Option<SocketAddr> {
-    let forwarded = match source {
-        ClientAddressSource::Connection => None,
-        ClientAddressSource::ProxyHeader => request
-            .headers()
-            .get(PROXY_CLIENT_ADDRESS_HEADER)
-            .and_then(|header| header.to_str().ok())
-            .and_then(|address| address.trim().parse().ok()),
-    };
-    forwarded.or_else(|| remote_address(request))
+    match source {
+        ClientAddressSource::Connection => remote_address(request),
+        ClientAddressSource::ProxyHeader => match proxy_named_client(request.headers()) {
+            Ok(client) => Some(client),
+            Err(fallback) => {
+                metrics::counter!(
+                    PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+                    "reason" => fallback.label()
+                )
+                .increment(1);
+                remote_address(request)
+            }
+        },
+    }
+}
+
+/// Why a request on a listener that trusts its proxy counts against the
+/// proxy's own connection instead of the client the proxy names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyHeaderFallback {
+    /// The request carries no [`PROXY_CLIENT_ADDRESS_HEADER`].
+    Missing,
+    /// The request carries the header more than once, or as a
+    /// comma-separated list. Which value the proxy set is unknown, and a
+    /// proxy that appends to the header rather than replacing it forwards
+    /// the client's own value first.
+    Repeated,
+    /// The header is not one `ip:port` address.
+    Invalid,
+}
+
+impl ProxyHeaderFallback {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Repeated => "repeated",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// The client connection that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in
+/// `headers` names.
+fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHeaderFallback> {
+    let mut fields = headers.get_all(PROXY_CLIENT_ADDRESS_HEADER).iter();
+    let field = fields.next().ok_or(ProxyHeaderFallback::Missing)?;
+    if fields.next().is_some() {
+        return Err(ProxyHeaderFallback::Repeated);
+    }
+    let address = field.to_str().map_err(|_| ProxyHeaderFallback::Invalid)?;
+    if address.contains(',') {
+        return Err(ProxyHeaderFallback::Repeated);
+    }
+    address.parse().map_err(|_| ProxyHeaderFallback::Invalid)
 }
 
 /// The remote address of the connection a request arrived on, which tonic
@@ -678,6 +750,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr, SocketAddr},
     };
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use prost::Message as _;
     use prost_types::FileDescriptorSet;
     use tonic::transport::server::TcpConnectInfo;
@@ -689,11 +762,12 @@ mod tests {
 
     const PROXY_CONNECTION: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
 
-    /// A request arriving on the proxy's connection, carrying `header`.
-    fn proxied_request(header: Option<&str>) -> Result<http::Request<()>, http::Error> {
+    /// A request arriving on the proxy's connection, carrying one
+    /// [`PROXY_CLIENT_ADDRESS_HEADER`] field per entry of `fields`.
+    fn proxied_request(fields: &[&str]) -> Result<http::Request<()>, http::Error> {
         let mut builder = http::Request::builder();
-        if let Some(header) = header {
-            builder = builder.header(PROXY_CLIENT_ADDRESS_HEADER, header);
+        for field in fields {
+            builder = builder.header(PROXY_CLIENT_ADDRESS_HEADER, *field);
         }
         let mut request = builder.body(())?;
         request.extensions_mut().insert(TcpConnectInfo {
@@ -709,7 +783,7 @@ mod tests {
             ("203.0.113.7:51234", "203.0.113.7:51234"),
             ("[2001:db8::7]:443", "[2001:db8::7]:443"),
         ] {
-            let request = proxied_request(Some(header))?;
+            let request = proxied_request(&[header])?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
                 Some(client.parse()?)
@@ -720,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_listener_that_trusts_no_proxy_ignores_the_header() -> Result<(), http::Error> {
-        let request = proxied_request(Some("203.0.113.7:51234"))?;
+        let request = proxied_request(&["203.0.113.7:51234"])?;
         assert_eq!(
             client_address(&request, ClientAddressSource::Connection),
             Some(PROXY_CONNECTION)
@@ -729,13 +803,62 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_malformed_proxy_header_counts_the_connection() -> Result<(), http::Error> {
-        for header in [None, Some("203.0.113.7"), Some("client-1"), Some("")] {
-            let request = proxied_request(header)?;
+    fn a_proxy_header_that_is_not_one_address_counts_the_connection() -> Result<(), http::Error> {
+        let not_one_address: [&[&str]; 9] = [
+            &[],
+            &["203.0.113.7"],
+            &["client-1"],
+            &[""],
+            &[" 203.0.113.7:51234"],
+            &["203.0.113.7:51234, 198.51.100.4:443"],
+            &["203.0.113.7:51234,"],
+            // A proxy that appends instead of replacing forwards the
+            // client's value first.
+            &["198.51.100.4:443", "203.0.113.7:51234"],
+            &["203.0.113.7:51234", "203.0.113.7:51234"],
+        ];
+        for fields in not_one_address {
+            let request = proxied_request(fields)?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
-                Some(PROXY_CONNECTION)
+                Some(PROXY_CONNECTION),
+                "{fields:?}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_header_fallbacks_are_counted_by_reason_without_the_address() -> Result<(), http::Error>
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let requests = [
+            proxied_request(&[])?,
+            proxied_request(&["198.51.100.4:443", "203.0.113.7:51234"])?,
+            proxied_request(&["203.0.113.7:51234, 198.51.100.4:443"])?,
+            proxied_request(&["203.0.113.7"])?,
+            proxied_request(&["203.0.113.7:51234"])?,
+        ];
+
+        metrics::with_local_recorder(&recorder, || {
+            for request in &requests {
+                let _ = client_address(request, ClientAddressSource::ProxyHeader);
+            }
+            // A listener that trusts no proxy never reads the header.
+            let _ = client_address(&requests[0], ClientAddressSource::Connection);
+        });
+
+        let exposition = handle.render();
+        for expected in [
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"missing\"} 1",
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"repeated\"} 2",
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"invalid\"} 1",
+        ] {
+            assert!(exposition.contains(expected), "{expected}\n{exposition}");
+        }
+        for address in ["203.0.113.7", "198.51.100.4", "127.0.0.1"] {
+            assert!(!exposition.contains(address), "{exposition}");
         }
         Ok(())
     }

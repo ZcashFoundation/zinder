@@ -337,7 +337,9 @@ has arrived. Long response streams such as `ChainEvents`,
 `CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a
 pool is full, a request from a client that holds fewer slots takes the
 oldest slot of the client that holds the most. The request that loses its
-slot fails with `UNAVAILABLE`. Retry these refusals with backoff.
+slot fails with `UNAVAILABLE`. A request from a client that holds no slot is
+therefore always admitted, and a client is refused only while it holds at
+least as many slots as every other client. Retry these refusals with backoff.
 
 A client is the connection a request arrives on. A proxy reaches Zinder over
 a few pooled connections, so behind one every client looks like the same few.
@@ -345,9 +347,11 @@ Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`,
 or `explorer.trust_proxy_client_address` to `true` when the listener is
 reachable only through a proxy that sets the `x-zinder-client-address`
 request header to the client connection's IP address and port. Zinder then
-counts each request against that connection, and against the proxy's own
-connection when the header is missing or invalid. With the setting off, the
-default, Zinder ignores the header.
+counts each request against that connection. A request that carries the
+header more than once, as a comma-separated list, or as anything but one IP
+address and port, or that carries none, counts against the proxy's own
+connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total`
+counts it. With the setting off, the default, Zinder ignores the header.
 [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
 lists the proxy settings this depends on.
 

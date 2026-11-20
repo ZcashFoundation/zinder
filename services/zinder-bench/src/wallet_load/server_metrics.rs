@@ -5,6 +5,10 @@
 //! that a checkpoint pass densified answers every settled height directly. A
 //! run given the server's metrics endpoint reports the server's own counts
 //! over the run instead of inferring them from the 100-block stride.
+//!
+//! The same reads show how full the public listener's receive pools got,
+//! which requests they refused or evicted, and whether a proxy in front of
+//! the server named each client.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -31,10 +35,19 @@ const BLOCK_RANGE_SLOT_WAIT_COUNT: &str =
 const BLOCK_RANGE_STAGE_SUM: &str = "zinder_compat_block_range_stage_duration_seconds_sum";
 const BLOCK_RANGE_STAGE_COUNT: &str = "zinder_compat_block_range_stage_duration_seconds_count";
 const RECEIVE_REFUSALS: &str = "zinder_grpc_request_receive_refusals_total";
+const RECEIVE_EVICTIONS: &str = "zinder_grpc_request_receive_evictions_total";
+const RECEIVE_SLOTS_HELD_COUNT: &str = "zinder_grpc_request_receive_slots_held_at_admission_count";
+const RECEIVE_SLOTS_HELD_SUM: &str = "zinder_grpc_request_receive_slots_held_at_admission_sum";
+const RECEIVE_SLOTS_HELD_BUCKET: &str =
+    "zinder_grpc_request_receive_slots_held_at_admission_bucket";
+const RECEIVE_SLOT_HOLD_SUM: &str = "zinder_grpc_request_receive_slot_hold_duration_seconds_sum";
+const RECEIVE_SLOT_HOLD_COUNT: &str =
+    "zinder_grpc_request_receive_slot_hold_duration_seconds_count";
+const PROXY_CLIENT_ADDRESS_FALLBACKS: &str = "zinder_grpc_proxy_client_address_fallbacks_total";
 const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 
 /// Every counter the observation subtracts, checked for a reset.
-const OBSERVED_COUNTERS: [&str; 15] = [
+const OBSERVED_COUNTERS: [&str; 22] = [
     TREE_STATE_RECONSTRUCTIONS,
     TREE_STATE_REPLAYED_BLOCKS,
     TREE_STATE_READS,
@@ -49,6 +62,13 @@ const OBSERVED_COUNTERS: [&str; 15] = [
     BLOCK_RANGE_STAGE_SUM,
     BLOCK_RANGE_STAGE_COUNT,
     RECEIVE_REFUSALS,
+    RECEIVE_EVICTIONS,
+    RECEIVE_SLOTS_HELD_COUNT,
+    RECEIVE_SLOTS_HELD_SUM,
+    RECEIVE_SLOTS_HELD_BUCKET,
+    RECEIVE_SLOT_HOLD_SUM,
+    RECEIVE_SLOT_HOLD_COUNT,
+    PROXY_CLIENT_ADDRESS_FALLBACKS,
     STALE_TIP_REFUSALS,
 ];
 
@@ -89,6 +109,16 @@ pub(crate) struct ServerObserved {
     /// Time block-range chunks spent in each stage, by stage name.
     block_range_stages: BTreeMap<String, StageTime>,
     receive_refusals: u64,
+    /// Requests that lost their receive slot to a client holding fewer.
+    receive_evictions: u64,
+    /// How each receive pool of the public gRPC listener was used, by `pool`
+    /// label.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    receive_pools: BTreeMap<String, ReceivePoolUse>,
+    /// Requests on a listener that trusts its proxy's client address that
+    /// counted against the proxy's own connection, by `reason` label.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    proxy_client_address_fallbacks: BTreeMap<String, u64>,
     stale_tip_refusals: u64,
 }
 
@@ -99,13 +129,41 @@ pub(crate) struct StageTime {
     chunks: u64,
 }
 
+/// How one receive pool of the server's public gRPC listener was used over
+/// a run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct ReceivePoolUse {
+    /// Requests the pool admitted.
+    admissions: u64,
+    refusals: u64,
+    evictions: u64,
+    /// Slots the pool held once it admitted a request, the request's own
+    /// included, averaged over admissions.
+    mean_slots_held_at_admission: f64,
+    /// The smallest histogram bucket that holds every admission: no request
+    /// found more slots held than this. Absent when nothing was admitted, or
+    /// when an admission exceeded every finite bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_slots_held_at_most: Option<f64>,
+    /// Mean time a request held its slot, over the slots freed or taken
+    /// during the run.
+    mean_slot_hold_seconds: f64,
+    /// Slot time held during the run over the run's wall time: the mean
+    /// number of slots held at once.
+    mean_slots_held: f64,
+}
+
 impl ServerObserved {
     /// The counter increases from `before` to `after`.
     ///
     /// Fails when a counter series went down or disappeared, as it does when
     /// the server restarts during the run: the increases would then mix two
     /// processes' counts, and a per-band count could exceed its total.
-    pub(super) fn between(before: &[MetricSample], after: &[MetricSample]) -> Result<Self, String> {
+    pub(super) fn between(
+        before: &[MetricSample],
+        after: &[MetricSample],
+        run: Duration,
+    ) -> Result<Self, String> {
         if let Some(series) = reset_series(before, after) {
             return Err(format!(
                 "server counter {series} went down during the run, so the server likely \
@@ -156,9 +214,125 @@ impl ServerObserved {
             block_range_slot_waits: count(BLOCK_RANGE_SLOT_WAIT_COUNT),
             block_range_stages,
             receive_refusals: count(RECEIVE_REFUSALS),
+            receive_evictions: count(RECEIVE_EVICTIONS),
+            receive_pools: receive_pools(before, after, run),
+            proxy_client_address_fallbacks: increases_by_label(
+                before,
+                after,
+                PROXY_CLIENT_ADDRESS_FALLBACKS,
+                "reason",
+            ),
             stale_tip_refusals: count(STALE_TIP_REFUSALS),
         })
     }
+}
+
+/// Each receive pool's use during the run, by `pool` label, for every pool
+/// that admitted, refused, or evicted a request.
+fn receive_pools(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    run: Duration,
+) -> BTreeMap<String, ReceivePoolUse> {
+    let pool_labels = after
+        .iter()
+        .filter(|sample| {
+            [
+                RECEIVE_SLOTS_HELD_COUNT,
+                RECEIVE_REFUSALS,
+                RECEIVE_EVICTIONS,
+            ]
+            .contains(&sample.name.as_str())
+        })
+        .filter_map(|sample| sample.label("pool").map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    pool_labels
+        .into_iter()
+        .filter_map(|pool| {
+            let in_pool = Some(("pool", pool.as_str()));
+            let increase = |name| after_minus_before(before, after, name, in_pool).max(0.0);
+            let admissions = increase(RECEIVE_SLOTS_HELD_COUNT);
+            let holds = increase(RECEIVE_SLOT_HOLD_COUNT);
+            let hold_seconds = increase(RECEIVE_SLOT_HOLD_SUM);
+            let ratio = |numerator: f64, denominator: f64| {
+                if denominator > 0.0 {
+                    numerator / denominator
+                } else {
+                    0.0
+                }
+            };
+            let used = ReceivePoolUse {
+                admissions: counter_value(admissions),
+                refusals: counter_value(increase(RECEIVE_REFUSALS)),
+                evictions: counter_value(increase(RECEIVE_EVICTIONS)),
+                mean_slots_held_at_admission: ratio(increase(RECEIVE_SLOTS_HELD_SUM), admissions),
+                peak_slots_held_at_most: peak_bucket(before, after, &pool, admissions),
+                mean_slot_hold_seconds: ratio(hold_seconds, holds),
+                mean_slots_held: ratio(hold_seconds, run.as_secs_f64()),
+            };
+            (used != ReceivePoolUse::default()).then_some((pool, used))
+        })
+        .collect()
+}
+
+/// The smallest finite `le` bucket of the occupancy histogram whose increase
+/// over the run covers all `admissions` in `pool`.
+fn peak_bucket(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    pool: &str,
+    admissions: f64,
+) -> Option<f64> {
+    if admissions <= 0.0 {
+        return None;
+    }
+    after
+        .iter()
+        .filter(|sample| {
+            sample.name == RECEIVE_SLOTS_HELD_BUCKET && sample.label("pool") == Some(pool)
+        })
+        .filter_map(|sample| {
+            let bound = sample.label("le")?;
+            let upper = bound
+                .parse::<f64>()
+                .ok()
+                .filter(|upper| upper.is_finite())?;
+            let covered = sample.reading
+                - before
+                    .iter()
+                    .find(|earlier| {
+                        earlier.name == RECEIVE_SLOTS_HELD_BUCKET
+                            && earlier.label("pool") == Some(pool)
+                            && earlier.label("le") == Some(bound)
+                    })
+                    .map_or(0.0, |earlier| earlier.reading);
+            (covered >= admissions).then_some(upper)
+        })
+        .min_by(f64::total_cmp)
+}
+
+/// The increase of every series of `name`, by its `label`, leaving out the
+/// labels that did not increase.
+fn increases_by_label(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    name: &str,
+    label: &str,
+) -> BTreeMap<String, u64> {
+    after
+        .iter()
+        .filter(|sample| sample.name == name)
+        .filter_map(|sample| sample.label(label).map(str::to_owned))
+        .filter_map(|label_value| {
+            let increase = counter_value(after_minus_before(
+                before,
+                after,
+                name,
+                Some((label, &label_value)),
+            ));
+            (increase > 0).then_some((label_value, increase))
+        })
+        .collect()
 }
 
 /// The first observed counter series, rendered with its labels, whose
@@ -353,9 +527,11 @@ mod tests {
     };
     use zinder_bench::metrics_scrape::parse_prometheus_samples;
 
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
     use super::{ServerObserved, scrape, scrape_within};
+
+    const RUN: Duration = Duration::from_secs(10);
 
     #[test]
     fn counts_are_increases_over_the_run() -> Result<(), String> {
@@ -371,7 +547,7 @@ mod tests {
              zinder_grpc_request_receive_refusals_total{pool=\"client_stream\"} 1\n",
         );
 
-        let observed = ServerObserved::between(&before, &after)?;
+        let observed = ServerObserved::between(&before, &after, RUN)?;
 
         assert_eq!(observed.tree_state_reconstructions, 6);
         assert_eq!(observed.tree_state_replayed_blocks, 420);
@@ -398,7 +574,7 @@ mod tests {
         );
 
         for after in [restarted, missing] {
-            let refused = ServerObserved::between(&before, &after).err();
+            let refused = ServerObserved::between(&before, &after, RUN).err();
 
             assert!(
                 refused.is_some_and(|reason| reason.contains("height_band=\"a\"")),
@@ -408,7 +584,7 @@ mod tests {
         // A metric the observation does not read may go down.
         let unrelated_before = parse_prometheus_samples("process_resident_memory_bytes 9\n");
         let unrelated_after = parse_prometheus_samples("process_resident_memory_bytes 1\n");
-        assert!(ServerObserved::between(&unrelated_before, &unrelated_after).is_ok());
+        assert!(ServerObserved::between(&unrelated_before, &unrelated_after, RUN).is_ok());
     }
 
     #[test]
@@ -429,7 +605,7 @@ mod tests {
              zinder_compat_block_range_stage_duration_seconds_count{stage=\"send\"} 9\n",
         );
 
-        let observed = ServerObserved::between(&before, &after)?;
+        let observed = ServerObserved::between(&before, &after, RUN)?;
 
         assert_eq!(observed.tree_state_stored_reads, 5);
         assert_eq!(observed.tree_state_replayed_reads, 4);
@@ -441,6 +617,58 @@ mod tests {
         assert!((read.seconds - 2.5).abs() < 1e-9);
         assert_eq!(read.chunks, 10);
         assert_eq!(observed.block_range_stages["send"].chunks, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn receive_pools_report_occupancy_evictions_refusals_and_proxy_fallbacks() -> Result<(), String>
+    {
+        let before = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"1\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"2\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"4\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"+Inf\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_sum{pool=\"request\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_count{pool=\"request\"} 10\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 0.5\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 10\n",
+        );
+        let after = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"1\"} 70\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"2\"} 100\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"4\"} 110\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"+Inf\"} 110\n\
+             zinder_grpc_request_receive_slots_held_at_admission_sum{pool=\"request\"} 160\n\
+             zinder_grpc_request_receive_slots_held_at_admission_count{pool=\"request\"} 110\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 2.5\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 110\n\
+             zinder_grpc_request_receive_evictions_total{pool=\"request\"} 3\n\
+             zinder_grpc_request_receive_refusals_total{pool=\"client_stream\"} 2\n\
+             zinder_grpc_proxy_client_address_fallbacks_total{reason=\"missing\"} 4\n\
+             zinder_grpc_proxy_client_address_fallbacks_total{reason=\"repeated\"} 0\n",
+        );
+
+        let observed = ServerObserved::between(&before, &after, RUN)?;
+
+        assert_eq!(observed.receive_evictions, 3);
+        assert_eq!(observed.receive_refusals, 2);
+        let request = &observed.receive_pools["request"];
+        assert_eq!(request.admissions, 100);
+        assert_eq!(request.evictions, 3);
+        assert_eq!(request.refusals, 0);
+        assert!((request.mean_slots_held_at_admission - 1.5).abs() < 1e-9);
+        // Every admission in the run fell at or below 4 slots, not all at 2.
+        assert_eq!(request.peak_slots_held_at_most, Some(4.0));
+        assert!((request.mean_slot_hold_seconds - 0.02).abs() < 1e-9);
+        assert!((request.mean_slots_held - 0.2).abs() < 1e-9);
+        let client_stream = &observed.receive_pools["client_stream"];
+        assert_eq!(client_stream.refusals, 2);
+        assert_eq!(client_stream.admissions, 0);
+        assert_eq!(client_stream.peak_slots_held_at_most, None);
+        assert_eq!(
+            observed.proxy_client_address_fallbacks,
+            BTreeMap::from([("missing".to_owned(), 4)])
+        );
         Ok(())
     }
 
@@ -465,7 +693,7 @@ mod tests {
         server.await??;
 
         assert_eq!(
-            ServerObserved::between(&[], &samples)?.tree_state_replay_refusals,
+            ServerObserved::between(&[], &samples, RUN)?.tree_state_replay_refusals,
             5
         );
         assert!(scrape("https://127.0.0.1:1/metrics").await.is_err());

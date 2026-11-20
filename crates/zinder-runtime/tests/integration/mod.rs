@@ -4,6 +4,7 @@ mod env_var_docs;
 mod http_listener;
 mod ops_endpoint;
 mod ops_healthcheck;
+mod proxy_client_address_contract;
 mod public_grpc_health;
 mod public_grpc_server;
 mod runtime_supervision;

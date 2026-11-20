@@ -481,7 +481,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
     }
     let wall = started.elapsed();
     let (server_observed, server_metrics_error) = match (&args.server_metrics_url, metrics_before) {
-        (Some(url), Some(before)) => observe_after_run(url, &before).await,
+        (Some(url), Some(before)) => observe_after_run(url, &before, wall).await,
         _ => (None, None),
     };
     Ok(LightwalletdWalletLoadOutput {
@@ -705,9 +705,10 @@ impl RecordedTotals {
 async fn observe_after_run(
     url: &str,
     before: &[zinder_bench::metrics_scrape::MetricSample],
+    run: Duration,
 ) -> (Option<server_metrics::ServerObserved>, Option<String>) {
     match server_metrics::scrape(url).await {
-        Ok(after) => match server_metrics::ServerObserved::between(before, &after) {
+        Ok(after) => match server_metrics::ServerObserved::between(before, &after, run) {
             Ok(observed) => (Some(observed), None),
             Err(reason) => (None, Some(reason)),
         },
@@ -1133,7 +1134,8 @@ mod tests {
         let url = format!("http://{}/metrics", listener.local_addr()?);
         drop(listener);
 
-        let (observed, error) = super::observe_after_run(&url, &[]).await;
+        let (observed, error) =
+            super::observe_after_run(&url, &[], std::time::Duration::from_secs(1)).await;
 
         assert!(observed.is_none());
         assert!(

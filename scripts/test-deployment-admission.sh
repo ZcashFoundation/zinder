@@ -234,6 +234,30 @@ jq -e '
 ' "$resolved_explorer_compose" >/dev/null \
   || fail "the optional explorer overlay does not preserve its reader-only deployment contract"
 
+proxy_trust_settings='
+  [
+    .services["zinder-query"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS,
+    .services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS,
+    .services["zinder-explorer"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS
+  ]
+'
+jq -e "$proxy_trust_settings == [\"false\", \"false\", \"false\"]" \
+  "$resolved_explorer_compose" >/dev/null \
+  || fail "a public listener trusts its proxy's client address header by default"
+trusted_proxy_compose="$temporary_directory/trusted-proxy-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true \
+ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true \
+ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.explorer.yml" \
+  config --format json > "$trusted_proxy_compose"
+jq -e "$proxy_trust_settings == [\"true\", \"true\", \"true\"]" \
+  "$trusted_proxy_compose" >/dev/null \
+  || fail "the Compose topology does not pass trust_proxy_client_address to every public listener"
+
 released_compose="$temporary_directory/released-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
 ZINDER_VERSION=v9.8.7 \

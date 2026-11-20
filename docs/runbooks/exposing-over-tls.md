@@ -45,6 +45,9 @@ environment:
 
 Restrict the private key and its directory to the account that runs Caddy.
 
+Do these steps in order. Caddy must replace the client address header before
+Zinder trusts it, because until then any wallet can send its own.
+
 1. Validate the configuration with the variables set:
 
    ```bash
@@ -55,8 +58,10 @@ Restrict the private key and its directory to the account that runs Caddy.
 2. Load it into your Caddy service, for example with `caddy reload` or by
    restarting the service.
 
-3. Tell Zinder to trust the client address Caddy forwards. Add this line to
-   the env file you pass to Compose, then recreate the compatibility
+3. Check the requirements in
+   [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit),
+   then tell Zinder to trust the client address Caddy forwards. Add this line
+   to the env file you pass to Compose, then recreate the compatibility
    container:
 
    ```bash
@@ -88,27 +93,63 @@ When you renew the certificate, replace the files and reload Caddy.
 
 Zinder admits at most 32 requests whose message is still arriving, as
 [Configuration](../reference/configuration.md#public-grpc-listeners)
-describes. When that pool is full, a request from a client holding fewer
-slots takes a slot from the client holding the most. Caddy reaches Zinder over
-a few pooled connections, so without a client address every wallet looks like
-the same client, and one wallet that opens many slow requests gets the others
-refused with `UNAVAILABLE`.
+describes. When that pool is full, a new request takes the oldest slot of the
+client holding the most slots, but only if that client holds strictly more
+slots than the requester. Otherwise the new request is refused with
+`UNAVAILABLE`. A client that holds no slot is therefore always admitted, and a
+client is refused only while it holds at least as many slots as every other
+client. When clients hold equal shares, a further request from any of them is
+refused.
+
+Caddy reaches Zinder over a few pooled connections. Without a client address,
+every wallet behind Caddy counts as one of those few clients, so one wallet
+that opens many slow requests gets the others refused.
 
 With the header set and `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true`,
 Zinder counts each wallet connection as its own client, as it does for a
-direct connection. One wallet connection that holds many slots then loses its
-own oldest slots to other wallets, and refusals fall on it alone.
+direct connection. A wallet that opens many slow requests then loses its own
+oldest slots to wallets holding fewer, and it cannot get a wallet with fewer
+slots refused.
 
-This guarantee depends on these proxy settings:
+This guarantee depends on these settings:
 
 - Caddy sets `X-Zinder-Client-Address` to `{http.request.remote}` on every
-  forwarded call, replacing any value the client sent. The value must be an
-  IP address and port, such as `203.0.113.7:51234` or `[2001:db8::7]:51234`.
-  Zinder counts a call without a valid value against Caddy's own connection.
-- Only Caddy can reach the gRPC listener. Zinder trusts the header from any
-  client once the setting is on, so a client that reaches the listener
-  directly could name another wallet's connection. The Compose deployment
-  publishes the listener on loopback only.
+  forwarded call, replacing any value the client sent. Zinder reads the
+  header only when a request carries it once, as one IP address and port,
+  such as `203.0.113.7:51234` or `[2001:db8::7]:51234`. It counts a request
+  against Caddy's own connection when the header is missing, appears more
+  than once, holds a comma-separated list, or holds anything else.
+  `zinder_grpc_proxy_client_address_fallbacks_total` counts these requests by
+  reason, and stays at zero behind this template.
+- Only Caddy can reach the gRPC listener, apart from peers you trust as much
+  as Caddy. Zinder reads the header from every connection once the setting is
+  on. A peer that reaches the listener without going through Caddy can name
+  another wallet's connection, so that wallet loses its slots or is refused.
+  The scan in [Verify from outside](#verify-from-outside) cannot show these
+  paths. In the Compose deployment, the listener binds every address of the
+  network namespace it shares with ingest, so besides Caddy it is reachable
+  from:
+  - every process on the host, through the loopback port or the container's
+    own addresses;
+  - every container on the Compose `node` network, the node's Docker network
+    that `ZINDER_SOURCE_NETWORK_NAME` names, including the node; and
+  - every container on the Compose `observability` network, including
+    Prometheus and Grafana.
+
+  Before you turn the setting on, confirm that the host runs no untrusted
+  users or workloads, and that you run and trust every container on those
+  networks. This lists them:
+
+  ```bash
+  env_file=deploy/.env.mainnet # the env file you pass to Compose
+  ingest="$(docker compose --env-file "$env_file" -f deploy/docker-compose.yml ps -q zinder-ingest)"
+  for network in $(docker inspect "$ingest" \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'); do
+    docker network inspect "$network" \
+      --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'
+  done
+  ```
+
 - Zinder identifies wallets by connection, not by IP address, because wallets
   behind Tor share exit addresses. A client that opens many connections still
   counts as many clients, so keep the per-client connection limit described
@@ -180,8 +221,9 @@ To expose the native `WalletQuery` endpoint as well, add a second site block
 to the template, with its own DNS name and certificate. Point its `forward_auth` at the query ops port
 (`ZINDER_QUERY_OPS_HOST_PORT`, 9106 on Mainnet) and its `reverse_proxy` at
 `h2c://127.0.0.1:` plus the query gRPC port (`ZINDER_QUERY_HOST_PORT`, 9102 on
-Mainnet). Keep the same `header_up X-Zinder-Client-Address` line, and set
-`ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true`. Verify it the same way, calling
+Mainnet). Keep the same `header_up X-Zinder-Client-Address` line. Once Caddy
+serves the new site, set `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true`
+under the same requirements. Verify it the same way, calling
 `zinder.v1.wallet.WalletQuery/ServerInfo`. How native clients connect is in
 [Integration surfaces](../reference/integration-surfaces.md).
 
@@ -195,8 +237,27 @@ and confirm that it does not fall back to a bundled server.
 
 ## Roll back the proxy
 
-If a certificate rotation or a Caddy change breaks the endpoint, restore the
-previous certificate files and Caddyfile and reload Caddy. If no trusted
-certificate is available, stop serving the public name. Then repeat the
-checks in [Verify from outside](#verify-from-outside). A proxy rollback does
-not change Zinder's stores.
+If a certificate rotation or a Caddy change breaks the endpoint, roll back in
+this order. A Caddyfile without the `header_up X-Zinder-Client-Address` line
+passes on whatever value a wallet sends, so Zinder must stop trusting the
+header before Caddy loads such a file.
+
+1. If the Caddyfile you restore does not set `X-Zinder-Client-Address`, turn
+   the setting off first. In the env file you pass to Compose, set
+   `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false`, and also
+   `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` if you expose the native
+   endpoint. Then recreate each container whose setting you changed, here
+   with the Mainnet env file:
+
+   ```bash
+   docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml \
+     up -d zinder-compat-lightwalletd # and zinder-query, if you changed it
+   ```
+
+   Outside Compose, set `trust_proxy_client_address = false` and restart each
+   runtime. Check the resolved value with `--print-config` before you go on.
+2. Restore the previous certificate files and Caddyfile, and reload Caddy.
+3. If no trusted certificate is available, stop serving the public name.
+4. Repeat the checks in [Verify from outside](#verify-from-outside).
+
+A proxy rollback does not change Zinder's stores.

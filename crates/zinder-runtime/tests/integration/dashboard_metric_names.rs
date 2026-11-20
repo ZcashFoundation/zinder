@@ -23,10 +23,14 @@ const METRIC_PREFIX: &str = "zinder_";
 /// name.
 const SUMMARY_SERIES_SUFFIXES: &[&str] = &["_sum", "_count"];
 
-/// Histogram names whose recorder configures buckets, as
-/// `crates/zinder-runtime/src/metrics.rs` does; every other histogram exports
-/// as a summary and has no `_bucket` series.
+/// The suffix of the histogram names whose recorder configures buckets, as
+/// `crates/zinder-runtime/src/metrics.rs` does.
+///
+/// Those histograms, and the ones in [`BUCKETED_HISTOGRAM_NAMES`], export
+/// `_bucket` series. Every other histogram exports as a summary.
 const BUCKETED_HISTOGRAM_SUFFIX: &str = "_duration_seconds";
+/// Histograms with buckets of their own, whatever their name ends in.
+const BUCKETED_HISTOGRAM_NAMES: &[&str] = &["zinder_grpc_request_receive_slots_held_at_admission"];
 
 #[test]
 fn dashboard_expressions_name_only_documented_metrics() -> Result<()> {
@@ -107,13 +111,15 @@ fn only_histograms_and_summaries_export_derived_series() {
 }
 
 #[test]
-fn only_duration_histograms_export_buckets() {
+fn only_bucketed_histograms_export_buckets() {
     let reference = DocumentedMetrics::parse(
         "| `zinder_query_request_duration_seconds` | histogram |\n\
+         | `zinder_grpc_request_receive_slots_held_at_admission` | histogram |\n\
          | `zinder_query_compact_block_range_block_count` | histogram |",
     );
 
     assert!(reference.lists("zinder_query_request_duration_seconds_bucket"));
+    assert!(reference.lists("zinder_grpc_request_receive_slots_held_at_admission_bucket"));
     assert!(reference.lists("zinder_query_compact_block_range_block_count_count"));
     assert!(reference.lists("zinder_query_compact_block_range_block_count_sum"));
     assert!(!reference.lists("zinder_query_compact_block_range_block_count_bucket"));
@@ -180,9 +186,11 @@ impl DocumentedMetrics {
     fn lists(&self, metric: &str) -> bool {
         let derived_from = |base: &str| self.with_derived_series.contains(base);
         self.names.contains(metric)
-            || metric
-                .strip_suffix("_bucket")
-                .is_some_and(|base| base.ends_with(BUCKETED_HISTOGRAM_SUFFIX) && derived_from(base))
+            || metric.strip_suffix("_bucket").is_some_and(|base| {
+                (base.ends_with(BUCKETED_HISTOGRAM_SUFFIX)
+                    || BUCKETED_HISTOGRAM_NAMES.contains(&base))
+                    && derived_from(base)
+            })
             || SUMMARY_SERIES_SUFFIXES
                 .iter()
                 .any(|suffix| metric.strip_suffix(suffix).is_some_and(derived_from))
