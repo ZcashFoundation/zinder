@@ -160,11 +160,9 @@ retries = { count = 0, backoff = "fixed", delay = "0s" }
 # serialize through `node-mutating`. The Zebra indexer gRPC port is a single
 # upstream resource: any test that opens an indexer stream races with the
 # destructive container-restart test, so all indexer consumers join here.
-# `ingest_control_tip_change_publisher_fires_when_zebra_mines_block` mutates
-# regtest chain state via `generate`, so it joins too.
 # `source_blocks_reencode_to_node_bytes_across_the_chain` reads every block up
 # to the tip it observed, which a concurrent reorg test could invalidate.
-filter = "test(live::deep_chain) or test(live::cli) or test(/live::broadcast_fallback::/) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(/live::nu7_activation::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block) or test(source_blocks_reencode_to_node_bytes_across_the_chain)"
+filter = "test(live::deep_chain) or test(live::cli) or test(/live::broadcast_fallback::/) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(/live::nu7_activation::/) or test(source_blocks_reencode_to_node_bytes_across_the_chain)"
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]
@@ -172,5 +170,5 @@ filter = "test(standalone_wallet_query_serves_native_contract)"
 slow-timeout = { period = "15s", terminate-after = 1 }
 
 [[profile.ci-live.overrides]]
-filter = "test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_replay_loads_1000_blocks_from_fixed_checkpoint)"
+filter = "test(canonical_blocks_load_requested_range_from_fixed_checkpoint)"
 slow-timeout = { period = "5m", terminate-after = 1 }

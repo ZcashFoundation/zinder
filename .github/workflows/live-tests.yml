@@ -245,15 +245,12 @@ jobs:
           ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
           ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
           ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
-        # Run every live test except mainnet-only ones, the activation test
-        # above, and the node restart test below. Regtest is the only network
-        # where deep_chain and latency fit in CI budgets without checkpoint
-        # backfill. Mainnet-only tests are excluded by explicit behavior name
-        # because live test names avoid network labels unless the behavior
-        # itself is network-specific.
+        # Exclude the hosted-network checkpoint tracer, mainnet-only cases,
+        # the activation test above, and the node restart test below.
+        # Regtest runs deep_chain and latency within the CI budget.
         run: |
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Run the node restart test against regtest
         env:
@@ -308,14 +305,11 @@ jobs:
           ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
           ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
           ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
-        # Filter out tests scoped to other networks. Tests under deep_chain
-        # and latency need checkpoint backfill before they fit in hosted-
-        # network CI budgets. Network-constrained tests are excluded by
-        # explicit behavior name because live test names avoid network labels
-        # unless the behavior itself is network-specific.
+        # Filter out tests scoped to other networks. The checkpoint tracer,
+        # deep_chain, and latency are outside the weekly lane's budget.
         run: |
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::/) and not test(_on_regtest) and not test(mainnet) and not test(backfills_from_checkpoint) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(deep_chain) and not test(latency)'
+            -E 'test(/^live::/) and not test(fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(deep_chain) and not test(latency)'
 
   mainnet:
     name: live mainnet
@@ -356,4 +350,4 @@ jobs:
         # names unless the behavior itself is network-specific.
         run: |
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order) or test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'
+            -E 'test(mainnet) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order) or test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'
