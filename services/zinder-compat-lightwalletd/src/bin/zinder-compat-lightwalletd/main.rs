@@ -410,10 +410,10 @@ enum CanonicalComposition {
     },
 }
 
+#[cfg(feature = "light-wallet-qualification")]
 impl CanonicalComposition {
     async fn admit(config: &config::LightwalletdConfig) -> Result<Self, LightwalletdConfigError> {
         match config.serving {
-            #[cfg(feature = "light-wallet-qualification")]
             CompatServing::LightWalletQualification => {
                 let target = config.broadcaster.as_ref().ok_or_else(|| {
                     zinder_runtime::ConfigError::invalid(
@@ -459,7 +459,10 @@ async fn run_canonical(
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
+    #[cfg(feature = "light-wallet-qualification")]
     let composition = CanonicalComposition::admit(&lightwalletd_config).await?;
+    #[cfg(not(feature = "light-wallet-qualification"))]
+    let composition = CanonicalComposition::CompactBlocks;
     let serving_readiness = match &composition {
         #[cfg(feature = "light-wallet-qualification")]
         CanonicalComposition::Qualification { .. } => {
