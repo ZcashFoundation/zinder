@@ -37,7 +37,7 @@ pub(crate) struct RocksDbTreeStateReplayArgs {
     /// Most anchors measured, spread evenly over the window.
     #[arg(long = "max-anchors", default_value_t = DEFAULT_MAX_ANCHORS)]
     max_anchors: u32,
-    /// Measure every listed height in file order, including stored checkpoints.
+    /// Measure every listed height, including the stored history predecessor, in file order.
     #[arg(long, conflicts_with_all = ["from_height", "to_height", "max_anchors"])]
     heights_file: Option<PathBuf>,
 }
@@ -160,10 +160,17 @@ pub(crate) fn measure_tree_state_replays(
     explicit: Option<&[u32]>,
 ) -> Result<TreeStateReplayMeasurement, BenchError> {
     let ready = secondary.ready_evidence();
-    let window_start = window
-        .from_height
-        .unwrap_or(0)
-        .max(ready.first_retained_block.height.value());
+    let first_height = if explicit.is_some() {
+        secondary
+            .build_plan()
+            .history_predecessor()
+            .block_id
+            .height
+            .value()
+    } else {
+        ready.first_retained_block.height.value()
+    };
+    let window_start = window.from_height.unwrap_or(0).max(first_height);
     let window_end = window
         .to_height
         .unwrap_or(u32::MAX)
@@ -252,7 +259,7 @@ fn select_anchors(
         || heights.iter().any(|height| !(start..=end).contains(height))
     {
         return Err(BenchError::invalid_argument(
-            "selected heights must be nonempty and within the retained window",
+            "selected heights must be nonempty and within the served tree-state window",
         ));
     }
     if explicit.is_some() {
@@ -475,6 +482,7 @@ mod tests {
         let mut store = writer.into_serving_store_fixture()?;
         let (canonical, _wallet) = store.take_readers()?;
         for heights in [
+            &[0, 99, 0][..],
             &[99, 199][..],
             &[100, 200][..],
             &[199, 100, 99, 250, 100][..],
@@ -506,6 +514,66 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_nonzero_history_predecessor_is_measured() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = with_note_commitments(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(150),
+            &activations,
+        )?;
+        let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(50));
+        let mut store = CanonicalWriterFixture::publish(&baseline, &activations)?
+            .into_serving_store_fixture()?;
+        let (canonical, _wallet) = store.take_readers()?;
+        let window = ReplayWindow {
+            from_height: None,
+            to_height: None,
+            max_anchors: 64,
+        };
+        let measurement = measure_tree_state_replays(
+            &canonical,
+            &activations,
+            zinder_store::RocksDbStatisticsLevel::Tickers,
+            window,
+            Some(&[50, 51, 50]),
+        )?;
+        assert_eq!(measurement.window_start_height, 50);
+        assert_eq!(
+            measurement
+                .anchors
+                .iter()
+                .map(|anchor| anchor.height)
+                .collect::<Vec<_>>(),
+            [50, 51, 50]
+        );
+        assert_eq!(measurement.anchors[0].source, TreeStateSource::Stored);
+        assert_eq!(measurement.anchors[0].replayed_blocks, 0);
+        assert_eq!(measurement.anchors[1].source, TreeStateSource::Replayed);
+        assert_eq!(measurement.anchors[1].replayed_blocks, 1);
+        assert_eq!(measurement.anchors[2].source, TreeStateSource::Stored);
+        assert!(
+            measure_tree_state_replays(
+                &canonical,
+                &activations,
+                zinder_store::RocksDbStatisticsLevel::Tickers,
+                window,
+                Some(&[49]),
+            )
+            .is_err()
+        );
+        let sampled = measure_tree_state_replays(
+            &canonical,
+            &activations,
+            zinder_store::RocksDbStatisticsLevel::Tickers,
+            window,
+            None,
+        )?;
+        assert_eq!(sampled.window_start_height, 51);
+        assert_eq!(sampled.anchors[0].height, 99);
         Ok(())
     }
 
@@ -546,6 +614,7 @@ mod tests {
         dense: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(measurement.read_path, "wallet-query-store");
+        assert_eq!(measurement.window_start_height, 0);
         assert_eq!(measurement.stored_checkpoint_anchors_skipped, 0);
         assert_eq!(
             measurement

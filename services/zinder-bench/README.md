@@ -676,8 +676,11 @@ To compare the same historical reads across sparse and dense stores, replace
 `--from-height`, `--to-height`, and `--max-anchors` with
 `--heights-file ./frontiers.txt`. The file contains one decimal u32 height per
 line. Every listed height is measured in order, including duplicates and stored
-checkpoints; no sampling limit applies. Empty files, blank or malformed lines,
-and heights outside the retained range fail the command. This option conflicts
+checkpoints; no sampling limit applies. The explicit window includes the build
+plan's history-predecessor checkpoint through the visible tip. For a full-history
+store whose first retained block is 1, height 0 is a valid stored read. Empty
+files, blank or malformed lines, and heights outside that served window fail
+the command. This option conflicts
 with the three sampling options; omitting it preserves the default sampling and
 stored-checkpoint skipping behavior.
 
