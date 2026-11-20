@@ -1095,3 +1095,293 @@ The tests in `crates/zinder-proto/tests/integration/capability_docs.rs` also
 check this file on every `ci` run: the quoted `default-filter` must match
 `.config/nextest.toml`, every profile in `RUNBOOK_REFERENCED_PROFILES` must
 exist and appear here, and the capability list must match the code.
+
+## Disposable wallet Regtest fixtures
+
+Select the fixture using the wallet binary's compiled or configured activation
+heights. The node and the wallet must interpret the same block under the same
+consensus rules.
+
+| Wallet integration exercised | Zebra configuration under `deploy/zebra/` | Serving interface |
+| --- | --- | --- |
+| Zallet native backend | `regtest.toml` | Native WalletQuery with `--raw-blob-policy all` for full-block reads |
+| Zally native SDK | `regtest.toml` | Native WalletQuery |
+| Zingo CLI and zcash-devtool with the all-at-one schedule | `regtest-nu6-at-one.toml` | lightwalletd |
+| Zkool v6.37.0, the Cake Wallet v6.5.4 engine fork, and Vizor v0.0.65 configured for NU6.3 at 250 | `regtest-ironwood-at-250.toml` | lightwalletd |
+
+Give independent miners distinct fixture projects. After mining, wait until the
+serving endpoint returns the target block before asserting what the wallet has
+scanned. Rapid Regtest mining can fill the serving process's retained snapshots
+and delay publication even after ingest and projection have reached the target.
+Record the target height, the time it becomes readable, and the height the
+wallet actually scans. When a wallet needs another confirmation, mine that
+block explicitly and keep the original target in the assertion.
+
+
+Use `scripts/regtest-fixture.py` to give a real wallet a fresh, owned node and
+following single-host ingest, projector, native WalletQuery, and lightwalletd
+endpoints. It uses `deploy/docker-compose.yml` and its configs. A local Linux
+Docker host with bridge addresses reachable from the host, Python 3.11 or
+later, Docker Compose, iproute2, curl, and jq are required. Start from the checkout matching
+the candidate release. Pull the four runtime images first, or build them using
+`deploy/Dockerfile` and its corresponding targets.
+
+Create an image map with the exact release tag, digest, or built image reference
+for each runtime. The command resolves references to immutable local image IDs
+before starting anything:
+
+```bash
+cat > /tmp/fixture-images.json <<'JSON'
+{
+  "ingest": "ghcr.io/zcashfoundation/zinder-ingest:v0.21.0",
+  "projector": "ghcr.io/zcashfoundation/zinder-projector:v0.21.0",
+  "query": "ghcr.io/zcashfoundation/zinder-query:v0.21.0",
+  "compat-lightwalletd": "ghcr.io/zcashfoundation/zinder-compat-lightwalletd:v0.21.0"
+}
+JSON
+scripts/regtest-fixture.py up --project zinder-fixture-review-a \
+  --port-base 42100 --images /tmp/fixture-images.json \
+  --revision 830b426060169f5b2e94d84ff0f134bc1ad96004
+scripts/regtest-fixture.py mine --project zinder-fixture-review-a --tip 152
+scripts/regtest-fixture.py status --project zinder-fixture-review-a
+scripts/regtest-fixture.py down --project zinder-fixture-review-a
+```
+
+Choose an unused project name and port range for each run. Ports are loopback
+only: base + 32 is node RPC, + 2 is native WalletQuery, + 67 is lightwalletd,
+and + 5, + 10, + 6, and + 7 are the ingest, projector, query, and compat ops
+listeners. Each project owns distinct internal Compose networks and volumes. The node's
+peer listener binds container loopback; it has no published peer port. An owned
+Python TCP relay exposes only the selected loopback ports while containers
+retain internal networks without an outbound default route. Readiness verifies
+internal network isolation, absence of a default route, and an empty peer list.
+Two unused /28 subnets are selected from `10.253.0.0/16`, excluding existing
+Docker networks and host routes. Set `--subnet-pool` if that range conflicts
+with your host. This avoids consuming Docker's large default address pools.
+Do not attach unrelated containers to these fixture networks. The unauthenticated RPC can mine only this project's
+fresh Regtest chain.
+
+The default node config and mining helper exercise the CI schedule through NU7
+and its shielded prefix. Use `--node-config <Regtest TOML>` for a client release's
+consensus schedule. The checked-in `deploy/zebra/regtest-nu6-at-one.toml` activates
+through NU6.3 at height 1, matching the demonstrated Zingo nakednet release.
+`deploy/zebra/regtest-ironwood-at-250.toml` delays NU6.3 to 250, matching the
+Zkool release evaluator; pass `--tip 260`. Both leave NU7 unset. Custom configs
+use transparent `generate` mining; they do not assert the default helper's
+three-pool shielded prefix. Schedule selection belongs to the fixture config,
+not wallet names in server runtime. Client adapters still own their wallet's
+funding and lifecycle transactions.
+
+Pass `--raw-blob-policy all` for Zallet full-block serving. Every canonical
+reader receives the same retention admission expectation. Use a new fixture
+when changing retention. To test built or extracted release executables with
+existing runtime images, add `--bin-dir /absolute/candidate/bin`; the command
+mounts the four named executables and records their SHA256 values. All four
+running `/healthz` revisions must equal `--revision`, including this mode.
+This check establishes executable identity, not release signature provenance.
+Verify downloaded archives or images through the release workflow separately.
+
+The command prints the absolute `ready.json` path only after all four `/readyz`
+responses reach the node tip. The receipt includes the actual node activation
+map, complete health capabilities and versions, candidate commit, image IDs,
+optional binary hashes, endpoints, retention, chain hash, and observation time.
+`mine` and `status` refresh it; a failed refresh removes stale readiness.
+Startup also saves `ready.initial.json` once. Pin that immutable receipt's SHA256
+as a lifecycle harness input. Keep the changing `ready.json` outside pinned
+inputs, because mining and status refresh it. Readiness does
+not certify a wallet lifecycle.
+
+Startup failure or interruption tears down this project's relay, containers,
+networks, and volumes. A random ownership label prevents stale state directories
+from controlling a newer instance that reuses the same Compose project name.
+`down` removes those resources and readiness but keeps local
+configuration and identity files for inspection. A stopped project directory
+cannot be reused accidentally: select a new name, or remove that specific
+stopped directory under `.tmp/regtest-fixtures/` before a fresh run. Never use
+another campaign's project name, store, or ports.
+
+Exercise setup, following, concurrent schedules, full-block capability, a fresh
+repeat, failed-start cleanup, and project-name reuse protection with:
+
+```bash
+scripts/test-regtest-fixture.py --images /tmp/fixture-images.json \
+  --revision 830b426060169f5b2e94d84ff0f134bc1ad96004 --port-base 43100
+```
+
+#### Gate a real wallet lifecycle
+
+Run a pinned wallet adapter against an isolated, funded fixture:
+
+```sh
+python3 scripts/run-wallet-lifecycle.py \
+  --manifest /path/to/wallet-lifecycle.json \
+  --output .tmp/wallet-lifecycle-evidence
+```
+
+Start from [the schema v2 manifest example](../../scripts/wallet-lifecycle.example.json).
+Replace its paths, SHA-256 pins, endpoint, and adapter arguments. The example
+cannot certify without real inputs and an adapter. Run
+`python3 scripts/test-wallet-lifecycle.py` for isolated runner contract checks.
+Those checks use a test adapter; they do not qualify a real wallet.
+
+The manifest contains `schema_version: 2`, positive `timeout_seconds` per child,
+and nonempty named `cases`. Each case identifies `wallet`, `version`, `variant`,
+`network`, `implementation` (`app`, `engine`, or `simulated-profile`), `interface`
+(`lightwalletd` or `native-wallet-query`), `endpoint`, and boolean
+`require_no_fallback`. Use separate cases for Zkool `internal-enabled` and
+`external-only`, and for each wallet/version/network/endpoint you intend to
+qualify. The gate cannot infer a wallet omitted from the manifest.
+
+`client` contains an absolute executable `path` and `sha256`. `inputs` maps
+absolute file paths to required SHA-256 digests. Pin the client, adapter
+executable, interpreted adapter source, configuration, activation schedule,
+fixture identity, and patches. For a Python adapter, pin both interpreter and
+script. Record exact service image digests, source commits, node schedule,
+fixture height/hash, and configuration in the pinned fixture manifest. Pin an
+immutable readiness snapshot, such as the fixture operator's `ready.initial.json`;
+exclude mutable `ready.json` and wallet/node stores. The runner verifies inputs
+before and after the case and before each command. Missing or mismatched pins
+block execution. Hashes identify supplied inputs; reviewed adapter source and
+its receipts must show that the real client used them.
+
+`steps` maps these ordered names to commands: `bootstrap`, `restore`,
+`transparent-discovery`, `shielded-discovery`, `send`, `pending`, `mined`,
+`scanned`, `restart`, and `resume`. Commands are argv arrays. Whole arguments
+`{report}`, `{scratch}`, and `{endpoint}` expand to a fresh JSON report path, a
+shared private case directory, and the endpoint. Every command must receive
+`{report}` and have a nonempty `expect` map of JSON pointers to domain results.
+A counting-only command cannot qualify. Keep the persisted wallet in `{scratch}`
+across the lifecycle, and use a separate new database for restore.
+
+A single-process suite may execute once in `prepare` and save individual
+observations in `{scratch}` for ordered readers to export. Pin its source and
+record actual suite execution order in the fixture manifest. Reader order does
+not establish the order of wallet operations. A funded restore may occur after
+funding in that suite, provided it recovers existing activity into a genuinely
+new, independent wallet database.
+
+Every completed report contains `status: "completed"`, the exact `endpoint`,
+boolean `fallback_used`, `assertions_enabled: true`, and
+`assertion_mode: "always-on"`, plus domain fields. Always-on checks use explicit
+failure paths, such as Python `if`/`raise`, that survive interpreter optimization.
+Python `assert` alone is insufficient. An adapter may reject `-O`, but adapters
+using explicit checks can run safely with it. Native adapters use checks that
+are enabled in their measured build. These declarations are part of the pinned
+adapter contract; the runner cannot establish real observations from an
+unreviewed program that fabricates reports.
+
+The following typed objects are required in v2 reports. All fingerprints are
+64 lowercase hexadecimal SHA-256 characters; raw keys, seeds, transactions,
+and authorization material must never appear in them or in report identifiers.
+
+| Step | Required typed evidence |
+| --- | --- |
+| `send` | `transaction` with `fingerprint_sha256` and `observation: "submitted"` |
+| `pending` | `transaction` with the same fingerprint and `observation: "wallet-pending"` |
+| `mined` | `transaction` with the same fingerprint, `observation: "canonical-mined"`, and positive u32 `mined_height` |
+| `scanned` | `transaction` with the same fingerprint, `observation: "wallet-scanned"`, and the same `mined_height` |
+| `restore` | `restore` with the independent database, wallet, and activity fields below |
+| `restart` | `restart_scope` matching the case; process evidence fields below when `process-restart` |
+| `resume` | `progress` with u32 `before_height`, greater u32 `after_height`, and `new_block_mined_after_restart: true` |
+
+Compute the transaction fingerprint as SHA-256 of the 32 bytes decoded from the
+canonical RPC display transaction ID: `sha256(bytes.fromhex(display_txid))`.
+Normalize a wallet's byte order to that display form first. This fingerprint is
+not a hash of the full transaction. Obtain each stage independently from the
+send outcome, selected wallet pending record, canonical mined response, and
+selected scanned wallet record. Node mempool evidence alone cannot establish
+wallet pending observation. All four fingerprints and both mined heights must
+agree; sanitized linkage is retained in the receipts.
+
+The `restore` object contains `fresh_database: true`, positive integer
+`restored_activity_count`, and these fingerprint pairs:
+
+- `source_database_fingerprint_sha256` and `restored_database_fingerprint_sha256`
+  must differ. Hash canonical database paths or independent database identifiers.
+- `source_wallet_fingerprint_sha256` and `restored_wallet_fingerprint_sha256`
+  must agree. Use stable public account/address identity, never a seed or secret.
+- `source_activity_fingerprint_sha256` and `restored_activity_fingerprint_sha256`
+  must agree. Use the transaction fingerprint of known preexisting wallet activity.
+
+An empty restore or reopening the existing database does not satisfy restore.
+The known restored activity may precede the primary send tested later.
+
+`restart_scope` is `process-restart`, `wallet-reopen`, or `unspecified` (default).
+The completed restart report must repeat it. For `process-restart`, its `restart`
+object contains distinct positive `before_process_id` and `after_process_id`,
+and u32 `before_height` and `after_height` with no regression. These identify the
+old wallet process and a different process reopening its persisted wallet.
+Reopening at the same height is sufficient; a new block need not be scanned
+until resume. `resume.progress.before_height` must be at least the reopened
+height, and `after_height` must show actual progress on a block mined after
+restart. Neither a same-process reopen nor resuming without new progress grants
+process-restart lifecycle qualification.
+
+Record endpoint observations in `endpoint_evidence` with `scope`
+(`configured`, `process-trace`, or `local-only`), boolean `target_connected`, nonnegative integer
+`unexpected_connections`, and, for a process trace, `trace_fingerprint_sha256`.
+`local-only` means the operation made no Internet socket connection. Set
+`target_connected: false` and `unexpected_connections: 0`; it never supplies a
+positive connection observation. For example, an offline wallet list, local
+confirmation lookup, or database reopen can use this scope. Missing endpoint
+metadata also supplies no positive connection. A case needs at least one
+explicit `target_connected: true` observation from a wallet lifecycle step to
+qualify its target; fixture preparation or cleanup traffic cannot supply it.
+Mixed online and local steps can qualify, while an entirely offline case cannot.
+
+Retain a sanitized trace artifact matching that digest. Distinguish client
+traffic from control-node mining connections in the reviewed adapter. Configured
+endpoint evidence cannot establish the separate process-trace claim. That
+claim requires a trace digest for every step, including a socketless trace for
+local-only operations, and at least one observed target connection. A case
+cannot qualify its target if fallback is allowed, observed, or contradicted by
+unexpected trace connections. `require_no_fallback` must be true.
+
+Other report statuses are `skipped`, `blocked`, `unsupported`, and `no-evidence`;
+incomplete reports may add a non-sensitive identifier `reason_code`. Nonzero
+exits, timeouts, missing reports, and failed checks become `failed`. Missing
+steps become `no-evidence`, and later steps become `blocked`.
+
+Optional `prepare` and `cleanup` use the same command/report/check contract.
+Preparation can call the deployment runner for an isolated fixture. Cleanup runs
+after partial preparation or execution; it is skipped if no pinned command was
+entered. It must tolerate partial state and touch only case-owned resources.
+Reuse deployment runners and `scripts/mine-live-regtest.sh`; do not stop shared
+processes by executable name. Process-group timeouts reuse the benchmark runner.
+SIGINT and SIGTERM trigger bounded cleanup. Independently daemonized services
+require explicit cleanup. Sends and mining are never retried automatically.
+
+V2 `certified` requires all steps and cleanup to complete, a real app or engine,
+linked primary transaction evidence, independent populated restore, target
+endpoint policy, different-process reopen, and post-restart progress. Case
+receipts expose `workflow_completed`, `transaction_linkage_certified`,
+`restore_certified`, `process_restart_certified`, `wallet_reopen_certified`,
+`resume_progress_certified`, `target_endpoint_certified`, and
+`endpoint_trace_certified` separately. `target_connection_observed` records
+whether any lifecycle step explicitly observed the target connection. A receipt
+without this field set to true does not independently establish that connection
+claim; retain its original runner digest and configured-versus-traced scope. `qualification_problems` names unmet flags.
+`endpoint_evidence_scope` is `configured`, `process-trace`, or `unqualified`.
+
+Schema v1 manifests remain accepted for workflow completeness, but cannot
+produce a qualification pass in this runner. Historical v1 receipts retain their
+original meaning and runner digest; do not reinterpret their `certified` field
+as the stronger v2 claim. The gate returns 0 only for complete v2 qualification,
+1 for incomplete qualification, 2 for invalid setup, and 130 on interruption.
+
+`summary.json` contains the case matrix, individual `receipt.json` files contain
+checks and sanitized typed observations, and `provenance.json` records schema,
+manifest and runner digests, source revision, and tracked diff digest. The named
+app or engine is the qualification scope; no mobile UI, platform build, or
+external certification follows from an engine run. General workflow completeness
+and simulated profiles remain separately visible.
+
+Keep credentials outside argv and manifests. Endpoint URLs omit userinfo, query
+strings, and fragments. The output directory is private. The runner discards
+child stdout/stderr, deletes raw reports and wallet scratch after cleanup, and
+retains only assertion names, pass/fail, hashes, heights, process IDs, and endpoint
+metadata. Adapters must not put secrets in identifiers or write sensitive files
+outside `{scratch}` and `{report}`. Review receipts before sharing them and retain
+the manifest privately to reproduce its digest. Historical sync-only evaluations
+and paired throughput campaigns remain separate evidence, using
+`scripts/run-zkool-restore.py` and `scripts/run-benchmark-campaign.py` respectively.

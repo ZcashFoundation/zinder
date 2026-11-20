@@ -1,0 +1,41 @@
+# Disposable client-compatible schedule. NU7 is deliberately unset.
+[network]
+network = "Regtest"
+
+[network.testnet_parameters]
+# Zebra 7 rejects funding streams whose effective height ranges overlap, so
+# each stream below starts where the previous one ends.
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 1
+NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 250
+
+
+# NU6.1 onward, continuing across NU7 as the Mainnet streams do.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 1, end = 100000 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+# The ZIP 271 one-time lockbox disbursement in the NU6.1 activation block.
+# Zakura rejects that block unless at least one disbursement is configured; a
+# single zero-value P2SH output is the smallest entry that satisfies the rule
+# and leaves the deferred pool untouched. deploy/zakura/regtest.toml carries
+# the same entry, so both nodes mine the same coinbase shape.
+[[network.testnet_parameters.lockbox_disbursements]]
+address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8"
+amount = 0
+
+[state]
+ephemeral = false
