@@ -3111,8 +3111,10 @@ impl SyntheticView {
     /// read.
     ///
     /// The read walks the range in `order` and keeps blocks while their stored
-    /// bytes fit `max_bytes`, always keeping the first. It returns the heights
-    /// kept and their blocks in ascending order.
+    /// bytes fit `max_bytes`, always keeping the first. Once the kept blocks
+    /// take at least `max_bytes`, it stops without looking at the next
+    /// height. It returns the heights kept and their blocks in ascending
+    /// order.
     fn compact_blocks_up_to(
         &self,
         block_range: BlockHeightRange,
@@ -3142,6 +3144,9 @@ impl SyntheticView {
         let mut compact_blocks = Vec::new();
         let mut kept_bytes = 0_usize;
         for height in heights {
+            if !compact_blocks.is_empty() && kept_bytes >= max_bytes {
+                break;
+            }
             if self.missing_block_height == Some(height.value()) {
                 return Err(QueryError::canonical_read(StorageReadError::Unavailable {
                     source: format!("compact block at height {} is absent", height.value()).into(),
