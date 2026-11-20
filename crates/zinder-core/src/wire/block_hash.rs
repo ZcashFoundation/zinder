@@ -15,8 +15,10 @@
 //! Pick the function whose name matches the wire surface:
 //! - Lightwalletd-compat `bytes` fields carry internal byte order. Use
 //!   [`encode_internal_block_hash`] and [`decode_internal_block_hash`].
-//!   The exception is `SubtreeRoot.completingBlockHash`, which reference
-//!   lightwalletd fills in RPC byte order. Use [`encode_rpc_block_hash_bytes`].
+//!   Two exceptions follow reference lightwalletd's RPC byte order on `bytes`
+//!   fields: `SubtreeRoot.completingBlockHash` in responses
+//!   ([`encode_rpc_block_hash_bytes`]) and `GetTreeState(BlockID { height: 0, hash })`
+//!   in requests ([`decode_rpc_block_hash_bytes`]).
 //! - Native zinder protobuf `string` hash fields, JSON, log records, and
 //!   any human-facing surface carry RPC byte order hex. Use
 //!   [`encode_rpc_block_hash_hex`] and [`decode_rpc_block_hash_hex`].
@@ -119,8 +121,10 @@ pub fn encode_rpc_block_hash_bytes(block_hash: BlockHash) -> [u8; 32] {
 ///
 /// The raw-bytes analogue of [`decode_rpc_block_hash_hex`]. Zebra's
 /// indexer gRPC surface (`zebra_indexer_rpc`) fills hash `bytes` fields
-/// with `bytes_in_display_order`, so the input is reversed into internal
-/// byte order before constructing the domain value.
+/// with `bytes_in_display_order`, and reference lightwalletd reads
+/// `GetTreeState(BlockID { height: 0, hash })` in RPC byte order, so the
+/// input is reversed into internal byte order before constructing the domain
+/// value.
 ///
 /// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
 ///

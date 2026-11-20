@@ -38,7 +38,10 @@ use zinder_core::{
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId,
     TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentSpendFact, TransparentUnspentOutput,
-    wire::{encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex},
+    wire::{
+        encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_bytes,
+        encode_rpc_block_hash_hex,
+    },
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -2660,6 +2663,97 @@ async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::
     Ok(())
 }
 
+/// Unary `GetBlockNullifiers` retains every stored transaction as a shell.
+///
+/// Transparent-only coinbase transactions remain as `{index, txid, fee}`
+/// shells, whereas `GetBlockRangeNullifiers` drops transactions outside the
+/// requested shielded pools.
+#[tokio::test]
+async fn get_block_nullifiers_retains_transparent_only_shells_unlike_range_nullifiers()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = fixture_block(&chain, ACCEPTANCE_BLOCK_HEIGHT)?;
+    let mut coinbase = FixtureTransactionRows::coinbase(
+        TransactionId::from_bytes([0x10; 32]),
+        block.height,
+        block.hash,
+        b"transparent-coinbase".to_vec(),
+    );
+    coinbase.facts.public_facts.counts.transparent_output_count = 1;
+    let shielded = mixed_pool_transaction_rows(&block, 1);
+    let rows = [coinbase, shielded];
+    let artifact = acceptance_compact_block_artifact_at(&block, &rows)?;
+    let mut transactions = artifact.into_parts().transactions;
+    let [coinbase_tx, shielded_tx] = transactions.as_mut_slice() else {
+        return Err(eyre!("expected coinbase and shielded transaction"));
+    };
+    coinbase_tx
+        .data
+        .transparent_outputs
+        .push(zinder_core::CompactTransparentOutput {
+            value_zat: 50_000,
+            script_pub_key: vec![0x51],
+        });
+    shielded_tx.data.fee_zat = Some(10_000);
+    let compact = CompactBlockArtifact::new(
+        BlockId::new(block.height, block.hash),
+        canonical_parent_hash(&block),
+        block.block_time_seconds,
+        transactions,
+        block.compact_block_artifact().chain_metadata(),
+    )?;
+    let chain = rows
+        .into_iter()
+        .fold(chain, ChainFixture::with_transaction_rows)
+        .with_compact_block_artifact(compact);
+    let store_fixture = acceptance_store_from_chain(&chain)?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    let unary = adapter
+        .get_block_nullifiers(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let ranged = collect_stream(
+        adapter
+            .get_block_range_nullifiers(Request::new(block_range_request(1, 1)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    let [ranged_block] = ranged.as_slice() else {
+        return Err(eyre!("expected one block from GetBlockRangeNullifiers"));
+    };
+
+    assert!(unary.chain_metadata.is_none());
+    assert_eq!(
+        unary.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        unary.vtx[0],
+        lightwalletd::CompactTx {
+            index: 0,
+            txid: vec![0x10; 32],
+            fee: 0,
+            ..lightwalletd::CompactTx::default()
+        }
+    );
+    assert_eq!(
+        ranged_block
+            .vtx
+            .iter()
+            .map(|tx| tx.index)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(unary.vtx[1], ranged_block.vtx[0]);
+
+    Ok(())
+}
+
 /// Both nullifiers-only RPCs must omit everything the deprecated lightwalletd
 /// contract excludes.
 ///
@@ -2708,7 +2802,7 @@ async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fi
 fn nullifier_parity_store() -> eyre::Result<AcceptanceStore> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let block = fixture_block(&chain, ACCEPTANCE_BLOCK_HEIGHT)?;
-    let mixed = mixed_pool_transaction_rows(&block);
+    let mixed = mixed_pool_transaction_rows(&block, 0);
     let transaction_id = TransactionId::from_bytes([17; 32]);
     let mut deposit = FixtureTransactionRows::from_raw_transaction(
         transaction_id,
@@ -3704,6 +3798,76 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
     };
 
     assert_eq!(status.code(), Code::InvalidArgument);
+
+    Ok(())
+}
+
+/// `GetTreeState(BlockID { height: 0, hash })` accepts RPC byte order.
+///
+/// It matches `hex::decode(TreeState.hash)` and Go `lightwalletd`, rejects
+/// unknown or reversed hashes with `INVALID_ARGUMENT`, and ignores `hash`
+/// when `height` is non-zero.
+#[tokio::test]
+async fn tree_state_by_hash_uses_rpc_byte_order_like_lightwalletd() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = fixture_block(&chain, ACCEPTANCE_BLOCK_HEIGHT)?;
+    let store_fixture = acceptance_store_from_chain(&chain)?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    let by_height = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let rpc_hash_bytes = hex::decode(&by_height.hash)?;
+    assert_eq!(rpc_hash_bytes, encode_rpc_block_hash_bytes(block.hash));
+
+    let by_rpc_hash = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: rpc_hash_bytes,
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(by_rpc_hash, by_height);
+
+    // Non-zero height ignores hash, matching reference lightwalletd.
+    let by_height_with_bad_hash = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: vec![0xab],
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(by_height_with_bad_hash, by_height);
+
+    // Internal-byte-order hash (non-palindromic in ChainFixture) and unknown
+    // or malformed hashes fail with INVALID_ARGUMENT.
+    let internal_hash_bytes = encode_internal_block_hash(block.hash).to_vec();
+    assert_ne!(
+        internal_hash_bytes,
+        encode_rpc_block_hash_bytes(block.hash),
+        "fixture block hash must be non-palindromic to distinguish byte orders"
+    );
+    for invalid_hash in [
+        internal_hash_bytes,
+        vec![0xee; 32],
+        vec![0xee; 31],
+        vec![0xee; 33],
+    ] {
+        let outcome = adapter
+            .get_tree_state(Request::new(lightwalletd::BlockId {
+                height: 0,
+                hash: invalid_hash,
+            }))
+            .await;
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::InvalidArgument)
+        );
+    }
 
     Ok(())
 }
@@ -5510,17 +5674,20 @@ async fn ordered_broadcasting_acceptance_adapter(
 
 fn acceptance_store_fixture() -> eyre::Result<AcceptanceStore> {
     acceptance_store_fixture_with_transaction_rows(RawBlobRetention::None, |block| {
-        vec![mixed_pool_transaction_rows(block)]
+        vec![mixed_pool_transaction_rows(block, 0)]
     })
 }
 
-fn mixed_pool_transaction_rows(block: &FixtureBlock) -> FixtureTransactionRows {
+fn mixed_pool_transaction_rows(
+    block: &FixtureBlock,
+    tx_index_in_block: u32,
+) -> FixtureTransactionRows {
     let transaction_id = TransactionId::from_bytes([2; 32]);
     let mut rows = FixtureTransactionRows::from_raw_transaction(
         transaction_id,
         block.height,
         block.hash,
-        0,
+        tx_index_in_block,
         b"compact-wallet-transaction",
     );
     rows.facts.public_facts.counts = TransactionComponentCounts {

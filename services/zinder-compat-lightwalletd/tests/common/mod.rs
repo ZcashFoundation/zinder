@@ -1,3 +1,5 @@
+pub(crate) mod nullifier_parity;
+
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 use zinder_core::Network;
