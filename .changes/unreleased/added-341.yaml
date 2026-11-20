@@ -1,6 +1,0 @@
-kind: added
-body: "Behind the reference Caddy proxy, one wallet could hold enough receive slots to get other wallets refused with `UNAVAILABLE`. New `trust_proxy_client_address` settings for query, compat, and explorer key receive-slot fairness on the `x-zinder-client-address` header the Caddy template now sets; leave them off unless every path to the listener goes through that proxy, as the TLS runbook describes. Every runtime now folds buffered histogram samples on a five-second schedule, so an unscraped `/metrics` endpoint no longer grows with traffic, and receive pools export `zinder_grpc_request_receive_slots_held`."
-time: 2026-11-20T05:30:00.000000000Z
-custom:
-    Bump: minor
-    PR: "341"

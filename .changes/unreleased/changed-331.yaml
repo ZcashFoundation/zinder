@@ -1,6 +1,0 @@
-kind: changed
-body: "Compact-block range reads, which serve `GetBlockRange` and tree-state rebuilds, now read one stored row per block instead of two, cutting storage reads for wallet block streams."
-time: 2026-11-19T20:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "331"

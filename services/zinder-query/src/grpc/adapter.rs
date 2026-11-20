@@ -21,13 +21,14 @@ use zinder_proto::{
         ops::ErrorReason,
         wallet::{self, wallet_query_server},
     },
-    wire::{TransactionAbsence, outpoint_from_message},
+    wire::{CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, outpoint_from_message},
 };
 use zinder_runtime::{AuthenticatedChannel, Readiness, RepeatedFieldGuard};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    StreamCursorTokenV1, chain_event_stream_family_from_request, event_stream_start_from_request,
+    ChainEventStreamFamily, StreamCursorTokenV1, chain_event_stream_family_from_request,
+    event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -603,13 +604,21 @@ where
                 .resolve_chain_events_start(start, requested_family)
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
+            let family = resume.family;
             let stream = chain_event_stream(
                 self.query_api.clone(),
                 resume,
                 address_filter,
                 self.traffic_readiness.clone(),
             );
-            Ok(self.server_stream(Box::pin(stream)))
+            let mut response = self.server_stream(Box::pin(stream));
+            if family == ChainEventStreamFamily::Settled {
+                response.metadata_mut().insert(
+                    CHAIN_EVENT_FAMILY_HEADER,
+                    tonic::metadata::MetadataValue::from_static("settled"),
+                );
+            }
+            Ok(response)
         }
         .await;
         record_proxy_outcome("chain_events", started_at, &outcome);

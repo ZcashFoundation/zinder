@@ -589,6 +589,18 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn settled_commit_round_trips_with_the_visible_tip_ahead_of_its_range() -> eyre::Result<()> {
+    let epoch = synthetic_chain_epoch();
+    let committed = wallet::ChainEpochCommitted {
+        chain_epoch: Some(epoch),
+        start_height: 39,
+        end_height: 40,
+    };
+    assert_eq!(round_trip(&committed)?, committed);
+    Ok(())
+}
+
+#[test]
 fn compact_blocks_in_range_chunk_header_round_trips_through_prost() -> eyre::Result<()> {
     let header = wallet::CompactBlocksInRangeChunk {
         body: Some(wallet::compact_blocks_in_range_chunk::Body::Header(

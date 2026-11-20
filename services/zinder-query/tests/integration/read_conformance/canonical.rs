@@ -656,37 +656,60 @@ pub(crate) async fn chain_event_starts_resolve_to_a_resume_position<H: ReaderHar
     Ok(())
 }
 
-pub(crate) async fn the_settled_stream_carries_only_settled_commits<H: ReaderHarness>()
+pub(crate) async fn the_settled_stream_commits_each_newly_settled_range<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (mut harness, _) = appended::<H>(1)?;
+    let chain = chain(RawBlobRetention::Transactions).extend_blocks(2);
+    let mut harness = H::publish(
+        &CanonicalBaseline::new(&chain)
+            .with_history_floor(BlockHeight::new(1))
+            .through(BlockHeight::new(TIP))
+            .with_settled_tip(BlockHeight::new(3)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    harness.append_live_block(&chain, block_id(&chain, 3)?)?;
+    let tail = harness
+        .canonical_reader()?
+        .resolve_wallet_chain_event_stream_start(
+            EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Settled,
+        )
+        .await?;
+    assert!(tail.cursor.is_some());
+    assert_eq!(tail.family, ChainEventStreamFamily::Settled);
+    harness.append_live_block(&chain, block_id(&chain, TIP)?)?;
     let reader = harness.canonical_reader()?;
     let visible = reader
         .wallet_chain_event_history(None, ChainEventStreamFamily::Visible, MANY_EVENTS)
         .await?;
-    let unsettled = visible
-        .last()
-        .ok_or_else(|| eyre!("the history must not be empty"))?;
-    ensure!(
-        !is_settled_commit(unsettled),
-        "the appended block must leave the visible tip above the settled tip"
-    );
-
+    let [baseline, held, advanced] = visible.as_slice() else {
+        return Err(eyre!("expected the baseline and two visible appends"));
+    };
+    assert_eq!(committed_range(baseline)?, range(2, TIP));
+    assert_eq!(committed_range(held)?, range(TIP + 1, TIP + 1));
+    assert_eq!(committed_range(advanced)?, range(TIP + 2, TIP + 2));
     let settled = reader
         .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
         .await?;
-    ensure!(
-        !settled.is_empty(),
-        "the settled baseline commit must be in the settled stream"
-    );
-    assert_eq!(
-        event_sequences(&settled),
-        event_sequences(visible.iter().filter(|event| is_settled_commit(event))),
-        "the settled stream carries exactly the commits that leave the tip settled"
-    );
-    assert!(
-        settled.iter().all(is_settled_commit),
-        "every settled event must leave the visible tip at or below the settled tip"
-    );
+    let [prefix, extension] = settled.as_slice() else {
+        return Err(eyre!(
+            "expected the settled baseline and one settlement advance"
+        ));
+    };
+    for (event, transition, expected) in [
+        (prefix, baseline, range(2, 3)),
+        (extension, advanced, range(4, TIP)),
+    ] {
+        assert_eq!(committed_range(event)?, expected);
+        assert_eq!(event.event_sequence, transition.event_sequence);
+        assert_eq!(event.chain_epoch, transition.chain_epoch);
+        assert_eq!(event.settled_tip_height, expected.end);
+    }
+    harness.prune_chain_events_before(advanced.event_sequence)?;
+    let resumed = harness
+        .canonical_reader()?
+        .wallet_chain_event_history(tail.cursor, tail.family, NonZeroU32::MIN)
+        .await?;
+    assert_eq!(resumed.as_slice(), std::slice::from_ref(extension));
     Ok(())
 }
 
@@ -810,7 +833,7 @@ pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderH
     let pinned_fence = pinned.event_fence();
     let pinned_epoch = pinned.chain_epoch();
 
-    harness.append_live_block(&chain)?;
+    harness.append_live_block(&chain, block_id(&chain, TIP)?)?;
     let current = harness.canonical_reader()?;
     let appended = block_id(&chain, TIP + 1)?;
 
@@ -969,14 +992,13 @@ pub(crate) async fn a_reorg_is_served_as_a_visible_chain_event<H: ReaderHarness>
         "the replacement must be served as a reorg event, got {:?}",
         last.event
     );
-    assert!(
-        after
-            .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
-            .await?
-            .iter()
-            .all(is_settled_commit),
-        "the settled stream serves no reorg and no commit above the settled tip"
-    );
+    let settled = after
+        .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
+        .await?;
+    let [baseline] = settled.as_slice() else {
+        return Err(eyre!("only the baseline advanced settlement"));
+    };
+    assert_eq!(committed_range(baseline)?, range(1, MINED_HEIGHT - 1));
     Ok(())
 }
 
@@ -1048,26 +1070,19 @@ fn appended<H: ReaderHarness>(appended: u32) -> eyre::Result<(H, ChainFixture)> 
         &CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP)),
         &sample_regtest_upgrade_activations(),
     )?;
+    let settled_tip = block_id(&chain, TIP)?;
     for _ in 0..appended {
-        harness.append_live_block(&chain)?;
+        harness.append_live_block(&chain, settled_tip)?;
     }
     Ok((harness, chain))
 }
 
-/// Reports whether `event` is a commit after which the visible tip is at or
-/// below the settled tip, the only events the settled stream carries.
-fn is_settled_commit(event: &ChainEventEnvelope) -> bool {
-    event.event.is_chain_committed()
-        && event.chain_epoch.visible_tip_height <= event.chain_epoch.settled_tip_height
-}
-
-fn event_sequences<'event>(
-    events: impl IntoIterator<Item = &'event ChainEventEnvelope>,
-) -> Vec<u64> {
-    events
-        .into_iter()
-        .map(|event| event.event_sequence)
-        .collect()
+fn committed_range(event: &ChainEventEnvelope) -> eyre::Result<BlockHeightRange> {
+    let ChainEvent::ChainCommitted { committed } = &event.event else {
+        return Err(eyre!("expected a commit, got {:?}", event.event));
+    };
+    assert_eq!(committed.chain_epoch, event.chain_epoch);
+    Ok(committed.block_range)
 }
 
 /// Frontiers of the sizes `frontiers` holds whose leaves are all the
