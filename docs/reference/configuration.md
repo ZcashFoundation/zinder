@@ -390,7 +390,7 @@ has a bound.
 | Transparent balance, lightwalletd only | 256 distinct addresses | `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`; an empty list is a plain `INVALID_ARGUMENT` |
 | Raw transaction for broadcast | 2,000,000 bytes | `BROADCAST_TRANSACTION_TOO_LARGE` |
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
-| Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `RESOURCE_EXHAUSTED`, no reason |
+| Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `COMPACT_BLOCK_STREAM_LIMIT_REACHED` |
 | Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`, `compat.tree_state_replay_wait_ms` in wallet-serving `zinder-compat-lightwalletd`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot` and `compat.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd `GetTreeState` |
 
 The broadcast budget covers native `BroadcastTransaction` and lightwalletd

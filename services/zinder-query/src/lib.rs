@@ -554,6 +554,9 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
         Some(QueryError::TreeStateReplayLimitReached { .. }) => "tree_state_replay_limit_reached",
+        Some(QueryError::CompactBlockStreamLimitReached { .. }) => {
+            "compact_block_stream_limit_reached"
+        }
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -1142,6 +1145,16 @@ pub enum QueryError {
         max_concurrent_replays: NonZeroU32,
     },
 
+    /// The adapter already serves its limit of open native
+    /// `CompactBlocksInRange` streams.
+    #[error(
+        "this server already serves {max_streams} CompactBlocksInRange streams; retry after a short delay"
+    )]
+    CompactBlockStreamLimitReached {
+        /// Most streams the adapter serves at once.
+        max_streams: NonZeroU32,
+    },
+
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
     #[error("query read task failed: {reason}")]
     BlockingTaskFailed {
@@ -1266,6 +1279,9 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::UnsupportedTransactionStatus { .. } => ErrorReason::UnsupportedTransactionStatus,
             Self::UnsupportedWalletEncoding { .. } => ErrorReason::UnsupportedWalletEncoding,
             Self::TreeStateReplayLimitReached { .. } => ErrorReason::TreeStateReplayLimitReached,
+            Self::CompactBlockStreamLimitReached { .. } => {
+                ErrorReason::CompactBlockStreamLimitReached
+            }
             Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
@@ -1408,6 +1424,9 @@ mod error_reason_tests {
             QueryError::TreeStateReplayLimitReached {
                 max_concurrent_replays: NonZeroU32::MIN,
             },
+            QueryError::CompactBlockStreamLimitReached {
+                max_streams: NonZeroU32::MIN,
+            },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
@@ -1454,6 +1473,19 @@ mod error_reason_tests {
             tonic_types::StatusExt::get_details_error_info(&status)
                 .map(|error_info| error_info.reason),
             Some("TREE_STATE_REPLAY_LIMIT_REACHED".to_owned())
+        );
+    }
+
+    #[test]
+    fn compact_block_stream_refusal_is_resource_exhausted_on_the_wire() {
+        let status = crate::status_from_query_error(&QueryError::CompactBlockStreamLimitReached {
+            max_streams: NonZeroU32::MIN,
+        });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("COMPACT_BLOCK_STREAM_LIMIT_REACHED".to_owned())
         );
     }
 

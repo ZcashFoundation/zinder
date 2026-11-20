@@ -453,7 +453,11 @@ where
             if crate::validate_block_range(block_range, crate::DEFAULT_MAX_COMPACT_BLOCK_RANGE)
                 .is_ok()
             {
-                Some(self.compact_block_streams.try_open()?)
+                Some(
+                    self.compact_block_streams
+                        .try_open()
+                        .map_err(|error| status_from_query_error(&error))?,
+                )
             } else {
                 None
             };

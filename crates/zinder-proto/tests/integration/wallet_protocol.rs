@@ -1586,6 +1586,50 @@ fn broadcast_budget_refusal_is_unavailable_and_retryable() -> eyre::Result<()> {
 }
 
 #[test]
+fn compact_block_stream_limit_refusal_is_resource_exhausted_and_retryable() -> eyre::Result<()> {
+    let reason = ops::ErrorReason::CompactBlockStreamLimitReached;
+    assert_eq!(reason.as_str_name(), "COMPACT_BLOCK_STREAM_LIMIT_REACHED");
+    assert_eq!(
+        ops::ErrorReason::from_str_name("COMPACT_BLOCK_STREAM_LIMIT_REACHED"),
+        Some(reason)
+    );
+    assert_eq!(ops::ErrorReason::try_from(56)?, reason);
+    let policy = zinder_proto::reason_policy(reason);
+    assert_eq!(policy.code, tonic::Code::ResourceExhausted);
+    assert_eq!(
+        policy.retry,
+        zinder_proto::RetryDisposition::RetryAfterBackoff
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_block_stream_limit_status_carries_error_info_through_detail_bytes() -> eyre::Result<()> {
+    use tonic_types::StatusExt as _;
+
+    let status = zinder_proto::status_for_reason(
+        ops::ErrorReason::CompactBlockStreamLimitReached,
+        "compact-block stream limit reached",
+    );
+    // Rebuild the status from its encoded `google.rpc.Status` detail bytes, as
+    // a remote peer receives it.
+    let received = tonic::Status::with_details(
+        status.code(),
+        status.message().to_owned(),
+        status.details().to_vec().into(),
+    );
+
+    assert_eq!(received.code(), tonic::Code::ResourceExhausted);
+    let error_info = received
+        .get_details_error_info()
+        .ok_or_else(|| eyre!("the status carries no google.rpc.ErrorInfo"))?;
+    assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(error_info.domain, "zinder.dev");
+    assert_eq!(error_info.reason, "COMPACT_BLOCK_STREAM_LIMIT_REACHED");
+    Ok(())
+}
+
+#[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
         (

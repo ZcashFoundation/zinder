@@ -486,6 +486,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::ServiceNotReady
         | ErrorReason::TransactionNotFound
         | ErrorReason::TreeStateReplayLimitReached
+        | ErrorReason::CompactBlockStreamLimitReached
         | ErrorReason::BroadcastBudgetExhausted => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
@@ -704,6 +705,27 @@ mod tests {
         );
         assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn compact_block_stream_limit_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::ResourceExhausted,
+            "stream limit reached",
+            ErrorDetails::with_error_info(
+                ErrorReason::CompactBlockStreamLimitReached.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(
+            error.reason(),
+            Some(ErrorReason::CompactBlockStreamLimitReached)
+        );
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 
     #[test]

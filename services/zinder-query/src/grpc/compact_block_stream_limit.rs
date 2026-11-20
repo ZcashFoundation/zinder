@@ -3,7 +3,8 @@
 use std::{future::Future, num::NonZeroU32, sync::Arc};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::Status;
+
+use crate::QueryError;
 
 /// Counter of `CompactBlocksInRange` streams refused because every slot was
 /// taken.
@@ -43,15 +44,14 @@ impl CompactBlockStreamLimit {
     ///
     /// # Errors
     ///
-    /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
-    /// refusal.
-    pub(super) fn try_open(&self) -> Result<CompactBlockStreamSlot, Status> {
+    /// Returns [`QueryError::CompactBlockStreamLimitReached`] when every slot
+    /// is taken, and counts the refusal.
+    pub(super) fn try_open(&self) -> Result<CompactBlockStreamSlot, QueryError> {
         let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
             metrics::counter!(STREAM_REFUSALS_COUNTER).increment(1);
-            Status::resource_exhausted(format!(
-                "this server already serves {} CompactBlocksInRange streams; retry after a short delay",
-                self.max_streams
-            ))
+            QueryError::CompactBlockStreamLimitReached {
+                max_streams: self.max_streams,
+            }
         })?;
         Ok(CompactBlockStreamSlot {
             _permit: Arc::new(permit),
@@ -101,20 +101,18 @@ pub(crate) fn describe_metrics() {
 mod tests {
     use std::num::NonZeroU32;
 
-    use tonic::Code;
-
     use super::CompactBlockStreamLimit;
+    use crate::QueryError;
 
     #[test]
-    fn the_stream_limit_refuses_past_its_slots_until_one_is_returned() -> Result<(), tonic::Status>
-    {
+    fn the_stream_limit_refuses_past_its_slots_until_one_is_returned() -> Result<(), QueryError> {
         let limit = CompactBlockStreamLimit::new(NonZeroU32::MIN);
         let open = limit.try_open()?;
         let shared = open.clone();
-        assert_eq!(
-            limit.try_open().err().map(|status| status.code()),
-            Some(Code::ResourceExhausted)
-        );
+        assert!(matches!(
+            limit.try_open(),
+            Err(QueryError::CompactBlockStreamLimitReached { .. })
+        ));
         drop(open);
         assert!(
             limit.try_open().is_err(),

@@ -193,6 +193,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::TransparentOutpointCountOutOfRange,
         WireErrorReason::TreeStateReplayLimitReached,
         WireErrorReason::BroadcastBudgetExhausted,
+        WireErrorReason::CompactBlockStreamLimitReached,
     ];
 
     for reason in reasons {

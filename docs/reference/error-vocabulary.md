@@ -154,6 +154,7 @@ data may be corrupt.
 | Reason | Meaning |
 | --- | --- |
 | `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU, and either no rebuild slot freed within the wait (2 seconds by default) or every waiting place was already taken (64 per slot by default), in which case the request is refused at once. A height with a stored checkpoint is never refused this way. |
+| `COMPACT_BLOCK_STREAM_LIMIT_REACHED` | Native `CompactBlocksInRange` was refused because the server already serves its limit of open streams (100 by default). A slot frees when an open stream ends or the client drops it and its outstanding read finishes. The lightwalletd `GetBlockRange` has its own limit and does not carry this reason. |
 
 ### `UNAVAILABLE`
 
