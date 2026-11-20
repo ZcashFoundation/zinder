@@ -384,3 +384,32 @@ async fn spawn_ops_endpoint_fails_before_returning_when_port_is_occupied() -> Re
     assert_eq!(failed_addr, listen_addr);
     Ok(())
 }
+
+/// Without upkeep, the recorder keeps every histogram sample until the next
+/// scrape, so an unscraped runtime's memory grows with its traffic.
+#[cfg(target_os = "linux")]
+#[test]
+fn installing_the_recorder_starts_its_upkeep_thread() -> Result<()> {
+    install_metrics_recorder_for_service(RuntimeService::Query, "0.0.0", "zcash-regtest")?;
+
+    // A new thread names itself once it starts running, so its name can
+    // appear a little after the install returns.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut thread_names = Vec::new();
+        for task in std::fs::read_dir("/proc/self/task")? {
+            // A thread that exits while the loop runs has no name left to read.
+            if let Ok(name) = std::fs::read_to_string(task?.path().join("comm")) {
+                thread_names.push(name.trim_end().to_owned());
+            }
+        }
+        if thread_names.iter().any(|name| name == "metrics-upkeep") {
+            return Ok(());
+        }
+        eyre::ensure!(
+            std::time::Instant::now() < deadline,
+            "no metrics-upkeep thread among {thread_names:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

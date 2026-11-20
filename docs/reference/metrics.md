@@ -22,6 +22,9 @@ Conventions:
   export as summaries with quantiles.
 - A series appears only after its first sample. For example, a runtime that
   has not broadcast yet exports no broadcast series.
+- Each runtime folds new histogram samples into their buckets or summaries
+  every five seconds, so its metrics memory stays bounded when nothing
+  scrapes `/metrics`.
 
 ## Signals worth alerting on
 

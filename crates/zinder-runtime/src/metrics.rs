@@ -1,9 +1,9 @@
 //! Prometheus metrics recorder used by Zinder operational endpoints.
 
-use std::sync::OnceLock;
+use std::{io, sync::OnceLock, thread, time::Duration};
 
 use metrics::{Unit, describe_gauge};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -14,6 +14,18 @@ use crate::{
 
 static PROMETHEUS_HANDLE: OnceLock<MetricsHandle> = OnceLock::new();
 static PROMETHEUS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// How often the installed recorder drains buffered histogram samples.
+///
+/// The recorder buffers each histogram sample until a render or an upkeep
+/// moves it into its buckets or summary, so without upkeep a runtime whose
+/// `/metrics` nobody scrapes keeps every sample it records. Five seconds, the
+/// exporter's own default, bounds that buffer to the samples of one interval.
+const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Name of the thread that runs recorder upkeep. Linux keeps at most 15 bytes
+/// of a thread name.
+const UPKEEP_THREAD_NAME: &str = "metrics-upkeep";
 
 /// Histogram bucket boundaries (in seconds) applied to every metric whose name
 /// ends in `_duration_seconds`.
@@ -71,7 +83,14 @@ pub enum MetricsInstallError {
     Install {
         /// Underlying recorder installation error.
         #[source]
-        source: metrics_exporter_prometheus::BuildError,
+        source: BuildError,
+    },
+    /// Failed to start the thread that drains buffered histogram samples.
+    #[error("failed to start metrics upkeep: {source}")]
+    Upkeep {
+        /// Underlying thread spawn error.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -81,6 +100,9 @@ pub enum MetricsInstallError {
 /// The recorder is process-wide because the `metrics` facade has one global
 /// recorder. Calling this more than once through Zinder runtime returns the
 /// already-installed handle and records another `zinder_build_info` label set.
+/// The first install also starts a thread that drains buffered histogram
+/// samples every five seconds, so memory stays bounded while nothing scrapes
+/// `/metrics`.
 pub fn install_metrics_recorder(server: &OpsServer) -> Result<MetricsHandle, MetricsInstallError> {
     install_metrics_recorder_with_identity(
         server.service_name,
@@ -120,9 +142,16 @@ fn install_metrics_recorder_with_identity(
                 network_name,
             ));
         }
-        let prometheus = prometheus_builder()
-            .and_then(PrometheusBuilder::install_recorder)
-            .map_err(|source| MetricsInstallError::Install { source })?;
+        let recorder = prometheus_builder()
+            .map_err(|source| MetricsInstallError::Install { source })?
+            .build_recorder();
+        let prometheus = recorder.handle();
+        let upkeep = prometheus.clone();
+        spawn_upkeep(UPKEEP_INTERVAL, move || upkeep.run_upkeep())
+            .map_err(|source| MetricsInstallError::Upkeep { source })?;
+        metrics::set_global_recorder(recorder).map_err(|source| MetricsInstallError::Install {
+            source: BuildError::from(source),
+        })?;
         let installed = MetricsHandle { prometheus };
         let _ = PROMETHEUS_HANDLE.set(installed.clone());
         installed
@@ -136,9 +165,23 @@ fn install_metrics_recorder_with_identity(
     ))
 }
 
+/// Runs `upkeep` every `interval` on a thread of its own until the process
+/// exits, since the global recorder it maintains lives that long.
+fn spawn_upkeep(interval: Duration, upkeep: impl Fn() + Send + 'static) -> io::Result<()> {
+    thread::Builder::new()
+        .name(UPKEEP_THREAD_NAME.to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(interval);
+                upkeep();
+            }
+        })
+        .map(drop)
+}
+
 /// The Prometheus exporter every Zinder runtime installs, with its histogram
 /// buckets.
-fn prometheus_builder() -> Result<PrometheusBuilder, metrics_exporter_prometheus::BuildError> {
+fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
     PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full("zinder_startup_phase_duration_seconds".to_owned()),
@@ -179,11 +222,27 @@ fn record_build_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, prometheus_builder};
+    use std::{sync::mpsc, time::Duration};
+
+    use super::{RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, prometheus_builder, spawn_upkeep};
+
+    #[test]
+    fn upkeep_runs_again_after_every_interval() -> Result<(), Box<dyn std::error::Error>> {
+        let (runs, observed) = mpsc::channel();
+        spawn_upkeep(Duration::from_millis(5), move || {
+            // The receiver stops listening once the test has seen enough.
+            let _ = runs.send(());
+        })?;
+
+        for _ in 0..3 {
+            observed.recv_timeout(Duration::from_secs(10))?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn receive_slot_occupancy_exports_buckets_that_single_out_a_full_pool()
-    -> Result<(), metrics_exporter_prometheus::BuildError> {
+    -> Result<(), super::BuildError> {
         let recorder = prometheus_builder()?.build_recorder();
         let handle = recorder.handle();
 
