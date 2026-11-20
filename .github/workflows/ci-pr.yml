@@ -208,6 +208,7 @@ jobs:
           scripts/test-observability-smoke-safety.sh
           python3 scripts/test-publication-delay.py
           python3 scripts/test-wallet-lifecycle.py
+          python3 scripts/wallet-clients/test-wallet-fixture.py
           env \
             ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             ZINDER_BENCH_SOFTWARE_REVISION=ci \
