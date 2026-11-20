@@ -544,26 +544,11 @@ async fn remote_chain_event_stream_rejects_duplicate_sequence_from_the_wire() ->
         .extend_blocks(2)
         .chain_epoch(zinder_client::ChainEpochId::new(1))
         .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
-    let event = wallet::ChainEventEnvelope {
-        cursor: vec![1],
-        event_sequence: 1,
-        chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
-            indexed_tip: None,
-            upstream_tip: None,
-            materialized_views: None,
-        }),
-        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
-            wallet::ChainCommitted {
-                committed: Some(wallet::ChainEpochCommitted {
-                    chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
-                    start_height: 1,
-                    end_height: 2,
-                }),
-            },
-        )),
-    };
-    let endpoint = spawn_malformed_chain_event_service(vec![event.clone(), event]).await?;
+    let first = chain_event_message(chain_epoch, 1, vec![1]);
+    let mut next_epoch = chain_epoch;
+    next_epoch.id = zinder_client::ChainEpochId::new(2);
+    let duplicate = chain_event_message(next_epoch, 1, vec![2]);
+    let endpoint = spawn_malformed_chain_event_service(vec![first, duplicate]).await?;
     let client = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
@@ -590,13 +575,12 @@ async fn remote_chain_event_stream_rejects_a_nonadjacent_repeated_cursor_from_th
         .extend_blocks(2)
         .chain_epoch(zinder_client::ChainEpochId::new(1))
         .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
-    let mut first = chain_event_message(chain_epoch, 1, vec![1]);
-    let second = chain_event_message(chain_epoch, 2, vec![2]);
-    let mut repeated = chain_event_message(chain_epoch, 3, vec![1]);
-    // Keep the event payloads independent so the regression specifically
-    // exercises cursor identity across nonadjacent stream items.
-    first.event_sequence = 1;
-    repeated.event_sequence = 3;
+    let first = chain_event_message(chain_epoch, 1, vec![1]);
+    let mut next_epoch = chain_epoch;
+    next_epoch.id = zinder_client::ChainEpochId::new(2);
+    let second = chain_event_message(next_epoch, 2, vec![2]);
+    next_epoch.id = zinder_client::ChainEpochId::new(3);
+    let repeated = chain_event_message(next_epoch, 3, vec![1]);
 
     let endpoint = spawn_malformed_chain_event_service(vec![first, second, repeated]).await?;
     let client = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -890,7 +874,8 @@ where
     Ok(format!("http://{addr}"))
 }
 
-async fn spawn_wallet_query<QueryApi>(
+/// Serves the native adapter on an ephemeral loopback port.
+pub(super) async fn spawn_wallet_query<QueryApi>(
     grpc_adapter: WalletQueryGrpcAdapter<QueryApi>,
 ) -> eyre::Result<String>
 where

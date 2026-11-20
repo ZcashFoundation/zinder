@@ -967,11 +967,11 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        let mut progression = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
+        let mut progression = ChainEventStreamProgression::new();
         let stream = response.into_inner().map(move |event_result| {
             let event = event_result.map_err(|status| recovery.map_status(status))?;
             let envelope = chain_event_envelope_from_message(expected_network, event)?;
-            progression.validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
+            progression.validate(&envelope)?;
             Ok(envelope)
         });
 
@@ -2000,21 +2000,60 @@ fn validate_reorg_relationship(
             "reverted epoch must precede the committed epoch",
         ));
     }
-    if reverted.chain_epoch.settled_tip_height != committed.chain_epoch.settled_tip_height
-        || reverted.chain_epoch.settled_tip_hash != committed.chain_epoch.settled_tip_hash
-    {
+    if !preserves_settlement(&reverted.chain_epoch, &committed.chain_epoch) {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.chain_epoch.settled_tip",
-            "reorg must preserve the settled tip identity",
+            "settlement must preserve or advance the previous settled tip",
         ));
     }
-    if reverted.block_range.start <= committed.chain_epoch.settled_tip_height {
+    if reverted.block_range.start <= reverted.chain_epoch.settled_tip_height {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.block_range.start",
             "reorg range must begin above the settled tip",
         ));
     }
     Ok(())
+}
+
+fn preserves_settlement(previous: &ChainEpoch, next: &ChainEpoch) -> bool {
+    next.settled_tip_height > previous.settled_tip_height
+        || (next.settled_tip_height == previous.settled_tip_height
+            && next.settled_tip_hash == previous.settled_tip_hash)
+}
+
+struct ChainEventStreamProgression {
+    events: EventStreamProgression,
+    previous_epoch: Option<ChainEpoch>,
+}
+
+impl ChainEventStreamProgression {
+    fn new() -> Self {
+        Self {
+            events: EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS),
+            previous_epoch: None,
+        }
+    }
+
+    fn validate(&mut self, envelope: &ChainEventEnvelope) -> Result<(), IndexerError> {
+        if let Some(previous) = &self.previous_epoch {
+            if envelope.chain_epoch.id <= previous.id {
+                return Err(IndexerError::malformed(
+                    "chain_view.chain_epoch.chain_epoch_id",
+                    "chain event epochs must strictly increase",
+                ));
+            }
+            if !preserves_settlement(previous, &envelope.chain_epoch) {
+                return Err(IndexerError::malformed(
+                    "chain_view.chain_epoch.settled_tip",
+                    "settlement must preserve or advance the previous settled tip",
+                ));
+            }
+        }
+        self.events
+            .validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
+        self.previous_epoch = Some(envelope.chain_epoch);
+        Ok(())
+    }
 }
 
 // Retain every accepted cursor for this stream so a server cannot move the
@@ -3295,7 +3334,7 @@ mod tests {
                 hash: "55".repeat(32),
             });
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, settlement_changed).is_err());
+        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, settlement_changed).is_ok());
 
         let mut zero_epoch = committed_event_message(1, vec![1]);
         if let Some(chain_epoch) = zero_epoch
@@ -3306,6 +3345,65 @@ mod tests {
             chain_epoch.chain_epoch_id = 0;
         }
         assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, zero_epoch).is_err());
+    }
+
+    #[test]
+    fn reorg_may_settle_replacements_but_must_preserve_previously_settled_blocks()
+    -> Result<(), IndexerError> {
+        let envelope = chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
+        let ChainEvent::ChainReorged {
+            reverted,
+            mut committed,
+        } = envelope.event
+        else {
+            return Err(IndexerError::malformed("event", "expected a reorg"));
+        };
+        committed.chain_epoch.settled_tip_hash = BlockHash::from_bytes([0x55; 32]);
+        for (height, accepted) in [(39, false), (40, false), (41, true), (42, true)] {
+            committed.chain_epoch.settled_tip_height = BlockHeight::new(height);
+            assert_eq!(
+                validate_reorg_relationship(&reverted, &committed).is_ok(),
+                accepted
+            );
+        }
+        for start in [39, 40] {
+            let mut reverted = reverted;
+            reverted.block_range.start = BlockHeight::new(start);
+            committed.block_range.start = reverted.block_range.start;
+            assert!(validate_reorg_relationship(&reverted, &committed).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chain_event_stream_requires_increasing_epochs_and_monotonic_settlement()
+    -> Result<(), IndexerError> {
+        let mut state = ChainEventStreamProgression::new();
+        let mut first = chain_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            committed_event_message(1, vec![1]),
+        )?;
+        state.validate(&first)?;
+        first.event_sequence = 2;
+        first.cursor = ChainEventCursor::from_bytes([2]);
+        for (epoch, height, hash, accepted) in [
+            (7, 40, 0x22, false),
+            (6, 40, 0x22, false),
+            (8, 39, 0x33, false),
+            (8, 40, 0x33, false),
+            (8, 40, 0x22, true),
+        ] {
+            first.chain_epoch.id = ChainEpochId::new(epoch);
+            first.chain_epoch.settled_tip_height = BlockHeight::new(height);
+            first.chain_epoch.settled_tip_hash = BlockHash::from_bytes([hash; 32]);
+            assert_eq!(state.validate(&first).is_ok(), accepted);
+        }
+        first.event_sequence = 5;
+        first.cursor = ChainEventCursor::from_bytes([5]);
+        first.chain_epoch.id = ChainEpochId::new(11);
+        first.chain_epoch.settled_tip_height = BlockHeight::new(41);
+        first.chain_epoch.settled_tip_hash = BlockHash::from_bytes([0x33; 32]);
+        state.validate(&first)
     }
 
     #[test]

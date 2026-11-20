@@ -10,9 +10,8 @@ Each time `zinder-ingest` changes the canonical chain, it records one chain
 event in the same atomic write as the blocks. The event names the block range
 that was committed and, after a reorg, the range that was replaced. A client
 reads events in order and keeps an opaque cursor. After a disconnect, it sends
-the cursor back and receives exactly the events it has not seen. Events carry
-no block data; a client fetches what it needs through the other `WalletQuery`
-methods. See [Wallet data plane](wallet-data-plane.md).
+the cursor back to recover changes since that position. A client fetches block
+data through the other `WalletQuery` methods. See [Wallet data plane](wallet-data-plane.md).
 
 ## Event contents
 
@@ -54,7 +53,7 @@ your application's policy, at any depth between those two tips.
 
 | Start | Delivers |
 | --- | --- |
-| `after_cursor` | Every event after the cursor. Use it to resume. |
+| `after_cursor` | Changes since the saved position. Use it to resume. |
 | `earliest_retained` | Every event still retained, from the oldest. Use it to build state from scratch. |
 | `live_tail` | Only events committed after the subscription opens. |
 
@@ -82,22 +81,30 @@ last cursor you stored.
 
 The server resumes as follows:
 
-- When the cursor's block is still on the chain and later events are retained,
-  the stream continues with the next event.
-- When the cursor's block was replaced by a reorg that is still retained, the
-  stream continues with the next event, which includes that `ChainReorged`.
-- When the cursor's block was replaced and the reorg event has been pruned, the
-  server sends one synthesized `ChainReorged` first. Its `reverted` range runs
-  from just above the last block both chains share to the cursor's tip. Its
-  `committed` range runs from the same height to the current tip. The stream
-  then continues from the oldest retained event.
-- When the cursor is too old or none of its recorded blocks is still on the
-  chain, the request fails with `CHAIN_EVENT_CURSOR_EXPIRED`.
+- When the next unseen event is retained, the stream replays from that
+  sequence, including any retained reorgs.
+- When events are missing and a visible cursor's block has been replaced,
+  the server can send one synthesized `ChainReorged`. Its `reverted` range
+  starts just above a verified common block and ends at the cursor's tip.
+  Its `committed` range runs from the same height to the current visible tip.
+  The replacement can have settled in the meantime, so
+  `committed.chain_epoch.settled_tip` can advance past the common block.
+  Apply the replacement before discarding undo state through the new settled tip.
+- When events are missing and the cursor still points to the canonical chain,
+  or the server cannot establish a common block and a valid replacement range,
+  the request fails with `CHAIN_EVENT_CURSOR_EXPIRED`.
 
 A cursor carries up to 32 recorded blocks, most recent first and spaced further
-apart going back, so the server can find where the client's chain and the
-current chain split. The synthesized reorg's cursor points at that split. A
-client that disconnects before applying it receives the same reorg again.
+apart going back. If the matching block is below the cursor epoch's settled
+tip, the server verifies the settled block against the current chain and starts
+the replacement above it. Each delivered epoch advances, and settlement never
+moves backward or changes hash at the same height.
+
+The synthesized event carries the current event sequence and a cursor anchored
+at the current visible tip. It covers the retained changes through that tip.
+The stream continues only with later events. If you disconnect before applying
+the replacement, reconnect with your saved cursor and the server computes
+recovery against the tip it then serves.
 
 A `SETTLED` cursor whose block is no longer on the chain is always expired,
 because a settled stream never carries a reorg.
@@ -125,7 +132,7 @@ hours (seven days) by default, and prunes older ones without renumbering the
 rest. `0` disables pruning. Events that a running projector build has leased
 are kept. See [Configuration](../reference/configuration.md).
 
-A client that stays disconnected longer than the retention window gets
+If the server cannot recover a cursor after pruning, the client gets
 `CHAIN_EVENT_CURSOR_EXPIRED`. It must rebuild its state from Zinder's block and
 address queries and then open a new stream with `earliest_retained` or
 `live_tail`.
