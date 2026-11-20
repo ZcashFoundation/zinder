@@ -14,7 +14,8 @@
 //! its request, so open streams cannot exhaust memory. Once the listener's
 //! drain starts, open streams end, so they do not hold the drain open. A
 //! stream on the listener's status first sends `NOT_SERVING` unless that was
-//! its last message, and never sends `SERVING` after the drain starts.
+//! its last message, and drops any recovery it had not yet sent; a `SERVING`
+//! already being sent as the drain began can still precede it.
 
 use std::{
     pin::Pin,

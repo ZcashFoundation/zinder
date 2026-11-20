@@ -155,9 +155,10 @@ lists; `Check` has no such bound.
 On a termination signal the runtime publishes `shutting_down` before its
 listener drains, so `Check`, `Watch`, and `/readyz` report it together. When
 the drain starts, every open `Watch` stream ends. A stream on the listener's
-status first sends `NOT_SERVING` unless that was its last message, and never
-sends `SERVING` once the drain has started, so a balancer stops routing to
-the listener while it closes. A stream that reported `SERVICE_UNKNOWN` ends
+status first sends `NOT_SERVING` unless that was its last message, and
+drops any recovery it had not yet sent, so a balancer stops routing to the
+listener while it closes. A `SERVING` the stream was already sending as the
+drain began can still arrive just before that final `NOT_SERVING`. A stream that reported `SERVICE_UNKNOWN` ends
 without another message.
 
 A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
