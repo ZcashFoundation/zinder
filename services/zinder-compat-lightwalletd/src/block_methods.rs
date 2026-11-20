@@ -314,10 +314,11 @@ impl BlockMethods {
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        shape: CompactBlockShape,
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<BlockRangeResponse<Result<lightwalletd::CompactBlock, Status>>, Status> {
         let (block_range, is_descending) = block_range_from_request(request)?;
         let stream_slot = self.block_range_streams.open().await?;
+        let shape = select(&request.pool_types)?;
         let view = reads.capture_view().await?;
         reject_future_block_height(
             block_range.end,

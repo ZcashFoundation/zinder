@@ -44,7 +44,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    self, ChainMetadata, compact_tx_streamer_client::CompactTxStreamerClient,
     compact_tx_streamer_server::CompactTxStreamer,
 };
 
@@ -2007,10 +2007,9 @@ async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns() -
     Ok(())
 }
 
-/// Validation runs before a request takes a block-range stream slot, so a
-/// malformed request gets `INVALID_ARGUMENT` however many streams are open.
 #[tokio::test]
-async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -> eyre::Result<()> {
+async fn block_range_checks_bounds_before_admission_and_pool_sentinel_afterward() -> eyre::Result<()>
+{
     let store_fixture = acceptance_store_fixture()?;
     let recorder = EpochPinRecorder::new(store_fixture.query())
         .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
@@ -2030,26 +2029,29 @@ async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -
         "the open stream takes the only slot"
     );
 
-    for malformed in [
-        lightwalletd::BlockRange {
-            start: None,
-            ..block_range_request(1, 10)
-        },
-        lightwalletd::BlockRange {
-            pool_types: vec![999],
-            ..block_range_request(1, 10)
-        },
-    ] {
-        assert_eq!(
-            adapter
-                .get_block_range(Request::new(malformed))
-                .await
-                .err()
-                .map(|status| status.code()),
-            Some(Code::InvalidArgument),
-            "a malformed request at the limit must still be INVALID_ARGUMENT"
-        );
-    }
+    let invalid_pool = lightwalletd::BlockRange {
+        pool_types: vec![lightwalletd::PoolType::Invalid as i32],
+        ..block_range_request(1, 10)
+    };
+    assert_eq!(
+        adapter
+            .get_block_range(Request::new(invalid_pool.clone()))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::Unavailable),
+    );
+    assert_eq!(
+        adapter
+            .get_block_range(Request::new(lightwalletd::BlockRange {
+                start: None,
+                ..invalid_pool
+            }))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::InvalidArgument),
+    );
     assert_eq!(
         adapter
             .get_block_range_nullifiers(Request::new(lightwalletd::BlockRange {
@@ -2652,13 +2654,17 @@ async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::
                 height: 1,
                 hash: Vec::new(),
             }),
-            pool_types: vec![999],
+            pool_types: vec![99, 0],
         }))
         .await
     else {
-        return Err(eyre!("expected unknown-pool error, got a block stream"));
+        return Err(eyre!("expected invalid-pool error, got a block stream"));
     };
-    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.code(), Code::Unknown);
+    assert_eq!(
+        status.message(),
+        "GetBlockRange: invalid pool type requested"
+    );
 
     Ok(())
 }
@@ -2727,7 +2733,7 @@ async fn get_block_nullifiers_retains_transparent_only_shells_unlike_range_nulli
         return Err(eyre!("expected one block from GetBlockRangeNullifiers"));
     };
 
-    assert!(unary.chain_metadata.is_none());
+    assert_eq!(unary.chain_metadata, Some(ChainMetadata::default()));
     assert_eq!(
         unary.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
         vec![0, 1]
@@ -2861,7 +2867,7 @@ async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre
         let [block] = blocks.as_slice() else {
             return Err(eyre!("expected one block for {:?}", case.pool_types));
         };
-        assert!(block.chain_metadata.is_none());
+        assert_eq!(block.chain_metadata, Some(ChainMetadata::default()));
         let transactions: Vec<_> = block
             .vtx
             .iter()
@@ -2881,18 +2887,8 @@ async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre
                 }))
                 .await?
                 .into_inner();
-            assert_eq!(single.vtx, block.vtx);
+            assert_eq!(&single, block);
         }
-    }
-    for invalid in [lightwalletd::PoolType::Invalid as i32, 99] {
-        let request = lightwalletd::BlockRange {
-            pool_types: vec![lightwalletd::PoolType::Ironwood as i32, invalid],
-            ..block_range_request(1, 1)
-        };
-        let result = adapter
-            .get_block_range_nullifiers(Request::new(request))
-            .await;
-        assert!(matches!(result, Err(status) if status.code() == Code::InvalidArgument));
     }
     Ok(())
 }
@@ -2901,7 +2897,7 @@ async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre
 /// and has every excluded field cleared.
 fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre::Result<()> {
     assert!(
-        block.chain_metadata.is_none(),
+        block.chain_metadata == Some(ChainMetadata::default()),
         "nullifiers-only responses must omit commitment-tree sizes"
     );
     let transaction = block
