@@ -78,10 +78,10 @@ The template does four things:
 - It serves TLS on `:443` for the exact name, with your certificate, and
   offers only HTTP/2 (`alpn h2`), which gRPC needs. Its `auto_https off`
   setting turns off Caddy's own certificate management and HTTP redirects.
-- Before every new gRPC call, `forward_auth` sends `GET /readyz` to the
-  compatibility ops port. A 2xx response lets the call through. Any other
-  response goes back to the client instead. A not-ready runtime answers 503,
-  which a gRPC client reports as `UNAVAILABLE`.
+- Before every new gRPC call, `forward_auth` sends `HEAD /readyz` to the
+  compatibility ops port. A 2xx status lets the call through. Caddy returns
+  a refusing status to the client. A not-ready runtime answers 503, which a
+  gRPC client reports as `UNAVAILABLE`.
 - `reverse_proxy h2c://127.0.0.1:...` forwards admitted calls to the
   plaintext gRPC listener on loopback.
 - `header_up X-Zinder-Client-Address {http.request.remote}` names, on every
@@ -167,11 +167,17 @@ off, Zinder ignores the header.
 
 ## How readiness reaches wallets
 
-The readiness check runs once per call. It stops new calls while
-compatibility is not ready, for example during startup. It does not end a
-stream that has already started. Compatibility also checks its own readiness
-on every call, so a call that passes Caddy just as readiness drops still
-fails cleanly.
+Caddy checks readiness once per new call, using up to 16 connections to the
+ops listener. Further checks wait for a connection. Each connection can
+serve another check as soon as Caddy receives the status, even while the
+admitted wallet call is streaming. This leaves 48 of the
+listener's 64 connections available for other ops traffic. Caddy closes idle
+connections after 5 seconds, before the listener's 10-second idle deadline.
+
+The first check after readiness turns refusing stops the call at Caddy. If
+readiness changes after the check, compatibility checks it again before
+running the wallet RPC. An admitted block-range stream continues when
+readiness changes.
 
 A node outage does not drain compatibility; see
 [Readiness](../reference/readiness.md#during-a-node-outage).
