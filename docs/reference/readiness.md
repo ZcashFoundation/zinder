@@ -298,10 +298,11 @@ Two dependencies are reported under `degraded` instead of refusing traffic:
 
 | Input | Used by | When degraded |
 | --- | --- | --- |
-| `node_source` | Transaction broadcast | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
+| `node_source` | Transaction broadcast, and `GetStandardFee` in wallet-mode compatibility | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 
-A reader verifies each node endpoint before it broadcasts through it, as
+A reader verifies each node endpoint before it broadcasts through it or reads
+the recommended fee from it, as
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 describes.
 
@@ -341,7 +342,7 @@ unreachable.
 | --- | --- | --- | --- |
 | `zinder-ingest` | `node_unavailable` | Its private control API, including writer status. | Committing blocks. The chain tip stops advancing. |
 | `zinder-projector` | `ready` | Its last wallet state. | Nothing new to apply. |
-| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
+| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, and `GetStandardFee` in wallet-mode compatibility, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
 Watch `served_epoch_age_seconds` during an outage. It grows while the chain

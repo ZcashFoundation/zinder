@@ -127,13 +127,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn(
-            "running zinder-ingest, or broadcasting transactions from a reader",
+            "running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader",
         ),
         sensitive: false,
         description: "Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` \
                       and wallet-mode `zinder-compat-lightwalletd` broadcast transactions \
-                      through it and start without contacting it; without it they serve \
-                      storage only and advertise no broadcast. Compact-blocks compatibility \
+                      through it, compatibility also reads the recommended fee for \
+                      `GetStandardFee` through it, and both start without contacting it. \
+                      Without it they serve \
+                      storage only and advertise no broadcast, and compatibility answers \
+                      `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility \
                       rejects every `ZINDER_NODE__*` variable. Optional for \
                       `zinder-explorer`: without it the upstream-observation probe stays \
                       off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",

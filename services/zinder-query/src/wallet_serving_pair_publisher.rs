@@ -439,9 +439,9 @@ impl WalletServingReadiness {
     /// wallet serving share: the serving pair unadmitted, and the node source
     /// and ingest control as dependencies not yet observed.
     ///
-    /// Both runtimes call the node only to broadcast, and ingest control for
-    /// mempool reads and unmined transaction lookups, so each runs both
-    /// dependency probes.
+    /// Both runtimes call the node to broadcast, and compatibility also to
+    /// read the standard fee. Both call ingest control for mempool reads and
+    /// unmined transaction lookups, so each runs both dependency probes.
     #[must_use]
     pub fn with_node_and_ingest_control(runtime: Readiness) -> Self {
         Self::with_dependencies(

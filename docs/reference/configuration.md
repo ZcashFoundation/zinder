@@ -112,8 +112,10 @@ Each runtime uses `[node]` differently:
 
 - Ingest requires it.
 - Query and wallet-mode compatibility use it only to broadcast transactions
-  and, in compatibility, to read the recommended fee, for which a pruned node works. They start without contacting the node. Without `[node]` they serve stored
-  data and do not advertise broadcast. Any node setting requires
+  and, in compatibility, to read the recommended fee, for which a pruned node
+  works. They start without contacting the node. Without `[node]` they serve
+  stored data and do not advertise broadcast, and compatibility answers
+  `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires
   `node.json_rpc_addr`.
 - Explorer uses it only to report the node's tip in its freshness envelope.
 - The projector, and compatibility with `compat.serving = "compact-blocks"`,
@@ -156,7 +158,7 @@ not check descriptions or defaults.
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
-| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-ingest, or broadcasting transactions from a reader` | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast transactions through it and start without contacting it; without it they serve storage only and advertise no broadcast. Compact-blocks compatibility rejects every `ZINDER_NODE__*` variable. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader` | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast transactions through it, compatibility also reads the recommended fee for `GetStandardFee` through it, and both start without contacting it. Without it they serve storage only and advertise no broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility rejects every `ZINDER_NODE__*` variable. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
 | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read at startup and whenever an indexer stream reconnects. |
 | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node.indexer_tls.client_cert_path` | PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. |
