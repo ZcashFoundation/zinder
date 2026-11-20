@@ -376,7 +376,7 @@ impl PublicationContext {
             self.build_plan.reorg_policy(),
         );
         let (admitted_database_identity, admitted_control, _) =
-            admit_existing_store(&self.store_path, &expectation)?;
+            admit_existing_store(&self.store_path, &expectation, self.resource_budget)?;
         if admitted_database_identity.as_slice() != built_database_identity
             || admitted_control != expected_control
         {

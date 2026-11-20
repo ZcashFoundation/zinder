@@ -15,7 +15,7 @@ use rust_rocksdb::{
 use crate::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
-const SECONDARY_MAX_FILE_OPENING_THREADS: i32 = 1;
+const NON_PRIMARY_MAX_FILE_OPENING_THREADS: i32 = 1;
 
 /// Filesystem I/O mode of a `RocksDB` instance: the mode a resource budget
 /// requests, or the mode an open resolved to.
@@ -45,6 +45,7 @@ impl RocksDbIoMode {
 enum RocksDbOpenPosture {
     Primary,
     Secondary,
+    ReadOnlyProbe,
 }
 
 impl RocksDbOpenPosture {
@@ -54,14 +55,14 @@ impl RocksDbOpenPosture {
     ) -> Option<i32> {
         match self {
             Self::Primary => Some(resource_budget.max_background_jobs),
-            Self::Secondary => None,
+            Self::Secondary | Self::ReadOnlyProbe => None,
         }
     }
 
     const fn effective_max_file_opening_threads(self) -> Option<i32> {
         match self {
             Self::Primary => None,
-            Self::Secondary => Some(SECONDARY_MAX_FILE_OPENING_THREADS),
+            Self::Secondary | Self::ReadOnlyProbe => Some(NON_PRIMARY_MAX_FILE_OPENING_THREADS),
         }
     }
 }
@@ -279,6 +280,12 @@ pub enum RocksDbOpenRole<'path> {
         /// Reader-local secondary metadata path.
         secondary_path: &'path Path,
     },
+    /// Short-lived read-only admission probe opening an existing store path
+    /// without creating files or acquiring a writer lock.
+    ReadOnlyProbe {
+        /// Existing store path inspected read-only.
+        path: &'path Path,
+    },
 }
 
 impl<'path> RocksDbOpenRole<'path> {
@@ -287,12 +294,15 @@ impl<'path> RocksDbOpenRole<'path> {
             Self::Primary { .. } => "primary",
             Self::ExistingPrimary { .. } => "existing_primary",
             Self::Secondary { .. } => "secondary",
+            Self::ReadOnlyProbe { .. } => "read_only_probe",
         }
     }
 
     const fn store_path(self) -> &'path Path {
         match self {
-            Self::Primary { path } | Self::ExistingPrimary { path } => path,
+            Self::Primary { path }
+            | Self::ExistingPrimary { path }
+            | Self::ReadOnlyProbe { path } => path,
             Self::Secondary { primary_path, .. } => primary_path,
         }
     }
@@ -305,6 +315,16 @@ impl<'path> RocksDbOpenRole<'path> {
         match self {
             Self::Primary { .. } | Self::ExistingPrimary { .. } => RocksDbOpenPosture::Primary,
             Self::Secondary { .. } => RocksDbOpenPosture::Secondary,
+            Self::ReadOnlyProbe { .. } => RocksDbOpenPosture::ReadOnlyProbe,
+        }
+    }
+
+    const fn effective_block_cache_bytes(self, budget: RocksDbResourceBudget) -> u64 {
+        match self {
+            Self::Primary { .. } | Self::ExistingPrimary { .. } | Self::Secondary { .. } => {
+                budget.block_cache_bytes
+            }
+            Self::ReadOnlyProbe { .. } => RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES,
         }
     }
 }
@@ -375,11 +395,14 @@ pub fn open_bounded_rocksdb(
         budget: rocksdb_resource_budget,
         shared_block_cache,
     } = resources.into();
-    if let RocksDbOpenRole::ExistingPrimary { path } = role {
-        DB::list_cf(&Options::default(), path)?;
+    if matches!(
+        role,
+        RocksDbOpenRole::ExistingPrimary { .. } | RocksDbOpenRole::ReadOnlyProbe { .. }
+    ) {
+        DB::list_cf(&Options::default(), role.store_path())?;
     }
     let block_cache = shared_block_cache.map_or_else(
-        || build_block_cache(rocksdb_resource_budget.block_cache_bytes),
+        || build_block_cache(role.effective_block_cache_bytes(rocksdb_resource_budget)),
         |shared| shared.cache,
     );
     let write_buffer_manager =
@@ -400,6 +423,45 @@ pub fn open_bounded_rocksdb(
         io_mode,
         statistics: Arc::new(statistics),
     })
+}
+
+/// Opens an existing `RocksDB` store read-only for a short-lived admission
+/// probe, bounding open files, block cache, and direct reads.
+///
+/// Every column family in `column_family_names` opens with a
+/// [`build_block_based_table_factory`] descriptor bound to the probe's block
+/// cache so index and filter blocks charge against that cache instead of
+/// accumulating in uncached table-reader memory. When `resources` do not
+/// supply a [`SharedBlockCache`], the probe allocates a block cache of
+/// [`RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES`] (4 MiB) rather than the
+/// caller's full writer or reader cache. Table-file opens are serialized to
+/// one thread and capped by `max_open_files`, and direct reads fall back to
+/// buffered I/O when the filesystem rejects direct I/O.
+pub fn open_bounded_rocksdb_read_only_probe<S>(
+    path: &Path,
+    column_family_names: &[S],
+    resources: impl Into<RocksDbOpenResources>,
+) -> Result<BoundedRocksDbOpen, rust_rocksdb::Error>
+where
+    S: AsRef<str>,
+{
+    open_bounded_rocksdb(
+        RocksDbOpenRole::ReadOnlyProbe { path },
+        resources,
+        |cache, _| {
+            column_family_names
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|name| *name != DEFAULT_COLUMN_FAMILY_NAME)
+                .map(|name| {
+                    let mut options = Options::default();
+                    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+                    keep_blocks_of_dropped_table_files(&mut options);
+                    ColumnFamilyDescriptor::new(name, options)
+                })
+                .collect()
+        },
+    )
 }
 
 fn open_with_preferred_io_mode<BuildColumnFamilies>(
@@ -456,10 +518,12 @@ where
             open_attempt.block_cache,
             false,
         ),
-        RocksDbOpenRole::Secondary { .. } => build_secondary_db_options(
-            open_attempt.rocksdb_resource_budget,
-            open_attempt.block_cache,
-        ),
+        RocksDbOpenRole::Secondary { .. } | RocksDbOpenRole::ReadOnlyProbe { .. } => {
+            build_secondary_db_options(
+                open_attempt.rocksdb_resource_budget,
+                open_attempt.block_cache,
+            )
+        }
     };
     if let Some(max_background_jobs) = open_attempt
         .role
@@ -510,6 +574,9 @@ where
             secondary_path,
             column_families,
         ),
+        RocksDbOpenRole::ReadOnlyProbe { path } => {
+            DB::open_cf_descriptors_read_only(&db_options, path, column_families, false)
+        }
     }?;
     Ok((db, db_options))
 }
@@ -1136,6 +1203,9 @@ mod tests {
             primary_path: Path::new("primary"),
             secondary_path: Path::new("secondary"),
         };
+        let probe_open = RocksDbOpenRole::ReadOnlyProbe {
+            path: Path::new("primary"),
+        };
         assert_eq!(
             primary_open
                 .open_posture()
@@ -1150,6 +1220,12 @@ mod tests {
         );
         assert_eq!(
             secondary_open
+                .open_posture()
+                .effective_max_background_jobs(budget),
+            None
+        );
+        assert_eq!(
+            probe_open
                 .open_posture()
                 .effective_max_background_jobs(budget),
             None
@@ -1188,6 +1264,9 @@ mod tests {
             primary_path: Path::new("primary"),
             secondary_path: Path::new("secondary"),
         };
+        let probe_open = RocksDbOpenRole::ReadOnlyProbe {
+            path: Path::new("primary"),
+        };
 
         assert_eq!(
             primary_open
@@ -1203,6 +1282,12 @@ mod tests {
         );
         assert_eq!(
             secondary_open
+                .open_posture()
+                .effective_max_file_opening_threads(),
+            Some(1)
+        );
+        assert_eq!(
+            probe_open
                 .open_posture()
                 .effective_max_file_opening_threads(),
             Some(1)
@@ -1474,6 +1559,162 @@ mod tests {
             |_, _| Vec::new(),
         )?;
         assert_eq!(bounded_open.io_mode, RocksDbIoMode::Buffered);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_probe_never_creates_a_missing_store() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let path = temporary.path().join("missing-probe-store");
+        let outcome = open_bounded_rocksdb_read_only_probe(
+            &path,
+            &[DEFAULT_COLUMN_FAMILY_NAME],
+            RocksDbResourceBudget::read_only_probe_defaults(),
+        );
+        assert!(outcome.is_err());
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_probe_uses_minimum_cache_unless_shared_cache_is_supplied()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        {
+            let primary = open_rows_primary(store_dir.path())?;
+            write_row(&primary, 9)?;
+        }
+        let column_families = DB::list_cf(&Options::default(), store_dir.path())?;
+        let writer_budget = RocksDbResourceBudget::canonical_writer_defaults();
+        let private_probe = open_bounded_rocksdb_read_only_probe(
+            store_dir.path(),
+            &column_families,
+            writer_budget,
+        )?;
+        assert_eq!(
+            usize_to_u64(private_probe.block_cache.get_capacity()),
+            RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES
+        );
+        drop(private_probe);
+
+        let local_budget = RocksDbResourceBudget::for_local_tests();
+        let shared = SharedBlockCache::new(local_budget.block_cache_bytes);
+        let shared_probe = open_bounded_rocksdb_read_only_probe(
+            store_dir.path(),
+            &column_families,
+            RocksDbOpenResources::with_shared_block_cache(local_budget, &shared),
+        )?;
+        assert_eq!(
+            usize_to_u64(shared_probe.block_cache.get_capacity()),
+            shared.capacity_bytes()
+        );
+        let cached_before = shared.usage_bytes();
+        assert_eq!(
+            read_row(&shared_probe)??,
+            Some(vec![9; ISOLATION_ROW_BYTES])
+        );
+        assert!(shared.usage_bytes() >= cached_before + u64::try_from(ISOLATION_ROW_BYTES)?);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_probe_buffered_preference_skips_direct_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        {
+            let primary = open_rows_primary(store_dir.path())?;
+            write_row(&primary, 3)?;
+        }
+        let column_families = DB::list_cf(&Options::default(), store_dir.path())?;
+        let mut budget = RocksDbResourceBudget::read_only_probe_defaults();
+        budget.preferred_io_mode = RocksDbIoMode::Buffered;
+        let probe =
+            open_bounded_rocksdb_read_only_probe(store_dir.path(), &column_families, budget)?;
+        assert_eq!(probe.io_mode, RocksDbIoMode::Buffered);
+        Ok(())
+    }
+
+    fn build_store_with_many_ssts(
+        path: &Path,
+        payload_table_count: u32,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let primary = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path },
+            RocksDbResourceBudget::for_local_tests(),
+            |cache, _| {
+                let mut options = Options::default();
+                options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+                options.set_disable_auto_compactions(true);
+                vec![ColumnFamilyDescriptor::new("payload", options)]
+            },
+        )?;
+        primary.db.put(b"control", b"ready")?;
+        primary.db.flush()?;
+        let payload_cf = primary.db.cf_handle("payload").ok_or("payload must open")?;
+        let mut flush = rust_rocksdb::FlushOptions::default();
+        flush.set_allow_write_stall(true);
+        for batch_index in 0..payload_table_count {
+            for row_offset in 0_u32..8 {
+                let key = (batch_index * 8 + row_offset).to_be_bytes();
+                primary.db.put_cf(&payload_cf, key, vec![0x5A_u8; 2048])?;
+            }
+            primary.db.flush_cf_opt(&payload_cf, &flush)?;
+        }
+        drop(payload_cf);
+        drop(primary);
+        Ok(table_file_names(path)?.len())
+    }
+
+    #[test]
+    fn read_only_probe_bounds_table_opens_and_table_reader_memory_when_ssts_exceed_max_open_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let probe_budget = RocksDbResourceBudget::read_only_probe_defaults();
+        let payload_table_count = u32::try_from(probe_budget.max_open_files)? + 16;
+        let sst_count = build_store_with_many_ssts(store_dir.path(), payload_table_count)?;
+        assert!(sst_count > usize::try_from(probe_budget.max_open_files)?);
+
+        let column_families = DB::list_cf(&Options::default(), store_dir.path())?;
+        let bounded_probe =
+            open_bounded_rocksdb_read_only_probe(store_dir.path(), &column_families, probe_budget)?;
+        assert_eq!(bounded_probe.db.get(b"control")?, Some(b"ready".to_vec()));
+        let bounded_file_opens = bounded_probe
+            .statistics
+            .get_ticker_count(Ticker::NoFileOpens);
+        let bounded_table_reader_bytes = bounded_probe.instance_memory().table_reader_bytes;
+        assert!(bounded_file_opens > 0);
+        assert!(
+            bounded_file_opens < u64::try_from(probe_budget.max_open_files)?,
+            "bounded probe opened {bounded_file_opens} tables with max_open_files={} across {sst_count} SSTs",
+            probe_budget.max_open_files
+        );
+        drop(bounded_probe);
+
+        let mut unbounded_options = Options::default();
+        unbounded_options.enable_statistics();
+        let unbounded_db = DB::open_cf_for_read_only(
+            &unbounded_options,
+            store_dir.path(),
+            &column_families,
+            false,
+        )?;
+        let unbounded_file_opens = unbounded_options.get_ticker_count(Ticker::NoFileOpens);
+        let unbounded_table_reader_bytes = column_families
+            .iter()
+            .filter_map(|name| unbounded_db.cf_handle(name))
+            .filter_map(|handle| {
+                unbounded_db
+                    .property_int_value_cf(&handle, TABLE_READERS_MEMORY_PROPERTY)
+                    .ok()
+                    .flatten()
+            })
+            .fold(0_u64, u64::saturating_add);
+        assert!(unbounded_file_opens >= u64::from(payload_table_count));
+        assert!(bounded_file_opens < unbounded_file_opens);
+        assert!(
+            bounded_table_reader_bytes < unbounded_table_reader_bytes,
+            "bounded table_reader_bytes={bounded_table_reader_bytes} must stay below unbounded={unbounded_table_reader_bytes}"
+        );
         Ok(())
     }
 

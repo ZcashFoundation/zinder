@@ -278,6 +278,11 @@ store's size on disk does not raise process memory beyond these caps.
 | Canonical reader | 1/8 of the container memory limit, from 128 to 512 MiB | 32 MiB | 128 to 256, scaled with the block cache | 16 MiB |
 | Wallet and materialized-view writer | 256 MiB | 256 MiB | 512 | 512 MiB |
 | Wallet and materialized-view reader | 64 MiB | 16 MiB | 64 | 16 MiB |
+| Read-only admission probe | 4 MiB (or caller's shared cache) | — | 32 (or caller's budget) | — |
+
+Read-only admission probes open existing stores through the same bounded open
+path with single-threaded table-file opens, index and filter blocks charged to
+the probe cache, and direct reads with buffered fallback.
 
 You can override any field in `[storage.canonical.rocksdb]`,
 `[storage.materialized_views.rocksdb]`, or `[wallet.rocksdb]`. The
@@ -287,9 +292,10 @@ the [metrics reference](../reference/metrics.md) lists them.
 
 ## Schema admission
 
-Every open validates the store before it returns a handle. The open fails
-without changing anything when any of these differ from what the process
-expects:
+Every open validates the store before it returns a handle. Existing canonical and materialized-view stores use a bounded
+read-only probe before a primary opens for writes. Their secondaries validate
+through the bounded secondary handle. The open fails without changing anything when any of these
+differ from what the process expects:
 
 - the store identity or layout version;
 - the network;

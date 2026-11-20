@@ -228,6 +228,27 @@ impl RocksDbResourceBudget {
         Self::materialized_view_reader_defaults()
     }
 
+    /// Minimal bounded defaults for short-lived read-only admission probes.
+    ///
+    /// `4 MiB` block cache and `32` open file handles keep admission probes
+    /// bounded independently of store size while reading only store control,
+    /// epoch-tip, or manifest metadata. Primary-only write fields stay at their
+    /// minimum valid values and are not applied to read-only opens.
+    #[must_use]
+    pub const fn read_only_probe_defaults() -> Self {
+        Self {
+            block_cache_bytes: Self::MIN_BLOCK_CACHE_BYTES,
+            max_wal_bytes: Self::MIN_MAX_WAL_BYTES,
+            max_open_files: Self::MIN_MAX_OPEN_FILES,
+            write_buffer_bytes: Self::MIN_WRITE_BUFFER_BYTES,
+            max_write_buffer_count: Self::MIN_MAX_WRITE_BUFFER_COUNT,
+            max_background_jobs: Self::MIN_MAX_BACKGROUND_JOBS,
+            memtable_budget_bytes: Self::MIN_MEMTABLE_BUDGET_BYTES,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
+    }
+
     /// Defaults for throwaway local test stores.
     ///
     /// `32 MiB` block cache, `16 MiB` WAL ceiling, `64` open file handles,
@@ -444,6 +465,21 @@ mod tests {
     }
 
     #[test]
+    fn read_only_probe_defaults_are_valid_and_use_minimum_bounds() {
+        let budget = RocksDbResourceBudget::read_only_probe_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(
+            budget.block_cache_bytes,
+            RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES
+        );
+        assert_eq!(
+            budget.max_open_files,
+            RocksDbResourceBudget::MIN_MAX_OPEN_FILES
+        );
+        assert_eq!(budget.preferred_io_mode, RocksDbIoMode::Direct);
+    }
+
+    #[test]
     fn every_default_budget_preserves_two_background_jobs() {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
@@ -452,6 +488,7 @@ mod tests {
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
             RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::read_only_probe_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.max_background_jobs, 2);
@@ -476,6 +513,7 @@ mod tests {
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
             RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::read_only_probe_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.statistics_level, RocksDbStatisticsLevel::Tickers);

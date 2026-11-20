@@ -488,3 +488,55 @@ fn secondary_open_rejects_unknown_manifest_consumer() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn secondary_open_rejects_physical_column_family_drift_through_open_handle() -> Result<()> {
+    let missing_cf_primary = TempDir::new()?;
+    let missing_cf_secondary = TempDir::new()?;
+    open(missing_cf_primary.path(), ONLY_A_V1)?;
+    {
+        let names = rust_rocksdb::DB::list_cf(
+            &rust_rocksdb::Options::default(),
+            missing_cf_primary.path(),
+        )?;
+        let db = rust_rocksdb::DB::open_cf(
+            &rust_rocksdb::Options::default(),
+            missing_cf_primary.path(),
+            names,
+        )?;
+        db.drop_cf(CONSUMER_A_CF)?;
+    }
+    let missing_outcome = MaterializedViewStore::open_secondary(
+        missing_cf_primary.path(),
+        missing_cf_secondary.path(),
+        options(ONLY_A_V1),
+    );
+    assert!(matches!(
+        missing_outcome,
+        Err(MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. })
+    ));
+
+    let orphan_cf_primary = TempDir::new()?;
+    let orphan_cf_secondary = TempDir::new()?;
+    open(orphan_cf_primary.path(), ONLY_A_V1)?;
+    {
+        let names =
+            rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), orphan_cf_primary.path())?;
+        let db = rust_rocksdb::DB::open_cf(
+            &rust_rocksdb::Options::default(),
+            orphan_cf_primary.path(),
+            names,
+        )?;
+        db.create_cf("orphan_consumer_rows", &rust_rocksdb::Options::default())?;
+    }
+    let orphan_outcome = MaterializedViewStore::open_secondary(
+        orphan_cf_primary.path(),
+        orphan_cf_secondary.path(),
+        options(ONLY_A_V1),
+    );
+    assert!(matches!(
+        orphan_outcome,
+        Err(MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. })
+    ));
+    Ok(())
+}

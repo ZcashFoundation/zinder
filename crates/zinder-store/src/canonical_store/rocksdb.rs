@@ -14,6 +14,7 @@ use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
     build_block_based_table_factory, keep_blocks_of_dropped_table_files,
     kv::build_uncached_block_based_table_factory, open_bounded_rocksdb,
+    open_bounded_rocksdb_read_only_probe,
 };
 
 use super::{
@@ -617,7 +618,7 @@ impl RocksDbCanonicalStore {
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
         let (admitted_database_identity, admitted_control, admitted_subtree_root_coverage) =
-            admit_existing_store(&store_path, expectation)?;
+            admit_existing_store(&store_path, expectation, resource_budget)?;
         let (CanonicalStoreBuildState::Ready(admitted_ready_evidence), Some(subtree_root_coverage)) =
             (admitted_control.build_state, admitted_subtree_root_coverage)
         else {
@@ -850,10 +851,15 @@ impl RocksDbCanonicalStore {
             )
         })?;
         validate_exact_column_families(path, &column_families)?;
-        let db = DB::open_cf_for_read_only(&Options::default(), path, &column_families, false)
-            .map_err(|source| {
-                CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
-            })?;
+        let bounded_open = open_bounded_rocksdb_read_only_probe(
+            path,
+            &column_families,
+            RocksDbResourceBudget::read_only_probe_defaults(),
+        )
+        .map_err(|source| {
+            CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
+        })?;
+        let db = &bounded_open.db;
         let encoded_control = db
             .get(STORE_CONTROL_KEY)
             .map_err(|source| CanonicalStoreError::RocksDbOperation {
@@ -865,7 +871,7 @@ impl RocksDbCanonicalStore {
         let CanonicalStoreBuildState::Ready(ready_evidence) = control.build_state else {
             return Ok(None);
         };
-        let (visible_tip, settled_tip) = read_chain_epoch_tips(&db, ready_evidence.visible_epoch)?;
+        let (visible_tip, settled_tip) = read_chain_epoch_tips(db, ready_evidence.visible_epoch)?;
         if visible_tip != ready_evidence.visible_tip {
             return Err(CanonicalStoreError::admission(
                 path,
@@ -873,7 +879,7 @@ impl RocksDbCanonicalStore {
             ));
         }
         Ok(Some(CanonicalReadyStoreSummary {
-            admitted_activations: read_admitted_schedule(&db, path, &control)?
+            admitted_activations: read_admitted_schedule(db, path, &control)?
                 .map(|schedule| schedule.activations().clone()),
             construction_activations_fingerprint: control
                 .build_plan
@@ -1080,14 +1086,16 @@ pub(super) fn initialize_store_identity(
     workload: CanonicalStoreWorkload,
     build_plan: &super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    resource_budget: RocksDbResourceBudget,
 ) -> Result<(), CanonicalStoreError> {
-    let mut database_options = Options::default();
-    database_options.create_if_missing(true);
-    let db = DB::open(&database_options, path).map_err(|source| {
-        CanonicalStoreError::RocksDbOperation {
-            operation: "identity open",
-            source,
-        }
+    let bounded_open = open_bounded_rocksdb(
+        RocksDbOpenRole::Primary { path },
+        resource_budget,
+        |_, _| Vec::new(),
+    )
+    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+        operation: "identity open",
+        source,
     })?;
     let mut batch = WriteBatch::default();
     let encoded_control = encode_building_store_control(workload, build_plan, cursor_auth_key)
@@ -1096,7 +1104,9 @@ pub(super) fn initialize_store_identity(
     let mut options = WriteOptions::default();
     options.disable_wal(false);
     options.set_sync(true);
-    db.write_opt(&batch, &options)
+    bounded_open
+        .db
+        .write_opt(&batch, &options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "identity initialization",
             source,
@@ -1106,6 +1116,7 @@ pub(super) fn initialize_store_identity(
 pub(super) fn admit_existing_store(
     path: &Path,
     expectation: &CanonicalStoreAdmissionExpectation,
+    resource_budget: RocksDbResourceBudget,
 ) -> Result<
     (
         Vec<u8>,
@@ -1118,11 +1129,14 @@ pub(super) fn admit_existing_store(
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
     })?;
     validate_exact_column_families(path, &column_families)?;
-    let db = DB::open_cf_for_read_only(&Options::default(), path, &column_families, false)
-        .map_err(|source| {
-            CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
-        })?;
-    let control = validate_open_store_control(&db, path, expectation)?;
+    let bounded_open =
+        open_bounded_rocksdb_read_only_probe(path, &column_families, resource_budget).map_err(
+            |source| {
+                CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
+            },
+        )?;
+    let db = &bounded_open.db;
+    let control = validate_open_store_control(db, path, expectation)?;
     let subtree_root_coverage = match control.build_state {
         CanonicalStoreBuildState::Ready(ready) => Some(validate_ready_construction_manifest(
             path,
@@ -1132,7 +1146,7 @@ pub(super) fn admit_existing_store(
         )?),
         CanonicalStoreBuildState::Building => None,
     };
-    validate_mempool_lifecycle_admission(&db, control.network, control.cursor_auth_key)?;
+    validate_mempool_lifecycle_admission(db, control.network, control.cursor_auth_key)?;
     let database_identity = db.get_db_identity().map_err(|source| {
         CanonicalStoreError::admission(path, format!("database identity read failed: {source}"))
     })?;
@@ -1676,6 +1690,39 @@ mod tests {
                 .iter()
                 .any(|family| family == TRANSACTION_BLOB_COLUMN_FAMILY)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn read_ready_summary_returns_none_for_absent_path_and_refuses_missing_family()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let missing_path = temporary.path().join("absent-canonical");
+        assert_eq!(
+            RocksDbCanonicalStore::read_ready_summary(&missing_path)?,
+            None
+        );
+
+        let broken_path = temporary.path().join("missing-family-summary");
+        let store = RocksDbCanonicalBuilder::create_fresh(
+            &broken_path,
+            CanonicalStoreWorkload::Explorer,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        drop(store);
+        let column_families = DB::list_cf(&Options::default(), &broken_path)?;
+        let db = DB::open_cf(&Options::default(), &broken_path, &column_families)?;
+        db.drop_cf(TRANSACTION_BLOB_COLUMN_FAMILY)?;
+        drop(db);
+
+        let error = RocksDbCanonicalStore::read_ready_summary(&broken_path)
+            .err()
+            .ok_or("missing required family should fail summary probe")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::AdmissionRefused { .. }
+        ));
         Ok(())
     }
 
