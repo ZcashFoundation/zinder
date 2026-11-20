@@ -82,8 +82,8 @@ impl RocksDbCanonicalSecondary {
         let mut envelopes = Vec::new();
         for sequence in start_sequence..=self.ready_evidence.visible_event_sequence {
             let event = read_retained_event_from_db(&self.bounded_open.db, sequence)?;
-            if self.wallet_event_matches_family(event, family)? {
-                envelopes.push(self.wallet_event_envelope(event, family)?);
+            if let Some(envelope) = self.wallet_event_envelope(event, family)? {
+                envelopes.push(envelope);
                 if envelopes.len() == max_events.get() as usize {
                     break;
                 }
@@ -209,57 +209,49 @@ impl RocksDbCanonicalSecondary {
         ))
     }
 
-    fn wallet_event_matches_family(
-        &self,
-        event: CanonicalRetainedEvent,
-        family: ChainEventStreamFamily,
-    ) -> Result<bool, CanonicalStoreError> {
-        if family == ChainEventStreamFamily::Visible {
-            return Ok(true);
-        }
-        let epoch = self.chain_epoch_at(event.resulting_epoch_id())?;
-        Ok(event.kind() == CanonicalEventKind::Committed
-            && epoch.visible_tip_height <= epoch.settled_tip_height)
-    }
-
     fn wallet_event_envelope(
         &self,
         event: CanonicalRetainedEvent,
         family: ChainEventStreamFamily,
-    ) -> Result<ChainEventEnvelope, CanonicalStoreError> {
+    ) -> Result<Option<ChainEventEnvelope>, CanonicalStoreError> {
         let chain_epoch = self.chain_epoch_at(event.resulting_epoch_id())?;
-        let committed = ChainEpochCommitted::new(chain_epoch, event.committed_range());
-        let wallet_event = match event.kind() {
-            CanonicalEventKind::Committed => ChainEvent::ChainCommitted { committed },
-            CanonicalEventKind::Reorged => {
-                let previous_epoch_id = event.previous_epoch_id().ok_or_else(|| {
-                    CanonicalStoreError::CanonicalEventRecordMalformed {
-                        event_sequence: event.cursor().event_sequence(),
-                        reason: "reorg event has no previous epoch",
-                    }
-                })?;
-                let previous_epoch = self.chain_epoch_at(previous_epoch_id)?;
-                let reverted_range = event.reverted_range().ok_or_else(|| {
-                    CanonicalStoreError::CanonicalEventRecordMalformed {
-                        event_sequence: event.cursor().event_sequence(),
-                        reason: "reorg event has no reverted range",
-                    }
-                })?;
-                ChainEvent::ChainReorged {
-                    reverted: ChainRangeReverted::new(previous_epoch, reverted_range),
-                    committed,
+        let wallet_event = match family {
+            ChainEventStreamFamily::Visible => {
+                let reverted_epoch = match event.kind() {
+                    CanonicalEventKind::Committed => None,
+                    CanonicalEventKind::Reorged => event
+                        .previous_epoch_id()
+                        .map(|id| self.chain_epoch_at(id))
+                        .transpose()?,
+                };
+                ChainEvent::from_canonical_retained(event, chain_epoch, reverted_epoch)?
+            }
+            ChainEventStreamFamily::Settled => {
+                let start = match event.previous_epoch_id() {
+                    Some(id) => self.chain_epoch_at(id)?.settled_tip_height.next(),
+                    None => Some(event.committed_range().start),
+                };
+                let Some(start) = start.filter(|height| *height <= chain_epoch.settled_tip_height)
+                else {
+                    return Ok(None);
+                };
+                ChainEvent::ChainCommitted {
+                    committed: ChainEpochCommitted::new(
+                        chain_epoch,
+                        BlockHeightRange::inclusive(start, chain_epoch.settled_tip_height),
+                    ),
                 }
             }
         };
         let event_sequence = event.cursor().event_sequence();
         let cursor = self.mint_wallet_event_cursor(chain_epoch, family, event_sequence)?;
-        Ok(ChainEventEnvelope::new(
+        Ok(Some(ChainEventEnvelope::new(
             cursor,
             event_sequence,
             chain_epoch,
             chain_epoch.settled_tip_height,
             wallet_event,
-        ))
+        )))
     }
 
     fn mint_wallet_event_cursor(
@@ -268,17 +260,25 @@ impl RocksDbCanonicalSecondary {
         family: ChainEventStreamFamily,
         event_sequence: u64,
     ) -> Result<StreamCursorTokenV1, CanonicalStoreError> {
-        let tip = ChainEventCursorAnchor {
-            height: chain_epoch.visible_tip_height,
-            hash: chain_epoch.visible_tip_hash,
+        let tip = match family {
+            ChainEventStreamFamily::Visible => ChainEventCursorAnchor {
+                height: chain_epoch.visible_tip_height,
+                hash: chain_epoch.visible_tip_hash,
+            },
+            ChainEventStreamFamily::Settled => ChainEventCursorAnchor {
+                height: chain_epoch.settled_tip_height,
+                hash: chain_epoch.settled_tip_hash,
+            },
         };
         let mut entries = vec![tip];
         for height in locator_heights(tip.height).into_iter().skip(1) {
-            if let Some(hash) = first_displaced_block_hash_after_event(
-                &self.bounded_open.db,
-                event_sequence,
-                height,
-            )? {
+            if family == ChainEventStreamFamily::Visible
+                && let Some(hash) = first_displaced_block_hash_after_event(
+                    &self.bounded_open.db,
+                    event_sequence,
+                    height,
+                )?
+            {
                 entries.push(ChainEventCursorAnchor { height, hash });
             } else if let Some(header) = self.block_header_at(height)? {
                 entries.push(ChainEventCursorAnchor {

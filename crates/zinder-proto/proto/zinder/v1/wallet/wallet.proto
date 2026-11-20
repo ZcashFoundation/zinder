@@ -838,8 +838,11 @@ message BroadcastTransactionResponse {
   }
 }
 
-// Chain-event stream family. Visible receives every chain event. Settled
-// receives only non-reorg commits entirely at or below the settled tip.
+// Visible receives every canonical transition. Settled receives one
+// ChainCommitted for each advance of the settled tip. Its inclusive range
+// starts just above the previous settled tip (at the first stored height
+// for the baseline) and ends at the new settled tip. Its cursor is anchored
+// at that settled block. Settled never receives ChainReorged.
 enum ChainEventStreamFamily {
   CHAIN_EVENT_STREAM_FAMILY_VISIBLE = 0;
   CHAIN_EVENT_STREAM_FAMILY_SETTLED = 1;
@@ -1525,7 +1528,9 @@ service WalletQuery {
   // UNAVAILABLE and `BROADCAST_BUDGET_EXHAUSTED`.
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 
-  // Stream replayable chain events.
+  // Stream replayable chain events. From contract revision 12, a subscription
+  // whose resolved family is Settled carries initial gRPC metadata
+  // `zinder-chain-event-family: settled`, including when resuming from a cursor.
   rpc ChainEvents(ChainEventsRequest) returns (stream ChainEventEnvelope);
 
   // Return a bounded snapshot of the live mempool index.

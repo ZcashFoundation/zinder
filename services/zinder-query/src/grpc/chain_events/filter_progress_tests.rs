@@ -6,10 +6,11 @@ use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_core::{
-    BlockHeight, Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentUnspentOutput,
+    BlockHeight, BlockId, Network, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as _};
+use zinder_proto::wire::CHAIN_EVENT_FAMILY_HEADER;
 use zinder_store::{
     DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, StreamCursorTokenV1,
     event_stream_start_message,
@@ -121,5 +122,72 @@ async fn filtered_subscription_crosses_a_quiet_page_and_resumes_its_delivered_cu
             assert_eq!(raw, next_match);
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn newly_settled_blocks_are_streamed_with_visible_tip_ahead() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain)
+            .through(BlockHeight::new(2))
+            .with_settled_tip(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let slot = WalletServingPairSlot::new(pair(&mut writer)?);
+    let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let ingest =
+        AdmittedIngestControl::connect(control.endpoint(), None, Network::ZcashRegtest).await?;
+    let adapter = WalletQueryGrpcAdapter::new(
+        WalletServingQuery::from_admitted_native_serving_pair(slot.clone(), ingest),
+        WalletEndpointMetadata::default(),
+    );
+
+    let response = adapter
+        .chain_events(Request::new(wallet::ChainEventsRequest {
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::LiveTail,
+            )),
+            family: wallet::ChainEventStreamFamily::Settled as i32,
+            address_filter: Vec::new(),
+        }))
+        .await?;
+    assert_eq!(
+        response
+            .metadata()
+            .get(CHAIN_EVENT_FAMILY_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("settled")
+    );
+    let mut events = response.into_inner();
+
+    // The start cursor is resolved before the writer transition and pair publication.
+    let newly_settled = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("fixture omitted the newly settled block"))?;
+    writer.append_live_block_with_settled_tip(
+        &chain,
+        BlockId::new(newly_settled.height, newly_settled.hash),
+    )?;
+    slot.publish_for_test(pair(&mut writer)?);
+
+    let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await?
+        .ok_or_else(|| eyre!("settled stream closed before the new settlement"))??;
+    let committed = match event.event {
+        Some(wallet::chain_event_envelope::Event::ChainCommitted(committed)) => committed,
+        other => return Err(eyre!("expected ChainCommitted event, got {other:?}")),
+    };
+    let committed = committed
+        .committed
+        .ok_or_else(|| eyre!("settled commit omitted its payload"))?;
+    assert_eq!((committed.start_height, committed.end_height), (2, 2));
+    let chain_epoch = committed
+        .chain_epoch
+        .ok_or_else(|| eyre!("settled commit omitted its chain epoch"))?;
+    assert_eq!(chain_epoch.settled_tip.map(|tip| tip.height), Some(2));
+    assert_eq!(chain_epoch.visible_tip.map(|tip| tip.height), Some(3));
+    assert!(!event.cursor.is_empty());
+
     Ok(())
 }
