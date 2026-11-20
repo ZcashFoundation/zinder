@@ -231,8 +231,10 @@ fn spawn_silent_tls_peer(
     })
 }
 
-#[tokio::test]
-async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> TestResult {
+/// A TLS server configuration for `127.0.0.1` that offers HTTP/2, and the
+/// roots a client needs to trust it.
+fn loopback_tls() -> Result<(Arc<rustls::ServerConfig>, RootCertStore), Box<dyn std::error::Error>>
+{
     let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
     let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -244,12 +246,18 @@ async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> Te
         rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
     )?;
     server_config.alpn_protocols = vec![b"h2".to_vec()];
+    let mut roots = RootCertStore::empty();
+    roots.add(certified.cert.der().clone())?;
+    Ok((Arc::new(server_config), roots))
+}
+
+#[tokio::test]
+async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> TestResult {
+    let (server_config, roots) = loopback_tls()?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let (handshake_completed, handshake_observed) = mpsc::channel();
-    let _peer = spawn_silent_tls_peer(listener, Arc::new(server_config), handshake_completed);
-    let mut roots = RootCertStore::empty();
-    roots.add(certified.cert.der().clone())?;
+    let _peer = spawn_silent_tls_peer(listener, server_config, handshake_completed);
     let endpoint = ZinderGrpcEndpoint::parse(
         &format!("https://{address}"),
         SHORT_CONNECT_TIMEOUT,
@@ -348,6 +356,71 @@ async fn a_dial_needs_no_route_or_credential_from_a_proxy() -> TestResult {
     assert!(
         matches!(authenticated_check, Some(Ok(_))),
         "the authenticated call must succeed, got {authenticated_check:?}"
+    );
+    Ok(())
+}
+
+/// Terminates TLS and serves the health check over HTTP/2, the way a
+/// TLS-terminating proxy does, reporting the URI of every request it serves.
+fn spawn_tls_terminating_peer(
+    listener: TcpListener,
+    server_config: Arc<rustls::ServerConfig>,
+) -> (
+    JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<http::Uri>,
+) {
+    let (served, served_uris) = tokio::sync::mpsc::unbounded_channel();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let (_reporter, health_service) = tonic_health::server::health_reporter();
+    let peer = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(stream) = acceptor.accept(stream).await else {
+                continue;
+            };
+            let served = served.clone();
+            let health_service = health_service.clone();
+            let route =
+                hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+                    let _ = served.send(request.uri().clone());
+                    health_service.clone().oneshot(request)
+                });
+            tokio::spawn(
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), route),
+            );
+        }
+    });
+    (peer, served_uris)
+}
+
+#[tokio::test]
+async fn an_https_dial_serves_calls_through_a_tls_terminating_peer() -> TestResult {
+    let (server_config, roots) = loopback_tls()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (peer, mut served_uris) = spawn_tls_terminating_peer(listener, server_config);
+    let endpoint = ZinderGrpcEndpoint::parse(
+        &format!("https://{address}"),
+        SHORT_CONNECT_TIMEOUT,
+        move || Ok(roots),
+    )?;
+
+    let channel = dial(&endpoint, SHORT_CONNECT_TIMEOUT).await?;
+    let check = HealthClient::new(channel)
+        .check(HealthCheckRequest::default())
+        .await;
+    let served_uri = served_uris.recv().await;
+    peer.abort();
+
+    assert!(
+        check.is_ok(),
+        "the call must succeed over TLS, got {check:?}"
+    );
+    let served_uri = served_uri.ok_or("the peer served no request")?;
+    assert_eq!(served_uri.scheme_str(), Some("https"));
+    assert_eq!(
+        served_uri.authority().map(http::uri::Authority::as_str),
+        Some(address.to_string().as_str())
     );
     Ok(())
 }
