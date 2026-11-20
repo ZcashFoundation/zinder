@@ -35,7 +35,7 @@ const DEFAULT_WINDOW_SECONDS: u32 = 300;
 /// Executes one `MempoolEventCounts` request.
 pub(crate) async fn query_mempool_event_counts(
     materialized_view_store: &MaterializedViewStore,
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    wallet_client: impl Future<Output = Result<WalletQueryClient<AuthenticatedChannel>, Status>>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<MempoolEventCountsRequest>,
 ) -> Result<Response<MempoolEventCountsResponse>, Status> {
@@ -45,6 +45,7 @@ pub(crate) async fn query_mempool_event_counts(
         .ok_or_else(|| ExplorerError::not_materialized(MEMPOOL_EVENT_COUNTS_NOT_INDEXED))?;
 
     let latest = wallet_client
+        .await?
         .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
         .await?
         .into_inner();

@@ -60,9 +60,8 @@ use zinder_proto::v1::{
     wallet::wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
-    LazyZinderGrpcChannel, RepeatedFieldGuard, RpcMetricNames, RpcOutcome, describe_rpc_metrics,
-    record_rpc_request,
+    AuthenticatedChannel, BearerToken, BearerTokenServerInterceptor, LazyZinderGrpcChannel,
+    RepeatedFieldGuard, RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request,
 };
 use zinder_source::NodeSource;
 
@@ -1183,10 +1182,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         "MempoolEventCounts requires a materialized-view store",
                     )
                 })?;
-            let mut client = self.wallet_client(OP.method).await?;
+            let wallet_channel = self.require_wallet_channel(OP.method)?;
             query_mempool_event_counts(
                 materialized_view_store,
-                &mut client,
+                connect_wallet_client(wallet_channel),
                 &self.upstream_observation_cache,
                 request,
             )
@@ -1430,12 +1429,7 @@ impl ExplorerQueryGrpcAdapter {
         &self,
         method: &'static str,
     ) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
-        let channel = self
-            .require_wallet_channel(method)?
-            .channel()
-            .await
-            .map_err(|error| connect_error_to_status(&error))?;
-        Ok(WalletQueryClient::new(channel))
+        connect_wallet_client(self.require_wallet_channel(method)?).await
     }
 }
 
@@ -1450,8 +1444,13 @@ fn canonical_store_unavailable(method: &'static str) -> Status {
     .into()
 }
 
-fn connect_error_to_status(error: &BearerTokenConnectError) -> Status {
-    ExplorerError::upstream_unreachable(format!("WalletQuery endpoint unreachable: {error}")).into()
+async fn connect_wallet_client(
+    channel: &LazyZinderGrpcChannel,
+) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
+    let channel = channel.channel().await.map_err(|error| {
+        ExplorerError::upstream_unreachable(format!("WalletQuery endpoint unreachable: {error}"))
+    })?;
+    Ok(WalletQueryClient::new(channel))
 }
 
 /// Registers `# HELP` and `# TYPE` text for every metric this module emits.
