@@ -234,6 +234,15 @@ under the same requirements. Verify it the same way, calling
 `zinder.v1.wallet.WalletQuery/ServerInfo`. How native clients connect is in
 [Integration surfaces](../reference/integration-surfaces.md).
 
+The `ExplorerQuery` endpoint, which runs when the deployment merges
+`deploy/docker-compose.explorer.yml`, is exposed the same way. Its site
+block points `forward_auth` at the explorer ops port
+(`ZINDER_EXPLORER_OPS_HOST_PORT`, 9069 on Mainnet) and `reverse_proxy` at the
+explorer gRPC port (`ZINDER_EXPLORER_HOST_PORT`, 9068 on Mainnet). The
+explorer listener also runs in ingest's network namespace, so
+`ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true` has the same requirements.
+Verify it by calling `zinder.v1.explorer.ExplorerQuery/ServerInfo`.
+
 ## Supported wallets
 
 Wallet apps are supported by name, each after end-to-end certification, as
@@ -251,13 +260,14 @@ header before Caddy loads such a file.
 
 1. If the Caddyfile you restore does not set `X-Zinder-Client-Address`, turn
    the setting off first. In the env file you pass to Compose, set
-   `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false`, and also
+   `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false`. Also set
    `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` if you expose the native
-   endpoint. Then recreate each container whose setting you changed. Give
-   Compose the same env file and the same `-f` files, in the same order, that
-   the deployment runs with. With fewer files, Compose recreates the
-   container without what the missing overlays add, such as the fallback
-   node's settings and cookie mount from
+   endpoint, and `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=false` if you
+   expose the explorer endpoint. Then recreate each container whose setting
+   you changed. Give Compose the same env file and the same `-f` files, in
+   the same order, that the deployment runs with. With fewer files, Compose
+   recreates the container without what the missing overlays add, such as
+   the fallback node's settings and cookie mount from
    `deploy/docker-compose.node-fallback.yml`. For a Mainnet deployment that
    merges that overlay:
 
@@ -265,7 +275,7 @@ header before Caddy loads such a file.
    env_file=deploy/.env.mainnet
    compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
    docker compose --env-file "$env_file" "${compose_files[@]}" \
-     up -d zinder-compat-lightwalletd # and zinder-query, if you changed it
+     up -d zinder-compat-lightwalletd # and zinder-query or zinder-explorer, if you changed them
    ```
 
    Outside Compose, set `trust_proxy_client_address = false` and restart each

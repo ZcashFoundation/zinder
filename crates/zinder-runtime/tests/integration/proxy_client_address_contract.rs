@@ -4,10 +4,10 @@
 //! A listener that trusts [`PROXY_CLIENT_ADDRESS_HEADER`] lets whoever sets
 //! the header choose the client its requests count against. The reference
 //! Caddy template must therefore replace the header on the requests it
-//! forwards to the gRPC listener, the TLS runbook must stop the trust before
-//! restoring a proxy configuration that passes client headers on, and it
-//! must name every network that reaches the listener without the proxy, in
-//! the base Compose file and in every overlay merged with it.
+//! forwards to the gRPC listener, the TLS runbook must stop every listener's
+//! trust before restoring a proxy configuration that passes client headers
+//! on, and it must name every network that reaches the listener without the
+//! proxy, in the base Compose file and in every overlay merged with it.
 
 #![allow(
     missing_docs,
@@ -17,7 +17,7 @@
 use std::fs;
 
 use eyre::{Result, ensure, eyre};
-use zinder_runtime::PROXY_CLIENT_ADDRESS_HEADER;
+use zinder_runtime::{ENVIRONMENT_VARIABLES, PROXY_CLIENT_ADDRESS_HEADER};
 
 const CADDYFILE: &str = include_str!("../../../../deploy/compat-lightwalletd.Caddyfile");
 const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-tls.md");
@@ -212,17 +212,28 @@ https://example.org:443 {
 #[test]
 fn the_runbook_stops_trusting_the_header_before_restoring_an_older_proxy() -> Result<()> {
     let rollback = section(TLS_RUNBOOK, "## Roll back the proxy")?;
-    let distrust = rollback
-        .find("TRUST_PROXY_CLIENT_ADDRESS=false")
-        .ok_or_else(|| eyre!("the rollback never turns trust_proxy_client_address off"))?;
     let restore = rollback
         .find("reload Caddy")
         .ok_or_else(|| eyre!("the rollback never reloads Caddy"))?;
+    let trust_settings = ENVIRONMENT_VARIABLES
+        .iter()
+        .filter(|variable| variable.toml_path.ends_with(".trust_proxy_client_address"))
+        .map(|variable| variable.name)
+        .collect::<Vec<_>>();
     ensure!(
-        distrust < restore,
-        "the rollback must turn trust_proxy_client_address off before Caddy loads an older \
-         configuration, which passes a client's own header on"
+        !trust_settings.is_empty(),
+        "no environment variable sets trust_proxy_client_address"
     );
+    for name in trust_settings {
+        let distrust = rollback
+            .find(&format!("{name}=false"))
+            .ok_or_else(|| eyre!("the rollback never turns {name} off"))?;
+        ensure!(
+            distrust < restore,
+            "the rollback must turn {name} off before Caddy loads an older configuration, \
+             which passes a client's own header on"
+        );
+    }
     Ok(())
 }
 
