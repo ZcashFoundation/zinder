@@ -315,6 +315,8 @@ pub(super) fn replay_compact_blocks(
 pub(super) struct ReplayedTrees {
     accumulator: CommitmentTreeAccumulator,
     tip: BlockId,
+    /// Block time of the tip, once its canonical header has been checked.
+    canonical_tip_time: Option<u32>,
 }
 
 impl ReplayedTrees {
@@ -332,6 +334,7 @@ impl ReplayedTrees {
         Ok(Self {
             accumulator,
             tip: seed.block_id,
+            canonical_tip_time: None,
         })
     }
 
@@ -358,6 +361,7 @@ impl ReplayedTrees {
             )));
         }
         self.tip = BlockId::new(height, compact_block.block_hash());
+        self.canonical_tip_time = None;
         Ok(())
     }
 
@@ -371,22 +375,25 @@ impl ReplayedTrees {
         self.accumulator.tip_metadata()
     }
 
-    /// Returns the checkpoint at the tip, which must be the canonical block
-    /// at its height.
-    pub(super) fn checkpoint(
+    /// Checks that the tip is the canonical block at its height and returns
+    /// its block time.
+    pub(super) fn canonical_block_time(
         &mut self,
         store: &impl CanonicalServingRead,
-    ) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+    ) -> Result<u32, CanonicalStoreError> {
+        if let Some(block_time_seconds) = self.canonical_tip_time {
+            return Ok(block_time_seconds);
+        }
         let height = self.tip.height;
         let header = read_block_header_at(store, height)?.ok_or_else(|| {
             CanonicalStoreError::publication(format!(
-                "tree-state reconstruction header at height {} is absent",
+                "block header at height {} is absent",
                 height.value()
             ))
         })?;
         if header.block_hash != self.tip.hash {
             return Err(CanonicalStoreError::publication(format!(
-                "replayed compact blocks do not end at the canonical block at height {}",
+                "replayed compact block at height {} is not the canonical block",
                 height.value()
             )));
         }
@@ -396,10 +403,21 @@ impl ReplayedTrees {
                 height.value()
             ))
         })?;
+        self.canonical_tip_time = Some(block_time_seconds);
+        Ok(block_time_seconds)
+    }
+
+    /// Returns the checkpoint at the tip, which must be the canonical block
+    /// at its height.
+    pub(super) fn checkpoint(
+        &mut self,
+        store: &impl CanonicalServingRead,
+    ) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+        let block_time_seconds = self.canonical_block_time(store)?;
         let frontiers = self
             .accumulator
             .cross_checked_frontiers()
-            .map_err(|source| replay_refused(height, &source))?;
+            .map_err(|source| replay_refused(self.tip.height, &source))?;
         Ok(CommitmentTreeCheckpoint::new(
             self.tip,
             block_time_seconds,

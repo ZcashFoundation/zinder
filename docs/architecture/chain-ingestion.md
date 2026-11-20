@@ -174,7 +174,8 @@ one:
 
 The pass works one stride at a time, from one stored checkpoint to the next
 multiple of 100. It replays the stride's compact blocks from the first
-checkpoint with the per-block step a tree-state rebuild runs, and accepts the result
+checkpoint with the per-block step a tree-state rebuild runs, checks every
+replayed block against the canonical header at its height, and accepts the result
 only when the replay reproduces every checkpoint already stored in the stride,
 including the one that ends it, byte for byte. The writer then adds the stride's rows in one batch between live
 commits, after checking that the stride ends at or below the settled tip, that
@@ -218,8 +219,7 @@ as it is for wallet serving.
 strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
 (500 by default) bounds, on average, how many stored blocks it replays per
 second, including replays the writer could not commit and the pass retries; a scan is charged one block for every two reads it makes, counting each checkpoint row it visits and each compact block it reads as one read. A replayed block costs
-at most two reads, its compact block and, when it gains or holds a
-checkpoint, its header, and adds at most one row,
+about two reads, its compact block and its header, and adds at most one row,
 so the defaults hold the pass near 1,000 reads per second on average, with
 short bursts of up to one stride per worker. A scan stops after the stride that
 brings its reads to 200, the charge of one replayed stride, so densified

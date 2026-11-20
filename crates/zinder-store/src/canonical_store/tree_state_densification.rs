@@ -227,8 +227,9 @@ impl RocksDbCanonicalSecondary {
     /// Replays `stride` and returns the checkpoint rows `selection` adds.
     ///
     /// Fails with [`CanonicalStoreError::TreeStateStrideMismatch`] when the
-    /// replay does not link, does not reach the recorded tree sizes, or does
-    /// not reproduce a checkpoint already stored in the stride, including the
+    /// replay does not link, does not reach the recorded tree sizes, replays a
+    /// block that is not the canonical block at its height, or does not
+    /// reproduce a checkpoint already stored in the stride, including the
     /// cadence checkpoint that ends it.
     pub fn densify_tree_state_stride(
         &self,
@@ -630,6 +631,10 @@ fn replay_stride(
         stride.end_height,
         network_upgrade_activations,
         |trees| {
+            // Every replayed block must be the canonical block at its height;
+            // only the costlier frontier roots wait for a row the stride
+            // compares or writes.
+            trees.canonical_block_time(store)?;
             let height = trees.tip().height;
             let commitments = commitment_count(trees.tree_sizes());
             let stored = stored_rows.at(height);
