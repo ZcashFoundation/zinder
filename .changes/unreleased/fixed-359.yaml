@@ -1,5 +1,5 @@
 kind: fixed
-body: Wallet-mode `GetBlockRangeNullifiers` returns only the requested shielded pools. Empty and transparent-only selections continue to return all shielded nullifiers.
+body: Wallet-mode `GetBlockRangeNullifiers` returns only the requested shielded pools. Empty and transparent-only selections continue to return all shielded nullifiers. Selecting Sapling keeps transactions that have Sapling outputs and no Sapling spends.
 time: 2026-11-20T08:56:12.222614194Z
 custom:
     Bump: patch

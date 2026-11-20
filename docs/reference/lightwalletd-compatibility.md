@@ -111,6 +111,8 @@ A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a h
 
 `GetBlockRangeNullifiers` returns nullifiers for the shielded pools listed in `poolTypes`. Both an empty list and a list containing only `TRANSPARENT` select all shielded pools. When a request includes a shielded pool, `TRANSPARENT` has no effect. Unknown pool values and `POOL_TYPE_INVALID` return `INVALID_ARGUMENT`.
 
+A Sapling-only request includes transactions with Sapling outputs even when they have no Sapling spends. For those transactions, the response contains only the transaction’s position in the block, its ID, and its fee.
+
 Vizor v0.0.65 requests only Ironwood nullifiers when it scans for Gift Card spends. Its ordinary wallet sync uses `GetBlockRange`, as does Slipstream in the ZODL 8.1.0 wallet SDKs. [Vizor Gift Card request](https://github.com/chainapsis/vizor-wallet/blob/d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6/rust/src/wallet/sync_engine/lwd.rs#L1813-L1837) · [Vizor sync request](https://github.com/chainapsis/vizor-wallet/blob/d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6/rust/src/wallet/sync_engine/lwd.rs#L1052-L1068) · [Slipstream sync request](https://github.com/zodl-inc/slipstream/blob/80f95741896543a22262182ab37a5a05d484d2e7/core/src/fetch.rs#L1125-L1145)
 
 These outcomes fail the call before any block is sent:
