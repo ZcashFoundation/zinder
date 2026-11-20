@@ -11,12 +11,10 @@
 //! found within one pass over it.
 //!
 //! Verification reads through a [`RocksDbTreeStateVerifier`], a canonical
-//! secondary whose checkpoint family has no block cache, so every read takes
-//! its blocks from the table file and checks their checksums. A block that an
-//! earlier read cached cannot hide damage done to the file since. A block
-//! that fails that check is damage, reported like a row that fails a row
-//! check. A table file the primary has since deleted is not damage: it is an
-//! ordinary store error that clears once the secondary catches up.
+//! secondary that bypasses the block cache for checkpoints and block headers.
+//! Each read of a data block from their table files rechecks its checksum.
+//! A checksum failure is reported as damage. If the primary has deleted a
+//! table file, the secondary retries after catching up.
 
 use std::{num::NonZeroU32, path::Path};
 
@@ -44,10 +42,8 @@ use crate::{RawBlobRetention, RocksDbResourceBudget, StoreRole};
 
 /// A canonical secondary opened to verify stored tree-state checkpoints.
 ///
-/// Its tree-state checkpoint family reads through no block cache, so each
-/// verification reads the checkpoint blocks from their table files and
-/// checks their checksums, whatever an earlier read loaded. It serves no
-/// other read.
+/// It bypasses the block cache for checkpoint and block-header data blocks
+/// so that an earlier read cannot mask damage to either table file.
 pub struct RocksDbTreeStateVerifier {
     pub(super) secondary: RocksDbCanonicalSecondary,
 }
@@ -132,8 +128,9 @@ impl RocksDbTreeStateVerifier {
     /// up to the primary's current state, as
     /// [`RocksDbCanonicalSecondary::open_ready`] does.
     ///
-    /// `resource_budget` bounds every family but the checkpoint family,
-    /// which reads through no block cache.
+    /// The checkpoint and block-header families keep their indexes in table
+    /// readers. The resource budget's open-file limit bounds the number of
+    /// these readers.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
