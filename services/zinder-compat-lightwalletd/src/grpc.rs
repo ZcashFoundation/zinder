@@ -707,7 +707,7 @@ where
         script_hashes: Vec<TransparentAddressScriptHash>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         if script_hashes.is_empty() {
-            return Err(Status::invalid_argument("addresses list must not be empty"));
+            return Err(Status::invalid_argument(EMPTY_BALANCE_ADDRESSES));
         }
         let visible_tip_block = self.compat_visible_tip_block().await?;
         let balance = self
@@ -726,6 +726,9 @@ where
             .map_err(|error| status_from_query_error(&error))
     }
 }
+
+const EMPTY_BALANCE_ADDRESSES: &str = "addresses list must not be empty";
+const UNRECEIVABLE_ADDRESS: &str = "transparent address does not produce a receivable script";
 
 /// The distinct script hashes of one balance request, in request order.
 ///
@@ -1609,9 +1612,7 @@ fn transparent_address_tx_history_request(
     }
     let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
     if script_pub_key.is_empty() {
-        return Err(Status::invalid_argument(
-            "transparent address does not produce a receivable script",
-        ));
+        return Err(Status::invalid_argument(UNRECEIVABLE_ADDRESS));
     }
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let range = filter
@@ -1662,9 +1663,7 @@ fn transparent_address_unspent_outputs_request(
 
     let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
     if script_pub_key.is_empty() {
-        return Err(Status::invalid_argument(
-            "transparent address does not produce a receivable script",
-        ));
+        return Err(Status::invalid_argument(UNRECEIVABLE_ADDRESS));
     }
 
     Ok(TransparentAddressUnspentOutputsRequest {

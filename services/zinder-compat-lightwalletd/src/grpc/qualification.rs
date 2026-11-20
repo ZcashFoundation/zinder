@@ -141,7 +141,13 @@ impl QualificationWallet {
         let network = self.slot.capture().network();
         let mut distinct = HashSet::new();
         while let Some(address) = addresses.next().await {
-            distinct.insert(indexed_address(&address?, network)?);
+            let parsed = indexed_address(&address?, network)?;
+            if matches!(parsed, Address::Tex { .. }) {
+                return Err(status_from_query_error(&QueryError::InvalidAddress {
+                    reason: super::UNRECEIVABLE_ADDRESS,
+                }));
+            }
+            distinct.insert(parsed);
             if distinct.len() > u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
                 return Err(status_from_query_error(
                     &QueryError::TransparentBalanceAddressCountExceeded {
@@ -150,6 +156,9 @@ impl QualificationWallet {
                     },
                 ));
             }
+        }
+        if distinct.is_empty() {
+            return Err(Status::invalid_argument(super::EMPTY_BALANCE_ADDRESSES));
         }
         let lookup = TransparentAddressLookup::new(network, distinct)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -174,11 +183,14 @@ impl QualificationWallet {
             return Ok(Box::pin(stream::empty()));
         }
         let network = self.slot.capture().network();
-        let addresses = request
-            .addresses
-            .iter()
-            .map(|text| indexed_address(text, network))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut addresses = Vec::with_capacity(request.addresses.len());
+        for text in request.addresses {
+            let parsed = indexed_address(&text, network)?;
+            if matches!(parsed, Address::Tex { .. }) {
+                return Err(Status::invalid_argument(super::UNRECEIVABLE_ADDRESS));
+            }
+            addresses.push(parsed);
+        }
         let lookup = TransparentAddressLookup::new(network, addresses)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let height = BlockHeight::new(

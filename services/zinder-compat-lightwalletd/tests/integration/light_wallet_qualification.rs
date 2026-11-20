@@ -35,6 +35,7 @@ use zinder_testkit::{
 };
 
 mod canonical;
+mod tex_validation;
 
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 
