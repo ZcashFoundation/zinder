@@ -3798,6 +3798,73 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn tree_state_requires_sapling_only_on_the_compatibility_surface() -> eyre::Result<()> {
+    let mut upgrades = sample_regtest_upgrade_activations().activations().to_vec();
+    for upgrade in &mut upgrades {
+        upgrade.activation_height = BlockHeight::new(upgrade.activation_height.value().max(2));
+    }
+    let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, upgrades)?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let store_fixture = AcceptanceStore::from_store_fixture(
+        WalletServingStoreFixture::from_chain(&chain, &activations)?,
+        Vec::new(),
+    )?;
+    let adapter = acceptance_adapter(&store_fixture);
+    for height in [1, 2] {
+        let native = store_fixture
+            .query()
+            .tree_state_at(BlockHeight::new(height), None)
+            .await?;
+        assert_eq!(native.frontiers.sapling_final_state.is_some(), height == 2);
+        for request in [
+            lightwalletd::BlockId {
+                height: u64::from(height),
+                hash: Vec::new(),
+            },
+            lightwalletd::BlockId {
+                height: 0,
+                hash: encode_rpc_block_hash_bytes(native.block_hash).to_vec(),
+            },
+        ] {
+            let outcome = adapter.get_tree_state(Request::new(request)).await;
+            if height == 1 {
+                let status = outcome
+                    .err()
+                    .ok_or_else(|| eyre!("pre-Sapling request succeeded"))?;
+                assert_eq!(status.code(), Code::InvalidArgument);
+                assert_eq!(
+                    status.message(),
+                    "GetTreeState: z_gettreestate did not return treestate"
+                );
+            } else {
+                let response = outcome?.into_inner();
+                assert_eq!(response.height, 2);
+                assert_ne!(response.sapling_tree, "");
+            }
+        }
+    }
+    let before_activation = AcceptanceStore::from_store_fixture(
+        WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
+            &activations,
+        )?,
+        Vec::new(),
+    )?;
+    let native = before_activation
+        .query()
+        .latest_tree_state_checkpoint(None)
+        .await?;
+    assert!(native.frontiers.sapling_final_state.is_none());
+    let status = acceptance_adapter(&before_activation)
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("pre-Sapling latest tree state succeeded"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    Ok(())
+}
+
 /// `GetTreeState(BlockID { height: 0, hash })` accepts RPC byte order.
 ///
 /// It matches `hex::decode(TreeState.hash)` and Go `lightwalletd`, rejects

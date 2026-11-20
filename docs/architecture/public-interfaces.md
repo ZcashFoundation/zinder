@@ -45,7 +45,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `SupervisedRuntime` | The supervision that stops a wallet-serving runtime's gRPC listener and background tasks together, and ends the calls still open at its drain deadline. | `zinder-runtime` |
 | `WalletQueryApi` | The wallet read and broadcast trait that the gRPC adapters call. | `zinder-query` |
 | `WalletServingQuery` | The `WalletQueryApi` implementation over a replaceable serving pair. The native and lightwalletd-compatible runtimes share it. | `zinder-query` |
-| `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload, and the lightwalletd adapter hex-encodes each pool, so neither parses the other's encoding. | `zinder-query` |
+| `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload. The lightwalletd adapter hex-encodes each pool and rejects `GetTreeState` before Sapling activation with `INVALID_ARGUMENT`, matching Go lightwalletd. Native WalletQuery reads still return inactive pools as `None`. | `zinder-query` |
 | `NativeWalletEndpointCapabilities` | The immutable capability set a native query derives once storage and providers are admitted. | `zinder-query` |
 | `MaterializedViewConsumer` | An explorer view builder that applies retained chain events. | `zinder-materialized-views` |
 | `MaterializedViewStore` | The separate store for materialized-view rows, cursors, coverage, and schemas. | `zinder-materialized-views` |

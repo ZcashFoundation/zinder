@@ -1003,6 +1003,8 @@ where
             .await
             .map_err(|error| tree_state_status(&error))?;
 
+        require_sapling_tree_state(&tree_state)?;
+
         Ok(Response::new(lightwalletd_tree_state(&tree_state)))
     }
 
@@ -1015,6 +1017,8 @@ where
             .latest_tree_state_checkpoint(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
+
+        require_sapling_tree_state(&tree_state)?;
 
         Ok(Response::new(lightwalletd_tree_state(&tree_state)))
     }
@@ -1742,6 +1746,15 @@ fn subtree_roots_status(error: &QueryError) -> Status {
         return Status::unavailable(format!("{error}; retry shortly"));
     }
     status_from_query_error(error)
+}
+
+fn require_sapling_tree_state(tree_state: &TreeState) -> Result<(), Status> {
+    if tree_state.frontiers.sapling_final_state.is_none() {
+        return Err(Status::invalid_argument(
+            "GetTreeState: z_gettreestate did not return treestate",
+        ));
+    }
+    Ok(())
 }
 
 fn lightwalletd_tree_state(tree_state: &TreeState) -> lightwalletd::TreeState {

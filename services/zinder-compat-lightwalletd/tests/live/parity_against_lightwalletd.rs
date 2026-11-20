@@ -747,14 +747,58 @@ async fn tree_state_matches_reference_between_checkpoints() -> Result<()> {
     let reference_tip = reference.get_latest_block(ChainSpec {}).await?.into_inner();
     let shared_tip = zinder_tip.height.min(reference_tip.height);
 
-    for height in TREE_STATE_PARITY_HEIGHTS
+    let activation = reference
+        .get_lightd_info(Empty {})
+        .await?
+        .into_inner()
+        .sapling_activation_height;
+    let heights = TREE_STATE_PARITY_HEIGHTS
         .into_iter()
+        .chain([activation.saturating_sub(1), activation]);
+    for height in heights
+        .filter(|height| *height > 0)
         .filter(|height| *height <= shared_tip)
     {
         let request = || BlockId {
             height,
             hash: Vec::new(),
         };
+        if height < activation {
+            let zinder_status = zinder
+                .get_tree_state(request())
+                .await
+                .err()
+                .ok_or_else(|| eyre!("Zinder accepted a pre-Sapling tree state"))?;
+            let reference_status = reference
+                .get_tree_state(request())
+                .await
+                .err()
+                .ok_or_else(|| eyre!("reference accepted a pre-Sapling tree state"))?;
+            assert_eq!(zinder_status.code(), tonic::Code::InvalidArgument);
+            assert_eq!(zinder_status.code(), reference_status.code());
+            let hash = zinder.get_block(request()).await?.into_inner().hash;
+            let by_hash = BlockId {
+                height: 0,
+                hash: hash.into_iter().rev().collect(),
+            };
+            assert_eq!(
+                zinder
+                    .get_tree_state(by_hash.clone())
+                    .await
+                    .err()
+                    .map(|status| status.code()),
+                Some(tonic::Code::InvalidArgument)
+            );
+            assert_eq!(
+                reference
+                    .get_tree_state(by_hash)
+                    .await
+                    .err()
+                    .map(|status| status.code()),
+                Some(tonic::Code::InvalidArgument)
+            );
+            continue;
+        }
         let zinder_tree_state = zinder.get_tree_state(request()).await?.into_inner();
         let reference_tree_state = reference.get_tree_state(request()).await?.into_inner();
         assert_tree_state_identity_matches(&zinder_tree_state, &reference_tree_state);
