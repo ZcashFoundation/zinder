@@ -1346,6 +1346,12 @@ Optional `prepare` and `cleanup` use the same command/report/check contract.
 Preparation can call the deployment runner for an isolated fixture. Cleanup runs
 after partial preparation or execution; it is skipped if no pinned command was
 entered. It must tolerate partial state and touch only case-owned resources.
+By default cleanup verifies every case input. If teardown can run independently,
+set `cleanup.input_paths` to the case input paths it needs, including any files
+the teardown program reads indirectly. The runner also checks its executable
+and pinned paths passed as command arguments. This lets teardown run if an
+unrelated input changes. Qualification checks every case input before and after
+cleanup, and an input change fails the case.
 Reuse deployment runners and `scripts/mine-live-regtest.sh`; do not stop shared
 processes by executable name. Process-group timeouts reuse the benchmark runner.
 SIGINT and SIGTERM trigger bounded cleanup. Independently daemonized services

@@ -76,6 +76,12 @@ def validate(manifest):
             raise ValueError("Zkool requires separate internal-enabled and external-only cases")
         if not isinstance(case.get("steps"), dict) or set(case["steps"]) - set(STEPS):
             raise ValueError("unknown lifecycle step")
+        if "input_paths" in case.get("cleanup", {}):
+            dependencies = case["cleanup"]["input_paths"]
+            if not isinstance(dependencies, list) or not all(
+                isinstance(path, str) and path in case["inputs"] for path in dependencies
+            ):
+                raise ValueError("cleanup input_paths must name pinned case inputs")
         for step in (*case["steps"].values(), *(case[k] for k in ("prepare", "cleanup") if k in case)):
             command = step["command"]
             if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
@@ -228,7 +234,11 @@ def execute(step, case, root, name, timeout):
         if case["inputs"].get(command[0]) != receipt["executable_sha256"]:
             raise ValueError("adapter executable must be pinned in inputs")
         # Adapter logs may contain seed phrases or RPC authorization. Retain assertions only.
-        pins(case["inputs"])
+        inputs = case["inputs"]
+        if name == "cleanup" and "input_paths" in step:
+            required = set(step["input_paths"]) | {arg for arg in command if arg in inputs}
+            inputs = {path: inputs[path] for path in required}
+        pins(inputs)
         receipt["inputs_verified"] = True
         case["_command_entered"] = True
         receipt["command_entered"] = True
@@ -279,6 +289,15 @@ def execute(step, case, root, name, timeout):
     return receipt
 
 
+def inputs_unchanged(case, evidence):
+    try:
+        pins(case["inputs"])
+        return True
+    except (OSError, KeyError, ValueError, TypeError):
+        evidence["postflight"] = "immutable inputs changed or unavailable"
+        return False
+
+
 def run_case(case, root, timeout):
     case["_command_entered"] = False
     root.mkdir()
@@ -310,11 +329,8 @@ def run_case(case, root, timeout):
                 receipt = execute(case["steps"][name], case, root, name, timeout)
                 ready = receipt["status"] == "completed"
             evidence["steps"].append(receipt)
-        try:
-            pins(case["inputs"])
-        except (OSError, KeyError, ValueError, TypeError):
+        if not inputs_unchanged(case, evidence):
             ready = False
-            evidence["postflight"] = "immutable inputs changed or unavailable"
         finished = True
     finally:
         cleanup_ok = "cleanup" not in case
@@ -326,6 +342,8 @@ def run_case(case, root, timeout):
                 evidence["cleanup"] = {"status": "skipped", "reason_code": "no-pinned-command-entered"}
         finally:
             shutil.rmtree(root / "scratch")
+            if evidence.get("cleanup", {}).get("command_entered") and not inputs_unchanged(case, evidence):
+                ready = False
             complete = (
                 finished and ready and cleanup_ok and len(evidence["steps"]) == len(STEPS)
                 and all(step["status"] == "completed" for step in evidence["steps"])

@@ -172,6 +172,41 @@ class LifecycleTests(unittest.TestCase):
                                 'expect': {'/cleaned': True}}
         self.assertEqual(self.run_gate(1)['cleanup']['status'], 'failed')
 
+    def teardown_command(self, script, args=()):
+        script.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'status':'completed', 'endpoint':sys.argv[2], "
+            "'fallback_used':False, 'assertion_mode':'always-on', 'assertions_enabled':True, 'cleaned':True}))\n"
+            "for path in sys.argv[3:]: Path(path).write_text('changed')\n"
+        )
+        self.case['inputs'][str(script)] = self.digest(script)
+        return {'command': [self.binary, str(script), '{report}', '{endpoint}', *map(str, args)],
+                'input_paths': [], 'expect': {'/cleaned': True}}
+
+    def test_cleanup_input_change_fails_qualification(self):
+        fixture = self.root / 'fixture'
+        fixture.write_text('initial')
+        self.case['inputs'][str(fixture)] = self.digest(fixture)
+        self.case['cleanup'] = self.teardown_command(self.root / 'teardown.py', [fixture])
+        receipt = self.run_gate(1)
+        self.assertEqual(receipt['cleanup']['status'], 'completed')
+        self.assertIn('changed', receipt['postflight'])
+
+    def test_cleanup_releases_resources_after_unrelated_input_changes(self):
+        self.case['cleanup'] = self.teardown_command(self.root / 'teardown.py')
+        self.case['prepare'] = self.teardown_command(self.root / 'prepare.py', [self.adapter])
+        receipt = self.run_gate(1)
+        self.assertEqual(receipt['cleanup']['status'], 'completed')
+        self.assertIn('changed', receipt['postflight'])
+
+    def test_changed_teardown_script_cannot_run(self):
+        teardown = self.root / 'teardown.py'
+        self.case['cleanup'] = self.teardown_command(teardown)
+        self.case['prepare'] = self.teardown_command(self.root / 'prepare.py', [teardown])
+        receipt = self.run_gate(1)
+        self.assertEqual(receipt['cleanup']['status'], 'failed')
+        self.assertFalse(receipt['cleanup'].get('command_entered', False))
+
     def test_reopen_does_not_certify_process_restart(self):
         self.case['steps']['restart']['command'][-1] = 'wallet-reopen'
         receipt = self.run_gate(1)
