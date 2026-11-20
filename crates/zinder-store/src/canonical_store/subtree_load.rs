@@ -1247,15 +1247,17 @@ mod tests {
                 encode_subtree_root_value(root),
             )?;
         }
-        let range = SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            penultimate.subtree_index,
-            NonZeroU32::new(3).ok_or("page length must be nonzero")?,
-        );
-        assert_eq!(
-            store.subtree_roots(range)?,
-            [penultimate, last.clone(), last]
-        );
+        for count in [3, zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST] {
+            let range = SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                penultimate.subtree_index,
+                NonZeroU32::new(count).ok_or("page length must be nonzero")?,
+            );
+            let roots = store.subtree_roots(range)?;
+            assert_eq!(roots.len(), usize::try_from(count)?);
+            assert_eq!(roots.first(), Some(&penultimate));
+            assert!(roots.iter().skip(1).all(|root| root == &last));
+        }
         Ok(())
     }
 
