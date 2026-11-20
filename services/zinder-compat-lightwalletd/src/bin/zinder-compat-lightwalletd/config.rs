@@ -45,6 +45,9 @@ pub(crate) enum CompatServing {
     Wallet,
     /// Canonical compact-block serving without wallet storage.
     CompactBlocks,
+    /// Canonical wallet reads with node-backed transparent methods for qualification.
+    #[cfg(feature = "light-wallet-qualification")]
+    LightWalletQualification,
 }
 
 impl CompatServing {
@@ -52,6 +55,8 @@ impl CompatServing {
         match self {
             Self::Wallet => "wallet",
             Self::CompactBlocks => "compact-blocks",
+            #[cfg(feature = "light-wallet-qualification")]
+            Self::LightWalletQualification => "light-wallet-qualification",
         }
     }
 }
@@ -331,10 +336,10 @@ fn resolve_lightwalletd_config(
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let serving = config.compat.serving.unwrap_or_default();
     let wallet = config.wallet;
-    if matches!(serving, CompatServing::CompactBlocks) && wallet.is_some() {
-        return Err(ConfigError::invalid(
-            "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"",
-        )
+    if serving != CompatServing::Wallet && wallet.is_some() {
+        return Err(ConfigError::invalid(format!(
+            "compat.serving = \"{}\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"", serving.as_str()
+        ))
         .into());
     }
     let network = config.network.resolve()?;
@@ -409,7 +414,7 @@ fn resolve_wallet_storage(
     wallet: WalletSection,
     storage: &ResolvedCanonicalSecondaryStorage,
 ) -> Result<WalletStorage, LightwalletdConfigError> {
-    if matches!(serving, CompatServing::CompactBlocks) {
+    if serving != CompatServing::Wallet {
         return Ok((None, None, None));
     }
     let wallet_primary_path = require_field(wallet.path, "wallet.path")?;
@@ -445,6 +450,14 @@ fn resolve_node_list(
     {
         return Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node and node_fallbacks sections and every ZINDER_NODE__* and ZINDER_NODE_FALLBACKS__* variable, or select compat.serving = \"wallet\"",
+        ));
+    }
+    #[cfg(feature = "light-wallet-qualification")]
+    if serving == CompatServing::LightWalletQualification
+        && (node.is_none() || !node_fallbacks.is_empty())
+    {
+        return Err(ConfigError::invalid(
+            "light-wallet qualification requires one [node] and does not accept node_fallbacks",
         ));
     }
     let broadcaster = node
@@ -606,13 +619,13 @@ fn resolve_tree_state_replay_wait(
     serving: CompatServing,
     configured_ms: Option<u64>,
 ) -> Result<Option<Duration>, ConfigError> {
-    match (serving, configured_ms) {
-        (CompatServing::CompactBlocks, None) => Ok(None),
-        (CompatServing::CompactBlocks, Some(_)) => Err(ConfigError::invalid(
+    match (serving == CompatServing::CompactBlocks, configured_ms) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept compat.tree_state_replay_wait_ms, because compact-block serving answers no tree-state request; remove it or select compat.serving = \"wallet\"",
         )),
-        (CompatServing::Wallet, None) => Ok(Some(DEFAULT_TREE_STATE_REPLAY_WAIT)),
-        (CompatServing::Wallet, Some(configured_ms)) => {
+        (false, None) => Ok(Some(DEFAULT_TREE_STATE_REPLAY_WAIT)),
+        (false, Some(configured_ms)) => {
             let wait = Duration::from_millis(configured_ms);
             if wait > MAX_TREE_STATE_REPLAY_WAIT {
                 return Err(ConfigError::invalid(format!(
@@ -631,13 +644,13 @@ fn resolve_tree_state_replay_waiters_per_slot(
     serving: CompatServing,
     configured: Option<u32>,
 ) -> Result<Option<NonZeroU32>, ConfigError> {
-    match (serving, configured) {
-        (CompatServing::CompactBlocks, None) => Ok(None),
-        (CompatServing::CompactBlocks, Some(_)) => Err(ConfigError::invalid(
+    match (serving == CompatServing::CompactBlocks, configured) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept compat.tree_state_replay_waiters_per_slot, because compact-block serving answers no tree-state request; remove it or select compat.serving = \"wallet\"",
         )),
-        (CompatServing::Wallet, None) => Ok(Some(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT)),
-        (CompatServing::Wallet, Some(configured)) => NonZeroU32::new(configured)
+        (false, None) => Ok(Some(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT)),
+        (false, Some(configured)) => NonZeroU32::new(configured)
             .filter(|waiters| *waiters <= MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT)
             .map(Some)
             .ok_or_else(|| {

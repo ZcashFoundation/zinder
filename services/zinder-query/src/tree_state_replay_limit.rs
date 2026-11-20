@@ -11,9 +11,11 @@ use std::{
 };
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument as _;
 use zinder_core::{BlockHeight, ChainTipMetadata};
+use zinder_store::{ServedTreeState, TreeStateReplayOutcome};
 
-use crate::QueryError;
+use crate::{QueryError, StorageReadError};
 
 /// Blocks in one `height_band` label value.
 ///
@@ -221,6 +223,56 @@ impl Drop for WaitingPlace<'_> {
     }
 }
 
+pub(crate) fn record_stored_tree_state_read(height: BlockHeight, stored: &ServedTreeState) {
+    let trees = stored.tip_metadata();
+    record_tree_state_read(height, 0, trees, trees);
+}
+
+/// Holds the slot on the replay task so cancelling the request cannot release
+/// capacity while its storage read is still running.
+pub(crate) async fn replay_holding_slot<Read>(
+    height: BlockHeight,
+    replay_slot: Arc<OwnedSemaphorePermit>,
+    read: Read,
+) -> Result<ServedTreeState, QueryError>
+where
+    Read:
+        Future<Output = Result<Option<TreeStateReplayOutcome>, StorageReadError>> + Send + 'static,
+{
+    let (outcome, duration) = tokio::spawn(
+        async move {
+            let _replay_slot = replay_slot;
+            let started_at = Instant::now();
+            let outcome = read.await;
+            (outcome, started_at.elapsed())
+        }
+        .in_current_span(),
+    )
+    .await
+    .map_err(|join_error| QueryError::BlockingTaskFailed {
+        reason: join_error.to_string(),
+    })?;
+    match outcome
+        .map_err(QueryError::canonical_read)?
+        .ok_or(QueryError::BlockNotInBestChain)?
+    {
+        TreeStateReplayOutcome::Stored(stored) => {
+            record_stored_tree_state_read(height, &stored);
+            Ok(stored)
+        }
+        TreeStateReplayOutcome::Replayed { replay, tree_state } => {
+            record_replay_duration(height, duration);
+            record_tree_state_read(
+                height,
+                replay.replayed_blocks(),
+                replay.seed().tip_metadata(),
+                tree_state.tip_metadata(),
+            );
+            Ok(tree_state)
+        }
+    }
+}
+
 /// Records one served tree-state read at `height` whose seed sits
 /// `replayed_blocks` below it, whose trees after that seed hold `seed_trees`,
 /// and whose answer holds `served_trees`.
@@ -228,7 +280,7 @@ impl Drop for WaitingPlace<'_> {
 /// A stored checkpoint is its own seed, so it counts as a `stored` read and
 /// records zero blocks and zero commitments in every pool. Every other read
 /// replays at least one block and counts as `replayed`.
-pub(crate) fn record_tree_state_read(
+fn record_tree_state_read(
     height: BlockHeight,
     replayed_blocks: u32,
     seed_trees: ChainTipMetadata,
@@ -255,7 +307,7 @@ pub(crate) fn record_tree_state_read(
 }
 
 /// Records how long one completed reconstruction of `height` spent replaying.
-pub(crate) fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
+fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
     metrics::histogram!(REPLAY_DURATION_HISTOGRAM, "height_band" => height_band(height))
         .record(replay_duration.as_secs_f64());
 }

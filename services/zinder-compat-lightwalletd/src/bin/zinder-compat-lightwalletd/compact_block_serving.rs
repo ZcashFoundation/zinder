@@ -24,10 +24,10 @@ use zinder_query::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
-    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
-    ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
-    classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
-    expected_writer_fence, refresh_within_stale_deadline,
+    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation, Readiness,
+    ReadinessCause, ReadinessState, WriterAttestation, classify_canonical_writer_fence,
+    connect_zinder_grpc, converge_on_canonical_writer_fence, expected_writer_fence,
+    refresh_within_stale_deadline, writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
@@ -88,33 +88,68 @@ enum ConvergenceFailure {
 /// generation alone: no compact-blocks method calls the node.
 #[derive(Clone)]
 pub(crate) struct CompactServingReadiness {
-    composed: ComposedReadiness,
+    inputs: zinder_query::WalletServingReadiness,
 }
 
 impl CompactServingReadiness {
     pub(crate) fn new(runtime: Readiness) -> Self {
         Self {
-            composed: ComposedReadiness::new(runtime, &[]),
+            inputs: zinder_query::WalletServingReadiness::pair_only(runtime),
         }
     }
 
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) fn for_qualification(runtime: Readiness) -> Self {
+        Self {
+            inputs: zinder_query::WalletServingReadiness::with_node_and_ingest_control(runtime),
+        }
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) fn dependencies(&self) -> zinder_query::WalletServingReadiness {
+        self.inputs.clone()
+    }
+
     pub(crate) fn runtime(&self) -> Readiness {
-        self.composed.runtime_readiness()
+        self.inputs.runtime_readiness()
     }
 
     pub(crate) fn publish_storage(&self, storage: ReadinessState) {
-        self.composed.publish_admission(storage);
+        self.inputs.canonical_admission().publish_admission(storage);
+    }
+
+    fn observe_reader_schedule(
+        &self,
+        attestation: &WriterAttestation,
+        status: &CanonicalWriterStatusResponse,
+        reader: &RocksDbCanonicalReader,
+    ) -> bool {
+        if writer_attests_network_upgrade_schedule(status, reader.network_upgrade_schedule()) {
+            return true;
+        }
+        attestation.withdraw_allowance();
+        let fence = reader.event_fence();
+        let lag = status.fence.as_ref().map_or(0, |writer| {
+            writer
+                .chain_epoch_id
+                .saturating_sub(fence.chain_epoch_id().value())
+        });
+        self.publish_storage(ReadinessState::replica_lagging(
+            lag,
+            Some(fence.visible_tip().height.value()),
+        ));
+        false
     }
 
     /// Records the writer's commit time of the chain epoch `reader` serves.
     fn publish_served_epoch(&self, reader: &RocksDbCanonicalReader) {
-        self.composed
+        self.inputs
             .runtime_readiness()
             .set_served_epoch_committed_at(reader.chain_epoch().created_at);
     }
 
     pub(crate) fn publish_shutting_down(&self) {
-        self.composed.publish_shutting_down();
+        self.inputs.publish_shutting_down();
     }
 }
 
@@ -203,7 +238,7 @@ impl CompactBlockPublisher {
             ServedReader {
                 attestation: &mut writer_attestation,
                 readiness: &readiness,
-                visible_height: None,
+                active: None,
             },
         )
         .await
@@ -266,7 +301,7 @@ impl CompactBlockPublisher {
                     () = self.writer_attestation.stale_deadline().passed() => {}
                 }
                 let deadline = self.writer_attestation.stale_deadline();
-                let admission = self.readiness.composed.clone();
+                let admission = self.readiness.inputs.canonical_admission().clone();
                 refresh_within_stale_deadline(deadline, &admission, self.refresh()).await;
                 self.writer_attestation.end_lapsed_allowance();
                 self.record_resource_gauges().await;
@@ -282,6 +317,11 @@ impl CompactBlockPublisher {
     )]
     async fn refresh(&mut self) {
         let active = self.slot.capture();
+        #[cfg(feature = "light-wallet-qualification")]
+        self.readiness.inputs.begin_canonical_refresh(
+            &mut self.writer_attestation,
+            active.event_fence().visible_tip().height.value(),
+        );
         let status = match self.writer_status.fetch().await {
             Ok(status) => status,
             Err(_error) => {
@@ -318,36 +358,44 @@ impl CompactBlockPublisher {
                 );
                 return;
             }
-            CanonicalFenceRelation::Matches => {
-                self.writer_attestation.attest();
-                self.readiness.publish_storage(ReadinessState::ready(Some(
-                    active.event_fence().visible_tip().height.value(),
-                )));
-                return;
-            }
-            CanonicalFenceRelation::SecondaryBehind(behind) => behind,
+            CanonicalFenceRelation::Matches => None,
+            CanonicalFenceRelation::SecondaryBehind(behind) => Some(behind),
         };
-        let lag = behind.lag_chain_epochs;
-        if lag <= self.config.lag_threshold {
-            self.readiness
-                .publish_storage(ReadinessState::ready_with_target(
-                    Some(active.event_fence().visible_tip().height.value()),
-                    Some(behind.writer_visible_tip_height),
-                ));
-        } else if let Some(staleness) = self.writer_attestation.stale_allowance() {
-            self.readiness
-                .publish_storage(ReadinessState::serving_pair_stale(
-                    lag,
-                    staleness.as_secs(),
-                    Some(active.event_fence().visible_tip().height.value()),
-                ));
-        } else {
-            self.record_failure(
-                ReadinessCause::ReplicaLagging {
-                    lag_chain_epochs: lag,
-                },
-                active.event_fence().visible_tip().height.value(),
-            );
+        let lag = behind.map_or(0, |behind| behind.lag_chain_epochs);
+        if self
+            .readiness
+            .observe_reader_schedule(&self.writer_attestation, &status, &active)
+        {
+            let visible_height = Some(active.event_fence().visible_tip().height.value());
+            let Some(behind) = behind else {
+                self.writer_attestation.attest();
+                #[cfg(feature = "light-wallet-qualification")]
+                self.readiness.inputs.confirm_canonical_attestation();
+                self.readiness
+                    .publish_storage(ReadinessState::ready(visible_height));
+                return;
+            };
+            if lag <= self.config.lag_threshold {
+                self.readiness
+                    .publish_storage(ReadinessState::ready_with_target(
+                        visible_height,
+                        Some(behind.writer_visible_tip_height),
+                    ));
+            } else if let Some(staleness) = self.writer_attestation.stale_allowance() {
+                self.readiness
+                    .publish_storage(ReadinessState::serving_pair_stale(
+                        lag,
+                        staleness.as_secs(),
+                        visible_height,
+                    ));
+            } else {
+                self.record_failure(
+                    ReadinessCause::ReplicaLagging {
+                        lag_chain_epochs: lag,
+                    },
+                    active.event_fence().visible_tip().height.value(),
+                );
+            }
         }
         if let Some(retired) = self.retired.take() {
             // A request or a read in flight still holds the retired
@@ -384,7 +432,7 @@ impl CompactBlockPublisher {
             ServedReader {
                 attestation: &mut self.writer_attestation,
                 readiness: &self.readiness,
-                visible_height: Some(active.event_fence().visible_tip().height.value()),
+                active: Some(&active),
             },
         )
         .await;
@@ -454,6 +502,8 @@ impl CompactBlockPublisher {
             .observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             self.writer_attestation.attest();
+            #[cfg(feature = "light-wallet-qualification")]
+            self.readiness.inputs.confirm_canonical_attestation();
         }
         self.readiness.publish_storage(
             refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
@@ -610,8 +660,8 @@ struct CandidateFenceProbe<'a> {
 struct ServedReader<'a> {
     attestation: &'a mut WriterAttestation,
     readiness: &'a CompactServingReadiness,
-    /// Visible tip height of the active reader, or `None` at bootstrap.
-    visible_height: Option<u32>,
+    /// The published reader, or `None` at bootstrap.
+    active: Option<&'a RocksDbCanonicalReader>,
 }
 
 impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
@@ -634,15 +684,23 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
             .map_err(|error| ConvergenceFailure::WriterStatusTransport(error.message().to_owned()))
     }
 
-    /// A halt or store damage the writer reports while the candidate trails
-    /// refuses traffic on the active reader at once.
+    fn attests_writer_schedule(&self, status: &CanonicalWriterStatusResponse) -> bool {
+        self.candidate.as_ref().is_some_and(|candidate| {
+            writer_attests_network_upgrade_schedule(status, candidate.network_upgrade_schedule())
+        })
+    }
+
     fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
-        if let Some(refusal) = self
+        let height = self
             .served
-            .attestation
-            .observe(status, self.served.visible_height)
-        {
+            .active
+            .map(|reader| reader.event_fence().visible_tip().height.value());
+        if let Some(refusal) = self.served.attestation.observe(status, height) {
             self.served.readiness.publish_storage(refusal);
+        } else if let Some(reader) = self.served.active {
+            self.served
+                .readiness
+                .observe_reader_schedule(self.served.attestation, status, reader);
         }
     }
 }
@@ -1102,6 +1160,41 @@ mod tests {
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
         readiness.publish_storage(ReadinessState::ready(Some(11)));
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_requires_the_writer_to_attest_the_candidate_schedule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let config =
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_secs(5))?;
+        let (primary, _) =
+            lifecycle_store(&config.canonical_primary_path, &lifecycle_activations())?;
+        let mut status = lifecycle_writer_status(&primary);
+        status
+            .network_upgrade_schedule
+            .as_mut()
+            .ok_or("missing writer schedule")?
+            .revision += 1;
+        let control = MutableCanonicalControl::new(status);
+        let (endpoint, shutdown, server) = serve_control(&control).await?;
+        let readiness = CompactServingReadiness::new(Readiness::default());
+        let first =
+            CompactBlockPublisher::bootstrap(config.clone(), readiness.clone(), &endpoint, None)
+                .await;
+        assert!(first.is_err(), "an unattested schedule was published");
+        assert!(!readiness.runtime().report().is_ready);
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        let (_publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, readiness.clone(), &endpoint, None).await?;
+        assert!(readiness.runtime().report().is_ready);
+        assert_eq!(
+            slot.capture().network_upgrade_schedule(),
+            primary.network_upgrade_schedule()
+        );
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2553,6 +2646,14 @@ mod tests {
         async fn start(
             baseline: &zinder_testkit::CanonicalBaseline<'_>,
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::start_with_readiness(baseline, CompactServingReadiness::new(Readiness::default()))
+                .await
+        }
+
+        async fn start_with_readiness(
+            baseline: &zinder_testkit::CanonicalBaseline<'_>,
+            serving_readiness: CompactServingReadiness,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let activations = zinder_testkit::sample_regtest_upgrade_activations();
             let writer = zinder_testkit::CanonicalWriterFixture::publish(baseline, &activations)?;
             let control =
@@ -2575,8 +2676,7 @@ mod tests {
                 }
             });
             let secondaries = tempfile::tempdir()?;
-            let readiness = Readiness::default();
-            let serving_readiness = CompactServingReadiness::new(readiness.clone());
+            let readiness = serving_readiness.runtime();
             let config = CompactBlockServingConfig {
                 canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
                 canonical_secondary_root: secondaries.path().to_path_buf(),
@@ -2613,6 +2713,13 @@ mod tests {
                 .set_writer_status(lifecycle_writer_status(self.writer.canonical_primary()?));
             self.publisher.refresh().await;
             Ok(())
+        }
+
+        async fn lightd_info(&self) -> Result<lightwalletd::LightdInfo, tonic::Status> {
+            self.adapter
+                .get_lightd_info(Request::new(lightwalletd::Empty {}))
+                .await
+                .map(tonic::Response::into_inner)
         }
 
         fn published_height(&self) -> BlockHeight {
@@ -2688,6 +2795,164 @@ mod tests {
                 child.height, parent.height
             );
         }
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    #[tokio::test]
+    async fn qualification_probe_halt_requires_a_confirmed_writer_at_the_served_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_query::{AdmittedIngestControl, spawn_wallet_ingest_control_readiness_probe};
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(2);
+        let readiness = CompactServingReadiness::for_qualification(Readiness::default());
+        let mut harness = LongRangeHarness::start_with_readiness(
+            &zinder_testkit::CanonicalBaseline::new(&chain),
+            readiness.clone(),
+        )
+        .await?;
+        let control = zinder_testkit::IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest =
+            AdmittedIngestControl::connect(control.endpoint(), None, Network::ZcashRegtest).await?;
+        control.set_reorg_window_exceeded(Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 101,
+            configured: 100,
+            covered: Some(100),
+        }));
+        let cancel = CancellationToken::new();
+        let probe = spawn_wallet_ingest_control_readiness_probe(
+            ingest,
+            readiness.dependencies(),
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        let is_halted = || {
+            matches!(
+                readiness.runtime().report().cause,
+                ReadinessCause::ReorgWindowExceeded { .. }
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !is_halted() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        control.set_reorg_window_exceeded(None);
+        let confirmed = lifecycle_writer_status(harness.writer.canonical_primary()?);
+        for status in [
+            CanonicalWriterStatusResponse {
+                tip_unconfirmed: true,
+                ..confirmed.clone()
+            },
+            CanonicalWriterStatusResponse {
+                fence: None,
+                ..confirmed
+            },
+        ] {
+            harness.control.set_writer_status(status);
+            harness.publisher.refresh().await;
+            assert!(is_halted(), "{:?}", readiness.runtime().report());
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                harness.refresh_at_writer_fence().await?;
+                if readiness.runtime().report().is_ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        cancel.cancel();
+        probe.await?;
+        control.shutdown().await?;
+        harness.stop().await
+    }
+
+    #[tokio::test]
+    async fn a_fixed_fence_schedule_revision_closes_admission_until_the_reader_is_replaced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(3);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
+        )
+        .await?;
+        let leased = harness.slot.capture();
+        harness.writer.append_live_block(&chain)?;
+        harness.refresh_at_writer_fence().await?;
+        let active = harness.slot.capture();
+        let fence = active.event_fence();
+        let mut activations = zinder_testkit::sample_regtest_upgrade_activations()
+            .activations()
+            .to_vec();
+        let next_upgrade = activations
+            .iter_mut()
+            .find(|upgrade| upgrade.name == "NU6.3")
+            .ok_or("missing next upgrade")?;
+        let old_height = next_upgrade.activation_height.value();
+        let before = harness.lightd_info().await?;
+        assert_eq!(before.upgrade_height, u64::from(old_height));
+        next_upgrade.activation_height = BlockHeight::new(4);
+        let revised = NetworkUpgradeActivations::new(Network::ZcashRegtest, activations)?;
+        harness.writer.admit_network_upgrade_schedule(&revised)?;
+        harness.refresh_at_writer_fence().await?;
+        assert_eq!(harness.writer.canonical_primary()?.event_fence(), fence);
+        assert!(Arc::ptr_eq(&active, &harness.slot.capture()));
+        assert!(
+            !harness.readiness.report().is_ready,
+            "a leased generation blocked replacement but the old schedule still served"
+        );
+        harness.control.set_available(false);
+        harness.publisher.refresh().await;
+        assert!(
+            !harness.readiness.report().is_ready,
+            "writer loss readmitted the old schedule"
+        );
+
+        drop(leased);
+        harness.control.set_available(true);
+        let status = lifecycle_writer_status(harness.writer.canonical_primary()?);
+        harness.control.queue_writer_status(status.clone());
+        harness
+            .control
+            .set_writer_status(CanonicalWriterStatusResponse {
+                network_upgrade_schedule: None,
+                ..status
+            });
+        harness.publisher.refresh().await;
+        assert!(
+            Arc::ptr_eq(&active, &harness.slot.capture()),
+            "the candidate did not match the writer schedule"
+        );
+        assert!(!harness.readiness.report().is_ready);
+        harness.refresh_at_writer_fence().await?;
+        let published = harness.slot.capture();
+        assert_eq!(published.event_fence(), fence);
+        assert_eq!(
+            published.network_upgrade_schedule(),
+            harness
+                .writer
+                .canonical_primary()?
+                .network_upgrade_schedule()
+        );
+        let after = harness.lightd_info().await?;
+        assert_eq!(after.block_height, before.block_height);
+        assert_eq!(
+            (after.upgrade_name.as_str(), after.upgrade_height),
+            ("NU6.3", 4)
+        );
+        assert!(harness.readiness.report().is_ready);
+        harness.control.set_available(false);
+        harness.publisher.refresh().await;
+        assert!(matches!(
+            harness.readiness.report().cause,
+            ReadinessCause::ServingPairStale { .. }
+        ));
+        harness.stop().await
     }
 
     /// A stream that waits on a slow client holds no generation, so the

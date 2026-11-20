@@ -466,6 +466,92 @@ stops the proxy, and checks that a broadcast moves to the fallback with cause
 The Zingolib flow cannot run on this chain. Zingolib 5.0.0 supports upgrades
 only through NU6.2, and the test refuses a tip at or past NU6.3.
 
+### Light-wallet serving qualification
+
+Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
+The qualification build serves wallet RPCs with one canonical store and ingest
+control. It uses the node for transparent balances, UTXOs, address history,
+transaction submission, and the recommended fee. Each forwarded request checks
+that the node holds the served tip on its best chain. If the canonical fence or
+schedule revision changes during verification, the request returns `UNAVAILABLE`.
+Requests share evidence of broadcast support and agreement with the writer's
+schedule through the next block for up to one minute. A failed tip check, a
+new schedule revision, or a change to the upgrade active at the next block
+requires fresh discovery. If discovery fails, concurrent callers waiting for it
+return the refusal or a retryable error. The next request can retry immediately.
+The node can advance while answering. Compare forwarded
+answers with wallet serving while the node stays at the same hash and height.
+
+The node orders UTXOs within a block by position. Qualification needs every
+matching output in the last block of a wallet's request to sort them by wallet
+transaction ID. A request can match more than 100,000 outputs across multiple
+blocks. Qualification uses bounded prefixes to finish the last requested
+height. A tip change between successful reads returns `UNAVAILABLE`.
+
+In the synthetic cutoff fixture, one height supplies 100,000 outputs and a
+later height supplies one more. The node has no ending-height filter, so
+qualification returns `RESOURCE_EXHAUSTED` when it cannot establish wallet
+order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
+32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
+
+Each qualification instance admits one nonempty UTXO request and one
+address-history request at a time. `GetTaddressTxids` and
+`GetTaddressTransactions` share the history slot. Each request holds its slot
+while it reads from the node and while the client drains the stream. A request
+for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
+
+Build the two qualification binaries:
+
+```bash
+cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd \
+  --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
+```
+
+In a shell with the Regtest node authentication from the preceding section,
+start ingest with a fresh store. The example uses the default ingest-control
+listener on port 9100. Set the same storage policy on both processes.
+
+```bash
+unset ZINDER_NETWORK
+export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
+export ZINDER_STORAGE__RAW_BLOB_POLICY=none
+mkdir -p .tmp
+ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving \
+  target/debug/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/qualification-canonical >.tmp/qualification-ingest.log 2>&1 &
+```
+
+Once ingest reaches the mined tip and its `/readyz` on port 9105 returns 200,
+start compatibility from the same shell:
+
+```bash
+target/debug/zinder-compat-lightwalletd --network zcash-regtest \
+  --serving light-wallet-qualification --listen-addr 127.0.0.1:9089 \
+  --canonical-primary-path .tmp/qualification-canonical \
+  --canonical-secondary-root .tmp/qualification-secondary
+```
+
+The canonical reader serves compact blocks, nullifiers, tree states, and subtree
+roots. A subtree-root stream returns roots completed by its starting tip.
+It can continue across an append and returns `UNAVAILABLE` if a later page
+finds that tip has left the best chain. A writer halt observed by ingest control
+closes admission until the publisher verifies the recovered writer's fence.
+
+Both mempool methods use ingest control. If an address-history lookup
+exceeds a row or byte limit, qualification splits it into disjoint height ranges.
+Before looking up transaction IDs, the stream records the hash at the end of
+the requested range. Each page is read in order. For each transaction, one
+verbose node call obtains its bytes and mined height, then a block-hash
+lookup checks the range before the wallet receives the row. The stream also
+checks the hash for empty pages and before reporting completion. A replacement
+returns `UNAVAILABLE`, and cancelling the stream stops further calls. If one
+height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
+With `none`, `GetTransaction` fetches the bytes from
+the node. To exercise local mined-transaction reads, repeat with fresh store
+paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
+projector or wallet store. The feature is for qualification only. Release
+builds accept `wallet` and `compact-blocks`.
+
 ### Testnet
 
 Testnet uses the same command with a cookie-authenticated node. This example

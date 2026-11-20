@@ -420,6 +420,30 @@ fn wallet_node_settings_without_an_address_are_rejected() -> eyre::Result<()> {
 }
 
 #[test]
+fn qualification_serving_requires_the_cargo_feature() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let path = temporary.path().join("compat.toml");
+    let config = compact_blocks_config_toml(
+        &temporary.path().join("canonical"),
+        &temporary.path().join("secondary"),
+    )?
+    .replace("compact-blocks", "light-wallet-qualification");
+    fs::write(
+        &path,
+        format!("{config}\n[node]\njson_rpc_addr = \"http://127.0.0.1:1\"\n"),
+    )?;
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&path)?])
+        .output()?;
+    assert_eq!(
+        output.status.success(),
+        cfg!(feature = "light-wallet-qualification"),
+        "{output:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
     let temporary = tempdir()?;
     let storage_path = temporary.path().join("compat-alias-store");

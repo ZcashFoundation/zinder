@@ -4,6 +4,8 @@ mod cli;
 mod env_var_contract;
 mod health;
 mod ingest_control_tip_change;
+#[cfg(feature = "light-wallet-qualification")]
+mod light_wallet_qualification;
 mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;
 mod mempool_compat;

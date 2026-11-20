@@ -6,6 +6,7 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -373,30 +374,42 @@ pub fn address_lookup_to_script_hash(
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         wallet::address_lookup::Selector::Address(address_text) => {
-            let zebra_address = parse_transparent_address(&address_text).map_err(|error| {
-                QueryError::InvalidAddress {
-                    reason: if matches!(error, TransparentAddressParseError::TooLong { .. }) {
-                        "transparent address is longer than any valid encoding"
-                    } else {
-                        "transparent address could not be parsed"
-                    },
-                }
-            })?;
-            if !transparent_address_matches_network(zebra_address.network_kind(), network) {
-                return Err(QueryError::InvalidAddress {
-                    reason: "transparent address network does not match server network",
-                });
-            }
-            let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
-            if script_pub_key.is_empty() {
-                return Err(QueryError::InvalidAddress {
-                    reason: "transparent address does not produce a receivable script",
-                });
-            }
+            let address = parse_receivable_transparent_address(&address_text, network)?;
             Ok(TransparentAddressScriptHash::of_script_pub_key(
-                &script_pub_key,
+                address.script().as_raw_bytes(),
             ))
         }
+    }
+}
+
+/// Parses a P2PKH or P2SH address that the wallet can look up on `network`.
+///
+/// # Errors
+///
+/// Returns [`QueryError::InvalidAddress`] for an oversized or malformed encoding,
+/// a different network, or a TEX address that has no receivable script.
+pub fn parse_receivable_transparent_address(
+    text: &str,
+    network: Network,
+) -> Result<ZebraTransparentAddress, QueryError> {
+    let address = parse_transparent_address(text).map_err(|error| QueryError::InvalidAddress {
+        reason: if matches!(error, TransparentAddressParseError::TooLong { .. }) {
+            "transparent address is longer than any valid encoding"
+        } else {
+            "transparent address could not be parsed"
+        },
+    })?;
+    if !transparent_address_matches_network(address.network_kind(), network) {
+        return Err(QueryError::InvalidAddress {
+            reason: "transparent address network does not match server network",
+        });
+    }
+    match address {
+        ZebraTransparentAddress::PayToPublicKeyHash { .. }
+        | ZebraTransparentAddress::PayToScriptHash { .. } => Ok(address),
+        ZebraTransparentAddress::Tex { .. } => Err(QueryError::InvalidAddress {
+            reason: "transparent address does not produce a receivable script",
+        }),
     }
 }
 

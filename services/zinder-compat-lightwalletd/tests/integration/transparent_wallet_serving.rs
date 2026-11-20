@@ -1374,7 +1374,7 @@ async fn first_block_range_status(
     }
 }
 
-fn build_wallet_serving_adapter(
+pub(super) fn build_wallet_serving_adapter(
     store_fixture: &mut WalletServingStoreFixture,
 ) -> eyre::Result<WalletServingAdapter> {
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
@@ -1510,7 +1510,7 @@ fn busy_addresses_fixture(
 
 /// Builds a wallet-serving store whose address holds `utxo_count` UTXOs at
 /// height 2, one per transaction, in transaction-index order.
-fn many_utxo_fixture(
+pub(super) fn many_utxo_fixture(
     address_byte: u8,
     utxo_count: u32,
 ) -> eyre::Result<(WalletServingStoreFixture, String)> {

@@ -437,7 +437,9 @@ impl WriterAttestation {
         *self.clock.attested_at.lock()
     }
 
-    fn withdraw_allowance(&self) {
+    /// Withdraws disconnected serving when the writer no longer attests the
+    /// published reader. A remembered writer halt remains in force.
+    pub fn withdraw_allowance(&self) {
         *self.clock.attested_at.lock() = None;
     }
 

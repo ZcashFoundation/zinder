@@ -426,6 +426,8 @@ pub struct WalletServingReadiness {
 struct IngestControlInput {
     observed: ReadinessCause,
     unadopted_halt: Option<ReorgWindowExceededDetail>,
+    #[cfg(feature = "light-wallet-qualification")]
+    awaiting_writer_attestation: bool,
 }
 
 impl IngestControlInput {
@@ -463,7 +465,43 @@ impl WalletServingReadiness {
             ingest_control: Arc::new(Mutex::new(IngestControlInput {
                 observed: ReadinessCause::Starting,
                 unadopted_halt: None,
+                #[cfg(feature = "light-wallet-qualification")]
+                awaiting_writer_attestation: false,
             })),
+        }
+    }
+
+    /// Returns the shared admission for the storage publisher and its stale deadline.
+    #[must_use]
+    pub const fn canonical_admission(&self) -> &ComposedReadiness {
+        &self.composed
+    }
+
+    /// Hands a latched ingest halt to the canonical publisher before its writer-status read.
+    #[cfg(feature = "light-wallet-qualification")]
+    pub fn begin_canonical_refresh(&self, writer: &mut WriterAttestation, height: u32) {
+        let mut input = self.ingest_control.lock();
+        if let Some(halt) = input.unadopted_halt {
+            input.awaiting_writer_attestation = true;
+            drop(input);
+            writer.remember_halt(halt, Some(height));
+        }
+    }
+
+    /// Releases the halt observed before this refresh once the writer attests the served fence.
+    /// A new halt observed during the refresh must wait for the next attestation.
+    #[cfg(feature = "light-wallet-qualification")]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the latest observation and its publication must stay ordered"
+    )]
+    pub fn confirm_canonical_attestation(&self) {
+        let mut input = self.ingest_control.lock();
+        if input.awaiting_writer_attestation {
+            input.unadopted_halt = None;
+            input.awaiting_writer_attestation = false;
+            self.composed
+                .publish_input(ReadinessInput::IngestControl, input.observed.clone());
         }
     }
 
@@ -505,6 +543,10 @@ impl WalletServingReadiness {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = ingest_control_cause.reorg_window_exceeded_detail() {
             input.unadopted_halt = Some(halt);
+            #[cfg(feature = "light-wallet-qualification")]
+            {
+                input.awaiting_writer_attestation = false;
+            }
         }
         input.observed = ingest_control_cause;
         self.composed
@@ -841,22 +883,27 @@ fn publish_wallet_node_observation(
     observation: Result<UpstreamHealthSnapshot, NodeFailure>,
     outage: &mut Option<WalletNodeOutage>,
 ) {
+    readiness.publish_node_source_cause(node_observation_cause(observation, outage));
+}
+
+fn node_observation_cause(
+    observation: Result<UpstreamHealthSnapshot, NodeFailure>,
+    outage: &mut Option<WalletNodeOutage>,
+) -> ReadinessCause {
     match observation {
         Ok(snapshot) if snapshot.ready_for_queries => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::Ready);
+            ReadinessCause::Ready
         }
         Ok(snapshot) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::UpstreamNotReady(
-                upstream_not_ready_detail(snapshot),
-            ));
+            ReadinessCause::UpstreamNotReady(upstream_not_ready_detail(snapshot))
         }
         Err(NodeFailure::CapabilityMissing(capability)) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::NodeCapabilityMissing {
+            ReadinessCause::NodeCapabilityMissing {
                 capability: capability.name(),
-            });
+            }
         }
         Err(NodeFailure::Unavailable {
             failure_class,
@@ -864,11 +911,41 @@ fn publish_wallet_node_observation(
         }) => {
             let continued =
                 WalletNodeOutage::continue_with(outage.as_ref(), failure_class, &reason);
-            readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
-                continued.detail.clone(),
-            ));
+            let cause = ReadinessCause::NodeUnavailable(continued.detail.clone());
             *outage = Some(continued);
+            cause
         }
+    }
+}
+
+#[cfg(feature = "light-wallet-qualification")]
+impl crate::QualificationWalletQuery {
+    /// Probes this endpoint's forwarding admission and health for the node-source dependency.
+    #[must_use]
+    pub fn spawn_node_readiness_probe(
+        self,
+        readiness: WalletServingReadiness,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut outage = None;
+            loop {
+                let probe = async {
+                    let node = self.verified_node().await?;
+                    probe_wallet_node_readiness(node).await
+                };
+                let observation = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    observation = probe => observation.map_err(|error| NodeFailure::from(&error)),
+                };
+                publish_wallet_node_observation(&readiness, observation, &mut outage);
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {}
+                }
+            }
+        })
     }
 }
 

@@ -1,4 +1,5 @@
 pub(crate) mod nullifier_parity;
+pub(crate) mod verified_node;
 
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};

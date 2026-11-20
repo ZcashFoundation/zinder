@@ -64,8 +64,8 @@ pub use source_transaction::{
 };
 pub use source_transparent_address::{
     MAX_TRANSPARENT_ADDRESS_LOOKUP_ADDRESSES, SourceTransparentAddressBalance,
-    SourceTransparentUnspentOutput, TransparentAddressLookup, TransparentAddressLookupError,
-    TransparentAddressRowLimit,
+    SourceTransparentUnspentOutput, SourceTransparentUtxoPage, TransparentAddressLookup,
+    TransparentAddressLookupError, TransparentAddressRowLimit,
 };
 pub use transparent_address::{
     MAX_TRANSPARENT_ADDRESS_TEXT_BYTES, TransparentAddressParseError, parse_transparent_address,
