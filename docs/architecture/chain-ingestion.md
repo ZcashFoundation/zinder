@@ -335,7 +335,8 @@ damage again:
   passes. A row that is gone stays damage, because the store never drops a
   settled row and every reconstruction that seeds from it fails without it.
 - Damage recorded where the pass could not read an entry as a row, such as a
-  key that is not a height, clears once the rows from that height pass.
+  key that is not a height, clears once the verification step that starts at
+  that height passes.
 
 Damage that is still there parks readiness again and the pass stops. Damage
 that clears stops being reported, which ingest logs as
