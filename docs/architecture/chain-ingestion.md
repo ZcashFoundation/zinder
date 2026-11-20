@@ -247,6 +247,10 @@ again, as a writer checks a row it stores:
 - Each frontier derives the root stored beside it.
 - The row carries a frontier for exactly the pools active at its height, even
   when a pool's tree is still empty.
+- The row's block time is the time in the canonical block header at its
+  height. The history predecessor has no stored header, so its row carries
+  the block time recorded for it when the store was built. A row at any other
+  height with no stored header fails this check.
 
 The pass starts when densification does: once ingest follows the tip, and
 Explorer views have caught up when they are enabled. A restart over a store

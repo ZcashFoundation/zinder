@@ -5,9 +5,10 @@
 //! on `RocksDB` block checksums. Verification reads settled rows again and
 //! checks each one as a writer does: every frontier parses with the official
 //! codec, is its canonical encoding, and derives the root stored beside it,
-//! and the row carries a frontier for exactly the pools active at its height.
-//! A caller repeats bounded verifications over settled history, so a damaged
-//! row is found within one pass over it.
+//! the row carries a frontier for exactly the pools active at its height, and
+//! its block time is the canonical block time at that height. A caller
+//! repeats bounded verifications over settled history, so a damaged row is
+//! found within one pass over it.
 //!
 //! Verification reads through a [`RocksDbTreeStateVerifier`], a canonical
 //! secondary whose checkpoint family has no block cache, so every read takes
@@ -32,7 +33,7 @@ use super::{
     block_load::{decode_tree_state_checkpoint, encode_block_position},
     frontier_presence_mismatch,
     publication::column_family,
-    reader::CanonicalServingRead,
+    reader::{CanonicalServingRead, read_block_header_at},
     rocksdb::{
         CanonicalStoreAdmissionExpectation, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         canonical_verification_column_family_descriptors,
@@ -86,7 +87,8 @@ pub struct TreeStateCheckpointMismatch {
     /// What `height` names.
     pub kind: TreeStateCheckpointMismatchKind,
     /// Pool whose frontier failed, or `None` when the row failed outside any
-    /// one frontier, such as a value that ends inside its block time.
+    /// one frontier, such as a value that ends inside its block time or a
+    /// block time that differs from the canonical block's.
     pub pool: Option<ShieldedProtocol>,
     /// The check that failed.
     pub reason: String,
@@ -177,13 +179,14 @@ impl RocksDbTreeStateVerifier {
     /// Each row must decode in full: every frontier parses with the official
     /// codec, is its canonical encoding, and derives the root stored beside
     /// it. It must also carry a frontier for exactly the pools that
-    /// `network_upgrade_activations` activates at or below its height. The
-    /// first row that fails is reported in
-    /// [`TreeStateCheckpointVerification::mismatch`], as is a key that is not
-    /// a height and a table block that fails its checksum. Entries above the
-    /// settled tip are never read, so damage there waits for the tip to pass
-    /// it. An error means the store could not be read or does not admit the
-    /// activation table.
+    /// `network_upgrade_activations` activates at or below its height, and the
+    /// block time of the canonical header at its height, or of the history
+    /// predecessor, which has no retained header. The first row that fails is
+    /// reported in [`TreeStateCheckpointVerification::mismatch`], as is a key
+    /// that is not a height and a table block that fails its checksum.
+    /// Entries above the settled tip are never read, so damage there waits
+    /// for the tip to pass it. An error means the store could not be read or
+    /// does not admit the activation table.
     pub fn verify_tree_state_checkpoints(
         &self,
         from: BlockHeight,
@@ -212,11 +215,13 @@ impl RocksDbTreeStateVerifier {
         read_options.set_verify_checksums(true);
         match db.get_cf_opt(&family, encode_block_position(height), &read_options) {
             Ok(None) => Ok(TreeStateCheckpointRowVerification::Absent),
-            Ok(Some(encoded)) => Ok(verify_row(network_upgrade_activations, height, &encoded)
-                .map_or(
-                    TreeStateCheckpointRowVerification::Intact,
-                    TreeStateCheckpointRowVerification::Mismatch,
-                )),
+            Ok(Some(encoded)) => verify_row(store, network_upgrade_activations, height, &encoded)
+                .map(|mismatch| {
+                    mismatch.map_or(
+                        TreeStateCheckpointRowVerification::Intact,
+                        TreeStateCheckpointRowVerification::Mismatch,
+                    )
+                }),
             Err(source) if source.kind() == ErrorKind::Corruption => Ok(
                 TreeStateCheckpointRowVerification::Mismatch(TreeStateCheckpointMismatch {
                     height,
@@ -313,7 +318,9 @@ fn verify_tree_state_checkpoints(
         if verification.verified_rows >= max_rows.get() {
             return Ok(verification);
         }
-        if let Some(mismatch) = verify_row(network_upgrade_activations, height, &encoded) {
+        if let Some(mismatch) = verify_row(store, network_upgrade_activations, height, &encoded)
+            .map_err(|source| interrupted(&verification, source))?
+        {
             verification.mismatch = Some(mismatch);
             verification.next_from = height;
             return Ok(verification);
@@ -372,27 +379,54 @@ fn scanned_entry(
 
 /// Checks one stored row as a writer checks the checkpoint it stores.
 fn verify_row(
+    store: &impl CanonicalServingRead,
     network_upgrade_activations: &NetworkUpgradeActivations,
     height: BlockHeight,
     encoded: &[u8],
-) -> Option<TreeStateCheckpointMismatch> {
+) -> Result<Option<TreeStateCheckpointMismatch>, CanonicalStoreError> {
     let mismatch = |pool, reason| TreeStateCheckpointMismatch {
         height,
         kind: TreeStateCheckpointMismatchKind::Row,
         pool,
         reason,
     };
-    match decode_tree_state_checkpoint(encoded) {
-        Err(error) => Some(mismatch(error.protocol(), error.to_string())),
-        Ok((_, frontiers)) => {
-            frontier_presence_mismatch(network_upgrade_activations, height, &frontiers).map(
-                |presence| {
-                    mismatch(
-                        Some(presence.protocol),
-                        format!("the checkpoint {}", presence.describe()),
-                    )
-                },
-            )
-        }
+    let (block_time_seconds, frontiers) = match decode_tree_state_checkpoint(encoded) {
+        Ok(decoded) => decoded,
+        Err(error) => return Ok(Some(mismatch(error.protocol(), error.to_string()))),
+    };
+    if let Some(presence) =
+        frontier_presence_mismatch(network_upgrade_activations, height, &frontiers)
+    {
+        return Ok(Some(mismatch(
+            Some(presence.protocol),
+            format!("the checkpoint {}", presence.describe()),
+        )));
     }
+    Ok(match canonical_block_time(store, height)? {
+        Some(block_time) if block_time == i64::from(block_time_seconds) => None,
+        Some(block_time) => Some(mismatch(
+            None,
+            format!(
+                "the checkpoint block time {block_time_seconds} differs from the canonical block time {block_time}"
+            ),
+        )),
+        None => Some(mismatch(
+            None,
+            "no canonical block header is stored at the checkpoint's height".to_owned(),
+        )),
+    })
+}
+
+/// Returns the block time a checkpoint stored at `height` carries: the
+/// history predecessor's, which has no retained header, or the canonical
+/// header's. `None` means no header is stored at `height`.
+fn canonical_block_time(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+) -> Result<Option<i64>, CanonicalStoreError> {
+    let history_predecessor = store.serving_build_plan().history_predecessor();
+    if height == history_predecessor.block_id.height {
+        return Ok(Some(i64::from(history_predecessor.block_time_seconds)));
+    }
+    Ok(read_block_header_at(store, height)?.map(|header| header.block_time))
 }

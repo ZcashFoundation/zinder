@@ -57,6 +57,25 @@ fn damaged_cause() -> ReadinessCause {
     damaged_row().readiness_cause()
 }
 
+/// Damage at the damaged row when only its block time changed, which fails
+/// outside any pool.
+fn damaged_block_time() -> CanonicalStoreDamage {
+    CanonicalStoreDamage {
+        site: CanonicalStoreDamageSite::Row(BlockHeight::new(DAMAGED_HEIGHT)),
+        pool: None,
+    }
+}
+
+/// The record a pass that found [`damaged_block_time`] leaves.
+fn damaged_block_time_record(store: &PublishedStore) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "construction_manifest_sha256": store.manifest_sha256,
+        "next_height": DAMAGED_HEIGHT,
+        "damaged": {"site": "row", "height": DAMAGED_HEIGHT},
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_over_an_intact_store_completes_its_cycle_and_keeps_ingest_ready() -> eyre::Result<()>
 {
@@ -192,6 +211,58 @@ async fn recorded_damage_the_row_no_longer_shows_is_cleared() -> eyre::Result<()
         closed_gate.readiness().admission_state().cause == ReadinessCause::Starting,
         "cleared damage must not park readiness"
     );
+    Ok(())
+}
+
+/// A row whose only change is its block time is damage outside any pool,
+/// since a wallet would otherwise be served a time its block does not carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_block_time_differs_from_its_block_is_reported_without_a_pool()
+-> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_block_time_bit(DAMAGED_HEIGHT)?;
+    let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
+
+    store.run_until_the_pass_ends(&gate, &store_damage).await?;
+
+    eyre::ensure!(
+        store_damage.current() == Some(damaged_block_time()),
+        "the pass must report the row with another block time, got {:?}",
+        store_damage.current()
+    );
+    eyre::ensure!(
+        gate.readiness().runtime_readiness().report().cause
+            == damaged_block_time().readiness_cause()
+    );
+    eyre::ensure!(store.watermark()? == damaged_block_time_record(&store));
+    Ok(())
+}
+
+/// Recorded damage at a row that still carries another block time stays
+/// reported: checking the row again checks its block time too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_damage_at_a_row_whose_block_time_still_differs_stays_reported() -> eyre::Result<()>
+{
+    let store = PublishedStore::new()?;
+    store.flip_block_time_bit(DAMAGED_HEIGHT)?;
+    store.write_watermark(&damaged_block_time_record(&store))?;
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    let closed_gate = closed_gate();
+
+    store
+        .run_until_the_pass_ends(&closed_gate, &store_damage)
+        .await?;
+
+    eyre::ensure!(
+        store_damage.current() == Some(damaged_block_time()),
+        "a row that still carries another block time must stay reported, got {:?}",
+        store_damage.current()
+    );
+    eyre::ensure!(
+        closed_gate.readiness().admission_state().cause == damaged_block_time().readiness_cause()
+    );
+    eyre::ensure!(store.watermark()? == damaged_block_time_record(&store));
     Ok(())
 }
 
@@ -547,6 +618,18 @@ impl PublishedStore {
                 .get_mut(5)
                 .ok_or_else(|| eyre::eyre!("checkpoint row holds no root"))?;
             *root_byte ^= 0xff;
+            Ok(())
+        })
+    }
+
+    /// Flips the low bit of the block time that leads the row at `height`,
+    /// which keeps a row that decodes to the same trees.
+    fn flip_block_time_bit(&self, height: u32) -> eyre::Result<()> {
+        rewrite_checkpoint_row(&self.primary_path, height, |row| {
+            let block_time_byte = row
+                .first_mut()
+                .ok_or_else(|| eyre::eyre!("checkpoint row is empty"))?;
+            *block_time_byte ^= 0x01;
             Ok(())
         })
     }

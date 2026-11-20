@@ -3,9 +3,10 @@
 //! The test store settles at height 120 below its tip at 150 and holds a
 //! checkpoint at every height through 100 once densified, so the settled rows
 //! are heights 0 through 100. Sapling activates at 2, Orchard at 6, and
-//! Ironwood at 10, and every tree stays empty. Each test changes the store
-//! through its primary and verifies it through a [`RocksDbTreeStateVerifier`]
-//! opened on that primary.
+//! Ironwood at 10, and every tree stays empty. Each block's time is its
+//! height, as is the time of genesis, the history predecessor. Each test
+//! changes the store through its primary and verifies it through a
+//! [`RocksDbTreeStateVerifier`] opened on that primary.
 
 use std::num::NonZeroU32;
 
@@ -23,7 +24,7 @@ use super::{
     block_load::{encode_block_position, encode_tree_state_checkpoint},
     live_replacement_tests::published_store,
     publication::column_family,
-    rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    rocksdb::{BLOCK_HEADER_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
     secondary_tests::{compact_away_rows_in, split_rows_into_bottom_level_files, table_file_path},
     test_network_upgrade_activations,
 };
@@ -185,6 +186,83 @@ fn a_row_that_fails_outside_any_frontier_is_a_mismatch_without_a_pool() -> TestR
 
     let mismatch = verification.mismatch.ok_or("a truncated row must fail")?;
     assert_eq!((mismatch.height, mismatch.pool), (height, None));
+    Ok(())
+}
+
+/// A row whose only change is its block time is a mismatch without a pool,
+/// both at a height with a canonical header and at the history predecessor,
+/// whose block time the build plan holds.
+#[test]
+fn a_row_whose_block_time_differs_from_its_block_is_a_mismatch_without_a_pool() -> TestResult {
+    let heights = [BlockHeight::new(50), BlockHeight::new(0)];
+    let mut found = Vec::new();
+    for height in heights {
+        let temporary = TempDir::new()?;
+        let store = densified_store(&temporary)?;
+        flip_block_time_bit(&store, height)?;
+
+        let verification = verify_all(&temporary)?;
+
+        found.push((
+            verification.mismatch,
+            verification.verified_rows,
+            verification.next_from,
+        ));
+    }
+
+    assert_eq!(
+        found,
+        heights.map(|height| (Some(block_time_mismatch(height)), height.value(), height))
+    );
+    Ok(())
+}
+
+/// A row recorded as damaged that still carries another block time stays a
+/// mismatch when it is verified at its height, so a restart does not clear
+/// that damage.
+#[test]
+fn a_row_verified_at_its_height_fails_when_only_its_block_time_differs() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    let height = BlockHeight::new(50);
+    flip_block_time_bit(&store, height)?;
+    let verifier = open_verifier(&temporary)?;
+
+    assert_eq!(
+        verifier.verify_tree_state_checkpoint_at(height, &activations()?)?,
+        TreeStateCheckpointRowVerification::Mismatch(block_time_mismatch(height))
+    );
+    Ok(())
+}
+
+/// A settled row above the history predecessor has a canonical header, so a
+/// row without one is a mismatch, not a row that skips the block-time check.
+#[test]
+fn a_row_whose_block_has_no_header_is_a_mismatch_without_a_pool() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    let height = BlockHeight::new(30);
+    let family = column_family(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    store
+        .bounded_open
+        .db
+        .delete_cf(&family, encode_block_position(height))?;
+    let expected = TreeStateCheckpointMismatch {
+        height,
+        kind: TreeStateCheckpointMismatchKind::Row,
+        pool: None,
+        reason: "no canonical block header is stored at the checkpoint's height".to_owned(),
+    };
+
+    let verification = verify_all(&temporary)?;
+    let at_height =
+        open_verifier(&temporary)?.verify_tree_state_checkpoint_at(height, &activations()?)?;
+
+    assert_eq!(verification.mismatch, Some(expected.clone()));
+    assert_eq!(
+        at_height,
+        TreeStateCheckpointRowVerification::Mismatch(expected)
+    );
     Ok(())
 }
 
@@ -540,6 +618,30 @@ fn replace_row(store: &RocksDbCanonicalStore, height: BlockHeight, row: &[u8]) -
         .db
         .put_cf(&family, encode_block_position(height), row)?;
     Ok(())
+}
+
+/// Flips the low bit of the block time that leads the row at `height`,
+/// which keeps a row that decodes to the same trees.
+fn flip_block_time_bit(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestResult {
+    let mut row = stored_row(store, height)?;
+    let first = row.first_mut().ok_or("checkpoint row is empty")?;
+    *first ^= 0x01;
+    replace_row(store, height, &row)
+}
+
+/// The mismatch of the row at `height` after [`flip_block_time_bit`], where
+/// the canonical block time is the height.
+fn block_time_mismatch(height: BlockHeight) -> TreeStateCheckpointMismatch {
+    TreeStateCheckpointMismatch {
+        height,
+        kind: TreeStateCheckpointMismatchKind::Row,
+        pool: None,
+        reason: format!(
+            "the checkpoint block time {} differs from the canonical block time {}",
+            height.value() ^ 1,
+            height.value()
+        ),
+    }
 }
 
 /// Stores a row under the key of `height` extended by one byte, a key no

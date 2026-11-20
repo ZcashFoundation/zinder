@@ -3,10 +3,11 @@
 //! A stored tree-state read serves a checkpoint row after checking only its
 //! framing, so this pass reads every settled row again and checks it as a
 //! writer does: it re-derives each frontier's root, compares it with the
-//! stored root, and requires a frontier for exactly the pools active at the
-//! row's height. A [`RocksDbTreeStateVerifier`] reads the rows from disk on a
-//! blocking thread, and the pass holds itself to a configured average number
-//! of rows per second. It runs only while historical work may run.
+//! stored root, requires a frontier for exactly the pools active at the row's
+//! height, and requires the block time of the canonical block at that height.
+//! A [`RocksDbTreeStateVerifier`] reads the rows from disk on a blocking
+//! thread, and the pass holds itself to a configured average number of rows
+//! per second. It runs only while historical work may run.
 //!
 //! The pass works in cycles. Each cycle verifies every row from the history
 //! predecessor through the settled tip, including rows that densification or
