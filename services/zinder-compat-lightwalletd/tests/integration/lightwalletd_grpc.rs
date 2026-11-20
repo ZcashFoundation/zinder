@@ -2705,6 +2705,104 @@ async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fi
     Ok(())
 }
 
+fn nullifier_parity_store() -> eyre::Result<AcceptanceStore> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = fixture_block(&chain, ACCEPTANCE_BLOCK_HEIGHT)?;
+    let mixed = mixed_pool_transaction_rows(&block);
+    let transaction_id = TransactionId::from_bytes([17; 32]);
+    let mut deposit = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        block.height,
+        block.hash,
+        1,
+        b"sapling-deposit",
+    );
+    deposit.facts.public_facts.counts.sapling_output_count = 1;
+    let rows = [mixed, deposit];
+    let artifact = acceptance_compact_block_artifact_at(&block, &rows)?;
+    let mut transactions = artifact.into_parts().transactions;
+    let [_, deposit] = transactions.as_mut_slice() else {
+        return Err(eyre!("expected a mixed transaction and a Sapling deposit"));
+    };
+    deposit.data.fee_zat = Some(10_000);
+    let compact = CompactBlockArtifact::new(
+        BlockId::new(block.height, block.hash),
+        canonical_parent_hash(&block),
+        block.block_time_seconds,
+        transactions,
+        block.compact_block_artifact().chain_metadata(),
+    )?;
+    let chain = rows
+        .into_iter()
+        .fold(chain, ChainFixture::with_transaction_rows)
+        .with_compact_block_artifact(compact);
+    acceptance_store_from_chain(&chain)
+}
+
+#[tokio::test]
+async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        pool_types: Vec<i32>,
+        transactions_hex: Vec<String>,
+    }
+
+    // Go lightwalletd v0.6.2 served the mixed transaction and Sapling output-only
+    // deposit from nullifier_parity_store through its GetBlockRangeNullifiers handler.
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "fixtures/lightwalletd-v0.6.2-nullifier-pools.json"
+    ))?;
+    let store_fixture = nullifier_parity_store()?;
+    let adapter = acceptance_adapter(&store_fixture);
+    for case in cases {
+        let request = lightwalletd::BlockRange {
+            pool_types: case.pool_types.clone(),
+            ..block_range_request(1, 1)
+        };
+        let stream = adapter
+            .get_block_range_nullifiers(Request::new(request))
+            .await?
+            .into_inner();
+        let blocks = collect_stream(stream).await?;
+        let [block] = blocks.as_slice() else {
+            return Err(eyre!("expected one block for {:?}", case.pool_types));
+        };
+        assert!(block.chain_metadata.is_none());
+        let transactions: Vec<_> = block
+            .vtx
+            .iter()
+            .map(|tx| hex::encode(prost::Message::encode_to_vec(tx)))
+            .collect();
+        assert_eq!(
+            transactions, case.transactions_hex,
+            "requested pools {:?}",
+            case.pool_types
+        );
+
+        if case.pool_types.is_empty() {
+            let single = adapter
+                .get_block_nullifiers(Request::new(lightwalletd::BlockId {
+                    height: 1,
+                    hash: Vec::new(),
+                }))
+                .await?
+                .into_inner();
+            assert_eq!(single.vtx, block.vtx);
+        }
+    }
+    for invalid in [lightwalletd::PoolType::Invalid as i32, 99] {
+        let request = lightwalletd::BlockRange {
+            pool_types: vec![lightwalletd::PoolType::Ironwood as i32, invalid],
+            ..block_range_request(1, 1)
+        };
+        let result = adapter
+            .get_block_range_nullifiers(Request::new(request))
+            .await;
+        assert!(matches!(result, Err(status) if status.code() == Code::InvalidArgument));
+    }
+    Ok(())
+}
+
 /// Asserts one nullifiers-only compact block carries only shielded nullifiers
 /// and has every excluded field cleared.
 fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre::Result<()> {
@@ -5412,25 +5510,29 @@ async fn ordered_broadcasting_acceptance_adapter(
 
 fn acceptance_store_fixture() -> eyre::Result<AcceptanceStore> {
     acceptance_store_fixture_with_transaction_rows(RawBlobRetention::None, |block| {
-        let transaction_id = TransactionId::from_bytes([2; 32]);
-        let mut rows = FixtureTransactionRows::from_raw_transaction(
-            transaction_id,
-            block.height,
-            block.hash,
-            0,
-            b"compact-wallet-transaction",
-        );
-        rows.facts.public_facts.counts = TransactionComponentCounts {
-            transparent_input_count: 0,
-            transparent_output_count: 0,
-            sapling_spend_count: 1,
-            sapling_output_count: 1,
-            orchard_action_count: 1,
-            ironwood_action_count: 1,
-            sprout_joinsplit_count: 0,
-        };
-        vec![rows]
+        vec![mixed_pool_transaction_rows(block)]
     })
+}
+
+fn mixed_pool_transaction_rows(block: &FixtureBlock) -> FixtureTransactionRows {
+    let transaction_id = TransactionId::from_bytes([2; 32]);
+    let mut rows = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        block.height,
+        block.hash,
+        0,
+        b"compact-wallet-transaction",
+    );
+    rows.facts.public_facts.counts = TransactionComponentCounts {
+        transparent_input_count: 0,
+        transparent_output_count: 0,
+        sapling_spend_count: 1,
+        sapling_output_count: 1,
+        orchard_action_count: 1,
+        ironwood_action_count: 1,
+        sprout_joinsplit_count: 0,
+    };
+    rows
 }
 
 fn acceptance_store_fixture_with_transaction_rows<TransactionsFn>(

@@ -2,7 +2,7 @@
 
 use tonic::Status;
 use zinder_core::{
-    CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
+    CompactBlockArtifact, CompactShieldedAction, CompactTransaction, CompactTransactionData,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd;
@@ -77,6 +77,19 @@ impl CompactBlockShape {
         Ok(selected)
     }
 
+    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
+        let selected = Self::for_range(pool_types)?;
+        if !selected.sapling && !selected.orchard && !selected.ironwood {
+            // lightwalletd removes transparent first, then defaults an empty list to all shielded pools.
+            return Ok(Self::NULLIFIERS);
+        }
+        Ok(Self {
+            transparent: false,
+            payload: Payload::Nullifiers,
+            ..selected
+        })
+    }
+
     pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
         Ok(Self {
             payload: Payload::Mempool,
@@ -130,8 +143,16 @@ impl CompactBlockShape {
             .transpose()
             .map_err(|_| Status::data_loss("compact transaction fee exceeds u32"))?
             .unwrap_or_default();
+        if !self.includes_transaction(&scan) {
+            return Ok(None);
+        }
         let nullifiers_only = self.payload == Payload::Nullifiers;
-        let mut message = lightwalletd::CompactTx::default();
+        let mut message = lightwalletd::CompactTx {
+            index: transaction.index,
+            txid: encode_internal_transaction_id(transaction.transaction_id).to_vec(),
+            fee,
+            ..lightwalletd::CompactTx::default()
+        };
         if self.sapling {
             message.spends = scan
                 .sapling_spends
@@ -179,13 +200,19 @@ impl CompactBlockShape {
                 })
                 .collect();
         }
-        if self.payload != Payload::FullBlock && !compact_transaction_has_payload(&message) {
-            return Ok(None);
-        }
-        message.index = transaction.index;
-        message.txid = encode_internal_transaction_id(transaction.transaction_id).to_vec();
-        message.fee = fee;
         Ok(Some(message))
+    }
+
+    fn includes_transaction(self, scan: &CompactTransactionData) -> bool {
+        // A Sapling output selects the transaction even when the nullifier RPC omits the output.
+        self.payload == Payload::FullBlock
+            || (self.sapling
+                && (!scan.sapling_spends.is_empty() || !scan.sapling_outputs.is_empty()))
+            || (self.orchard && !scan.orchard_actions.is_empty())
+            || (self.ironwood && !scan.ironwood_actions.is_empty())
+            || (self.transparent
+                && (!scan.transparent_outputs.is_empty()
+                    || (self.payload != Payload::Mempool && !scan.transparent_inputs.is_empty())))
     }
 }
 
@@ -211,17 +238,6 @@ fn encode_actions(
             }
         })
         .collect()
-}
-
-/// Returns whether a projected transaction carries any wallet scan data.
-#[must_use]
-fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> bool {
-    !transaction.spends.is_empty()
-        || !transaction.outputs.is_empty()
-        || !transaction.actions.is_empty()
-        || !transaction.ironwood_actions.is_empty()
-        || !transaction.vin.is_empty()
-        || !transaction.vout.is_empty()
 }
 
 #[cfg(test)]

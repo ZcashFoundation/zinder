@@ -741,8 +741,9 @@ where
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let request = request.into_inner();
+        let shape = CompactBlockShape::for_nullifier_range(&request.pool_types)?;
         self.block_methods
-            .block_range(&self.query_api, &request, CompactBlockShape::NULLIFIERS)
+            .block_range(&self.query_api, &request, shape)
             .await
             .map(Response::new)
     }

@@ -37,7 +37,7 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetBlock` | Served | Served | Height 0 with an empty hash is `INVALID_ARGUMENT` |
 | `GetBlockNullifiers` | Served | `UNIMPLEMENTED` | Shielded pools, nullifiers only |
 | `GetBlockRange` | Served | Served | Ascending or descending; see below |
-| `GetBlockRangeNullifiers` | Served | `UNIMPLEMENTED` | Ignores `poolTypes`; shielded pools only |
+| `GetBlockRangeNullifiers` | Served | `UNIMPLEMENTED` | Returns nullifiers for the requested shielded pools |
 | `GetTransaction` | Served | `UNIMPLEMENTED` | Pending transactions at height 0 |
 | `SendTransaction` | Served when `[node]` is set | `UNIMPLEMENTED` | |
 | `GetTaddressTxids`, `GetTaddressTransactions` | Served | `UNIMPLEMENTED` | Same behavior for both |
@@ -109,13 +109,17 @@ A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a h
 
 `GetBlockRange` applies the requested `poolTypes` to every transaction and omits any transaction left with no spends, outputs, actions, or transparent inputs and outputs, as lightwalletd does. With no `poolTypes`, it returns the shielded pools, so a transparent-only coinbase is absent unless the request names the transparent pool. Each remaining transaction keeps its block position in `CompactTx.index`, so a gap marks an omitted transaction. A range with start above end is sent in descending order.
 
-`GetBlockRangeNullifiers` ignores `poolTypes` and sends the nullifiers of every shielded pool. This differs from lightwalletd v0.6.2, which drops the transparent pool from `poolTypes` and honors the pools that remain, so a request that names only some shielded pools gets only their nullifiers from lightwalletd.
+`GetBlockRangeNullifiers` returns nullifiers for the shielded pools listed in `poolTypes`. Both an empty list and a list containing only `TRANSPARENT` select all shielded pools. When a request includes a shielded pool, `TRANSPARENT` has no effect. Unknown pool values and `POOL_TYPE_INVALID` return `INVALID_ARGUMENT`.
+
+A Sapling-only request includes transactions with Sapling outputs even when they have no Sapling spends. For those transactions, the response contains only the transaction’s position in the block, its ID, and its fee.
+
+Vizor v0.0.65 requests only Ironwood nullifiers when it scans for Gift Card spends. Its ordinary wallet sync uses `GetBlockRange`, as does Slipstream in the ZODL 8.1.0 wallet SDKs. [Vizor Gift Card request](https://github.com/chainapsis/vizor-wallet/blob/d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6/rust/src/wallet/sync_engine/lwd.rs#L1813-L1837) · [Vizor sync request](https://github.com/chainapsis/vizor-wallet/blob/d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6/rust/src/wallet/sync_engine/lwd.rs#L1052-L1068) · [Slipstream sync request](https://github.com/zodl-inc/slipstream/blob/80f95741896543a22262182ab37a5a05d484d2e7/core/src/fetch.rs#L1125-L1145)
 
 These outcomes fail the call before any block is sent:
 
 | Condition | Status |
 | --- | --- |
-| Malformed request, including a missing bound or, for `GetBlockRange`, an invalid pool type | `INVALID_ARGUMENT` |
+| Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
@@ -281,7 +285,7 @@ lightwalletd reports an over-cap list refusal as `INTERNAL`.
 The vendored protocol and the images the parity suite runs are:
 
 - `lightwallet-protocol` `v0.6.0` (`299805c19011a027d2c48c5e912dd05041f76156`);
-- `lightwalletd` `v0.6.2` (`f8fe2cca7ede03b1f76b1d637a2ab467d151b79d`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
+- `lightwalletd` `v0.6.2` (`f8fe2cca7ede03b1f06b1d637a2ab467d151b79d`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
 - `electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951`;
 - `docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`, started on Regtest with `deploy/zebra/regtest.toml`, which activates every upgrade through NU7 (see [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7));
 - `docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`, started on Regtest with `deploy/zakura/regtest.toml`, which uses the same schedule.
