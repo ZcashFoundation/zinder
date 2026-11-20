@@ -16,8 +16,8 @@ use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHeight, BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction, Network,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    CompactBlockArtifact, CompactTransaction, MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction,
+    Network, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
@@ -42,11 +42,7 @@ use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
     CompactBlockReads, RequestedBlock, requested_block, view_reaches,
 };
-use crate::compact_block_messages::{
-    CompactBlockPayloadMode, CompactBlockPoolSelection, CompactBlockShape,
-    compact_transaction_data_to_lightwalletd, compact_transaction_has_payload, prune_compact_block,
-    prune_mempool_compact_transaction,
-};
+use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
     SharedTipChangeWatcher, TipChangeWatcherError,
@@ -702,22 +698,26 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(&self.query_api, &request.into_inner())
-            .await
-            .map(Response::new)
+        block_methods::compact_block(
+            &self.query_api,
+            &request.into_inner(),
+            CompactBlockShape::FULL_BLOCK,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn get_block_nullifiers(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let compact_block =
-            block_methods::compact_block(&self.query_api, &request.into_inner()).await?;
-        Ok(Response::new(prune_compact_block(
-            compact_block,
-            CompactBlockPoolSelection::shielded(),
-            CompactBlockPayloadMode::NullifiersOnly,
-        )))
+        block_methods::compact_block(
+            &self.query_api,
+            &request.into_inner(),
+            CompactBlockShape::NULLIFIERS,
+        )
+        .await
+        .map(Response::new)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
@@ -727,9 +727,7 @@ where
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::full(CompactBlockPoolSelection::from_request(
-            &request.pool_types,
-        )?);
+        let shape = CompactBlockShape::for_range(&request.pool_types)?;
         self.block_methods
             .block_range(&self.query_api, &request, shape)
             .await
@@ -742,12 +740,9 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
+        let request = request.into_inner();
         self.block_methods
-            .block_range(
-                &self.query_api,
-                &request.into_inner(),
-                CompactBlockShape::NULLIFIERS,
-            )
+            .block_range(&self.query_api, &request, CompactBlockShape::NULLIFIERS)
             .await
             .map(Response::new)
     }
@@ -872,7 +867,7 @@ where
     ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
         let request = request.into_inner();
         validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
-        let pool_selection = CompactBlockPoolSelection::from_request(&request.pool_types)?;
+        let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
         let exclude_txid_suffixes = request.exclude_txid_suffixes;
         let mempool_surface = self
             .mempool_surface
@@ -887,42 +882,35 @@ where
         let mut exclude_suffix_match_counts = vec![0_usize; exclude_txid_suffixes.len()];
         let mut compact_messages = Vec::new();
         while let Some(entry_outcome) = entries.next().await {
-            let entry = entry_outcome?;
-            let transaction_id = encode_internal_transaction_id(entry.transaction_id());
-            let compact_message = compact_transaction_data_to_lightwalletd(
-                0,
-                entry.transaction_id(),
-                entry.compact_transaction_data(),
-            )?;
-            let pruned = prune_mempool_compact_transaction(
-                compact_message,
-                pool_selection,
-                CompactBlockPayloadMode::Full,
-            );
-            if !compact_transaction_has_payload(&pruned) {
+            let entry = entry_outcome?.into_parts();
+            let Some(compact_message) = shape.encode_transaction(CompactTransaction {
+                index: 0,
+                transaction_id: entry.transaction_id,
+                data: entry.compact_transaction_data,
+            })?
+            else {
                 continue;
-            }
+            };
             for (exclude_suffix, match_count) in exclude_txid_suffixes
                 .iter()
                 .zip(&mut exclude_suffix_match_counts)
             {
-                if !exclude_suffix.is_empty() && transaction_id.ends_with(exclude_suffix) {
+                if !exclude_suffix.is_empty() && compact_message.txid.ends_with(exclude_suffix) {
                     *match_count = match_count.saturating_add(1);
                 }
             }
-            compact_messages.push((transaction_id, pruned));
+            compact_messages.push(compact_message);
         }
-        let filtered_messages =
-            compact_messages
-                .into_iter()
-                .filter_map(move |(transaction_id, compact_message)| {
-                    (!transaction_id_is_uniquely_excluded(
-                        &transaction_id,
-                        &exclude_txid_suffixes,
-                        &exclude_suffix_match_counts,
-                    ))
-                    .then_some(Ok(compact_message))
-                });
+        let filtered_messages = compact_messages
+            .into_iter()
+            .filter_map(move |compact_message| {
+                (!transaction_id_is_uniquely_excluded(
+                    &compact_message.txid,
+                    &exclude_txid_suffixes,
+                    &exclude_suffix_match_counts,
+                ))
+                .then_some(Ok(compact_message))
+            });
         Ok(Response::new(Box::pin(stream::iter(filtered_messages))))
     }
 
@@ -2045,7 +2033,7 @@ fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), S
 }
 
 fn transaction_id_is_uniquely_excluded(
-    transaction_id: &[u8; 32],
+    transaction_id: &[u8],
     exclude_suffixes: &[Vec<u8>],
     exclude_suffix_match_counts: &[usize],
 ) -> bool {

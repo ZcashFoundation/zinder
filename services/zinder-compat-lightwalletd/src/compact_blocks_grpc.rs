@@ -19,7 +19,7 @@ use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
     CompactBlockReads, RequestedBlock, view_reaches,
 };
-use crate::compact_block_messages::{CompactBlockPoolSelection, CompactBlockShape};
+use crate::compact_block_messages::CompactBlockShape;
 use crate::grpc::GrpcStream;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
@@ -327,9 +327,13 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(&self.slot, &request.into_inner())
-            .await
-            .map(Response::new)
+        block_methods::compact_block(
+            &self.slot,
+            &request.into_inner(),
+            CompactBlockShape::FULL_BLOCK,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn get_block_range(
@@ -337,9 +341,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::full(CompactBlockPoolSelection::from_request(
-            &request.pool_types,
-        )?);
+        let shape = CompactBlockShape::for_range(&request.pool_types)?;
         self.block_methods
             .block_range(&self.slot, &request, shape)
             .await
