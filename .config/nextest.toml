@@ -80,6 +80,15 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(/^integration::tree_state_densification::/)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# This test starts a canonical writer on RocksDB, an ingest-control server, and
+# the tip-change publisher, then waits for the writer to commit a new tip. It
+# bounds each wait by a 90s scenario deadline that reports the condition still
+# outstanding, which needs a kill window longer than the 20s default under
+# full-workspace parallelism.
+filter = "test(production_tip_change_publisher_observes_a_post_wait_canonical_event)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }

@@ -2391,6 +2391,7 @@ mod tests {
             }
         });
 
+        let staleness_ceiling = Duration::from_mins(1);
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
         let config = CompactBlockServingConfig {
@@ -2403,7 +2404,7 @@ mod tests {
             catchup_interval: Duration::from_millis(1),
             convergence_timeout: Duration::from_secs(2),
             convergence_attempts: 4,
-            staleness_ceiling: Duration::from_millis(50),
+            staleness_ceiling,
             lag_threshold: 0,
         };
         let (mut publisher, slot) =
@@ -2476,9 +2477,14 @@ mod tests {
             readiness.report().cause.metric_label(),
             "serving_pair_stale"
         );
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Advancing the paused clock past the ceiling expires the allowance
+        // while the lease and the confirmed writer status stay as they are, so
+        // no wall-clock wait or machine load decides the outcome.
         control.set_available(true);
         control.set_writer_status(lifecycle_writer_status(&primary));
+        tokio::time::pause();
+        tokio::time::advance(staleness_ceiling + Duration::from_secs(1)).await;
+        tokio::time::resume();
         publisher.refresh().await;
         assert_eq!(readiness.report().cause.metric_label(), "replica_lagging");
 
