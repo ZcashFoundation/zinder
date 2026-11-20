@@ -173,7 +173,13 @@ impl CanonicalReader for RocksDbCanonicalReader {
     ) -> Result<Option<CompactBlockArtifact>, StorageReadError> {
         self.read(
             move |secondary| match secondary.block_hash_lookup(block_hash)? {
-                BlockHashLookup::Resolved(block_id) => secondary.compact_block_at(block_id.height),
+                BlockHashLookup::Resolved(block_id) => secondary
+                    .compact_block_at(block_id.height)?
+                    .map(Some)
+                    .ok_or(CanonicalStoreError::ArtifactUnavailable {
+                        family: ArtifactFamily::CompactBlock,
+                        height: block_id.height,
+                    }),
                 BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => Ok(None),
             },
         )

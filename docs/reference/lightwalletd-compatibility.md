@@ -24,7 +24,7 @@ A named wallet is supported once it passes end-to-end certification against a re
 The operator selects one of two serving modes with `[compat].serving`, the `ZINDER_COMPAT__SERVING` environment variable, or `--serving`. The default is `wallet`.
 
 - `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction` and `GetStandardFee`, and connects to ingest control for the mempool methods.
-- `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
+- `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store and answers them as wallet serving does, except that `taddrSupport` is `false`. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
 
 In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
 
@@ -79,7 +79,7 @@ The upgrade fields come from the network-upgrade schedule that ingest admitted, 
 
 An old tip is not always a stale one: the network may simply not have produced a block. So `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE` only when both hold:
 
-- The served tip is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`). Its age counts from its block time, or from when this process first served it since it started if that is earlier, so a block time ahead of the local clock, which consensus accepts, delays a refusal only until the first tip call after the tip changes or the process restarts.
+- The served tip is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`). Its age counts from its block time, or from when this process first served it since it started if that is earlier, so a block time ahead of the local clock, which consensus accepts, delays a refusal only until the first tip call after the tip changes or the process restarts. The age is taken after any read of the tip's header the call makes, so it is the age the tip has when the call answers.
 - The writer cannot vouch that the served tip is the network's tip: its node is unreachable, the node reports that its peers show it behind the network, the node has a block above the served tip because the writer is behind it (catching up or restored from an old snapshot), the writer is starting or parked, or ingest control does not answer.
 
 While the writer's node is reachable, reports itself in sync, and has no block above the served tip, the tip calls answer however old that tip is, and `estimatedHeight` tells wallets the chain is quiet. Go lightwalletd fails these calls only while its node is down, and keeps answering while its node is reachable but behind the network.
@@ -103,21 +103,24 @@ How each engine uses the tip calls:
 
 ### `GetBlock` and `GetBlockNullifiers`
 
-A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. `GetBlock` in compact-blocks serving returns the stored block without pool filtering.
+A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`. Both serving modes answer this way, whether the request names the block by height or by hash. `GetBlock` in compact-blocks serving returns the stored block without pool filtering.
 
 ### `GetBlockRange` and `GetBlockRangeNullifiers`
 
 `GetBlockRange` applies the requested `poolTypes` to every transaction and omits any transaction left with no spends, outputs, actions, or transparent inputs and outputs, as lightwalletd does. With no `poolTypes`, it returns the shielded pools, so a transparent-only coinbase is absent unless the request names the transparent pool. Each remaining transaction keeps its block position in `CompactTx.index`, so a gap marks an omitted transaction. A range with start above end is sent in descending order.
 
+`GetBlockRangeNullifiers` ignores `poolTypes` and sends the nullifiers of every shielded pool. This differs from lightwalletd v0.6.2, which drops the transparent pool from `poolTypes` and honors the pools that remain, so a request that names only some shielded pools gets only their nullifiers from lightwalletd.
+
 These outcomes fail the call before any block is sent:
 
 | Condition | Status |
 | --- | --- |
-| Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
+| Malformed request, including a missing bound or, for `GetBlockRange`, an invalid pool type | `INVALID_ARGUMENT` |
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
-| A block missing inside retained history | `UNAVAILABLE` |
+| A block missing from the first byte-bounded chunk | `UNAVAILABLE` |
+| A stored block in the first byte-bounded chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
 
 Once a stream has started, a client can rely on the following:
 
@@ -126,10 +129,10 @@ Once a stream has started, a client can rely on the following:
 3. **One chain as read.** An ascending stream that crosses a reorg above its last sent block continues on the new branch. A descending stream continues on the chain it started on. An `OK` stream does not promise its blocks are still the best chain on arrival.
 4. **Reorg ending.** A stream ends with `ABORTED` when a reorg replaces a block it already linked to (ascending) or the next height it must send (descending), as lightwalletd v0.5.5 and later do. It ends with `OUT_OF_RANGE` when a reorg leaves the tip below a height it still must send. To recover, request again from the height the wallet needs.
 5. **Settled history never ends a stream.** Ingest never replaces a block at or below the settled tip, so only the last reorg window (1,000 blocks by default) can end a stream early.
-6. **Other mid-stream endings.** A storage failure ends the stream with `UNAVAILABLE`. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
+6. **Other mid-stream endings.** A storage failure, such as a block missing from a later chunk, ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
 7. **No time limit.** Elapsed time, new blocks, and slow reading never end a stream. Shutdown, unanswered keepalive pings, and the listener's send-stall deadline do.
 
-A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. The server reads ahead by up to two chunks at the start of a stream, and afterwards by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
+A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. Until the server's gRPC layer has taken every block of the first chunk from the stream to send it, the server reads only the first two chunks, however few blocks they hold. The gRPC layer takes blocks as it fills its send buffer, so this bounds the reads ahead of that layer, not ahead of what the client has received. After that, the server reads ahead by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 

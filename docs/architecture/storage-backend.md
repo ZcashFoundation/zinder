@@ -199,7 +199,9 @@ one read where it needs several lookups:
 - `mined_transaction` returns a transaction's location, its block's header,
   and its bytes, or proves the transaction absent.
 - `block_header_by_hash` and `compact_block_by_hash` resolve a block hash
-  through the best-chain index and read the block it names.
+  through the best-chain index and read the block it names. A resolved hash
+  whose compact block the store lacks fails `compact_block_by_hash` as that
+  block's unavailable artifact, so it never reads as an unknown hash.
 - `total_address_balance` sums up to 256 addresses.
 - `outpoint_spend_statuses` classifies a batch of outpoints. On checkpointed
   history a missing outpoint fails the request, so there the read ends at the

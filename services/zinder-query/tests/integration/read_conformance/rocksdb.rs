@@ -4,12 +4,18 @@ use std::time::Duration;
 
 use eyre::eyre;
 use tempfile::TempDir;
-use zinder_core::{BlockHeight, BlockHeightRange, Network, NetworkUpgradeActivations};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, NetworkUpgradeActivations,
+    wire::encode_height_key_ascending,
+};
 use zinder_query::{
-    CanonicalReader, RocksDbCanonicalReader, RocksDbWalletReader, StorageReadError,
+    ArtifactKey, CanonicalReader, RocksDbCanonicalReader, RocksDbWalletReader, StorageReadError,
     read_on_blocking_thread,
 };
-use zinder_store::{CanonicalStoreWorkload, RocksDbCanonicalSecondary, RocksDbResourceBudget};
+use zinder_store::{
+    ArtifactFamily, BlockHashLookup, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
+};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
 };
@@ -136,6 +142,65 @@ fn a_read_driven_on_a_blocking_thread_reads_on_that_thread() -> eyre::Result<()>
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
+}
+
+/// A hash the best-chain index resolves to a block whose compact block the
+/// store lacks fails as that block's missing compact block, so a caller
+/// does not report it as a hash outside the best chain.
+#[tokio::test]
+async fn a_resolved_hash_without_its_compact_block_reports_the_block_unavailable()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let damaged = chain
+        .block_at(BlockHeight::new(2))
+        .cloned()
+        .ok_or_else(|| eyre!("the fixture must contain height 2"))?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let canonical_primary_path = writer.canonical_primary_path().to_owned();
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    delete_compact_block_row(&canonical_primary_path, damaged.height)?;
+    let (mut canonical, _wallet) = store_fixture.take_readers()?;
+    canonical.try_catch_up()?;
+    let reader = RocksDbCanonicalReader::new(canonical)?;
+
+    assert_eq!(
+        reader.block_hash_lookup(damaged.hash).await?,
+        BlockHashLookup::Resolved(BlockId::new(damaged.height, damaged.hash))
+    );
+    let outcome = reader.compact_block_by_hash(damaged.hash).await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(StorageReadError::ArtifactUnavailable {
+                family: ArtifactFamily::CompactBlock,
+                key: ArtifactKey::BlockHeight(height),
+            }) if *height == damaged.height
+        ),
+        "expected the missing compact block, got {outcome:?}"
+    );
+    let unknown = BlockHash::from_bytes([0xee; 32]);
+    assert_eq!(reader.compact_block_by_hash(unknown).await?, None);
+    Ok(())
+}
+
+/// Deletes the compact block at `height` from a closed canonical primary,
+/// as store damage would.
+fn delete_compact_block_row(
+    canonical_primary_path: &std::path::Path,
+    height: BlockHeight,
+) -> eyre::Result<()> {
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
+    let family = db
+        .cf_handle("compact_block")
+        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    db.flush_cf(&family)?;
+    Ok(())
 }
 
 impl WalletReaderHarness for RocksDbReaderHarness {

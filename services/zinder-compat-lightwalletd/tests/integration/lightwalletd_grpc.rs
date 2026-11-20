@@ -16,13 +16,15 @@ use std::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status, transport::Server};
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, serialization::ZcashDeserializeInto as _,
     transparent::Address as ZebraTransparentAddress,
 };
 use zinder_compat_lightwalletd::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdGrpcAdapter, LightwalletdPing, NodeTipWitness, StaleTipLimit,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, CanonicalReaderSlot, CompactBlocksGrpcAdapter,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdGrpcAdapter, LightwalletdPing,
+    NodeTipWitness, StaleTipLimit,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -34,7 +36,7 @@ use zinder_core::{
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId,
     TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentSpendFact, TransparentUnspentOutput,
-    wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
+    wire::{encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -734,6 +736,101 @@ async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> e
     Ok(())
 }
 
+/// A best-chain hash whose compact block the store lacks reports the missing
+/// block, not a hash outside the best chain, and both serving modes report
+/// both outcomes alike.
+#[tokio::test]
+async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes() -> eyre::Result<()>
+{
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let damaged = chain
+        .block_at(BlockHeight::new(2))
+        .cloned()
+        .ok_or_else(|| eyre!("the fixture must contain height 2"))?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let canonical_primary_path = writer.canonical_primary_path().to_owned();
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    delete_compact_block_row(&canonical_primary_path, damaged.height)?;
+    let (mut canonical, wallet) = store_fixture.take_readers()?;
+    canonical.try_catch_up()?;
+    let canonical = Arc::new(RocksDbCanonicalReader::new(canonical)?);
+    let wallet_serving = LightwalletdGrpcAdapter::new(WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::<RocksDbCanonicalReader>::clone(&canonical),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?)),
+    ));
+    let compact_blocks_serving = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(canonical));
+
+    let cases = [
+        (
+            "missing compact block",
+            damaged.hash,
+            "ARTIFACT_UNAVAILABLE",
+        ),
+        (
+            "hash outside the best chain",
+            BlockHash::from_bytes([0xee; 32]),
+            "BLOCK_NOT_IN_BEST_CHAIN",
+        ),
+    ];
+    for (case, block_hash, expected_reason) in cases {
+        let request = || {
+            Request::new(lightwalletd::BlockId {
+                height: 0,
+                hash: encode_internal_block_hash(block_hash).to_vec(),
+            })
+        };
+        let outcomes = [
+            ("wallet", wallet_serving.get_block(request()).await),
+            (
+                "compact-blocks",
+                compact_blocks_serving.get_block(request()).await,
+            ),
+        ];
+        for (mode, outcome) in outcomes {
+            let status = match outcome {
+                Ok(response) => {
+                    return Err(eyre!(
+                        "{mode} serving answered GetBlock for a {case}: {response:?}"
+                    ));
+                }
+                Err(status) => status,
+            };
+            let reason = status
+                .get_details_error_info()
+                .map(|error_info| error_info.reason);
+            assert_eq!(status.code(), Code::NotFound, "{mode} serving, {case}");
+            assert_eq!(
+                reason.as_deref(),
+                Some(expected_reason),
+                "{mode} serving, {case}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the compact block at `height` from a closed canonical primary,
+/// as store damage would.
+fn delete_compact_block_row(
+    canonical_primary_path: &std::path::Path,
+    height: BlockHeight,
+) -> eyre::Result<()> {
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
+    let family = db
+        .cf_handle("compact_block")
+        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    db.flush_cf(&family)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_block_nullifiers_reports_future_height_like_lightwalletd() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
@@ -897,6 +994,144 @@ async fn get_block_range_times_each_chunk_stage() -> eyre::Result<()> {
     assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
     assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(3));
     assert_eq!(block_range_stage_samples(&rendered, "send"), Some(2));
+    Ok(())
+}
+
+/// A block-range chunk becomes lightwalletd messages on the blocking pool,
+/// not on the task that read it.
+///
+/// The runtime has one blocking thread and the test holds it, so a chunk the
+/// query has already read waits to be converted until the test releases the
+/// thread.
+#[test]
+fn get_block_range_converts_each_chunk_on_the_blocking_pool() -> eyre::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(convert_a_chunk_while_the_blocking_pool_is_held())
+}
+
+async fn convert_a_chunk_while_the_blocking_pool_is_held() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(10));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let (gate_held, gate_held_receiver) = tokio::sync::oneshot::channel();
+    let (release_gate, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate_thread = tokio::task::spawn_blocking(move || {
+        let _ = gate_held.send(());
+        let _ = gate.blocking_recv();
+    });
+    gate_held_receiver.await?;
+
+    let mut call = Box::pin(adapter.get_block_range(Request::new(block_range_request(1, 10))));
+    let chunk_read = async {
+        while recorder.recorded_compact_block_ranges().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => {
+            return Err(eyre!(
+                "the call answered before its chunk was read: {:?}",
+                outcome.map(|_| ())
+            ));
+        }
+        () = chunk_read => {}
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut call)
+            .await
+            .is_err(),
+        "a read chunk must wait for the blocking pool to be converted"
+    );
+
+    let _ = release_gate.send(());
+    gate_thread.await?;
+    let blocks = collect_stream(call.await?.into_inner()).await?;
+    assert_one_linked_chain(&blocks, 1, 10);
+    Ok(())
+}
+
+/// Returns the seconds `rendered` records for the block-range `stage`.
+fn block_range_stage_seconds(rendered: &str, stage: &str) -> Option<f64> {
+    let series =
+        format!("zinder_compat_block_range_stage_duration_seconds_sum{{stage=\"{stage}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str())?.parse::<f64>().ok())
+}
+
+/// A chunk's read stage ends when the wallet query returns, so it leaves out
+/// the time the chunk then waits for a blocking thread to be converted.
+#[test]
+fn get_block_range_read_stage_leaves_out_the_wait_to_convert() -> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let hold = std::time::Duration::from_secs(1);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(convert_a_chunk_after_the_blocking_pool_is_held_for(hold))?;
+
+    let rendered = metrics_handle.render();
+    assert_eq!(block_range_stage_samples(&rendered, "read"), Some(1));
+    let read_seconds =
+        block_range_stage_seconds(&rendered, "read").ok_or_else(|| eyre!("no read stage"))?;
+    assert!(
+        read_seconds < hold.as_secs_f64(),
+        "the read stage counted the {hold:?} its chunk waited to be converted: {read_seconds}s"
+    );
+    Ok(())
+}
+
+/// Streams heights 1 through 10, one chunk, while the test holds the only
+/// blocking thread from before the chunk is read until `hold` after.
+async fn convert_a_chunk_after_the_blocking_pool_is_held_for(
+    hold: std::time::Duration,
+) -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(10));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let (gate_held, gate_held_receiver) = tokio::sync::oneshot::channel();
+    let (release_gate, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate_thread = tokio::task::spawn_blocking(move || {
+        let _ = gate_held.send(());
+        let _ = gate.blocking_recv();
+    });
+    gate_held_receiver.await?;
+
+    let mut call = Box::pin(adapter.get_block_range(Request::new(block_range_request(1, 10))));
+    let chunk_read = async {
+        while recorder.recorded_compact_block_ranges().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => {
+            return Err(eyre!(
+                "the call answered before its chunk was read: {:?}",
+                outcome.map(|_| ())
+            ));
+        }
+        () = chunk_read => {}
+    }
+    assert!(
+        tokio::time::timeout(hold, &mut call).await.is_err(),
+        "a read chunk must wait for the blocking pool to be converted"
+    );
+
+    let _ = release_gate.send(());
+    gate_thread.await?;
+    let blocks = collect_stream(call.await?.into_inner()).await?;
+    assert_one_linked_chain(&blocks, 1, 10);
     Ok(())
 }
 

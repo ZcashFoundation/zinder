@@ -36,8 +36,9 @@ use std::{
 use tokio::sync::{
     OwnedSemaphorePermit, Semaphore,
     mpsc::{self, error::SendError},
+    oneshot,
 };
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_stream::Stream;
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
@@ -69,7 +70,7 @@ pub const DEFAULT_BLOCK_RANGE_ADMISSION_WAIT: Duration = Duration::from_secs(10)
 /// run of them from that end, and [`Self::advance`] moves past the blocks it
 /// kept, so the next chunk starts at the next height to send.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockRangeChunks {
+pub(crate) struct BlockRangeChunks {
     /// Heights no chunk has covered yet, or `None` once every height has.
     remaining: Option<BlockHeightRange>,
     is_descending: bool,
@@ -78,7 +79,7 @@ pub struct BlockRangeChunks {
 impl BlockRangeChunks {
     /// Plans the chunks of `range` in the order the stream sends them.
     #[must_use]
-    pub const fn new(range: BlockHeightRange, is_descending: bool) -> Self {
+    pub(crate) const fn new(range: BlockHeightRange, is_descending: bool) -> Self {
         let remaining = if range.start.value() <= range.end.value() {
             Some(range)
         } else {
@@ -92,13 +93,13 @@ impl BlockRangeChunks {
 
     /// Returns whether a chunk remains to be read.
     #[must_use]
-    pub const fn has_remaining(&self) -> bool {
+    pub(crate) const fn has_remaining(&self) -> bool {
         self.remaining.is_some()
     }
 
     /// Returns the height order of the stream, which every chunk read walks.
     #[must_use]
-    pub const fn order(&self) -> HeightOrder {
+    pub(crate) const fn order(&self) -> HeightOrder {
         if self.is_descending {
             HeightOrder::Descending
         } else {
@@ -109,7 +110,7 @@ impl BlockRangeChunks {
     /// Returns the heights the next chunk read may cover: up to 1,000 at the
     /// end of the remaining range that the stream sends first.
     #[must_use]
-    pub fn next_chunk(&self) -> Option<BlockHeightRange> {
+    pub(crate) fn next_chunk(&self) -> Option<BlockHeightRange> {
         let remaining = self.remaining?;
         let span = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_sub(1);
         Some(if self.is_descending {
@@ -134,7 +135,7 @@ impl BlockRangeChunks {
     ///
     /// A read that kept no block leaves the plan unchanged. Its caller must
     /// end the stream, as the continuity check of an empty chunk does.
-    pub fn advance(&mut self, read_blocks: usize) {
+    pub(crate) fn advance(&mut self, read_blocks: usize) {
         let Some(remaining) = self.remaining else {
             return;
         };
@@ -177,7 +178,7 @@ const STAGE_DURATION_HISTOGRAM: &str = "zinder_compat_block_range_stage_duration
 /// `zinder_compat_block_range_stage_duration_seconds{stage}`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum BlockRangeStage {
+pub(crate) enum BlockRangeStage {
     /// Reading the chunk's compact blocks from storage.
     Read,
     /// Converting the chunk's blocks to lightwalletd messages and pruning
@@ -199,20 +200,15 @@ impl BlockRangeStage {
     }
 
     /// Records that one chunk spent `elapsed` in this stage.
-    pub fn record(self, elapsed: Duration) {
+    pub(crate) fn record(self, elapsed: Duration) {
         metrics::histogram!(STAGE_DURATION_HISTOGRAM, "stage" => self.label()).record(elapsed);
     }
 
-    /// Runs `stage_work` and records how long it took.
-    pub fn time<Output>(self, stage_work: impl FnOnce() -> Output) -> Output {
-        let started_at = Instant::now();
-        let output = stage_work();
-        self.record(started_at.elapsed());
-        output
-    }
-
     /// Awaits `stage_work` and records how long it took.
-    pub async fn time_async<Output>(self, stage_work: impl Future<Output = Output>) -> Output {
+    pub(crate) async fn time_async<Output>(
+        self,
+        stage_work: impl Future<Output = Output>,
+    ) -> Output {
         let started_at = Instant::now();
         let output = stage_work.await;
         self.record(started_at.elapsed());
@@ -231,7 +227,7 @@ impl BlockRangeStage {
 /// served, for at most [`Self::max_wait`]. At most as many requests wait as
 /// the limit has slots, so a request that finds the queue full fails at once.
 #[derive(Clone, Debug)]
-pub struct BlockRangeStreamLimit {
+pub(crate) struct BlockRangeStreamLimit {
     slots: Arc<Semaphore>,
     waiters: Arc<AtomicUsize>,
     max_streams: NonZeroU32,
@@ -242,7 +238,7 @@ impl BlockRangeStreamLimit {
     /// Creates a limit that admits at most `max_streams` streams at once and
     /// lets a request wait [`DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`] for a slot.
     #[must_use]
-    pub fn new(max_streams: NonZeroU32) -> Self {
+    pub(crate) fn new(max_streams: NonZeroU32) -> Self {
         let permits = usize::try_from(max_streams.get())
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
@@ -259,20 +255,20 @@ impl BlockRangeStreamLimit {
 
     /// Sets how long a request waits for a slot before it fails.
     #[must_use]
-    pub const fn with_max_wait(mut self, max_wait: Duration) -> Self {
+    pub(crate) const fn with_max_wait(mut self, max_wait: Duration) -> Self {
         self.max_wait = max_wait;
         self
     }
 
     /// Returns the most streams this limit admits at once.
     #[must_use]
-    pub const fn max_streams(&self) -> NonZeroU32 {
+    pub(crate) const fn max_streams(&self) -> NonZeroU32 {
         self.max_streams
     }
 
     /// Returns how long a request waits for a slot before it fails.
     #[must_use]
-    pub const fn max_wait(&self) -> Duration {
+    pub(crate) const fn max_wait(&self) -> Duration {
         self.max_wait
     }
 
@@ -290,7 +286,7 @@ impl BlockRangeStreamLimit {
     /// [`Self::max_wait`], or at once when as many requests already wait as
     /// the limit has slots. Each refusal is counted in
     /// `zinder_compat_block_range_stream_refusals_total{reason}`.
-    pub async fn open(&self) -> Result<BlockRangeStreamSlot, Status> {
+    pub(crate) async fn open(&self) -> Result<BlockRangeStreamSlot, Status> {
         let started_at = Instant::now();
         // The semaphore hands a returned slot to the oldest waiter, so a new
         // request takes a free slot here only when nobody waits.
@@ -441,7 +437,7 @@ impl Drop for OpenStream {
 }
 
 /// A block-range response: the blocks a stream sends, in wire order.
-pub type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send + 'static>>;
+pub(crate) type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send + 'static>>;
 
 /// One stream's slot of a [`BlockRangeStreamLimit`].
 ///
@@ -450,7 +446,7 @@ pub type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send
 /// more than one chunk, and a read run with [`Self::hold_during`] that has
 /// not finished.
 #[derive(Clone, Debug)]
-pub struct BlockRangeStreamSlot {
+pub(crate) struct BlockRangeStreamSlot {
     _open_stream: Arc<OpenStream>,
 }
 
@@ -473,7 +469,7 @@ impl BlockRangeStreamSlot {
     ///
     /// Returns the error of `read`, or `UNAVAILABLE` when the task that runs
     /// `read` panics.
-    pub async fn hold_during<Output, Read>(&self, read: Read) -> Result<Output, Status>
+    pub(crate) async fn hold_during<Output, Read>(&self, read: Read) -> Result<Output, Status>
     where
         Output: Send + 'static,
         Read: Future<Output = Result<Output, Status>> + Send + 'static,
@@ -487,7 +483,7 @@ impl BlockRangeStreamSlot {
 
     /// Returns a response that sends `messages` and holds this slot until it
     /// is dropped.
-    pub fn hold_for<Message: Send + 'static>(
+    pub(crate) fn hold_for<Message: Send + 'static>(
         self,
         messages: Vec<Message>,
     ) -> BlockRangeResponse<Message> {
@@ -500,7 +496,12 @@ impl BlockRangeStreamSlot {
     ///
     /// The response and the reader's sink each hold this slot, so the reader
     /// keeps the slot while it reads, even after the client has gone away.
-    pub fn hold_with_reader<Message, Reader>(
+    /// The response tells the sink once its consumer polls for a message past
+    /// `first_messages`, which [`BlockRangeSink::first_chunk_taken`] waits
+    /// for. The consumer is tonic, which polls messages as it fills its send
+    /// buffer, so it can poll past `first_messages` before the client has
+    /// received any of them.
+    pub(crate) fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,
         capacity: usize,
@@ -511,13 +512,17 @@ impl BlockRangeStreamSlot {
         Reader: Future<Output = ()> + Send + 'static,
     {
         let (messages, queued_messages) = mpsc::channel(capacity);
+        let (first_chunk_taken, first_chunk_taken_receiver) = oneshot::channel();
         tokio::spawn(reader(BlockRangeSink {
             messages,
+            first_chunk_taken: Some(first_chunk_taken_receiver),
             _stream_slot: self.clone(),
         }));
-        self.hold_for_stream(Box::pin(
-            tokio_stream::iter(first_messages).chain(ReceiverStream::new(queued_messages)),
-        ))
+        self.hold_for_stream(Box::pin(QueuedChunks {
+            first_messages: Some(tokio_stream::iter(first_messages)),
+            first_chunk_taken: Some(first_chunk_taken),
+            queued_messages,
+        }))
     }
 
     fn hold_for_stream<Message: 'static>(
@@ -535,8 +540,11 @@ impl BlockRangeStreamSlot {
 ///
 /// It holds the stream's slot until the reader drops it.
 #[derive(Debug)]
-pub struct BlockRangeSink<Message> {
+pub(crate) struct BlockRangeSink<Message> {
     messages: mpsc::Sender<Message>,
+    /// Resolves once the response's consumer has polled for a message past
+    /// the first chunk, or `None` once it has.
+    first_chunk_taken: Option<oneshot::Receiver<()>>,
     _stream_slot: BlockRangeStreamSlot,
 }
 
@@ -546,8 +554,69 @@ impl<Message> BlockRangeSink<Message> {
     /// # Errors
     ///
     /// Returns the message when the client has dropped the response.
-    pub async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
+    pub(crate) async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
         self.messages.send(message).await
+    }
+
+    /// Waits until the response's consumer has taken every message of the
+    /// stream's first chunk and polled for the next, and returns at once
+    /// after that.
+    ///
+    /// A queue of `capacity` messages could otherwise fill with as many
+    /// one-block chunks, each up to [`BLOCK_RANGE_CHUNK_MAX_BYTES`], before
+    /// tonic takes any message. A reader that waits here before each read
+    /// after its first reads at most two chunks until tonic has taken the
+    /// first chunk to send. Tonic takes messages as it fills its send buffer,
+    /// so the client may not yet have received them.
+    ///
+    /// Returns `false` when the response was dropped first.
+    pub(crate) async fn first_chunk_taken(&mut self) -> bool {
+        match self.first_chunk_taken.take() {
+            Some(taken) => taken.await.is_ok(),
+            None => true,
+        }
+    }
+}
+
+/// The messages of a stream with later chunks: those of its first chunk,
+/// then those its reader queues.
+struct QueuedChunks<Message> {
+    /// The first chunk's messages, which yield to the runtime as a one-chunk
+    /// response does, or `None` once they have all been taken.
+    first_messages: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
+    /// Told when polling moves past the first chunk to the queued messages.
+    first_chunk_taken: Option<oneshot::Sender<()>>,
+    queued_messages: mpsc::Receiver<Message>,
+}
+
+// No field is pinned: the stream moves its messages out by value.
+impl<Message> Unpin for QueuedChunks<Message> {}
+
+impl<Message> Stream for QueuedChunks<Message> {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
+        if let Some(first_messages) = self.first_messages.as_mut() {
+            match Pin::new(first_messages).poll_next(context) {
+                Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.first_messages = None;
+                    if let Some(first_chunk_taken) = self.first_chunk_taken.take() {
+                        let _ = first_chunk_taken.send(());
+                    }
+                }
+            }
+        }
+        self.queued_messages.poll_recv(context)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let first_messages = self
+            .first_messages
+            .as_ref()
+            .map_or(0, |first_messages| first_messages.size_hint().0);
+        (first_messages, None)
     }
 }
 
@@ -575,7 +644,7 @@ impl<S: Stream + Unpin> Stream for SlotHoldingStream<S> {
 /// against this value, so they end a stream for the same reasons and record
 /// the same metric and log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockRangeContinuity {
+pub(crate) struct BlockRangeContinuity {
     is_descending: bool,
     last_sent_height: BlockHeight,
     /// An ascending chunk must name this hash as its first block's parent.
@@ -584,6 +653,23 @@ pub struct BlockRangeContinuity {
     last_sent_parent_hash: BlockHash,
     /// Epoch of the view the last sent chunk was read at.
     sent_chain_epoch_id: ChainEpochId,
+}
+
+/// A later chunk that [`BlockRangeContinuity::link`] checked against the
+/// chain a stream has sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkLink {
+    next_chunk: BlockHeightRange,
+    read_at: ChainEpochId,
+    /// The continuity past the chunk, or `None` when the chunk does not link.
+    continued: Option<BlockRangeContinuity>,
+}
+
+impl ChunkLink {
+    /// Returns whether the chunk continues the chain the stream has sent.
+    pub(crate) const fn continues(&self) -> bool {
+        self.continued.is_some()
+    }
 }
 
 /// Why a block-range stream ended before its last requested height.
@@ -617,7 +703,7 @@ impl BlockRangeContinuity {
     /// Returns `UNAVAILABLE` when `blocks` is empty. A chunk read keeps at
     /// least one block or fails, so an empty chunk means the store broke that
     /// contract.
-    pub fn after_first_chunk(
+    pub(crate) fn after_first_chunk(
         blocks: &[CompactBlockArtifact],
         chain_epoch_id: ChainEpochId,
         is_descending: bool,
@@ -639,70 +725,80 @@ impl BlockRangeContinuity {
         })
     }
 
-    /// Checks that `view` still serves every height of `next_chunk`.
+    /// Ends the stream at `view`, whose visible tip a reorg lowered below
+    /// `next_chunk`, records the ending, and returns lightwalletd's
+    /// `OUT_OF_RANGE`.
     ///
-    /// Call it before reading `next_chunk` at `view`, so a reorg that lowered
-    /// the visible tip ends the stream with lightwalletd's `OUT_OF_RANGE`
-    /// rather than the `NOT_FOUND` of a read above the tip.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OUT_OF_RANGE` when `next_chunk` ends above the view's visible
+    /// The chunk read finds the lowered tip before it reads, so the stream
+    /// ends with this code rather than the `NOT_FOUND` of a read above the
     /// tip.
-    pub fn check_view_reaches(
-        &self,
-        next_chunk: BlockHeightRange,
-        view: &ChainEpoch,
-    ) -> Result<(), Status> {
-        if next_chunk.end > view.visible_tip_height {
-            self.record_reorg_ending(ReorgEndingCause::TipLowered, next_chunk, view.id);
-            return Err(Status::out_of_range(format!(
-                "block {} is newer than latest block {} after a reorg",
-                next_chunk.end.value(),
-                view.visible_tip_height.value(),
-            )));
-        }
-        Ok(())
+    pub(crate) fn end_below_tip(&self, next_chunk: BlockHeightRange, view: &ChainEpoch) -> Status {
+        self.record_reorg_ending(ReorgEndingCause::TipLowered, next_chunk, view.id);
+        Status::out_of_range(format!(
+            "block {} is newer than latest block {} after a reorg",
+            next_chunk.end.value(),
+            view.visible_tip_height.value(),
+        ))
     }
 
-    /// Accepts `blocks`, the compact blocks a read of `next_chunk` at
+    /// Checks whether `blocks`, the compact blocks a read of `next_chunk` at
     /// `read_at` kept from the end the stream sends first, in ascending height
-    /// order, when they continue the chain the stream has sent, and moves past
-    /// them.
+    /// order, continue the chain the stream has sent.
     ///
     /// Ascending, the chunk's lowest block must sit one height above the last
     /// block sent and name it as its parent. Descending, the chunk's highest
     /// block must sit one height below the last block sent and be its parent.
     ///
+    /// The check records nothing, so it runs where the chunk was read, and
+    /// the stream's task passes its outcome to [`Self::accept`].
+    pub(crate) fn link(
+        &self,
+        next_chunk: BlockHeightRange,
+        read_at: ChainEpochId,
+        blocks: &[CompactBlockArtifact],
+    ) -> ChunkLink {
+        let continued = if self.is_continued_by(blocks) {
+            Self::after_first_chunk(blocks, read_at, self.is_descending).ok()
+        } else {
+            None
+        };
+        ChunkLink {
+            next_chunk,
+            read_at,
+            continued,
+        }
+    }
+
+    /// Moves past the chunk `link` checked, and records a stream it ends.
+    ///
     /// # Errors
     ///
     /// Returns `ABORTED` when the chunk does not link.
-    pub fn advance(
-        &mut self,
-        next_chunk: BlockHeightRange,
-        read_at: &ChainEpoch,
-        blocks: &[CompactBlockArtifact],
-    ) -> Result<(), Status> {
-        if !self.is_continued_by(blocks) {
-            self.record_reorg_ending(ReorgEndingCause::ChainReplaced, next_chunk, read_at.id);
+    pub(crate) fn accept(&mut self, link: ChunkLink) -> Result<(), Status> {
+        let Some(continued) = link.continued else {
+            self.record_reorg_ending(
+                ReorgEndingCause::ChainReplaced,
+                link.next_chunk,
+                link.read_at,
+            );
             return Err(Status::aborted(
                 "block-range stream ended at a chain discontinuity: a reorg replaced the chain it \
                  was sending",
             ));
-        }
-        if read_at.id != self.sent_chain_epoch_id {
+        };
+        if link.read_at != self.sent_chain_epoch_id {
             tracing::debug!(
                 target: "zinder::compat_lightwalletd",
                 event = "compat_block_range_continued_at_newer_epoch",
                 last_sent_height = self.last_sent_height.value(),
                 sent_chain_epoch = self.sent_chain_epoch_id.value(),
-                current_chain_epoch = read_at.id.value(),
-                next_chunk_start = next_chunk.start.value(),
-                next_chunk_end = next_chunk.end.value(),
+                current_chain_epoch = link.read_at.value(),
+                next_chunk_start = link.next_chunk.start.value(),
+                next_chunk_end = link.next_chunk.end.value(),
                 "block-range stream continued at a newer chain view"
             );
         }
-        *self = Self::after_first_chunk(blocks, read_at.id, self.is_descending)?;
+        *self = continued;
         Ok(())
     }
 
@@ -751,9 +847,11 @@ impl BlockRangeContinuity {
     reason = "Admission tests hold slots and join handles until the step that releases or awaits them."
 )]
 mod tests {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{num::NonZeroU32, pin::Pin, task::Poll, time::Duration};
 
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::Instant;
+    use tokio_stream::Stream;
     use tonic::{Code, Status};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
@@ -765,7 +863,7 @@ mod tests {
 
     use super::{
         BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, QueuedChunks,
     };
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
@@ -826,6 +924,18 @@ mod tests {
         BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
     }
 
+    /// Checks `blocks` against `continuity` and applies the outcome, as a
+    /// stream's reader does across the blocking pool and its own task.
+    fn advance(
+        continuity: &mut BlockRangeContinuity,
+        next_chunk: BlockHeightRange,
+        read_at: &ChainEpoch,
+        blocks: &[CompactBlockArtifact],
+    ) -> Result<(), tonic::Status> {
+        let link = continuity.link(next_chunk, read_at.id, blocks);
+        continuity.accept(link)
+    }
+
     fn assert_chain_discontinuity(outcome: Result<(), tonic::Status>) {
         assert_eq!(
             outcome.err().map(|status| status.code()),
@@ -839,19 +949,31 @@ mod tests {
         let mut continuity = BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, false)?;
 
         // A fork just above the last sent block keeps the sent chain.
-        continuity.advance(range(11, 20), &view(30), &chain(11, 20, 1, 11))?;
+        advance(
+            &mut continuity,
+            range(11, 20),
+            &view(30),
+            &chain(11, 20, 1, 11),
+        )?;
         // The next chunk must follow the new last block, not the first chunk's.
-        continuity.advance(range(21, 30), &view(30), &chain(21, 30, 1, 11))?;
+        advance(
+            &mut continuity,
+            range(21, 30),
+            &view(30),
+            &chain(21, 30, 1, 11),
+        )?;
 
         let mut fork_at_last_sent =
             BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, false)?;
-        assert_chain_discontinuity(fork_at_last_sent.advance(
+        assert_chain_discontinuity(advance(
+            &mut fork_at_last_sent,
             range(11, 20),
             &view(20),
             &chain(11, 20, 2, 10),
         ));
         let mut fork_below = BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, false)?;
-        assert_chain_discontinuity(fork_below.advance(
+        assert_chain_discontinuity(advance(
+            &mut fork_below,
             range(11, 20),
             &view(20),
             &chain(11, 20, 2, 9),
@@ -868,11 +990,22 @@ mod tests {
 
         // A fork at the last sent height keeps its parent, so the stream
         // continues on the chain it has sent.
-        continuity.advance(range(11, 20), &view(30), &chain(11, 20, 1, 21))?;
-        continuity.advance(range(1, 10), &view(30), &chain(1, 10, 1, 21))?;
+        advance(
+            &mut continuity,
+            range(11, 20),
+            &view(30),
+            &chain(11, 20, 1, 21),
+        )?;
+        advance(
+            &mut continuity,
+            range(1, 10),
+            &view(30),
+            &chain(1, 10, 1, 21),
+        )?;
 
         let mut fork_below = BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, true)?;
-        assert_chain_discontinuity(fork_below.advance(
+        assert_chain_discontinuity(advance(
+            &mut fork_below,
             range(11, 20),
             &view(30),
             &chain(11, 20, 2, 20),
@@ -884,7 +1017,8 @@ mod tests {
     fn a_chunk_at_the_wrong_height_does_not_link() -> Result<(), tonic::Status> {
         let ascending = chain(1, 10, 0, u32::MAX);
         let mut skipped = BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_chain_discontinuity(skipped.advance(
+        assert_chain_discontinuity(advance(
+            &mut skipped,
             range(12, 20),
             &view(20),
             &chain(12, 20, 0, u32::MAX),
@@ -893,7 +1027,8 @@ mod tests {
         let descending = chain(21, 30, 0, u32::MAX);
         let mut overlapping =
             BlockRangeContinuity::after_first_chunk(&descending, SENT_EPOCH, true)?;
-        assert_chain_discontinuity(overlapping.advance(
+        assert_chain_discontinuity(advance(
+            &mut overlapping,
             range(12, 21),
             &view(30),
             &chain(12, 21, 0, u32::MAX),
@@ -903,21 +1038,23 @@ mod tests {
         // another height does not link either.
         let mut misnumbered =
             BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_chain_discontinuity(misnumbered.advance(
+        assert_chain_discontinuity(advance(
+            &mut misnumbered,
             range(11, 11),
             &view(20),
             &[block_at(12, block_hash(12, 0), block_hash(10, 0))],
         ));
         let mut misnumbered_parent =
             BlockRangeContinuity::after_first_chunk(&descending, SENT_EPOCH, true)?;
-        assert_chain_discontinuity(misnumbered_parent.advance(
+        assert_chain_discontinuity(advance(
+            &mut misnumbered_parent,
             range(20, 20),
             &view(30),
             &[block_at(19, block_hash(20, 0), block_hash(18, 0))],
         ));
 
         let mut empty = BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_chain_discontinuity(empty.advance(range(11, 20), &view(20), &[]));
+        assert_chain_discontinuity(advance(&mut empty, range(11, 20), &view(20), &[]));
         Ok(())
     }
 
@@ -925,13 +1062,8 @@ mod tests {
     fn a_view_below_the_next_chunk_ends_the_stream_out_of_range() -> Result<(), tonic::Status> {
         let continuity =
             BlockRangeContinuity::after_first_chunk(&chain(1, 10, 0, u32::MAX), SENT_EPOCH, false)?;
-        continuity.check_view_reaches(range(11, 20), &view(20))?;
-
-        let outcome = continuity.check_view_reaches(range(11, 20), &view(19));
-        assert_eq!(
-            outcome.err().map(|status| status.code()),
-            Some(Code::OutOfRange)
-        );
+        let status = continuity.end_below_tip(range(11, 20), &view(19));
+        assert_eq!(status.code(), Code::OutOfRange);
         Ok(())
     }
 
@@ -1206,5 +1338,74 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Polls `stream` once with the task's context, so the poll spends the
+    /// task's cooperative budget as tonic's poll does.
+    async fn poll_once<S: Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {
+        std::future::poll_fn(|context| Poll::Ready(Pin::new(&mut *stream).poll_next(context))).await
+    }
+
+    /// Polls `stream` until it yields, letting the runtime run each time it
+    /// returns `Pending`, and returns how many times it did.
+    async fn next_counting_yields<S: Stream + Unpin>(stream: &mut S) -> (Option<S::Item>, usize) {
+        let mut yields = 0;
+        loop {
+            match poll_once(stream).await {
+                Poll::Ready(message) => return (message, yields),
+                Poll::Pending => {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// The first chunk of a stream with later chunks yields to the runtime
+    /// as a one-chunk response does. Once polling moves past it, the
+    /// response drops its messages and tells the reader.
+    #[tokio::test]
+    async fn the_first_chunk_yields_to_the_runtime_and_is_released_once_taken() {
+        const FIRST_CHUNK_MESSAGES: usize = 1_000;
+        let first_messages = (0..FIRST_CHUNK_MESSAGES).collect::<Vec<_>>();
+        let (messages, queued_messages) = mpsc::channel(1);
+        let (first_chunk_taken, mut first_chunk_taken_receiver) = oneshot::channel();
+        let mut queued_chunks = QueuedChunks {
+            first_messages: Some(tokio_stream::iter(first_messages.clone())),
+            first_chunk_taken: Some(first_chunk_taken),
+            queued_messages,
+        };
+
+        let mut sent = Vec::new();
+        let mut first_chunk_yields = 0;
+        while sent.len() < FIRST_CHUNK_MESSAGES {
+            let (message, yields) = next_counting_yields(&mut queued_chunks).await;
+            first_chunk_yields += yields;
+            let Some(message) = message else {
+                break;
+            };
+            sent.push(message);
+        }
+        assert_eq!(sent, first_messages);
+        assert!(
+            first_chunk_yields > 0,
+            "the first chunk must yield to the runtime while it is sent"
+        );
+        assert!(
+            first_chunk_taken_receiver.try_recv().is_err(),
+            "the reader must not be told before polling moves past the first chunk"
+        );
+
+        assert!(messages.try_send(FIRST_CHUNK_MESSAGES).is_ok());
+        let (queued, _) = next_counting_yields(&mut queued_chunks).await;
+        assert_eq!(queued, Some(FIRST_CHUNK_MESSAGES));
+        assert!(
+            first_chunk_taken_receiver.try_recv().is_ok(),
+            "the reader must be told once polling moves past the first chunk"
+        );
+        assert!(
+            queued_chunks.first_messages.is_none(),
+            "the response must drop the first chunk once it is taken"
+        );
     }
 }
