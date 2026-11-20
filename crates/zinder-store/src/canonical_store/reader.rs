@@ -7,8 +7,9 @@ use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
     ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
-    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, UnixTimestampMillis,
+    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
+    UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
@@ -28,7 +29,7 @@ use super::{
     },
     served_tree_state::ServedTreeState,
     subtree_load::{
-        CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
+        CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_position,
     },
     tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome},
 };
@@ -37,6 +38,7 @@ const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
 const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
 const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
+const SUBTREE_ROOT_PAGE_SIZE: usize = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST as usize;
 
 pub(super) trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
@@ -1027,7 +1029,8 @@ fn read_subtree_roots(
     store: &impl CanonicalServingRead,
     range: SubtreeRootRange,
 ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
-    let family = column_family(&store.serving_open().db, SUBTREE_ROOT_COLUMN_FAMILY)?;
+    let db = &store.serving_open().db;
+    let family = column_family(db, SUBTREE_ROOT_COLUMN_FAMILY)?;
     // A complete-prefix load holds every advertised root. A retained-range
     // load holds the roots its retained blocks complete, so only an index the
     // predecessor's trees already completed may be absent.
@@ -1039,42 +1042,68 @@ fn read_subtree_roots(
             .tip_metadata()
             .completed_subtree_count(range.protocol),
     };
-    range
-        .into_iter()
-        .map(|subtree_index| {
-            let probe = SubtreeRootArtifact::new(
+    let mut indices = range.into_iter();
+    let mut roots = Vec::new();
+    while indices.len() >= SUBTREE_ROOT_PAGE_SIZE {
+        let mut keys = Vec::with_capacity(SUBTREE_ROOT_PAGE_SIZE);
+        keys.extend(
+            indices
+                .by_ref()
+                .take(SUBTREE_ROOT_PAGE_SIZE)
+                .map(|index| (index, encode_subtree_root_position(range.protocol, index))),
+        );
+        // Within a pool, big-endian indices are in the column family's bytewise order.
+        let rows = db.batched_multi_get_cf_slice(&family, keys.iter().map(|(_, key)| key), true);
+        for ((index, key), row) in keys.into_iter().zip(rows) {
+            roots.push(decode_subtree_root_row(
                 range.protocol,
-                subtree_index,
-                zinder_core::SubtreeRootHash::from_bytes([0; 32]),
-                BlockHeight::new(0),
-                BlockHash::from_bytes([0; 32]),
-            );
-            let key = encode_subtree_root_key(&probe);
-            let encoded = store
-                .serving_open()
-                .db
-                .get_cf(&family, key)
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                    operation: "subtree-root read",
-                    source,
-                })?
-                .ok_or_else(|| {
-                    if subtree_index.value() < coverage_start {
-                        CanonicalStoreError::SubtreeRootUnavailable {
-                            protocol: range.protocol,
-                            subtree_index,
-                        }
-                    } else {
-                        CanonicalStoreError::publication(format!(
-                            "advertised {:?} subtree root {} is absent",
-                            range.protocol,
-                            subtree_index.value()
-                        ))
-                    }
-                })?;
-            decode_subtree_root(&key, &encoded)
-        })
-        .collect::<Result<Vec<_>, _>>()
+                index,
+                coverage_start,
+                &key,
+                row,
+            )?);
+        }
+    }
+    for index in indices {
+        let key = encode_subtree_root_position(range.protocol, index);
+        let row = db.get_cf(&family, key);
+        roots.push(decode_subtree_root_row(
+            range.protocol,
+            index,
+            coverage_start,
+            &key,
+            row,
+        )?);
+    }
+    Ok(roots)
+}
+
+fn decode_subtree_root_row(
+    protocol: ShieldedProtocol,
+    subtree_index: SubtreeRootIndex,
+    coverage_start: u32,
+    key: &[u8],
+    row: Result<Option<impl AsRef<[u8]>>, rust_rocksdb::Error>,
+) -> Result<SubtreeRootArtifact, CanonicalStoreError> {
+    let encoded = row
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "subtree-root read",
+            source,
+        })?
+        .ok_or_else(|| {
+            if subtree_index.value() < coverage_start {
+                CanonicalStoreError::SubtreeRootUnavailable {
+                    protocol,
+                    subtree_index,
+                }
+            } else {
+                CanonicalStoreError::publication(format!(
+                    "advertised {protocol:?} subtree root {} is absent",
+                    subtree_index.value()
+                ))
+            }
+        })?;
+    decode_subtree_root(key, encoded.as_ref())
 }
 
 fn read_optional(
