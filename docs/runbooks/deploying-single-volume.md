@@ -226,6 +226,11 @@ curl --fail-with-body -sS http://127.0.0.1:9106/readyz   # query
 curl --fail-with-body -sS http://127.0.0.1:9107/readyz   # lightwalletd compatibility
 ```
 
+## Private backups
+
+[Back up and restore a wallet-serving indexer](private-backups.md) covers
+coherent capture, off-host storage, and replacement on a fresh volume.
+
 ## Failure handling
 
 The entrypoint watches every process and its `/readyz`. When an enabled

@@ -21,7 +21,7 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 1. Zinder stores its canonical chain data in RocksDB through `rust-rocksdb`. The wallet store and the materialized-view stores use the same engine.
 2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one.
 3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
-4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). Zinder captures such a pair and has no restore command. Recovery rebuilds the stores, as [Service operations](../architecture/service-operations.md#recovery) describes.
+4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). [Private backups](../runbooks/private-backups.md) describes capture and restore of the pair.
 
 [Storage backend](../architecture/storage-backend.md) describes the stores, their column families, and their layout.
 
@@ -37,3 +37,7 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 - **`fjall`.** It is the strongest pure-Rust challenger and separates large values well. Its file-format track record, backup story, and production evidence are weaker than RocksDB's. Zinder reconsiders it only if all of these hold: it passes the same real-fixture replay and crash-recovery tests, stays within twice RocksDB's disk footprint, matches RocksDB on bulk catch-up and reorg replacement, and the RocksDB native build blocks normal contributor or CI work.
 - **`redb`.** It has a clean API and ACID transactions. Its evidence for append-heavy writes, reorg replacement, and disk efficiency is weaker than RocksDB's and `fjall`'s. It remains a candidate for small coordination state, not for chain data.
 - **LMDB through `heed`.** It excels at memory-mapped, read-heavy access from several processes. Zinder does not need several processes to open one database as primary, and LMDB fits append-heavy, frequently replaced data less well.
+
+## Revision history
+
+- 2026-11-20. Updated the checkpoint decision to reference private recovery of the canonical and wallet pair.

@@ -284,9 +284,38 @@ pub(crate) fn load_projector_config(
     config_path: Option<PathBuf>,
     overrides: ProjectorConfigOverrides,
 ) -> Result<ProjectorConfig, ProjectorError> {
-    let raw: ProjectorRawConfig = projector_config_loader()?
+    resolve_projector_config(load_raw_projector_config(
+        config_path,
+        overrides,
+        std::env::vars(),
+    )?)
+}
+
+pub(crate) fn load_backup_config(
+    config_path: Option<PathBuf>,
+    overrides: ProjectorConfigOverrides,
+) -> Result<(Network, zinder_runtime::ResolvedProjectorControl), ConfigError> {
+    let capture_settings = std::env::vars().filter(|(name, _)| {
+        name == "ZINDER_NETWORK"
+            || name.starts_with("ZINDER_NETWORK_")
+            || name == "ZINDER_PROJECTOR_CONTROL"
+            || name.starts_with("ZINDER_PROJECTOR_CONTROL_")
+    });
+    let raw = load_raw_projector_config(config_path, overrides, capture_settings)?;
+    Ok((
+        raw.network.resolve()?,
+        resolve_projector_control(raw.projector_control)?,
+    ))
+}
+
+fn load_raw_projector_config(
+    config_path: Option<PathBuf>,
+    overrides: ProjectorConfigOverrides,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Result<ProjectorRawConfig, ConfigError> {
+    projector_config_loader()?
         .with_file(config_path)
-        .with_zinder_env()?
+        .with_zinder_env_from_map(environment)?
         .with_override_if("network.name", overrides.network)?
         .with_override_path_if("storage.canonical_path", overrides.canonical_path)?
         .with_override_path_if(
@@ -326,9 +355,7 @@ pub(crate) fn load_projector_config(
             "ops.listen_addr",
             overrides.ops_listen_addr.map(|address| address.to_string()),
         )?
-        .load()?;
-
-    resolve_projector_config(raw)
+        .load()
 }
 
 fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {

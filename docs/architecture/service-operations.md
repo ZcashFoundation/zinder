@@ -279,17 +279,20 @@ describes how to distinguish these cases.
 
 ### Restore by rebuilding
 
-Zinder restores a deployment by rebuilding it from the node. A rebuild is a
+An operator with no verified private backup can rebuild from the node. A rebuild is a
 fresh first sync: start a new deployment on empty storage, let ingest and the
 projector build from the node, move traffic once its readers report ready,
 and then retire the old deployment. A Mainnet first sync takes many hours; see
 [Deploying](../runbooks/deploying.md) for measured times. Plan for that time
 in your recovery objective.
 
-The projector's private control API can capture a state bundle. A bundle
-holds a canonical checkpoint and a wallet checkpoint bound to the same
-canonical position, with a manifest. Recover by rebuilding, not from a
-bundle.
+### Restore from a private backup
+
+The projector can capture and seal a coherent pair of checkpoints. Offline
+restore verifies the independently recorded manifest digest and installs both
+stores under one fresh directory before ordinary owner and reader admission.
+Use [Back up and restore a wallet-serving indexer](../runbooks/private-backups.md)
+for capture, off-host transfer, verification, and cutover.
 
 Do not use a filesystem copy of the canonical and wallet directories as a
 backup. Copies taken at different moments describe different chain states,

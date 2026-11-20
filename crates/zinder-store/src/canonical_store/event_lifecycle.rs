@@ -525,6 +525,29 @@ impl RocksDbCanonicalStore {
         self.prune_canonical_events_before_locked(requested_floor, now)
     }
 
+    pub(super) fn clear_restored_retention_leases(&self) -> Result<(), CanonicalStoreError> {
+        let mut changes = WriteBatch::default();
+        let leases = self.bounded_open.db.iterator(IteratorMode::From(
+            PROJECTION_BUILD_LEASE_PREFIX,
+            Direction::Forward,
+        ));
+        for row in leases {
+            let (key, _) = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "scan restored projection leases",
+                source,
+            })?;
+            if !key.starts_with(PROJECTION_BUILD_LEASE_PREFIX) {
+                break;
+            }
+            projection_build_lease_id_from_key(&key)?;
+            changes.delete(&key);
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        write_lifecycle_batch(self, &changes, "release restored projection leases")
+    }
+
     fn live_projection_build_lease_state(
         &self,
         now: UnixTimestampMillis,

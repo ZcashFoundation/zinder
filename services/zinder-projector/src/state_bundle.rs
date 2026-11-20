@@ -1,12 +1,12 @@
 //! Coherent single-host canonical and wallet checkpoint bundles.
 //!
-//! The module deliberately stops at capture and admission primitives. The
-//! canonical owner must create its checkpoint at the returned fixed path and
-//! pass the cold-opened evidence back to the projector. The projector then
-//! verifies that its wallet owner represents the exact same canonical fence,
-//! creates the wallet checkpoint, and publishes the manifest last. Restore,
-//! archive extraction, cross-process transport, and cursor rekeying are
-//! separate production boundaries and are not implied by a valid manifest.
+//! The canonical owner captures its checkpoint and sends its evidence to the
+//! projector. The projector captures the wallet checkpoint at the same chain
+//! position and publishes the bundle manifest last. During recovery, this
+//! module compares evidence from both reopened databases with that manifest.
+//! [`crate::recovery_archive`] owns backup publication and installation.
+
+mod recovery;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -281,18 +281,26 @@ impl StateBundleManifest {
         root: impl AsRef<Path>,
         expected_network: Network,
     ) -> Result<Self, StateBundleError> {
-        Self::read_with_additional_root_entries(root.as_ref(), expected_network, &[])
+        Self::read_with_sha256(root, expected_network).map(|(manifest, _)| manifest)
+    }
+
+    /// Admits a completed capture and returns SHA-256 of the exact manifest bytes read.
+    pub fn read_with_sha256(
+        root: impl AsRef<Path>,
+        expected_network: Network,
+    ) -> Result<(Self, [u8; 32]), StateBundleError> {
+        Self::admit_manifest(root.as_ref(), expected_network, &[])
     }
 
     /// Reads a state-bundle nested inside a crate-owned fixed outer layout.
     ///
     /// The additional entries are compile-time names supplied by another
     /// projector boundary, never caller-selected paths.
-    pub(crate) fn read_with_additional_root_entries(
+    pub(crate) fn admit_manifest(
         root: &Path,
         expected_network: Network,
         additional_root_entries: &[&str],
-    ) -> Result<Self, StateBundleError> {
+    ) -> Result<(Self, [u8; 32]), StateBundleError> {
         let root = resolve_existing_directory(root, "state-bundle root")?;
         let manifest_path = root.join(STATE_BUNDLE_MANIFEST_FILE_NAME);
         require_regular_file(&manifest_path, "state-bundle manifest")?;
@@ -335,7 +343,7 @@ impl StateBundleManifest {
         })?;
         manifest.validate(expected_network)?;
         validate_complete_layout(&root, additional_root_entries)?;
-        Ok(manifest)
+        Ok((manifest, Sha256::digest(&encoded).into()))
     }
 
     /// Exact shared canonical-wallet fence admitted from this manifest.
@@ -476,7 +484,10 @@ pub fn prepare_state_bundle_capture(
         "configured state-bundle staging root",
     )?;
     let paths = StateBundleCapturePaths::for_candidate(&staging_root, candidate_id.to_owned());
-    match fs::create_dir(&paths.root) {
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut directory, 0o700);
+    match directory.create(&paths.root) {
         Ok(()) => Ok(paths),
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
             Err(StateBundleError::TargetExists { path: paths.root })
@@ -587,6 +598,14 @@ pub enum StateBundleError {
         #[source]
         source: zinder_wallet_rocksdb::RocksDbWalletError,
     },
+    /// Recovery could not admit the canonical checkpoint read-only.
+    #[error("canonical recovery checkpoint admission failed: {0}")]
+    CanonicalRecovery(#[source] zinder_store::CanonicalStoreError),
+
+    /// Recovery could not admit the wallet checkpoint read-only.
+    #[error("wallet recovery checkpoint admission failed: {0}")]
+    WalletRecovery(#[source] zinder_wallet_rocksdb::RocksDbWalletError),
+
     /// Filesystem operation failed.
     #[error("state-bundle filesystem operation failed at {path}: {source}")]
     Io {
@@ -1778,9 +1797,11 @@ fn validate_complete_checkpoint_pair(
 }
 
 fn open_new_file(path: &Path) -> Result<File, StateBundleError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
         .open(path)
         .map_err(|source| StateBundleError::io(path, source))
 }
@@ -2191,8 +2212,20 @@ mod tests {
         let wallet = sample_wallet_admission(7)?;
         let manifest = StateBundleManifest::from_admitted("bundle-a", &canonical, &wallet)?;
         publish_manifest_last(&paths, &manifest)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [paths.root(), paths.manifest()] {
+                assert!(fs::metadata(path)?.permissions().mode().trailing_zeros() >= 6);
+            }
+        }
 
-        let admitted = StateBundleManifest::read(paths.root(), Network::ZcashRegtest)?;
+        let (admitted, manifest_sha256) =
+            StateBundleManifest::read_with_sha256(paths.root(), Network::ZcashRegtest)?;
+        assert_eq!(
+            manifest_sha256,
+            <[u8; 32]>::from(Sha256::digest(fs::read(paths.manifest())?))
+        );
         assert_eq!(admitted, manifest);
         assert_eq!(admitted.identity, STATE_BUNDLE_IDENTITY);
         assert_eq!(admitted.format_version, STATE_BUNDLE_FORMAT_VERSION);
@@ -2605,41 +2638,6 @@ mod tests {
             StateBundleManifest::read(paths.root(), Network::ZcashRegtest)?,
             captured
         );
-        Ok(())
-    }
-
-    #[test]
-    fn recovery_archive_refuses_a_source_without_a_valid_construction_manifest_sidecar()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let staging_root = temporary.path().join("staging");
-        let archive_root = temporary.path().join("archives");
-        fs::create_dir(&staging_root)?;
-        fs::create_dir(&archive_root)?;
-        let paths = prepare_state_bundle_capture(&staging_root, "bundle-a")?;
-        fs::create_dir(paths.canonical_checkpoint())?;
-        fs::create_dir(paths.wallet_checkpoint())?;
-        fs::write(
-            paths.canonical_checkpoint().join("000001.sst"),
-            b"canonical",
-        )?;
-        fs::write(paths.wallet_checkpoint().join("000001.sst"), b"wallet")?;
-        let manifest = StateBundleManifest::from_admitted(
-            "bundle-a",
-            &sample_canonical_admission(7),
-            &sample_wallet_admission(7)?,
-        )?;
-        publish_manifest_last(&paths, &manifest)?;
-
-        assert!(
-            crate::recovery_archive::package_recovery_archive(
-                &archive_root,
-                &paths,
-                Network::ZcashRegtest,
-            )
-            .is_err()
-        );
-        assert!(!archive_root.join("bundle-a").exists());
         Ok(())
     }
 

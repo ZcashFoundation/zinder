@@ -23,7 +23,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 2. **Stores carry their identity.** Each store records its domain, exact schema version, network, and immutable parameters. A wallet store also binds the canonical source and position it projects. An opener fails without mutation when identity or version differs. Zinder never adopts an unknown non-empty directory, and a reader never upgrades a primary store.
 3. **One topology per deployment.** All stores of one deployment use the same engine. Parity between topologies is promised only on the public wallet contracts: native `WalletQuery` and lightwalletd compatibility.
 4. **`rocksdb-single-host` is the supported topology.** The canonical and wallet primaries live on one host filesystem, each with one owner. Readers open secondaries with process-unique metadata paths ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). Private, authenticated control APIs coordinate fences, leases, mempool state, and recovery.
-5. **A backup is a coherent pair.** A canonical checkpoint alone is not a wallet-serving backup. A restore authenticates the canonical fence and wallet digest together, restores both into fresh paths, and passes wallet-serving admission before traffic. Independently timed directory copies are not a backup. Zinder implements capture and has no restore command. Recovery rebuilds the stores ([Service operations](../architecture/service-operations.md#recovery)).
+5. **A backup is a coherent pair.** A canonical checkpoint alone is not a wallet-serving backup. A restore authenticates the canonical fence and wallet digest together, restores both into fresh paths, and passes wallet-serving admission before traffic. Independently timed directory copies are not a backup. Private restore uses an independently retained SHA-256 of the exact outer manifest, validates both checkpoint databases, releases the source projector's retention leases, and publishes one fresh directory. A private replacement retains the cursor authentication identity for its own deployment. [Private backups](../runbooks/private-backups.md) describes admission before cutover.
 6. **`postgres-horizontal` is the decided topology for hosted fleets.** Its objective is operability: stateless, replaceable Zinder processes, readers that upgrade without downtime, and recovery from a lost host in minutes. The objective does not rest on a measured load limit of `rocksdb-single-host`. Its first form is deliberately small:
    - Canonical and wallet data live in one database per network, in separate schemas, so one snapshot covers both.
    - Readers query the primary only. Replica reads come later, if the primary's read capacity limits serving.
@@ -58,5 +58,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 - **Persisting the live mempool in PostgreSQL in the first release.** Deferred, not rejected. It ships later only if the benchmark or production shows a need.
 
 ## Revision history
+
+- 2026-11-20. Specified private, same-schema restore into an inactive RocksDB deployment and the identity retained by its cursors.
 
 - 2026-11-20. Decision 6 assigns optional gRPC-Web translation to the compatibility reader across storage topologies. TLS, client limits, and balancing remain at the deployment edge.

@@ -562,7 +562,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zingod-snap]: Needs a `[snapshot]` manifest, from which aria2c fills empty index directories ([config.rs](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/packages/zingod/src/config.rs#L533-L545)).
 
-[^zinder-snap]: Zinder can capture a state bundle, but no restore path is implemented ([state_bundle.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-projector/src/state_bundle.rs#L1-L9)).
+[^zinder-snap]: The compared revision supported state-bundle capture only. The current [private backup workflow](../runbooks/private-backups.md) restores an operator's own deployment and retains its cursor authentication key. Public snapshot bootstrap needs a separately distributable artifact. [Compared state-bundle implementation](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-projector/src/state_bundle.rs#L1-L9).
 
 [^zingod-image]: The `zingodevops/zingod` Docker image, for linux/amd64 only ([release.yaml](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/.github/workflows/release.yaml#L120-L135)).
 

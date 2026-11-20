@@ -1209,26 +1209,38 @@ impl RocksDbWalletFollowingStore {
     ) -> Result<WalletOwnerCheckpointEvidence, RocksDbWalletError> {
         validate_resource_budget(config.resource_budget)?;
         let target = target.as_ref();
-        let cold_checkpoint = RocksDbWalletStore::open_ready_for_following(
-            target,
-            expected_network,
+        require_exact_column_families(target)?;
+        let opened = open_bounded_rocksdb(
+            RocksDbOpenRole::ReadOnlyProbe { path: target },
             config.resource_budget,
-        )?;
-        let database_identity = cold_checkpoint
-            .store
-            .bounded_open
-            .db
-            .get_db_identity()
-            .map_err(|source| RocksDbWalletError::CheckpointFailed {
+            wallet_column_family_descriptors,
+        )
+        .map_err(|source| RocksDbWalletError::rocksdb("recovery read-only open", source))?;
+        let expected_control = decode_only_control(&opened)?;
+        if expected_control.network != expected_network {
+            return Err(RocksDbWalletError::NetworkMismatch {
+                expected: expected_network,
+                observed: expected_control.network,
+            });
+        }
+        let WalletProjectionBuildState::Ready(ready_evidence) = &expected_control.build_state
+        else {
+            return Err(RocksDbWalletError::StoreNotReady {
                 path: target.to_path_buf(),
-                source,
-            })?;
-        let expected_control = cold_checkpoint.store.control.clone();
-        let ready_evidence = cold_checkpoint.store.ready_evidence().clone();
+            });
+        };
+        let database_identity =
+            opened
+                .db
+                .get_db_identity()
+                .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
         validate_ready_rows_by_semantic_rederivation(
-            &cold_checkpoint.store.bounded_open,
+            &opened,
             expected_network,
-            &ready_evidence,
+            ready_evidence,
             WalletSemanticValidationConfig {
                 staging_path: config.staging_path,
                 max_sort_memory_bytes_per_sorter: config.max_sort_memory_bytes_per_sorter,
@@ -1236,16 +1248,15 @@ impl RocksDbWalletFollowingStore {
                 max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
             },
         )?;
-        let observed_control = decode_only_control(&cold_checkpoint.store.bounded_open)?;
-        let observed_identity = cold_checkpoint
-            .store
-            .bounded_open
-            .db
-            .get_db_identity()
-            .map_err(|source| RocksDbWalletError::CheckpointFailed {
-                path: target.to_path_buf(),
-                source,
-            })?;
+        let observed_control = decode_only_control(&opened)?;
+        let observed_identity =
+            opened
+                .db
+                .get_db_identity()
+                .map_err(|source| RocksDbWalletError::CheckpointFailed {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
         if observed_control != expected_control || observed_identity != database_identity {
             return Err(RocksDbWalletError::AdmissionChanged {
                 reason: "wallet checkpoint changed during recovery cold admission",
@@ -1255,8 +1266,8 @@ impl RocksDbWalletFollowingStore {
             database_identity,
             store_identity: WALLET_PROJECTION_STORE_IDENTITY,
             schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
-            network: cold_checkpoint.network(),
-            ready_evidence,
+            network: expected_network,
+            ready_evidence: ready_evidence.clone(),
         })
     }
 

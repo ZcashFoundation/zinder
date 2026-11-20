@@ -615,6 +615,7 @@ async fn capture_state_bundle(
     match owner_control
         .create_state_bundle_capture(CreateStateBundleCaptureRequest {
             candidate_id: "parked-capture".to_owned(),
+            reuse_completed: false,
         })
         .await
     {

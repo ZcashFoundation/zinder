@@ -398,6 +398,11 @@ the shell.
 | Projector `/readyz` reports `wallet_transition_limit_exceeded` | One wallet update is larger than its limit, and the projector parked. | Raise `max_transition_logical_bytes` under `[projector.follow]` in `deploy/config/projector.toml` and restart the projector, as [Wallet transition exceeds its logical-byte limit](deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit) describes. |
 | Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. A restart parks ingest again. |
 
+## Private backups
+
+[Back up and restore a wallet-serving indexer](private-backups.md) covers
+coherent capture, off-host storage, and replacement on a fresh volume.
+
 ## Side-by-side wallet rebuild and cutover
 
 The projector refuses some failures with a request to rebuild the wallet in a

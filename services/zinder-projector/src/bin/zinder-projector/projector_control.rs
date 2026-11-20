@@ -1,7 +1,12 @@
 //! Private authenticated command surface for the running wallet owner.
 
+use std::path::Path;
+
+use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
+use zinder_projector::state_bundle::{StateBundleError, StateBundleManifest};
 use zinder_proto::v1::ingest::{
     CreateStateBundleCaptureRequest, CreateStateBundleCaptureResponse,
     projector_control_server::{ProjectorControl, ProjectorControlServer},
@@ -19,8 +24,8 @@ pub(crate) const PROJECTOR_CONTROL_COMMAND_CAPACITY: usize = 1;
 pub(crate) enum ProjectorControlCommand {
     /// Captures one coherent canonical-and-wallet state bundle.
     CreateStateBundleCapture {
-        /// Opaque operator-selected candidate identifier.
-        candidate_id: String,
+        /// Opaque candidate identifier and completed-capture reuse policy.
+        request: CreateStateBundleCaptureRequest,
         /// Reply sent only after manifest-last publication succeeds.
         reply: oneshot::Sender<Result<CreateStateBundleCaptureResponse, Status>>,
     },
@@ -35,14 +40,11 @@ pub(crate) struct ProjectorControlHandle {
 impl ProjectorControlHandle {
     async fn create_state_bundle_capture(
         &self,
-        candidate_id: String,
+        request: CreateStateBundleCaptureRequest,
     ) -> Result<CreateStateBundleCaptureResponse, Status> {
         let (reply, receiver) = oneshot::channel();
         self.sender
-            .try_send(ProjectorControlCommand::CreateStateBundleCapture {
-                candidate_id,
-                reply,
-            })
+            .try_send(ProjectorControlCommand::CreateStateBundleCapture { request, reply })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Status::resource_exhausted(
                     "projector owner is already capturing a state bundle",
@@ -102,8 +104,41 @@ impl ProjectorControl for ProjectorControlGrpcAdapter {
         request: Request<CreateStateBundleCaptureRequest>,
     ) -> Result<Response<CreateStateBundleCaptureResponse>, Status> {
         self.handle
-            .create_state_bundle_capture(request.into_inner().candidate_id)
+            .create_state_bundle_capture(request.into_inner())
             .await
             .map(Response::new)
     }
+}
+
+#[derive(Debug, Error)]
+pub(super) enum CaptureReceiptError {
+    #[error(transparent)]
+    StateBundle(#[from] StateBundleError),
+    #[error("the staged manifest differs from the requested capture")]
+    CaptureMismatch,
+}
+
+pub(super) fn read_capture_receipt(
+    root: &Path,
+    candidate: &str,
+    network: Network,
+    fresh_capture: Option<&StateBundleManifest>,
+) -> Result<(CreateStateBundleCaptureResponse, [u8; 32]), CaptureReceiptError> {
+    let (manifest, digest) = StateBundleManifest::read_with_sha256(root, network)?;
+    if manifest.candidate_id() != candidate || fresh_capture.is_some_and(|fresh| fresh != &manifest)
+    {
+        return Err(CaptureReceiptError::CaptureMismatch);
+    }
+    let receipt = CreateStateBundleCaptureResponse {
+        candidate_id: candidate.to_owned(),
+        state_bundle_identity: manifest.identity().to_owned(),
+        state_bundle_format_version: u32::from(manifest.format_version()),
+        topology: manifest.topology().to_owned(),
+        network_name: encode_zinder_native_chain_name(network).to_owned(),
+        chain_epoch_id: manifest.fence().chain_epoch_id(),
+        chain_event_sequence: manifest.fence().chain_event_sequence(),
+        visible_tip_height: manifest.fence().visible_tip_height(),
+        state_bundle_manifest_sha256: digest.to_vec(),
+    };
+    Ok((receipt, digest))
 }
