@@ -1,5 +1,5 @@
 kind: changed
-body: RocksDB writers honor the configured write-buffer limits for the default column family. Use the new rocksdb_direct_io_open_failed event to find direct I/O errors that trigger a buffered retry.
+body: RocksDB writers honor the configured write-buffer limits for the default column family. Update log filters from rocksdb_direct_io_unsupported to rocksdb_direct_io_open_failed for direct I/O errors that trigger a buffered retry.
 time: 2026-11-20T12:09:25.034547485Z
 custom:
     Bump: patch
