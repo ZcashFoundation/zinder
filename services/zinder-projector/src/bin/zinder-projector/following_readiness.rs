@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::{CancellationToken, DropGuard};
-use zinder_runtime::{CanonicalFenceLag, Readiness, ReadinessCause, ReadinessState};
+use zinder_runtime::{CanonicalFenceLag, Readiness, ReadinessCause, ReadinessState, StartupPhase};
 
 /// Longest a ready projector may trail the canonical fence without its wallet
 /// applying a block before it reports `syncing`.
@@ -39,6 +39,7 @@ pub(crate) struct FollowingReadiness<'a> {
     /// Whether the last convergence deadline passed without the secondary
     /// reaching the writer, and nothing has advanced the wallet since.
     secondary_stale: bool,
+    startup_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +113,7 @@ impl<'a> FollowingReadiness<'a> {
             wallet_height,
             trail: None,
             secondary_stale: false,
+            startup_complete: false,
         }
     }
 
@@ -121,6 +123,10 @@ impl<'a> FollowingReadiness<'a> {
         self.trail = None;
         self.secondary_stale = false;
         self.readiness.set(ReadinessState::ready(Some(height)));
+        if !self.startup_complete {
+            StartupPhase::Ready.start().complete();
+            self.startup_complete = true;
+        }
     }
 
     /// Records that the wallet applied a transition up to `height`, which
@@ -290,6 +296,26 @@ mod tests {
         assert_eq!(report.cause, ReadinessCause::Ready);
         assert_eq!(report.current_height, Some(current_height));
         assert_eq!(report.target_height, Some(target_height));
+    }
+
+    #[test]
+    fn startup_reports_ready_once_when_the_wallet_first_matches_the_writer() {
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+        let readiness = Readiness::default();
+        let mut following = FollowingReadiness::for_wallet(&readiness, 10);
+
+        following.trailing(10, 11);
+        assert!(capture.events().is_empty());
+        following.caught_up(11);
+        following.writer_unreached(None);
+        following.caught_up(12);
+
+        let events = capture.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].field("phase"), Some("ready"));
+        assert_eq!(events[0].field("phase_state"), Some("entry"));
+        assert_eq!(events[1].field("phase_state"), Some("exit"));
+        assert_eq!(events[1].field("outcome"), Some("ok"));
     }
 
     #[tokio::test]

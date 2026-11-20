@@ -11,23 +11,28 @@ changing runtime lifecycle code. Readiness causes are listed in
 
 ### Startup phases
 
-Every runtime except `zinder-projector` reports its startup through the same
-named phases and skips the phases that do not apply to it. The projector
-reports no startup phases, so use its `/readyz` instead. Each phase logs an
-entry event and an exit event under the `zinder::startup` target, with `phase`,
-`phase_state`, and an `outcome` of `ok`, `failed`, or `aborted`. The
+Each runtime reports the startup phases it performs. Each phase logs an entry
+and an exit under the `zinder::startup` target. Both events carry `phase` and
+`phase_state`. The exit carries an `outcome` of `ok`, `failed`, or `aborted`. The
 `zinder_startup_phase_duration_seconds` histogram records the same phases.
 
 | Phase | What happens |
 | --- | --- |
-| `load_config` | Merge defaults, the config file, environment variables, and flags. |
+| `load_config` | Merge defaults, the config file, environment variables, and flags, and validate the result. |
 | `connect_node` | Ingest only: build the node clients from configuration. |
 | `check_schema` | Ingest only: check each node's capabilities, archive storage, genesis block, and network-upgrade table. |
-| `admit_ingest_control` | Readers that need it: authenticate to ingest control and check its identity, network, and contract revision. |
-| `open_storage` | Readers only: open their read-only store copies. Ingest opens its store after `ready`. |
+| `admit_ingest_control` | Authenticate to ingest control. Wallet-serving readers check its identity, network, and contract revision. The projector checks its canonical secondary against the writer's fence. |
+| `open_storage` | Open a read-only store copy, including the projector's canonical secondary. Ingest opens its store after `ready`. |
 | `recover_state` | Replay or rebuild in-flight state. |
 | `start_api` | Bind the gRPC and operational listeners. |
 | `ready` | Startup is complete. |
+
+The projector reports `start_api` when it binds each enabled listener, first
+for operations and later for owner control. During `recover_state`, it builds
+a wallet or resumes the persisted wallet at a retained event. If it must
+bootstrap from the next retained event, recovery covers that first transition.
+The projector reports `ready` once, when the wallet first catches up to the
+attested writer fence. Use `/readyz` for its current state.
 
 Only ingest contacts a node during startup. The projector, `zinder-query`,
 and `zinder-compat-lightwalletd` open storage with the network-upgrade

@@ -20,9 +20,10 @@ use zinder_core::{
 use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsHealthcheckArgs, OpsServer,
-    Readiness, ReadinessState, TracingSubscriberError, cancel_on_terminating_signal,
-    compare_canonical_writer_fences, converge_on_canonical_writer_fence, expected_writer_fence,
-    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint,
+    OpsServerError, Readiness, ReadinessState, StartupPhase, StartupPhaseGuard,
+    TracingSubscriberError, cancel_on_terminating_signal, compare_canonical_writer_fences,
+    converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
+    install_metrics_recorder, install_tracing_subscriber, spawn_ops_endpoint,
     writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
@@ -198,24 +199,34 @@ fn print_config(cli: Cli) -> ExitCode {
 }
 
 async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
+    let load_config = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
-    let config = config::load_projector_config(config_path, cli.into())?;
+    let config = match config::load_projector_config(config_path, cli.into()) {
+        Ok(config) => config,
+        Err(error) => {
+            load_config.fail(&error);
+            return Err(error);
+        }
+    };
+    let ops_server = OpsServer {
+        service_name: PROJECTOR_SERVICE_NAME,
+        service_version: env!("CARGO_PKG_VERSION"),
+        network_name: encode_zinder_native_chain_name(config.network),
+        advertised_capabilities: Arc::from([]),
+    };
+    if config.ops_listen_addr.is_some() {
+        install_metrics_recorder(&ops_server).map_err(OpsServerError::from)?;
+    }
+    load_config.complete();
+
     let readiness = Readiness::default();
-    let ops_handle = match config.ops_listen_addr {
-        Some(listen_addr) => Some(
-            spawn_ops_endpoint(
-                listen_addr,
-                OpsServer {
-                    service_name: PROJECTOR_SERVICE_NAME,
-                    service_version: env!("CARGO_PKG_VERSION"),
-                    network_name: encode_zinder_native_chain_name(config.network),
-                    advertised_capabilities: Arc::from([]),
-                },
-                readiness.clone(),
-            )
-            .await?,
-        ),
-        None => None,
+    let ops_handle = if let Some(address) = config.ops_listen_addr {
+        let start_api = StartupPhase::StartApi.start();
+        let handle = spawn_ops_endpoint(address, ops_server, readiness.clone()).await?;
+        start_api.complete();
+        Some(handle)
+    } else {
+        None
     };
     let cancel = CancellationToken::new();
     let _signal = cancel_on_terminating_signal(cancel.clone());
@@ -260,9 +271,12 @@ async fn run_owned_projector(
             "projector.reorg_window_blocks is invalid: {error}"
         ))
     })?;
+    let open_storage = StartupPhase::OpenStorage.start();
     let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
         return Ok(());
     };
+    open_storage.complete();
+    let admit_ingest_control = StartupPhase::AdmitIngestControl.start();
     let Some(mut canonical_control) = CanonicalWriterControlClient::connect_at_startup(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
@@ -273,6 +287,7 @@ async fn run_owned_projector(
     else {
         return Ok(());
     };
+    let recover_state = StartupPhase::RecoverState.start();
     let resumable_wallet = open_resumable_wallet(config, canonical.reorg_policy())?;
     let resumable_source = resumable_wallet
         .as_ref()
@@ -302,6 +317,7 @@ async fn run_owned_projector(
         return Ok(());
     };
 
+    admit_ingest_control.complete();
     if let Some(wallet) = resumable_wallet {
         let wallet_source =
             WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
@@ -309,6 +325,7 @@ async fn run_owned_projector(
             .await?
         {
             ResumedFollowingAdmission::Anchored(canonical_lease) => {
+                recover_state.complete();
                 tracing::info!(
                     target: "zinder::projector",
                     event = "wallet_projection_following_resumed",
@@ -349,6 +366,7 @@ async fn run_owned_projector(
                     canonical_control,
                     wallet,
                     first_retained_event_sequence,
+                    recover_state,
                 ))
                 .await;
             }
@@ -527,6 +545,7 @@ async fn run_owned_projector(
         config.lease_duration,
     )
     .await?;
+    recover_state.complete();
     let ready_height = report.source_position.tip.height.value();
     tracing::info!(
         target: "zinder::projector",
@@ -775,6 +794,7 @@ impl ProjectorControlTasks {
         let Some(listen_addr) = config.listen_addr else {
             return Ok(Self::disabled());
         };
+        let start_api = StartupPhase::StartApi.start();
         let Some(bearer_token) = config.bearer_token.clone() else {
             return Err(ProjectorError::ProjectorControlTokenMissing);
         };
@@ -796,6 +816,7 @@ impl ProjectorControlTasks {
                 )
                 .await
         });
+        start_api.complete();
         Ok(Self {
             commands: Some(commands),
             server: Some(server),
@@ -983,6 +1004,7 @@ async fn bootstrap_resumed_wallet_following(
     mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     first_retained_event_sequence: u64,
+    recover_state: StartupPhaseGuard,
 ) -> Result<(), ProjectorError> {
     let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
     let mut following_readiness = FollowingReadiness::for_wallet(
@@ -1147,6 +1169,7 @@ async fn bootstrap_resumed_wallet_following(
             config.lease_duration,
         )
         .await?;
+        recover_state.complete();
         return run_continuous_wallet_following(
             config,
             readiness,

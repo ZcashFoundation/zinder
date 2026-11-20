@@ -74,6 +74,64 @@ const CAPTURE_RETRIES: u32 = 8;
 /// Long enough that each renewal extends the lease by a whole millisecond.
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
+#[tokio::test]
+async fn fresh_and_resumed_wallets_complete_startup_at_the_writer_fence() -> TestResult {
+    let Some(listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let policy = CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?;
+    let (mut writer, _) = baseline_writer(&root.path().join("canonical"), policy)?;
+    writer.admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())?;
+    let server_cancel = CancellationToken::new();
+    let endpoint = spawn_canonical_control(
+        listener,
+        RecordingCanonicalControl::new(writer),
+        server_cancel.clone(),
+    )?;
+    let mut config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
+    config.lease_duration = Duration::from_hours(4);
+
+    for resume in [false, true] {
+        assert_eq!(config.wallet_path.exists(), resume);
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        let mut owner = Box::pin(crate::run_owned_projector(
+            &config,
+            &readiness,
+            cancel.clone(),
+        ));
+        tokio::select! {
+            outcome = &mut owner => return Err(format!("projector exited during startup: {outcome:?}").into()),
+            report = wait_for_report(&readiness, "initial wallet catch-up", |state| state.is_ready) => {
+                assert_eq!(report?.current_height, Some(1));
+            }
+        }
+        cancel.cancel();
+        owner.await?;
+
+        let events = capture.events();
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event.field("outcome") == Some("ok"))
+            .filter_map(|event| event.field("phase"))
+            .collect();
+        assert_eq!(
+            completed,
+            [
+                "open_storage",
+                "admit_ingest_control",
+                "recover_state",
+                "start_api",
+                "ready"
+            ]
+        );
+    }
+    server_cancel.cancel();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_transition_parks_following_until_a_reorg_changes_it() -> TestResult {
     let Some(canonical_control_listener) = bind_loopback().await? else {
@@ -262,6 +320,7 @@ async fn a_refused_bootstrap_transition_parks_behind_the_owner_control_endpoint(
         canonical_control,
         chain.wallet,
         first_retained_event_sequence,
+        zinder_runtime::StartupPhase::RecoverState.start(),
     ));
     let script =
         drive_bootstrap_park_and_resume(&control, &readiness, projector_control_addr, &cancel);
