@@ -1,0 +1,6 @@
+kind: added
+body: Wallet integrators can replay funded Regtest recovery, sends, and restart checks for Zingo, Zkool, Vizor, the Cake Wallet Zcash engine, and zcash-devtool.
+time: 2026-11-20T21:15:15.56879479Z
+custom:
+    Bump: minor
+    PR: "439"
