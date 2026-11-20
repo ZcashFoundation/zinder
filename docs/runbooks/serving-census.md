@@ -24,10 +24,26 @@ the serving path answered.
 3. Remote-write over an authenticated private or TLS connection to a backend
    outside the application volume. Provision 30 days of retention for daily
    and seven-day reports. Supply credentials from a mounted secret. Size the
-   collector's write-ahead log for the tolerated outage and test interrupted
-   delivery and recovery. Alert at the receiver on a missing collector
-   heartbeat, stale last-received timestamp, increasing send failures, and
-   a growing unsent backlog. [Prometheus remote write](https://prometheus.io/docs/practices/remote_write/)
+   collector's write-ahead log (WAL) for the tolerated outage. Alert at the
+   receiver on a missing collector heartbeat, stale last-received timestamp,
+   increasing send failures, and a growing unsent backlog.
+   [Prometheus remote write](https://prometheus.io/docs/practices/remote_write/)
+
+   Test receiver recovery twice. First keep the collector running while the
+   receiver rejects writes, then verify that the receiver stores the retried
+   samples at their original timestamps. Repeat with the collector restarted
+   during the outage, using the same persistent WAL. The Prometheus v3.16.0
+   WAL watcher filters samples by its start time. Samples written before the
+   restart can remain in the WAL and still be missing at the receiver after
+   new writes succeed. [Prometheus v3.16.0 WAL watcher](https://github.com/prometheus/prometheus/blob/v3.16.0/tsdb/wlog/watcher.go#L548-L574)
+
+   After recovery, query the raw scrape timestamps stored by the receiver for
+   each expected target across the outage and restart. Compare them with
+   the expected scrape schedule and record any uncovered interval. A healthy
+   current target and an empty send queue can coexist with a historical gap.
+   If a report requires gap-free coverage, keep an independent source that
+   can backfill the missing samples or a redundant collector that retains them.
+
 4. Evaluate expected coverage at the retained backend, independent of target
    discovery. Match the full stable target identity. Distinguish a failed
    scrape (`up == 0`), a vanished target, an absent metric on a healthy target,
