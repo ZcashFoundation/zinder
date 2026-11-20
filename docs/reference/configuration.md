@@ -430,8 +430,9 @@ A runtime that calls another Zinder runtime, such as a reader dialing
 finish the name lookup, the TCP connect, and the TLS handshake and receive the
 peer's first HTTP/2 frame within that time. The dial sends no request, so a
 TLS-terminating proxy in front of the peer needs no route or credential for it.
-A reconnect that the open channel makes on its own gets the same 5 seconds for
-its name lookup, TCP connect, and TLS handshake together.
+A reconnect that the open channel makes on its own gets the same 5 seconds, from
+the name lookup until the peer's first HTTP/2 frame, so a call that waits on it
+fails within that time when the peer stays silent.
 
 | Caller | When a dial runs out of time |
 | --- | --- |

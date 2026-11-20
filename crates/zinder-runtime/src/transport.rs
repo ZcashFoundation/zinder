@@ -93,9 +93,10 @@ pub async fn connect_zinder_grpc(
 /// handshake, and the peer's first HTTP/2 frame. A peer that accepts the TCP
 /// connection or completes TLS but never speaks HTTP/2 therefore fails within
 /// it. The dial sends no request, so a proxy in front of the peer needs no
-/// route or credential for it. When the channel later reconnects on its own,
-/// the name lookup, the TCP connect, and the TLS handshake together stay
-/// within `connect_timeout`.
+/// route or credential for it. Every connection the channel later opens on
+/// its own fails when the peer has sent nothing within `connect_timeout` of
+/// its name lookup, so a call that needs that reconnect fails within the bound
+/// rather than waiting for the HTTP/2 keep-alive to time out.
 pub async fn connect_zinder_grpc_with_timeout(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
@@ -175,9 +176,9 @@ impl ZinderGrpcEndpoint {
     /// `https` endpoint runs TLS, trusting the certificates `tls_roots`
     /// returns, and an `http` endpoint stays plaintext HTTP/2.
     ///
-    /// `connect_timeout` bounds the name lookup, the TCP connect, and the TLS
-    /// handshake of every connection the channel opens, including the
-    /// reconnects tonic makes after the first dial.
+    /// `connect_timeout` bounds every connection the channel opens, including
+    /// the reconnects tonic makes after the first dial, from the name lookup
+    /// until the peer first sends bytes.
     fn parse(
         endpoint: &str,
         connect_timeout: Duration,
@@ -208,7 +209,7 @@ impl ZinderGrpcEndpoint {
         let tcp = tcp_connector(GaiResolver::new(), connect_timeout);
         Ok(Self {
             channel,
-            connector: ZinderGrpcConnector::new(target, tcp, tls),
+            connector: ZinderGrpcConnector::new(target, tcp, tls, connect_timeout),
         })
     }
 }
@@ -229,7 +230,9 @@ async fn dial(
         let channel = endpoint.channel.connect_with_connector(connector).await?;
         // The wait also ends when the peer closes the connection without a
         // frame. The dial is not hung then, and the channel reconnects on its
-        // next call.
+        // next call. A silent peer still ends the dial with `ConnectTimeout`,
+        // because the connection's silence deadline starts after this dial's
+        // timer.
         let _ = first_peer_bytes.await;
         Ok(channel)
     };

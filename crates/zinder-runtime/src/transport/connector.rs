@@ -2,7 +2,9 @@
 //!
 //! tonic runs it under the endpoint's connect timeout, so the name lookup,
 //! the TCP connect, and the TLS handshake of every connection, including the
-//! reconnects a channel makes on its own, share one bound. The connector runs
+//! reconnects a channel makes on its own, share one bound. A connection whose
+//! peer has sent nothing when that bound ends fails, so a call that waits on a
+//! reconnect to a silent peer fails within the bound too. The connector runs
 //! the TLS handshake itself so that it can see the first bytes the peer sends
 //! over HTTP/2, which tonic and hyper do not expose.
 
@@ -24,6 +26,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     sync::oneshot,
+    time::{Instant, Sleep, sleep_until},
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_util::either::Either;
@@ -49,17 +52,26 @@ pub(super) struct ZinderGrpcConnector {
     target: Uri,
     pub(super) tcp: TcpConnector,
     tls: Option<ZinderGrpcTls>,
+    /// How long a connection may take, from the name lookup until the peer
+    /// first sends bytes.
+    connect_timeout: Duration,
     /// Taken by the first connection, which reports when the peer first sends
     /// bytes.
     first_peer_bytes: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl ZinderGrpcConnector {
-    pub(super) fn new(target: Uri, tcp: TcpConnector, tls: Option<ZinderGrpcTls>) -> Self {
+    pub(super) fn new(
+        target: Uri,
+        tcp: TcpConnector,
+        tls: Option<ZinderGrpcTls>,
+        connect_timeout: Duration,
+    ) -> Self {
         Self {
             target,
             tcp,
             tls,
+            connect_timeout,
             first_peer_bytes: Arc::new(Mutex::new(None)),
         }
     }
@@ -90,6 +102,7 @@ impl Service<Uri> for ZinderGrpcConnector {
     /// of an `https` endpoint, because it only accepts an `https` URI when it
     /// runs the TLS handshake itself.
     fn call(&mut self, _channel_uri: Uri) -> Self::Future {
+        let silence_deadline = Instant::now() + self.connect_timeout;
         let connecting = self.tcp.call(self.target.clone());
         let tls = self.tls.clone();
         let report = self.first_peer_bytes.lock().take();
@@ -99,7 +112,11 @@ impl Service<Uri> for ZinderGrpcConnector {
                 None => Either::Left(tcp),
                 Some(tls) => Either::Right(tls.handshake(tcp).await?),
             };
-            Ok(TokioIo::new(FirstPeerBytes { stream, report }))
+            Ok(TokioIo::new(FirstPeerBytes {
+                stream,
+                silence_deadline: Some(Box::pin(sleep_until(silence_deadline))),
+                report,
+            }))
         })
     }
 }
@@ -176,9 +193,16 @@ fn tls_setup_error(error: &dyn std::error::Error) -> BearerTokenConnectError {
 #[error("the peer did not negotiate HTTP/2 during the TLS handshake")]
 struct Http2NotNegotiated;
 
-/// A stream that reports when the peer first sends bytes over it.
+#[derive(Debug, Error)]
+#[error("the peer sent nothing within the connect timeout")]
+struct PeerStayedSilent;
+
+/// A stream that reports when the peer first sends bytes over it, and fails
+/// once its silence deadline passes before the peer sent any.
 pub(super) struct FirstPeerBytes<S> {
     stream: S,
+    /// Cleared once the peer sends bytes.
+    silence_deadline: Option<Pin<Box<Sleep>>>,
     report: Option<oneshot::Sender<()>>,
 }
 
@@ -190,10 +214,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for FirstPeerBytes<S> {
     ) -> Poll<io::Result<()>> {
         let filled_before = buf.filled().len();
         let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
-        if buf.filled().len() > filled_before
-            && let Some(report) = self.report.take()
+        if buf.filled().len() > filled_before {
+            self.silence_deadline = None;
+            if let Some(report) = self.report.take() {
+                let _ = report.send(());
+            }
+        } else if polled.is_pending()
+            && let Some(silence_deadline) = self.silence_deadline.as_mut()
+            && silence_deadline.as_mut().poll(cx).is_ready()
         {
-            let _ = report.send(());
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                PeerStayedSilent,
+            )));
         }
         polled
     }

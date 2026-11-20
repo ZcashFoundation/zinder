@@ -480,6 +480,59 @@ async fn a_reconnect_after_the_first_dial_stays_within_the_connect_timeout() -> 
 }
 
 #[tokio::test]
+async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeout() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop_server, server_stopped) = oneshot::channel();
+    let server = spawn_health_server(listener, server_stopped);
+    let channel =
+        connect_zinder_grpc_with_timeout(&format!("http://{address}"), None, SHORT_CONNECT_TIMEOUT)
+            .await?;
+    let mut client = HealthClient::new(channel);
+    client.check(HealthCheckRequest::default()).await?;
+
+    // The peer goes away, and a peer that accepts connections but never
+    // answers takes its address, so the channel's reconnect completes the TCP
+    // connect and then hears nothing. The pause lets the channel see its
+    // first connection close.
+    let _ = stop_server.send(());
+    server.await??;
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    let silent_listener = socket.listen(16)?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    let silent_peer = tokio::spawn(async move {
+        while let Ok((stream, _)) = silent_listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            hold_silently(stream);
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started_at = Instant::now();
+    let reconnecting_call = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.check(HealthCheckRequest::default()),
+    )
+    .await;
+    let elapsed = started_at.elapsed();
+    silent_peer.abort();
+
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 1,
+        "the call must reconnect to the silent peer"
+    );
+    assert!(
+        matches!(reconnecting_call, Ok(Err(_))),
+        "a call whose reconnect hears nothing fails within the connect timeout, got {reconnecting_call:?}"
+    );
+    assert!(elapsed < SHORT_DIAL_CEILING, "reconnect took {elapsed:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_reconnect_bounds_a_name_lookup_that_never_answers() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
