@@ -719,6 +719,7 @@ async fn run_continuous_wallet_following(
                     continue;
                 }
             }
+            wallet.record_resource_gauges();
             following_readiness.caught_up(wallet_source.source_position().tip.height.value());
             if let Some(command) = control.next_command_or_poll(&cancel).await? {
                 apply_projector_control_command(

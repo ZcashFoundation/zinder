@@ -1,5 +1,0 @@
-kind: added
-body: Ingest and the projector expose RocksDB write pressure and per-level SST counts for the canonical and wallet stores. Query and lightwalletd report cache use and cumulative read statistics across serving generations.
-time: 2026-11-20T10:58:52.041047Z
-custom:
-    Bump: minor
