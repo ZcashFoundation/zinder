@@ -1008,9 +1008,9 @@ impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
         let reply = *self;
         Box::pin(async move {
             let revision = match reply {
-                WalletRevision::Reported(revision) => revision,
-                WalletRevision::Unavailable => return Err(Status::unimplemented("no ServerInfo")),
-                WalletRevision::Stalled => return std::future::pending().await,
+                Self::Reported(revision) => revision,
+                Self::Unavailable => return Err(Status::unimplemented("no ServerInfo")),
+                Self::Stalled => return std::future::pending().await,
             };
             Ok(Response::new(wallet::ServerInfoResponse {
                 info: Some(wallet::WalletServerInfo {

@@ -230,12 +230,12 @@ impl RemoteChainIndex {
         // Revisions 8 and 9 number retained transitions with their resulting epoch.
         // Only a synthesized reorg reports the current epoch at the pre-retention sequence.
         if envelope.event_sequence < envelope.chain_epoch.id.value() {
-            let info = tokio::time::timeout(CONNECT_TIMEOUT, self.wallet_server_info(client))
+            let descriptor = tokio::time::timeout(CONNECT_TIMEOUT, self.wallet_server_info(client))
                 .await
                 .map_err(|_| IndexerError::ServiceUnavailable {
                     reason: "wallet contract revision lookup timed out".to_owned(),
                 })??;
-            if info.contract_revision < 10 {
+            if descriptor.contract_revision < 10 {
                 return Err(IndexerError::ChainEventCursorExpired {
                     recovery: crate::ChainEventCursorRecovery::EarliestRetained,
                 });
