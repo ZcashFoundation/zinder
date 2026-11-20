@@ -54,6 +54,14 @@ const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
     0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
 ];
 
+const GENERATION_WAIT_METRIC: &str =
+    "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds";
+
+// Include the one-minute retention window and the additional released-read limit.
+const GENERATION_WAIT_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 90.0, 120.0,
+];
+
 /// Histogram bucket boundaries for the receive slots a public gRPC pool held
 /// once it admitted a request.
 ///
@@ -224,6 +232,10 @@ fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
             DURATION_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(
+            Matcher::Full(GENERATION_WAIT_METRIC.to_owned()),
+            GENERATION_WAIT_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
             Matcher::Full(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC.to_owned()),
             RECEIVE_SLOTS_HELD_BUCKETS,
         )
@@ -263,6 +275,22 @@ mod tests {
         MetricsInstallError, RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, drain_on_schedule,
         install_global_recorder, prometheus_builder, spawn_upkeep,
     };
+
+    #[test]
+    fn generation_wait_buckets_cover_retention_and_released_reads() -> Result<(), super::BuildError>
+    {
+        let recorder = prometheus_builder()?.build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(super::GENERATION_WAIT_METRIC).record(52.0);
+        });
+        let text = recorder.handle().render();
+        for (le, count) in [("50", 0), ("60", 1), ("90", 1)] {
+            assert!(text.lines().any(|line| line == format!(
+                "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds_bucket{{le=\"{le}\"}} {count}"
+            )));
+        }
+        Ok(())
+    }
 
     /// A histogram no bucket matcher names, so it renders as a summary.
     const UPKEEP_PROBE_METRIC: &str = "zinder_test_upkeep_probe";

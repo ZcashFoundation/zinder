@@ -33,6 +33,7 @@ use crate::{
     source_recovery::{
         SourceOutage, SourceRecoveryDecision, decide_recovery, default_recovery_backoff,
     },
+    subtree_verification::SubtreeVerificationObservation,
     writer::construction::{
         canonical_build_block, compact_block_commitments, first_differing_subtree_root,
         register_prohibited_read_metrics,
@@ -1567,10 +1568,18 @@ async fn confirm_live_subtree_roots<Source>(
 where
     Source: NodeSource,
 {
+    let mut observation = SubtreeVerificationObservation::new(
+        prepared
+            .subtree_root_ranges
+            .iter()
+            .map(|range| range.protocol),
+    );
     let source_roots = fetch_live_subtree_roots(source, request_timeout, cancel, prepared).await?;
     if first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots).is_none() {
+        observation.first_match();
         return Ok(prepared.derived_subtree_roots.clone());
     }
+    observation.begin_recheck();
     source_request(
         request_timeout,
         cancel,
@@ -1581,12 +1590,14 @@ where
     if let Some(differing_root) =
         first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots)
     {
+        observation.mismatch();
         return Err(CanonicalFollowError::SourceSubtreeRootMismatch {
             height: prepared.block_id.height,
             protocol: differing_root.protocol,
             subtree_index: differing_root.subtree_index,
         });
     }
+    observation.recheck_match();
     Ok(prepared.derived_subtree_roots.clone())
 }
 
@@ -1608,7 +1619,8 @@ where
             cancel,
             source.fetch_subtree_root_range(*range),
         )
-        .await?;
+        .await;
+        let response = response?;
         source_roots.extend(response.subtree_roots.into_iter().map(|root| {
             CanonicalBuildSubtreeRoot {
                 protocol: response.protocol,

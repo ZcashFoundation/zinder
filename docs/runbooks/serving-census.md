@@ -218,3 +218,54 @@ Before switching a daily report, reconcile an overlapping day with the
 archived process. Exercise a refused request during a short flap, a reader
 restart, a disappeared target, and a same-height replacement. Record the
 first deployment and time for which each new observation has coverage.
+
+### Replay one retained interval
+
+Use Python 3.10 or later with a JSONL log export containing a text tracing
+`message` on each line. Put the scope file beside the exports. Identify one
+writer, reader, and store lineage from deployment and process lifecycle
+records. Include the projector to measure its contribution. Times must share
+a clock with a known offset. Verify collection continuity independently of
+block arrivals. For example, this scope covers one hour of a query replica:
+
+```json
+{
+  "release": "candidate",
+  "deployment": "wallet-east",
+  "replica": "reader-1",
+  "store_lineage": "canonical-a",
+  "event_schema": "fence",
+  "coverage_start": "2026-11-20T10:00:00Z",
+  "coverage_end": "2026-11-20T11:00:00Z",
+  "coverage_gaps": [],
+  "writer": {"lifetime": "ingest-start-1", "log": "ingest.jsonl"},
+  "reader": {"lifetime": "query-start-1", "role": "query", "pid": 32, "log": "query.jsonl"},
+  "projector": {"lifetime": "projector-start-1", "pid": 31, "log": "projector.jsonl"}
+}
+```
+
+```sh
+python3 scripts/report-publication-delay.py scope.json \
+  --start 2026-11-20T10:05:00Z --end 2026-11-20T10:45:00Z \
+  --through 2026-11-20T11:00:00Z > publication-report.json
+```
+
+The commit window and lookahead have exclusive ends. `at_cutoff` and `as_of`
+show how many commits had resolved at each end. Inspect `missing_writer_ranges`,
+`unverified_transitions`, and `observations` alongside the latency distributions.
+Split input at known collection gaps and process boundaries. Set
+`ends_at_restart` to `true` for an interval closed by restart, and retain
+a separate scope for the next lifetime. A report cannot reconstruct
+publications lost in a reader log gap. For v0.17.0 archives use
+`event_schema: "v0.17.0"`, omit PIDs and projector, and independently verify
+that only one publisher contributed to the reader stream. That release
+requires an unambiguous matching fork discovery to establish replacement ancestry.
+
+`exact_fence_stage_seconds` measures exact commits with matching stage records.
+A projector event marks the verified wallet write. A selection marks the
+reader poll that found a usable slot and could begin preparing a candidate.
+The writer may advance during that work. Each stage has its own denominator.
+Projection and slot waits can overlap. `reader_waits` reports complete
+observed intervals and counts unpaired boundaries. For live monitoring,
+the generation wait histogram records elapsed time once per completed segment.
+A blocked refresh increments the attempt counter every time it checks.

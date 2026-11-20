@@ -1037,6 +1037,11 @@ impl WalletServingConvergence {
     }
 }
 
+struct GenerationWait {
+    reason: &'static str,
+    since: Instant,
+}
+
 /// Owns the bounded reader generations and their publication slot.
 pub struct WalletServingPairPublisher {
     config: WalletServingPairConfig,
@@ -1051,6 +1056,7 @@ pub struct WalletServingPairPublisher {
     /// lookups are too costly to repeat on every refresh.
     instance_memory_throttle: ResourceGaugeThrottle,
     published_generation: Option<usize>,
+    generation_wait: Option<GenerationWait>,
     /// Trailing references to the pairs released from the slot.
     ///
     /// Holding them makes the publisher the last owner of every released
@@ -1124,6 +1130,7 @@ impl WalletServingPairPublisher {
             store_resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             published_generation: None,
+            generation_wait: None,
             retired_pairs: Vec::with_capacity(SECONDARY_GENERATION_COUNT),
             writer_attestation,
             observed_lag_chain_epochs: 0,
@@ -1180,6 +1187,7 @@ impl WalletServingPairPublisher {
                 }
                 self.refresh_within_staleness_ceiling().await;
             }
+            self.end_generation_wait("interrupted");
             serving_runtime_drained.cancelled().await;
             tear_down_on_blocking_thread(self).await
         })
@@ -1196,6 +1204,9 @@ impl WalletServingPairPublisher {
 
     async fn refresh_and_record(&mut self) {
         let refreshed = self.refresh_once().await;
+        if refreshed.is_err() {
+            self.end_generation_wait("interrupted");
+        }
         self.record_resource_gauges().await;
         let Err(error) = refreshed else {
             metrics::counter!(
@@ -1247,19 +1258,37 @@ impl WalletServingPairPublisher {
         // when that fence has not moved.
         let replaces_active_pair = active_pair.has_missing_table_file();
         drop(active_pair);
-        match relation {
-            ActiveWriterRelation::Exact if !replaces_active_pair => return Ok(()),
-            ActiveWriterRelation::Refusing => return Ok(()),
-            ActiveWriterRelation::Exact | ActiveWriterRelation::Behind => {}
+        let needs_generation = match relation {
+            ActiveWriterRelation::Exact => replaces_active_pair,
+            ActiveWriterRelation::Refusing => false,
+            ActiveWriterRelation::Behind => true,
+        };
+        if !needs_generation {
+            self.end_generation_wait("interrupted");
+            return Ok(());
         }
 
         // Waiting keeps every retained pair pinnable for its whole window. A
         // later refresh publishes the writer's fence at that time, so the
         // blocks that arrive meanwhile share one publication.
+        let fence = writer_status
+            .fence
+            .as_ref()
+            .ok_or_else(|| writer_fence_divergence_error(CanonicalFenceDivergence::MissingFence))?;
         let Some(generation) = self.inactive_generation() else {
-            self.record_generation_wait();
+            self.record_generation_wait(fence);
             return Ok(());
         };
+        self.end_generation_wait("available");
+        tracing::info!(
+            target: "zinder::wallet_serving",
+            event = "wallet_serving_pair_publisher_generation_selected",
+            process_id = std::process::id(),
+            generation,
+            chain_epoch = fence.chain_epoch_id,
+            event_sequence = fence.event_sequence,
+            "selected a secondary generation for the observed writer fence"
+        );
         self.prepare_candidate(generation).await?;
         self.converge_and_publish(generation).await
     }
@@ -1359,7 +1388,7 @@ impl WalletServingPairPublisher {
     /// not ended, so the wait ends by the time that window does at the latest.
     /// `in_flight_requests` means only released pairs that requests still
     /// hold take the slots.
-    fn record_generation_wait(&self) {
+    fn record_generation_wait(&mut self, fence: &CanonicalWriterFence) {
         let reason = if self
             .serving_pair_slot
             .as_ref()
@@ -1374,6 +1403,48 @@ impl WalletServingPairPublisher {
             "reason" => reason
         )
         .increment(1);
+        if self
+            .generation_wait
+            .as_ref()
+            .is_some_and(|wait| wait.reason == reason)
+        {
+            return;
+        }
+        self.end_generation_wait("reason_changed");
+        self.generation_wait = Some(GenerationWait {
+            reason,
+            since: Instant::now(),
+        });
+        tracing::info!(
+            target: "zinder::wallet_serving",
+            event = "wallet_serving_pair_publisher_generation_wait_started",
+            process_id = std::process::id(),
+            reason,
+            chain_epoch = fence.chain_epoch_id,
+            event_sequence = fence.event_sequence,
+            "observed every inactive generation occupied"
+        );
+    }
+
+    fn end_generation_wait(&mut self, outcome: &'static str) {
+        if let Some(wait) = self.generation_wait.take() {
+            let elapsed = wait.since.elapsed();
+            metrics::histogram!(
+                "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds",
+                "reason" => wait.reason,
+                "outcome" => outcome
+            )
+            .record(elapsed);
+            tracing::info!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_publisher_generation_wait_ended",
+                process_id = std::process::id(),
+                reason = wait.reason,
+                outcome,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "finished observing a generation wait"
+            );
+        }
     }
 
     /// Stops serving pins on retained pairs replaced longer ago than the
@@ -6847,6 +6918,7 @@ mod tests {
             );
         }
         let last_published = slot.capture();
+        let mut wait_start = None;
         let mut coalesced = Vec::new();
         for block in 1..=2 {
             coalesced.push(primaries.append_block()?);
@@ -6855,6 +6927,11 @@ mod tests {
                 Arc::ptr_eq(&slot.capture(), &last_published),
                 "coalesced block {block} must wait for a slot"
             );
+            let wait = publisher
+                .generation_wait
+                .as_ref()
+                .ok_or("missing slot wait")?;
+            assert_eq!(*wait_start.get_or_insert(wait.since), wait.since);
             assert!(readiness.report().is_ready);
             assert_eq!(
                 query.visible_tip_block(Some(pinned.id)).await?.chain_epoch,
@@ -6872,6 +6949,12 @@ mod tests {
             generation_waits(&rendered_metrics.render(), "retention_window"),
             2
         );
+
+        primaries.control.set_available(false);
+        publisher.refresh_and_record().await;
+        assert!(publisher.generation_wait.is_none());
+        primaries.control.set_available(true);
+        publisher.refresh_once().await?;
 
         let replaced_at = slot
             .published
@@ -6892,6 +6975,16 @@ mod tests {
         ));
 
         publisher.refresh_once().await?;
+        assert!(publisher.generation_wait.is_none());
+        let elapsed = rendered_metrics.render();
+        for outcome in ["interrupted", "available"] {
+            let sample = elapsed.lines().find(|line| {
+                line.starts_with("zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds_count{")
+                    && line.contains("reason=\"retention_window\"")
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            }).ok_or("missing retention wait")?;
+            assert_eq!(sample.split_whitespace().last(), Some("1"));
+        }
         let latest = *coalesced.last().ok_or("the burst must coalesce blocks")?;
         assert_eq!(slot.capture().canonical_fence(), latest);
         assert_eq!(

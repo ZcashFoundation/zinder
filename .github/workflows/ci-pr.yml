@@ -198,6 +198,7 @@ jobs:
           scripts/test-container-resource-evidence.sh
           scripts/test-storage-benchmark-campaign-validator.sh
           scripts/test-observability-smoke-safety.sh
+          python3 scripts/test-publication-delay.py
           env \
             ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             ZINDER_BENCH_SOFTWARE_REVISION=ci \

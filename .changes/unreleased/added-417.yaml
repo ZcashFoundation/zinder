@@ -1,0 +1,6 @@
+kind: added
+body: Operators can replay retained events to measure when a wallet reader first published a committed block. Publisher slot waits and ingest subtree verification outcomes now report elapsed time, including time spent rechecking a disagreement.
+time: 2026-11-20T13:25:34.444028258Z
+custom:
+    Bump: minor
+    PR: "417"

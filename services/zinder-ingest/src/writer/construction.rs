@@ -38,6 +38,7 @@ use crate::{
         position_canonical_block, prepare_canonical_block,
     },
     chain_ingest::IngestError,
+    subtree_verification::SubtreeVerificationObservation,
     writer::raw_blob_policy_for_retention,
 };
 use source_fetch::{
@@ -468,6 +469,8 @@ where
         &config.network_upgrade_activations,
     )?;
     let required_ranges = builder.required_subtree_root_ranges()?;
+    let mut observation =
+        SubtreeVerificationObservation::new(required_ranges.iter().map(|range| range.protocol));
     let source_subtree_roots = fetch_source_subtree_roots(source, config, &required_ranges).await?;
     // The subtree-root reads name no block. The fixed tip is read by hash
     // after them, so a node that no longer holds it refuses that read.
@@ -486,6 +489,7 @@ where
     })?;
     builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
     if first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots).is_some() {
+        observation.begin_recheck();
         // A node that switched away and back between the two reads answered
         // the first one for another chain, so it is asked once more while it
         // holds the fixed tip.
@@ -494,12 +498,17 @@ where
         if let Some(differing_root) =
             first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots)
         {
+            observation.mismatch();
             return Err(CanonicalConstructionError::SourceSubtreeRootMismatch {
                 protocol: differing_root.protocol,
                 subtree_index: differing_root.subtree_index,
             });
         }
+        observation.recheck_match();
+    } else {
+        observation.first_match();
     }
+    drop(observation);
     let subtree_root_evidence = builder.load_subtree_roots(derived_subtree_roots)?;
     builder.record_resource_gauges();
     record_construction_phase("source_families", started_at);

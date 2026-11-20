@@ -138,6 +138,9 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_canonical_live_commit_seconds` | histogram | | Time to commit one appended block. |
 | `zinder_ingest_canonical_live_replacement_prepare_seconds` | histogram | | Time to prepare one replacement block. |
 | `zinder_ingest_canonical_live_replacement_commit_seconds` | histogram | | Time to commit one replacement. |
+| `zinder_ingest_subtree_root_verifications_total` | counter | `pool`, `outcome` | Source comparisons of nonempty subtree-root batches during construction and following. Each batch records one terminal outcome. |
+| `zinder_ingest_subtree_root_verification_duration_seconds` | histogram | `pool`, `outcome` | Elapsed time for the batch, including source reads, checkpoint confirmation when required, and any recheck. |
+| `zinder_ingest_subtree_root_recheck_duration_seconds` | histogram | `pool`, `outcome` | Portion of the batch duration spent after the first disagreement, including any interrupted recheck. |
 | `zinder_ingest_canonical_fork_discoveries_total` | counter | | Forks found and prepared for replacement. |
 | `zinder_ingest_canonical_fork_discovery_seconds` | histogram | | Time to find where a fork starts. |
 | `zinder_ingest_canonical_fork_trigger_block_reads_total` | counter | | Node block reads whose parent did not match the store's tip. |
@@ -164,6 +167,12 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_tree_state_verification_retries_total` | counter | | Steps the verification pass retried after a store error, such as a table file compacted away under its secondary. Rows a failed step checked first are counted in `rows_total` and not checked again. |
 | `zinder_explorer_views_admitted` | gauge | | 1 when ingest admitted its Explorer view store. |
 | `zinder_ingest_raw_blob_disabled_total` | counter | `table` | Rows stored without raw bytes under the raw-blob policy. |
+
+A single-pool batch names its shielded protocol. Batches covering multiple pools use `multiple`.
+A subtree batch records `first_match`, `recheck_match`, `mismatch` after a
+second disagreement, or `interrupted` when verification ends before a
+decision. Compare these observations with node
+request counts and durations by RPC method to measure transport work.
 
 ### Fresh construction
 
@@ -391,6 +400,7 @@ it as the writer commits.
 | `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs kept for one minute for pinned reads. |
 | `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` | gauge | | Retired pairs that requests still hold. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_total` | counter | `reason` | Refreshes that published nothing because every slot was taken: `retention_window` or `in_flight_requests`. |
+| `zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds` | histogram | `reason`, `outcome` | Elapsed time from the first blocked slot check to the first observation of a free slot (`available`), a different reason (`reason_changed`), or a failed or unnecessary refresh or shutdown (`interrupted`). Repeated checks with the same reason share one observation. |
 | `zinder_wallet_serving_pair_publisher_revoked_pairs_total` | counter | | Retired pairs whose reads were revoked after 30 seconds. |
 | `zinder_wallet_serving_missing_table_file_pairs_total` | counter | | Pairs replaced because compaction deleted a file they needed. |
 
@@ -562,6 +572,9 @@ information and query.
 | `canonical_secondary_behind_writer` | projector | A convergence attempt timed out. |
 | `wallet_serving_pair_publisher_published` | query, compatibility | A reader published a fence. The process ID, epoch, sequence, visible tip, and sequence digest identify the observation for the [census](../runbooks/serving-census.md#measure-publication-delay). |
 | `wallet_serving_pair_publisher_refresh_failed` | query, compatibility | A refresh failed. Routine lag logs at debug level. |
+| `wallet_projection_following_applied` | projector | The wallet primary applied and verified a retained-event transition at the logged fence. |
+| `wallet_serving_pair_publisher_generation_selected` | query, compatibility | A refresh selected an inactive generation after observing this writer fence. Preparation and convergence follow. |
+| `wallet_serving_pair_publisher_generation_wait_started`, `wallet_serving_pair_publisher_generation_wait_ended` | query, compatibility | The reader first observed occupied slots or ended the observation. A process exit can leave an open interval. |
 | `wallet_serving_pair_publisher_generation_opened` | query, compatibility | A pair slot was opened cold. |
 | `wallet_serving_pair_table_file_missing`, `wallet_serving_pair_reads_revoked` | query, compatibility | A pair lost a file to compaction, or its reads were revoked. |
 | `wallet_node_verified`, `wallet_node_verification_failed`, `wallet_node_excluded`, `wallet_node_reverification_inconclusive` | query, compatibility | Broadcast endpoint verification. |
