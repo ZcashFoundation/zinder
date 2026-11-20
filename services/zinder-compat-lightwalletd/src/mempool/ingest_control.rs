@@ -74,11 +74,23 @@ type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel
 const TIP_PUBLISHER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Mempool read surface backed by an `IngestControl` gRPC endpoint.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IngestControlMempoolSurface {
     endpoint: String,
     channel: LazyZinderGrpcChannel,
     request_timeout: Duration,
+}
+
+impl std::fmt::Debug for IngestControlMempoolSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The channel shows the endpoint with its credentials redacted, so the
+        // raw `endpoint` stays out.
+        formatter
+            .debug_struct("IngestControlMempoolSurface")
+            .field("channel", &self.channel)
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IngestControlMempoolSurface {
@@ -499,6 +511,25 @@ mod tests {
     use zinder_runtime::DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT;
 
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_endpoint_credentials() -> Result<(), Box<dyn std::error::Error>> {
+        let surface = IngestControlMempoolSurface::new(
+            "https://reader:hunter2@ingest.internal:9100/?token=s3cret".to_owned(),
+        )
+        .with_bearer_token(<BearerToken as std::str::FromStr>::from_str(
+            "bearer-s3cret",
+        )?);
+
+        let debug = format!("{surface:?}");
+
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+        assert!(debug.contains("ingest.internal:9100"), "{debug}");
+        Ok(())
+    }
 
     /// A writer that accepts TCP but never answers HTTP/2 must not hold a
     /// mempool lookup past the request bound.
