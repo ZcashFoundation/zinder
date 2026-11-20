@@ -50,7 +50,7 @@ fn export(args: &Args, path: &Path) -> eyre::Result<archive::ProjectionReport> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     let report = {
         let mut writer = BufWriter::new(file.as_file_mut());
