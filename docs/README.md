@@ -9,6 +9,9 @@ what it answers and who it is for.
   to enable for it.
 - [Indexer comparison](reference/indexer-comparison.md): Zinder beside Zebra,
   Zakura, ztreamer, Zingod, and Go lightwalletd, feature by feature.
+- [Performance](reference/performance.md): measured wallet-serving load,
+  against the previous release and Go lightwalletd, and the tree-state
+  checkpoint pass's cost.
 - [How Zinder works](architecture/overview.md): the processes, the stores, and
   how a block becomes a wallet response.
 

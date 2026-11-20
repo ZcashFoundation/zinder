@@ -32,13 +32,16 @@ longer without needing a special case.
 | Canopy | `1046400..1687103` | First halving and development fund |
 | NU5 | `1687104..2726399` | Transaction v5, Orchard, Unified Addresses, and non-malleable transaction IDs: the largest parser and compact-block change |
 | NU6 | `2726400..3146399` | Funding and lockbox rules; no new transaction version |
-| NU6.1 | from `3146400` | Further funding and lockbox rules; no new transaction version |
+| NU6.1 | `3146400..3364599` | Further funding and lockbox rules; no new transaction version |
+| NU6.2 | `3364600..3428142` | A rule on Orchard proof sizes; no new transaction version |
+| NU6.3 | `3428143..3543404` | Version 6 transactions and the Ironwood shielded pool, so compact blocks and tree states carry a third shielded protocol |
+| NU7 | from `3543405` | Target spacing drops to 25 seconds, so blocks arrive three times as often. A fixed block count, such as the reorg window or the 100-block checkpoint stride, now covers a third of the time it did. |
 
-Later upgrades, including NU6.3 (Ironwood, with version 6 transactions and the
-Ironwood shielded pool) and NU7, take their activation heights from the node.
-Run `getblockchaininfo` against your node to see them.
+Zinder takes every activation height from the node, not from this table. Run
+`getblockchaininfo` against your node to see them.
 [ZIP 204](https://zips.z.cash/zip-0204) lists the published heights through
-NU6.1.
+NU6.1. The NU6.2, NU6.3, and NU7 heights above are the ones `zebra-chain`
+16.0.0 uses, the release Zinder builds with.
 
 ## Workload bands
 
@@ -66,6 +69,8 @@ another:
 | `1702296`, `1708048`, `1723244` | Start of post-NU5 load and two heavy blocks |
 | `2175692` | Load back to pre-NU5 levels |
 | `2726400`, `3146400` | NU6 and NU6.1 activations |
+| `3428143` | NU6.3 activation: version 6 transactions and Ironwood |
+| `3543405` | NU7 activation: 25-second blocks |
 
 `zinder-bench rocksdb-canonical-fixture-replay` replays a captured range
 through the production construction pipeline into a fresh store and reports
