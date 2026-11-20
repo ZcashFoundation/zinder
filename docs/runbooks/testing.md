@@ -1208,7 +1208,22 @@ scripts/test-regtest-fixture.py --images /tmp/fixture-images.json \
   --revision 830b426060169f5b2e94d84ff0f134bc1ad96004 --port-base 43100
 ```
 
-#### Gate a real wallet lifecycle
+## Gate a real wallet lifecycle
+
+Start the disposable fixture for the wallet's activation schedule, then use the
+client's entrypoint with the fixture's immutable `ready.initial.json`. Allocate
+a new wallet and output directory on each run.
+
+| Wallet engine | Reproduction entrypoint |
+| --- | --- |
+| Zingo and standalone Zkool | [Build the pinned engine and generate the case manifest](../../scripts/wallet-clients/README.md). Run each Zkool internal-address setting as its own case. |
+| Vizor | [Build the tagged Rust engine and run the funded wallet case](../../scripts/wallet-clients/vizor.md). |
+| Cake Wallet | [Build and run the exact Zcash engine pinned by the app](../../scripts/wallet-clients/cake-regtest.md). |
+| zcash-devtool | Use [run-devtool-regtest.py](../../scripts/wallet-clients/run-devtool-regtest.py) with the Regtest-enabled CLI, its source revision and binary SHA-256, the readiness receipt, and a fresh output directory. |
+
+Zallet and Zally supply native WalletQuery adapters from their own repositories.
+For Zallet, retain canonical full blocks during ingest and configure the query
+service with the same retention policy before starting the wallet.
 
 Run a pinned wallet adapter against an isolated, funded fixture:
 
