@@ -264,6 +264,13 @@ pub enum BearerTokenConnectError {
     /// outcome, because the runtime running it shut down or the dial panicked.
     #[error("zinder gRPC dial ended without an outcome")]
     DialAbandoned,
+    /// The peer did not open the connection with an HTTP/2 `SETTINGS` frame,
+    /// so it does not serve HTTP/2.
+    #[error("zinder gRPC peer does not speak HTTP/2: {reason}")]
+    PeerNotHttp2 {
+        /// What the peer sent instead.
+        reason: String,
+    },
     /// TLS for an `https` endpoint could not be set up.
     #[error("zinder gRPC TLS setup failed: {reason}")]
     TlsSetup {

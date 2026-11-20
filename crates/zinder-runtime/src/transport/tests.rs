@@ -23,7 +23,7 @@ use hyper_util::{
 use parking_lot::Mutex;
 use rustls::RootCertStore;
 use tokio::{
-    io::AsyncReadExt as _,
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -53,6 +53,16 @@ const SHORT_DIAL_CEILING: Duration = Duration::from_secs(2);
 
 /// Path of the gRPC health check.
 const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
+
+/// The first four bytes of a `SETTINGS` frame header.
+const PARTIAL_SETTINGS_HEADER: &[u8] = &[0, 0, 6, 0x4];
+
+/// A `SETTINGS` frame header announcing one setting, followed by the first two
+/// bytes of that setting.
+const PARTIAL_SETTINGS_PAYLOAD: &[u8] = &[0, 0, 6, 0x4, 0, 0, 0, 0, 0, 0, 0x3];
+
+/// A complete HTTP/2 `PING` frame.
+const PING_FRAME: &[u8] = &[0, 0, 8, 0x6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 /// Trusts no certificate, for dials that never finish a TLS handshake.
 #[allow(
@@ -93,18 +103,32 @@ fn is_connect_timeout<T>(
 
 /// Accepts every connection and holds it open without sending a byte.
 fn spawn_silent_peer(listener: TcpListener) -> JoinHandle<()> {
+    spawn_stalling_peer(listener, &[])
+}
+
+/// Accepts every connection, sends `opening` on it, and then holds it open
+/// without sending more.
+fn spawn_stalling_peer(listener: TcpListener, opening: &'static [u8]) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            hold_silently(stream);
+            hold_after_sending(stream, opening);
         }
     })
 }
 
 /// Reads and discards what the client sends, answering nothing, until the
 /// client closes the connection.
-fn hold_silently(mut stream: TcpStream) {
+fn hold_silently(stream: TcpStream) {
+    hold_after_sending(stream, &[]);
+}
+
+/// Sends `opening`, then reads and discards what the client sends without
+/// answering, until the client closes the connection.
+fn hold_after_sending(mut stream: TcpStream, opening: &'static [u8]) {
     tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+        if stream.write_all(opening).await.is_ok() {
+            let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+        }
     });
 }
 
@@ -182,11 +206,12 @@ async fn a_dial_gives_up_within_the_default_bound() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_plaintext_peer_that_never_speaks_http2_fails_the_dial() -> TestResult {
+/// Dials a plaintext peer that sends `opening` on every connection and then
+/// stalls, and checks that the dial times out within the connect timeout.
+async fn assert_dial_to_stalling_peer_times_out(opening: &'static [u8]) -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
-    let peer = spawn_silent_peer(listener);
+    let peer = spawn_stalling_peer(listener, opening);
 
     let started_at = Instant::now();
     let outcome = tokio::time::timeout(
@@ -199,9 +224,44 @@ async fn a_plaintext_peer_that_never_speaks_http2_fails_the_dial() -> TestResult
 
     assert!(
         is_connect_timeout(&outcome, SHORT_CONNECT_TIMEOUT),
-        "a peer that never sends HTTP/2 frames must time the dial out, got {outcome:?}"
+        "a peer that sends {opening:?} and stalls must time the dial out, got {outcome:?}"
     );
     assert!(elapsed < SHORT_DIAL_CEILING, "dial took {elapsed:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_plaintext_peer_that_never_speaks_http2_fails_the_dial() -> TestResult {
+    assert_dial_to_stalling_peer_times_out(&[]).await
+}
+
+#[tokio::test]
+async fn a_peer_that_stalls_within_the_settings_header_fails_the_dial() -> TestResult {
+    assert_dial_to_stalling_peer_times_out(PARTIAL_SETTINGS_HEADER).await
+}
+
+#[tokio::test]
+async fn a_peer_that_stalls_within_the_settings_payload_fails_the_dial() -> TestResult {
+    assert_dial_to_stalling_peer_times_out(PARTIAL_SETTINGS_PAYLOAD).await
+}
+
+#[tokio::test]
+async fn a_peer_whose_first_frame_is_not_settings_fails_the_dial() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let peer = spawn_stalling_peer(listener, PING_FRAME);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_zinder_grpc_with_timeout(&endpoint, None, SHORT_CONNECT_TIMEOUT),
+    )
+    .await?;
+    peer.abort();
+
+    assert!(
+        matches!(outcome, Err(BearerTokenConnectError::PeerNotHttp2 { .. })),
+        "a peer that opens with a PING frame must fail the dial, got {outcome:?}"
+    );
     Ok(())
 }
 
@@ -505,8 +565,10 @@ async fn a_reconnect_after_the_first_dial_stays_within_the_connect_timeout() -> 
     Ok(())
 }
 
-#[tokio::test]
-async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeout() -> TestResult {
+/// Serves one call, then puts a peer at the same address that sends
+/// `opening` on every connection and then stalls, and checks that a call that
+/// must reconnect fails within the connect timeout.
+async fn assert_reconnect_to_stalling_peer_fails(opening: &'static [u8]) -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (stop_server, server_stopped) = oneshot::channel();
@@ -517,10 +579,10 @@ async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeou
     let mut client = HealthClient::new(channel);
     client.check(HealthCheckRequest::default()).await?;
 
-    // The peer goes away, and a peer that accepts connections but never
-    // answers takes its address, so the channel's reconnect completes the TCP
-    // connect and then hears nothing. The pause lets the channel see its
-    // first connection close.
+    // The peer goes away, and a peer that accepts connections and then
+    // stalls takes its address, so the channel's reconnect completes the TCP
+    // connect and then hears no whole SETTINGS frame. The pause lets the
+    // channel see its first connection close.
     let _ = stop_server.send(());
     server.await??;
     let socket = TcpSocket::new_v4()?;
@@ -532,7 +594,7 @@ async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeou
     let silent_peer = tokio::spawn(async move {
         while let Ok((stream, _)) = silent_listener.accept().await {
             counted.fetch_add(1, Ordering::SeqCst);
-            hold_silently(stream);
+            hold_after_sending(stream, opening);
         }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -548,14 +610,31 @@ async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeou
 
     assert!(
         accepted.load(Ordering::SeqCst) >= 1,
-        "the call must reconnect to the silent peer"
+        "the call must reconnect to the stalling peer"
     );
     assert!(
         matches!(reconnecting_call, Ok(Err(_))),
-        "a call whose reconnect hears nothing fails within the connect timeout, got {reconnecting_call:?}"
+        "a call whose reconnect hears {opening:?} and then nothing fails within the connect timeout, got {reconnecting_call:?}"
     );
     assert!(elapsed < SHORT_DIAL_CEILING, "reconnect took {elapsed:?}");
     Ok(())
+}
+
+#[tokio::test]
+async fn a_reconnect_to_a_peer_that_stays_silent_fails_within_the_connect_timeout() -> TestResult {
+    assert_reconnect_to_stalling_peer_fails(&[]).await
+}
+
+#[tokio::test]
+async fn a_reconnect_to_a_peer_that_stalls_within_the_settings_header_fails_within_the_connect_timeout()
+-> TestResult {
+    assert_reconnect_to_stalling_peer_fails(PARTIAL_SETTINGS_HEADER).await
+}
+
+#[tokio::test]
+async fn a_reconnect_to_a_peer_that_stalls_within_the_settings_payload_fails_within_the_connect_timeout()
+-> TestResult {
+    assert_reconnect_to_stalling_peer_fails(PARTIAL_SETTINGS_PAYLOAD).await
 }
 
 #[tokio::test]

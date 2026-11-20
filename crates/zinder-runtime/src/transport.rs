@@ -59,7 +59,7 @@ const ZINDER_GRPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const ZINDER_GRPC_TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Default time a dial to another Zinder service may take, from the name
-/// lookup until the peer sends its first HTTP/2 frame.
+/// lookup until the peer's initial HTTP/2 `SETTINGS` frame has arrived.
 ///
 /// Intra-Zinder peers share a host or a network, so a healthy dial completes
 /// in milliseconds; five seconds leaves room for a loaded peer while keeping
@@ -90,12 +90,14 @@ pub async fn connect_zinder_grpc(
 /// after `connect_timeout` with [`BearerTokenConnectError::ConnectTimeout`].
 ///
 /// The bound covers the whole dial: the name lookup, the TCP connect, the TLS
-/// handshake, and the peer's first HTTP/2 frame. A peer that accepts the TCP
-/// connection or completes TLS but never speaks HTTP/2 therefore fails within
-/// it. The dial sends no request, so a proxy in front of the peer needs no
-/// route or credential for it. Every connection the channel later opens on
-/// its own fails when the peer has sent nothing within `connect_timeout` of
-/// its name lookup, so a call that needs that reconnect fails within the bound
+/// handshake, and the peer's whole initial HTTP/2 `SETTINGS` frame. A peer
+/// that accepts the TCP connection or completes TLS but never finishes that
+/// frame therefore fails within it, and a peer that opens with any other frame
+/// fails at once with [`BearerTokenConnectError::PeerNotHttp2`]. The dial
+/// sends no request, so a proxy in front of the peer needs no route or
+/// credential for it. Every connection the channel later opens on its own
+/// fails when the peer has not sent that frame within `connect_timeout` of its
+/// name lookup, so a call that needs that reconnect fails within the bound
 /// rather than waiting for the HTTP/2 keep-alive to time out.
 pub async fn connect_zinder_grpc_with_timeout(
     endpoint: &str,
@@ -113,9 +115,9 @@ pub async fn connect_zinder_grpc_with_timeout(
 /// or `cancel` fires.
 ///
 /// A peer that is slow to come up delays startup instead of ending it. Every
-/// other error returns at once: an invalid endpoint, a refused connection, or
-/// a failed TLS handshake ends startup. Returns `Ok(None)` when `cancel` fires
-/// first.
+/// other error returns at once: an invalid endpoint, a refused connection, a
+/// failed TLS handshake, or a peer that does not speak HTTP/2 ends startup.
+/// Returns `Ok(None)` when `cancel` fires first.
 pub async fn connect_zinder_grpc_at_startup(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
@@ -178,7 +180,7 @@ impl ZinderGrpcEndpoint {
     ///
     /// `connect_timeout` bounds every connection the channel opens, including
     /// the reconnects tonic makes after the first dial, from the name lookup
-    /// until the peer first sends bytes.
+    /// until the peer's initial `SETTINGS` frame has arrived.
     fn parse(
         endpoint: &str,
         connect_timeout: Duration,
@@ -214,8 +216,8 @@ impl ZinderGrpcEndpoint {
     }
 }
 
-/// Connects `endpoint` and waits for the peer's first HTTP/2 frame, all
-/// within `connect_timeout`.
+/// Connects `endpoint` and waits for the peer's initial HTTP/2 `SETTINGS`
+/// frame, all within `connect_timeout`.
 ///
 /// The HTTP/2 client handshake completes once the client has sent its
 /// preface, so a connected channel alone does not prove the peer is serving.
@@ -225,16 +227,24 @@ async fn dial(
     endpoint: &ZinderGrpcEndpoint,
     connect_timeout: Duration,
 ) -> Result<Channel, BearerTokenConnectError> {
-    let (connector, first_peer_bytes) = endpoint.connector.reporting_first_peer_bytes();
+    let (connector, peer_preface) = endpoint.connector.reporting_peer_preface();
     let connect_and_wait = async {
-        let channel = endpoint.channel.connect_with_connector(connector).await?;
-        // The wait also ends when the peer closes the connection without a
-        // frame. The dial is not hung then, and the channel reconnects on its
-        // next call. A silent peer still ends the dial with `ConnectTimeout`,
-        // because the connection's silence deadline starts after this dial's
-        // timer.
-        let _ = first_peer_bytes.await;
-        Ok(channel)
+        let channel = endpoint
+            .channel
+            .connect_with_connector(connector)
+            .await
+            .map_err(BearerTokenConnectError::Transport)?;
+        match peer_preface.await {
+            Ok(Err(invalid)) => Err(BearerTokenConnectError::PeerNotHttp2 {
+                reason: invalid.to_string(),
+            }),
+            // The wait also ends when the peer closes the connection before
+            // the frame is complete. The dial is not hung then, and the
+            // channel reconnects on its next call. A stalled peer still ends
+            // the dial with `ConnectTimeout`, because the connection's
+            // deadline starts after this dial's timer.
+            Ok(Ok(())) | Err(_) => Ok(channel),
+        }
     };
     tokio::select! {
         // Polled first: the endpoint's own connect bound equals this one and
@@ -244,7 +254,7 @@ async fn dial(
         () = tokio::time::sleep(connect_timeout) => {
             Err(BearerTokenConnectError::ConnectTimeout { connect_timeout })
         }
-        outcome = connect_and_wait => outcome.map_err(BearerTokenConnectError::Transport),
+        outcome = connect_and_wait => outcome,
     }
 }
 
