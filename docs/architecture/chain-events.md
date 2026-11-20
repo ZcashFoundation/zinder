@@ -26,9 +26,9 @@ Each message on the stream is a `ChainEventEnvelope`:
 
 The two event types:
 
-- **`ChainCommitted`** adds a block range on top of the previous chain. Ingest
-  produces one for the store's first publication, covering every stored block,
-  and one for each appended block.
+- **`ChainCommitted`** reports the block range that joined the selected
+  family. On the Visible stream, the first publication covers every stored
+  block. Each subsequent append reports the new block.
 - **`ChainReorged`** carries a `reverted` range and a `committed` range that
   start at the same height. The blocks in `reverted` are no longer on the
   chain. The blocks in `committed` replace them and may extend past them.
@@ -61,13 +61,25 @@ your application's policy, at any depth between those two tips.
 
 - `CHAIN_EVENT_STREAM_FAMILY_VISIBLE`, the default, carries every commit and
   every reorg. A client on this family must handle reorgs.
-- `CHAIN_EVENT_STREAM_FAMILY_SETTLED` carries only `ChainCommitted` events
-  after which the visible tip is at or below the settled tip. It never carries
+- `CHAIN_EVENT_STREAM_FAMILY_SETTLED` delivers one `ChainCommitted` whenever
+  the settled tip advances. Its range starts one block above the previous
+  settled tip and ends at the new settled tip, inclusive. The first
+  publication starts at the first stored block. For example, if the settled
+  tip moves from 40 to 42 while the visible tip reaches 45, the event covers
+  blocks 41 and 42. Its cursor points to block 42. Transitions that leave the
+  settled tip in place produce no Settled event. This family never delivers
   a reorg.
 
 A cursor records its family. With `after_cursor`, the cursor's family applies.
 The request's `family` must be left at its default or match the cursor, or the
 request fails with `INVALID_ARGUMENT`.
+
+For Settled subscriptions, use a server advertising `contract_revision` 12 or
+later. It sends `zinder-chain-event-family: settled` in the initial gRPC
+metadata whenever the resolved family is Settled, including on cursor resume.
+Earlier servers can stay silent as blocks settle. Rust SDK consumers also
+need a client that supports revision 12. Earlier clients reject a committed
+range that ends below the visible tip.
 
 ## Resume with a cursor
 
@@ -82,7 +94,7 @@ last cursor you stored.
 The server resumes as follows:
 
 - When the next unseen event is retained, the stream replays from that
-  sequence, including any retained reorgs.
+  sequence in the cursor's family. Visible streams include retained reorgs.
 - When events are missing and a visible cursor's block has been replaced,
   the server can send one synthesized `ChainReorged`. Its `reverted` range
   starts just above a verified common block and ends at the cursor's tip.

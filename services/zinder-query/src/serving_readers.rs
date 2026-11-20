@@ -220,9 +220,10 @@ pub trait CanonicalReader: Send + Sync + 'static {
     /// `from_cursor`, or from the oldest retained event of `family`.
     ///
     /// A cursor records its family, which applies to the events after it
-    /// whatever `family` names. [`ChainEventStreamFamily::Settled`] carries
-    /// only a `ChainCommitted` event after which the visible tip is at or
-    /// below the settled tip.
+    /// whatever `family` names. [`ChainEventStreamFamily::Settled`] emits a
+    /// `ChainCommitted` for the baseline's retained settled blocks and for
+    /// each subsequent range of newly settled blocks. Each event keeps the
+    /// sequence and epoch of the canonical transition that settled the range.
     async fn wallet_chain_event_history(
         &self,
         from_cursor: Option<StreamCursorTokenV1>,

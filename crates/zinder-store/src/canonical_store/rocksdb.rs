@@ -1017,9 +1017,8 @@ pub(super) fn canonical_column_family_descriptors(
 /// checkpoints.
 ///
 /// They match [`canonical_column_family_descriptors`] except that the
-/// tree-state checkpoint family reads through no block cache, so every read
-/// of a checkpoint takes its blocks from the table file and checks their
-/// checksums.
+/// checkpoint and block-header families bypass the block cache so reads
+/// recheck the checksum of each data block fetched from their table files.
 pub(super) fn canonical_verification_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
@@ -1028,7 +1027,10 @@ pub(super) fn canonical_verification_column_family_descriptors(
         .into_iter()
         .map(|name| {
             let mut options = canonical_data_options(block_cache, resource_budget);
-            if name == TREE_STATE_CHECKPOINT_COLUMN_FAMILY {
+            if matches!(
+                name,
+                TREE_STATE_CHECKPOINT_COLUMN_FAMILY | BLOCK_HEADER_COLUMN_FAMILY
+            ) {
                 options.set_block_based_table_factory(&build_uncached_block_based_table_factory());
             }
             ColumnFamilyDescriptor::new(name, options)

@@ -164,7 +164,7 @@ data may be corrupt.
 | Reason | Meaning |
 | --- | --- |
 | `NODE_UNAVAILABLE` | The node is unreachable or failing. A broadcast also returns it, without sending, until one configured endpoint passes first-contact verification and whenever every verified endpoint is unreachable. The writer's mempool returns it while it hydrates from the node, and query forwards that for mempool calls. |
-| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. The writer also returns it for a control request that its store owner did not answer within 60 seconds or stopped before answering. Native query forwards it for mempool calls when the owner has stopped. Native query gives up on ingest control after 15 seconds, so a stalled owner reaches its callers as `UPSTREAM_UNREACHABLE`. |
+| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. Native query forwards this reason for mempool reads and stream establishment when the writer’s store owner stalls or stops. The writer reserves up to one second of the caller’s deadline to return the refusal. Reads without a deadline and owner writes retain the 60-second bound. |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint, such as the explorer's wallet query endpoint or native query's ingest control, is temporarily unreachable. |
 | `SERVICE_NOT_READY` | The process is alive but not ready. Metadata: `readiness_cause`, a label from [Readiness](readiness.md#readiness-causes). With `canonical_store_damaged`, retrying does not succeed until an operator rebuilds the canonical store. |
 | `NO_VISIBLE_CHAIN_EPOCH` | No chain epoch has been committed yet. |

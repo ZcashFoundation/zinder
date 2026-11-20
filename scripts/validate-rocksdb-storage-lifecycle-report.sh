@@ -344,7 +344,7 @@ jq -e \
           "wallet_value_encoding_version"
         ])
       and .canonical_store_identity == "canonical"
-      and .canonical_store_schema_version == 4
+      and .canonical_store_schema_version == 7
       and .wallet_store_identity == "wallet"
       and .wallet_store_schema_version == 1
       and .wallet_projection_schema_version == 1

@@ -1800,13 +1800,19 @@ impl BroadcastRejectionReason {
         }
     }
 }
-/// Chain-event stream family. Visible receives every chain event. Settled
-/// receives only non-reorg commits entirely at or below the settled tip.
+/// Selects which block ranges a ChainEvents subscription delivers.
 #[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ChainEventStreamFamily {
+    /// Every visible canonical transition, including reorgs.
     Visible = 0,
+    /// One ChainCommitted event for each advance of the settled tip.
+    ///
+    /// The inclusive range starts just above the previous settled tip (at the
+    /// first stored height for the baseline) and ends at the new settled tip.
+    /// The cursor is anchored at that settled block. Settled never receives
+    /// ChainReorged.
     Settled = 1,
 }
 impl ChainEventStreamFamily {
@@ -2337,7 +2343,9 @@ pub mod wallet_query_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Stream replayable chain events.
+        /// Stream replayable chain events. From contract revision 12, a subscription
+        /// whose resolved family is Settled carries initial gRPC metadata
+        /// `zinder-chain-event-family: settled`, including when resuming from a cursor.
         pub async fn chain_events(
             &mut self,
             request: impl tonic::IntoRequest<super::ChainEventsRequest>,
@@ -2774,7 +2782,9 @@ pub mod wallet_query_server {
             >
             + std::marker::Send
             + 'static;
-        /// Stream replayable chain events.
+        /// Stream replayable chain events. From contract revision 12, a subscription
+        /// whose resolved family is Settled carries initial gRPC metadata
+        /// `zinder-chain-event-family: settled`, including when resuming from a cursor.
         async fn chain_events(
             &self,
             request: tonic::Request<super::ChainEventsRequest>,

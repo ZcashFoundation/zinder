@@ -181,6 +181,22 @@ pub fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
     request
 }
 
+/// Requests a wallet mempool event stream with a bounded wait for response
+/// headers and an unrestricted subscription lifetime.
+#[must_use]
+pub fn wallet_mempool_events_request(
+    message: wallet::MempoolEventsRequest,
+) -> Request<wallet::MempoolEventsRequest> {
+    let mut request = Request::new(message);
+    let millis =
+        u64::try_from(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    request.metadata_mut().insert(
+        zinder_proto::MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER,
+        millis.into(),
+    );
+    request
+}
+
 #[cfg(test)]
 fn validate_health_observation(
     writer_status: &zinder_proto::v1::ingest::WriterStatusResponse,

@@ -16,8 +16,8 @@
 //! certified while the owner hydrates its replacement, so the gate also
 //! admits a different certified tip for a bounded grace after the two first
 //! disagree. The certification is withdrawn only when no
-//! generation can serve: before the first snapshot completes, and while the
-//! index is rebuilt after a source failure.
+//! generation can serve: before the first snapshot completes, after its replacement
+//! exceeds the staging grace, and during a rebuild after a source failure.
 //!
 //! With fallback node endpoints, each certification also records the active
 //! endpoint the owner observed before it last found its source stream open.
@@ -33,7 +33,7 @@
 //! zinder_source::MempoolSourceEvent::InitialSnapshotComplete
 
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -57,6 +57,7 @@ pub(crate) const MEMPOOL_TIP_TRANSITION_GRACE: Duration = Duration::from_secs(30
 struct SourceCertification {
     source_tip: BlockId,
     endpoint: ObservedNodeEndpoint,
+    replacement_deadline: OnceLock<tokio::time::Instant>,
 }
 
 /// The active node endpoint as the mempool owner observed it.
@@ -75,10 +76,19 @@ pub struct ObservedNodeEndpoint {
 impl ObservedNodeEndpoint {
     /// Returns whether no switch happened since the observation. A closed
     /// switch channel fails closed.
-    fn is_active(&self) -> bool {
+    pub(super) fn is_active(&self) -> bool {
         self.switches
             .as_ref()
             .is_none_or(|switches| matches!(switches.has_changed(), Ok(false)))
+    }
+
+    pub(super) async fn deactivated(mut self) {
+        match self.switches.as_mut() {
+            Some(switches) => {
+                let _changed_or_closed = switches.changed().await;
+            }
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -106,7 +116,13 @@ impl MempoolReadyGate {
         self.certified_source_tip
             .borrow()
             .as_ref()
-            .filter(|certification| certification.endpoint.is_active())
+            .filter(|certification| {
+                certification.endpoint.is_active()
+                    && certification
+                        .replacement_deadline
+                        .get()
+                        .is_none_or(|deadline| tokio::time::Instant::now() < *deadline)
+            })
             .map(|certification| certification.source_tip)
     }
 
@@ -200,7 +216,15 @@ impl MempoolReadySignal {
             .send_replace(Some(SourceCertification {
                 source_tip,
                 endpoint: observed,
+                replacement_deadline: OnceLock::new(),
             }));
+    }
+
+    /// Shares the owner's deadline without waking the follower on ordinary tip changes.
+    pub(super) fn stage_replacement_until(&self, deadline: tokio::time::Instant) {
+        if let Some(certification) = self.certified_source_tip.borrow().as_ref() {
+            let _first_deadline = certification.replacement_deadline.set(deadline);
+        }
     }
 
     /// Withdraws the gate while no source generation can serve.
@@ -269,6 +293,21 @@ mod tests {
             BlockHeight::new(u32::from(tag)),
             BlockHash::from_bytes([tag; 32]),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_expires_even_before_the_owner_publishes_its_withdrawal() {
+        let (signal, gate) = mempool_ready_channel();
+        let tip = source_tip(1);
+        signal.certify_source_tip(tip, signal.observe_node_endpoint());
+        let deadline = tokio::time::Instant::now() + MEMPOOL_TIP_TRANSITION_GRACE;
+        signal.stage_replacement_until(deadline);
+        signal.stage_replacement_until(deadline + MEMPOOL_TIP_TRANSITION_GRACE);
+        assert!(gate.admits_canonical_tip(tip));
+        tokio::time::advance(MEMPOOL_TIP_TRANSITION_GRACE).await;
+        assert!(!gate.admits_canonical_tip(tip));
+        signal.certify_source_tip(tip, signal.observe_node_endpoint());
+        assert!(gate.admits_canonical_tip(tip));
     }
 
     #[test]

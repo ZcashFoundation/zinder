@@ -252,9 +252,11 @@ impl MempoolSurface for IngestControlMempoolSurface {
             .bounded("mempool_events", async {
                 let mut client = self.ingest_control_client().await?;
                 client
-                    .mempool_events(wallet::MempoolEventsRequest {
-                        start: Some(event_stream_start_message(&start)),
-                    })
+                    .mempool_events(zinder_query::wallet_mempool_events_request(
+                        wallet::MempoolEventsRequest {
+                            start: Some(event_stream_start_message(&start)),
+                        },
+                    ))
                     .await
                     .map_err(|status| MempoolSurfaceError::Unavailable {
                         reason: format!("ingest-control mempool_events failed: {status}"),

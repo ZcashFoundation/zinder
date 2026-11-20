@@ -1,6 +1,0 @@
-kind: fixed
-body: Transparent address lookups now report a protocol mismatch when the node returns a balance or an unspent output as an array of values in field order.
-time: 2026-11-20T11:45:29.270679919Z
-custom:
-    Bump: patch
-    PR: "399"

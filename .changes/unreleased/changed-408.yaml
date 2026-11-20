@@ -1,6 +1,0 @@
-kind: changed
-body: Native wallet queries batch complete 1,024-root subtree pages to reduce read latency.
-time: 2026-11-20T12:10:51.541653656Z
-custom:
-    Bump: patch
-    PR: "408"

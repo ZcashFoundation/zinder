@@ -64,7 +64,7 @@ pub use grpc::{
 };
 pub use ingest_control::{
     AdmittedIngestControl, IngestControlAdmissionError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-    wallet_ingest_control_request,
+    wallet_ingest_control_request, wallet_mempool_events_request,
 };
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,

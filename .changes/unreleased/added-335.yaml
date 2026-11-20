@@ -1,6 +1,0 @@
-kind: added
-body: "When native `CompactBlocksInRange` refuses a stream because the server already serves its open-stream limit, the `RESOURCE_EXHAUSTED` status now carries the `COMPACT_BLOCK_STREAM_LIMIT_REACHED` error reason, and `zinder-client` classifies it as retry-with-backoff. Clients that do not know the reason keep their current handling."
-time: 2026-11-20T04:00:00.000000000Z
-custom:
-    Bump: minor
-    PR: "335"

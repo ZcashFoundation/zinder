@@ -21,7 +21,11 @@ pub use error_policy::{
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
 /// advertised capabilities satisfy their requirements.
-pub const CONTRACT_REVISION: u32 = 11;
+pub const CONTRACT_REVISION: u32 = 13;
+
+/// Milliseconds an ingest-control caller can wait for `MempoolEvents` response
+/// headers. Unlike a gRPC deadline, this budget ends once the stream opens.
+pub const MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER: &str = "x-zinder-mempool-events-open-timeout-ms";
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///

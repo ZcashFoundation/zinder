@@ -481,21 +481,26 @@ async fn fetch_chain_segment_rejects_batch_responses_with_unknown_ids() -> eyre:
 #[tokio::test]
 async fn fetch_chain_segment_rejects_a_batch_response_with_fewer_entries() -> eyre::Result<()> {
     let blocks = linked_chain(4)?;
-    let server = chain_server(&blocks)?;
-    server.shape_batch_responses(|_batch_size| vec![BatchResponseShape::DropLast]);
-    let source = regtest_source(&server)?;
+    for shapes in [
+        vec![BatchResponseShape::DropLast],
+        vec![BatchResponseShape::Reverse, BatchResponseShape::DropLast],
+    ] {
+        let server = chain_server(&blocks)?;
+        server.shape_batch_responses(move |_batch_size| shapes.clone());
+        let source = regtest_source(&server)?;
 
-    let outcome = fetch_from_first_block(&source, 4).await?;
+        let outcome = fetch_from_first_block(&source, 4).await?;
 
-    assert!(
-        matches!(
-            outcome,
-            Err(SourceError::SourceProtocolMismatch {
-                reason: "batched block response contained fewer entries than requested",
-            })
-        ),
-        "unexpected outcome: {outcome:?}"
-    );
+        assert!(
+            matches!(
+                outcome,
+                Err(SourceError::SourceProtocolMismatch {
+                    reason: "batched block response contained fewer entries than requested",
+                })
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
     Ok(())
 }
 
@@ -521,34 +526,57 @@ async fn fetch_chain_segment_rejects_a_batch_response_with_an_extra_duplicate_id
     Ok(())
 }
 
-/// A duplicated id in place of a missing one is reported as a height refusal.
-///
-/// The response count still equals the request count. jsonrpsee leaves the missing member's
-/// slot holding its placeholder error (code 0, empty message), which the
-/// source reports as a refusal of that height rather than as a protocol
-/// mismatch.
 #[tokio::test]
-async fn fetch_chain_segment_reports_a_duplicate_replacing_a_missing_id_as_block_unavailable()
--> eyre::Result<()> {
+async fn fetch_chain_segment_rejects_a_duplicate_replacing_a_missing_id() -> eyre::Result<()> {
     let blocks = linked_chain(4)?;
-    let server = chain_server(&blocks)?;
-    server.shape_batch_responses(|_batch_size| {
-        vec![
-            BatchResponseShape::DropLast,
-            BatchResponseShape::DuplicateFirst,
-        ]
-    });
+    for refusals in [HashMap::new(), HashMap::from([(1, "height out of range")])] {
+        let server = JsonRpcTestServer::start([
+            tip_stub(tip_of(&blocks)?),
+            getblock_stub(&blocks, refusals),
+        ])?;
+        server.shape_batch_responses(|_batch_size| {
+            vec![
+                BatchResponseShape::DropLast,
+                BatchResponseShape::DuplicateFirst,
+            ]
+        });
+        let source = regtest_source(&server)?;
+
+        let outcome = fetch_from_first_block(&source, 4).await?;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(SourceError::SourceProtocolMismatch {
+                    reason: "batched getblock response repeated a request id",
+                })
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_preserves_a_node_error_with_an_empty_message() -> eyre::Result<()> {
+    let blocks = linked_chain(4)?;
+    let server = JsonRpcTestServer::start([
+        tip_stub(tip_of(&blocks)?),
+        method("getblock").reply(RpcReply::error_with_code(0, "")),
+        getblock_stub(&blocks, HashMap::new()),
+    ])?;
     let source = regtest_source(&server)?;
 
     let outcome = fetch_from_first_block(&source, 4).await?;
 
-    match outcome {
-        Err(SourceError::BlockUnavailable { height, reason }) => {
-            assert_eq!(height, BlockHeight::new(4));
-            assert_eq!(reason, "getblock: ");
-        }
-        other => return Err(eyre!("unexpected outcome: {other:?}")),
-    }
+    assert!(
+        matches!(
+            &outcome,
+            Err(SourceError::BlockUnavailable { height, reason })
+                if *height == BlockHeight::new(1) && reason == "getblock: "
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
     Ok(())
 }
 
