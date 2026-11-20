@@ -251,7 +251,9 @@ again, as a writer checks a row it stores:
   height. The history predecessor has no stored header, so its row carries
   the block time recorded for it when the store was built. A row at any other
   height fails this check when its header is missing, does not decode, or
-  sits in a table block that fails its checksum.
+  sits in a table block that fails its checksum when read. Unlike checkpoint
+  rows, headers are read through the block cache, so a header block already
+  cached on the verification secondary is checked from memory.
 
 The pass starts when densification does: once ingest follows the tip, and
 Explorer views have caught up when they are enabled. A restart over a store
