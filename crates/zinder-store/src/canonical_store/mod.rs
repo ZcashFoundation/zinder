@@ -31,6 +31,8 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod served_tree_state;
+#[cfg(test)]
+mod stored_tree_state_roots_tests;
 mod subtree_load;
 mod tree_state_densification;
 #[cfg(test)]
@@ -476,6 +478,18 @@ pub(super) fn frontier_presence_mismatch(
     height: BlockHeight,
     frontiers: &CommitmentTreeFrontiers,
 ) -> Option<FrontierPresenceMismatch> {
+    pool_presence_mismatch(network_upgrade_activations, height, |protocol| {
+        frontiers.get(protocol).is_some()
+    })
+}
+
+/// Returns the first pool whose presence reported by `is_present` disagrees
+/// with its activation at `height`.
+pub(super) fn pool_presence_mismatch(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+    is_present: impl Fn(ShieldedProtocol) -> bool,
+) -> Option<FrontierPresenceMismatch> {
     [
         ShieldedProtocol::Sapling,
         ShieldedProtocol::Orchard,
@@ -486,7 +500,7 @@ pub(super) fn frontier_presence_mismatch(
         let is_active = network_upgrade_activations
             .activation_height_by_name(protocol.activation_upgrade_name())
             .is_some_and(|activation_height| activation_height <= height);
-        let frontier_present = frontiers.get(protocol).is_some();
+        let frontier_present = is_present(protocol);
         (frontier_present != is_active).then_some(FrontierPresenceMismatch {
             protocol,
             frontier_present,
