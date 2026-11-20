@@ -44,7 +44,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    self, ChainMetadata, compact_tx_streamer_client::CompactTxStreamerClient,
     compact_tx_streamer_server::CompactTxStreamer,
 };
 
@@ -2733,7 +2733,7 @@ async fn get_block_nullifiers_retains_transparent_only_shells_unlike_range_nulli
         return Err(eyre!("expected one block from GetBlockRangeNullifiers"));
     };
 
-    assert_eq!(unary.chain_metadata, Some(Default::default()));
+    assert_eq!(unary.chain_metadata, Some(ChainMetadata::default()));
     assert_eq!(
         unary.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
         vec![0, 1]
@@ -2867,7 +2867,7 @@ async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre
         let [block] = blocks.as_slice() else {
             return Err(eyre!("expected one block for {:?}", case.pool_types));
         };
-        assert_eq!(block.chain_metadata, Some(Default::default()));
+        assert_eq!(block.chain_metadata, Some(ChainMetadata::default()));
         let transactions: Vec<_> = block
             .vtx
             .iter()
@@ -2897,7 +2897,7 @@ async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre
 /// and has every excluded field cleared.
 fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre::Result<()> {
     assert!(
-        block.chain_metadata == Some(Default::default()),
+        block.chain_metadata == Some(ChainMetadata::default()),
         "nullifiers-only responses must omit commitment-tree sizes"
     );
     let transaction = block

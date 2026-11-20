@@ -329,10 +329,16 @@ mod tests {
             [0, 1, 2, 3, 4]
         );
         let nullifiers = CompactBlockShape::for_nullifier_range(&[])?.message(mixed_block()?)?;
-        assert_eq!(nullifiers.chain_metadata, Some(Default::default()));
+        assert_eq!(
+            nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
         assert_eq!(nullifiers.vtx, shielded_expected.vtx);
         let block_nullifiers = CompactBlockShape::BLOCK_NULLIFIERS.message(mixed_block()?)?;
-        assert_eq!(block_nullifiers.chain_metadata, Some(Default::default()));
+        assert_eq!(
+            block_nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
         assert_eq!(
             block_nullifiers
                 .vtx

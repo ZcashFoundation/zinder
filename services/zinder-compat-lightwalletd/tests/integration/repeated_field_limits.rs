@@ -205,7 +205,7 @@ async fn generated_client_distinguishes_unknown_pool_values_from_the_invalid_sen
                 .await?
                 .ok_or_else(|| eyre!("missing height {expected_height}"))?;
             assert_eq!(block.height, expected_height);
-            assert!(block.vtx.is_empty());
+            assert_eq!(block.vtx.len(), 0);
         }
         assert!(stream.message().await?.is_none());
     }
