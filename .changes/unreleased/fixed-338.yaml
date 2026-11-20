@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-compat-lightwalletd` now exits with status 1 and names the task when a background task, its operational endpoint, or a serving-generation teardown fails or ends early, as `zinder-query` does; previously it could keep serving wallet traffic without them. On shutdown, both runtimes now deliver `UNAVAILABLE` with the `shutting_down` readiness cause to calls still open at the drain deadline, waiting up to 2 more seconds, instead of leaving clients with `UNKNOWN` and a broken connection."
-time: 2026-11-20T05:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "338"
