@@ -25,6 +25,15 @@ final-status-level = "fail"
 junit = { path = "target/nextest/junit.xml" }
 
 [[profile.default.overrides]]
+# Concurrent canonical and wallet fixture builds stall on filesystem journal
+# commits. Each replay then copies and syncs both stores and opens a secondary.
+# Limit overlapping fixtures. Even two can cross 20s when other suites share
+# the disk, so report slow tests at 20s and terminate them at 60s.
+filter = "package(=zinder-bench) & test(/^integration::rocksdb_tip_replay::/)"
+test-group = "rocksdb-tip-replay"
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # Process-crash tests spawn child processes that abort at a crash point, then
 # reopen the store. Each abort plus RocksDB reopen costs seconds where the host
 # collects core dumps, which exceeds the 20s default kill window under
@@ -118,12 +127,14 @@ default-filter = "test(/^parity::/)"
 slow-timeout = { period = "60s", terminate-after = 1 }
 junit = { path = "target/nextest/parity.xml" }
 
+[test-groups]
+rocksdb-tip-replay = { max-threads = 2 }
+
 # Live tests that mutate node state share a single Docker container.
 # Read-only live tests (capability probes, tip fetches, broadcast-rejection
 # classification) run in parallel under the default group unless they share a
 # fixture with a mutating test. The lightwalletd parity file serializes as a
 # unit because accepted-send parity mutates the shared regtest mempool.
-[test-groups]
 node-mutating = { max-threads = 1 }
 
 [[profile.ci-live.overrides]]
