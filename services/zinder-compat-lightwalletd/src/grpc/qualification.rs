@@ -26,10 +26,10 @@ use zinder_store::{ArtifactFamily, BlockHashLookup};
 use super::{
     CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
-    lightwalletd_tree_state, reject_future_tree_state_height, send_response_from_broadcast_outcome,
-    shielded_protocol_from_request, spawn_response_stream, standard_fee_response,
-    transparent_address_tx_history_request, tree_state_block_lookup_status, tree_state_status,
-    u32_to_usize, wire_decode_error_to_status,
+    address_utxo_limit_exceeded, lightwalletd_tree_state, reject_future_tree_state_height,
+    send_response_from_broadcast_outcome, shielded_protocol_from_request, spawn_response_stream,
+    standard_fee_response, transparent_address_tx_history_request, tree_state_block_lookup_status,
+    tree_state_status, u32_to_usize, wire_decode_error_to_status,
 };
 use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
@@ -142,6 +142,7 @@ impl QualificationWallet {
     async fn utxos(
         &self,
         request: lightwalletd::GetAddressUtxosArg,
+        response_limit: NonZeroU32,
     ) -> Result<std::vec::IntoIter<SourceTransparentUnspentOutput>, Status> {
         if request.addresses.is_empty() {
             return Ok(Vec::new().into_iter());
@@ -160,6 +161,7 @@ impl QualificationWallet {
         );
         let node = self.node().await?;
         let mut rows = wallet_ordered_utxos(node, &lookup, height, request.max_entries).await?;
+        let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         rows.sort_unstable_by_key(|row| {
             (
                 row.block_height,
@@ -167,9 +169,7 @@ impl QualificationWallet {
                 row.outpoint.output_index,
             )
         });
-        if request.max_entries != 0 {
-            rows.truncate(u32_to_usize(request.max_entries));
-        }
+        rows.truncate(count);
         Ok(rows.into_iter())
     }
 
@@ -204,6 +204,20 @@ impl QualificationWallet {
             range.end_height,
         ))
     }
+}
+
+fn wallet_utxo_response_len(
+    available: usize,
+    requested: u32,
+    limit: NonZeroU32,
+) -> Result<usize, Status> {
+    let count =
+        NonZeroU32::new(requested).map_or(available, |max| available.min(u32_to_usize(max.get())));
+    let limit = u32_to_usize(limit.get());
+    if count > limit {
+        return Err(address_utxo_limit_exceeded(limit));
+    }
+    Ok(count)
 }
 
 fn indexed_address(text: &str, network: Network) -> Result<Address, Status> {
@@ -587,7 +601,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
     ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
         let address_utxos = self
             .query_api
-            .utxos(request.into_inner())
+            .utxos(request.into_inner(), self.response_limits.max_address_utxos)
             .await?
             .map(utxo_reply)
             .collect::<Result<_, _>>()?;
@@ -602,7 +616,10 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        let outputs = self.query_api.utxos(request.into_inner()).await?;
+        let outputs = self
+            .query_api
+            .utxos(request.into_inner(), self.response_limits.max_address_utxos)
+            .await?;
         Ok(Response::new(Box::pin(stream::iter(
             outputs.map(utxo_reply),
         ))))
@@ -634,5 +651,27 @@ impl compact_tx_streamer_server::CompactTxStreamer
             .respond(request.into_inner())
             .await
             .map(Response::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualification_utxo_limit_applies_to_the_requested_response() {
+        let limit = NonZeroU32::MIN.saturating_add(9);
+        for (available, requested, expected) in [(20, 4, 4), (20, 10, 10), (10, 0, 10), (7, 11, 7)]
+        {
+            assert_eq!(
+                wallet_utxo_response_len(available, requested, limit).ok(),
+                Some(expected)
+            );
+        }
+        for requested in [0, 11] {
+            assert!(
+                matches!(wallet_utxo_response_len(20, requested, limit), Err(status) if status.code() == tonic::Code::ResourceExhausted)
+            );
+        }
     }
 }
