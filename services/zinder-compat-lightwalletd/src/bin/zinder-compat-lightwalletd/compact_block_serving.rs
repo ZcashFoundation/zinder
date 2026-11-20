@@ -63,6 +63,24 @@ pub(crate) enum CompactBlockServingError {
     WriterStatus(String),
     #[error("compact-block runtime failed: {0}")]
     Runtime(String),
+    #[error("compact-block publisher teardown failed: {0}")]
+    Teardown(#[source] tokio::task::JoinError),
+}
+
+/// Drops `publisher` on a blocking thread, because the last owner of a
+/// secondary pays its close.
+async fn tear_down_on_blocking_thread<T: Send + 'static>(
+    publisher: T,
+) -> Result<(), CompactBlockServingError> {
+    tokio::task::spawn_blocking(move || drop(publisher))
+        .await
+        .map_err(CompactBlockServingError::Teardown)?;
+    tracing::info!(
+        target: "zinder::compat_lightwalletd",
+        event = "compact_serving_publisher_teardown_complete",
+        "compact serving publisher teardown completed"
+    );
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,11 +276,15 @@ impl CompactBlockPublisher {
         Ok((publisher, slot))
     }
 
+    /// Refreshes the served generation until `cancel` is cancelled, then
+    /// closes the publisher's secondaries on a blocking thread once
+    /// `serving_drained` is cancelled. The task fails when that teardown
+    /// fails.
     pub(crate) fn spawn(
         mut self,
         cancel: CancellationToken,
         serving_drained: CancellationToken,
-    ) -> JoinHandle<()> {
+    ) -> JoinHandle<Result<(), CompactBlockServingError>> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -274,19 +296,7 @@ impl CompactBlockPublisher {
                 }
             }
             serving_drained.cancelled().await;
-            match tokio::task::spawn_blocking(move || drop(self)).await {
-                Ok(()) => tracing::info!(
-                    target: "zinder::compat_lightwalletd",
-                    event = "compact_serving_publisher_teardown_complete",
-                    "compact serving publisher teardown completed"
-                ),
-                Err(error) => tracing::error!(
-                    target: "zinder::compat_lightwalletd",
-                    event = "compact_serving_publisher_teardown_failed",
-                    error = %error,
-                    "compact serving publisher teardown task failed"
-                ),
-            }
+            tear_down_on_blocking_thread(self).await
         })
     }
 
@@ -2356,7 +2366,7 @@ mod tests {
         let publisher_handle = publisher.spawn(cancel.clone(), drained.clone());
         cancel.cancel();
         drained.cancel();
-        publisher_handle.await?;
+        publisher_handle.await??;
         drop((initial, replaced, slot));
         assert_eq!(block_cache.pinned_usage_bytes(), 0);
         let _ = shutdown_sender.send(());
@@ -2541,7 +2551,7 @@ mod tests {
         let publisher_handle = publisher.spawn(cancel.clone(), drained.clone());
         cancel.cancel();
         drained.cancel();
-        publisher_handle.await?;
+        publisher_handle.await??;
         drop(replaced);
         drop(reused);
         let _ = shutdown_sender.send(());
@@ -3097,7 +3107,7 @@ mod tests {
             let publisher_handle = self.publisher.spawn(cancel.clone(), drained.clone());
             cancel.cancel();
             drained.cancel();
-            publisher_handle.await?;
+            publisher_handle.await??;
             drop(self.slot);
             drop(self.adapter);
             let _ = self.shutdown.send(());
@@ -4746,5 +4756,35 @@ mod tests {
 
         drain.cancel();
         watch_ends(&mut watch).await
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::{CompactBlockServingError, tear_down_on_blocking_thread};
+
+    /// Stands in for a publisher whose secondary panics while closing.
+    struct PanicsWhenDropped;
+
+    impl Drop for PanicsWhenDropped {
+        #[allow(clippy::panic, reason = "the test needs a teardown that panics")]
+        fn drop(&mut self) {
+            panic!("closing a secondary panicked");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_teardown_that_panics_is_an_error() {
+        let teardown = tear_down_on_blocking_thread(PanicsWhenDropped).await;
+
+        assert!(
+            matches!(teardown, Err(CompactBlockServingError::Teardown(_))),
+            "a panicking teardown must fail the publisher task, got {teardown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_teardown_succeeds() -> Result<(), CompactBlockServingError> {
+        tear_down_on_blocking_thread(()).await
     }
 }

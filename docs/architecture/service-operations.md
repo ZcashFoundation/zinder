@@ -75,24 +75,32 @@ streams never end on their own.
 
 1. They report `shutting_down`, so `/readyz` and new requests see it before
    anything stops.
-2. They stop their background tasks and start the gRPC server's graceful
-   drain.
+2. They stop their background tasks and their operational endpoint, and
+   start the gRPC server's graceful drain at the same time.
 3. They wait up to 10 seconds for the drain.
 4. They end every call still open, such as a block-range stream to a client
    that reads slowly, with `UNAVAILABLE`, and refuse any later call the same
-   way before its handler runs.
-5. They release their serving generations.
-6. They wait for their background tasks to stop. `zinder-query` stops its
-   operational endpoint with the other tasks in step 2, and
-   `zinder-compat-lightwalletd` closes its endpoint after this step.
+   way before its service runs. Both carry `SERVICE_NOT_READY` with the
+   `shutting_down` readiness cause.
+5. If the drain timed out, they wait up to 2 more seconds for the server to
+   send those calls their status and close its connections.
+6. They release their serving generations.
+7. They wait for their background tasks to stop.
 
 When step 4 completes, no call handler or response of the gRPC server
-remains. Work a handler already handed off finishes on its own and holds the
-generation it reads until then: a storage read running on a blocking thread
-completes and its result is discarded, and a block-range reader finishes the
-chunk it is reading and stops when it tries to send it, because the response
-it fed has ended. Connections stay open, without calls, until the process
-exits. The single-volume entrypoint allows its processes 20 seconds to exit.
+remains, and each ended response sends its status before any more of its
+data. A client-streaming call's request stream also ends, so work its handler
+handed the stream to cannot keep the connection open. Other work a handler
+already handed off finishes on its own and holds the generation it reads
+until then: a storage read running on a blocking thread completes and its
+result is discarded, and a block-range reader finishes the chunk it is
+reading and stops when it tries to send it, because the response it fed has
+ended.
+
+A client that has stopped reading cannot receive its status, so step 5 gives
+up on its connection after 2 seconds; a client that reads gets its status
+within milliseconds. The two bounds keep shutdown within the single-volume
+entrypoint's 20-second window for its processes to exit.
 
 ### Background task failure
 
@@ -111,19 +119,21 @@ stopping, so a signal never looks like the server stopping on its own.
 | Runtime | Watched tasks |
 | --- | --- |
 | `zinder-query` | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, and operational endpoint |
-| `zinder-compat-lightwalletd`, wallet serving | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, tip-change publisher, and node-tip witness |
-| `zinder-compat-lightwalletd`, compact-blocks serving | Compact-block publisher and node-tip witness |
+| `zinder-compat-lightwalletd`, wallet serving | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, tip-change publisher, node-tip witness, and operational endpoint |
+| `zinder-compat-lightwalletd`, compact-blocks serving | Compact-block publisher, node-tip witness, and operational endpoint |
 
-The compatibility runtime closes its operational endpoint after the server
-stops, and does not watch it.
+A task that had already ended when the runtime started stopping counts as
+failed, even when the runtime stopped for a shutdown request. A publisher
+fails if closing its serving generations fails, which happens after shutdown
+starts.
 
 The runtime logs every task that fails, with its name, as
 `runtime_task_failed`, or as `runtime_task_stopped` for a task that ended
 without an error. It exits with status 0 only after a requested shutdown in
-which the gRPC server reported no error and every task stopped cleanly. It
-exits with status 1 in every other case, with an error that names the task or
-server that stopped the runtime, or, for a requested shutdown, the first task
-that failed while stopping.
+which the gRPC server reported no error and every task stopped cleanly after
+the runtime started stopping. It exits with status 1 in every other case,
+with an error that names the task or server that stopped the runtime, or, for
+a requested shutdown, the first task that failed.
 
 ## Memory allocator
 

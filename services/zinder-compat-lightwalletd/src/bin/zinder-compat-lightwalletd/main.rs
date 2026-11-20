@@ -377,6 +377,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
                 ingest_control_readiness_probe: ingest_control_readiness_handle,
                 tip_change_publisher: tip_publisher_handle,
                 node_tip_witness: node_tip_witness_handle,
+                operations: ops_handle,
             }
             .supervised(),
             || serving_readiness.publish_shutting_down(),
@@ -389,10 +390,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         serving = "wallet",
         "lightwalletd-compatible gRPC server stopped"
     );
-
-    let operations_outcome = shutdown_operations(ops_handle).await;
-    runtime_outcome?;
-    operations_outcome
+    Ok(runtime_outcome?)
 }
 
 #[allow(
@@ -505,6 +503,7 @@ async fn run_compact_blocks(
             CompactBlocksServingTasks {
                 compact_block_publisher: publisher_handle,
                 node_tip_witness: node_tip_witness_handle,
+                operations: ops_handle,
             }
             .supervised(),
             || serving_readiness.publish_shutting_down(),
@@ -516,19 +515,7 @@ async fn run_compact_blocks(
         serving = "compact-blocks",
         "lightwalletd-compatible gRPC server stopped"
     );
-    let operations_outcome = shutdown_operations(ops_handle).await;
-    runtime_outcome?;
-    operations_outcome
-}
-
-/// Closes the operational endpoint once the runtime has stopped.
-async fn shutdown_operations(
-    operations: Option<zinder_runtime::OpsEndpointHandle>,
-) -> Result<(), LightwalletdConfigError> {
-    match operations {
-        Some(handle) => Ok(handle.shutdown().await?),
-        None => Ok(()),
-    }
+    Ok(runtime_outcome?)
 }
 
 /// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`

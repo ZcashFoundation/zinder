@@ -252,9 +252,10 @@ deadlines. Lengthen it for a Mainnet build.
 
 On `SIGTERM`, the entrypoint signals compatibility, query, the projector, and
 ingest in that order, and they stop in parallel. Query and compatibility
-end gRPC calls still open after 10 seconds with `UNAVAILABLE`, so a slow
-block-range client cannot hold the shutdown open. The entrypoint waits 20 seconds, then exits
-non-zero and names any process still holding a store open.
+end gRPC calls still open after 10 seconds with `UNAVAILABLE`, and allow 2
+more seconds to deliver that status, so a slow block-range client cannot hold
+the shutdown open. The entrypoint waits 20 seconds, then exits non-zero and
+names any process still holding a store open.
 
 ### Wallet transition exceeds its logical-byte limit
 

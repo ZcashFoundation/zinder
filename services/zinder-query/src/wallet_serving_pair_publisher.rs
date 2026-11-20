@@ -934,6 +934,27 @@ fn upstream_not_ready_detail(snapshot: UpstreamHealthSnapshot) -> UpstreamNotRea
     }
 }
 
+/// The wallet-serving publisher's final teardown, which closes its
+/// secondaries on a blocking thread, panicked or was cancelled.
+#[derive(Debug, Error)]
+#[error("wallet-serving publisher teardown failed: {0}")]
+pub struct WalletServingPairTeardownError(#[source] tokio::task::JoinError);
+
+/// Drops `publisher` on a blocking thread, because the last owner of a
+/// secondary pays its close, and records how long the teardown took.
+async fn tear_down_on_blocking_thread<T: Send + 'static>(
+    publisher: T,
+) -> Result<(), WalletServingPairTeardownError> {
+    let started_at = Instant::now();
+    let teardown = tokio::task::spawn_blocking(move || drop(publisher)).await;
+    metrics::histogram!(
+        "zinder_wallet_serving_pair_publisher_teardown_duration_seconds",
+        "status" => if teardown.is_ok() { "ok" } else { "error" }
+    )
+    .record(started_at.elapsed());
+    teardown.map_err(WalletServingPairTeardownError)
+}
+
 /// Errors that stop bootstrap or make a refresh generation ineligible.
 #[derive(Debug, Error)]
 pub enum WalletServingPairError {
@@ -1125,12 +1146,16 @@ impl WalletServingPairPublisher {
     /// finds a pair missing a table file. Every refresh failure leaves the
     /// current immutable pair untouched and updates readiness with its typed
     /// cause; it never falls back to a primary store.
+    ///
+    /// The task closes the publisher's secondaries on a blocking thread once
+    /// `serving_runtime_drained` is cancelled, and fails when that teardown
+    /// fails.
     #[must_use = "await the publisher on shutdown so secondary handles close before process exit"]
     pub fn spawn(
         mut self,
         cancel: CancellationToken,
         serving_runtime_drained: CancellationToken,
-    ) -> JoinHandle<()> {
+    ) -> JoinHandle<Result<(), WalletServingPairTeardownError>> {
         tokio::spawn(async move {
             let signals = self
                 .serving_pair_slot
@@ -1145,21 +1170,7 @@ impl WalletServingPairPublisher {
                 self.refresh_and_record().await;
             }
             serving_runtime_drained.cancelled().await;
-            let started_at = Instant::now();
-            let teardown = tokio::task::spawn_blocking(move || drop(self)).await;
-            metrics::histogram!(
-                "zinder_wallet_serving_pair_publisher_teardown_duration_seconds",
-                "status" => if teardown.is_ok() { "ok" } else { "error" }
-            )
-            .record(started_at.elapsed());
-            if let Err(error) = teardown {
-                tracing::warn!(
-                    target: "zinder::wallet_serving",
-                    event = "wallet_serving_pair_publisher_teardown_failed",
-                    error = %error,
-                    "wallet-serving publisher teardown task failed"
-                );
-            }
+            tear_down_on_blocking_thread(self).await
         })
     }
 
@@ -6991,7 +7002,7 @@ mod tests {
         drop((stale_pair, replacement, query, slot));
         cancel.cancel();
         serving_runtime_drained.cancel();
-        publisher_task.await?;
+        publisher_task.await??;
         primaries.shutdown().await
     }
 
@@ -7063,7 +7074,7 @@ mod tests {
         drop((stale_pair, query, slot));
         cancel.cancel();
         serving_runtime_drained.cancel();
-        publisher_task.await?;
+        publisher_task.await??;
         primaries.shutdown().await
     }
 
@@ -7303,7 +7314,7 @@ mod tests {
         drop((log_capture, stream, stale_pair, replacement, slot));
         cancel.cancel();
         serving_runtime_drained.cancel();
-        publisher_task.await?;
+        publisher_task.await??;
         primaries.shutdown().await
     }
 
@@ -7366,7 +7377,7 @@ mod tests {
         drop((stream, stale_pair, slot));
         cancel.cancel();
         serving_runtime_drained.cancel();
-        publisher_task.await?;
+        publisher_task.await??;
         primaries.shutdown().await
     }
 
@@ -8810,5 +8821,35 @@ mod retention_tests {
             spent,
             created,
         })
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::{WalletServingPairTeardownError, tear_down_on_blocking_thread};
+
+    /// Stands in for a publisher whose secondaries panic while closing.
+    struct PanicsWhenDropped;
+
+    impl Drop for PanicsWhenDropped {
+        #[allow(clippy::panic, reason = "the test needs a teardown that panics")]
+        fn drop(&mut self) {
+            panic!("closing a secondary panicked");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_teardown_that_panics_is_an_error() {
+        let teardown = tear_down_on_blocking_thread(PanicsWhenDropped).await;
+
+        assert!(
+            teardown.is_err(),
+            "a panicking teardown must fail the publisher task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_teardown_succeeds() -> Result<(), WalletServingPairTeardownError> {
+        tear_down_on_blocking_thread(()).await
     }
 }

@@ -285,7 +285,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .supervise(
             server,
             SupervisedTasks::new()
-                .with("serving-pair publisher", publisher_handle)
+                .with_fallible("serving-pair publisher", publisher_handle)
                 .with("node-readiness probe", node_readiness_handle)
                 .with(
                     "ingest-control readiness probe",
