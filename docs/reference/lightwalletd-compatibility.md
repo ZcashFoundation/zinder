@@ -259,7 +259,7 @@ The protocol has no lossless way to page past the cap. A single block with more 
 
 ### `GetMempoolTx`
 
-`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. Zinder accepts up to 1,024 entries in `exclude_txid_suffixes`, compared with 20,000 in Go lightwalletd v0.6.2. Both accept up to 32 bytes per suffix. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
+`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. Zinder and Go lightwalletd v0.6.2 accept up to 20,000 entries in `exclude_txid_suffixes`, each up to 32 bytes long. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
 
 When suffixes overlap, the shortest matching suffix takes precedence, as in Go lightwalletd v0.6.2. A list containing an empty suffix therefore excludes the only transaction in a singleton snapshot. An empty list excludes nothing. [Go mempool filter](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L1019-L1058)
 
@@ -279,12 +279,12 @@ Limits shared by every public Zinder gRPC listener are listed in [Configuration]
 | --- | --- | --- | --- |
 | `GetTaddressBalance` | `addresses` | 512 | 256 distinct addresses |
 | `GetAddressUtxos`, `GetAddressUtxosStream` | `addresses` | 10,000 | none |
-| `GetMempoolTx` | `exclude_txid_suffixes` | 2,048 | 1,024 |
+| `GetMempoolTx` | `exclude_txid_suffixes` | 40,000 | 20,000 |
 | `GetMempoolTx` | `poolTypes` | 1,000 | none |
 | `GetBlockRange`, `GetBlockRangeNullifiers` | `poolTypes` | 1,000 | none |
 | `GetTaddressTxids`, `GetTaddressTransactions` | `range.poolTypes` | 1,000 | none |
 
-lightwalletd reports an over-cap list refusal as `INTERNAL`.
+For `GetMempoolTx`, both servers return `INVALID_ARGUMENT` for 20,001 through 40,000 suffixes. Above the predecode limit, Zinder returns `INVALID_ARGUMENT` and Go lightwalletd v0.6.2 returns `INTERNAL`. [Go handler](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L810-L829) and [Go predecode limit](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/codec.go#L17-L40).
 
 ## Reference inputs
 
