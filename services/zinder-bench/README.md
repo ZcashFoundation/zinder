@@ -978,7 +978,10 @@ identity, the workload's constants, and, over all wallets:
   `zinder_grpc_request_receive_slots_held` gauge when it starts, when it ends,
   and every second between, leaving out reads that fail, and averages the
   reads over time, so `mean_slots_held` counts slots held across either end of
-  the run and never exceeds the pool's size. Behind a proxy,
+  the run and never exceeds the pool's size. The read after the run counts as
+  taken when the wallets finished, however long its scrape takes, and reads
+  that complete after that moment are left out, so the mean covers the run
+  alone. Behind a proxy,
   `proxy_client_address_fallbacks` counts, by reason, the requests that
   counted against the proxy's own connection because they lacked one valid
   client address header.

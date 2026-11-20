@@ -234,6 +234,17 @@ impl HeldSlotsTimeline {
         self.readings.push(HeldSlotsReading { at, by_pool });
     }
 
+    /// Ends the timeline at `ended`, the moment the run ended, with the
+    /// slots each pool held in `samples`, the scrape taken after it.
+    ///
+    /// Reads that completed after `ended` are left out, and `samples` counts
+    /// as read at `ended` however long its scrape took, so the mean covers
+    /// the run and none of the time spent reading after it.
+    fn close(&mut self, ended: Duration, samples: &[MetricSample]) {
+        self.readings.retain(|reading| reading.at <= ended);
+        self.record(ended, samples);
+    }
+
     /// The slots `pool` held on average from the first read to the last.
     ///
     /// Between two reads, the pool counts as holding the mean of both. The
@@ -289,17 +300,19 @@ impl HeldSlotsSampler {
         }
     }
 
-    /// Stops reading, then scrapes `url` once more and returns that scrape
-    /// with the reads, the scrape as the last.
+    /// Ends the run now: stops reading, then scrapes `url` once more and
+    /// returns that scrape with the reads, the scrape as the last.
     ///
     /// The reader stops before the closing scrape starts, so no read shows
-    /// the server after that scrape or lands later in the timeline.
+    /// the server after that scrape. The timeline ends when this is called,
+    /// before either step, as [`HeldSlotsTimeline::close`] describes.
     async fn finish(self, url: &str) -> Result<(Vec<MetricSample>, HeldSlotsTimeline), String> {
+        let ended = self.started.elapsed();
         self.reader.abort();
         let _ = self.reader.await;
         let after = scrape(url).await?;
         let mut timeline = std::mem::take(&mut *self.timeline.lock());
-        timeline.record(self.started.elapsed(), &after);
+        timeline.close(ended, &after);
         Ok((after, timeline))
     }
 }
@@ -944,6 +957,36 @@ mod tests {
         assert!((mean - 32.0).abs() < 1e-9, "{mean}");
     }
 
+    #[test]
+    fn mean_slots_held_leaves_out_the_time_after_the_run_ends() {
+        // The pool holds 8 slots for the run's last second and frees them
+        // once the run ends at 2 seconds, so both a background read that
+        // completes after the end and the closing scrape find none held.
+        let ended = Duration::from_secs(2);
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, &held_in_request_pool(0));
+        held_slots.record(Duration::from_secs(1), &held_in_request_pool(8));
+        held_slots.record(ended, &held_in_request_pool(8));
+        held_slots.record(Duration::from_millis(2_400), &held_in_request_pool(0));
+
+        held_slots.close(ended, &held_in_request_pool(0));
+
+        assert!(
+            held_slots
+                .readings
+                .iter()
+                .all(|reading| reading.at <= ended),
+            "{held_slots:?}"
+        );
+        assert_eq!(
+            held_slots.readings.last().map(|reading| reading.at),
+            Some(ended)
+        );
+        // 4 slot-seconds over the first second and 8 over the second.
+        let mean = held_slots.mean("request");
+        assert!((mean - 6.0).abs() < 1e-9, "{mean}");
+    }
+
     #[tokio::test]
     async fn the_sampler_stops_reading_before_its_closing_scrape()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -979,6 +1022,7 @@ mod tests {
 
         let sampler = HeldSlotsSampler::start(&url, &held_in_request_pool(0));
         answered.await?;
+        let run_ended = sampler.started.elapsed();
         let (after, held_slots) = sampler.finish(&url).await?;
         server.abort();
 
@@ -994,6 +1038,14 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].at <= pair[1].at),
             "{held_slots:?}"
+        );
+        // The closing scrape took two read intervals, but counts as read
+        // when the run ended.
+        assert!(
+            held_slots.readings.last().is_some_and(|closing| {
+                closing.at >= run_ended && closing.at < run_ended + super::HELD_SLOTS_READ_INTERVAL
+            }),
+            "{run_ended:?} {held_slots:?}"
         );
         Ok(())
     }
