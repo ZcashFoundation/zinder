@@ -47,9 +47,11 @@ use crate::RocksDbIoMode;
 ///   background job pool used for flushes and compactions. `OpenAsSecondary`
 ///   disables automatic flushes and compactions, so secondary opens retain the
 ///   field in this uniform budget type but do not apply it.
-/// - `memtable_budget_bytes` is the threshold the write-buffer manager uses
-///   to trigger flushes across column families. Pending flushes can take
-///   total memtable memory over budget.
+/// - `memtable_budget_bytes` applies to one open database across its column
+///   families. On a primary, the write-buffer manager uses it to trigger
+///   flushes. Usage can exceed the budget while flushes are pending. Secondary
+///   WAL replay can exceed the budget until catch-up sees a primary flush
+///   and releases the old read view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RocksDbResourceBudget {
     /// Bounded LRU cache size for data, index, and filter blocks.
@@ -65,7 +67,7 @@ pub struct RocksDbResourceBudget {
     pub max_write_buffer_count: i32,
     /// Primary-writer background flush and compaction job limit.
     pub max_background_jobs: i32,
-    /// Total mutable and immutable memtable memory budget across column families.
+    /// Memtable memory budget for one open database, across all its column families.
     pub memtable_budget_bytes: u64,
     /// `RocksDB` statistics collection gate.
     pub statistics_level: RocksDbStatisticsLevel,

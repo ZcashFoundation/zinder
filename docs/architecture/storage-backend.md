@@ -265,11 +265,12 @@ without `RocksDB`.
 ## Resource bounds
 
 The store budget sets the block cache, write-ahead log (WAL), open files,
-write buffers, and background jobs. Each column family, including `default`,
-uses the configured write-buffer size and count. When memtable usage
-approaches the shared budget, RocksDB triggers flushes. Usage can exceed
-the budget while a flush is pending.
-[ADR-0005](../adrs/0005-bounded-process-memory.md) records the memory model.
+write buffers, and background jobs. Primaries and secondaries apply the
+configured write-buffer size and count to every column family, including
+`default`. Read-only admission probes keep RocksDB's write-buffer defaults for
+non-default families. The memtable budget applies to each open instance.
+[ADR-0005](../adrs/0005-bounded-process-memory.md#decision) describes primary
+flushes and secondary WAL replay.
 
 | Role | Block cache | WAL | Open files | Memtable budget |
 | --- | --- | --- | --- | --- |

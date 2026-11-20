@@ -19,7 +19,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 
 1. **One bounded open path.** Canonical, wallet, and materialized-view stores use a common open path. A typed resource budget sets the block cache, WAL ceiling, open files, write buffers, and total memtable budget. Configuration validates each setting against a minimum. A read-only admission probe uses the caller's shared block cache or a private 4 MiB cache. It applies the open-file budget and opens table files on one thread.
 2. **Direct I/O first.** Every production open tries direct reads, and primaries also use direct I/O for flush and compaction. If the direct open fails, the process logs the RocksDB error and retries once with buffered I/O. There is no operator toggle.
-3. **Each store shares one memtable budget.** A write-buffer manager triggers flushes across column families as memory approaches the budget. Writes can continue while those flushes complete.
+3. **One write-buffer manager per open database.** Each instance shares its manager across column families. On a primary, approaching the memtable budget triggers flushes. A secondary replays the primary's WAL and can exceed its budget until it catches up with the primary's flush and releases the old read view.
 4. **Metadata is charged to the cache.** Every column family, including each store's default family, reads through the bounded block cache, and index and filter blocks count against it. The one exception is the tree-state checkpoint family of the canonical secondary that ingest opens to verify stored checkpoints. It reads through no block cache, so every verification read takes its blocks from the table file and checks their checksums.
 5. **One cache per store per process.** A process that keeps several secondaries of one store open shares one block cache of the configured size among them. The canonical and wallet stores keep separate caches. The cache stays non-strict, so one generation's pinned blocks cannot fail another generation's catch-up.
 6. **Pressure means non-reclaimable memory.** Throttling of rebuildable work, such as materialized-view replay, uses anonymous memory against the cgroup limit, not working set.
@@ -52,5 +52,5 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 
 ## Revision history
 
-- 2026-11-20. Decisions 2 and 3 specify the buffered retry and the memtable budget's flush behavior.
+- 2026-11-20. Decisions 2 and 3 specify the buffered retry and distinguish primary flush thresholds from secondary WAL replay.
 - 2026-11-20. Decision 1 applies the cache and open-file budgets to short-lived admission probes. Materialized-view secondaries validate the manifest through their own handle. [Storage backend](../architecture/storage-backend.md#resource-bounds).
