@@ -82,7 +82,7 @@ pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 9;
 
 /// Total attempts used to cross a primary-compaction race while a secondary
 /// catches up and validates its newly replayed manifest.
-const SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS: u32 = 3;
+const MISSING_SST_ATTEMPTS: u32 = 3;
 
 const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const MATERIALIZED_VIEW_STATUS_KEY: &[u8] = b"\x00\x02materialized_view_status";
@@ -1236,9 +1236,11 @@ impl MaterializedViewStore {
         &self,
         manifest_admission: ManifestAdmission,
     ) -> Result<(), MaterializedViewStoreError> {
-        self.retry_secondary_validation(false, || {
-            self.validate_open_secondary_store_once(manifest_admission)
-        })
+        Self::retry_secondary_validation(
+            false,
+            || self.catch_up_secondary(),
+            || self.validate_open_secondary_store_once(manifest_admission),
+        )
     }
 
     fn validate_open_secondary_store_once(
@@ -1264,45 +1266,38 @@ impl MaterializedViewStore {
             return Ok(());
         }
         let _catch_up_guard = self.catch_up_barrier.write();
-        self.retry_secondary_validation(true, || {
-            self.require_matching_store_format_version()?;
-            self.validate_consumer_schemas()
-        })
+        Self::retry_secondary_validation(
+            true,
+            || self.catch_up_secondary(),
+            || {
+                self.require_matching_store_format_version()?;
+                self.validate_consumer_schemas()
+            },
+        )
     }
 
     fn retry_secondary_validation(
-        &self,
-        mut catch_up: bool,
-        validate: impl Fn() -> Result<(), MaterializedViewStoreError>,
+        catch_up_first: bool,
+        mut catch_up: impl FnMut() -> Result<(), MaterializedViewStoreError>,
+        mut validate: impl FnMut() -> Result<(), MaterializedViewStoreError>,
     ) -> Result<(), MaterializedViewStoreError> {
-        let mut attempt = 1;
-        loop {
-            let outcome = if catch_up {
-                self.catch_up_secondary().and_then(|()| validate())
-            } else {
-                validate()
-            };
-            if outcome
-                .as_ref()
-                .is_err_and(is_transient_secondary_missing_sst)
-                && attempt < SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS
-            {
+        retry_missing_sst(|attempt| {
+            if attempt > 1 {
                 metrics::counter!("zinder_materialized_views_secondary_catchup_retries_total")
                     .increment(1);
                 tracing::debug!(
                     target: "zinder::materialized_views",
                     event = "secondary_catchup_missing_sst_retry",
-                    attempt,
-                    max_attempts = SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS,
+                    attempt = attempt - 1,
+                    max_attempts = MISSING_SST_ATTEMPTS,
                     "materialized-view secondary crossed a primary-compaction file race; retrying catchup"
                 );
-                std::thread::yield_now();
-                attempt += 1;
-                catch_up = true;
-                continue;
             }
-            return outcome;
-        }
+            if catch_up_first || attempt > 1 {
+                catch_up()?;
+            }
+            validate()
+        })
     }
 
     fn catch_up_secondary(&self) -> Result<(), MaterializedViewStoreError> {
@@ -2496,6 +2491,13 @@ impl MaterializedViewStore {
         path: &Path,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Option<ProbedStoreMetadata>, MaterializedViewStoreError> {
+        retry_missing_sst(|_| Self::probe_existing_store_once(path, resource_budget))
+    }
+
+    fn probe_existing_store_once(
+        path: &Path,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Option<ProbedStoreMetadata>, MaterializedViewStoreError> {
         let existing_column_families = existing_column_family_names(path);
         if existing_column_families.is_empty() {
             return Ok(None);
@@ -3219,7 +3221,23 @@ fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes(array))
 }
 
-fn is_transient_secondary_missing_sst(error: &MaterializedViewStoreError) -> bool {
+// Read-only probes reopen, while secondary readers catch up before revalidating.
+fn retry_missing_sst<T>(
+    mut run: impl FnMut(u32) -> Result<T, MaterializedViewStoreError>,
+) -> Result<T, MaterializedViewStoreError> {
+    let mut attempt = 1;
+    loop {
+        let outcome = run(attempt);
+        if attempt >= MISSING_SST_ATTEMPTS || !outcome.as_ref().is_err_and(is_transient_missing_sst)
+        {
+            return outcome;
+        }
+        std::thread::yield_now();
+        attempt += 1;
+    }
+}
+
+fn is_transient_missing_sst(error: &MaterializedViewStoreError) -> bool {
     std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<rust_rocksdb::Error>())
         .is_some_and(zinder_store::is_missing_table_file_error)
@@ -3842,7 +3860,69 @@ mod tests {
     }
 
     #[test]
-    fn missing_sst_during_manifest_iteration_can_retry() -> Result<()> {
+    fn missing_manifest_sst_triggers_secondary_catchup_before_revalidation() -> Result<()> {
+        use std::cell::RefCell;
+
+        let source = missing_manifest_sst_error()?;
+        let calls = RefCell::new(Vec::new());
+        MaterializedViewStore::retry_secondary_validation(
+            false,
+            || {
+                calls.borrow_mut().push("catch up");
+                Ok(())
+            },
+            || {
+                let mut calls = calls.borrow_mut();
+                calls.push("validate");
+                if calls.len() == 1 {
+                    decode_consumer_manifest_entries(std::iter::once(Err(source.clone())))?;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(*calls.borrow(), ["validate", "catch up", "validate"]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_sst_retries_are_bounded_and_schema_mismatches_fail_immediately() -> Result<()> {
+        use std::cell::Cell;
+
+        let source = missing_manifest_sst_error()?;
+        let catchups = Cell::new(0);
+        let validations = Cell::new(0);
+        let result = MaterializedViewStore::retry_secondary_validation(
+            false,
+            || {
+                catchups.set(catchups.get() + 1);
+                Ok(())
+            },
+            || {
+                validations.set(validations.get() + 1);
+                decode_consumer_manifest_entries(std::iter::once(Err(source.clone()))).map(|_| ())
+            },
+        );
+        assert!(result.as_ref().is_err_and(is_transient_missing_sst));
+        assert_eq!(validations.get(), MISSING_SST_ATTEMPTS);
+        assert_eq!(catchups.get(), MISSING_SST_ATTEMPTS - 1);
+
+        let mut attempts = Vec::new();
+        let result = retry_missing_sst(|attempt| {
+            attempts.push(attempt);
+            Err::<(), _>(MaterializedViewStoreError::SchemaMismatch {
+                persisted: 0,
+                running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(MaterializedViewStoreError::SchemaMismatch { .. })
+        ));
+        assert_eq!(attempts, [1]);
+        Ok(())
+    }
+
+    fn missing_manifest_sst_error() -> Result<rust_rocksdb::Error> {
         let temporary = tempdir()?;
         let options = rust_rocksdb::Options::default();
         let mut writer = rust_rocksdb::SstFileWriter::create(&options);
@@ -3850,11 +3930,7 @@ mod tests {
         let Err(source) = writer.open(missing_table) else {
             eyre::bail!("an SST in a missing directory must fail to open");
         };
-        let Err(error) = decode_consumer_manifest_entries(std::iter::once(Err(source))) else {
-            eyre::bail!("manifest iteration must report the RocksDB error");
-        };
-        assert!(is_transient_secondary_missing_sst(&error), "{error}");
-        Ok(())
+        Ok(source)
     }
 
     #[test]
