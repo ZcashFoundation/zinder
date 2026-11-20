@@ -246,19 +246,61 @@ async fn concurrent_forwarding_shares_discovery_and_schedule_but_checks_each_tip
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::time::resume();
-    let refusal = fixture
-        .adapter
-        .send_transaction(send())
-        .await
-        .err()
-        .ok_or_else(|| eyre!("an expired capability allowed forwarding"))?;
-    assert_eq!(refusal.code(), Code::FailedPrecondition);
+    let responses: [_; 2] = tokio::join!(
+        fixture.adapter.send_transaction(send()),
+        other.send_transaction(send())
+    )
+    .into();
+    for result in responses {
+        let refusal = result
+            .err()
+            .ok_or_else(|| eyre!("an expired capability allowed forwarding"))?;
+        assert_eq!(refusal.code(), Code::FailedPrecondition);
+    }
     assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 2);
     assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 3);
 
     broadcasts.store(true, std::sync::atomic::Ordering::Relaxed);
     fixture.adapter.send_transaction(send()).await?;
     assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_forwarding_shares_a_failed_tip_verification_and_can_retry() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip = chain.tip_hash().ok_or_else(|| eyre!("missing tip"))?;
+    let fixture = Fixture::from_chain(
+        &chain,
+        &super::one_upgrade_per_height()?,
+        [
+            method("getblockhash").reply(RpcReply::result(json!("fe".repeat(32)))),
+            method("getblockhash")
+                .reply_with(move |_| RpcReply::result(json!(encode_rpc_block_hash_hex(tip)))),
+            method("sendrawtransaction").reply_with(|_| RpcReply::result(json!("01".repeat(32)))),
+        ],
+        Duration::from_secs(2),
+    )?;
+    let responses: [_; 3] = tokio::join!(
+        fixture.adapter.send_transaction(send()),
+        fixture.adapter.send_transaction(send()),
+        fixture.adapter.send_transaction(send())
+    )
+    .into();
+    for result in responses {
+        node_unavailable(
+            &result
+                .err()
+                .ok_or_else(|| eyre!("forwarded after a failed tip check"))?,
+        );
+    }
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 1);
+    assert!(fixture.node.requests_for("sendrawtransaction")?.is_empty());
+
+    fixture.adapter.send_transaction(send()).await?;
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 1);
     Ok(())
 }
 

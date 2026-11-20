@@ -1,6 +1,8 @@
 //! Transaction broadcast through the ordered node list, with every endpoint
 //! verified on first contact.
 
+#[cfg(feature = "light-wallet-qualification")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
@@ -1199,7 +1201,17 @@ async fn verify_served_tip(
 #[cfg(feature = "light-wallet-qualification")]
 #[derive(Default)]
 pub(crate) struct QualificationNodeVerification {
-    schedule: Mutex<Option<(VerificationBasis, NetworkUpgradeActivations, Instant)>>,
+    schedule: Mutex<QualificationSchedule>,
+    failed_attempts: AtomicU64,
+}
+
+#[cfg(feature = "light-wallet-qualification")]
+#[derive(Default)]
+enum QualificationSchedule {
+    #[default]
+    Unverified,
+    Refused(VerificationBasis, VerificationRefusal),
+    Verified(VerificationBasis, NetworkUpgradeActivations, Instant),
 }
 
 #[cfg(feature = "light-wallet-qualification")]
@@ -1209,30 +1221,59 @@ impl QualificationNodeVerification {
         source: &impl BroadcastNodeProbe,
         target: &VerificationTarget,
     ) -> Result<(), SourceError> {
+        // Callers already waiting on a failed attempt share its outcome. A caller
+        // arriving after it can retry even while earlier waiters are draining.
+        let observed_failures = self.failed_attempts.load(Ordering::Acquire);
         let mut schedule = self.schedule.lock().await;
-        if !schedule
-            .as_ref()
-            .is_some_and(|(basis, activations, checked)| {
-                *basis == target.basis
+        let verified = matches!(
+            &*schedule,
+            QualificationSchedule::Verified(basis, activations, checked)
+                if *basis == target.basis
                     && checked.elapsed() < STALE_VERIFICATION_GRACE
                     && target.agrees_with(activations)
-            })
-        {
-            *schedule = None;
-            let evidence = verify_node_endpoint(source, target)
-                .await
-                .map_err(|failure| match failure {
-                    VerificationFailure::Refused(refusal) => refusal.error(),
+        );
+        if verified {
+            drop(schedule);
+            let tip_check = verify_served_tip(source, target).await;
+            if tip_check.is_err() {
+                *self.schedule.lock().await = QualificationSchedule::Unverified;
+            }
+            return tip_check;
+        }
+
+        if self.failed_attempts.load(Ordering::Relaxed) != observed_failures {
+            return Err(match *schedule {
+                QualificationSchedule::Refused(basis, refusal) if basis == target.basis => {
+                    refusal.error()
+                }
+                QualificationSchedule::Unverified
+                | QualificationSchedule::Refused(..)
+                | QualificationSchedule::Verified(..) => SourceError::NodeUnavailable {
+                    reason: "concurrent verification did not confirm the served schedule and tip"
+                        .to_owned(),
+                },
+            });
+        }
+
+        *schedule = QualificationSchedule::Unverified;
+        let evidence = verify_node_endpoint(source, target)
+            .await
+            .map_err(|failure| {
+                self.failed_attempts.fetch_add(1, Ordering::Release);
+                match failure {
+                    VerificationFailure::Refused(refusal) => {
+                        *schedule = QualificationSchedule::Refused(target.basis, refusal);
+                        refusal.error()
+                    }
                     VerificationFailure::Inconclusive(error) => error,
-                })?;
-            *schedule = Some((target.basis, evidence.node_activations, Instant::now()));
-            return Ok(());
-        }
+                }
+            })?;
+        *schedule = QualificationSchedule::Verified(
+            target.basis,
+            evidence.node_activations,
+            Instant::now(),
+        );
         drop(schedule);
-        let tip_check = verify_served_tip(source, target).await;
-        if tip_check.is_err() {
-            *self.schedule.lock().await = None;
-        }
-        tip_check
+        Ok(())
     }
 }

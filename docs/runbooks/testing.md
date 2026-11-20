@@ -475,7 +475,9 @@ schedule revision changes during verification, the request returns `UNAVAILABLE`
 Requests share evidence of broadcast support and agreement with the writer's
 schedule through the next block for up to one minute. A failed tip check, a
 new schedule revision, or a change to the upgrade active at the next block
-requires fresh discovery. The node can advance while answering. Compare forwarded
+requires fresh discovery. If discovery fails, concurrent callers waiting for it
+return the refusal or a retryable error. The next request can retry immediately.
+The node can advance while answering. Compare forwarded
 answers with wallet serving while the node stays at the same hash and height.
 
 The node orders UTXOs within a block by position. Qualification needs every
