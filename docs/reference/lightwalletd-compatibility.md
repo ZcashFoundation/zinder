@@ -119,7 +119,7 @@ These outcomes fail the call before any block is sent:
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
-| A block missing inside retained history | `UNAVAILABLE` |
+| A block missing from the first byte-bounded chunk | `UNAVAILABLE` |
 | A stored block in the first byte-bounded chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
 
 Once a stream has started, a client can rely on the following:
@@ -129,7 +129,7 @@ Once a stream has started, a client can rely on the following:
 3. **One chain as read.** An ascending stream that crosses a reorg above its last sent block continues on the new branch. A descending stream continues on the chain it started on. An `OK` stream does not promise its blocks are still the best chain on arrival.
 4. **Reorg ending.** A stream ends with `ABORTED` when a reorg replaces a block it already linked to (ascending) or the next height it must send (descending), as lightwalletd v0.5.5 and later do. It ends with `OUT_OF_RANGE` when a reorg leaves the tip below a height it still must send. To recover, request again from the height the wallet needs.
 5. **Settled history never ends a stream.** Ingest never replaces a block at or below the settled tip, so only the last reorg window (1,000 blocks by default) can end a stream early.
-6. **Other mid-stream endings.** A storage failure ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
+6. **Other mid-stream endings.** A storage failure, such as a block missing from a later chunk, ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
 7. **No time limit.** Elapsed time, new blocks, and slow reading never end a stream. Shutdown, unanswered keepalive pings, and the listener's send-stall deadline do.
 
 A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. Until the server's gRPC layer has taken every block of the first chunk from the stream to send it, the server reads only the first two chunks, however few blocks they hold. The gRPC layer takes blocks as it fills its send buffer, so this bounds the reads ahead of that layer, not ahead of what the client has received. After that, the server reads ahead by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
