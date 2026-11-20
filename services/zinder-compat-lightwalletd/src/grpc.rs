@@ -83,7 +83,7 @@ const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 /// Fewest outputs the first page of one address's UTXO stream reads.
 const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
-pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
+pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 20_000;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
 ///
 /// The stream remembers each id it sent so it can skip repeats, and that set

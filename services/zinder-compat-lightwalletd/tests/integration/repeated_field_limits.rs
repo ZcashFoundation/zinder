@@ -110,6 +110,38 @@ async fn a_mempool_request_of_empty_txid_suffixes_is_refused_before_decoding() -
 }
 
 #[tokio::test]
+async fn mempool_suffix_counts_select_the_handler_or_predecode_refusal() -> Result<()> {
+    let mut client = spawn_compat_server().await?;
+
+    for count in [20_001u32, 40_000, 40_001] {
+        let refusal = client
+            .get_mempool_tx(lightwalletd::GetMempoolTxRequest {
+                exclude_txid_suffixes: (0..count).map(|i| i.to_be_bytes().to_vec()).collect(),
+                pool_types: Vec::new(),
+            })
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected a refusal for {count} suffixes"))?;
+
+        assert_eq!(refusal.code(), Code::InvalidArgument);
+        if count <= 40_000 {
+            assert_eq!(
+                refusal.message(),
+                format!(
+                    "exclude_txid_suffixes contains {count} entries; at most 20000 are allowed"
+                ),
+            );
+        } else {
+            assert_eq!(
+                refusal.message(),
+                "GetMempoolTx request field exclude_txid_suffixes carries 40001 elements; at most 40000 are accepted"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_block_range_of_packed_pool_types_is_refused_before_decoding() -> Result<()> {
     let mut client = spawn_compat_server().await?;
     let mut request = block_range(1, FIXTURE_TIP_HEIGHT);

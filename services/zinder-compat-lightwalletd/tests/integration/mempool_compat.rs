@@ -78,9 +78,11 @@ async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_be
     let (wallet_query, _store_fixture) = single_block_serving_query()?;
     let adapter = LightwalletdGrpcAdapter::new(wallet_query);
 
+    let mut suffixes: Vec<_> = (0..19_999u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    suffixes.push(vec![0; 33]);
     let outcome = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
-            exclude_txid_suffixes: vec![vec![0; 33]],
+            exclude_txid_suffixes: suffixes,
             pool_types: Vec::new(),
         }))
         .await;
@@ -88,29 +90,9 @@ async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_be
         .err()
         .ok_or_else(|| eyre!("expected invalid excluded txid suffix"))?;
     assert_eq!(status.code(), Code::InvalidArgument);
-    assert_eq!(status.message(), "exclude txid 0 is larger than 32 bytes");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn lightwalletd_get_mempool_tx_rejects_too_many_excluded_txid_suffixes_before_surface_lookup()
--> eyre::Result<()> {
-    let (wallet_query, _store_fixture) = single_block_serving_query()?;
-    let adapter = LightwalletdGrpcAdapter::new(wallet_query);
-
-    let outcome = adapter
-        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
-            exclude_txid_suffixes: vec![vec![0xAA]; 1_025],
-            pool_types: Vec::new(),
-        }))
-        .await;
-    let status = outcome
-        .err()
-        .ok_or_else(|| eyre!("expected too many excluded txid suffixes to be rejected"))?;
-    assert_eq!(status.code(), Code::InvalidArgument);
     assert_eq!(
         status.message(),
-        "exclude_txid_suffixes contains 1025 entries; at most 1024 are allowed"
+        "exclude txid 19999 is larger than 32 bytes"
     );
     Ok(())
 }
@@ -136,7 +118,7 @@ async fn lightwalletd_get_mempool_tx_rejects_invalid_pool_type_before_surface_lo
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::Result<()> {
+async fn lightwalletd_get_mempool_tx_filters_with_twenty_thousand_suffixes() -> eyre::Result<()> {
     let (wallet_query, _store_fixture) = single_block_serving_query()?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
         synthetic_entry(0xAA, synthetic_chain_epoch())?,
@@ -144,13 +126,23 @@ async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::R
     ]);
     let adapter =
         LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface));
-
-    let suffix = vec![0xAA; 4];
-    let response = adapter
-        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
-            exclude_txid_suffixes: vec![suffix],
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(
+        zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
+            .add_service(adapter.into_server())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let mut client =
+        lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient::connect(endpoint)
+            .await?;
+    let mut suffixes: Vec<_> = (0..19_999u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    suffixes.push(vec![0xAA; 32]);
+    let response = client
+        .get_mempool_tx(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: suffixes,
             pool_types: Vec::new(),
-        }))
+        })
         .await?
         .into_inner();
     let collected = collect_compact_txids(response).await?;
