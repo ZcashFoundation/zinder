@@ -56,9 +56,9 @@ A restart during a first sync starts the interrupted build over; see
 ### Shutdown
 
 On a termination signal, a runtime reports `shutting_down` at once and stops
-accepting new requests. It then cancels background tasks, waits for its
-servers and owned tasks, and closes its operational endpoint. Only the owner
-of a store closes it, and readers make no final writes.
+accepting new requests. It then stops its background tasks and its servers,
+including the operational endpoint, and waits for them. Only the owner of a
+store closes it, and readers make no final writes.
 
 `zinder-query` and `zinder-compat-lightwalletd` publish `shutting_down`
 before their gRPC listener starts to drain, so `/readyz` and their
