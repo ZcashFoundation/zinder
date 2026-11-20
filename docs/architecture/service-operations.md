@@ -101,8 +101,15 @@ ended.
 
 A client that has stopped reading cannot receive its status, so step 5 gives
 up on its connection after 2 seconds; a client that reads gets its status
-within milliseconds. The two bounds keep shutdown within the single-volume
-entrypoint's 20-second window for its processes to exit.
+within milliseconds. These limits bound the gRPC drain. The single-volume
+wallet-serving entrypoint gives its processes 20 seconds to exit.
+
+In `compact-blocks` mode, the publisher interrupts pending writer-status
+reads and retry delays when shutdown begins, including during candidate
+convergence. It keeps the published reader and skips refresh-failure
+reporting for the interrupted refresh. RocksDB work already running finishes,
+and the publisher closes its serving generations after the drain. Slow
+storage can extend process shutdown beyond the entrypoint's grace window.
 
 ### Background task failure
 

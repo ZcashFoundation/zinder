@@ -68,6 +68,20 @@ async fn tear_down_on_blocking_thread<T: Send + 'static>(
     Ok(())
 }
 
+async fn close_unpublished_generation<T: Send + 'static>(generation: Option<T>) {
+    let Some(generation) = generation else {
+        return;
+    };
+    if let Err(error) = tokio::task::spawn_blocking(move || drop(generation)).await {
+        tracing::error!(
+            target: "zinder::compat_lightwalletd",
+            event = "compact_serving_candidate_teardown_failed",
+            error = %error,
+            "unpublished compact-block generation teardown failed"
+        );
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ConvergenceFailure {
     #[error("writer status transport failed: {0}")]
@@ -240,8 +254,10 @@ impl CompactBlockPublisher {
                 readiness: &readiness,
                 active: None,
             },
+            &CancellationToken::new(),
         )
         .await
+        .and_then(|candidate| candidate.ok_or_else(candidate_unavailable))
         .map_err(|failure| match failure {
             ConvergenceFailure::Storage(error) => error,
             failure @ (ConvergenceFailure::WriterStatusTransport(_)
@@ -296,13 +312,18 @@ impl CompactBlockPublisher {
                 .refresh_interval(self.config.catchup_interval);
             loop {
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(refresh_interval) => {}
                     () = self.writer_attestation.stale_deadline().passed() => {}
                 }
                 let deadline = self.writer_attestation.stale_deadline();
                 let admission = self.readiness.inputs.canonical_admission().clone();
-                refresh_within_stale_deadline(deadline, &admission, self.refresh()).await;
+                refresh_within_stale_deadline(deadline, &admission, self.refresh_once(&cancel))
+                    .await;
+                if cancel.is_cancelled() {
+                    break;
+                }
                 self.writer_attestation.end_lapsed_allowance();
                 self.record_resource_gauges().await;
             }
@@ -315,14 +336,19 @@ impl CompactBlockPublisher {
         clippy::too_many_lines,
         reason = "Replacement admission keeps writer attestation, generation leasing, and readiness transitions together."
     )]
-    async fn refresh(&mut self) {
+    async fn refresh_once(&mut self, shutdown: &CancellationToken) {
         let active = self.slot.capture();
         #[cfg(feature = "light-wallet-qualification")]
         self.readiness.inputs.begin_canonical_refresh(
             &mut self.writer_attestation,
             active.event_fence().visible_tip().height.value(),
         );
-        let status = match self.writer_status.fetch().await {
+        let status = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            status = self.writer_status.fetch() => status,
+        };
+        let status = match status {
             Ok(status) => status,
             Err(_error) => {
                 // A writer last seen parked keeps its halt through an outage;
@@ -434,6 +460,7 @@ impl CompactBlockPublisher {
                 readiness: &self.readiness,
                 active: Some(&active),
             },
+            shutdown,
         )
         .await;
         // A halt or store damage a status read during convergence reported
@@ -443,7 +470,8 @@ impl CompactBlockPublisher {
             return;
         }
         let (candidate, attesting_status) = match converged {
-            Ok(converged) => converged,
+            Ok(Some(converged)) => converged,
+            Ok(None) => return,
             Err(ConvergenceFailure::WriterStatusTransport(_)) => {
                 let cause = self.writer_attestation.stale_allowance().map_or(
                     ReadinessCause::WriterStatusUnavailable,
@@ -483,7 +511,12 @@ impl CompactBlockPublisher {
                 return;
             }
         };
-        let Ok(reader) = admit_generation(candidate).await else {
+        let admitted = admit_generation(candidate).await;
+        if shutdown.is_cancelled() {
+            close_unpublished_generation(admitted.ok()).await;
+            return;
+        }
+        let Ok(reader) = admitted else {
             self.record_failure(
                 ReadinessCause::StorageUnavailable,
                 active.event_fence().visible_tip().height.value(),
@@ -722,12 +755,17 @@ async fn open_generation_awaiting_schedule(
     config: &CompactBlockServingConfig,
     generation: CandidateGeneration<'_>,
     retry_delay: Duration,
-) -> Result<RocksDbCanonicalSecondary, ConvergenceFailure> {
+    shutdown: &CancellationToken,
+) -> Result<Option<RocksDbCanonicalSecondary>, ConvergenceFailure> {
     let deadline = tokio::time::Instant::now() + config.convergence_timeout;
     let mut waiting_logged = false;
-    loop {
+    while !shutdown.is_cancelled() {
         match open_generation(config, generation).await {
-            Ok(candidate) => return Ok(candidate),
+            opened if shutdown.is_cancelled() => {
+                close_unpublished_generation(opened.ok()).await;
+                break;
+            }
+            Ok(candidate) => return Ok(Some(candidate)),
             Err(CompactBlockServingError::Storage(
                 CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
             )) if tokio::time::Instant::now() < deadline => {
@@ -745,20 +783,30 @@ async fn open_generation_awaiting_schedule(
             )) => return Err(ConvergenceFailure::WriterScheduleNotAdmitted),
             Err(error) => return Err(ConvergenceFailure::Storage(error)),
         }
-        tokio::time::sleep(retry_delay).await;
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(retry_delay) => {}
+        }
     }
+    Ok(None)
 }
 
 /// Opens a candidate in `generation`, converges it on the writer fence, and
-/// returns it with the writer status that attested it.
+/// returns it with the writer status that attested it, or `None` on shutdown.
 async fn converge_candidate<'a>(
     writer_status: &'a mut WriterStatus,
     config: &CompactBlockServingConfig,
     generation: CandidateGeneration<'_>,
     served: ServedReader<'a>,
-) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
+    shutdown: &CancellationToken,
+) -> Result<Option<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse)>, ConvergenceFailure>
+{
     let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
-    let candidate = open_generation_awaiting_schedule(config, generation, retry_delay).await?;
+    let Some(candidate) =
+        open_generation_awaiting_schedule(config, generation, retry_delay, shutdown).await?
+    else {
+        return Ok(None);
+    };
     let mut probe = CandidateFenceProbe {
         writer_status,
         candidate: Some(candidate),
@@ -773,15 +821,16 @@ async fn converge_candidate<'a>(
             initial_delay: retry_delay,
             max_delay: retry_delay,
         },
-        &CancellationToken::new(),
+        shutdown,
     )
     .await;
-    match outcome {
-        Ok(CanonicalFenceConvergence::Converged(attesting_status)) => probe
-            .candidate
-            .map(|candidate| (candidate, *attesting_status))
-            .ok_or_else(candidate_unavailable),
-        Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
+    let unpublished = match outcome {
+        Ok(CanonicalFenceConvergence::Converged(attesting_status)) => {
+            let candidate = probe.candidate.ok_or_else(candidate_unavailable)?;
+            return Ok(Some((candidate, *attesting_status)));
+        }
+        Ok(CanonicalFenceConvergence::Cancelled) => Ok(None),
+        Ok(CanonicalFenceConvergence::Trailing(_))
         | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
             Err(ConvergenceFailure::WriterAhead)
         }
@@ -789,7 +838,9 @@ async fn converge_candidate<'a>(
         Err(CanonicalFenceConvergenceError::Diverged(_)) => {
             Err(ConvergenceFailure::WriterFenceDiverged)
         }
-    }
+    };
+    close_unpublished_generation(probe.candidate).await;
+    unpublished
 }
 
 #[cfg(test)]
@@ -843,6 +894,12 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
     }
 
+    impl CompactBlockPublisher {
+        async fn refresh(&mut self) {
+            self.refresh_once(&CancellationToken::new()).await;
+        }
+    }
+
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
@@ -851,8 +908,9 @@ mod tests {
         queued_statuses:
             Arc<Mutex<std::collections::VecDeque<Option<CanonicalWriterStatusResponse>>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
-        /// Accepts each writer-status call and never answers it.
+        /// Leaves writer-status calls pending once all queued answers have been served.
         stalled: Arc<std::sync::atomic::AtomicBool>,
+        stalled_read: Arc<tokio::sync::Notify>,
         /// How long each writer-status call waits before it answers.
         answer_delay: Arc<Mutex<Duration>>,
     }
@@ -864,6 +922,7 @@ mod tests {
                 queued_statuses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stalled_read: Arc::default(),
                 answer_delay: Arc::new(Mutex::new(Duration::ZERO)),
             }
         }
@@ -901,9 +960,6 @@ mod tests {
             &self,
             _request: Request<CanonicalWriterStatusRequest>,
         ) -> Result<tonic::Response<CanonicalWriterStatusResponse>, tonic::Status> {
-            if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
-                std::future::pending::<()>().await;
-            }
             let answer_delay = *self.answer_delay.lock();
             if !answer_delay.is_zero() {
                 tokio::time::sleep(answer_delay).await;
@@ -917,6 +973,10 @@ mod tests {
                 Some(None) => Err(tonic::Status::unavailable(
                     "fixture queued writer status outage",
                 )),
+                None if self.stalled.load(std::sync::atomic::Ordering::Relaxed) => {
+                    self.stalled_read.notify_one();
+                    std::future::pending().await
+                }
                 None => Ok(tonic::Response::new(self.writer_status.lock().clone())),
             }
         }
@@ -1955,6 +2015,100 @@ mod tests {
         drop(primary);
         let _ = shutdown_sender.send(());
         server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_the_writer_read_during_candidate_convergence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_shutdown_interrupts_stalled_read(true).await
+    }
+
+    #[test]
+    fn cancelled_convergence_waits_for_the_blocking_pool_to_close_its_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        one_blocking_thread_runtime()?.block_on(async {
+            let mut harness = publisher_with_stalled_writer_read(true).await?;
+            let shutdown = CancellationToken::new();
+            {
+                let mut refresh = std::pin::pin!(harness.publisher.refresh_once(&shutdown));
+                tokio::select! {
+                    () = harness.control.stalled_read.notified() => {}
+                    () = &mut refresh => return Err("refresh ended before the candidate's writer read".into()),
+                }
+                let held = BlockingGate::hold().await?;
+                shutdown.cancel();
+                assert!(
+                    poll_once(&mut refresh).is_pending(),
+                    "the refresh must wait for the held blocking thread to close its candidate"
+                );
+                held.release().await?;
+                refresh.await;
+            }
+            harness.stop().await
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_the_initial_writer_read() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_shutdown_interrupts_stalled_read(false).await
+    }
+
+    async fn publisher_with_stalled_writer_read(
+        converge_candidate: bool,
+    ) -> Result<LongRangeHarness, Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(2);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
+        )
+        .await?;
+        harness.writer.append_live_block(&chain)?;
+        if converge_candidate {
+            harness
+                .control
+                .queue_writer_status(lifecycle_writer_status(harness.writer.canonical_primary()?));
+        }
+        harness.control.stall();
+        harness.publisher.config.convergence_timeout = Duration::from_mins(1);
+        Ok(harness)
+    }
+
+    #[expect(
+        clippy::future_not_send,
+        reason = "The current-thread tests poll the publisher on the thread that owns the metrics recorder."
+    )]
+    async fn assert_shutdown_interrupts_stalled_read(
+        converge_candidate: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let harness = publisher_with_stalled_writer_read(converge_candidate).await?;
+        let published = harness.slot.capture();
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = harness.publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            harness.control.stalled_read.notified(),
+        )
+        .await?;
+        cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(Duration::from_secs(2), publisher_task).await???;
+
+        assert!(Arc::ptr_eq(&published, &harness.slot.capture()));
+        assert!(
+            !metrics
+                .render()
+                .lines()
+                .any(|line| line.starts_with("zinder_compat_compact_refresh_failures_total"))
+        );
+        let _ = harness.shutdown.send(());
+        harness.server.await??;
         Ok(())
     }
 
@@ -5178,7 +5332,42 @@ mod tests {
 
 #[cfg(test)]
 mod teardown_tests {
-    use super::{CompactBlockServingError, tear_down_on_blocking_thread};
+    use super::{
+        CompactBlockServingError, close_unpublished_generation, tear_down_on_blocking_thread,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Notify, mpsc};
+
+    #[tokio::test]
+    async fn a_slow_candidate_close_leaves_the_async_worker_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct SlowClose {
+            started: Arc<Notify>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Drop for SlowClose {
+            fn drop(&mut self) {
+                self.started.notify_one();
+                let _ = self.release.blocking_recv();
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let (release, receiver) = mpsc::channel(1);
+        let closing = tokio::spawn(close_unpublished_generation(Some(SlowClose {
+            started: Arc::clone(&started),
+            release: receiver,
+        })));
+        started.notified().await;
+        assert!(
+            !closing.is_finished(),
+            "cleanup must wait for the close to finish"
+        );
+        release.send(()).await?;
+        closing.await?;
+        Ok(())
+    }
 
     /// Stands in for a publisher whose secondary panics while closing.
     struct PanicsWhenDropped;
