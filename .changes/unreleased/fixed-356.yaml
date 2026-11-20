@@ -1,0 +1,6 @@
+kind: fixed
+body: The reference Caddy configuration reuses up to 16 readiness connections, so concurrent wallet calls can be admitted while block ranges continue streaming.
+time: 2026-11-20T08:55:27.839832209Z
+custom:
+    Bump: patch
+    PR: "356"
