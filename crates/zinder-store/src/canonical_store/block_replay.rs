@@ -101,16 +101,12 @@ impl<'a> CanonicalReplayRangeScan<'a> {
     }
 }
 
-fn validate_incremental_replay_range_bound(
+pub(super) fn validate_incremental_replay_range_bound(
     range: BlockHeightRange,
 ) -> Result<(), CanonicalStoreError> {
-    let requested_block_count = range
-        .end
-        .value()
-        .checked_sub(range.start.value())
-        .and_then(|distance| distance.checked_add(1))
-        .unwrap_or(0);
-    if requested_block_count > MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS {
+    let requested_block_count =
+        (u64::from(range.end.value()) + 1).saturating_sub(u64::from(range.start.value()));
+    if requested_block_count > u64::from(MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS) {
         return Err(CanonicalStoreError::block_replay_sequence(format!(
             "requested replay range has {requested_block_count} blocks; maximum is {MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS}"
         )));

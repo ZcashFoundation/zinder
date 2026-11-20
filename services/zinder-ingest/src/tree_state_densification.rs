@@ -216,7 +216,7 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         resource_budget: context.resource_budget,
     }
     .open_when_published(
-        Some(&context.gate),
+        || context.gate.record_open_metric(),
         &cancel,
         "tree_state_densification_secondary_unavailable",
     )

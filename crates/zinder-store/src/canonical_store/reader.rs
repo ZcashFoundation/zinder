@@ -5,11 +5,11 @@ use std::mem::size_of;
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
-    ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
-    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-    UnixTimestampMillis,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
+    CompactBlockArtifact, Network, NetworkUpgradeActivations, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
@@ -17,9 +17,12 @@ use super::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore,
     block_load::{
-        BLOCK_HEADER_VALUE_LEN, decode_served_tree_state_checkpoint, decode_tree_state_checkpoint,
-        encode_block_position, encode_transaction_position, encode_tree_state_checkpoint,
+        BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, decode_served_tree_state_checkpoint,
+        decode_stored_tree_state_roots, decode_tree_state_checkpoint, encode_block_position,
+        encode_transaction_position, encode_tree_state_checkpoint,
     },
+    block_replay::validate_incremental_replay_range_bound,
+    pool_presence_mismatch,
     publication::column_family,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
@@ -31,13 +34,16 @@ use super::{
     subtree_load::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_position,
     },
-    tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome},
+    tree_state_replay::{
+        TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, refuse_unadmitted_activations,
+    },
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
 const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
 const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
+const TREE_STATE_ROOTS_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const SUBTREE_ROOT_PAGE_SIZE: usize = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST as usize;
 
 pub(super) trait CanonicalServingRead {
@@ -384,6 +390,37 @@ macro_rules! impl_canonical_typed_reads {
                 super::tree_state_replay::replay_tree_state(
                     self,
                     replay,
+                    network_upgrade_activations,
+                )
+            }
+
+            /// Batch-reads stored final note-commitment roots from
+            /// `tree_state_checkpoint` rows across an inclusive height range.
+            ///
+            /// The output preserves range order and contains one entry per
+            /// requested height, up to [`crate::MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS`].
+            /// A height outside retained history (below the
+            /// first retained block or above the visible tip) or without a
+            /// stored checkpoint row returns `None`. For each stored row inside
+            /// retained history, this checks the exact framing of every present
+            /// frontier without decoding or hashing tree nodes, verifies that
+            /// the present pools match `network_upgrade_activations` at that
+            /// height, and verifies that the row's block time matches the
+            /// canonical block header at that height; any mismatch fails closed
+            /// as store damage ([`CanonicalStoreError::PublicationRefused`]).
+            ///
+            /// `network_upgrade_activations` must agree with the schedule this
+            /// store admits through `range.end`; otherwise the read fails with
+            /// [`CanonicalStoreError::AdmissionRefused`]. The returned roots carry
+            /// no frontier bytes and cannot seed a commitment-tree accumulator.
+            pub fn stored_final_note_commitment_roots_in_range(
+                &self,
+                range: BlockHeightRange,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Vec<Option<BlockFinalNoteCommitmentRoots>>, CanonicalStoreError> {
+                read_stored_final_note_commitment_roots_in_range(
+                    self,
+                    range,
                     network_upgrade_activations,
                 )
             }
@@ -1023,6 +1060,148 @@ fn stored_tree_state_block_id(
         CanonicalStoreError::publication("tree-state checkpoint header is absent")
     })?;
     Ok(BlockId::new(checkpoint_height, header.block_hash))
+}
+
+fn read_stored_final_note_commitment_roots_in_range(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<Vec<Option<BlockFinalNoteCommitmentRoots>>, CanonicalStoreError> {
+    validate_incremental_replay_range_bound(range)?;
+    if range.start > range.end {
+        return Ok(Vec::new());
+    }
+    refuse_unadmitted_activations(store, range.end, network_upgrade_activations)?;
+    let retained = retained_compact_block_span(store);
+    let mut roots = vec![None; range.into_iter().len()];
+    let overlap_start = range.start.max(retained.start);
+    let overlap_end = range.end.min(retained.end);
+    if overlap_start > overlap_end {
+        return Ok(roots);
+    }
+    let mut heights = BlockHeightRange::inclusive(overlap_start, overlap_end).into_iter();
+    loop {
+        let batch = heights
+            .by_ref()
+            .take(TREE_STATE_ROOTS_MULTI_GET_BATCH_SIZE)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        for block_roots in read_stored_roots_batch(store, &batch, network_upgrade_activations)? {
+            let offset = usize::try_from(block_roots.height.value() - range.start.value())
+                .map_err(|_| {
+                    CanonicalStoreError::publication("block height offset exceeds usize")
+                })?;
+            let slot = roots.get_mut(offset).ok_or_else(|| {
+                CanonicalStoreError::publication("stored roots range offset is out of bounds")
+            })?;
+            *slot = Some(block_roots);
+        }
+    }
+    Ok(roots)
+}
+
+fn read_stored_roots_batch(
+    store: &impl CanonicalServingRead,
+    heights: &[BlockHeight],
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<Vec<BlockFinalNoteCommitmentRoots>, CanonicalStoreError> {
+    let db = &store.serving_open().db;
+    let checkpoint_family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    let keys = heights
+        .iter()
+        .copied()
+        .map(encode_block_position)
+        .collect::<Vec<_>>();
+    let checkpoint_rows = db.batched_multi_get_cf_slice(
+        &checkpoint_family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+    );
+    let mut decoded = Vec::new();
+    for (height, row) in heights.iter().copied().zip(checkpoint_rows) {
+        let encoded = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "tree-state checkpoint roots range read",
+            source,
+        })?;
+        let Some(encoded) = encoded else {
+            continue;
+        };
+        let stored = decode_checked_stored_roots(height, &encoded, network_upgrade_activations)?;
+        decoded.push((height, stored));
+    }
+    if decoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    resolve_stored_roots_headers(store, &decoded)
+}
+
+fn decode_checked_stored_roots(
+    height: BlockHeight,
+    encoded: &[u8],
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<StoredTreeStateRoots, CanonicalStoreError> {
+    let stored = decode_stored_tree_state_roots(encoded).map_err(|source| {
+        CanonicalStoreError::publication(format!(
+            "tree-state checkpoint at height {} is invalid: {source}",
+            height.value()
+        ))
+    })?;
+    if let Some(mismatch) =
+        pool_presence_mismatch(network_upgrade_activations, height, |protocol| {
+            stored.has_pool(protocol)
+        })
+    {
+        return Err(CanonicalStoreError::publication(format!(
+            "tree-state checkpoint at height {} {}",
+            height.value(),
+            mismatch.describe()
+        )));
+    }
+    Ok(stored)
+}
+
+fn resolve_stored_roots_headers(
+    store: &impl CanonicalServingRead,
+    decoded: &[(BlockHeight, StoredTreeStateRoots)],
+) -> Result<Vec<BlockFinalNoteCommitmentRoots>, CanonicalStoreError> {
+    let db = &store.serving_open().db;
+    let header_family = column_family(db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let header_keys = decoded
+        .iter()
+        .map(|(height, _)| encode_block_position(*height))
+        .collect::<Vec<_>>();
+    let header_rows = db.batched_multi_get_cf_slice(
+        &header_family,
+        header_keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+    );
+    let mut resolved = Vec::with_capacity(decoded.len());
+    for ((height, stored), header_row) in decoded.iter().copied().zip(header_rows) {
+        let encoded_header = header_row
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "tree-state checkpoint header range read",
+                source,
+            })?
+            .ok_or_else(|| {
+                CanonicalStoreError::publication(format!(
+                    "tree-state checkpoint header at height {} is absent",
+                    height.value()
+                ))
+            })?;
+        let header = decode_block_header(height, &encoded_header)?;
+        if header.block_time != i64::from(stored.block_time_seconds) {
+            return Err(CanonicalStoreError::publication(format!(
+                "tree-state checkpoint at height {} has block time {} differing from canonical block time {}",
+                height.value(),
+                stored.block_time_seconds,
+                header.block_time,
+            )));
+        }
+        resolved.push(stored.into_block_roots(height, header.block_hash));
+    }
+    Ok(resolved)
 }
 
 fn read_subtree_roots(
