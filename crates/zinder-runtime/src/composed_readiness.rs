@@ -831,7 +831,10 @@ mod tests {
         unparked.publish_admission(ReadinessState::ready(Some(11)));
         assert!(matches!(
             unparked.admission_state().cause,
-            ReadinessCause::CanonicalStoreDamaged { height: Some(5), .. }
+            ReadinessCause::CanonicalStoreDamaged {
+                height: Some(5),
+                ..
+            }
         ));
     }
 

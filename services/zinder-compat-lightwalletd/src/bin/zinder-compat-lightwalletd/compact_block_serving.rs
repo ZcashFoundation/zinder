@@ -230,12 +230,19 @@ impl CompactBlockPublisher {
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
         let block_cache = SharedBlockCache::new(config.resource_budget.block_cache_bytes);
+        let mut writer_attestation =
+            WriterAttestation::new(config.network, config.staleness_ceiling);
         let (candidate, attesting_status) = converge_candidate(
             &mut writer_status,
             &config,
             CandidateGeneration {
                 block_cache: &block_cache,
                 generation: 0,
+            },
+            ServedReader {
+                attestation: &mut writer_attestation,
+                readiness: &readiness,
+                visible_height: None,
             },
         )
         .await
@@ -251,8 +258,6 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
-        let mut writer_attestation =
-            WriterAttestation::new(config.network, config.staleness_ceiling);
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             writer_attestation.attest();
@@ -390,16 +395,27 @@ impl CompactBlockPublisher {
             }
         }
         let candidate_generation = (self.active_generation + 1) % GENERATION_COUNT;
-        let (candidate, attesting_status) = match converge_candidate(
+        let converged = converge_candidate(
             &mut self.writer_status,
             &self.config,
             CandidateGeneration {
                 block_cache: &self.block_cache,
                 generation: candidate_generation,
             },
+            ServedReader {
+                attestation: &mut self.writer_attestation,
+                readiness: &self.readiness,
+                visible_height: Some(active.event_fence().visible_tip().height.value()),
+            },
         )
-        .await
-        {
+        .await;
+        // A halt or store damage a status read during convergence reported
+        // outlasts the failure that ended it.
+        if let (Err(_), Some(halt)) = (&converged, self.writer_attestation.remembered_halt()) {
+            self.readiness.publish_storage(halt);
+            return;
+        }
+        let (candidate, attesting_status) = match converged {
             Ok(converged) => converged,
             Err(ConvergenceFailure::WriterStatusTransport(_)) => {
                 let cause = self.writer_attestation.stale_allowance().map_or(
@@ -585,6 +601,16 @@ struct CandidateGeneration<'a> {
 struct CandidateFenceProbe<'a> {
     writer_status: &'a mut WriterStatus,
     candidate: Option<RocksDbCanonicalSecondary>,
+    served: ServedReader<'a>,
+}
+
+/// The reader a converging candidate would replace, which every writer
+/// status the convergence reads may refuse.
+struct ServedReader<'a> {
+    attestation: &'a mut WriterAttestation,
+    readiness: &'a CompactServingReadiness,
+    /// Visible tip height of the active reader, or `None` at bootstrap.
+    visible_height: Option<u32>,
 }
 
 impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
@@ -605,6 +631,18 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
             .fetch()
             .await
             .map_err(|error| ConvergenceFailure::WriterStatusTransport(error.message().to_owned()))
+    }
+
+    /// A halt or store damage the writer reports while the candidate trails
+    /// refuses traffic on the active reader at once.
+    fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
+        if let Some(refusal) = self
+            .served
+            .attestation
+            .observe(status, self.served.visible_height)
+        {
+            self.served.readiness.publish_storage(refusal);
+        }
     }
 }
 
@@ -666,16 +704,18 @@ async fn open_generation_awaiting_schedule(
 
 /// Opens a candidate in `generation`, converges it on the writer fence, and
 /// returns it with the writer status that attested it.
-async fn converge_candidate(
-    writer_status: &mut WriterStatus,
+async fn converge_candidate<'a>(
+    writer_status: &'a mut WriterStatus,
     config: &CompactBlockServingConfig,
     generation: CandidateGeneration<'_>,
+    served: ServedReader<'a>,
 ) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
     let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
     let candidate = open_generation_awaiting_schedule(config, generation, retry_delay).await?;
     let mut probe = CandidateFenceProbe {
         writer_status,
         candidate: Some(candidate),
+        served,
     };
     let outcome = converge_on_canonical_writer_fence(
         &mut probe,
@@ -1565,8 +1605,10 @@ mod tests {
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
-        /// Answers served once each, in order, before `writer_status`.
-        queued_statuses: Arc<Mutex<std::collections::VecDeque<CanonicalWriterStatusResponse>>>,
+        /// Answers served once each, in order, before `writer_status`; `None`
+        /// answers with an outage.
+        queued_statuses:
+            Arc<Mutex<std::collections::VecDeque<Option<CanonicalWriterStatusResponse>>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
         /// Accepts each writer-status call and never answers it.
         stalled: Arc<std::sync::atomic::AtomicBool>,
@@ -1588,7 +1630,11 @@ mod tests {
         }
 
         fn queue_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
-            self.queued_statuses.lock().push_back(writer_status);
+            self.queued_statuses.lock().push_back(Some(writer_status));
+        }
+
+        fn queue_outage(&self) {
+            self.queued_statuses.lock().push_back(None);
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -1614,9 +1660,13 @@ mod tests {
                 return Err(tonic::Status::unavailable("fixture writer status outage"));
             }
             let queued = self.queued_statuses.lock().pop_front();
-            Ok(tonic::Response::new(
-                queued.unwrap_or_else(|| self.writer_status.lock().clone()),
-            ))
+            match queued {
+                Some(Some(writer_status)) => Ok(tonic::Response::new(writer_status)),
+                Some(None) => Err(tonic::Status::unavailable(
+                    "fixture queued writer status outage",
+                )),
+                None => Ok(tonic::Response::new(self.writer_status.lock().clone())),
+            }
         }
 
         async fn event_page(
@@ -2614,6 +2664,68 @@ mod tests {
         publisher.refresh().await;
         assert!(readiness.report().is_ready);
 
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// Store damage reported while a candidate trails the writer outlasts an
+    /// outage.
+    ///
+    /// The damage refuses traffic at once, and a writer-status outage that
+    /// then ends the refresh keeps refusing instead of admitting traffic
+    /// under the staleness allowance.
+    #[tokio::test]
+    async fn damage_reported_while_a_candidate_trails_survives_a_later_outage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (mut publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_mins(1))?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        // The first status shows the writer one epoch ahead, so the refresh
+        // converges a candidate that trails it; the writer reports damage on
+        // the next status and then stops answering.
+        let mut ahead = lifecycle_writer_status(&primary);
+        let fence = ahead
+            .fence
+            .as_mut()
+            .ok_or("lifecycle writer status has no fence")?;
+        fence.chain_epoch_id += 1;
+        fence.event_sequence += 1;
+        fence.visible_tip_height += 1;
+        control.queue_writer_status(ahead.clone());
+        control.queue_writer_status(CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                Some(BlockHeight::new(1)),
+                None,
+            )),
+            ..ahead
+        });
+        control.queue_outage();
+        publisher.refresh().await;
+
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalStoreDamaged {
+                height: Some(1),
+                pool: None,
+            }
+        );
+        assert!(!readiness.report().is_ready);
         drop(slot);
         drop(publisher);
         let _ = shutdown_sender.send(());

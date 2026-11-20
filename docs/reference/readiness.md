@@ -293,7 +293,7 @@ status RPC. The pair alone decides readiness. The reasons are recorded in
 | `ready` | The published pair matches what the writer attests. |
 | `serving_pair_stale` | A refresh fails for a transient reason, such as lag, a status-RPC outage, or a store file compacted away. Traffic continues until `storage.serving_pair_staleness_ceiling_ms` (5 minutes by default) passes since the last attestation. The reader refreshes when the ceiling passes even if `storage.secondary_catchup_interval_ms` is longer, so traffic stops then. |
 | `writer_status_unavailable`, `replica_lagging` | The ceiling passed. The underlying cause takes over and traffic stops. |
-| `canonical_store_damaged` | Ingest reports damage in the canonical store. Traffic stops on the next refresh, with no staleness allowance, and stays stopped through a writer-status outage until ingest reports no damage. New requests fail with `SERVICE_NOT_READY`. |
+| `canonical_store_damaged` | Ingest reports damage in the canonical store. Traffic stops at the first writer status that reports it, including one read while a replacement pair converges, with no staleness allowance, and stays stopped through a writer-status outage until ingest reports no damage. New requests fail with `SERVICE_NOT_READY`. |
 | `canonical_tip_unconfirmed` | Ingest restarted and has not confirmed its tip. |
 | `reorg_window_exceeded` | Ingest is parked. New requests fail with `REORG_WINDOW_EXCEEDED` and open event streams end. |
 | `storage_unavailable`, `schema_mismatch` | Fail closed at once, as does a writer fence that disagrees with the pair. |

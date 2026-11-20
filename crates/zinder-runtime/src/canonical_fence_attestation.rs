@@ -5,8 +5,9 @@
 //! publishes before it uses that view. This module owns the comparison, the
 //! bounded catch-up loop, and the [`WriterAttestation`] rules that refuse
 //! traffic while a parked or unconfirmed writer keeps attesting a frozen
-//! fence, or while a writer reports damage in its store. It holds no control-plane client or credential: callers read writer
-//! status through their own [`CanonicalFenceProbe`].
+//! fence, or while a writer reports damage in its store. It holds no
+//! control-plane client or credential: callers read writer status through
+//! their own [`CanonicalFenceProbe`].
 
 use std::{future::Future, num::NonZeroU32, time::Duration};
 
@@ -187,6 +188,17 @@ pub trait CanonicalFenceProbe {
         true
     }
 
+    /// Observes each writer status convergence reads that names a fence on
+    /// the probe's network, before convergence compares that fence with the
+    /// secondary's or retries.
+    ///
+    /// A serving reader passes each one to [`WriterAttestation::observe`] for
+    /// the reader it already serves, so a halt or store damage the writer
+    /// reports while the candidate still trails refuses traffic at once and
+    /// is remembered through a later writer-status outage. The default
+    /// ignores it, so the projector keeps converging on such a writer.
+    fn observe_writer_status(&mut self, _status: &CanonicalWriterStatusResponse) {}
+
     /// Observes one round in which the secondary trailed the writer, `elapsed`
     /// after convergence started.
     fn secondary_behind(&mut self, _lag: CanonicalFenceLag, _elapsed: Duration) {}
@@ -242,7 +254,10 @@ pub enum CanonicalFenceConvergenceError<ProbeError> {
 /// bound, unless the probe accepts the lag of a round, which ends convergence
 /// with [`CanonicalFenceConvergence::Trailing`]. A matching fence whose
 /// network-upgrade schedule revision the probe has not caught up to is
-/// retried like lag. Divergence fails on the round that observes it.
+/// retried like lag. Divergence fails on the round that observes it. Every
+/// status that names a fence on `network` reaches
+/// [`CanonicalFenceProbe::observe_writer_status`] before its fence is
+/// compared, so a refusal it carries is never lost to a retry.
 ///
 /// Each writer-status read races the deadline and `cancel`: a read still
 /// pending when either fires is dropped, so a stalled writer cannot hold the
@@ -278,7 +293,17 @@ where
                     status.map_err(CanonicalFenceConvergenceError::Probe)?
                 }
             };
-            match classify_canonical_writer_fence(&status, network, &local) {
+            let relation = classify_canonical_writer_fence(&status, network, &local);
+            if !matches!(
+                relation,
+                CanonicalFenceRelation::Diverged(
+                    CanonicalFenceDivergence::MissingFence
+                        | CanonicalFenceDivergence::NetworkMismatch
+                )
+            ) {
+                probe.observe_writer_status(&status);
+            }
+            match relation {
                 CanonicalFenceRelation::Matches if probe.attests_writer_schedule(&status) => {
                     return Ok(CanonicalFenceConvergence::Converged(Box::new(status)));
                 }
@@ -562,6 +587,8 @@ mod tests {
         schedule_lag_catch_ups: u32,
         behind_rounds: Vec<CanonicalFenceLag>,
         accepts_trailing: bool,
+        /// Statuses passed to `observe_writer_status`, in order.
+        observed: Vec<CanonicalWriterStatusResponse>,
     }
 
     impl ScriptedProbe {
@@ -574,6 +601,7 @@ mod tests {
                 schedule_lag_catch_ups: 0,
                 behind_rounds: Vec::new(),
                 accepts_trailing: false,
+                observed: Vec::new(),
             }
         }
     }
@@ -607,6 +635,10 @@ mod tests {
             self.catch_ups > self.schedule_lag_catch_ups
         }
 
+        fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
+            self.observed.push(status.clone());
+        }
+
         fn secondary_behind(&mut self, lag: CanonicalFenceLag, _elapsed: Duration) {
             self.behind_rounds.push(lag);
         }
@@ -637,6 +669,37 @@ mod tests {
             &mut self,
         ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, ProbeFailure>> {
             std::future::ready(Ok(self.writer.clone()))
+        }
+    }
+
+    /// A serving reader's probe: its candidate trails the writer, and every
+    /// status it reads passes through the reader's [`WriterAttestation`].
+    struct ServingProbe {
+        local: CanonicalWriterFence,
+        statuses: std::collections::VecDeque<Result<CanonicalWriterStatusResponse, ProbeFailure>>,
+        attestation: WriterAttestation,
+        refusals: Vec<ReadinessState>,
+    }
+
+    impl CanonicalFenceProbe for ServingProbe {
+        type Error = ProbeFailure;
+
+        fn catch_up(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, ProbeFailure>> {
+            std::future::ready(Ok(Some(self.local.clone())))
+        }
+
+        fn writer_status(
+            &mut self,
+        ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, ProbeFailure>> {
+            std::future::ready(self.statuses.pop_front().unwrap_or(Err(ProbeFailure)))
+        }
+
+        fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
+            if let Some(refusal) = self.attestation.observe(status, Some(7)) {
+                self.refusals.push(refusal);
+            }
         }
     }
 
@@ -949,6 +1012,122 @@ mod tests {
             Err(CanonicalFenceConvergenceError::DidNotConverge)
         ));
         assert_eq!(probe.catch_ups, 3);
+    }
+
+    /// Every status that names a fence on the probe's network reaches the
+    /// probe before a round that trails the writer is retried.
+    #[tokio::test]
+    async fn every_writer_status_reaches_the_probe_before_a_lagging_round_is_retried() {
+        let mut probe = ScriptedProbe::new(None);
+        let policy = CanonicalFenceConvergencePolicy {
+            max_attempts: NonZeroU32::new(3),
+            ..fast_policy(Duration::from_mins(1))
+        };
+
+        let outcome = converge_on_canonical_writer_fence(
+            &mut probe,
+            NETWORK,
+            policy,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CanonicalFenceConvergenceError::DidNotConverge)
+        ));
+        assert_eq!(probe.observed.len(), 3);
+        assert_eq!(probe.behind_rounds.len(), 3);
+        assert_eq!(
+            probe
+                .observed
+                .iter()
+                .filter_map(|status| status.fence.as_ref())
+                .map(|fence| fence.event_sequence)
+                .collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+    }
+
+    /// A status without a fence or for another network is not observed: it
+    /// cannot be the writer's attestation of this reader.
+    #[tokio::test]
+    async fn a_status_that_names_no_fence_on_the_network_is_not_observed() {
+        for writer in [
+            CanonicalWriterStatusResponse {
+                fence: None,
+                ..damaged_store_writer_status()
+            },
+            CanonicalWriterStatusResponse {
+                network_name: encode_zinder_native_chain_name(Network::ZcashMainnet).to_owned(),
+                fence: Some(fence(5, 1)),
+                ..damaged_store_writer_status()
+            },
+        ] {
+            let mut probe = ServingProbe {
+                local: fence(5, 1),
+                statuses: [Ok(writer)].into(),
+                attestation: WriterAttestation::new(NETWORK, Duration::from_mins(1)),
+                refusals: Vec::new(),
+            };
+
+            let outcome = converge_on_canonical_writer_fence(
+                &mut probe,
+                NETWORK,
+                fast_policy(Duration::from_mins(1)),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CanonicalFenceConvergenceError::Diverged(_))
+            ));
+            assert_eq!(probe.refusals, []);
+            assert_eq!(probe.attestation.remembered_halt(), None);
+        }
+    }
+
+    /// Store damage a writer reports while the candidate trails reaches the
+    /// served reader at once, and a writer-status outage that then ends
+    /// convergence leaves it remembered.
+    #[tokio::test]
+    async fn damage_reported_while_the_candidate_trails_survives_a_later_outage() {
+        let ahead = |status: CanonicalWriterStatusResponse| CanonicalWriterStatusResponse {
+            fence: Some(fence(8, 2)),
+            ..status
+        };
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_mins(1));
+        attestation.attest();
+        let mut probe = ServingProbe {
+            local: fence(5, 1),
+            statuses: [Ok(ahead(damaged_store_writer_status())), Err(ProbeFailure)].into(),
+            attestation,
+            refusals: Vec::new(),
+        };
+
+        let outcome = converge_on_canonical_writer_fence(
+            &mut probe,
+            NETWORK,
+            fast_policy(Duration::from_mins(1)),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let damaged = ReadinessState {
+            current_height: Some(7),
+            ..ReadinessState::not_ready(ReadinessCause::CanonicalStoreDamaged {
+                height: Some(42),
+                pool: Some("orchard"),
+            })
+        };
+        assert!(matches!(
+            outcome,
+            Err(CanonicalFenceConvergenceError::Probe(ProbeFailure))
+        ));
+        assert_eq!(probe.refusals, std::slice::from_ref(&damaged));
+        assert_eq!(probe.attestation.remembered_halt(), Some(damaged));
+        assert_eq!(probe.attestation.stale_allowance(), None);
     }
 
     #[tokio::test]

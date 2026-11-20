@@ -1912,17 +1912,23 @@ impl WalletServingPairPublisher {
         ))
     }
 
-    /// Publishes the readiness a failed refresh leaves behind and returns
-    /// whether that readiness still admits traffic on the published pair.
-    fn record_refresh_failure(&self, error: &WalletServingPairError) -> bool {
-        let visible_height = self.serving_pair_slot.as_ref().map(|serving_pair_slot| {
+    /// Returns the visible tip height of the published pair, or `None` before
+    /// the first publication.
+    fn published_visible_height(&self) -> Option<u32> {
+        self.serving_pair_slot.as_ref().map(|serving_pair_slot| {
             serving_pair_slot
                 .capture()
                 .canonical_fence()
                 .visible_tip()
                 .height
                 .value()
-        });
+        })
+    }
+
+    /// Publishes the readiness a failed refresh leaves behind and returns
+    /// whether that readiness still admits traffic on the published pair.
+    fn record_refresh_failure(&self, error: &WalletServingPairError) -> bool {
+        let visible_height = self.published_visible_height();
         let admitted_while_stale = refresh_failure_retains_attested_pair(error)
             .then(|| self.stale_serving_pair_readiness(visible_height))
             .flatten();
@@ -2297,6 +2303,20 @@ impl CanonicalFenceProbe for CandidatePairFenceProbe<'_> {
         self.publisher
             .candidate_network_upgrade_schedule(self.generation)
             .is_ok_and(|schedule| writer_attests_network_upgrade_schedule(status, schedule))
+    }
+
+    /// A halt or store damage the writer reports while the candidate trails
+    /// refuses traffic on the published pair at once, and stays remembered
+    /// through a refresh failure that ends convergence.
+    fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
+        let visible_height = self.publisher.published_visible_height();
+        if let Some(refusal) = self
+            .publisher
+            .writer_attestation
+            .observe(status, visible_height)
+        {
+            self.publisher.readiness.publish_pair_state(refusal);
+        }
     }
 
     fn secondary_behind(&mut self, _lag: CanonicalFenceLag, _elapsed: Duration) {
@@ -5233,6 +5253,97 @@ mod tests {
         cancel.cancel();
         server_task.await??;
         Ok(())
+    }
+
+    /// Store damage reported while a candidate trails the writer outlasts an
+    /// outage.
+    ///
+    /// The damage refuses traffic at once, and a writer-status outage that
+    /// then ends the refresh keeps refusing instead of admitting traffic
+    /// under the staleness allowance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn damage_reported_while_a_candidate_trails_survives_a_later_outage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let (endpoint, cancel, server_task) = serve_canonical_control(control.clone()).await?;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, _slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                )?,
+                WalletServingReadiness::pair_only(readiness.clone()),
+                &endpoint,
+                None,
+            )
+            .await?;
+        assert!(readiness.report().is_ready);
+
+        // The first status shows the writer one epoch ahead, so the refresh
+        // converges a candidate that trails it; the writer reports damage on
+        // the next status and then stops answering.
+        let ahead = writer_status_ahead_of(&canonical_primary)?;
+        control.queue([
+            Some(ahead.clone()),
+            Some(CanonicalWriterStatusResponse {
+                canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                    Some(BlockHeight::new(1)),
+                    None,
+                )),
+                ..ahead
+            }),
+            None,
+        ]);
+        let outage = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("the refresh must fail on the outage")?;
+        publisher.record_refresh_failure(&outage);
+
+        assert_eq!(
+            readiness.report().cause,
+            zinder_runtime::ReadinessCause::CanonicalStoreDamaged {
+                height: Some(1),
+                pool: None,
+            }
+        );
+        assert!(!readiness.report().is_ready);
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
+    /// Returns the status of a writer one chain epoch past `store`.
+    fn writer_status_ahead_of(
+        store: &RocksDbCanonicalStore,
+    ) -> Result<CanonicalWriterStatusResponse, Box<dyn std::error::Error>> {
+        let mut status = writer_status_for_store(store);
+        let fence = status
+            .fence
+            .as_mut()
+            .ok_or("a store's writer status carries its fence")?;
+        fence.chain_epoch_id += 1;
+        fence.event_sequence += 1;
+        fence.visible_tip_height += 1;
+        Ok(status)
     }
 
     /// The staleness ceiling holds when the catch-up interval is longer.
@@ -8491,6 +8602,9 @@ mod tests {
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
+        /// Answers served once each, in order, before `writer_status`; `None`
+        /// answers with an outage.
+        queued: Arc<Mutex<std::collections::VecDeque<Option<CanonicalWriterStatusResponse>>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -8498,12 +8612,18 @@ mod tests {
         fn new(writer_status: CanonicalWriterStatusResponse) -> Self {
             Self {
                 writer_status: Arc::new(Mutex::new(writer_status)),
+                queued: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
             *self.writer_status.lock() = writer_status;
+        }
+
+        /// Serves `answers` once each, in order, before the current status.
+        fn queue(&self, answers: impl IntoIterator<Item = Option<CanonicalWriterStatusResponse>>) {
+            self.queued.lock().extend(answers);
         }
 
         fn set_available(&self, available: bool) {
@@ -8521,7 +8641,12 @@ mod tests {
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Status::unavailable("fixture writer status outage"));
             }
-            Ok(Response::new(self.writer_status.lock().clone()))
+            let queued = self.queued.lock().pop_front();
+            match queued {
+                Some(Some(writer_status)) => Ok(Response::new(writer_status)),
+                Some(None) => Err(Status::unavailable("fixture queued writer status outage")),
+                None => Ok(Response::new(self.writer_status.lock().clone())),
+            }
         }
 
         async fn event_page(
