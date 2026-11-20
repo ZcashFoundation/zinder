@@ -298,6 +298,9 @@ pub(crate) fn decode_address_utxos(
         });
     }
     outputs.truncate(max_rows.row_count());
+    // Zakura ignores the bounds, so the buffer was sized for every row it
+    // returned; keep only what the caller receives.
+    outputs.shrink_to_fit();
     Ok(outputs)
 }
 
