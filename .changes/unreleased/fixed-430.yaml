@@ -1,0 +1,6 @@
+kind: fixed
+body: Historical wallet tree-state reads use less CPU when Zinder rebuilds a frontier between stored checkpoints.
+time: 2026-11-20T15:25:50.411114807Z
+custom:
+    Bump: patch
+    PR: "430"

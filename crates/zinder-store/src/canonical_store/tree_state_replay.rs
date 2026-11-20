@@ -153,7 +153,9 @@ pub(super) fn read_tree_state_checkpoint_at(
             decode_stored_tree_state_checkpoint(store, height, &encoded).map(Some)
         }
         Some(TreeStateSource::Seed(seed)) => {
-            reconstruct(store, &seed, height, activations).map(Some)
+            replay_compact_blocks(store, &seed, height, activations, |_| Ok(()))?
+                .checkpoint(store)
+                .map(Some)
         }
     }
 }
@@ -250,10 +252,18 @@ pub(super) fn replay_tree_state(
             Some(TreeStateLookup::Replay(reread)) => reread,
         }
     };
-    let checkpoint = reconstruct(store, &replay.seed, replay.height, activations)?;
+    let mut trees =
+        replay_compact_blocks(store, &replay.seed, replay.height, activations, |_| Ok(()))?;
+    let block_time_seconds = trees.canonical_block_time(store)?;
+    let tree_state = ServedTreeState::from_replayed_accumulator(
+        trees.tip,
+        block_time_seconds,
+        &trees.accumulator,
+    )
+    .map_err(|source| replay_refused(trees.tip.height, &source))?;
     Ok(Some(TreeStateReplayOutcome::Replayed {
         replay: Box::new(replay),
-        tree_state: ServedTreeState::from(checkpoint),
+        tree_state,
     }))
 }
 
@@ -270,17 +280,6 @@ pub(super) fn refuse_unadmitted_activations(
             "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
         ))
     }
-}
-
-/// Replays the stored compact blocks above `seed` through `height` and checks
-/// the result against the canonical block at `height`.
-fn reconstruct(
-    store: &impl CanonicalServingRead,
-    seed: &CommitmentTreeCheckpoint,
-    height: BlockHeight,
-    activations: &NetworkUpgradeActivations,
-) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
-    replay_compact_blocks(store, seed, height, activations, |_| Ok(()))?.checkpoint(store)
 }
 
 /// Returns the lowest checkpoint height a reconstruction of `height` may seed

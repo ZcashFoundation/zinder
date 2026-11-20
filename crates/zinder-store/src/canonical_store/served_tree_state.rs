@@ -7,8 +7,9 @@
 //! replays tree state can take it as input.
 
 use zinder_core::{
-    BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-    CommitmentTreeFrontierValidationError, ShieldedProtocol,
+    BlockId, ChainTipMetadata, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    ShieldedProtocol,
 };
 
 /// Parent slots in the canonical encoding of a nonempty note commitment
@@ -47,6 +48,31 @@ impl ServedTreeState {
             block_time_seconds,
             frontiers,
         }
+    }
+
+    pub(super) fn from_replayed_accumulator(
+        block_id: BlockId,
+        block_time_seconds: u32,
+        accumulator: &CommitmentTreeAccumulator,
+    ) -> Result<Self, CommitmentTreeAccumulatorError> {
+        let sizes = accumulator.tip_metadata();
+        let frontier = |protocol| {
+            accumulator.final_state_bytes(protocol).map(|bytes| {
+                bytes.map(|final_state_bytes| ServedFrontier {
+                    tree_size: sizes.commitment_tree_size(protocol),
+                    final_state_bytes,
+                })
+            })
+        };
+        Ok(Self::new(
+            block_id,
+            block_time_seconds,
+            ServedFrontiers::new(
+                frontier(ShieldedProtocol::Sapling)?,
+                frontier(ShieldedProtocol::Orchard)?,
+                frontier(ShieldedProtocol::Ironwood)?,
+            ),
+        ))
     }
 
     /// Returns the block this tree state follows.
@@ -165,7 +191,7 @@ impl ServedFrontiers {
     }
 }
 
-/// One stored frontier whose framing alone was checked.
+/// The tree size and canonical frontier bytes a wallet read returns for one pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::canonical_store) struct ServedFrontier {
     tree_size: u32,
