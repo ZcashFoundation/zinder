@@ -1215,9 +1215,39 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
 
-        // A missing row inside retained history fails closed once the read
-        // reaches it.
+    /// A missing row inside retained history fails a bounded read once the
+    /// read reaches it.
+    ///
+    /// A read whose kept blocks leave budget looks at the next row to learn
+    /// whether it fits, so it reaches a gap there even when too little budget
+    /// is left for any block to fit.
+    #[test]
+    fn bounded_compact_block_read_fails_closed_at_a_missing_row_it_reaches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::HeightOrder::{Ascending, Descending};
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+        let range =
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+        let read_heights = |order, max_bytes| -> Result<Vec<u32>, CanonicalStoreError> {
+            Ok(store
+                .compact_blocks_in_range_up_to(range, order, max_bytes)?
+                .iter()
+                .map(|block| block.height().value())
+                .collect())
+        };
+        let row_bytes = |height| -> Result<usize, Box<dyn std::error::Error>> {
+            let block = store
+                .compact_block_at(BlockHeight::new(height))?
+                .ok_or("the test store must hold heights 1 through 3")?;
+            Ok(crate::encode_compact_block_artifact(&block).len())
+        };
+        let (low_row, high_row) = (row_bytes(1)?, row_bytes(3)?);
         let family = store
             .bounded_open
             .db
@@ -1227,10 +1257,20 @@ mod tests {
             &family,
             crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
         )?;
-        assert_eq!(read_heights(Ascending, 0)?, [1]);
-        assert_eq!(read_heights(Descending, 0)?, [3]);
-        for order in [Ascending, Descending] {
-            let error = read_heights(order, usize::MAX)
+
+        for max_bytes in [0, low_row] {
+            assert_eq!(read_heights(Ascending, max_bytes)?, [1]);
+        }
+        for max_bytes in [0, high_row] {
+            assert_eq!(read_heights(Descending, max_bytes)?, [3]);
+        }
+        for (order, max_bytes) in [
+            (Ascending, usize::MAX),
+            (Descending, usize::MAX),
+            (Ascending, low_row + 1),
+            (Descending, high_row + 1),
+        ] {
+            let error = read_heights(order, max_bytes)
                 .err()
                 .ok_or("an interior compact-block gap must fail closed")?;
             assert!(
@@ -1239,7 +1279,7 @@ mod tests {
                     CanonicalStoreError::PublicationRefused { reason }
                         if reason.contains("compact block at height 2 is absent")
                 ),
-                "{order:?} read: unexpected error {error:?}"
+                "{order:?} read of {max_bytes} bytes: unexpected error {error:?}"
             );
         }
         Ok(())

@@ -2189,9 +2189,10 @@ async fn a_stalled_block_range_client_leaves_the_stream_two_chunks() -> eyre::Re
 /// A missing block fails the call only when the first chunk's read reaches it.
 ///
 /// A block missing inside retained history that the read of the first chunk
-/// reaches fails the call with `UNAVAILABLE`. Past that read, the stream
-/// opens and ends with `UNAVAILABLE` after the chunks before the one whose
-/// read reaches it.
+/// reaches fails the call with `UNAVAILABLE`. That read reaches the block
+/// just past the first chunk too, because it looks at that block to learn
+/// that it does not fit. Past that read, the stream opens and ends with
+/// `UNAVAILABLE` after the chunks before the one whose read reaches it.
 #[tokio::test]
 async fn a_block_missing_past_the_first_chunk_ends_the_stream_unavailable() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
@@ -2210,19 +2211,24 @@ async fn a_block_missing_past_the_first_chunk_ends_the_stream_unavailable() -> e
         .map(|read| read.end.value())
         .ok_or_else(|| eyre!("the stream must read its first chunk"))?;
 
-    let within_first_chunk = LightwalletdGrpcAdapter::new(
-        EpochPinRecorder::new(store_fixture.query())
-            .with_synthetic_views(vec![large.with_missing_block(first_chunk_end)]),
-    );
-    assert_eq!(
-        within_first_chunk
-            .get_block_range(Request::new(block_range_request(1, tip)))
-            .await
-            .err()
-            .map(|status| status.code()),
-        Some(Code::Unavailable),
-        "a block missing from the first chunk must fail the call"
-    );
+    for (missing_height, place) in [
+        (first_chunk_end, "the last block of the first chunk"),
+        (first_chunk_end + 1, "the block just past the first chunk"),
+    ] {
+        let reached_by_the_first_read = LightwalletdGrpcAdapter::new(
+            EpochPinRecorder::new(store_fixture.query())
+                .with_synthetic_views(vec![large.with_missing_block(missing_height)]),
+        );
+        assert_eq!(
+            reached_by_the_first_read
+                .get_block_range(Request::new(block_range_request(1, tip)))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable),
+            "a missing block at {place}, height {missing_height}, must fail the call"
+        );
+    }
 
     let past_first_chunk = stream_across_views(
         &store_fixture,
