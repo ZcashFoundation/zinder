@@ -90,6 +90,26 @@ class BenchmarkCampaignTests(unittest.TestCase):
         self.assertEqual(self.read_json("failed/round-1/before/report.json"), {"blocks": 1})
         self.assertTrue((self.output / "failed/round-1/before/scratch").is_dir())
 
+    def test_json_comparisons_distinguish_booleans_from_numbers(self):
+        before = {"ready": True, "stats": {"calls": [False]}, "blocks": 1}
+        after = {"ready": 1, "stats": {"calls": [0]}, "blocks": 1.0}
+        self.campaign["arms"]["before"]["report_payload"] = json.dumps(before)
+        self.campaign["arms"]["after"]["report_payload"] = json.dumps(after)
+        self.campaign["repeats"] = 1
+        self.campaign["cases"]["json-types"] = {
+            "command": [sys.executable, "-c", "import sys; print(sys.argv[1])", "{report_payload}"],
+            "expect": {"/ready": True, "/stats": before["stats"], "/blocks": 1},
+            "match": ["/ready", "/stats", "/blocks"],
+        }
+
+        self.run_campaign(1)
+        pair, = self.read_json("summary.json")
+        self.assertEqual(pair["runs"]["before"]["problems"], [])
+        self.assertEqual(pair["runs"]["after"]["problems"], [
+            "unexpected value at /ready", "unexpected value at /stats",
+        ])
+        self.assertEqual(pair["mismatched_fields"], ["/ready", "/stats"])
+
     def test_refuses_to_overwrite_evidence(self):
         self.campaign["cases"]["range"] = {"command": [sys.executable, "-c", "print('{\"blocks\": 1}')"]}
         self.output.mkdir()

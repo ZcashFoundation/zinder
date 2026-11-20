@@ -39,6 +39,26 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"), parse_float=finite_float, parse_constant=finite_float)
 
 
+def json_equal(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, dict) and isinstance(right, dict):
+        if left.keys() != right.keys():
+            return False
+        pairs = ((value, right[key]) for key, value in left.items())
+    elif isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return False
+        pairs = zip(left, right)
+    else:
+        return left == right
+
+    for first, second in pairs:
+        if not json_equal(first, second):
+            return False
+    return True
+
+
 def sha256(path):
     with open(path, "rb") as source:
         digest = hashlib.sha256()
@@ -173,7 +193,7 @@ def run_case(command, directory, timeout, case):
             except (IndexError, KeyError):
                 problems.append(f"report is missing {pointer}")
                 continue
-            if pointer in expected and observed != expected[pointer]:
+            if pointer in expected and not json_equal(observed, expected[pointer]):
                 problems.append(f"unexpected value at {pointer}")
             if pointer in case.get("match", []):
                 match[pointer] = observed
@@ -225,8 +245,10 @@ def main():
                 pair["runs"][arm] = {"path": str(run_path), "problems": observation["problems"]}
                 pair["runs"][arm]["matched_fields"] = observation["matched_fields"]
             first, second = (pair["runs"][arm]["matched_fields"] for arm in arms)
-            pair["mismatched_fields"] = sorted(pointer for pointer in first.keys() & second.keys()
-                                               if first[pointer] != second[pointer])
+            pair["mismatched_fields"] = sorted(
+                pointer for pointer in first.keys() & second.keys()
+                if not json_equal(first[pointer], second[pointer])
+            )
             summary.append(pair)
             write_json(output / "summary.json", summary)
 
