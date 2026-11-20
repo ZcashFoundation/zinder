@@ -290,7 +290,7 @@ while true; do
       || [ "$explorer_restart_delay_seconds" -eq 0 ]; then
       explorer_restart_delay_seconds="$explorer_restart_initial_seconds"
     fi
-    log "zinder-explorer exited with status $explorer_status after ${explorer_uptime_seconds}s; wallet serving continues; restarting zinder-explorer in ${explorer_restart_delay_seconds}s"
+    log "event=supervisor_child_exited role=zinder-explorer phase=serving status=$explorer_status action=restart_child uptime_seconds=$explorer_uptime_seconds restart_delay_seconds=$explorer_restart_delay_seconds zinder-explorer exited with status $explorer_status after ${explorer_uptime_seconds}s; wallet serving continues; restarting zinder-explorer in ${explorer_restart_delay_seconds}s"
     explorer_restart_at=$((now + explorer_restart_delay_seconds))
     explorer_restart_delay_seconds=$((explorer_restart_delay_seconds * 2))
     if [ "$explorer_restart_delay_seconds" -gt "$explorer_restart_max_seconds" ]; then

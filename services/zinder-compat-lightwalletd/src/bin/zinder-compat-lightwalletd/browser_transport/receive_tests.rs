@@ -245,3 +245,142 @@ async fn stalled_browser_receives_refuse_excess_calls_until_the_receive_deadline
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn browser_listener_records_the_native_status_and_block_count_in_both_encodings() -> Result<()>
+{
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let mut reader = reader()?;
+    let service = service(&mut reader)?;
+    let id = lightwalletd::BlockId {
+        height: 1,
+        hash: vec![],
+    };
+    let range = lightwalletd::BlockRange {
+        start: Some(id.clone()),
+        end: Some(id),
+        pool_types: vec![],
+    };
+    for encoding in ENCODINGS {
+        let response = service
+            .clone()
+            .oneshot(message_request("GetBlockRange", encoding, &range)?)
+            .await?;
+        response.into_body().collect().await?;
+        let refused = service
+            .clone()
+            .oneshot(message_request(
+                "GetTaddressBalanceStream",
+                encoding,
+                &lightwalletd::Address::default(),
+            )?)
+            .await?;
+        assert_response_error(refused, encoding, Code::Unimplemented).await?;
+    }
+    let exposition = handle.render();
+    for sample in [
+        r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetBlockRange",grpc_code="ok",error_class="none"} 2"#,
+        r#"zinder_wallet_rpc_block_range_blocks_sum{surface="lightwalletd",method="GetBlockRange",grpc_code="ok",error_class="none"} 2"#,
+        r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetTaddressBalanceStream",grpc_code="unimplemented",error_class="none"} 2"#,
+        r#"zinder_wallet_rpc_open_streams{surface="lightwalletd",method="GetTaddressBalanceStream"} 0"#,
+    ] {
+        assert!(
+            exposition.lines().any(|line| line == sample),
+            "{sample}\n{exposition}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_rpc_in_wallet_mode_counts_one_lightwalletd_range_across_query_reads() -> Result<()>
+{
+    use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+    use zinder_query::{
+        RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    };
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let mut store =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?;
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
+    let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?.into_server();
+    let native = transport_layers(&[]).layer(adapter);
+    let id = lightwalletd::BlockId {
+        height: 1,
+        hash: vec![],
+    };
+    let range = lightwalletd::BlockRange {
+        start: Some(id.clone()),
+        end: Some(id),
+        pool_types: vec![],
+    };
+    let mut request = message_request("GetBlockRangeNullifiers", "application/grpc", &range)?;
+    *request.version_mut() = http::Version::HTTP_2;
+    observe_balance_upload(native.clone(), &handle).await?;
+    let response = native.oneshot(request).await?.into_body().collect().await?;
+    let trailers = response.trailers().ok_or_eyre("missing native trailers")?;
+    assert_eq!(trailers[Status::GRPC_STATUS], "0");
+    let exposition = handle.render();
+    for sample in [
+        r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetBlockRangeNullifiers",grpc_code="ok",error_class="none"} 1"#,
+        r#"zinder_wallet_rpc_block_range_blocks_sum{surface="lightwalletd",method="GetBlockRangeNullifiers",grpc_code="ok",error_class="none"} 1"#,
+    ] {
+        assert!(
+            exposition.lines().any(|line| line == sample),
+            "{sample}\n{exposition}"
+        );
+    }
+    Ok(())
+}
+
+async fn observe_balance_upload(
+    native: impl Service<Request<Body>, Response = Response<Body>, Error = Infallible> + Clone,
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> Result<()> {
+    let stream_count = r#"zinder_wallet_rpc_open_streams{surface="lightwalletd",method="GetTaddressBalanceStream"}"#;
+    assert!(handle.render().contains(&format!("{stream_count} 0")));
+    for half_close in [true, false] {
+        let (receiving, first_poll) = tokio::sync::oneshot::channel();
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        let upload =
+            tokio_stream::once((receiving, closed)).then(|(receiving, closed)| async move {
+                let _ = receiving.send(());
+                let _ = closed.await;
+                Ok::<_, Status>(Frame::<Bytes>::trailers(http::HeaderMap::new()))
+            });
+        let mut upload = request(
+            "GetTaddressBalanceStream",
+            "application/grpc",
+            Body::new(StreamBody::new(upload)),
+        )?;
+        *upload.version_mut() = http::Version::HTTP_2;
+        let mut response = Box::pin(native.clone().oneshot(upload));
+        tokio::select! {
+            _ = &mut response => eyre::bail!("balance RPC completed before reading the upload"),
+            read = first_poll => read?,
+        }
+        assert!(handle.render().contains(&format!("{stream_count} 1")));
+        if half_close {
+            let _ = close.send(());
+            let _head = response.await?;
+        } else {
+            drop(response);
+        }
+        assert!(handle.render().contains(&format!("{stream_count} 0")));
+    }
+    Ok(())
+}

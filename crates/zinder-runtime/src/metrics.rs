@@ -72,7 +72,9 @@ impl MetricsHandle {
     /// Renders the current metric snapshot in Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
-        self.prometheus.render()
+        let mut exposition = self.prometheus.render();
+        crate::process::append_metrics(&mut exposition);
+        exposition
     }
 }
 
@@ -206,6 +208,18 @@ fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
             STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(
+            Matcher::Full(crate::public_grpc_server::RANGE_DURATION.to_owned()),
+            &[
+                0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 600.0, 1_800.0, 3_600.0,
+            ],
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::public_grpc_server::RANGE_BLOCKS.to_owned()),
+            &[
+                0.0, 1.0, 4.0, 16.0, 64.0, 100.0, 256.0, 1_000.0, 4_096.0, 10_000.0, 100_000.0,
+            ],
+        )?
+        .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".to_owned()),
             DURATION_SECONDS_BUCKETS,
         )?
@@ -335,6 +349,30 @@ mod tests {
 
         for _ in 0..3 {
             observed.recv_timeout(Duration::from_secs(10))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_rpc_range_histograms_export_long_duration_and_block_count_buckets()
+    -> Result<(), super::BuildError> {
+        let recorder = prometheus_builder()?.build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(crate::public_grpc_server::RANGE_DURATION).record(42.0);
+            metrics::histogram!(crate::public_grpc_server::RANGE_BLOCKS).record(900);
+        });
+        let exposition = handle.render();
+        for sample in [
+            r#"zinder_wallet_rpc_block_range_duration_seconds_bucket{le="30"} 0"#,
+            r#"zinder_wallet_rpc_block_range_duration_seconds_bucket{le="60"} 1"#,
+            r#"zinder_wallet_rpc_block_range_blocks_bucket{le="256"} 0"#,
+            r#"zinder_wallet_rpc_block_range_blocks_bucket{le="1000"} 1"#,
+        ] {
+            assert!(
+                exposition.lines().any(|line| line == sample),
+                "{sample}\n{exposition}"
+            );
         }
         Ok(())
     }

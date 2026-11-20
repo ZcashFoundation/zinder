@@ -1040,16 +1040,13 @@ wallet keeps.
 - Canonical-fixture `resource_limits`: the CPU and memory envelope, the exact
   source-planner, admission, preparation, and deterministic delay settings, and
   the canonical `RocksDB` budget used by the run.
-- Canonical-fixture `source_fetch_attribution`: completed segment requests, request and
-  payload rates over replay wall time, cumulative concurrent request-task
-  seconds, adaptive restart counts, and speculative discard totals. Total
-  connected blocks and response payload bytes include completed responses that
-  the adaptive planner later discarded and fetched again. The completed
-  response bytes discarded on restart are exact for responses already held in
-  the reorder buffer, but they are only a lower bound on wasted network work
-  because canceled in-flight requests do not expose trustworthy actual bytes.
-  The object is `null` when no metrics recorder covered completed segment
-  requests.
+- Canonical-fixture `source_fetch_attribution` reports completed segment
+  requests, request and payload rates over replay wall time, cumulative
+  request-task seconds, density adjustments, and retained and discarded
+  prefetch work. The planner applies size changes to future requests and keeps
+  disjoint prefetched ranges. Both restart counts are zero. Discarded bytes
+  count only completed responses. The object is `null` when no metrics
+  recorder covered completed segment requests.
 - Canonical-fixture `prohibited_reads`: explicit counters for historical
   prevout and cross-block wallet reads. Both metric series must be present and
   zero; missing telemetry fails report validation.

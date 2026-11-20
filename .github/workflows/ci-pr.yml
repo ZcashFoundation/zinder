@@ -188,6 +188,11 @@ jobs:
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 
+      - name: Test observability contracts
+        run: |
+          python3 scripts/test-observability-rules.py
+          python3 scripts/test-metric-names.py
+
       - name: Test storage benchmark contracts
         run: |
           scripts/test-container-resource-evidence.sh

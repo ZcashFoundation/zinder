@@ -196,6 +196,9 @@ compatibility. Also monitor `/readyz` on 9106 and 9107, and
 process that exits, or is not ready within the serving deadline, stops the
 container.
 
+For private scrape placement, lifecycle evidence, and coverage checks, follow
+[Measure a wallet-serving deployment](serving-census.md).
+
 ## What a fresh sync looks like
 
 A fresh volume builds the chain store, then the wallet store, and serves

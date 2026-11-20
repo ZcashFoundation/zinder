@@ -234,6 +234,7 @@ where
         &self,
         store: RocksDbCanonicalStore,
         replacement: CanonicalLiveReplacement,
+        common_parent: BlockId,
         observed_tip: BlockId,
     ) -> Result<RocksDbCanonicalStore, CanonicalFollowError> {
         let commit_started = std::time::Instant::now();
@@ -254,6 +255,8 @@ where
         tracing::info!(
             target: "zinder::ingest",
             event = "canonical_live_replacement_committed",
+            common_parent_height = common_parent.height.value(),
+            common_parent_hash = ?common_parent.hash,
             chain_epoch = fence.chain_epoch_id().value(),
             chain_event_sequence = fence.chain_event_sequence(),
             previous_tip_height = previous_tip.height.value(),
@@ -761,9 +764,15 @@ where
             }
             FollowIteration::Replacement {
                 replacement,
+                common_parent,
                 observed_tip,
             } => {
-                store = follower.commit_replacement(store, *replacement, observed_tip)?;
+                store = follower.commit_replacement(
+                    store,
+                    *replacement,
+                    common_parent,
+                    observed_tip,
+                )?;
                 tip_confirmation = TipConfirmation::Confirmed;
             }
         }
@@ -888,6 +897,7 @@ enum FollowIteration {
     },
     Replacement {
         replacement: Box<CanonicalLiveReplacement>,
+        common_parent: BlockId,
         observed_tip: BlockId,
     },
 }
@@ -1252,6 +1262,7 @@ where
             replacement_blocks,
             UnixTimestampMillis::now(),
         )),
+        common_parent,
         observed_tip,
     })
 }

@@ -8,6 +8,14 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+rule_files:
+  - /etc/prometheus/rules/*.yml
+  - /etc/prometheus/rules/compose/*.yml
+  - /etc/prometheus/explorer/rules/*.yml
+
+scrape_config_files:
+  - /etc/prometheus/explorer/scrapes/*.yml
+
 scrape_configs:
   - job_name: "zinder-ingest"
     scrape_interval: 15s

@@ -17,8 +17,9 @@ Conventions:
   `zinder_readiness_*` and `zinder_materialized_view_identity_info` series.
   Your scrape configuration supplies the target identity for the rest.
 - A histogram whose name ends in `_duration_seconds` exports Prometheus
-  buckets, and so does
-  `zinder_grpc_request_receive_slots_held_at_admission`. Other histograms
+  buckets, as do
+  `zinder_grpc_request_receive_slots_held_at_admission` and the wallet RPC
+  block-count histogram `zinder_wallet_rpc_block_range_blocks`. Other histograms
   export as summaries with quantiles.
 - A series appears only after its first sample. For example, a runtime that
   has not broadcast yet exports no broadcast series.
@@ -34,7 +35,8 @@ both the reference Compose Prometheus and the local
 
 | Alert | Fires when | What it means |
 | --- | --- | --- |
-| `ZinderTargetDown` | A scrape target is down for 30 seconds. | The process or its operational endpoint is gone. |
+| `ZinderTargetDown` | A configured target fails scrapes for 30 seconds. | Check the process, listener, and scrape path. |
+| `ZinderTargetMissing` | An expected target has no current scrape series for 30 seconds. | Check discovery, role, and instance against the topology's inventory. |
 | `ZinderServiceNotReady` | `zinder_readiness_state` reports a refusing cause for 1 minute. | The runtime refuses traffic. Read its `/readyz`. |
 | `ZinderReadinessWarning` | `cursor_at_risk` for 5 minutes. | A chain-event consumer is close to losing its cursor. |
 | `ZinderServingPairStale` | `serving_pair_stale` for 1 minute. | A reader serves an older attested chain view and stops when the staleness ceiling passes. |
@@ -47,6 +49,16 @@ both the reference Compose Prometheus and the local
 | `ZinderRocksDbCompactionRunningTooLong` | More than four compactions run for 15 minutes. | Compaction is saturated. |
 | `ZinderStoreWalGrowth` | A store's WAL is above 75% of its limit for 5 minutes. | Flushes stall. See [Bulk catch-up resource tuning](../runbooks/bulk-catchup-resource-tuning.md). |
 | `ZinderStartupOpenStorageSlow` | p95 of the `open_storage` startup phase is above 60 seconds. | Opening storage is slow, usually from WAL replay or disk contention. |
+
+The **Scrape Targets** panel reads `zinder:target_scrape_status`. Each
+expected target has a value of 1 (up), 0 (down), or −1 (missing). A stale series or a last
+scrape older than 45 seconds counts as missing, including a job removed on
+reload. With evaluations on schedule, the 30-second alert hold expires within
+90 seconds of the final sample in Compose or 80 seconds in the local smoke.
+An explicit stale marker can shorten that interval. Both stacks expect ingest,
+projector, query, and compatibility. The Compose Explorer overlay adds
+Explorer. Keep the independent expected-target rules in step with intentional
+topology or scrape-address changes. Monitor the collector from outside it.
 
 A wallet-serving reader answers 200 on `/readyz` during a node outage, so watch
 the dependency gauge and the served-chain age, not only HTTP status.
@@ -88,6 +100,9 @@ Other signals that need attention when they keep rising:
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
+| `zinder_process_start_time_seconds` | gauge | | Linux process start in Unix seconds from kernel boot time and start ticks. Compare within one target to detect observed restarts. |
+| `zinder_process_rss_bytes` | gauge | | Resident bytes at scrape time from Linux `VmRSS`. |
+| `zinder_process_rss_anon_bytes` | gauge | | Anonymous resident bytes at scrape time from Linux `RssAnon`. |
 | `zinder_build_info` | gauge | `service`, `version`, `git_commit`, `network` | Always 1. Identifies the build. |
 | `zinder_readiness_state` | gauge | `service`, `network`, `cause` | 1 for the current [readiness cause](readiness.md#readiness-causes), 0 for the others. |
 | `zinder_readiness_dependency_state` | gauge | `service`, `network`, `input`, `cause` | 1 for each dependency's current cause. Includes a writer halt read through a dependency. |
@@ -97,6 +112,11 @@ Other signals that need attention when they keep rising:
 | `zinder_readiness_served_epoch_age_seconds` | gauge | `service`, `network` | Wallet-serving readers: seconds since the writer committed the served chain state. |
 | `zinder_materialized_view_identity_info` | gauge | `service`, `network`, `identity` | 1 for each Explorer view store identity the runtime admitted. |
 | `zinder_startup_phase_duration_seconds` | histogram | `phase`, `outcome` | Duration of each [startup phase](../architecture/service-operations.md). |
+
+Process gauges use scrape target labels. An unavailable kernel field is absent.
+A process that starts and exits between scrapes needs lifecycle event evidence.
+For the single-volume image use the ingest cgroup series once per container.
+Ingest's existing `zinder_ingest_process_rss_*` series also sample its own process.
 
 The projector exports only these series. Its wallet store exports no
 `zinder_store_*` metrics.
@@ -175,6 +195,7 @@ These series describe the first sync. They stay flat while ingest follows.
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | | Fetched segments waiting to be emitted in order. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | | Bytes of those segments. |
 | `zinder_ingest_source_segment_connected_blocks_total` | counter | | Blocks received in segments. |
+| `zinder_ingest_source_segment_updates` | histogram | | Chain updates returned by each successful segment request. |
 | `zinder_ingest_source_segment_response_payload_bytes` | histogram | | Response size of each segment. |
 | `zinder_ingest_source_segment_reserved_response_bytes` | histogram | | Bytes reserved for each segment request. |
 | `zinder_ingest_source_segment_reservation_undersized_total` | counter | | Segments larger than their reservation. |
@@ -291,6 +312,30 @@ Both runtimes serve wallet reads through the same code and export the same
 series. Compatibility in compact-blocks mode has no serving pair and no
 broadcast, so it exports none of those series.
 
+### Wallet RPCs at the listener
+
+Native WalletQuery and both lightwalletd serving modes count each recognized
+wallet method once. Use `surface` (`wallet_query` or `lightwalletd`) and the
+protobuf `method` for caller traffic. A terminal `grpc_code` is the gRPC code
+in snake case. `error_class` is the typed Zinder wire reason when present and
+`none` otherwise. A dropped unfinished call counts as cancelled. Health,
+reflection, and unknown method paths are outside this denominator.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_wallet_rpc_requests_total` | counter | `surface`, `method`, `grpc_code`, `error_class` | Completed RPCs, including refusals and terminal stream errors. |
+| `zinder_wallet_rpc_readiness_refusals_total` | counter | `surface`, `method` | Requests refused by the readiness interceptor. Each recognized method starts at zero. A refusal also contributes one terminal RPC outcome. |
+| `zinder_wallet_rpc_duration_seconds` | histogram | same as completed RPCs | Seconds from listener arrival through completion or cancellation. |
+| `zinder_wallet_rpc_in_flight` | gauge | `surface`, `method` | Calls from arrival until their final outcome. |
+| `zinder_wallet_rpc_open_streams` | gauge | `surface`, `method` | Open streaming response bodies or an admitted native balance upload from its first body poll through half-close, error, or drop. Included in in-flight calls. |
+| `zinder_wallet_rpc_block_range_blocks` | histogram | same as completed RPCs | Complete block messages handed to the transport per opened range stream, including partial results before errors or cancellation. |
+| `zinder_wallet_rpc_block_range_duration_seconds` | histogram | same as completed RPCs | Seconds from opening a range response body until its final outcome. |
+
+Readiness refusals contribute to completed RPCs. A range refused before it
+opens contributes no stream-length or open-duration observation. Native range
+headers are excluded from the block count. To measure what arrived at a wallet,
+collect the client's outcome as well.
+
 ### Wallet requests
 
 | Metric | Type | Labels | Meaning |
@@ -333,7 +378,7 @@ it as the writer commits.
 | `zinder_wallet_serving_writer_status_total` | counter | `status` | Reads of the writer's status RPC. |
 | `zinder_wallet_serving_writer_status_duration_seconds` | histogram | `status` | Duration of those reads. |
 | `zinder_wallet_serving_writer_status_available` | gauge | | 1 when the latest status read succeeded. |
-| `zinder_wallet_serving_pair_publisher_refresh_total` | counter | `status`, `error_class` | Refresh attempts. |
+| `zinder_wallet_serving_pair_publisher_refresh_total` | counter | `status`, `error_class` | Completed background refresh attempts, including successful polls of an unchanged fence (`ok`, `none`) and failures. A poll that cannot reserve a slot can succeed without publishing. |
 | `zinder_wallet_serving_pair_publisher_convergence_total` | counter | `outcome` | Rounds spent bringing a candidate pair to the writer's state. |
 | `zinder_wallet_serving_pair_publisher_publications_total` | counter | | Pairs published. |
 | `zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs` | gauge | | Chain epochs between the writer and the published pair. |
@@ -469,7 +514,7 @@ information and query.
 | `canonical_writer_started` | ingest | The writer started. |
 | `canonical_ready_store_reopened` | ingest | An existing store was reopened. |
 | `canonical_empty_construction_staging_removed`, `canonical_unpublished_construction_restarted` | ingest | A first sync restarted from scratch. |
-| `canonical_live_append_committed`, `canonical_live_replacement_committed` | ingest | A block or a reorg replacement was committed. |
+| `canonical_live_append_committed`, `canonical_live_replacement_committed` | ingest | A block or a reorg replacement was committed. A replacement includes the previous tip and the common parent. |
 | `canonical_source_recovery` | ingest | A node outage started or changed class. |
 | `upstream_health_probe_started`, `upstream_health_endpoint_unreachable` | ingest | The node health probe started, or cannot reach its endpoint. |
 | `node_endpoint_admitted`, `node_endpoint_excluded`, `node_endpoint_unreachable`, `node_endpoint_skipped`, `node_endpoint_deferred` | ingest | Startup checks of fallback nodes. |
@@ -480,7 +525,7 @@ information and query.
 | `tree_state_verification_cycle_completed`, `tree_state_verification_mismatch` | ingest | The verification pass checked every settled tree-state row, or found a damaged one, with its `height`, `pool`, and `reason`. |
 | `tree_state_verification_recorded_damage_reported`, `tree_state_verification_recorded_damage_cleared`, `tree_state_verification_recorded_damage_discarded` | ingest | A start reported damage the pass recorded before, a recheck found that row intact, or the record named another store. |
 | `canonical_secondary_behind_writer` | projector | A convergence attempt timed out. |
-| `wallet_serving_pair_publisher_published` | query, compatibility | A pair was published. Match it with `canonical_live_append_committed` to measure block-to-wallet delay. |
+| `wallet_serving_pair_publisher_published` | query, compatibility | A reader published a fence. The process ID, epoch, sequence, visible tip, and sequence digest identify the observation for the [census](../runbooks/serving-census.md#measure-publication-delay). |
 | `wallet_serving_pair_publisher_refresh_failed` | query, compatibility | A refresh failed. Routine lag logs at debug level. |
 | `wallet_serving_pair_publisher_generation_opened` | query, compatibility | A pair slot was opened cold. |
 | `wallet_serving_pair_table_file_missing`, `wallet_serving_pair_reads_revoked` | query, compatibility | A pair lost a file to compaction, or its reads were revoked. |

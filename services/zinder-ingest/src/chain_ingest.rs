@@ -192,7 +192,7 @@ where
         let stats = segment.stats();
         metrics::counter!("zinder_ingest_source_segment_connected_blocks_total")
             .increment(u64::from(stats.connected_blocks()));
-        metrics::histogram!("zinder_ingest_source_segment_max_blocks")
+        metrics::histogram!("zinder_ingest_source_segment_updates")
             .record(usize_to_u32_saturating(segment.len()));
         metrics::histogram!("zinder_ingest_source_segment_response_payload_bytes")
             .record(u64_to_f64(stats.response_payload_bytes()));

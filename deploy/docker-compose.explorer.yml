@@ -13,6 +13,10 @@
 # WalletQuery service over the shared loopback namespace.
 
 services:
+  zinder-prometheus:
+    volumes:
+      - ./observability/explorer:/etc/prometheus/explorer:ro
+
   zinder-ingest:
     environment:
       ZINDER_INGEST__EXPLORER_VIEWS: "true"

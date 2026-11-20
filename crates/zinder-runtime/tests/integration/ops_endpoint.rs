@@ -39,6 +39,18 @@ async fn get_text(listen_addr: SocketAddr, path: &str) -> Result<(u16, String)> 
     Ok((status, String::from_utf8(body.to_vec())?))
 }
 
+#[cfg(target_os = "linux")]
+fn process_gauge(metrics: &str, name: &str) -> Result<f64> {
+    let kind = format!("# TYPE {name} gauge");
+    assert!(metrics.lines().any(|line| line == kind), "{kind}");
+    let prefix = format!("{name} ");
+    let sample = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| eyre::eyre!("missing {name} sample"))?;
+    Ok(sample.parse()?)
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -108,6 +120,20 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
 
     let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
     assert_eq!(status, 200);
+    #[cfg(target_os = "linux")]
+    {
+        let start = process_gauge(&metrics_text, "zinder_process_start_time_seconds")?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        assert!(start > 0.0 && start <= now.as_secs_f64());
+        let rss = process_gauge(&metrics_text, "zinder_process_rss_bytes")?;
+        let anon = process_gauge(&metrics_text, "zinder_process_rss_anon_bytes")?;
+        assert!(rss > 0.0 && (0.0..=rss).contains(&anon));
+        let (_, next_scrape) = get_text(listen_addr, "/metrics").await?;
+        assert_eq!(
+            start.to_bits(),
+            process_gauge(&next_scrape, "zinder_process_start_time_seconds")?.to_bits()
+        );
+    }
     assert!(
         metrics_text.contains("zinder_build_info{"),
         "{metrics_text}"

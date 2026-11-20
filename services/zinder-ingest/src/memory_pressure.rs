@@ -12,10 +12,10 @@ use std::{
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zinder_runtime::ProcessMemory;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
-const PROC_SELF_STATUS: &str = "/proc/self/status";
 
 /// Default cadence for runtime memory gauges exported by the ingest process.
 pub const DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL: Duration = Duration::from_secs(1);
@@ -46,14 +46,13 @@ impl RuntimeMemorySnapshot {
         Self::sample_from_paths(
             Path::new(CGROUP_ROOT),
             Path::new(PROC_SELF_CGROUP),
-            Path::new(PROC_SELF_STATUS),
+            ProcessMemory::sample(),
         )
     }
 
-    fn sample_from_paths(cgroup_root: &Path, proc_cgroup: &Path, proc_status: &Path) -> Self {
+    fn sample_from_paths(cgroup_root: &Path, proc_cgroup: &Path, process: ProcessMemory) -> Self {
         let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
         let cgroup_memory_stat = read_cgroup_memory_stat(&cgroup_dir);
-        let (process_rss_bytes, process_rss_anon_bytes) = process_rss_bytes(proc_status);
         Self {
             cgroup_current_bytes: read_cgroup_u64(&cgroup_dir, "memory.current"),
             cgroup_max_bytes: read_cgroup_u64(&cgroup_dir, "memory.max"),
@@ -65,8 +64,8 @@ impl RuntimeMemorySnapshot {
             cgroup_active_file_bytes: cgroup_memory_stat.active_file,
             cgroup_kernel_bytes: cgroup_memory_stat.kernel,
             cgroup_slab_bytes: cgroup_memory_stat.slab,
-            process_rss_bytes,
-            process_rss_anon_bytes,
+            process_rss_bytes: process.rss_bytes,
+            process_rss_anon_bytes: process.rss_anon_bytes,
         }
     }
 
@@ -286,28 +285,6 @@ fn read_cgroup_memory_stat(cgroup_dir: &Path) -> CgroupMemoryStat {
     stat
 }
 
-fn process_rss_bytes(proc_status: &Path) -> (Option<u64>, Option<u64>) {
-    let Ok(status_text) = fs::read_to_string(proc_status) else {
-        return (None, None);
-    };
-    let mut rss = None;
-    let mut rss_anon = None;
-    for line in status_text.lines() {
-        if rss.is_none() {
-            rss = parse_status_kib_line(line, "VmRSS:");
-        }
-        if rss_anon.is_none() {
-            rss_anon = parse_status_kib_line(line, "RssAnon:");
-        }
-    }
-    (rss, rss_anon)
-}
-
-fn parse_status_kib_line(line: &str, key: &str) -> Option<u64> {
-    let kib_text = line.strip_prefix(key)?.split_whitespace().next()?;
-    kib_text.parse::<u64>().ok()?.checked_mul(1024)
-}
-
 #[allow(
     clippy::cast_precision_loss,
     reason = "Prometheus gauges use f64 samples; runtime memory values are diagnostic magnitudes"
@@ -339,15 +316,13 @@ mod tests {
             service_dir.join("memory.stat"),
             "anon 400\nfile 500\ninactive_file 300\nactive_file 200\nkernel 50\nslab 20\n",
         )?;
-        fs::write(
-            tempdir.path().join("status"),
-            "Name:\tzinder\nVmRSS:\t42 kB\nRssAnon:\t40 kB\n",
-        )?;
-
         let snapshot = RuntimeMemorySnapshot::sample_from_paths(
             &cgroup_root,
             &tempdir.path().join("cgroup"),
-            &tempdir.path().join("status"),
+            ProcessMemory {
+                rss_bytes: Some(42 * 1024),
+                rss_anon_bytes: Some(40 * 1024),
+            },
         );
 
         assert_eq!(snapshot.cgroup_current_bytes, Some(900));

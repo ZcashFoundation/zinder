@@ -38,6 +38,7 @@ mod call_termination;
 mod message_boundaries;
 mod receive_slots;
 mod send_stall;
+mod wallet_rpc_metrics;
 
 use std::{
     convert::Infallible,
@@ -79,6 +80,8 @@ pub(crate) use self::call_termination::OpenGrpcCalls;
 pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
+pub(crate) use self::wallet_rpc_metrics::{RANGE_BLOCKS, RANGE_DURATION, WalletRpcMethod};
+pub use self::wallet_rpc_metrics::{WalletRpcMetrics, WalletRpcMetricsLayer};
 use self::{
     message_boundaries::MessageBoundaries,
     receive_slots::{ReceiveSlot, ReceiveSlots},
@@ -714,7 +717,7 @@ impl http_body::Body for ReceiveBoundBody {
                 } else if this.pool == ReceivePool::ClientStream
                     && frame
                         .data_ref()
-                        .is_some_and(|chunk| receiving.boundaries.completes_a_message(chunk))
+                        .is_some_and(|chunk| receiving.boundaries.completed_messages(chunk) > 0)
                 {
                     receiving
                         .deadline

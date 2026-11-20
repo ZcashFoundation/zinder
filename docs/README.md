@@ -20,6 +20,7 @@ how to choose a deployment, and a Docker Compose quickstart.
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
 - [Deploying the single-volume container](runbooks/deploying-single-volume.md),
   including Railway
+- [Measure a wallet-serving deployment](runbooks/serving-census.md)
 - [Exposing over TLS](runbooks/exposing-over-tls.md)
 - [Initial sync](runbooks/initial-sync.md): what the first sync does and how to
   recover it

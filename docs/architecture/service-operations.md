@@ -136,6 +136,13 @@ the runtime started stopping. It exits with status 1 in every other case,
 with an error that names the task or server that stopped the runtime, or, for
 a requested shutdown, the first task that failed.
 
+## Wallet traffic
+
+For traffic by protocol method, use the [wallet RPC listener metrics](../reference/metrics.md#wallet-rpcs-at-the-listener).
+They include admission refusals and follow streaming calls through their last
+status or cancellation. The query engine's operation counters measure the work
+inside a call. A long lightwalletd stream can perform several engine reads.
+
 ## Memory allocator
 
 On Linux, every service binary allocates through jemalloc, and jemalloc also

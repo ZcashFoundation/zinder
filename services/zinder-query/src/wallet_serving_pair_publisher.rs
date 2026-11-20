@@ -1199,6 +1199,12 @@ impl WalletServingPairPublisher {
         let refreshed = self.refresh_once().await;
         self.record_resource_gauges().await;
         let Err(error) = refreshed else {
+            metrics::counter!(
+                "zinder_wallet_serving_pair_publisher_refresh_total",
+                "status" => "ok",
+                "error_class" => "none"
+            )
+            .increment(1);
             return;
         };
         let still_admitted = self.record_refresh_failure(&error);
@@ -1825,6 +1831,9 @@ impl WalletServingPairPublisher {
             chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
             event_sequence = pair.canonical_fence().chain_event_sequence(),
             visible_height = pair.canonical_fence().visible_tip().height.value(),
+            visible_tip_hash = ?pair.canonical_fence().visible_tip().hash,
+            sequence_digest = ?pair.canonical_fence().sequence_digest().as_bytes(),
+            process_id = std::process::id(),
             "published exact immutable canonical and wallet secondary pair"
         );
         Ok(())
@@ -7049,6 +7058,29 @@ mod tests {
         assert!(gauge("zinder_store_memtable_budget_usage_bytes").is_some());
         assert!(gauge("zinder_store_table_reader_memory_bytes").is_some());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_counter_includes_unchanged_fences_and_failed_attempts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, _slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        publisher.refresh_and_record().await;
+        primaries.control.set_available(false);
+        publisher.refresh_and_record().await;
+        let exposition = rendered_metrics.render();
+        for (status, class) in [("ok", "none"), ("error", "writer_status_rpc")] {
+            let series = format!(
+                "zinder_wallet_serving_pair_publisher_refresh_total{{status=\"{status}\",error_class=\"{class}\"}}"
+            );
+            assert_eq!(gauge_sample(&exposition, &series), Some(1.0));
+        }
+        primaries.shutdown().await
     }
 
     /// Reads one unlabelled or fully labelled gauge series from a Prometheus
