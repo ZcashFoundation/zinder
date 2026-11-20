@@ -632,6 +632,13 @@ impl<Message> BlockRangeSink<Message> {
         let permit = self.next_chunk.reserve().await.ok()?;
         Some(ChunkRoom { permit })
     }
+
+    /// Returns whether the client has dropped the response, so a reader
+    /// that already holds room can start no further read after its client
+    /// went away.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.next_chunk.is_closed()
+    }
 }
 
 /// Room for one chunk in a block-range response, which the read that fills

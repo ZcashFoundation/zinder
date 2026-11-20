@@ -2118,6 +2118,64 @@ async fn a_dropped_block_range_stream_keeps_its_slot_only_for_the_read_in_flight
     Ok(())
 }
 
+/// A later read that finds a height outside retained history after the
+/// client went away is the stream's last read.
+///
+/// While the client holds the stream, the server then reads the heights an
+/// earlier read checked and sends them before the stream ends with
+/// `NOT_FOUND`. Once the client has dropped the stream, it reads none of
+/// them, so the stream's slot returns as soon as the failed read finishes.
+#[tokio::test]
+async fn a_dropped_stream_reads_no_checked_heights_after_a_read_outside_retained_history()
+-> eyre::Result<()> {
+    // Heights 1,000 down to 0: the first read checks 1,000 down to 1 and
+    // keeps a few large blocks, so the second is offered the heights it did
+    // not keep together with unretained height 0.
+    const TIP: u32 = 1_000;
+    let store_fixture = acceptance_store_fixture()?;
+    let view =
+        SyntheticView::entry(ENTRY_EPOCH, TIP).with_sapling_outputs(LARGE_BLOCK_SAPLING_OUTPUTS);
+    let request = || block_range_request(u64::from(TIP), 0);
+
+    let held = stream_across_views(&store_fixture, request(), vec![view]).await?;
+    assert_one_linked_chain(&held.blocks, u64::from(TIP), 1);
+    assert_stream_ended_with(held.ending.as_ref(), Code::NotFound);
+
+    let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_views(vec![view])
+        .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
+    let dropped = adapter
+        .get_block_range(Request::new(request()))
+        .await?
+        .into_inner();
+    later_chunk_read_at_gate(&recorder).await?;
+    drop(dropped);
+    later_chunk_gate.add_permits(1);
+    wait_for_block_range_slot(&adapter).await?;
+
+    let first_chunk_start = recorder
+        .recorded_compact_block_ranges()
+        .first()
+        .map(|read| read.start.value())
+        .ok_or_else(|| eyre!("the stream must read its first chunk"))?;
+    let range =
+        |start, end| BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        vec![
+            range(1, TIP),
+            range(0, first_chunk_start.saturating_sub(1)),
+            range(1, 10)
+        ],
+        "a reader whose client went away must not read the checked heights after a failed read"
+    );
+    Ok(())
+}
+
 /// Waits until `recorder` has recorded at least `reads` compact-block range
 /// reads, lets the stream's reader run on, and returns how many it recorded.
 async fn settled_compact_block_reads<Inner: Sync>(
@@ -2132,6 +2190,21 @@ async fn settled_compact_block_reads<Inner: Sync>(
     .await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(recorder.recorded_compact_block_ranges().len())
+}
+
+/// Waits until a later block-range chunk read of `recorder` waits on the gate
+/// of [`EpochPinRecorder::with_later_chunk_gate`], for up to ten seconds.
+///
+/// Returns at once when a read has reached the gate since the last wait.
+async fn later_chunk_read_at_gate<Inner: Sync>(
+    recorder: &EpochPinRecorder<Inner>,
+) -> eyre::Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        recorder.later_chunk_gate_reached.notified(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// A stream holds at most two chunks however long its client stalls: the
@@ -2757,6 +2830,8 @@ struct EpochPinRecorder<Inner> {
     /// Holds every unpinned compact-block range read, the read of a later
     /// block-range chunk, until it has a permit.
     later_chunk_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Notified each time a read waits on `later_chunk_gate`.
+    later_chunk_gate_reached: Arc<tokio::sync::Notify>,
     /// Holds the next pinned compact-block range read, the read of a
     /// block-range stream's first chunk, until the gate opens. Only one read
     /// waits on it.
@@ -2801,6 +2876,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
+            later_chunk_gate_reached: Arc::new(tokio::sync::Notify::new()),
             first_chunk_gate: Arc::new(Mutex::new(None)),
             refuses_tree_state_rebuilds: false,
             block_time_override: Arc::new(Mutex::new(None)),
@@ -2920,6 +2996,7 @@ fn synthetic_block_hash(height: u32, branch: u8) -> BlockHash {
 
 /// One chain view a synthetic recorder serves: heights `1..=visible_tip_height`
 /// of branch 0 below `fork_height`, and of `branch` from `fork_height` on.
+/// Height 0 lies outside retained history, as in a store.
 #[derive(Clone, Copy, Debug)]
 struct SyntheticView {
     epoch_id: ChainEpochId,
@@ -3047,10 +3124,15 @@ impl SyntheticView {
         if requested > maximum {
             return Err(QueryError::BlockRangeTooLarge { requested, maximum });
         }
-        if block_range.end > self.visible_tip_height {
+        let unretained_height = if block_range.end > self.visible_tip_height {
+            Some(block_range.end)
+        } else {
+            (block_range.start.value() == 0).then_some(block_range.start)
+        };
+        if let Some(height) = unretained_height {
             return Err(QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::CompactBlock,
-                key: ArtifactKey::BlockHeight(block_range.end),
+                key: ArtifactKey::BlockHeight(height),
             });
         }
         let mut heights = block_range.into_iter().collect::<Vec<_>>();
@@ -3207,6 +3289,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         if at_epoch_id.is_none()
             && let Some(gate) = &self.later_chunk_gate
         {
+            self.later_chunk_gate_reached.notify_one();
             let _permit = gate.acquire().await;
         }
         self.record(at_epoch_id);

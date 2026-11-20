@@ -652,8 +652,9 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 /// converted ends the stream with that status after the blocks before it.
 /// A read that finds a height outside retained history, which fails with
 /// `NOT_FOUND`, is followed by a read of the heights an earlier read checked
-/// and the stream has not sent, when there are any, so the stream sends them
-/// before it ends. Once the client has dropped the response, the task
+/// and the stream has not sent, when there are any and the client still
+/// holds the response, so the stream sends them before it ends. Once the
+/// client has dropped the response, the task
 /// finishes the read in flight and starts no other, so it holds the stream's
 /// slot only while that read runs.
 async fn stream_later_chunks<Reads: CompactBlockReads>(
@@ -673,6 +674,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
         let mut outcome = read_later_chunk(&reads, chunk, chunks, continuity, conversion).await;
         if let Err(status) = &outcome
             && status.code() == Code::NotFound
+            && !sink.is_closed()
             && let Some((checked, only_checked)) = chunks.checked_heights()
         {
             outcome = read_later_chunk(&reads, checked, only_checked, continuity, conversion).await;
