@@ -1,0 +1,6 @@
+kind: changed
+body: "Compact-blocks `zinder-compat-lightwalletd` now judges the tip's age for `GetLatestBlock` and `GetLightdInfo` after reading the tip header rather than when the call arrives, so a slow read can refuse a tip that was fresh on arrival but never serves one that expired. `zinder-bench rocksdb-compact-block-range` reports also measure each range through the serving reader, under a new `canonical_reader` section in report format version 3."
+time: 2026-11-20T08:00:00.000000000Z
+custom:
+    Bump: patch
+    PR: "345"
