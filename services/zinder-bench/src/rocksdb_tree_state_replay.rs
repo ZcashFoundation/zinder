@@ -425,7 +425,10 @@ impl LatencySeconds {
 #[cfg(test)]
 mod tests {
     use rust_rocksdb::{PerfMetric, statistics::Ticker};
-    use zinder_core::{BlockHeight, Network};
+    use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+    use zinder_store::{
+        RocksDbCanonicalStore, ServedTreeState, TreeStateCheckpointSelection, TreeStateLookup,
+    };
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture,
         sample_regtest_upgrade_activations, with_note_commitments,
@@ -447,54 +450,92 @@ mod tests {
     }
 
     #[test]
-    fn explicit_sparse_dense_and_mixed_reads_retain_attribution()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn explicit_sparse_and_mixed_reads_retain_attribution() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_explicit_fixture(false)
+    }
+
+    #[test]
+    fn explicit_dense_and_mixed_reads_retain_attribution() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_explicit_fixture(true)
+    }
+
+    fn assert_explicit_fixture(dense: bool) -> Result<(), Box<dyn std::error::Error>> {
         let activations = sample_regtest_upgrade_activations();
         let chain = with_note_commitments(
             &ChainFixture::new(Network::ZcashRegtest).extend_blocks(250),
             &activations,
         )?;
-        for live_dense in [false, true] {
-            let baseline = CanonicalBaseline::new(&chain)
-                .through(BlockHeight::new(if live_dense { 1 } else { 250 }));
-            let mut writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
-            if live_dense {
-                writer.append_settled_blocks(&chain)?;
-            }
-            let mut store = writer.into_serving_store_fixture()?;
-            let (canonical, _wallet) = store.take_readers()?;
-            for heights in [
-                &[99, 199][..],
-                &[100, 200][..],
-                &[199, 100, 99, 250, 100][..],
-            ] {
-                let measurement = measure_tree_state_replays(
-                    &canonical,
-                    &activations,
-                    zinder_store::RocksDbStatisticsLevel::Tickers,
-                    ReplayWindow {
-                        from_height: None,
-                        to_height: None,
-                        max_anchors: 1,
-                    },
-                    Some(heights),
-                )?;
-                assert_explicit_reads(&measurement, heights, live_dense)?;
-            }
-            assert!(
-                measure_tree_state_replays(
-                    &canonical,
-                    &activations,
-                    zinder_store::RocksDbStatisticsLevel::Tickers,
-                    ReplayWindow {
-                        from_height: None,
-                        to_height: None,
-                        max_anchors: 64
-                    },
-                    Some(&[251]),
-                )
-                .is_err()
-            );
+        let writer =
+            CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+        if dense {
+            densify_selected_fixture_heights(writer.canonical_primary()?, &activations)?;
+        }
+        let mut store = writer.into_serving_store_fixture()?;
+        let (canonical, _wallet) = store.take_readers()?;
+        for heights in [
+            &[99, 199][..],
+            &[100, 200][..],
+            &[199, 100, 99, 250, 100][..],
+        ] {
+            let measurement = measure_tree_state_replays(
+                &canonical,
+                &activations,
+                zinder_store::RocksDbStatisticsLevel::Tickers,
+                ReplayWindow {
+                    from_height: None,
+                    to_height: None,
+                    max_anchors: 1,
+                },
+                Some(heights),
+            )?;
+            assert_explicit_reads(&measurement, heights, dense)?;
+        }
+        assert!(
+            measure_tree_state_replays(
+                &canonical,
+                &activations,
+                zinder_store::RocksDbStatisticsLevel::Tickers,
+                ReplayWindow {
+                    from_height: None,
+                    to_height: None,
+                    max_anchors: 64
+                },
+                Some(&[251]),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn densify_selected_fixture_heights(
+        store: &RocksDbCanonicalStore,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoints = [99, 100, 199, 200, 250]
+            .into_iter()
+            .map(|height| store.tree_state_checkpoint_at(BlockHeight::new(height), activations))
+            .collect::<Result<Vec<_>, _>>()?;
+        let selection = TreeStateCheckpointSelection::EveryBlock;
+        let mut from = BlockHeight::new(0);
+        let mut batches = 0;
+        let mut rows = 0;
+        while let Some(stride) = store.next_tree_state_stride(from, selection)? {
+            let densified = store.densify_tree_state_stride(stride, selection, activations)?;
+            rows += store.commit_tree_state_stride(&densified)?.rows_written;
+            batches += 1;
+            from = stride.end_height();
+        }
+        assert_eq!((batches, rows), (2, 198));
+        for checkpoint in checkpoints {
+            let checkpoint = checkpoint.ok_or("fixture checkpoint is absent")?;
+            let Some(TreeStateLookup::Stored(stored)) =
+                store.tree_state_lookup(checkpoint.block_id.height, activations)?
+            else {
+                return Err("selected height was not densified".into());
+            };
+            assert_eq!(stored, ServedTreeState::from(&checkpoint));
         }
         Ok(())
     }
@@ -502,7 +543,7 @@ mod tests {
     fn assert_explicit_reads(
         measurement: &super::TreeStateReplayMeasurement,
         heights: &[u32],
-        live_dense: bool,
+        dense: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(measurement.read_path, "wallet-query-store");
         assert_eq!(measurement.stored_checkpoint_anchors_skipped, 0);
@@ -515,7 +556,7 @@ mod tests {
             heights
         );
         for anchor in &measurement.anchors {
-            let stored = live_dense || anchor.height % 100 == 0 || anchor.height == 250;
+            let stored = dense || anchor.height % 100 == 0 || anchor.height == 250;
             assert_eq!(
                 anchor.source,
                 if stored {
