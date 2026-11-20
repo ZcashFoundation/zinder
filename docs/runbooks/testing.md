@@ -1221,9 +1221,10 @@ a new wallet and output directory on each run.
 | Cake Wallet | [Build and run the exact Zcash engine pinned by the app](../../scripts/wallet-clients/cake-regtest.md). |
 | zcash-devtool | Use [run-devtool-regtest.py](../../scripts/wallet-clients/run-devtool-regtest.py) with the Regtest-enabled CLI, its source revision and binary SHA-256, the readiness receipt, and a fresh output directory. |
 
-Zallet and Zally supply native WalletQuery adapters from their own repositories.
-For Zallet, retain canonical full blocks during ingest and configure the query
-service with the same retention policy before starting the wallet.
+For native WalletQuery, select the lifecycle adapter from the exact Zallet
+integration-tests or Zally revision under test. Zallet also requires canonical
+full blocks. Retain them during ingest and configure the query service with the
+same retention policy before starting the wallet.
 
 To run the pinned zcash-devtool case, start the all-at-one Regtest fixture and
 set `fixture_ready` to its `ready.initial.json`. From the Zinder checkout, build
