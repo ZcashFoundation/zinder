@@ -7,7 +7,7 @@ use std::{
 
 use clap::Parser;
 use eyre::{Result, WrapErr as _};
-use zinder_store::CanonicalStoreError;
+use zinder_store::{CanonicalStoreError, RawBlobRetention};
 
 use crate::{archive::ProjectionReport, corpus::ScanAction};
 
@@ -22,6 +22,9 @@ struct Args {
     /// Canonical Testnet wallet-serving store.
     #[arg(long)]
     store: PathBuf,
+    /// Raw blob policy used by the canonical writer (none, transactions, or all).
+    #[arg(long, default_value = "transactions", value_parser = parse_raw_blob_retention)]
+    raw_blob_retention: RawBlobRetention,
     /// First height, inclusive.
     #[arg(long)]
     start: u32,
@@ -31,6 +34,11 @@ struct Args {
     /// Write the public candidate actions to a new file.
     #[arg(long)]
     corpus: Option<PathBuf>,
+}
+
+fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
+    RawBlobRetention::from_kebab_case(encoded)
+        .ok_or_else(|| "expected none, transactions, or all".to_owned())
 }
 
 fn write_action(writer: &mut impl Write, action: &ScanAction) -> Result<()> {
@@ -100,7 +108,13 @@ fn measure(
 fn main() -> Result<()> {
     let args = Args::parse();
     let report = measure(args.corpus.as_deref(), |visit| {
-        archive::read_range(&args.store, args.start, args.end, visit)
+        archive::read_range(
+            &args.store,
+            args.raw_blob_retention,
+            args.start,
+            args.end,
+            visit,
+        )
     })?;
     let stdout = std::io::stdout().lock();
     serde_json::to_writer_pretty(stdout, &report)?;
@@ -113,6 +127,29 @@ mod tests {
     use eyre::OptionExt as _;
 
     use super::*;
+
+    #[test]
+    fn archive_retention_defaults_to_transactions_and_accepts_full_blocks() -> Result<()> {
+        let arguments = [
+            "export-wallet-scan-corpus",
+            "--store",
+            ".",
+            "--start",
+            "1",
+            "--end",
+            "1",
+        ];
+        assert_eq!(
+            Args::try_parse_from(arguments)?.raw_blob_retention,
+            RawBlobRetention::Transactions
+        );
+        let full_blocks = arguments.into_iter().chain(["--raw-blob-retention", "all"]);
+        assert_eq!(
+            Args::try_parse_from(full_blocks)?.raw_blob_retention,
+            RawBlobRetention::All
+        );
+        Ok(())
+    }
 
     fn missing_table_file() -> Result<CanonicalStoreError> {
         let directory = tempfile::tempdir()?;

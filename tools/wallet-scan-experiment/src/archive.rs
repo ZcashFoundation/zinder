@@ -32,6 +32,7 @@ pub(crate) struct ProjectionReport {
 
 pub(crate) fn read_range(
     store: &Path,
+    raw_blob_retention: RawBlobRetention,
     start: u32,
     end: u32,
     mut visit: impl FnMut(ScanAction) -> Result<()>,
@@ -46,7 +47,7 @@ pub(crate) fn read_range(
         temporary.path(),
         Network::ZcashTestnet,
         CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        raw_blob_retention,
         CanonicalReorgPolicy::new(DEFAULT_REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::canonical_reader_defaults(),
     )?;

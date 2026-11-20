@@ -2,9 +2,11 @@
 
 A wallet that scans shielded pools can omit transparent inputs and outputs from its downloads. A second option is to send an extra public Pallas point for each Orchard and Ironwood action so a wallet can reduce the work of trial decryption. This experiment measures the two options independently on the native Zinder compact-block format. Both encodings are experimental. [Ztreamer’s shifted-key implementation](https://github.com/zcashlabs/ztreamer/pull/382) describes the point and its cost per action.
 
+An incorrect hint can be a valid Pallas point and still hide a payment. Before treating a failed trial decryption as evidence that an action is unrelated, a wallet must verify that the hint equals `[2^64]EPK` or repeat trial decryption with the original EPK. The measured payload sizes include that original EPK.
+
 ## Replaying a range
 
-The exporter opens a read-only secondary of a wallet-serving Testnet canonical store with the default reorg window, retained transactions, and a recorded upgrade schedule. It checks the height and parent hash of each block. This command repeats the mixed-range measurement.
+The exporter opens a read-only secondary of a wallet-serving Testnet canonical store with the default reorg window and a recorded upgrade schedule. The exporter expects the writer’s `storage.raw_blob_policy` to be `transactions` by default. Pass `--raw-blob-retention all` for a full-block store. It checks the height and parent hash of each block. This command repeats the mixed-range measurement.
 
 ```sh
 cargo run --locked --release -p wallet-scan-experiment --bin export-wallet-scan-corpus -- \
