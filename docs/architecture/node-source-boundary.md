@@ -67,7 +67,8 @@ own address index. No runtime calls these methods.
 | --- | --- | --- |
 | `fetch_transparent_address_balance` | `getaddressbalance` | Unspent balance and total received |
 | `fetch_transparent_address_transaction_ids` | `getaddresstxids` | Transaction ids in a height range, in chain order |
-| `fetch_transparent_address_utxos` | `getaddressutxos` | Up to `max_rows` unspent outputs at or above a height, in chain order |
+| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order |
+| `fetch_transparent_address_utxo_prefix` | `getaddressutxos` | The first `max_rows` unspent outputs at or above a height, in chain order |
 
 Every method takes a `TransparentAddressLookup`: 1 to 10,000 distinct
 addresses of the source's network. TEX addresses are refused, because the
@@ -75,24 +76,48 @@ index holds the P2PKH address a TEX address encodes; Zebra refuses one and
 Zakura matches nothing for it. Zebra 7.1.0 and Zakura 1.8.6 answer
 differently, and the source gives both the same result:
 
-- **Row limit.** Zebra refuses a lookup that matches more than 100,000 rows.
-  Zakura has no limit, so the source refuses its larger answers too. Both are
-  reported as `TransparentAddressRowLimitExceeded`, and the caller narrows the
-  lookup.
-- **Height range.** Both nodes clamp `getaddresstxids` heights to their tip
-  and read an end height of zero as the tip. The source reads the tip first,
-  returns nothing for a range above it, and sends no request for a range that
-  ends at genesis, which neither node indexes.
-- **Paging.** `getaddressutxos` sends `startHeight` and `maxEntries`, which
-  Zebra applies to its index scan. Zakura ignores both and returns every
-  unspent output, so the source drops the rows below the start height and
-  truncates the rest. That whole answer still counts toward
-  `node.max_response_bytes`.
+- **Row limit.** One answer holds at most 100,000 rows. Zebra refuses a
+  larger `getaddresstxids` answer, and a larger `getaddressutxos` answer when
+  `maxEntries` is zero. Zakura has no limit, so the source counts the rows
+  that match and refuses more than 100,000. Both are reported as
+  `TransparentAddressRowLimitExceeded`, and the caller narrows the lookup: a
+  shorter height range for transaction ids, or fewer addresses for unspent
+  outputs.
+- **Height range.** Both nodes clamp `getaddresstxids` heights to the tip they
+  see when they answer, and read an end height of zero as the tip. The source
+  reads the tip first, returns nothing for a range above it, and sends no
+  request for a range that ends at genesis, which neither node indexes. It
+  reads the tip again after the request and keeps the answer only when both
+  reads name the same block, because a tip that fell below the range in
+  between makes the node answer with its new tip's transactions. After three
+  attempts whose tip changed, it reports `ChainTipChangedDuringFetch`, classed
+  `upstream_view_changed`.
+- **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
+  `maxEntries` zero, the only value for which Zebra refuses a lookup over the
+  row limit. With a positive `maxEntries`, Zebra returns that many outputs and
+  does not say whether more match.
+- **Prefix of unspent outputs.** `fetch_transparent_address_utxo_prefix`
+  sends `startHeight` and `maxEntries`, which Zebra applies to its index scan.
+  Zakura ignores both and returns every unspent output, so the source drops
+  the rows below the start height and truncates the rest. A full prefix may
+  have more outputs after it, and no later lookup resumes losslessly: the node
+  pages only by height, and one block can hold more matching outputs than one
+  prefix.
+- **Response size.** An answer above `node.max_response_bytes` is reported as
+  `SourceResponseTooLarge`. Zakura's unspent-output answer counts in full,
+  even for a prefix or a high start height. Either node answers JSON-RPC error
+  -32008 instead of an answer above its own `rpc.max_response_body_size`. The
+  source reports that refusal as `NodeResponseTooLarge`, classed
+  `configuration`, because the same request to the same node fails the same
+  way.
+
+Each unspent-output row must be in chain order and pay an address of the
+lookup. Any other row is reported as `SourceProtocolMismatch`.
 
 A Zakura node in pruned storage mode with checkpoint sync stops maintaining its
-transparent indexes and refuses all three methods. The source reports that
-refusal, and a node without the methods, as
-`TransparentAddressIndexesUnavailable`.
+transparent indexes and refuses `getaddressbalance`, `getaddresstxids`, and
+`getaddressutxos`. The source reports that refusal, and a node without the
+methods, as `TransparentAddressIndexesUnavailable`.
 
 ## Capabilities
 

@@ -1,5 +1,6 @@
 mod node_set;
 mod nu7_activation_boundary;
+mod public_error_enums;
 mod transport_invariants;
 mod zebra_indexer_block;
 mod zebra_indexer_tls;

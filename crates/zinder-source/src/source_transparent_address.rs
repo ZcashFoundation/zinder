@@ -84,6 +84,13 @@ impl TransparentAddressLookup {
     pub(crate) fn rpc_addresses(&self) -> &[String] {
         &self.encoded_addresses
     }
+
+    /// Returns whether `address` is one of the lookup's addresses.
+    pub(crate) fn holds(&self, address: &ZebraTransparentAddress) -> bool {
+        self.encoded_addresses
+            .binary_search(&address.to_string())
+            .is_ok()
+    }
 }
 
 /// Why [`TransparentAddressLookup::new`] refused its addresses.
@@ -114,9 +121,10 @@ pub enum TransparentAddressLookupError {
 
 /// Most rows one `getaddresstxids` or `getaddressutxos` answer may hold.
 ///
-/// Zebra refuses a lookup that matches more rows, and a `maxEntries` above
-/// this bound. Zakura has no limit, so the source enforces Zebra's for both
-/// nodes.
+/// Zebra refuses a `getaddresstxids` lookup that matches more rows, a
+/// `getaddressutxos` lookup that matches more rows when `maxEntries` is zero,
+/// and a `maxEntries` above this bound. Zakura has no limit, so the source
+/// enforces Zebra's for both nodes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TransparentAddressRowLimit(NonZeroU32);
 
@@ -202,45 +210,94 @@ pub(crate) struct ZebraAddressUtxo {
     height: u32,
 }
 
-/// Decodes `getaddressutxos` rows into the page the caller asked for.
+/// How many of the matching unspent outputs a `getaddressutxos` lookup keeps.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UtxoRowBound {
+    /// Every matching output. More than [`TransparentAddressRowLimit::MAX`]
+    /// is refused instead of truncated.
+    Complete,
+    /// The first matching outputs in chain order, up to the limit.
+    Prefix(TransparentAddressRowLimit),
+}
+
+impl UtxoRowBound {
+    /// Returns the request's `maxEntries` member.
+    ///
+    /// Zebra returns the first `maxEntries` matching outputs without saying
+    /// whether more match. Only zero makes it refuse a lookup that matches
+    /// more than [`TransparentAddressRowLimit::MAX`] outputs.
+    pub(crate) const fn rpc_max_entries(self) -> u32 {
+        match self {
+            Self::Complete => 0,
+            Self::Prefix(max_rows) => max_rows.get(),
+        }
+    }
+
+    const fn max_rows(self) -> TransparentAddressRowLimit {
+        match self {
+            Self::Complete => TransparentAddressRowLimit::MAX,
+            Self::Prefix(max_rows) => max_rows,
+        }
+    }
+}
+
+/// Decodes the `getaddressutxos` rows of `lookup` at or above `start_height`.
 ///
 /// Zebra applies `startHeight` and `maxEntries` itself. Zakura ignores both
 /// and returns every unspent output in chain order, so the rows below
-/// `start_height` are dropped and the rest truncated to `max_rows` here. Both
-/// nodes return rows in chain order, which keeps the two results identical.
-pub(crate) fn decode_address_utxo_page(
-    rows: Vec<ZebraAddressUtxo>,
+/// `start_height` are dropped and the rest bounded here. Both nodes return
+/// rows in chain order, which keeps the two results identical.
+///
+/// # Errors
+///
+/// A complete lookup with more than [`TransparentAddressRowLimit::MAX`]
+/// matching rows returns [`SourceError::TransparentAddressRowLimitExceeded`].
+/// Rows out of chain order, or for an address outside `lookup`, return
+/// [`SourceError::SourceProtocolMismatch`].
+pub(crate) fn decode_address_utxos(
+    rows: &[ZebraAddressUtxo],
+    lookup: &TransparentAddressLookup,
     start_height: BlockHeight,
-    max_rows: TransparentAddressRowLimit,
+    bound: UtxoRowBound,
 ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
-    let page_capacity = rows.len().min(max_rows.row_count());
-    let mut page = Vec::with_capacity(page_capacity);
-    let mut previous_height = BlockHeight::new(0);
-    for row in rows {
-        let block_height = BlockHeight::new(row.height);
-        if block_height < previous_height {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "getaddressutxos rows are not in chain order",
-            });
-        }
-        previous_height = block_height;
-        if block_height < start_height || page.len() == page_capacity {
-            continue;
-        }
-        page.push(decode_address_utxo(&row, block_height)?);
+    if rows
+        .windows(2)
+        .any(|pair| matches!(pair, [earlier, later] if later.height < earlier.height))
+    {
+        return Err(SourceError::SourceProtocolMismatch {
+            reason: "getaddressutxos rows are not in chain order",
+        });
     }
-    Ok(page)
+    let first_matching_row = rows.partition_point(|row| row.height < start_height.value());
+    let matching_rows = rows.get(first_matching_row..).unwrap_or_default();
+    let max_rows = bound.max_rows();
+    if matches!(bound, UtxoRowBound::Complete) && matching_rows.len() > max_rows.row_count() {
+        return Err(SourceError::TransparentAddressRowLimitExceeded {
+            operation: "getaddressutxos",
+            max_rows: max_rows.get(),
+        });
+    }
+    matching_rows
+        .iter()
+        .take(max_rows.row_count())
+        .map(|row| decode_address_utxo(row, lookup))
+        .collect()
 }
 
 fn decode_address_utxo(
     row: &ZebraAddressUtxo,
-    block_height: BlockHeight,
+    lookup: &TransparentAddressLookup,
 ) -> Result<SourceTransparentUnspentOutput, SourceError> {
     let address = parse_transparent_address(&row.address).map_err(|_| {
         SourceError::SourceProtocolMismatch {
             reason: "getaddressutxos returned an invalid transparent address",
         }
     })?;
+    if !lookup.holds(&address) {
+        return Err(SourceError::SourceProtocolMismatch {
+            reason: "getaddressutxos returned an output of an address the lookup does not hold",
+        });
+    }
     let transaction_id = zinder_core::wire::decode_rpc_transaction_id_hex(&row.txid)
         .map_err(wire_error_to_transaction_id_error)?;
     let script_pub_key =
@@ -252,7 +309,7 @@ fn decode_address_utxo(
         outpoint: TransparentOutPoint::new(transaction_id, row.output_index),
         script_pub_key,
         value_zat: row.satoshis,
-        block_height,
+        block_height: BlockHeight::new(row.height),
     })
 }
 
@@ -338,10 +395,30 @@ mod tests {
         assert_eq!(TransparentAddressRowLimit::new(100_001), None);
     }
 
+    fn lookup_of_address_one() -> Result<TransparentAddressLookup, TransparentAddressLookupError> {
+        TransparentAddressLookup::new(Network::ZcashTestnet, [testnet_address(1)])
+    }
+
+    fn heights_and_indexes(outputs: &[SourceTransparentUnspentOutput]) -> Vec<(u32, u32)> {
+        outputs
+            .iter()
+            .map(|output| (output.block_height.value(), output.outpoint.output_index))
+            .collect()
+    }
+
+    /// Rows at height 1, then `matching_rows` rows from height 5 up.
+    fn rows_with_matching_count(matching_rows: usize) -> Vec<ZebraAddressUtxo> {
+        let below_start = std::iter::once(utxo_row(1, 0));
+        let matching = (0_u32..)
+            .take(matching_rows)
+            .map(|index| utxo_row(5 + index / 4, index % 4));
+        below_start.chain(matching).collect()
+    }
+
     #[test]
-    fn utxo_page_applies_start_height_and_row_limit_a_node_ignored()
+    fn utxo_prefix_applies_start_height_and_row_limit_a_node_ignored()
     -> Result<(), Box<dyn std::error::Error>> {
-        let rows = vec![
+        let rows = [
             utxo_row(3, 0),
             utxo_row(5, 0),
             utxo_row(5, 1),
@@ -349,22 +426,114 @@ mod tests {
         ];
         let max_rows = TransparentAddressRowLimit::new(2).ok_or("row limit")?;
 
-        let page = decode_address_utxo_page(rows, BlockHeight::new(4), max_rows)?;
+        let prefix = decode_address_utxos(
+            &rows,
+            &lookup_of_address_one()?,
+            BlockHeight::new(4),
+            UtxoRowBound::Prefix(max_rows),
+        )?;
 
-        let positions: Vec<(u32, u32)> = page
-            .iter()
-            .map(|output| (output.block_height.value(), output.outpoint.output_index))
-            .collect();
-        assert_eq!(positions, [(5, 0), (5, 1)]);
+        assert_eq!(heights_and_indexes(&prefix), [(5, 0), (5, 1)]);
         Ok(())
     }
 
     #[test]
-    fn utxo_page_refuses_rows_out_of_chain_order() {
-        let rows = vec![utxo_row(5, 0), utxo_row(4, 0)];
+    fn complete_utxos_keep_every_row_at_or_above_the_start_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = [
+            utxo_row(3, 0),
+            utxo_row(5, 0),
+            utxo_row(5, 1),
+            utxo_row(9, 0),
+        ];
+
+        let outputs = decode_address_utxos(
+            &rows,
+            &lookup_of_address_one()?,
+            BlockHeight::new(4),
+            UtxoRowBound::Complete,
+        )?;
+
+        assert_eq!(heights_and_indexes(&outputs), [(5, 0), (5, 1), (9, 0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_utxos_refuse_more_matching_rows_than_the_cap_instead_of_truncating()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A node that ignores maxEntries returns every unspent output.
+        let rows = rows_with_matching_count(TransparentAddressRowLimit::MAX.row_count() + 1);
+        let lookup = lookup_of_address_one()?;
+
+        let refusal =
+            decode_address_utxos(&rows, &lookup, BlockHeight::new(5), UtxoRowBound::Complete);
+        let prefix = decode_address_utxos(
+            &rows,
+            &lookup,
+            BlockHeight::new(5),
+            UtxoRowBound::Prefix(TransparentAddressRowLimit::MAX),
+        )?;
+
         assert!(matches!(
-            decode_address_utxo_page(rows, BlockHeight::new(0), TransparentAddressRowLimit::MAX),
+            refusal,
+            Err(SourceError::TransparentAddressRowLimitExceeded {
+                operation: "getaddressutxos",
+                max_rows: 100_000,
+            })
+        ));
+        assert_eq!(prefix.len(), TransparentAddressRowLimit::MAX.row_count());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_utxos_count_only_rows_at_or_above_the_start_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The row below the start height takes the answer over the cap, but
+        // only the matching rows count toward it.
+        let rows = rows_with_matching_count(TransparentAddressRowLimit::MAX.row_count());
+
+        let outputs = decode_address_utxos(
+            &rows,
+            &lookup_of_address_one()?,
+            BlockHeight::new(5),
+            UtxoRowBound::Complete,
+        )?;
+
+        assert_eq!(outputs.len(), TransparentAddressRowLimit::MAX.row_count());
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_refuse_a_row_for_an_address_the_lookup_does_not_hold()
+    -> Result<(), TransparentAddressLookupError> {
+        let mut foreign_row = utxo_row(5, 1);
+        foreign_row.address = testnet_address(9).to_string();
+        let rows = [utxo_row(5, 0), foreign_row];
+
+        for bound in [
+            UtxoRowBound::Complete,
+            UtxoRowBound::Prefix(TransparentAddressRowLimit::MAX),
+        ] {
+            assert!(matches!(
+                decode_address_utxos(&rows, &lookup_of_address_one()?, BlockHeight::new(0), bound),
+                Err(SourceError::SourceProtocolMismatch { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_refuse_rows_out_of_chain_order() -> Result<(), TransparentAddressLookupError> {
+        let rows = [utxo_row(5, 0), utxo_row(4, 0)];
+        assert!(matches!(
+            decode_address_utxos(
+                &rows,
+                &lookup_of_address_one()?,
+                BlockHeight::new(0),
+                UtxoRowBound::Complete,
+            ),
             Err(SourceError::SourceProtocolMismatch { .. })
         ));
+        Ok(())
     }
 }

@@ -43,7 +43,9 @@ use crate::{
     ZebraIndexerSourceTarget, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition,
-    source_transparent_address::{ZebraAddressBalance, ZebraAddressUtxo, decode_address_utxo_page},
+    source_transparent_address::{
+        UtxoRowBound, ZebraAddressBalance, ZebraAddressUtxo, decode_address_utxos,
+    },
     zebra_ready_endpoint::ZebraReadyClient,
 };
 
@@ -124,6 +126,12 @@ const JSON_RPC_DUPLICATE_TRANSACTION_CODE: i32 = -27;
 const JSON_RPC_INVALID_ADDRESS_OR_KEY_CODE: i32 = -5;
 /// JSON-RPC 2.0 code for a method the server does not implement.
 const JSON_RPC_METHOD_NOT_FOUND_CODE: i64 = -32_601;
+/// JSON-RPC code Zebra's and Zakura's servers answer instead of a response
+/// larger than their `rpc.max_response_body_size`.
+const JSON_RPC_OVERSIZED_RESPONSE_CODE: i64 = -32_008;
+/// Attempts of a `getaddresstxids` lookup before a chain tip that changes
+/// during each one is reported.
+const TRANSPARENT_ADDRESS_TIP_ATTEMPTS: u32 = 3;
 /// JSON-RPC error code for general transaction verification failures.
 ///
 /// Zebra collapses every mempool rejection into this code; the
@@ -903,8 +911,9 @@ impl ZebraJsonRpcSource {
     /// Returns [`SourceError::TransparentAddressIndexesUnavailable`] when the
     /// node does not maintain its transparent address indexes,
     /// [`SourceError::TransparentAddressLookupNetworkMismatch`] when `lookup`
-    /// targets another network, and [`SourceError::NodeUnavailable`] when the
-    /// node cannot be reached.
+    /// targets another network, [`SourceError::NodeResponseTooLarge`] when
+    /// the answer exceeds the node's own response limit, and
+    /// [`SourceError::NodeUnavailable`] when the node cannot be reached.
     pub async fn fetch_transparent_address_balance(
         &self,
         lookup: &TransparentAddressLookup,
@@ -924,18 +933,24 @@ impl ZebraJsonRpcSource {
     /// addresses in blocks `start_height..=end_height`, in chain order, using
     /// `getaddresstxids`.
     ///
-    /// The node clamps both heights to its tip, so a range that starts above
-    /// the tip would return the tip block's transactions. The source reads
-    /// the tip first and returns nothing for such a range, or for an empty
-    /// one. Neither node indexes the genesis block, and both read an end
-    /// height of zero as the tip, so a range ending at genesis is answered
+    /// The node clamps both heights to the tip it sees when it answers, so a
+    /// range that starts above that tip returns the tip block's
+    /// transactions. The source reads the tip before the request, sends an
+    /// end height no higher than it, and returns nothing for a range above
+    /// it. It reads the tip again after the request and keeps the answer only
+    /// when both reads name the same block. Otherwise the tip may have fallen
+    /// below the range while the node answered, so the source repeats the
+    /// request against the new tip, up to three attempts in all. Neither
+    /// node indexes the genesis block, and both read an end height of zero
+    /// as the tip, so an empty range or one ending at genesis is answered
     /// without a node request.
     ///
     /// # Errors
     ///
     /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when the
     /// range holds more than [`TransparentAddressRowLimit::MAX`]
-    /// transactions, and the errors of
+    /// transactions, [`SourceError::ChainTipChangedDuringFetch`] when the tip
+    /// changed during every attempt, and the errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_transaction_ids(
         &self,
@@ -947,12 +962,36 @@ impl ZebraJsonRpcSource {
         if start_height > end_height || end_height == BlockHeight::new(0) {
             return Ok(Vec::new());
         }
-        let tip_height = self.tip_id().await?.height;
-        let end_height = end_height.min(tip_height);
-        if start_height > end_height || end_height == BlockHeight::new(0) {
-            return Ok(Vec::new());
+        let mut tip = self.tip_id().await?;
+        for _ in 0..TRANSPARENT_ADDRESS_TIP_ATTEMPTS {
+            let indexed_end_height = end_height.min(tip.height);
+            if start_height > indexed_end_height || indexed_end_height == BlockHeight::new(0) {
+                return Ok(Vec::new());
+            }
+            let txid_hex_list = self
+                .request_address_transaction_ids(lookup, start_height, indexed_end_height)
+                .await?;
+            let tip_after_request = self.tip_id().await?;
+            if tip_after_request == tip {
+                return txid_hex_list
+                    .iter()
+                    .map(|txid_hex| decode_display_transaction_id(txid_hex))
+                    .collect();
+            }
+            tip = tip_after_request;
         }
+        Err(SourceError::ChainTipChangedDuringFetch {
+            operation: "getaddresstxids",
+            attempts: TRANSPARENT_ADDRESS_TIP_ATTEMPTS,
+        })
+    }
 
+    async fn request_address_transaction_ids(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+    ) -> Result<Vec<String>, SourceError> {
         let txid_hex_list: Vec<String> = self
             .call_typed(
                 "getaddresstxids",
@@ -970,32 +1009,67 @@ impl ZebraJsonRpcSource {
                 max_rows: TransparentAddressRowLimit::MAX.get(),
             });
         }
-        txid_hex_list
-            .iter()
-            .map(|txid_hex| decode_display_transaction_id(txid_hex))
-            .collect()
+        Ok(txid_hex_list)
     }
 
-    /// Fetches up to `max_rows` unspent outputs of `lookup`'s addresses mined
-    /// at or above `start_height`, in chain order, using `getaddressutxos`.
+    /// Fetches every unspent output of `lookup`'s addresses mined at or above
+    /// `start_height`, in chain order, using `getaddressutxos`.
     ///
-    /// Zebra bounds its index scan by `startHeight` and `maxEntries`. Zakura
-    /// ignores both and returns every unspent output, which the source then
-    /// bounds itself, so the answer still counts toward
-    /// `node.max_response_bytes` in full. A page of exactly `max_rows` rows
-    /// may have more after it; the next page starts at the last row's height
-    /// and repeats the rows already returned at that height.
+    /// The answer is complete or an error. A lookup that matches more than
+    /// [`TransparentAddressRowLimit::MAX`] outputs is refused on both nodes,
+    /// never truncated. Zakura ignores `startHeight` and returns every
+    /// unspent output of the addresses, so the whole answer counts toward
+    /// `node.max_response_bytes` and the node's own response limit.
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::SourceResponseTooLarge`] when the answer
-    /// exceeds `node.max_response_bytes`, and the errors of
-    /// [`Self::fetch_transparent_address_transaction_ids`].
+    /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when more
+    /// than [`TransparentAddressRowLimit::MAX`] outputs match,
+    /// [`SourceError::SourceResponseTooLarge`] when the answer exceeds
+    /// `node.max_response_bytes`, [`SourceError::SourceProtocolMismatch`]
+    /// when a row is out of chain order or pays an address outside `lookup`,
+    /// and the errors of [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_utxos(
         &self,
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
+    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Complete)
+            .await
+    }
+
+    /// Fetches the first `max_rows` unspent outputs of `lookup`'s addresses
+    /// mined at or above `start_height`, in chain order, using
+    /// `getaddressutxos`.
+    ///
+    /// The answer is a bounded prefix. When it holds `max_rows` outputs, more
+    /// may follow, and no later lookup resumes losslessly after it: the node
+    /// pages only by height, and one block can hold more matching outputs
+    /// than one prefix. Use [`Self::fetch_transparent_address_utxos`] for the
+    /// complete set. Zebra stops its index scan at `maxEntries`. Zakura
+    /// ignores `startHeight` and `maxEntries` and returns every unspent
+    /// output, which the source bounds itself, so the whole answer still
+    /// counts toward `node.max_response_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::fetch_transparent_address_utxos`],
+    /// except [`SourceError::TransparentAddressRowLimitExceeded`].
+    pub async fn fetch_transparent_address_utxo_prefix(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
         max_rows: TransparentAddressRowLimit,
+    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Prefix(max_rows))
+            .await
+    }
+
+    async fn fetch_bounded_address_utxos(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        bound: UtxoRowBound,
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         let rows: Vec<ZebraAddressUtxo> = self
@@ -1004,12 +1078,12 @@ impl ZebraJsonRpcSource {
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
                     "startHeight": start_height.value(),
-                    "maxEntries": max_rows.get(),
+                    "maxEntries": bound.rpc_max_entries(),
                 })])?,
                 |error| transparent_address_call_error("getaddressutxos", error),
             )
             .await?;
-        decode_address_utxo_page(rows, start_height, max_rows)
+        decode_address_utxos(&rows, lookup, start_height, bound)
     }
 
     fn check_transparent_address_lookup(
@@ -1814,6 +1888,11 @@ fn transparent_address_call_error(operation: &'static str, error: JsonRpcCallErr
             operation,
             max_rows: TransparentAddressRowLimit::MAX.get(),
         }
+    } else if error.code == Some(JSON_RPC_OVERSIZED_RESPONSE_CODE) {
+        SourceError::NodeResponseTooLarge {
+            operation,
+            reason: error.message,
+        }
     } else {
         map_node_unavailable(error)
     }
@@ -2020,8 +2099,10 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         None => "none",
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
+        Some(SourceError::NodeResponseTooLarge { .. }) => "node_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
+        Some(SourceError::ChainTipChangedDuringFetch { .. }) => "chain_tip_changed_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::HistoricalTreeStateUnavailable { .. }) => {
             "historical_tree_state_unavailable"

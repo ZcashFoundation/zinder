@@ -16,6 +16,7 @@ use crate::NodeCapability;
 
 /// Error returned while normalizing upstream node source values.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SourceError {
     /// Display-order block hash hex could not be decoded.
     #[error("block hash is not valid hex: {reason}")]
@@ -236,6 +237,25 @@ pub enum SourceError {
         max_response_bytes: u64,
     },
 
+    /// The node refused to send an answer larger than its own response limit.
+    ///
+    /// Zebra and Zakura answer JSON-RPC error -32008 instead of a response
+    /// that would exceed their `rpc.max_response_body_size`. That limit
+    /// belongs to the node, not to `node.max_response_bytes`
+    /// ([`Self::SourceResponseTooLarge`]). The node is healthy and gives the
+    /// same answer to the same request, so the caller narrows the request or
+    /// the operator raises the node's limit. The source reports it for
+    /// transparent-address lookups, which Zakura answers without a row limit.
+    #[error(
+        "node refused to send its {operation} answer because it exceeds the node's response size limit: {reason}"
+    )]
+    NodeResponseTooLarge {
+        /// Node method whose answer was too large.
+        operation: &'static str,
+        /// Node error message.
+        reason: String,
+    },
+
     /// The configured upstream node does not support a required capability.
     #[error("node capability is missing: {capability}")]
     NodeCapabilityMissing {
@@ -258,6 +278,24 @@ pub enum SourceError {
         source_name: &'static str,
         /// Unsupported authentication scheme.
         auth_scheme: &'static str,
+    },
+
+    /// The node's chain tip changed during every attempt of a request whose
+    /// answer depends on that tip.
+    ///
+    /// The node bounds a `getaddresstxids` height range by the tip it sees
+    /// when it answers. The source reads the tip before and after the
+    /// request and accepts the answer only when both reads name the same
+    /// block, because a tip that fell below the range in between makes the
+    /// node answer for its new tip instead. It is classed
+    /// [`SourceFailureClass::UpstreamViewChanged`], so the caller retries
+    /// against the node's fresh tip.
+    #[error("chain tip changed during each of {attempts} {operation} attempts")]
+    ChainTipChangedDuringFetch {
+        /// Node method whose answer depends on the tip.
+        operation: &'static str,
+        /// Number of attempts made.
+        attempts: u32,
     },
 
     /// The node responded but the requested block could not be returned.
@@ -369,8 +407,8 @@ pub enum SourceError {
 
     /// A transparent-address lookup matched more rows than one answer holds.
     ///
-    /// The caller narrows the lookup, by height range for transaction ids or
-    /// by paging for unspent outputs, and retries.
+    /// The caller narrows the lookup and retries: a shorter height range for
+    /// transaction ids, or fewer addresses for unspent outputs.
     #[error("{operation} matched more than {max_rows} rows; narrow the lookup")]
     TransparentAddressRowLimitExceeded {
         /// Node method that matched too many rows.
@@ -573,6 +611,7 @@ impl SourceError {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
             Self::SourceResponseTooLarge { .. }
+            | Self::NodeResponseTooLarge { .. }
             | Self::MempoolTransactionCountLimitExceeded { .. }
             | Self::MempoolRawTransactionBytesLimitExceeded { .. }
             | Self::TransactionBroadcastDisabled
@@ -583,6 +622,7 @@ impl SourceError {
             }
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
+            | Self::ChainTipChangedDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }
             | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
             Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {

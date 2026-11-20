@@ -54,7 +54,19 @@ fn sorted_addresses() -> Vec<String> {
 }
 
 fn tip_reply(height: u32) -> RpcReply {
-    RpcReply::result(json!({ "height": height, "hash": vec![0_u8; 32] }))
+    tip_reply_with_hash(height, 0)
+}
+
+fn tip_reply_with_hash(height: u32, hash_byte: u8) -> RpcReply {
+    RpcReply::result(json!({ "height": height, "hash": vec![hash_byte; 32] }))
+}
+
+fn utxo_requests_max_entries(server: &JsonRpcTestServer) -> eyre::Result<Vec<Value>> {
+    Ok(server
+        .requests_for("getaddressutxos")?
+        .into_iter()
+        .map(|request| request.params[0]["maxEntries"].clone())
+        .collect())
 }
 
 fn transaction_id(byte: u8) -> TransactionId {
@@ -109,7 +121,7 @@ async fn transparent_address_balance_sends_sorted_distinct_addresses() -> eyre::
 async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip() -> eyre::Result<()>
 {
     let server = JsonRpcTestServer::start([
-        method("getbestblockheightandhash").reply(tip_reply(10)),
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids")
             .reply(RpcReply::result(json!([display_txid(3), display_txid(4)]))),
     ])?;
@@ -128,6 +140,105 @@ async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip()
         server.requests_for("getaddresstxids")?[0].params,
         json!([{ "addresses": sorted_addresses(), "start": 2, "end": 10 }])
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_transaction_ids_repeat_the_lookup_when_the_tip_changes_during_it()
+-> eyre::Result<()> {
+    // The tip falls from block 10 to a sibling at height 9 while the node
+    // answers, so the first answer may hold transactions of the old tip.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(9, 2)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(9, 2)),
+        method("getaddresstxids")
+            .reply(RpcReply::result(json!([display_txid(3), display_txid(4)]))),
+        method("getaddresstxids").reply(RpcReply::result(json!([display_txid(3)]))),
+    ])?;
+    let source = regtest_source(server.url())?;
+
+    let transaction_ids = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(2),
+            BlockHeight::new(50),
+        )
+        .await?;
+
+    assert_eq!(transaction_ids, [transaction_id(3)]);
+    let end_heights: Vec<Value> = server
+        .requests_for("getaddresstxids")?
+        .into_iter()
+        .map(|request| request.params[0]["end"].clone())
+        .collect();
+    assert_eq!(end_heights, [json!(10), json!(9)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_transaction_ids_drop_an_answer_for_a_tip_that_fell_below_the_range()
+-> eyre::Result<()> {
+    // The tip rolls back from 10 to 8 before the node answers, so the node
+    // clamps the range 10..=10 to its new tip and returns block 8's
+    // transactions, which lie outside the range.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(8, 2)),
+        method("getaddresstxids").reply(RpcReply::result(json!([display_txid(7)]))),
+    ])?;
+    let source = regtest_source(server.url())?;
+
+    let transaction_ids = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(10),
+            BlockHeight::new(10),
+        )
+        .await?;
+
+    assert_eq!(transaction_ids, Vec::<TransactionId>::new());
+    assert_eq!(server.requests_for("getaddresstxids")?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_transaction_ids_report_a_tip_that_changes_during_every_attempt()
+-> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(11, 2)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(12, 3)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(13, 4)),
+        method("getaddresstxids").reply_with(|_| RpcReply::result(json!([display_txid(3)]))),
+    ])?;
+    let source = regtest_source(server.url())?;
+
+    let error = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(1),
+            BlockHeight::new(10),
+        )
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected a changed-tip refusal"))?;
+
+    assert!(
+        matches!(
+            error,
+            SourceError::ChainTipChangedDuringFetch {
+                operation: "getaddresstxids",
+                attempts: 3,
+            }
+        ),
+        "unexpected error {error:?}"
+    );
+    assert_eq!(
+        error.upstream_classification(),
+        SourceFailureClass::UpstreamViewChanged
+    );
+    assert_eq!(server.requests_for("getaddresstxids")?.len(), 3);
     Ok(())
 }
 
@@ -202,11 +313,7 @@ async fn transparent_address_row_cap_refusal_is_typed() -> eyre::Result<()> {
         .err()
         .ok_or_else(|| eyre!("expected a row-limit refusal"))?;
     let utxo_error = source
-        .fetch_transparent_address_utxos(
-            &lookup,
-            BlockHeight::new(0),
-            TransparentAddressRowLimit::MAX,
-        )
+        .fetch_transparent_address_utxos(&lookup, BlockHeight::new(0))
         .await
         .err()
         .ok_or_else(|| eyre!("expected a row-limit refusal"))?;
@@ -263,7 +370,78 @@ async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Res
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_send_page_bounds_and_decode_rows() -> eyre::Result<()> {
+async fn transparent_address_utxos_ask_for_the_complete_set_and_refuse_a_capped_answer()
+-> eyre::Result<()> {
+    // Zebra 7.1.0 returns the first maxEntries outputs without saying whether
+    // more match. Only maxEntries 0 makes it refuse a lookup that matches
+    // more than 100,000 outputs.
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply_with(|params| {
+        if params[0]["maxEntries"] == json!(0) {
+            RpcReply::error(
+                "more than 100000 unspent outputs match; page with startHeight and maxEntries",
+            )
+        } else {
+            RpcReply::result(json!([utxo_row(4, 6, 0), utxo_row(7, 7, 1)]))
+        }
+    })])?;
+    let source = regtest_source(server.url())?;
+
+    let error = source
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(4))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected a row-limit refusal"))?;
+
+    assert!(
+        matches!(
+            error,
+            SourceError::TransparentAddressRowLimitExceeded {
+                operation: "getaddressutxos",
+                max_rows: 100_000,
+            }
+        ),
+        "unexpected error {error:?}"
+    );
+    assert_eq!(
+        server.requests_for("getaddressutxos")?[0].params,
+        json!([{ "addresses": sorted_addresses(), "startHeight": 4, "maxEntries": 0 }])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_utxos_return_every_output_at_or_above_the_start_height()
+-> eyre::Result<()> {
+    // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
+    // unspent output in chain order.
+    let server =
+        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
+            utxo_row(2, 1, 0),
+            utxo_row(5, 2, 0),
+            utxo_row(5, 2, 1),
+            utxo_row(6, 3, 0),
+        ])))])?;
+    let source = regtest_source(server.url())?;
+
+    let utxos = source
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(5))
+        .await?;
+
+    let outpoints: Vec<TransparentOutPoint> = utxos.iter().map(|output| output.outpoint).collect();
+    assert_eq!(
+        outpoints,
+        [
+            TransparentOutPoint::new(transaction_id(2), 0),
+            TransparentOutPoint::new(transaction_id(2), 1),
+            TransparentOutPoint::new(transaction_id(3), 0),
+        ]
+    );
+    assert_eq!(utxo_requests_max_entries(&server)?, [json!(0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
             utxo_row(4, 6, 0),
@@ -273,7 +451,7 @@ async fn transparent_address_utxos_send_page_bounds_and_decode_rows() -> eyre::R
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
     let utxos = source
-        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(4), max_rows)
+        .fetch_transparent_address_utxo_prefix(&regtest_lookup()?, BlockHeight::new(4), max_rows)
         .await?;
 
     assert_eq!(
@@ -294,7 +472,7 @@ async fn transparent_address_utxos_send_page_bounds_and_decode_rows() -> eyre::R
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_bound_a_node_that_ignores_paging() -> eyre::Result<()> {
+async fn transparent_address_utxo_prefix_bounds_a_node_that_ignores_paging() -> eyre::Result<()> {
     // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
     // unspent output in chain order.
     let server =
@@ -308,7 +486,7 @@ async fn transparent_address_utxos_bound_a_node_that_ignores_paging() -> eyre::R
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
     let utxos = source
-        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(5), max_rows)
+        .fetch_transparent_address_utxo_prefix(&regtest_lookup()?, BlockHeight::new(5), max_rows)
         .await?;
 
     let outpoints: Vec<TransparentOutPoint> = utxos.iter().map(|output| output.outpoint).collect();
@@ -318,6 +496,74 @@ async fn transparent_address_utxos_bound_a_node_that_ignores_paging() -> eyre::R
             TransparentOutPoint::new(transaction_id(2), 0),
             TransparentOutPoint::new(transaction_id(2), 1),
         ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_utxos_refuse_an_output_of_an_address_outside_the_lookup()
+-> eyre::Result<()> {
+    let mut foreign_row = utxo_row(6, 3, 0);
+    foreign_row["address"] = json!(testnet_address(9).to_string());
+    let server = JsonRpcTestServer::start([method("getaddressutxos")
+        .reply_with(move |_| RpcReply::result(json!([utxo_row(5, 2, 0), foreign_row.clone()])))])?;
+    let source = regtest_source(server.url())?;
+    let lookup = regtest_lookup()?;
+    let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
+
+    let errors = [
+        source
+            .fetch_transparent_address_utxos(&lookup, BlockHeight::new(0))
+            .await
+            .err(),
+        source
+            .fetch_transparent_address_utxo_prefix(&lookup, BlockHeight::new(0), max_rows)
+            .await
+            .err(),
+    ];
+
+    for error in errors {
+        let error = error.ok_or_else(|| eyre!("expected a protocol mismatch"))?;
+        assert!(
+            matches!(error, SourceError::SourceProtocolMismatch { .. }),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            SourceFailureClass::ProtocolMismatch
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_answer_over_the_node_response_limit_is_typed() -> eyre::Result<()> {
+    // Zakura and Zebra answer -32008 instead of a response larger than their
+    // rpc.max_response_body_size.
+    let server =
+        JsonRpcTestServer::start([method("getaddressutxos")
+            .reply(RpcReply::error_with_code(-32_008, "Response is too big"))])?;
+    let source = regtest_source(server.url())?;
+
+    let error = source
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected a response-size refusal"))?;
+
+    assert!(
+        matches!(
+            error,
+            SourceError::NodeResponseTooLarge {
+                operation: "getaddressutxos",
+                ..
+            }
+        ),
+        "unexpected error {error:?}"
+    );
+    assert_eq!(
+        error.upstream_classification(),
+        SourceFailureClass::Configuration
     );
     Ok(())
 }
@@ -354,11 +600,7 @@ async fn transparent_address_lookups_on_a_node_without_indexes_are_capability_mi
             .await
             .err(),
         source
-            .fetch_transparent_address_utxos(
-                &lookup,
-                BlockHeight::new(0),
-                TransparentAddressRowLimit::MAX,
-            )
+            .fetch_transparent_address_utxos(&lookup, BlockHeight::new(0))
             .await
             .err(),
     ];
