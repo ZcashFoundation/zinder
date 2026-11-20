@@ -1,5 +1,4 @@
-//! The reference proxy setup keeps the contract `trust_proxy_client_address`
-//! relies on.
+//! The reference proxy gates new calls on readiness and identifies each wallet.
 //!
 //! A listener that trusts [`PROXY_CLIENT_ADDRESS_HEADER`] lets whoever sets
 //! the header choose the client its requests count against. The reference
@@ -51,16 +50,14 @@ fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
     Ok(files)
 }
 
-/// The lines inside the Caddy block that forwards to the plaintext gRPC
-/// listener, without its opening and closing lines.
-fn grpc_upstream_block(caddyfile: &str) -> Result<Vec<&str>> {
-    let mut lines = caddyfile
-        .lines()
+/// The lines inside a Caddy block, without its opening and closing lines.
+fn caddy_block<'a>(lines: impl Iterator<Item = &'a str>, prefix: &str) -> Result<Vec<&'a str>> {
+    let mut lines = lines
         .map(str::trim)
-        .skip_while(|line| !(line.starts_with("reverse_proxy h2c://") && line.ends_with('{')));
+        .skip_while(|line| !(line.starts_with(prefix) && line.ends_with('{')));
     lines
         .next()
-        .ok_or_else(|| eyre!("the Caddy template has no reverse_proxy h2c:// block"))?;
+        .ok_or_else(|| eyre!("the Caddy template has no {prefix} block"))?;
     let mut depth = 1_usize;
     let mut block = Vec::new();
     for line in lines {
@@ -74,15 +71,13 @@ fn grpc_upstream_block(caddyfile: &str) -> Result<Vec<&str>> {
         }
         block.push(line);
     }
-    Err(eyre!(
-        "the Caddy template's reverse_proxy h2c:// block never closes"
-    ))
+    Err(eyre!("the Caddy template's {prefix} block never closes"))
 }
 
 /// Checks that the gRPC upstream block replaces the client address header
 /// with the address of the wallet's own connection.
 fn replaces_the_client_address_header_upstream(caddyfile: &str) -> Result<()> {
-    let directives = grpc_upstream_block(caddyfile)?
+    let directives = caddy_block(caddyfile.lines(), "reverse_proxy h2c://")?
         .into_iter()
         .filter(|line| line.starts_with("header_up"))
         .collect::<Vec<_>>();
@@ -184,6 +179,24 @@ fn the_caddy_template_replaces_the_header_the_listener_reads() -> Result<()> {
 }
 
 #[test]
+fn the_caddy_readiness_gate_reuses_a_bounded_pool_for_status_only_probes() -> Result<()> {
+    let gate = caddy_block(
+        CADDYFILE.lines(),
+        "forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT}",
+    )?;
+    for directive in ["uri /readyz", "method HEAD", "header_down -Content-Length"] {
+        assert!(
+            gate.contains(&directive),
+            "missing readiness directive {directive}"
+        );
+    }
+    let transport = caddy_block(gate.into_iter(), "transport http ")?;
+    assert!(transport.contains(&"max_conns_per_host 16"));
+    assert!(transport.contains(&"keepalive 5s"));
+    Ok(())
+}
+
+#[test]
 fn a_header_set_outside_the_grpc_upstream_block_does_not_count() {
     // `forward_auth` takes `header_up` too, but sets it only on the
     // readiness request, so the wallet's own header reaches Zinder.
@@ -203,7 +216,7 @@ https://example.org:443 {
 ";
 
     assert_eq!(
-        grpc_upstream_block(caddyfile).ok(),
+        caddy_block(caddyfile.lines(), "reverse_proxy h2c://").ok(),
         Some(vec!["flush_interval -1"])
     );
     assert!(replaces_the_client_address_header_upstream(caddyfile).is_err());

@@ -19,6 +19,16 @@ async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_jso
     Ok((status, serde_json::from_slice(&body)?))
 }
 
+async fn head_readyz(listen_addr: SocketAddr) -> Result<u16> {
+    let client = Client::builder(TokioExecutor::new()).build_http::<String>();
+    let request =
+        hyper::Request::head(format!("http://{listen_addr}/readyz")).body(String::new())?;
+    let response = client.request(request).await?;
+    let status = response.status().as_u16();
+    assert!(response.into_body().collect().await?.to_bytes().is_empty());
+    Ok(status)
+}
+
 async fn get_text(listen_addr: SocketAddr, path: &str) -> Result<(u16, String)> {
     let client = Client::builder(TokioExecutor::new()).build_http::<String>();
     let response = client
@@ -67,6 +77,7 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
 
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 200);
+    assert_eq!(head_readyz(listen_addr).await?, status);
     assert_eq!(readyz_value["status"], "ready");
     assert_eq!(readyz_value["cause"], "ready");
     assert_eq!(readyz_value["current_height"], 7);
@@ -80,6 +91,7 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     ));
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 503);
+    assert_eq!(head_readyz(listen_addr).await?, status);
     assert_eq!(readyz_value["status"], "not_ready");
     assert_eq!(
         readyz_value["cause"]["node_unavailable"]["failure_class"],

@@ -18,6 +18,13 @@ https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
 		# client and the h2c gRPC upstream is not called.
 		forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT} {
 			uri /readyz
+			# Release the probe connection before the wallet response streams.
+			method HEAD
+			header_down -Content-Length
+			transport http {
+				max_conns_per_host 16
+				keepalive 5s
+			}
 		}
 
 		# Name the wallet's own connection, so that Zinder's receive limit
