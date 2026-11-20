@@ -305,6 +305,69 @@ async fn concurrent_forwarding_shares_a_failed_tip_verification_and_can_retry() 
 }
 
 #[tokio::test]
+async fn cold_and_expired_discovery_timeouts_are_shared_until_a_fresh_request() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stalled = Arc::new(AtomicBool::new(true));
+    let discovery = Arc::clone(&stalled);
+    let fixture = Fixture::with_node_timeout(
+        [
+            method("rpc.discover").reply_with(move |_| {
+                let reply = RpcReply::result(json!({"methods": [{"name":"sendrawtransaction"}]}));
+                if discovery.load(Ordering::Relaxed) {
+                    RpcReply::Delay(Duration::from_secs(10), Box::new(reply))
+                } else {
+                    reply
+                }
+            }),
+            method("sendrawtransaction").reply_with(|_| RpcReply::result(json!("01".repeat(32)))),
+        ],
+        Duration::from_millis(750),
+    )?;
+
+    for completed in 0..2 {
+        if completed == 1 {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::resume();
+            stalled.store(true, Ordering::Relaxed);
+        }
+        let responses: [_; 3] = tokio::join!(
+            fixture.adapter.send_transaction(send()),
+            fixture.adapter.send_transaction(send()),
+            fixture.adapter.send_transaction(send())
+        )
+        .into();
+        for response in responses {
+            node_unavailable(
+                &response
+                    .err()
+                    .ok_or_else(|| eyre!("forwarded while discovery stalled"))?,
+            );
+        }
+        assert_eq!(
+            fixture.node.requests_for("rpc.discover")?.len(),
+            2 * completed + 1
+        );
+        assert_eq!(
+            fixture.node.requests_for("sendrawtransaction")?.len(),
+            completed
+        );
+        stalled.store(false, Ordering::Relaxed);
+        fixture.adapter.send_transaction(send()).await?;
+        assert_eq!(
+            fixture.node.requests_for("rpc.discover")?.len(),
+            2 * completed + 2
+        );
+        assert_eq!(
+            fixture.node.requests_for("sendrawtransaction")?.len(),
+            completed + 1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_changed_fence_during_the_node_tip_check_refuses_the_broadcast() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let schedule = super::one_upgrade_per_height()?;
