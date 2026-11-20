@@ -7,42 +7,23 @@
 //! measures that case through the admitted canonical secondary API, over the
 //! whole retained range or a chosen window such as a dense spending range.
 
-use std::{
-    fs,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
-
 use clap::Args;
 use serde::Serialize;
-use zinder_bench::{BenchError, fixture::FixtureManifest};
+use zinder_bench::BenchError;
 use zinder_core::{BlockHeight, ChainTipMetadata, NetworkUpgradeActivations};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
+    RocksDbCanonicalSecondary, RocksDbStatisticsLevel, TREE_STATE_CHECKPOINT_STRIDE,
 };
 
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
+use crate::rocksdb_read_bench::{ReadCounters, ReadEnvironment, ReadStoreArgs, TimedRead, measure};
+
 const DEFAULT_MAX_ANCHORS: u32 = 64;
 
 /// CLI contract for measuring tree-state reconstructions from one READY store.
 #[derive(Args)]
 pub(crate) struct RocksDbTreeStateReplayArgs {
-    /// Directory containing the fixture manifest used to construct the store.
-    #[arg(long)]
-    fixture: PathBuf,
-    /// Existing READY canonical primary store.
-    #[arg(long = "canonical-store")]
-    canonical_store: PathBuf,
-    /// Absent directory used for process-local secondary metadata.
-    #[arg(long = "secondary-root")]
-    secondary_root: PathBuf,
-    /// Exact source revision of the measured binary.
-    #[arg(long = "software-revision")]
-    software_revision: String,
-    /// Persisted canonical replacement depth.
-    #[arg(long, default_value_t = DEFAULT_SUPPORTED_REORG_DEPTH)]
-    supported_reorg_depth: u32,
+    #[command(flatten)]
+    pub(crate) store: ReadStoreArgs,
     /// Lowest height an anchor may take. Defaults to the first retained block.
     #[arg(long = "from-height")]
     from_height: Option<u32>,
@@ -52,15 +33,6 @@ pub(crate) struct RocksDbTreeStateReplayArgs {
     /// Most anchors measured, spread evenly over the window.
     #[arg(long = "max-anchors", default_value_t = DEFAULT_MAX_ANCHORS)]
     max_anchors: u32,
-    /// Write the JSON report to this path instead of stdout.
-    #[arg(long)]
-    report: Option<PathBuf>,
-}
-
-/// Report and optional output path produced by the reconstruction measurement.
-pub(crate) struct RocksDbTreeStateReplayOutput {
-    pub(crate) report: RocksDbTreeStateReplayReport,
-    pub(crate) report_path: Option<PathBuf>,
 }
 
 /// Reconstruction latency at every measured anchor of one READY store.
@@ -68,9 +40,8 @@ pub(crate) struct RocksDbTreeStateReplayOutput {
 pub(crate) struct RocksDbTreeStateReplayReport {
     contract_identity: &'static str,
     report_format_version: u16,
-    software_revision: String,
-    fixture_manifest_digest_sha256: String,
-    canonical_store: String,
+    #[serde(flatten)]
+    environment: ReadEnvironment,
     visible_tip_height: u32,
     #[serde(flatten)]
     measurement: TreeStateReplayMeasurement,
@@ -106,56 +77,33 @@ struct AnchorMeasurement {
     replayed_note_commitments: u64,
     cold_seconds: f64,
     warm_seconds: f64,
+    cold_counters: ReadCounters,
+    warm_counters: ReadCounters,
 }
 
 /// Measures reconstructions at the anchors of one admitted READY store.
 pub(crate) fn run_rocksdb_tree_state_replay(
-    args: RocksDbTreeStateReplayArgs,
-) -> Result<RocksDbTreeStateReplayOutput, BenchError> {
-    if args.software_revision.trim().is_empty() {
-        return Err(BenchError::invalid_argument(
-            "--software-revision must not be empty",
-        ));
-    }
-    let manifest = FixtureManifest::read(&args.fixture)?;
-    let activations = manifest.activations_typed()?;
-    let canonical_store = fs::canonicalize(&args.canonical_store)
-        .map_err(|source| BenchError::io(&args.canonical_store, source))?;
-    if args.secondary_root.exists() {
-        return Err(BenchError::invalid_argument(
-            "--secondary-root must name an absent directory",
-        ));
-    }
-    let secondary = RocksDbCanonicalSecondary::open_ready(
-        &canonical_store,
-        &args.secondary_root,
-        &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
-        CanonicalReorgPolicy::new(args.supported_reorg_depth)?,
-        RocksDbResourceBudget::canonical_reader_defaults(),
-    )?;
+    args: &RocksDbTreeStateReplayArgs,
+) -> Result<RocksDbTreeStateReplayReport, BenchError> {
+    let (store, environment) = args.store.prepare()?;
+    let (secondary, _) = store.open("tree-state", None)?;
     let ready = secondary.ready_evidence();
     let measurement = measure_tree_state_replays(
         &secondary,
-        &activations,
+        &store.activations,
+        store.budget.statistics_level,
         ReplayWindow {
             from_height: args.from_height,
             to_height: args.to_height,
             max_anchors: args.max_anchors,
         },
     )?;
-    Ok(RocksDbTreeStateReplayOutput {
-        report: RocksDbTreeStateReplayReport {
-            contract_identity: "rocksdb-tree-state-replay",
-            report_format_version: 1,
-            software_revision: args.software_revision,
-            fixture_manifest_digest_sha256: manifest.digest_sha256()?,
-            canonical_store: canonical_store.to_string_lossy().into_owned(),
-            visible_tip_height: ready.visible_tip.height.value(),
-            measurement,
-        },
-        report_path: args.report,
+    Ok(RocksDbTreeStateReplayReport {
+        contract_identity: "rocksdb-tree-state-replay",
+        report_format_version: 2,
+        environment,
+        visible_tip_height: ready.visible_tip.height.value(),
+        measurement,
     })
 }
 
@@ -177,6 +125,7 @@ pub(crate) struct ReplayWindow {
 pub(crate) fn measure_tree_state_replays(
     secondary: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
+    level: RocksDbStatisticsLevel,
     window: ReplayWindow,
 ) -> Result<TreeStateReplayMeasurement, BenchError> {
     let ready = secondary.ready_evidence();
@@ -211,15 +160,17 @@ pub(crate) fn measure_tree_state_replays(
     }
     let mut anchors = Vec::with_capacity(replays.len());
     for (height, seed_checkpoint_height, seed_sizes) in &replays {
-        let (cold, sizes) = time_reconstruction(secondary, activations, *height)?;
-        let (warm, _) = time_reconstruction(secondary, activations, *height)?;
+        let cold = time_reconstruction(secondary, activations, *height, level)?;
+        let warm = time_reconstruction(secondary, activations, *height, level)?;
         anchors.push(AnchorMeasurement {
             height: *height,
             seed_checkpoint_height: *seed_checkpoint_height,
             replayed_blocks: height.saturating_sub(*seed_checkpoint_height),
-            replayed_note_commitments: commitments_between(*seed_sizes, sizes),
-            cold_seconds: cold.as_secs_f64(),
-            warm_seconds: warm.as_secs_f64(),
+            replayed_note_commitments: commitments_between(*seed_sizes, cold.rows),
+            cold_seconds: cold.seconds,
+            warm_seconds: warm.seconds,
+            cold_counters: cold.counters,
+            warm_counters: warm.counters,
         });
     }
     Ok(TreeStateReplayMeasurement {
@@ -236,14 +187,18 @@ fn time_reconstruction(
     secondary: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
     height: u32,
-) -> Result<(Duration, ChainTipMetadata), BenchError> {
-    let started = Instant::now();
-    let checkpoint = secondary
-        .tree_state_checkpoint_at(BlockHeight::new(height), activations)?
-        .ok_or_else(|| {
-            BenchError::report_format(format!("anchor {height} has no tree state to reconstruct"))
-        })?;
-    Ok((started.elapsed(), checkpoint.tip_metadata()))
+    level: RocksDbStatisticsLevel,
+) -> Result<TimedRead<ChainTipMetadata>, BenchError> {
+    measure(secondary, level, || {
+        secondary
+            .tree_state_checkpoint_at(BlockHeight::new(height), activations)?
+            .map(|checkpoint| checkpoint.tip_metadata())
+            .ok_or_else(|| {
+                BenchError::report_format(format!(
+                    "anchor {height} has no tree state to reconstruct"
+                ))
+            })
+    })
 }
 
 /// Heights one block below each checkpoint stride boundary within
@@ -353,6 +308,7 @@ mod tests {
         let measurement = measure_tree_state_replays(
             &canonical,
             &activations,
+            zinder_store::RocksDbStatisticsLevel::Tickers,
             ReplayWindow {
                 from_height: None,
                 to_height: None,

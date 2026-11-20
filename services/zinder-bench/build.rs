@@ -24,6 +24,11 @@ fn main() {
             env::var("DEBUG").unwrap_or_default(),
         ),
         ("ZINDER_BENCH_BUILD_RUSTFLAGS", encoded_rustflags()),
+        ("ZINDER_BENCH_BUILD_TARGET_CPU", target_cpu()),
+        (
+            "ZINDER_BENCH_BUILD_TARGET_FEATURES",
+            env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default(),
+        ),
         ("ZINDER_BENCH_BUILD_RUSTC_VERSION", rustc_version()),
         ("ZINDER_BENCH_BUILD_TARGET", target.clone()),
     ];
@@ -40,15 +45,15 @@ fn main() {
     );
 }
 
-/// Cargo names no custom profile to build scripts, but places every profile's
-/// output under `target/[<triple>/]<profile-directory>/build/<package>/out`.
+/// Cargo places build-script outputs under the profile directory's `build` subtree.
 fn cargo_profile_directory() -> String {
     env::var("OUT_DIR")
         .ok()
         .and_then(|out_dir| {
             Path::new(&out_dir)
                 .ancestors()
-                .nth(3)
+                .find(|path| path.file_name().is_some_and(|name| name == "build"))
+                .and_then(Path::parent)
                 .and_then(Path::file_name)
                 .map(|name| name.to_string_lossy().into_owned())
         })
@@ -70,4 +75,22 @@ fn rustc_version() -> String {
         .and_then(|rustc| Command::new(rustc).arg("--version").output().ok())
         .filter(|output| output.status.success())
         .map_or_default(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn target_cpu() -> String {
+    let flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let mut flags = flags.split('\u{1f}');
+    let mut cpu = "";
+    while let Some(flag) = flags.next() {
+        let setting = match flag {
+            "-C" | "--codegen" => flags.next(),
+            _ => flag
+                .strip_prefix("-C")
+                .or_else(|| flag.strip_prefix("--codegen=")),
+        };
+        if let Some(requested) = setting.and_then(|setting| setting.strip_prefix("target-cpu=")) {
+            cpu = requested;
+        }
+    }
+    cpu.to_owned()
 }

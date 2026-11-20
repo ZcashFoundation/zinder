@@ -1,83 +1,43 @@
 //! Compact-block range measurements through the admitted canonical secondary
 //! API and through the canonical reader `zinder-query` serves from.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use clap::Args;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use zinder_bench::{BenchError, fixture::FixtureManifest};
-use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact, NetworkUpgradeActivations};
-use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
-use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget,
+use zinder_bench::BenchError;
+use zinder_compat_lightwalletd::{BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES};
+use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact};
+use zinder_query::{
+    CanonicalReader, DEFAULT_MAX_COMPACT_BLOCK_RANGE, RocksDbCanonicalReader,
+    read_on_blocking_thread,
+};
+use zinder_store::{CanonicalStoreReadyEvidence, HeightOrder, RocksDbStatisticsLevel};
+
+use crate::rocksdb_read_bench::{
+    ReadCounters, ReadEnvironment, ReadStore, ReadStoreArgs, ReadyFenceSummary, TimedRead, measure,
+    measure_reader,
 };
 
 const RANGE_BLOCK_COUNTS: [u32; 3] = [128, 512, 1_024];
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const OUTPUT_DIGEST_DOMAIN: &[u8] = b"zinder-bench-compact-block-range-output-v2\0";
 
-/// CLI contract for measuring compact-block range reads from one READY store.
-#[derive(Args)]
-pub(crate) struct RocksDbCompactBlockRangeArgs {
-    /// Directory containing the fixture manifest used to construct the store.
-    #[arg(long)]
-    fixture: PathBuf,
-    /// Existing READY canonical primary store.
-    #[arg(long = "canonical-store")]
-    canonical_store: PathBuf,
-    /// Absent directory used for process-local secondary metadata.
-    #[arg(long = "secondary-root")]
-    secondary_root: PathBuf,
-    /// Exact source revision of the measured binary.
-    #[arg(long = "software-revision")]
-    software_revision: String,
-    /// Persisted canonical replacement depth.
-    #[arg(long, default_value_t = DEFAULT_SUPPORTED_REORG_DEPTH)]
-    supported_reorg_depth: u32,
-    /// Write the JSON report to this path instead of stdout.
-    #[arg(long)]
-    report: Option<PathBuf>,
-}
-
-/// Report and optional output path produced by compact-block measurements.
-pub(crate) struct RocksDbCompactBlockRangeOutput {
-    pub(crate) report: RocksDbCompactBlockRangeReport,
-    pub(crate) report_path: Option<PathBuf>,
-}
-
-/// Exact benchmark evidence for all requested compact-block ranges.
 #[derive(Serialize)]
 pub(crate) struct RocksDbCompactBlockRangeReport {
     contract_identity: &'static str,
     report_format_version: u16,
-    software_revision: String,
-    fixture_manifest_digest_sha256: String,
-    canonical_store: String,
+    #[serde(flatten)]
+    environment: ReadEnvironment,
     ready_fence: ReadyFenceSummary,
     cases: Vec<CompactBlockRangeCase>,
-}
-
-#[derive(Serialize)]
-struct ReadyFenceSummary {
-    first_retained_height: u32,
-    visible_tip_height: u32,
-    visible_tip_hash_hex: String,
-    visible_epoch_id: u64,
-    visible_event_sequence: u64,
-    settled_tip_height: u32,
-    settled_tip_hash_hex: String,
-    visible_sequence_digest_sha256: String,
+    bounded_cases: Vec<CompactBlockRangeCase>,
 }
 
 #[derive(Serialize)]
 struct CompactBlockRangeCase {
+    io_mode: &'static str,
+    order: &'static str,
+    max_bytes: Option<usize>,
     requested_block_count: u32,
     range_start_height: u32,
     range_end_height: u32,
@@ -92,6 +52,7 @@ struct CompactBlockRangeCase {
 /// `zinder-query` makes for every read.
 #[derive(Serialize)]
 struct CanonicalReaderRangeCase {
+    io_mode: &'static str,
     fresh_secondary_open_seconds: f64,
     cold: CompactBlockRangeMeasurement,
     warm: CompactBlockRangeMeasurement,
@@ -101,192 +62,217 @@ struct CanonicalReaderRangeCase {
 struct CompactBlockRangeMeasurement {
     seconds: f64,
     blocks_per_second: f64,
+    #[serde(flatten)]
+    counters: ReadCounters,
     output: CompactBlockRangeOutputEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CompactBlockRangeOutputEvidence {
     block_count: u32,
+    first_height: u32,
+    last_height: u32,
+    stored_bytes: u64,
     structured_artifact_bytes: u64,
     digest_sha256: String,
 }
 
-/// Measures nested ranges ending at one immutable admitted READY tip.
+#[derive(Clone, Copy)]
+struct RangeRead {
+    block_count: u32,
+    order: HeightOrder,
+    max_bytes: Option<usize>,
+}
+
 pub(crate) async fn run_rocksdb_compact_block_range(
-    args: RocksDbCompactBlockRangeArgs,
-) -> Result<RocksDbCompactBlockRangeOutput, BenchError> {
-    if args.software_revision.trim().is_empty() {
-        return Err(BenchError::invalid_argument(
-            "--software-revision must not be empty",
-        ));
-    }
-    let manifest = FixtureManifest::read(&args.fixture)?;
-    let activations = manifest.activations_typed()?;
-    let reorg_policy = CanonicalReorgPolicy::new(args.supported_reorg_depth)?;
-    let canonical_store = fs::canonicalize(&args.canonical_store)
-        .map_err(|source| BenchError::io(&args.canonical_store, source))?;
-    prepare_secondary_root(&args.secondary_root, &canonical_store)?;
-
-    let mut admitted_ready = None;
-    let mut cases = Vec::with_capacity(RANGE_BLOCK_COUNTS.len());
+    args: &ReadStoreArgs,
+) -> Result<RocksDbCompactBlockRangeReport, BenchError> {
+    let (store, environment) = args.prepare()?;
+    let mut ready = None;
+    let mut cases = Vec::new();
     for block_count in RANGE_BLOCK_COUNTS {
-        let (secondary, open_elapsed) = open_secondary(
-            &canonical_store,
-            &args.secondary_root.join(format!("range-{block_count}")),
-            &activations,
-            reorg_policy,
-        )?;
-        let ready = secondary.ready_evidence();
-        require_same_ready_fence(admitted_ready.as_ref(), &ready)?;
-        admitted_ready = Some(ready);
-
-        let range = range_ending_at_ready_tip(&ready, block_count)?;
-        let cold = measure_range(&secondary, range, block_count)?;
-        let warm = measure_range(&secondary, range, block_count)?;
-        if cold.output != warm.output {
-            return Err(BenchError::report_format(format!(
-                "cold and warm compact-block outputs differ for {block_count} blocks"
-            )));
-        }
-        drop(secondary);
-        let reader_path = args
-            .secondary_root
-            .join(format!("range-{block_count}-canonical-reader"));
-        let (reader_secondary, reader_open_elapsed) = open_at_fence(
-            &canonical_store,
-            &reader_path,
-            &activations,
-            reorg_policy,
-            &ready,
-        )?;
-        let canonical_reader =
-            measure_reader_range(reader_secondary, reader_open_elapsed, range, block_count).await?;
-        if canonical_reader.cold.output != cold.output
-            || canonical_reader.warm.output != cold.output
-        {
-            return Err(BenchError::report_format(format!(
-                "canonical-reader compact-block outputs differ for {block_count} blocks"
-            )));
-        }
-        cases.push(CompactBlockRangeCase {
-            requested_block_count: block_count,
-            range_start_height: range.start.value(),
-            range_end_height: range.end.value(),
-            fresh_secondary_open_seconds: elapsed_seconds(open_elapsed),
-            cold,
-            warm,
-            canonical_reader,
-        });
+        let request = RangeRead {
+            block_count,
+            order: HeightOrder::Ascending,
+            max_bytes: None,
+        };
+        cases.push(measure_case(&store, &mut ready, request).await?);
     }
-
-    let ready = admitted_ready.ok_or_else(|| {
-        BenchError::report_format("compact-block benchmark produced no admitted READY fence")
-    })?;
-    let report = RocksDbCompactBlockRangeReport {
+    let mut bounded_cases = Vec::new();
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        for max_bytes in [
+            BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
+            BLOCK_RANGE_CHUNK_MAX_BYTES,
+        ] {
+            let request = RangeRead {
+                block_count: DEFAULT_MAX_COMPACT_BLOCK_RANGE.get(),
+                order,
+                max_bytes: Some(max_bytes),
+            };
+            bounded_cases.push(measure_case(&store, &mut ready, request).await?);
+        }
+    }
+    let ready = ready.ok_or_else(|| BenchError::report_format("no compact-block cases"))?;
+    Ok(RocksDbCompactBlockRangeReport {
         contract_identity: "rocksdb-compact-block-range",
-        report_format_version: 3,
-        software_revision: args.software_revision,
-        fixture_manifest_digest_sha256: manifest.digest_sha256()?,
-        canonical_store: canonical_store.to_string_lossy().into_owned(),
-        ready_fence: ReadyFenceSummary::from(ready),
+        report_format_version: 4,
+        environment,
+        ready_fence: ready.into(),
         cases,
-    };
-    Ok(RocksDbCompactBlockRangeOutput {
-        report,
-        report_path: args.report,
+        bounded_cases,
     })
 }
 
-/// Opens a fresh READY secondary and returns it with how long the open took.
-fn open_secondary(
-    canonical_store: &Path,
-    secondary_path: &Path,
-    activations: &NetworkUpgradeActivations,
-    reorg_policy: CanonicalReorgPolicy,
-) -> Result<(RocksDbCanonicalSecondary, Duration), BenchError> {
-    let open_started = Instant::now();
-    let secondary = RocksDbCanonicalSecondary::open_ready(
-        canonical_store,
-        secondary_path,
-        activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
-        reorg_policy,
-        RocksDbResourceBudget::canonical_reader_defaults(),
-    )?;
-    Ok((secondary, open_started.elapsed()))
-}
-
-/// Opens a secondary as [`open_secondary`] does, but only at the `expected`
-/// READY fence.
-///
-/// A case's canonical-reader measurement opens its secondary this way at the
-/// fence its direct measurement read, so both time the same chain.
-fn open_at_fence(
-    canonical_store: &Path,
-    secondary_path: &Path,
-    activations: &NetworkUpgradeActivations,
-    reorg_policy: CanonicalReorgPolicy,
-    expected: &CanonicalStoreReadyEvidence,
-) -> Result<(RocksDbCanonicalSecondary, Duration), BenchError> {
-    let (secondary, open_elapsed) =
-        open_secondary(canonical_store, secondary_path, activations, reorg_policy)?;
-    if secondary.ready_evidence() != *expected {
-        return Err(BenchError::report_format(
-            "canonical READY fence changed between the direct and canonical-reader measurements",
-        ));
-    }
-    Ok((secondary, open_elapsed))
-}
-
-fn prepare_secondary_root(
-    secondary_root: &std::path::Path,
-    canonical_store: &std::path::Path,
-) -> Result<(), BenchError> {
-    if secondary_root.exists() {
-        return Err(BenchError::invalid_argument(
-            "--secondary-root must name an absent directory",
-        ));
-    }
-    let parent = secondary_root.parent().ok_or_else(|| {
-        BenchError::invalid_argument("--secondary-root must have an existing parent directory")
-    })?;
-    let parent = fs::canonicalize(parent).map_err(|source| BenchError::io(parent, source))?;
-    let resolved = parent.join(
-        secondary_root
-            .file_name()
-            .ok_or_else(|| BenchError::invalid_argument("--secondary-root lacks a file name"))?,
+async fn measure_case(
+    store: &ReadStore,
+    fence: &mut Option<CanonicalStoreReadyEvidence>,
+    request: RangeRead,
+) -> Result<CompactBlockRangeCase, BenchError> {
+    let order = match request.order {
+        HeightOrder::Ascending => "ascending",
+        HeightOrder::Descending => "descending",
+    };
+    let case = format!(
+        "range-{}-{order}-{}",
+        request.block_count,
+        request.max_bytes.unwrap_or_default()
     );
-    if resolved.starts_with(canonical_store) || canonical_store.starts_with(&resolved) {
-        return Err(BenchError::invalid_argument(
-            "--secondary-root must be disjoint from --canonical-store",
-        ));
+    let (secondary, open_seconds) = store.open(&case, fence.as_ref())?;
+    let io_mode = secondary.io_mode().as_str();
+    let ready = secondary.ready_evidence();
+    *fence = Some(ready);
+    let range = range_ending_at_ready_tip(&ready, request.block_count)?;
+    let direct = || {
+        let sample = measure(&secondary, store.budget.statistics_level, || {
+            Ok(match request.max_bytes {
+                Some(bytes) => {
+                    secondary.compact_blocks_in_range_up_to(range, request.order, bytes)?
+                }
+                None => secondary.compact_blocks_in_range(range)?,
+            })
+        })?;
+        request.measurement(sample, range)
+    };
+    let cold = direct()?;
+    let warm = direct()?;
+    drop(secondary);
+    let (secondary, reader_open_seconds) = store.open(&format!("{case}-reader"), Some(&ready))?;
+    let reader = Arc::new(
+        RocksDbCanonicalReader::new(secondary)
+            .map_err(|error| BenchError::canonical_read(error.to_string()))?,
+    );
+    let reader_cold = request
+        .reader_measurement(&reader, range, store.budget.statistics_level)
+        .await?;
+    let reader_warm = request
+        .reader_measurement(&reader, range, store.budget.statistics_level)
+        .await?;
+    if [&warm.output, &reader_cold.output, &reader_warm.output]
+        .into_iter()
+        .any(|output| *output != cold.output)
+    {
+        return Err(BenchError::report_format(format!(
+            "compact-block outputs differ for {case}"
+        )));
     }
-    fs::create_dir(&resolved).map_err(|source| BenchError::io(&resolved, source))
+    Ok(CompactBlockRangeCase {
+        io_mode,
+        order,
+        max_bytes: request.max_bytes,
+        requested_block_count: request.block_count,
+        range_start_height: range.start.value(),
+        range_end_height: range.end.value(),
+        fresh_secondary_open_seconds: open_seconds,
+        cold,
+        warm,
+        canonical_reader: CanonicalReaderRangeCase {
+            io_mode: reader.secondary().io_mode().as_str(),
+            fresh_secondary_open_seconds: reader_open_seconds,
+            cold: reader_cold,
+            warm: reader_warm,
+        },
+    })
 }
 
-fn require_same_ready_fence(
-    expected: Option<&CanonicalStoreReadyEvidence>,
-    observed: &CanonicalStoreReadyEvidence,
-) -> Result<(), BenchError> {
-    if expected.is_some_and(|expected| expected != observed) {
-        return Err(BenchError::report_format(
-            "canonical READY fence changed between compact-block cases",
-        ));
+impl RangeRead {
+    async fn reader_measurement(
+        self,
+        reader: &Arc<RocksDbCanonicalReader>,
+        range: BlockHeightRange,
+        level: RocksDbStatisticsLevel,
+    ) -> Result<CompactBlockRangeMeasurement, BenchError> {
+        let sample = measure_reader(Arc::clone(reader), level, move |reader| {
+            self.max_bytes.map_or_else(
+                || read_on_blocking_thread(reader.compact_blocks_in_range(range)),
+                |bytes| {
+                    read_on_blocking_thread(
+                        reader.compact_blocks_in_range_up_to(range, self.order, bytes),
+                    )
+                },
+            )
+        })
+        .await?;
+        self.measurement(sample, range)
     }
-    Ok(())
+
+    fn measurement(
+        self,
+        sample: TimedRead<Vec<CompactBlockArtifact>>,
+        range: BlockHeightRange,
+    ) -> Result<CompactBlockRangeMeasurement, BenchError> {
+        let TimedRead {
+            rows,
+            seconds,
+            counters,
+        } = sample;
+        let (returned, count) = if self.max_bytes.is_some() {
+            let count = u32::try_from(rows.len())
+                .map_err(|_| BenchError::report_format("oversized compact-block chunk"))?;
+            if count == 0 || count > self.block_count {
+                return Err(BenchError::report_format(
+                    "bounded read returned an invalid row count",
+                ));
+            }
+            let returned = match self.order {
+                HeightOrder::Ascending => BlockHeightRange::inclusive(
+                    range.start,
+                    BlockHeight::new(range.start.value() + (count - 1)),
+                ),
+                HeightOrder::Descending => BlockHeightRange::inclusive(
+                    BlockHeight::new(range.end.value() - (count - 1)),
+                    range.end,
+                ),
+            };
+            (returned, count)
+        } else {
+            (range, self.block_count)
+        };
+        let output = compact_block_range_output(&rows, returned, count)?;
+        if count > 1
+            && self
+                .max_bytes
+                .is_some_and(|max| u128::from(output.stored_bytes) > max as u128)
+        {
+            return Err(BenchError::report_format(
+                "multi-block chunk exceeds its stored byte budget",
+            ));
+        }
+        Ok(CompactBlockRangeMeasurement {
+            seconds,
+            blocks_per_second: f64::from(count) / seconds.max(f64::EPSILON),
+            counters,
+            output,
+        })
+    }
 }
 
 fn range_ending_at_ready_tip(
     ready: &CanonicalStoreReadyEvidence,
     block_count: u32,
 ) -> Result<BlockHeightRange, BenchError> {
-    let start = ready
-        .visible_tip
-        .height
-        .value()
-        .checked_add(1)
-        .and_then(|exclusive_end| exclusive_end.checked_sub(block_count))
+    let start = block_count
+        .checked_sub(1)
+        .and_then(|offset| ready.visible_tip.height.value().checked_sub(offset))
         .ok_or_else(|| BenchError::invalid_argument("requested range underflows block height"))?;
     if start < ready.first_retained_block.height.value() {
         return Err(BenchError::invalid_argument(format!(
@@ -297,63 +283,6 @@ fn range_ending_at_ready_tip(
         BlockHeight::new(start),
         ready.visible_tip.height,
     ))
-}
-
-fn measure_range(
-    secondary: &RocksDbCanonicalSecondary,
-    range: BlockHeightRange,
-    expected_block_count: u32,
-) -> Result<CompactBlockRangeMeasurement, BenchError> {
-    let started = Instant::now();
-    let blocks = secondary.compact_blocks_in_range(range)?;
-    let seconds = elapsed_seconds(started.elapsed());
-    let output = compact_block_range_output(&blocks, range, expected_block_count)?;
-    Ok(CompactBlockRangeMeasurement {
-        seconds,
-        blocks_per_second: f64::from(expected_block_count) / seconds,
-        output,
-    })
-}
-
-/// Reads `range` cold and then warm through the canonical reader.
-async fn measure_reader_range(
-    secondary: RocksDbCanonicalSecondary,
-    open_elapsed: Duration,
-    range: BlockHeightRange,
-    expected_block_count: u32,
-) -> Result<CanonicalReaderRangeCase, BenchError> {
-    let reader: Arc<dyn CanonicalReader> = Arc::new(
-        RocksDbCanonicalReader::new(secondary)
-            .map_err(|error| BenchError::canonical_read(error.to_string()))?,
-    );
-    let cold = measure_reader_read(&reader, range, expected_block_count).await?;
-    let warm = measure_reader_read(&reader, range, expected_block_count).await?;
-    Ok(CanonicalReaderRangeCase {
-        fresh_secondary_open_seconds: elapsed_seconds(open_elapsed),
-        cold,
-        warm,
-    })
-}
-
-/// Times one read of `range` through `reader` as `zinder-query` makes it,
-/// including the reader's hop to the blocking pool.
-async fn measure_reader_read(
-    reader: &Arc<dyn CanonicalReader>,
-    range: BlockHeightRange,
-    expected_block_count: u32,
-) -> Result<CompactBlockRangeMeasurement, BenchError> {
-    let started = Instant::now();
-    let blocks = reader
-        .compact_blocks_in_range(range)
-        .await
-        .map_err(|error| BenchError::canonical_read(error.to_string()))?;
-    let seconds = elapsed_seconds(started.elapsed());
-    let output = compact_block_range_output(&blocks, range, expected_block_count)?;
-    Ok(CompactBlockRangeMeasurement {
-        seconds,
-        blocks_per_second: f64::from(expected_block_count) / seconds,
-        output,
-    })
 }
 
 fn compact_block_range_output(
@@ -370,6 +299,7 @@ fn compact_block_range_output(
     }
 
     let mut digest = StructuredArtifactDigest::new();
+    let mut stored_bytes = 0_u64;
     for (height, block) in range.into_iter().zip(blocks) {
         if block.height() != height {
             return Err(BenchError::report_format(format!(
@@ -379,10 +309,17 @@ fn compact_block_range_output(
             )));
         }
         digest.update_block(block)?;
+        stored_bytes += u64::try_from(zinder_store::encode_compact_block_artifact(block).len())
+            .map_err(|_| {
+                BenchError::report_format("stored compact block exceeds u64::MAX bytes")
+            })?;
     }
 
     Ok(CompactBlockRangeOutputEvidence {
         block_count: observed_count,
+        first_height: range.start.value(),
+        last_height: range.end.value(),
+        stored_bytes,
         structured_artifact_bytes: digest.structured_artifact_bytes,
         digest_sha256: hex::encode(digest.hasher.finalize()),
     })
@@ -484,26 +421,6 @@ impl StructuredArtifactDigest {
     }
 }
 
-fn elapsed_seconds(elapsed: Duration) -> f64 {
-    elapsed.as_secs_f64().max(f64::EPSILON)
-}
-
-impl From<CanonicalStoreReadyEvidence> for ReadyFenceSummary {
-    fn from(ready: CanonicalStoreReadyEvidence) -> Self {
-        let settled = ready.sequence_checkpoint.through();
-        Self {
-            first_retained_height: ready.first_retained_block.height.value(),
-            visible_tip_height: ready.visible_tip.height.value(),
-            visible_tip_hash_hex: hex::encode(ready.visible_tip.hash.as_bytes()),
-            visible_epoch_id: ready.visible_epoch.value(),
-            visible_event_sequence: ready.visible_event_sequence,
-            settled_tip_height: settled.height.value(),
-            settled_tip_hash_hex: hex::encode(settled.hash.as_bytes()),
-            visible_sequence_digest_sha256: hex::encode(ready.visible_sequence_digest),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use zinder_core::{
@@ -512,10 +429,7 @@ mod tests {
         CompactTransparentInput, CompactTransparentOutput, TransactionId,
     };
 
-    use super::{
-        BenchError, BlockHeight, BlockHeightRange, compact_block_range_output, open_at_fence,
-        open_secondary,
-    };
+    use super::{BenchError, BlockHeight, BlockHeightRange, ReadStore, compact_block_range_output};
 
     fn empty_block(height: u32, hash_byte: u8, parent_byte: u8, time: u32) -> CompactBlockArtifact {
         CompactBlockArtifact::empty(
@@ -550,33 +464,159 @@ mod tests {
         let canonical_store = writer.canonical_primary_path().to_path_buf();
         let reorg_policy = writer.canonical_primary()?.reorg_policy();
         let secondaries = tempfile::TempDir::new()?;
-        let (direct, _) = open_secondary(
-            &canonical_store,
-            &secondaries.path().join("direct"),
-            &activations,
+        let store = ReadStore {
+            primary: canonical_store,
+            secondary_root: secondaries.path().to_owned(),
+            activations,
             reorg_policy,
-        )?;
+            workload: zinder_store::CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+        };
+        let (direct, _) = store.open("direct", None)?;
         let ready = direct.ready_evidence();
-
-        open_at_fence(
-            &canonical_store,
-            &secondaries.path().join("same-fence"),
-            &activations,
-            reorg_policy,
-            &ready,
-        )?;
+        store.open("same-fence", Some(&ready))?;
         writer.append_live_block(&chain)?;
-        let moved = open_at_fence(
-            &canonical_store,
-            &secondaries.path().join("moved-fence"),
-            &activations,
-            reorg_policy,
-            &ready,
-        );
+        let moved = store.open("moved-fence", Some(&ready));
         assert!(
             matches!(moved, Err(BenchError::ReportFormat { .. })),
             "a secondary at a moved fence must fail the case"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_chunks_attribute_one_oversized_block_on_both_read_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_store::{HeightOrder, RocksDbStatisticsLevel};
+        let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .extend_blocks(4);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let writer = zinder_testkit::CanonicalWriterFixture::publish(
+            &zinder_testkit::CanonicalBaseline::new(&chain),
+            &activations,
+        )?;
+        let scratch = tempfile::TempDir::new()?;
+        let mut store = ReadStore {
+            primary: writer.canonical_primary_path().to_path_buf(),
+            secondary_root: scratch.path().into(),
+            activations,
+            reorg_policy: writer.canonical_primary()?.reorg_policy(),
+            workload: zinder_store::CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+        };
+        for (level, order, block_count) in [
+            (RocksDbStatisticsLevel::Full, HeightOrder::Descending, 3),
+            (RocksDbStatisticsLevel::Tickers, HeightOrder::Ascending, 3),
+            (RocksDbStatisticsLevel::Off, HeightOrder::Ascending, 2),
+        ] {
+            store.budget.statistics_level = level;
+            let request = super::RangeRead {
+                block_count,
+                order,
+                max_bytes: Some(1),
+            };
+            let case = super::measure_case(&store, &mut None, request).await?;
+            let expected_height = match order {
+                HeightOrder::Ascending => case.range_start_height,
+                HeightOrder::Descending => case.range_end_height,
+            };
+            for measurement in [
+                case.cold,
+                case.warm,
+                case.canonical_reader.cold,
+                case.canonical_reader.warm,
+            ] {
+                assert_eq!(measurement.output.block_count, 1);
+                assert_eq!(measurement.output.first_height, expected_height);
+                assert!(measurement.output.stored_bytes > 1);
+                let counters = serde_json::to_value(measurement.counters)?;
+                assert_eq!(
+                    counters["ticker_deltas"].is_object(),
+                    level != RocksDbStatisticsLevel::Off
+                );
+                assert_eq!(
+                    counters["histogram_deltas"].is_object(),
+                    level == RocksDbStatisticsLevel::Full
+                );
+                let io = &counters["perf_context"];
+                assert!(
+                    io["block_cache_hit_count"].as_u64().unwrap_or_default()
+                        + io["block_read_count"].as_u64().unwrap_or_default()
+                        > 0
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_chunks_keep_two_blocks_with_an_exact_budget_or_room_left()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_store::{HeightOrder, encode_compact_block_artifact};
+
+        let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .extend_blocks(3);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let writer = zinder_testkit::CanonicalWriterFixture::publish(
+            &zinder_testkit::CanonicalBaseline::new(&chain),
+            &activations,
+        )?;
+        let scratch = tempfile::TempDir::new()?;
+        let store = ReadStore {
+            primary: writer.canonical_primary_path().to_path_buf(),
+            secondary_root: scratch.path().into(),
+            activations,
+            reorg_policy: writer.canonical_primary()?.reorg_policy(),
+            workload: zinder_store::CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+        };
+
+        let blocks = chain.compact_block_artifacts();
+        let [first, middle, last] = blocks.as_slice() else {
+            return Err("the fixture must contain three compact blocks".into());
+        };
+        for (order, pair, excluded) in [
+            (HeightOrder::Ascending, [first, middle], last),
+            (HeightOrder::Descending, [middle, last], first),
+        ] {
+            let stored_bytes = pair
+                .iter()
+                .map(|block| encode_compact_block_artifact(block).len())
+                .sum::<usize>();
+            let one_byte_short_of_three =
+                stored_bytes + encode_compact_block_artifact(excluded).len() - 1;
+            for budget in [stored_bytes, one_byte_short_of_three] {
+                let request = super::RangeRead {
+                    block_count: 3,
+                    order,
+                    max_bytes: Some(budget),
+                };
+                let case = super::measure_case(&store, &mut None, request).await?;
+                assert_eq!(
+                    (
+                        case.cold.output.block_count,
+                        case.cold.output.first_height,
+                        case.cold.output.last_height,
+                        case.cold.output.stored_bytes,
+                    ),
+                    (
+                        2,
+                        pair[0].height().value(),
+                        pair[1].height().value(),
+                        u64::try_from(stored_bytes)?
+                    ),
+                    "{order:?} with a {budget}-byte budget"
+                );
+                assert_eq!(case.cold.output, case.warm.output);
+                assert_eq!(case.cold.output, case.canonical_reader.cold.output);
+                assert_eq!(case.cold.output, case.canonical_reader.warm.output);
+            }
+        }
         Ok(())
     }
 

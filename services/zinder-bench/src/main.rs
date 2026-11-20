@@ -24,12 +24,16 @@ use zinder_bench::{
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
+mod build_provenance;
 #[path = "canonical_replay_storage/command.rs"]
 mod canonical_replay_storage_command;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
+mod rocksdb_read_bench;
 mod rocksdb_storage_lifecycle;
+mod rocksdb_store_properties;
+mod rocksdb_subtree_roots;
 mod rocksdb_tip_replay;
 mod rocksdb_tree_state_replay;
 mod rocksdb_wallet_rebuild;
@@ -39,10 +43,11 @@ use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical
 use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
-use rocksdb_compact_block_range::{RocksDbCompactBlockRangeArgs, run_rocksdb_compact_block_range};
+use rocksdb_compact_block_range::run_rocksdb_compact_block_range;
 use rocksdb_raw_blob_retention_comparison::{
     RocksDbRawBlobRetentionComparisonArgs, run_rocksdb_raw_blob_retention_comparison,
 };
+use rocksdb_read_bench::ReadStoreArgs;
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_tip_replay::{
     CompareTipReplayReportsArgs, RocksDbTipReorgArgs, RocksDbTipReplayArgs,
@@ -97,9 +102,15 @@ enum Command {
     /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
     #[command(name = "rocksdb-wallet-rebuild")]
     RocksDbWalletRebuild(RocksDbWalletRebuildArgs),
-    /// Measure version-1 compact-block ranges through an admitted secondary.
+    /// Measure unbounded ranges and byte-bounded serving chunks on a READY store.
     #[command(name = "rocksdb-compact-block-range")]
-    RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    RocksDbCompactBlockRange(ReadStoreArgs),
+    /// Measure cold and warm reads of a subtree-root page.
+    #[command(name = "rocksdb-subtree-roots")]
+    RocksDbSubtreeRoots(rocksdb_subtree_roots::SubtreeArgs),
+    /// Inspect canonical column-family and SST properties through a READY secondary.
+    #[command(name = "rocksdb-store-properties")]
+    RocksDbStoreProperties(ReadStoreArgs),
     /// Measure tree-state reconstructions at wallet anchor heights.
     #[command(name = "rocksdb-tree-state-replay")]
     RocksDbTreeStateReplay(RocksDbTreeStateReplayArgs),
@@ -302,12 +313,20 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             Ok(())
         }
         Command::RocksDbCompactBlockRange(args) => {
-            let output = run_rocksdb_compact_block_range(args).await?;
-            emit_report(&output.report, output.report_path.as_deref())
+            let report = run_rocksdb_compact_block_range(&args).await?;
+            emit_report(&report, args.report.as_deref())
+        }
+        Command::RocksDbSubtreeRoots(args) => {
+            let report = rocksdb_subtree_roots::run(&args).await?;
+            emit_report(&report, args.store.report.as_deref())
+        }
+        Command::RocksDbStoreProperties(args) => {
+            let report = rocksdb_store_properties::run(&args)?;
+            emit_report(&report, args.report.as_deref())
         }
         Command::RocksDbTreeStateReplay(args) => {
-            let output = run_rocksdb_tree_state_replay(args)?;
-            emit_report(&output.report, output.report_path.as_deref())
+            let report = run_rocksdb_tree_state_replay(&args)?;
+            emit_report(&report, args.store.report.as_deref())
         }
         Command::CaptureTipReplayCheckpoints(args) => {
             run_capture_tip_replay_checkpoints(args).await
