@@ -1479,6 +1479,9 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Returns a bounded snapshot of the live mempool index.
     ///
+    /// If a page cursor has expired, [`RetryPolicy::RefreshMempoolSnapshot`](crate::RetryPolicy::RefreshMempoolSnapshot)
+    /// directs the caller to discard partial pages and restart with an empty cursor.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1495,6 +1498,9 @@ pub trait EndpointBackedIndex: ChainIndex {
     ) -> Result<MempoolSnapshotView, IndexerError>;
 
     /// Streams replayable mempool events.
+    ///
+    /// An expired event cursor yields [`RetryPolicy::RefreshMempoolSnapshot`](crate::RetryPolicy::RefreshMempoolSnapshot).
+    /// Read a complete snapshot and subscribe from its events resume cursor.
     ///
     /// The stream fails with [`IndexerError::MalformedResponse`] instead of
     /// yielding an event whose `event_sequence` does not strictly increase or

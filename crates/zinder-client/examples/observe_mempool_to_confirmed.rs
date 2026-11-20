@@ -99,7 +99,9 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
-                RetryPolicy::RefreshChainEpoch | RetryPolicy::RestartFromEarliestRetained => {}
+                RetryPolicy::RefreshChainEpoch
+                | RetryPolicy::RestartFromEarliestRetained
+                | RetryPolicy::RefreshMempoolSnapshot => {}
                 RetryPolicy::OperatorActionRequired | RetryPolicy::ClientError => {
                     return Err(error);
                 }

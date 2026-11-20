@@ -467,7 +467,6 @@ pub enum ErrorReason {
     BroadcastTransactionTooLarge = 46,
     SubtreeRootRangeTooLarge = 49,
     /// FAILED_PRECONDITION family.
-    BroadcastDisabled = 11,
     ChainEventCursorExpired = 12,
     MempoolEventCursorExpired = 13,
     SnapshotPageCursorExpired = 45,
@@ -578,7 +577,6 @@ impl ErrorReason {
             Self::SnapshotPageCursorInvalid => "SNAPSHOT_PAGE_CURSOR_INVALID",
             Self::BroadcastTransactionTooLarge => "BROADCAST_TRANSACTION_TOO_LARGE",
             Self::SubtreeRootRangeTooLarge => "SUBTREE_ROOT_RANGE_TOO_LARGE",
-            Self::BroadcastDisabled => "BROADCAST_DISABLED",
             Self::ChainEventCursorExpired => "CHAIN_EVENT_CURSOR_EXPIRED",
             Self::MempoolEventCursorExpired => "MEMPOOL_EVENT_CURSOR_EXPIRED",
             Self::SnapshotPageCursorExpired => "SNAPSHOT_PAGE_CURSOR_EXPIRED",
@@ -643,7 +641,6 @@ impl ErrorReason {
             "SNAPSHOT_PAGE_CURSOR_INVALID" => Some(Self::SnapshotPageCursorInvalid),
             "BROADCAST_TRANSACTION_TOO_LARGE" => Some(Self::BroadcastTransactionTooLarge),
             "SUBTREE_ROOT_RANGE_TOO_LARGE" => Some(Self::SubtreeRootRangeTooLarge),
-            "BROADCAST_DISABLED" => Some(Self::BroadcastDisabled),
             "CHAIN_EVENT_CURSOR_EXPIRED" => Some(Self::ChainEventCursorExpired),
             "MEMPOOL_EVENT_CURSOR_EXPIRED" => Some(Self::MempoolEventCursorExpired),
             "SNAPSHOT_PAGE_CURSOR_EXPIRED" => Some(Self::SnapshotPageCursorExpired),

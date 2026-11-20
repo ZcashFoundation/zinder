@@ -28,7 +28,8 @@ package zinder.v1.ops;
 // `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
 // and cut controlled consumers over with the server.
 enum ErrorReason {
-  reserved "COMPACT_BLOCK_RANGE_TOO_LARGE";
+  reserved 11;
+  reserved "BROADCAST_DISABLED", "COMPACT_BLOCK_RANGE_TOO_LARGE";
 
   // Default scalar so unset fields do not silently match a real reason.
   ERROR_REASON_UNSPECIFIED = 0;
@@ -50,7 +51,6 @@ enum ErrorReason {
   SUBTREE_ROOT_RANGE_TOO_LARGE = 49;
 
   // FAILED_PRECONDITION family.
-  BROADCAST_DISABLED = 11;
   CHAIN_EVENT_CURSOR_EXPIRED = 12;
   MEMPOOL_EVENT_CURSOR_EXPIRED = 13;
   SNAPSHOT_PAGE_CURSOR_EXPIRED = 45;

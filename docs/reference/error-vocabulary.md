@@ -47,6 +47,7 @@ than the wire disposition:
 | `RetryWithBackoff` | Retry with exponential backoff. |
 | `RefreshChainEpoch` | Read the current epoch again and restart the whole epoch-bound operation. Retrying the same pinned request cannot succeed. |
 | `RestartFromEarliestRetained` | Resubscribe to chain events from the earliest retained event and rebuild derived state from there. |
+| `RefreshMempoolSnapshot` | Discard the expired cursor and any partial snapshot. Start a new mempool snapshot and subscribe from its events resume cursor. |
 | `OperatorActionRequired` | Alert an operator. Do not retry until the deployment changes. |
 | `ClientError` | Fix the request. |
 
@@ -57,6 +58,7 @@ match error.retry_policy() {
     RetryPolicy::RetryWithBackoff => retry_with_backoff(),
     RetryPolicy::RefreshChainEpoch => restart_at_current_epoch(),
     RetryPolicy::RestartFromEarliestRetained => resubscribe_from_earliest(),
+    RetryPolicy::RefreshMempoolSnapshot => restart_mempool_snapshot(),
     RetryPolicy::ClientError => fix_request(),
     _ => alert_operator(),
 }
@@ -102,10 +104,9 @@ with a `type` and `subject`.
 
 | Reason | Meaning |
 | --- | --- |
-| `BROADCAST_DISABLED` | Defined for a server that cannot broadcast, but current servers do not return it. Without `[node]`, broadcast is not advertised and fails with `ENDPOINT_CAPABILITY_UNAVAILABLE` instead. |
 | `CHAIN_EVENT_CURSOR_EXPIRED` | The cursor is older than retained chain events. Client policy: `RestartFromEarliestRetained`. |
-| `MEMPOOL_EVENT_CURSOR_EXPIRED` | The cursor is older than retained mempool events. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, read a new `MempoolSnapshot` and follow `MempoolEvents` from its `events_resume_cursor`. |
-| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | A `MempoolSnapshot` page cursor is anchored ahead of the mempool events the writer has applied. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, start the snapshot walk again from the first page. |
+| `MEMPOOL_EVENT_CURSOR_EXPIRED` | The event cursor is older than retained mempool events. The client reports `RefreshMempoolSnapshot`. |
+| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | The snapshot page cursor is ahead of the writer’s applied events. The client reports `RefreshMempoolSnapshot`. |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | The pinned epoch is no longer retained. A `TransparentAddressUnspentOutputs` or `FullBlocksInRange` stream can also end with it after sending items, when its serving pair is released or replaced. Discard the partial result and read again at a newer epoch. Client policy: `RefreshChainEpoch`. |
 | `SCHEMA_MISMATCH` | The store's schema does not match the running binary. |
 | `SCHEMA_TOO_NEW` | A newer Zinder wrote the store. Rolling back is unsafe. |

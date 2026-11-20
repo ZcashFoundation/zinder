@@ -77,6 +77,33 @@ fn no_real_reason_round_trips_back_to_the_sentinel() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn retired_broadcast_reason_reserves_its_name_and_number() -> Result<()> {
+    let descriptor = FileDescriptorSet::decode(ZINDER_V1_FILE_DESCRIPTOR_SET)?;
+    let reasons = descriptor
+        .file
+        .iter()
+        .filter(|file| file.package() == "zinder.v1.ops")
+        .flat_map(|file| &file.enum_type)
+        .find(|definition| definition.name() == ERROR_REASON_ENUM)
+        .ok_or_else(|| eyre!("ops.ErrorReason descriptor is missing"))?;
+
+    assert!(
+        reasons
+            .reserved_name
+            .iter()
+            .any(|name| name == "BROADCAST_DISABLED")
+    );
+    assert!(
+        reasons
+            .reserved_range
+            .iter()
+            .any(|range| (range.start()..=range.end()).contains(&11))
+    );
+    assert!(ErrorReason::try_from(11).is_err());
+    Ok(())
+}
+
 /// Returns the string-form names of every `ErrorReason` value in the
 /// compiled descriptor.
 fn error_reason_value_names() -> Result<Vec<String>> {
