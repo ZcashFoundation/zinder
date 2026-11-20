@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tonic::Status;
+use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     NetworkUpgradeActivations,
@@ -650,9 +650,12 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 /// waits, so a slow client cannot keep a serving pair or a generation from
 /// being replaced. A read failure, a reorg ending, or a chunk that cannot be
 /// converted ends the stream with that status after the blocks before it.
-/// Once the client has dropped the response, the task finishes the read in
-/// flight and starts no other, so it holds the stream's slot only while that
-/// read runs.
+/// A read that finds a height outside retained history, which fails with
+/// `NOT_FOUND`, is followed by a read of the heights an earlier read checked
+/// and the stream has not sent, when there are any, so the stream sends them
+/// before it ends. Once the client has dropped the response, the task
+/// finishes the read in flight and starts no other, so it holds the stream's
+/// slot only while that read runs.
 async fn stream_later_chunks<Reads: CompactBlockReads>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
@@ -667,7 +670,14 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
         else {
             return;
         };
-        match read_later_chunk(&reads, chunk, chunks, continuity, conversion).await {
+        let mut outcome = read_later_chunk(&reads, chunk, chunks, continuity, conversion).await;
+        if let Err(status) = &outcome
+            && status.code() == Code::NotFound
+            && let Some((checked, only_checked)) = chunks.checked_heights()
+        {
+            outcome = read_later_chunk(&reads, checked, only_checked, continuity, conversion).await;
+        }
+        match outcome {
             Ok((next_chunks, next_continuity, messages)) => {
                 chunks = next_chunks;
                 continuity = next_continuity;

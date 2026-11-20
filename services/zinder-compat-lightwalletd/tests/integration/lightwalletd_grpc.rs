@@ -1662,8 +1662,8 @@ fn stored_block_bytes(view: &SyntheticView, height: u32) -> eyre::Result<usize> 
 /// Each read keeps as many blocks of `view` as fit its cap, which is
 /// [`BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES`] for the first read and
 /// [`BLOCK_RANGE_CHUNK_MAX_BYTES`] for the others, or every height it was
-/// offered. A read that stopped short of them is followed by one offered
-/// the rest of them, and any other by one offered up to 1,000 new heights.
+/// offered. Each read is offered up to 1,000 heights from the one it starts
+/// at, however many the read before it was offered.
 fn assert_byte_capped_chunks(
     view: &SyntheticView,
     reads: &[BlockHeightRange],
@@ -1692,7 +1692,6 @@ fn assert_byte_capped_chunks(
         }
     };
     let mut expected_next = Some(first_height);
-    let mut unkept_offer_end = None;
     for (read_index, (read, offered)) in reads.iter().zip(offered).enumerate() {
         let (read_first, read_last) = in_wire_order(read);
         let (offered_first, offered_last) = in_wire_order(offered);
@@ -1703,12 +1702,8 @@ fn assert_byte_capped_chunks(
         );
         assert_eq!(
             (offered_first, offered_last),
-            (
-                read_first,
-                unkept_offer_end.unwrap_or_else(|| new_heights_end(read_first))
-            ),
-            "chunk {read_index} must be offered the heights the read before it left, or else up \
-             to 1,000 new ones"
+            (read_first, new_heights_end(read_first)),
+            "chunk {read_index} must be offered up to 1,000 heights from the one it starts at"
         );
         let cap = if read_index == 0 {
             BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES
@@ -1730,8 +1725,7 @@ fn assert_byte_capped_chunks(
         } else {
             Some(read_last + 1)
         };
-        unkept_offer_end = (read_last != offered_last).then_some(offered_last);
-        if let Some(next_height) = expected_next.filter(|_| unkept_offer_end.is_some()) {
+        if let Some(next_height) = expected_next.filter(|_| read_last != offered_last) {
             assert!(
                 read_bytes + stored_block_bytes(view, next_height)? > cap,
                 "chunk {read_index} stopped before its next block would pass its cap"

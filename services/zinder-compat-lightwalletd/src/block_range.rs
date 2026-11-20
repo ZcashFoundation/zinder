@@ -6,9 +6,11 @@
 //! compact blocks, or one block when that block alone is larger, so a range
 //! of large blocks is read and sent in smaller chunks. The first chunk holds
 //! at most [`BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES`], so a response opens after a
-//! small read. [`BlockRangeChunks`] offers each read the heights the read
-//! before it was offered and did not keep, or else the next 1,000, so a
-//! stream sends every height a read checked before it reads past them.
+//! small read. [`BlockRangeChunks`] offers each read up to 1,000 heights from
+//! the next height to send, so every read can fill its byte budget. When a
+//! read finds a height outside retained history while heights an earlier
+//! read checked are unsent, the stream reads those heights alone, so it sends
+//! every height a read checked before that failure ends it.
 //!
 //! Each chunk after the first is read at the chain view current when the
 //! server reads it, so a stream never holds a serving pair or a
@@ -66,8 +68,7 @@ pub const BLOCK_RANGE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// chunk keeps, or one block when that block alone is larger. A thousand
 /// blocks of up to 262 stored bytes each fit, so a request for that many
 /// small blocks is served by one read. A denser range opens after its first
-/// few blocks, and the server reads the rest of its first 1,000 heights
-/// while it sends them.
+/// few blocks, and the server reads on while it sends them.
 pub const BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES: usize = 256 * 1024;
 
 /// Default for the process-wide limit on concurrent `GetBlockRange` and
@@ -81,23 +82,28 @@ pub const DEFAULT_BLOCK_RANGE_ADMISSION_WAIT: Duration = Duration::from_secs(10)
 
 /// Plans the chunk reads of one block-range stream in wire order.
 ///
-/// [`Self::next_chunk`] offers heights at the end of the remaining range that
-/// the stream sends first: the rest of the heights the last read was offered
-/// and did not keep, or else the next 1,000. A byte-bounded read keeps a run
-/// of them from that end, and [`Self::advance`] moves past the blocks it
-/// kept, so the next chunk starts at the next height to send.
+/// [`Self::next_chunk`] offers up to 1,000 heights from the end of the
+/// remaining range that the stream sends first. A byte-bounded read keeps a
+/// run of them from that end, and [`Self::advance`] moves past the blocks it
+/// kept, so the next chunk starts at the next height to send and every read
+/// can fill its byte budget.
 ///
 /// A read checks every height it is offered against retained history before
-/// it keeps any. Offering the rest of a read's heights before any new one
-/// therefore sends every height a read has checked before a read fails at a
-/// height past them, such as height 0 at the end of a descending range.
+/// it keeps any, so a read offered heights past those the last read checked
+/// and did not keep can fail before it sends them. [`Self::checked_heights`]
+/// then offers the checked heights alone until they are sent, so the stream
+/// sends every height a read has checked before a read past them fails, such
+/// as at height 0 at the end of a descending range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlockRangeChunks {
     /// Heights no chunk has covered yet, or `None` once every height has.
     remaining: Option<BlockHeightRange>,
-    /// Heights at the sending end of `remaining` that the last read was
-    /// offered and did not keep, which the next read is offered alone.
-    offered_unkept: u32,
+    /// Heights at the sending end of `remaining` that the last read checked
+    /// against retained history and did not keep.
+    checked_unkept: u32,
+    /// Whether the next read is offered the `checked_unkept` heights alone,
+    /// which holds only while some remain.
+    only_checked: bool,
     is_descending: bool,
 }
 
@@ -112,7 +118,8 @@ impl BlockRangeChunks {
         };
         Self {
             remaining,
-            offered_unkept: 0,
+            checked_unkept: 0,
+            only_checked: false,
             is_descending,
         }
     }
@@ -134,15 +141,15 @@ impl BlockRangeChunks {
     }
 
     /// Returns the heights the next chunk read may cover, at the end of the
-    /// remaining range that the stream sends first: those the last read was
-    /// offered and did not keep, or else up to 1,000.
+    /// remaining range that the stream sends first: up to 1,000, or the
+    /// heights [`Self::checked_heights`] offers alone.
     #[must_use]
     pub(crate) fn next_chunk(&self) -> Option<BlockHeightRange> {
         let remaining = self.remaining?;
-        let heights = if self.offered_unkept == 0 {
-            DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
+        let heights = if self.only_checked {
+            self.checked_unkept
         } else {
-            self.offered_unkept
+            DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
         };
         let span = heights.saturating_sub(1);
         Some(if self.is_descending {
@@ -162,6 +169,28 @@ impl BlockRangeChunks {
         })
     }
 
+    /// Returns the heights the last read checked and did not keep, and the
+    /// plan that offers them alone until the stream has sent them, when
+    /// [`Self::next_chunk`] offers heights past them too.
+    ///
+    /// A stream reads these after the read of [`Self::next_chunk`] finds a
+    /// height outside retained history, so it sends the heights an earlier
+    /// read checked before that failure ends it. Returns `None` when no such
+    /// heights remain or the next chunk is already them alone, and the
+    /// failure stands.
+    #[must_use]
+    pub(crate) fn checked_heights(&self) -> Option<(BlockHeightRange, Self)> {
+        let offered = self.next_chunk()?;
+        if self.checked_unkept == 0 || offered_heights(offered) <= self.checked_unkept {
+            return None;
+        }
+        let only_checked = Self {
+            only_checked: true,
+            ..*self
+        };
+        Some((only_checked.next_chunk()?, only_checked))
+    }
+
     /// Moves past `read_blocks` heights at the end of the remaining range
     /// that the stream sends first, the blocks a read of
     /// [`Self::next_chunk`] kept.
@@ -176,8 +205,8 @@ impl BlockRangeChunks {
         match u32::try_from(read_blocks) {
             Ok(0) => {}
             Ok(read_blocks) if read_blocks <= span => {
-                let offered_heights = offered.end.value() - offered.start.value() + 1;
-                self.offered_unkept = offered_heights.saturating_sub(read_blocks);
+                self.checked_unkept = offered_heights(offered).saturating_sub(read_blocks);
+                self.only_checked &= self.checked_unkept > 0;
                 self.remaining = Some(if self.is_descending {
                     BlockHeightRange::inclusive(
                         remaining.start,
@@ -193,6 +222,15 @@ impl BlockRangeChunks {
             _ => self.remaining = None,
         }
     }
+}
+
+/// Returns how many heights `chunk`, a chunk the plan offered, covers.
+const fn offered_heights(chunk: BlockHeightRange) -> u32 {
+    chunk
+        .end
+        .value()
+        .saturating_sub(chunk.start.value())
+        .saturating_add(1)
 }
 
 /// Gauge of the block-range streams that hold a slot.
@@ -905,7 +943,8 @@ mod tests {
     use zinder_store::HeightOrder;
 
     use super::{
-        BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit, ChunkedMessages,
+        BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
+        BlockRangeContinuity, BlockRangeStreamLimit, ChunkedMessages,
         DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
     };
 
@@ -1158,22 +1197,18 @@ mod tests {
     }
 
     #[test]
-    fn the_next_chunk_is_the_rest_of_the_heights_a_read_was_offered() {
+    fn each_chunk_is_offered_up_to_1000_heights_from_the_next_height_to_send() {
         let mut ascending = BlockRangeChunks::new(range(1, 3_000), false);
         assert_eq!(ascending.next_chunk(), Some(range(1, 1_000)));
         // A byte-bounded read kept 120 of the 1,000 heights it was offered.
         ascending.advance(120);
-        assert_eq!(ascending.next_chunk(), Some(range(121, 1_000)));
-        ascending.advance(1);
-        assert_eq!(ascending.next_chunk(), Some(range(122, 1_000)));
+        assert_eq!(ascending.next_chunk(), Some(range(121, 1_120)));
         // A read that kept nothing leaves the plan where it was.
         ascending.advance(0);
-        assert_eq!(ascending.next_chunk(), Some(range(122, 1_000)));
-        // A read that kept every height it was offered leaves 1,000 new ones
-        // to the next.
-        ascending.advance(879);
-        assert_eq!(ascending.next_chunk(), Some(range(1_001, 2_000)));
+        assert_eq!(ascending.next_chunk(), Some(range(121, 1_120)));
         ascending.advance(1_000);
+        assert_eq!(ascending.next_chunk(), Some(range(1_121, 2_120)));
+        ascending.advance(880);
         assert_eq!(ascending.next_chunk(), Some(range(2_001, 3_000)));
         ascending.advance(999);
         assert_eq!(ascending.next_chunk(), Some(range(3_000, 3_000)));
@@ -1183,29 +1218,115 @@ mod tests {
         let mut descending = BlockRangeChunks::new(range(1, 3_000), true);
         assert_eq!(descending.next_chunk(), Some(range(2_001, 3_000)));
         descending.advance(120);
-        assert_eq!(descending.next_chunk(), Some(range(2_001, 2_880)));
-        descending.advance(880);
-        assert_eq!(descending.next_chunk(), Some(range(1_001, 2_000)));
-        descending.advance(2_000);
+        assert_eq!(descending.next_chunk(), Some(range(1_881, 2_880)));
+        descending.advance(2_880);
         assert!(!descending.has_remaining());
     }
 
-    /// A descending range whose last height is outside retained history
-    /// sends every height above it before a read reaches it.
+    /// Returns how many reads a stream over `range` makes when every block
+    /// holds `block_bytes` stored bytes and each read keeps as many blocks
+    /// of the heights it is offered as its byte budget holds.
+    fn reads_of_equal_blocks(
+        range: BlockHeightRange,
+        is_descending: bool,
+        block_bytes: usize,
+    ) -> usize {
+        let mut chunks = BlockRangeChunks::new(range, is_descending);
+        let mut max_bytes = BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES;
+        let mut reads = 0;
+        while let Some(chunk) = chunks.next_chunk() {
+            let kept = (max_bytes / block_bytes).clamp(1, chunk.into_iter().len());
+            chunks.advance(kept);
+            max_bytes = BLOCK_RANGE_CHUNK_MAX_BYTES;
+            reads += 1;
+        }
+        reads
+    }
+
+    /// A dense range takes one read for each chunk its byte budget holds.
     ///
-    /// A read checks every height it is offered, so a read offered height 0
-    /// with the 936 heights the first read checked and did not keep would
-    /// fail them all.
+    /// A read fills its budget whatever heights the read before it was
+    /// offered, so blocks that just overflow a 1,000-block chunk take one
+    /// read per 998 blocks rather than two per 1,000 heights.
     #[test]
-    fn a_read_reaches_past_the_heights_an_earlier_read_checked_only_once_they_are_kept() {
+    fn a_dense_range_takes_one_read_for_each_byte_capped_chunk() {
+        const BLOCK_BYTES: usize = 2_100;
+        let whole = range(1, 100_000);
+        let first_chunk_blocks = BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES / BLOCK_BYTES;
+        let later_chunk_blocks = BLOCK_RANGE_CHUNK_MAX_BYTES / BLOCK_BYTES;
+        assert_eq!(
+            (first_chunk_blocks, later_chunk_blocks),
+            (124, 998),
+            "a later read must keep just under 1,000 blocks"
+        );
+        let heights = whole.into_iter().len();
+        let expected_reads = 1 + (heights - first_chunk_blocks).div_ceil(later_chunk_blocks);
+        assert_eq!(expected_reads, 102);
+        for is_descending in [false, true] {
+            assert_eq!(
+                reads_of_equal_blocks(whole, is_descending, BLOCK_BYTES),
+                expected_reads,
+                "descending: {is_descending}"
+            );
+        }
+    }
+
+    /// A descending range whose last height is outside retained history
+    /// sends every height an earlier read checked before a read reaches it.
+    ///
+    /// A read checks every height it is offered, so the read offered height
+    /// 0 with the 936 heights the first read checked and did not keep fails
+    /// them all. The stream then reads those 936 alone, until it has sent
+    /// them.
+    #[test]
+    fn a_read_past_the_checked_heights_gives_way_to_them_alone() -> Result<(), &'static str> {
         let mut descending = BlockRangeChunks::new(range(0, 1_000), true);
         assert_eq!(descending.next_chunk(), Some(range(1, 1_000)));
+        assert_eq!(
+            descending.checked_heights(),
+            None,
+            "no read has checked a height"
+        );
         descending.advance(64);
-        assert_eq!(descending.next_chunk(), Some(range(1, 936)));
-        descending.advance(900);
-        assert_eq!(descending.next_chunk(), Some(range(1, 36)));
-        descending.advance(36);
-        assert_eq!(descending.next_chunk(), Some(range(0, 0)));
+        assert_eq!(descending.next_chunk(), Some(range(0, 936)));
+
+        let (checked, mut only_checked) = descending
+            .checked_heights()
+            .ok_or("the first read checked 936 heights it did not keep")?;
+        assert_eq!(checked, range(1, 936));
+        assert_eq!(only_checked.next_chunk(), Some(checked));
+        assert_eq!(
+            only_checked.checked_heights(),
+            None,
+            "a read of the checked heights alone has no smaller retry"
+        );
+        only_checked.advance(900);
+        assert_eq!(only_checked.next_chunk(), Some(range(1, 36)));
+        only_checked.advance(36);
+        assert_eq!(only_checked.next_chunk(), Some(range(0, 0)));
+        assert_eq!(
+            only_checked.checked_heights(),
+            None,
+            "every checked height was sent"
+        );
+
+        // Once the checked heights are sent, reads are offered 1,000 new
+        // heights again.
+        let mut ascending = BlockRangeChunks::new(range(1, 3_000), false);
+        ascending.advance(100);
+        let (checked, mut only_checked) = ascending
+            .checked_heights()
+            .ok_or("the first read checked 900 heights it did not keep")?;
+        assert_eq!(checked, range(101, 1_000));
+        only_checked.advance(900);
+        assert_eq!(only_checked.next_chunk(), Some(range(1_001, 2_000)));
+
+        // A read offered only heights the last read checked has no retry.
+        let mut short = BlockRangeChunks::new(range(1, 500), false);
+        short.advance(100);
+        assert_eq!(short.next_chunk(), Some(range(101, 500)));
+        assert_eq!(short.checked_heights(), None);
+        Ok(())
     }
 
     /// Lets every spawned task run until it waits.
