@@ -68,3 +68,7 @@ pub const WALLET_QUERY_CAPABILITY_NOT_SUPPORTED: &str =
 /// resolved, such as during view replay or while the view and the wallet
 /// reader are one block apart at the tip.
 pub const TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED: &str = "Transparent output spend status is unknown because the spend index does not cover this chain epoch.";
+
+/// No mempool event counts were recorded for the requested window.
+pub const MEMPOOL_EVENT_COUNTS_NOT_INDEXED: &str =
+    "Mempool event counts are unavailable because this window has no indexed event counts.";

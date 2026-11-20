@@ -111,6 +111,7 @@ use super::value_pool_flow::{
     query_value_pool_flow_summary,
 };
 use super::value_pool_summary::query_value_pool_summary;
+use super::wallet_capabilities::WalletCapabilityDiscovery;
 use zinder_materialized_views::MaterializedViewStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -145,6 +146,7 @@ pub struct ExplorerQueryGrpcAdapter {
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: NetworkUpgradeActivationsCache,
     wallet_channel: Option<LazyZinderGrpcChannel>,
+    wallet_capabilities: WalletCapabilityDiscovery,
     prevout_resolution_online: bool,
     upstream_observation_cache: UpstreamObservationCache,
 }
@@ -162,6 +164,7 @@ impl ExplorerQueryGrpcAdapter {
             transaction_history_materialized_view_reader: None,
             network_upgrade_activations: NetworkUpgradeActivationsCache::new(settings.network),
             wallet_channel: None,
+            wallet_capabilities: WalletCapabilityDiscovery::default(),
             prevout_resolution_online: false,
             upstream_observation_cache: UpstreamObservationCache::empty(),
         }
@@ -198,6 +201,7 @@ impl ExplorerQueryGrpcAdapter {
     }
 
     fn reset_wallet_channel(&mut self) {
+        self.wallet_capabilities = WalletCapabilityDiscovery::default();
         self.wallet_channel = self.wallet_query_endpoint.clone().map(|endpoint| {
             LazyZinderGrpcChannel::new(endpoint, self.wallet_query_bearer_token.clone())
         });
@@ -300,16 +304,17 @@ impl ExplorerQueryGrpcAdapter {
         }
     }
 
-    /// Returns the capability strings the adapter currently advertises.
-    ///
-    /// Single source of truth for capability gating: `ServerInfo`, the ops
-    /// endpoint `/healthz`, and any future advertisement surface all read
-    /// from this method so a flag flip in one place reaches every consumer.
-    /// Per ADR-0014, each capability lights up only when the upstream
-    /// state it depends on is satisfied; the adapter never advertises a
-    /// capability whose handler would return `Unavailable`.
+    /// Returns capabilities supported by local dependencies and the latest
+    /// wallet descriptor observed by `ServerInfo`.
     #[must_use]
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
+        self.capabilities_with_wallet(self.wallet_capabilities.cached().as_deref())
+    }
+
+    fn capabilities_with_wallet(
+        &self,
+        wallet: Option<&zinder_proto::v1::wallet::WalletServerInfo>,
+    ) -> Vec<&'static str> {
         let readiness = self.advertised_capability_readiness();
         let ranking_active = self.materialized_view_store.as_ref().is_some_and(|store| {
             zinder_materialized_views::TransparentAddressRankingConsumer::active_metadata(store)
@@ -328,7 +333,10 @@ impl ExplorerQueryGrpcAdapter {
             self.materialized_view_store.as_ref(),
         );
         capabilities_for_surface(CapabilitySurface::Explorer)
-            .filter(|spec| spec.policy.explorer_satisfied(readiness))
+            .filter(|spec| {
+                spec.policy
+                    .explorer_satisfied_with_wallet(readiness, wallet)
+            })
             .filter(|spec| {
                 !matches!(
                     spec.string,
@@ -415,6 +423,19 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         .await;
         let materialized_view_status =
             read_materialized_view_status(self.materialized_view_store.as_ref())?;
+        let wallet = if self.wallet_channel.is_some() {
+            self.wallet_capabilities
+                .current(async {
+                    self.wallet_client("ServerInfo")
+                        .await?
+                        .server_info(zinder_proto::v1::wallet::ServerInfoRequest {})
+                        .await
+                        .map(|response| response.into_inner().info)
+                })
+                .await
+        } else {
+            None
+        };
         Ok(Response::new(ServerInfoResponse {
             freshness: Some(freshness),
             info: Some(ExplorerServerInfo {
@@ -424,7 +445,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                     service_version: env!("CARGO_PKG_VERSION").to_owned(),
                     build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
                     capabilities: self
-                        .advertised_capabilities()
+                        .capabilities_with_wallet(wallet.as_deref())
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
@@ -1540,6 +1561,45 @@ mod tests {
             "requests waited {elapsed:?}, longer than one dial"
         );
         drop(listener);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_info_advertises_wallet_value_pools_until_discovery_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_proto::capabilities::{
+            Capability, CapabilityDescriptor as _, EXPLORER_VALUE_POOL_SUMMARY_V1,
+        };
+
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+        let wallet = zinder_proto::v1::wallet::WalletServerInfo {
+            common: Some(ops::ServerInfo {
+                capabilities: vec![Capability::ChainValuePools.as_str().to_owned()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        adapter
+            .wallet_capabilities
+            .current(async { Ok(Some(wallet)) })
+            .await;
+        let supported = adapter
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or("missing Explorer server info")?;
+        assert!(supported.has(EXPLORER_VALUE_POOL_SUMMARY_V1));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let offline = adapter
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or("missing Explorer server info")?;
+        assert!(!offline.has(EXPLORER_VALUE_POOL_SUMMARY_V1));
+        assert!(offline.has(EXPLORER_SERVER_INFO_V1));
         Ok(())
     }
 

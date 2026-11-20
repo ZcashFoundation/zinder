@@ -74,14 +74,14 @@ In the table, "views" means the method reads the view store and "wallet" means i
 | `TransactionDetail` | Parsed public facts, mined or mempool location, transparent inputs and outputs, paid fee, and spent-by relations | Wallet, plus views for fees and spends. See [Transaction detail](#transaction-detail) |
 | `Search` | Typed candidates for a height, block hash, transaction id, or address | Wallet. Input up to 4 KiB |
 | `MempoolSummary`, `MempoolSnapshot`, `MempoolActivity` | Mempool totals; a summary and one page from a single snapshot; newest-first entries with component counts and ZIP-317 fee floors | Wallet, computed per request. Snapshot reads up to 4,096 entries; activity pages up to 256 |
-| `MempoolEventCounts` | Added, mined, and invalidated counts over a 60 to 3,600 second window | Views. Always zero in this release; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
+| `MempoolEventCounts` | Added, mined, and invalidated counts over a 60 to 3,600 second window | Views and wallet. Unadvertised; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
 | `TransparentAddressActivity`, `TransparentAddressDeltas`, `TransparentAddressRanking` | Per-address transaction rows and summary; per-output and per-spend value events; addresses ordered by balance | Views and wallet. See [Transparent addresses](#transparent-addresses) |
 | `FeeSummary` | ZIP-317 conventional fee floors over a block range, excluding coinbase | Views and wallet. At most 256 blocks |
 | `ConventionalFeeDistribution` | Exact conventional-fee frequencies by UTC day over a time range | Views and wallet, with coverage |
 | `TransactionComponentSummary` | Transparent, Sapling, Orchard, Ironwood, and Sprout component totals by UTC day | Views and wallet, with coverage |
-| `ValuePoolSummary` | The pool totals the node reports in `getblockchaininfo`, bound to one tip | Wallet |
+| `ValuePoolSummary` | The pool totals the node reports in `getblockchaininfo`, bound to one tip | Wallet endpoint with `ChainValuePoolsAtTip` support |
 | `ValuePoolFlowHistory`, `ValuePoolFlowEventsInRange`, `ValuePoolFlowSummary`, `ValuePoolFlowAmountThresholdSummary`, `ValuePoolFlowRoundedAmountSummary` | Per-transaction value moving into or out of the shielded pools, and aggregates by time, amount threshold, or rounded amount | Views and wallet. Summaries fail above 500,000 scanned events |
-| `ValuePoolBalanceHistory` | Pool balances at UTC-day boundaries | Views and wallet. No rows in this release; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
+| `ValuePoolBalanceHistory` | Pool balances at UTC-day boundaries | Views and wallet. Unadvertised; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
 | `NetworkUpgradeStatus` | The network-upgrade table ingest admitted, with the current tip and active upgrade | Wallet |
 | `ChainReorgHistory` | Observed reorgs from the reorg-incident view | Views. Up to 1,024 events per request |
 | `MigrationOverview`, `MigrationCohorts`, `MigrationDenominations` | Orchard-to-Ironwood migration totals, cohorts by shared anchor, and amount bins | Views and wallet. Cohort and denomination ranges up to 4,096 blocks |
@@ -146,7 +146,7 @@ View lag is the visible tip height minus the indexed tip height. Lag is reported
 
 Methods over long history, such as `TransactionHistory`, the distributions and summaries, the value-pool flow methods, and `TransparentAddressRanking`, return a coverage envelope beside the data. A result is complete only when its coverage says so, so a client checks coverage before presenting a result as the whole history.
 
-Missing data is reported as absent, through an `unavailable` entry or incomplete coverage. It is never turned into zero or an empty complete list. `MempoolEventCounts` is the one exception in this release.
+Missing data is reported as absent, through an `unavailable` entry or incomplete coverage.
 
 ## Cursors
 
@@ -183,8 +183,9 @@ The Explorer serves `/healthz`, `/readyz`, and `/metrics` on its ops listener, `
 | Method or field | Behavior |
 | --- | --- |
 | The seven [unadvertised methods](#unadvertised-methods) | Fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. |
-| `MempoolEventCounts`, and the mempool event counts in `OverviewSnapshot` | Always zero. The view is registered, and no runtime writes mempool events to it. |
-| `ValuePoolBalanceHistory` | Returns no points and no coverage. The view has no writer. |
+| `MempoolEventCounts` | No runtime indexes mempool events. From native contract revision 12, a direct call for a window with no indexed counts fails with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`. |
+| `OverviewSnapshot.mempool_events` | Absent for a window with no indexed counts. `freshness.unavailable` lists `mempool_events` with `UNAVAILABLE_NOT_INDEXED`. |
+| `ValuePoolBalanceHistory` | No runtime writes balance history. A direct call returns no points and reports incomplete coverage. |
 | `TransactionDetail.intrinsic_value_balances` | Never returned. |
 | Previous-output scripts on mined `TransactionDetail` inputs | Never returned. |
 | Full-history totals in `TransactionHistory` | Never claimed, because that claim must match a canonical tip, and the Explorer does not read the canonical store. |

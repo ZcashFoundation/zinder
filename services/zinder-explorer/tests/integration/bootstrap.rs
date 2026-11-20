@@ -32,9 +32,10 @@ use zinder_materialized_views::{
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_SUMMARY_V1,
-    EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_FEES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
+    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1, EXPLORER_VALUE_POOL_SUMMARY_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockSummariesInRangeRequest, BlockSummary,
@@ -335,6 +336,25 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         .as_ref()
         .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
     assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
+    for unsupported in [
+        EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+        EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
+        EXPLORER_VALUE_POOL_SUMMARY_V1,
+    ] {
+        assert!(
+            !common
+                .capabilities
+                .iter()
+                .any(|capability| capability == unsupported),
+            "advertised {unsupported}"
+        );
+    }
+    let status = client
+        .mempool_event_counts(zinder_proto::v1::explorer::MempoolEventCountsRequest::default())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("empty counts view returned counts"))?;
+    assert_eq!(status.code(), tonic::Code::NotFound);
 
     let first = client
         .overview_snapshot(OverviewSnapshotRequest {
@@ -927,9 +947,6 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
     );
 }
 
-/// The production wallet endpoint serves an empty mempool snapshot through
-/// its admitted ingest control but does not serve chain value pools, so only
-/// the value pools are reported unavailable.
 fn assert_overview_wallet_fields_from_production_endpoint(
     response: &OverviewSnapshotResponse,
 ) -> Result<()> {
@@ -945,7 +962,12 @@ fn assert_overview_wallet_fields_from_production_endpoint(
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    assert_eq!(freshness.unavailable.len(), 1);
+    assert!(response.mempool_events.is_none());
+    assert!(freshness.unavailable.iter().any(|field| field.field_path
+        == zinder_proto::wire::OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH
+        && field.reason() == UnavailableReason::UnavailableNotIndexed
+        && field.human_reason == zinder_core::explorer_reasons::MEMPOOL_EVENT_COUNTS_NOT_INDEXED));
+    assert_eq!(freshness.unavailable.len(), 2);
     let unavailable_field = freshness
         .unavailable
         .iter()

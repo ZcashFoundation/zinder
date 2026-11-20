@@ -28,6 +28,8 @@ on their gRPC listeners, as [gRPC health](#grpc-health) describes.
 
 `/healthz` returns `status` (`alive`), `service`, `version`, `git_commit`,
 `network`, and `capabilities`, the capability strings the runtime advertises.
+The Explorer snapshots these at startup. Query `ExplorerQuery.ServerInfo` for
+its current [capabilities](capabilities.md#explorer-capabilities).
 A local build reports `git_commit` as `unknown`.
 
 `/readyz` returns these fields. Fields without a value are omitted.

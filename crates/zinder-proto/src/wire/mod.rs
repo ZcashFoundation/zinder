@@ -27,7 +27,10 @@ pub use activation_schedule::{
 };
 pub use canonical_store_damaged::{canonical_store_damaged_detail, canonical_store_damaged_pool};
 pub use canonical_writer_fence::canonical_writer_fence_message;
-pub use explorer_field_path::TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH;
+pub use explorer_field_path::{
+    OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH, OVERVIEW_MEMPOOL_FIELD_PATH,
+    OVERVIEW_VALUE_POOLS_FIELD_PATH, TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH,
+};
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use reorg_window_exceeded::{
     ReorgWindowExceededMetadata, decode_reorg_window_exceeded_metadata,
