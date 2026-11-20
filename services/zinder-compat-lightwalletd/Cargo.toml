@@ -42,6 +42,7 @@ async-trait.workspace = true
 eyre.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
+rust-rocksdb.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -49,6 +50,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic-health.workspace = true
+tonic-types.workspace = true
 zcash_address = { workspace = true, features = ["std"] }
 zcash_protocol = { workspace = true, features = ["std"] }
 zinder-ingest.workspace = true

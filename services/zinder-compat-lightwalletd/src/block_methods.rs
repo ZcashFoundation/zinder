@@ -644,9 +644,9 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 /// converted ends the stream with that status, and a client that stops
 /// draining ends it on the next send.
 ///
-/// Before it reads the third chunk, the task waits until the client has
-/// taken every message of the first, so a stream reads at most two chunks
-/// ahead of a client that has not started, however few blocks each holds.
+/// Before it reads the third chunk, the task waits until tonic has taken
+/// every message of the first from the response, so a stream reads at most
+/// two chunks until tonic has taken the first, however few blocks each holds.
 async fn stream_later_chunks<Reads: CompactBlockReads>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
@@ -960,9 +960,13 @@ mod tests {
     #[test]
     fn lightd_info_reports_the_shared_build_identity() {
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
-        let info = lightd_info(&activations, BlockHeight::new(1), BlockHeight::new(1), true);
+        let lightd_info_response =
+            lightd_info(&activations, BlockHeight::new(1), BlockHeight::new(1), true);
 
-        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.git_commit, zinder_runtime::BUILD_GIT_COMMIT);
+        assert_eq!(lightd_info_response.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            lightd_info_response.git_commit,
+            zinder_runtime::BUILD_GIT_COMMIT
+        );
     }
 }

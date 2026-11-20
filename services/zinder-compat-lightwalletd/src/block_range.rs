@@ -496,9 +496,11 @@ impl BlockRangeStreamSlot {
     ///
     /// The response and the reader's sink each hold this slot, so the reader
     /// keeps the slot while it reads, even after the client has gone away.
-    /// The response tells the sink once the client asks for a message past
+    /// The response tells the sink once its consumer polls for a message past
     /// `first_messages`, which [`BlockRangeSink::first_chunk_taken`] waits
-    /// for.
+    /// for. The consumer is tonic, which polls messages as it fills its send
+    /// buffer, so it can poll past `first_messages` before the client has
+    /// received any of them.
     pub(crate) fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,
@@ -517,7 +519,7 @@ impl BlockRangeStreamSlot {
             _stream_slot: self.clone(),
         }));
         self.hold_for_stream(Box::pin(QueuedChunks {
-            first_messages: first_messages.into_iter(),
+            first_messages: Some(tokio_stream::iter(first_messages)),
             first_chunk_taken: Some(first_chunk_taken),
             queued_messages,
         }))
@@ -540,8 +542,8 @@ impl BlockRangeStreamSlot {
 #[derive(Debug)]
 pub(crate) struct BlockRangeSink<Message> {
     messages: mpsc::Sender<Message>,
-    /// Resolves once the client has asked for a message past the first
-    /// chunk, or `None` once it has.
+    /// Resolves once the response's consumer has polled for a message past
+    /// the first chunk, or `None` once it has.
     first_chunk_taken: Option<oneshot::Receiver<()>>,
     _stream_slot: BlockRangeStreamSlot,
 }
@@ -556,16 +558,18 @@ impl<Message> BlockRangeSink<Message> {
         self.messages.send(message).await
     }
 
-    /// Waits until the client has taken every message of the stream's first
-    /// chunk and asked for the next, and returns at once after that.
+    /// Waits until the response's consumer has taken every message of the
+    /// stream's first chunk and polled for the next, and returns at once
+    /// after that.
     ///
     /// A queue of `capacity` messages could otherwise fill with as many
     /// one-block chunks, each up to [`BLOCK_RANGE_CHUNK_MAX_BYTES`], before
-    /// the client reads anything. A reader that waits here before each read
-    /// after its first reads at most two chunks ahead of a client that has
-    /// not started.
+    /// tonic takes any message. A reader that waits here before each read
+    /// after its first reads at most two chunks until tonic has taken the
+    /// first chunk to send. Tonic takes messages as it fills its send buffer,
+    /// so the client may not yet have received them.
     ///
-    /// Returns `false` when the client dropped the response first.
+    /// Returns `false` when the response was dropped first.
     pub(crate) async fn first_chunk_taken(&mut self) -> bool {
         match self.first_chunk_taken.take() {
             Some(taken) => taken.await.is_ok(),
@@ -577,8 +581,10 @@ impl<Message> BlockRangeSink<Message> {
 /// The messages of a stream with later chunks: those of its first chunk,
 /// then those its reader queues.
 struct QueuedChunks<Message> {
-    first_messages: std::vec::IntoIter<Message>,
-    /// Told when the client asks for a message past the first chunk.
+    /// The first chunk's messages, which yield to the runtime as a one-chunk
+    /// response does, or `None` once they have all been taken.
+    first_messages: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
+    /// Told when polling moves past the first chunk to the queued messages.
     first_chunk_taken: Option<oneshot::Sender<()>>,
     queued_messages: mpsc::Receiver<Message>,
 }
@@ -590,17 +596,27 @@ impl<Message> Stream for QueuedChunks<Message> {
     type Item = Message;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
-        if let Some(message) = self.first_messages.next() {
-            return Poll::Ready(Some(message));
-        }
-        if let Some(first_chunk_taken) = self.first_chunk_taken.take() {
-            let _ = first_chunk_taken.send(());
+        if let Some(first_messages) = self.first_messages.as_mut() {
+            match Pin::new(first_messages).poll_next(context) {
+                Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.first_messages = None;
+                    if let Some(first_chunk_taken) = self.first_chunk_taken.take() {
+                        let _ = first_chunk_taken.send(());
+                    }
+                }
+            }
         }
         self.queued_messages.poll_recv(context)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.first_messages.len(), None)
+        let first_messages = self
+            .first_messages
+            .as_ref()
+            .map_or(0, |first_messages| first_messages.size_hint().0);
+        (first_messages, None)
     }
 }
 
@@ -831,9 +847,11 @@ impl BlockRangeContinuity {
     reason = "Admission tests hold slots and join handles until the step that releases or awaits them."
 )]
 mod tests {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{num::NonZeroU32, pin::Pin, task::Poll, time::Duration};
 
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::Instant;
+    use tokio_stream::Stream;
     use tonic::{Code, Status};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
@@ -845,7 +863,7 @@ mod tests {
 
     use super::{
         BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, QueuedChunks,
     };
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
@@ -1320,5 +1338,74 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Polls `stream` once with the task's context, so the poll spends the
+    /// task's cooperative budget as tonic's poll does.
+    async fn poll_once<S: Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {
+        std::future::poll_fn(|context| Poll::Ready(Pin::new(&mut *stream).poll_next(context))).await
+    }
+
+    /// Polls `stream` until it yields, letting the runtime run each time it
+    /// returns `Pending`, and returns how many times it did.
+    async fn next_counting_yields<S: Stream + Unpin>(stream: &mut S) -> (Option<S::Item>, usize) {
+        let mut yields = 0;
+        loop {
+            match poll_once(stream).await {
+                Poll::Ready(message) => return (message, yields),
+                Poll::Pending => {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// The first chunk of a stream with later chunks yields to the runtime
+    /// as a one-chunk response does. Once polling moves past it, the
+    /// response drops its messages and tells the reader.
+    #[tokio::test]
+    async fn the_first_chunk_yields_to_the_runtime_and_is_released_once_taken() {
+        const FIRST_CHUNK_MESSAGES: usize = 1_000;
+        let first_messages = (0..FIRST_CHUNK_MESSAGES).collect::<Vec<_>>();
+        let (messages, queued_messages) = mpsc::channel(1);
+        let (first_chunk_taken, mut first_chunk_taken_receiver) = oneshot::channel();
+        let mut queued_chunks = QueuedChunks {
+            first_messages: Some(tokio_stream::iter(first_messages.clone())),
+            first_chunk_taken: Some(first_chunk_taken),
+            queued_messages,
+        };
+
+        let mut sent = Vec::new();
+        let mut first_chunk_yields = 0;
+        while sent.len() < FIRST_CHUNK_MESSAGES {
+            let (message, yields) = next_counting_yields(&mut queued_chunks).await;
+            first_chunk_yields += yields;
+            let Some(message) = message else {
+                break;
+            };
+            sent.push(message);
+        }
+        assert_eq!(sent, first_messages);
+        assert!(
+            first_chunk_yields > 0,
+            "the first chunk must yield to the runtime while it is sent"
+        );
+        assert!(
+            first_chunk_taken_receiver.try_recv().is_err(),
+            "the reader must not be told before polling moves past the first chunk"
+        );
+
+        assert!(messages.try_send(FIRST_CHUNK_MESSAGES).is_ok());
+        let (queued, _) = next_counting_yields(&mut queued_chunks).await;
+        assert_eq!(queued, Some(FIRST_CHUNK_MESSAGES));
+        assert!(
+            first_chunk_taken_receiver.try_recv().is_ok(),
+            "the reader must be told once polling moves past the first chunk"
+        );
+        assert!(
+            queued_chunks.first_messages.is_none(),
+            "the response must drop the first chunk once it is taken"
+        );
     }
 }

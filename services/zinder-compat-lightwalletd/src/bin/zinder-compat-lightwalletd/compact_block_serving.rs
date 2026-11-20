@@ -1231,12 +1231,12 @@ mod tests {
             reader.secondary().network_upgrade_activations(),
             Some(&activations)
         );
-        let info = CompactBlocksGrpcAdapter::new(slot.clone())
+        let lightd_info_response = CompactBlocksGrpcAdapter::new(slot.clone())
             .get_lightd_info(Request::new(lightwalletd::Empty {}))
             .await?
             .into_inner();
         assert_eq!(
-            info.chain_name,
+            lightd_info_response.chain_name,
             zinder_core::wire::encode_bip70_chain_name(Network::ZcashRegtest)
         );
         drop(reader);

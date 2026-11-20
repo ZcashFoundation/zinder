@@ -93,7 +93,11 @@ pub trait CanonicalReader: Send + Sync + 'static {
     /// Reads the compact block of the visible best-chain block named by
     /// `block_hash`, resolving the hash and reading the block in one read.
     ///
-    /// `None` when no block of the visible best chain has that hash.
+    /// `None` when no block of the visible best chain has that hash. A
+    /// best-chain block whose compact block the store does not hold fails
+    /// with [`StorageReadError::ArtifactUnavailable`] for
+    /// [`ArtifactFamily::CompactBlock`] at its height, so a caller can tell
+    /// a missing block from an unknown hash.
     async fn compact_block_by_hash(
         &self,
         block_hash: BlockHash,

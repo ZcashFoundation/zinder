@@ -103,11 +103,13 @@ How each engine uses the tip calls:
 
 ### `GetBlock` and `GetBlockNullifiers`
 
-A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. `GetBlock` in compact-blocks serving returns the stored block without pool filtering.
+A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`. Both serving modes answer this way, whether the request names the block by height or by hash. `GetBlock` in compact-blocks serving returns the stored block without pool filtering.
 
 ### `GetBlockRange` and `GetBlockRangeNullifiers`
 
 `GetBlockRange` applies the requested `poolTypes` to every transaction and omits any transaction left with no spends, outputs, actions, or transparent inputs and outputs, as lightwalletd does. With no `poolTypes`, it returns the shielded pools, so a transparent-only coinbase is absent unless the request names the transparent pool. Each remaining transaction keeps its block position in `CompactTx.index`, so a gap marks an omitted transaction. A range with start above end is sent in descending order.
+
+`GetBlockRangeNullifiers` ignores `poolTypes` and sends the nullifiers of every shielded pool. This differs from lightwalletd v0.6.2, which drops the transparent pool from `poolTypes` and honors the pools that remain, so a request that names only some shielded pools gets only their nullifiers from lightwalletd.
 
 These outcomes fail the call before any block is sent:
 
@@ -118,7 +120,7 @@ These outcomes fail the call before any block is sent:
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
 | A block missing inside retained history | `UNAVAILABLE` |
-| A stored block among those first heights that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
+| A stored block in the first byte-bounded chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
 
 Once a stream has started, a client can rely on the following:
 
@@ -130,7 +132,7 @@ Once a stream has started, a client can rely on the following:
 6. **Other mid-stream endings.** A storage failure ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
 7. **No time limit.** Elapsed time, new blocks, and slow reading never end a stream. Shutdown, unanswered keepalive pings, and the listener's send-stall deadline do.
 
-A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. Until the client has received every block of the first chunk, the server reads only the first two chunks, however few blocks they hold. Afterwards it reads ahead by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
+A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. Until the server's gRPC layer has taken every block of the first chunk from the stream to send it, the server reads only the first two chunks, however few blocks they hold. The gRPC layer takes blocks as it fills its send buffer, so this bounds the reads ahead of that layer, not ahead of what the client has received. After that, the server reads ahead by one chunk plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 

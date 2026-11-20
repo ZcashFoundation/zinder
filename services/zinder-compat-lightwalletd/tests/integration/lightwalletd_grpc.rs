@@ -16,13 +16,15 @@ use std::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status, transport::Server};
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, serialization::ZcashDeserializeInto as _,
     transparent::Address as ZebraTransparentAddress,
 };
 use zinder_compat_lightwalletd::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdGrpcAdapter, LightwalletdPing, NodeTipWitness, StaleTipLimit,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, CanonicalReaderSlot, CompactBlocksGrpcAdapter,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdGrpcAdapter, LightwalletdPing,
+    NodeTipWitness, StaleTipLimit,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -34,7 +36,7 @@ use zinder_core::{
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId,
     TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentSpendFact, TransparentUnspentOutput,
-    wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
+    wire::{encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -731,6 +733,101 @@ async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> e
     };
     assert_eq!(status.code(), Code::InvalidArgument);
 
+    Ok(())
+}
+
+/// A best-chain hash whose compact block the store lacks reports the missing
+/// block, not a hash outside the best chain, and both serving modes report
+/// both outcomes alike.
+#[tokio::test]
+async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes() -> eyre::Result<()>
+{
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let damaged = chain
+        .block_at(BlockHeight::new(2))
+        .cloned()
+        .ok_or_else(|| eyre!("the fixture must contain height 2"))?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let canonical_primary_path = writer.canonical_primary_path().to_owned();
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    delete_compact_block_row(&canonical_primary_path, damaged.height)?;
+    let (mut canonical, wallet) = store_fixture.take_readers()?;
+    canonical.try_catch_up()?;
+    let canonical = Arc::new(RocksDbCanonicalReader::new(canonical)?);
+    let wallet_serving = LightwalletdGrpcAdapter::new(WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::<RocksDbCanonicalReader>::clone(&canonical),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?)),
+    ));
+    let compact_blocks_serving = CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(canonical));
+
+    let cases = [
+        (
+            "missing compact block",
+            damaged.hash,
+            "ARTIFACT_UNAVAILABLE",
+        ),
+        (
+            "hash outside the best chain",
+            BlockHash::from_bytes([0xee; 32]),
+            "BLOCK_NOT_IN_BEST_CHAIN",
+        ),
+    ];
+    for (case, block_hash, expected_reason) in cases {
+        let request = || {
+            Request::new(lightwalletd::BlockId {
+                height: 0,
+                hash: encode_internal_block_hash(block_hash).to_vec(),
+            })
+        };
+        let outcomes = [
+            ("wallet", wallet_serving.get_block(request()).await),
+            (
+                "compact-blocks",
+                compact_blocks_serving.get_block(request()).await,
+            ),
+        ];
+        for (mode, outcome) in outcomes {
+            let status = match outcome {
+                Ok(response) => {
+                    return Err(eyre!(
+                        "{mode} serving answered GetBlock for a {case}: {response:?}"
+                    ));
+                }
+                Err(status) => status,
+            };
+            let reason = status
+                .get_details_error_info()
+                .map(|error_info| error_info.reason);
+            assert_eq!(status.code(), Code::NotFound, "{mode} serving, {case}");
+            assert_eq!(
+                reason.as_deref(),
+                Some(expected_reason),
+                "{mode} serving, {case}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the compact block at `height` from a closed canonical primary,
+/// as store damage would.
+fn delete_compact_block_row(
+    canonical_primary_path: &std::path::Path,
+    height: BlockHeight,
+) -> eyre::Result<()> {
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
+    let family = db
+        .cf_handle("compact_block")
+        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    db.flush_cf(&family)?;
     Ok(())
 }
 
