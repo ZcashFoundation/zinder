@@ -1800,16 +1800,19 @@ impl BroadcastRejectionReason {
         }
     }
 }
-/// Visible receives every canonical transition. Settled receives one
-/// ChainCommitted for each advance of the settled tip. Its inclusive range
-/// starts just above the previous settled tip (at the first stored height
-/// for the baseline) and ends at the new settled tip. Its cursor is anchored
-/// at that settled block. Settled never receives ChainReorged.
+/// Selects which block ranges a ChainEvents subscription delivers.
 #[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ChainEventStreamFamily {
+    /// Every visible canonical transition, including reorgs.
     Visible = 0,
+    /// One ChainCommitted event for each advance of the settled tip.
+    ///
+    /// The inclusive range starts just above the previous settled tip (at the
+    /// first stored height for the baseline) and ends at the new settled tip.
+    /// The cursor is anchored at that settled block. Settled never receives
+    /// ChainReorged.
     Settled = 1,
 }
 impl ChainEventStreamFamily {

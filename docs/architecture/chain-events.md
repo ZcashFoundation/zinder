@@ -77,7 +77,9 @@ request fails with `INVALID_ARGUMENT`.
 For Settled subscriptions, use a server advertising `contract_revision` 12 or
 later. It sends `zinder-chain-event-family: settled` in the initial gRPC
 metadata whenever the resolved family is Settled, including on cursor resume.
-Earlier servers can stay silent as blocks settle.
+Earlier servers can stay silent as blocks settle. Rust SDK consumers also
+need a client that supports revision 12. Earlier clients reject a committed
+range that ends below the visible tip.
 
 ## Resume with a cursor
 
