@@ -219,6 +219,31 @@ impl RemoteChainIndex {
         server_info_from_message(self.network, wallet_info)
     }
 
+    async fn validate_reorg_cursor(
+        &self,
+        client: &mut WalletQueryClient<Channel>,
+        envelope: &ChainEventEnvelope,
+    ) -> Result<(), IndexerError> {
+        let ChainEvent::ChainReorged { reverted, .. } = &envelope.event else {
+            return Ok(());
+        };
+        // Revisions 8 and 9 number retained transitions with their resulting epoch.
+        // Only a synthesized reorg reports the current epoch at the pre-retention sequence.
+        if envelope.event_sequence < envelope.chain_epoch.id.value() {
+            let info = tokio::time::timeout(CONNECT_TIMEOUT, self.wallet_server_info(client))
+                .await
+                .map_err(|_| IndexerError::ServiceUnavailable {
+                    reason: "wallet contract revision lookup timed out".to_owned(),
+                })??;
+            if info.contract_revision < 10 {
+                return Err(IndexerError::ChainEventCursorExpired {
+                    recovery: crate::ChainEventCursorRecovery::EarliestRetained,
+                });
+            }
+        }
+        validate_reverted_range_start(reverted)
+    }
+
     /// Reads one request-sized batch of outpoint spend statuses.
     async fn transparent_outpoint_spend_status_batch(
         &self,
@@ -989,17 +1014,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
                 };
                 let envelope = chain_event_envelope_from_message(index.network, message)?;
                 progression.validate(&envelope)?;
-                if may_be_legacy_reorg(&envelope)
-                    && index
-                        .wallet_server_info(&mut client)
-                        .await?
-                        .contract_revision
-                        < 10
-                {
-                    return Err(IndexerError::ChainEventCursorExpired {
-                        recovery: crate::ChainEventCursorRecovery::EarliestRetained,
-                    });
-                }
+                index.validate_reorg_cursor(&mut client, &envelope).await?;
                 Ok(Some((envelope, (wire, progression, client, index))))
             },
         );
@@ -2035,6 +2050,10 @@ fn validate_reorg_relationship(
             "settlement must preserve or advance the previous settled tip",
         ));
     }
+    Ok(())
+}
+
+fn validate_reverted_range_start(reverted: &ChainRangeReverted) -> Result<(), IndexerError> {
     if reverted.block_range.start <= reverted.chain_epoch.settled_tip_height {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.block_range.start",
@@ -2048,13 +2067,6 @@ fn preserves_settlement(previous: &ChainEpoch, next: &ChainEpoch) -> bool {
     next.settled_tip_height > previous.settled_tip_height
         || (next.settled_tip_height == previous.settled_tip_height
             && next.settled_tip_hash == previous.settled_tip_hash)
-}
-
-// Revisions 8 and 9 number retained transitions with their resulting epoch. A
-// synthesized reorg alone reports the current epoch at the pre-retention sequence.
-fn may_be_legacy_reorg(envelope: &ChainEventEnvelope) -> bool {
-    matches!(envelope.event, ChainEvent::ChainReorged { .. })
-        && envelope.event_sequence < envelope.chain_epoch.id.value()
 }
 
 struct ChainEventStreamProgression {
@@ -2084,7 +2096,9 @@ impl ChainEventStreamProgression {
                     "settlement must preserve or advance the previous settled tip",
                 ));
             }
+            // The cursor's own settlement is checked after detecting a legacy locator below it.
             if let ChainEvent::ChainReorged { reverted, .. } = &envelope.event
+                && previous.settled_tip_height > reverted.chain_epoch.settled_tip_height
                 && reverted.block_range.start <= previous.settled_tip_height
             {
                 return Err(IndexerError::malformed(
@@ -3423,8 +3437,7 @@ mod tests {
         for start in [39, 40] {
             let mut reverted = reverted;
             reverted.block_range.start = BlockHeight::new(start);
-            committed.block_range.start = reverted.block_range.start;
-            assert!(validate_reorg_relationship(&reverted, &committed).is_err());
+            assert!(validate_reverted_range_start(&reverted).is_err());
         }
         Ok(())
     }

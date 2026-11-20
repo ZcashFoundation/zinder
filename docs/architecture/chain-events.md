@@ -111,6 +111,8 @@ For durable recovery across pruning, use a server advertising `contract_revision
 normally. If the server synthesizes a reorg after pruning, the SDK ends the
 stream with `ChainEventCursorExpired` before delivering the replacement or
 its cursor. Rebuild your state and start a new stream from `earliest_retained`.
+If the revision lookup times out, the SDK returns `ServiceUnavailable`.
+Reconnect with your last saved cursor.
 
 A `SETTLED` cursor whose block is no longer on the chain is always expired,
 because a settled stream never carries a reorg.
