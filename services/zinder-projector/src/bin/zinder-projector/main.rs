@@ -47,7 +47,9 @@ mod following_readiness;
 mod parked_following;
 mod projector_control;
 
-use canonical_writer_control::{CanonicalRetentionLease, CanonicalWriterControlClient};
+use canonical_writer_control::{
+    CanonicalRetentionLease, CanonicalWriterControlClient, CanonicalWriterControlError,
+};
 use config::{ProjectorConfigOverrides, ProjectorError};
 use following_readiness::FollowingReadiness;
 use parked_following::{
@@ -270,13 +272,6 @@ fn finish_startup_phase<T, E: std::fmt::Display>(
     outcome
 }
 
-#[derive(Default)]
-struct ProjectorStartup {
-    storage: Option<StartupPhaseGuard>,
-    ingest_control: Option<StartupPhaseGuard>,
-    recovery: Option<StartupPhaseGuard>,
-}
-
 fn complete_pending_phase(phase: &mut Option<StartupPhaseGuard>) {
     if let Some(phase) = phase.take() {
         phase.complete();
@@ -288,15 +283,10 @@ async fn run_owned_projector(
     readiness: &Readiness,
     cancel: CancellationToken,
 ) -> Result<(), ProjectorError> {
-    let mut startup = ProjectorStartup::default();
-    let outcome = Box::pin(project_wallet(config, readiness, cancel, &mut startup)).await;
-    if let Err(error) = &outcome {
-        for phase in [startup.recovery, startup.ingest_control, startup.storage]
-            .into_iter()
-            .flatten()
-        {
-            phase.fail(error);
-        }
+    let mut active_phase = None;
+    let outcome = Box::pin(project_wallet(config, readiness, cancel, &mut active_phase)).await;
+    if let (Err(error), Some(phase)) = (&outcome, active_phase) {
+        phase.fail(error);
     }
     outcome
 }
@@ -309,19 +299,19 @@ async fn project_wallet(
     config: &config::ProjectorConfig,
     readiness: &Readiness,
     cancel: CancellationToken,
-    startup: &mut ProjectorStartup,
+    active_phase: &mut Option<StartupPhaseGuard>,
 ) -> Result<(), ProjectorError> {
     let reorg_policy = CanonicalReorgPolicy::new(config.reorg_window_blocks).map_err(|error| {
         zinder_runtime::ConfigError::invalid(format!(
             "projector.reorg_window_blocks is invalid: {error}"
         ))
     })?;
-    startup.storage = Some(StartupPhase::OpenStorage.start());
+    *active_phase = Some(StartupPhase::OpenStorage.start());
     let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
         return Ok(());
     };
-    complete_pending_phase(&mut startup.storage);
-    startup.ingest_control = Some(StartupPhase::AdmitIngestControl.start());
+    complete_pending_phase(active_phase);
+    *active_phase = Some(StartupPhase::AdmitIngestControl.start());
     let Some(mut canonical_control) = CanonicalWriterControlClient::connect_at_startup(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
@@ -332,8 +322,11 @@ async fn project_wallet(
     else {
         return Ok(());
     };
-    startup.recovery = Some(StartupPhase::RecoverState.start());
+    // Admission needs the wallet cursor to choose a fence. Only the phase
+    // performing the current operation owns its failure.
+    let admission = active_phase.replace(StartupPhase::RecoverState.start());
     let resumable_wallet = open_resumable_wallet(config, canonical.reorg_policy())?;
+    let recovery = std::mem::replace(active_phase, admission);
     let resumable_source = resumable_wallet
         .as_ref()
         .map(|wallet| WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence()));
@@ -362,7 +355,8 @@ async fn project_wallet(
         return Ok(());
     };
 
-    complete_pending_phase(&mut startup.ingest_control);
+    complete_pending_phase(active_phase);
+    *active_phase = recovery;
     if let Some(wallet) = resumable_wallet {
         let wallet_source =
             WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
@@ -370,7 +364,7 @@ async fn project_wallet(
             .await?
         {
             ResumedFollowingAdmission::Anchored(canonical_lease) => {
-                complete_pending_phase(&mut startup.recovery);
+                complete_pending_phase(active_phase);
                 tracing::info!(
                     target: "zinder::projector",
                     event = "wallet_projection_following_resumed",
@@ -411,7 +405,7 @@ async fn project_wallet(
                     canonical_control,
                     wallet,
                     first_retained_event_sequence,
-                    &mut startup.recovery,
+                    active_phase,
                 ))
                 .await;
             }
@@ -559,7 +553,19 @@ async fn project_wallet(
     let outcome = match build_result {
         Ok(Some(outcome)) => outcome,
         Ok(None) => {
-            canonical_control.release(&canonical_lease).await?;
+            match canonical_control.release(&canonical_lease).await {
+                Err(CanonicalWriterControlError::Status(status))
+                    if status.code() == tonic::Code::Unavailable =>
+                {
+                    tracing::warn!(
+                        target: "zinder::projector",
+                        code = ?status.code(),
+                        expires_at_unix_millis = canonical_lease.expires_at().value(),
+                        "writer unavailable during shutdown, leaving any remaining retention lease to expire"
+                    );
+                }
+                release => release?,
+            }
             return Ok(());
         }
         Err(build_error) => {
@@ -601,7 +607,7 @@ async fn project_wallet(
         config.lease_duration,
     )
     .await?;
-    complete_pending_phase(&mut startup.recovery);
+    complete_pending_phase(active_phase);
     let ready_height = report.source_position.tip.height.value();
     tracing::info!(
         target: "zinder::projector",
@@ -1131,7 +1137,9 @@ async fn bootstrap_resumed_wallet_following(
 
     // Bound before the bootstrap can park, so a parked bootstrap refuses
     // captures; continuous following inherits this listener.
+    let recovery = recover_state.take();
     let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
+    *recover_state = recovery;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
