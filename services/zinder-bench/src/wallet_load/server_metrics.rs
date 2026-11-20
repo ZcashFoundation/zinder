@@ -209,7 +209,7 @@ impl RunObservation {
 /// The slots each receive pool held, read from the server at moments of a
 /// run, in the order they were read.
 #[derive(Clone, Debug, Default)]
-pub(super) struct HeldSlotsTimeline {
+struct HeldSlotsTimeline {
     readings: Vec<HeldSlotsReading>,
 }
 
@@ -222,7 +222,7 @@ struct HeldSlotsReading {
 
 impl HeldSlotsTimeline {
     /// Adds the slots each pool held in `samples`, read `at` into the run.
-    pub(super) fn record(&mut self, at: Duration, samples: &[MetricSample]) {
+    fn record(&mut self, at: Duration, samples: &[MetricSample]) {
         let mut by_pool = BTreeMap::<String, f64>::new();
         for sample in samples
             .iter()
@@ -265,7 +265,7 @@ impl HeldSlotsTimeline {
 /// Reads the slots each receive pool of the server holds, every
 /// [`HELD_SLOTS_READ_INTERVAL`] until the run ends.
 #[derive(Debug)]
-pub(super) struct HeldSlotsSampler {
+struct HeldSlotsSampler {
     started: Instant,
     timeline: Arc<Mutex<HeldSlotsTimeline>>,
     reader: AbortOnDropHandle<()>,
@@ -274,7 +274,7 @@ pub(super) struct HeldSlotsSampler {
 impl HeldSlotsSampler {
     /// Starts reading `url`, with `before`, the scrape just taken, as the
     /// run's first read.
-    pub(super) fn start(url: &str, before: &[MetricSample]) -> Self {
+    fn start(url: &str, before: &[MetricSample]) -> Self {
         let started = Instant::now();
         let mut timeline = HeldSlotsTimeline::default();
         timeline.record(Duration::ZERO, before);
@@ -293,7 +293,7 @@ impl HeldSlotsSampler {
 
     /// Stops reading and returns the reads, with `after`, the scrape just
     /// taken, as the last.
-    pub(super) async fn finish(self, after: &[MetricSample]) -> HeldSlotsTimeline {
+    async fn finish(self, after: &[MetricSample]) -> HeldSlotsTimeline {
         let at = self.started.elapsed();
         self.reader.abort();
         // Once the reader has stopped, no read can land after `after`.
@@ -320,7 +320,7 @@ impl ServerObserved {
     /// Fails when a counter series went down or disappeared, as it does when
     /// the server restarts during the run: the increases would then mix two
     /// processes' counts, and a per-band count could exceed its total.
-    pub(super) fn between(
+    fn between(
         before: &[MetricSample],
         after: &[MetricSample],
         held_slots: &HeldSlotsTimeline,
