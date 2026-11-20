@@ -111,16 +111,12 @@ impl ReceiveSlots {
             eviction: eviction.clone(),
             claimed_at,
         });
-        let held = table.held.len();
+        let held = self.publish_held(&table);
         drop(table);
         metrics::histogram!(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, "pool" => self.pool.label())
-            .record(f64::from(u32::try_from(held).unwrap_or(u32::MAX)));
+            .record(held);
         if let Some(hold) = evicted_hold {
-            // The evicted request's slot passed to this one, so the pool
-            // holds as many slots as before.
             self.record_hold(hold);
-        } else {
-            metrics::gauge!(RECEIVE_SLOTS_HELD_METRIC, "pool" => self.pool.label()).increment(1.0);
         }
         Some(Admission {
             slot: ReceiveSlot {
@@ -135,16 +131,22 @@ impl ReceiveSlots {
     /// Frees slot `id`, unless another client's request already took it.
     fn release(&self, id: u64) {
         let mut table = self.table.lock();
-        let released = table
-            .held
-            .iter()
-            .position(|held| held.id == id)
-            .map(|index| table.held.remove(index));
+        let Some(index) = table.held.iter().position(|held| held.id == id) else {
+            return;
+        };
+        let released = table.held.remove(index);
+        self.publish_held(&table);
         drop(table);
-        if let Some(released) = released {
-            metrics::gauge!(RECEIVE_SLOTS_HELD_METRIC, "pool" => self.pool.label()).decrement(1.0);
-            self.record_hold(released.claimed_at.elapsed());
-        }
+        self.record_hold(released.claimed_at.elapsed());
+    }
+
+    /// Sets the occupancy gauge to the slots `table` holds, and returns that
+    /// count. Callers hold the table lock, so the gauge takes each count in
+    /// the order the table reached it.
+    fn publish_held(&self, table: &SlotTable) -> f64 {
+        let held = f64::from(u32::try_from(table.held.len()).unwrap_or(u32::MAX));
+        metrics::gauge!(RECEIVE_SLOTS_HELD_METRIC, "pool" => self.pool.label()).set(held);
+        held
     }
 
     fn record_hold(&self, hold: Duration) {
@@ -217,12 +219,84 @@ mod tests {
         sync::Arc,
     };
 
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use parking_lot::Mutex;
 
-    use super::{super::ReceivePool, Admission, ReceiveSlots};
+    use super::{
+        super::{RECEIVE_SLOTS_HELD_METRIC, ReceivePool},
+        Admission, ReceiveSlots,
+    };
 
     fn connection(port: u16) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// The value the occupancy gauge holds now, and the lowest and highest it
+    /// ever took.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct OccupancyReadings {
+        now: f64,
+        lowest: f64,
+        highest: f64,
+    }
+
+    /// Records every value the occupancy gauge takes, from any thread.
+    #[derive(Debug, Default)]
+    struct OccupancyTrace(Mutex<OccupancyReadings>);
+
+    impl OccupancyTrace {
+        fn update(&self, next: impl FnOnce(f64) -> f64) {
+            let mut readings = self.0.lock();
+            readings.now = next(readings.now);
+            readings.lowest = readings.lowest.min(readings.now);
+            readings.highest = readings.highest.max(readings.now);
+        }
+    }
+
+    impl GaugeFn for OccupancyTrace {
+        fn increment(&self, amount: f64) {
+            self.update(|now| now + amount);
+        }
+
+        fn decrement(&self, amount: f64) {
+            self.update(|now| now - amount);
+        }
+
+        fn set(&self, amount: f64) {
+            self.update(|_| amount);
+        }
+    }
+
+    /// A recorder that traces the occupancy gauge and discards every other
+    /// metric.
+    #[derive(Debug, Default)]
+    struct OccupancyRecorder(Arc<OccupancyTrace>);
+
+    impl Recorder for OccupancyRecorder {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+            if key.name() == RECEIVE_SLOTS_HELD_METRIC {
+                Gauge::from_arc(Arc::clone(&self.0))
+            } else {
+                Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
     }
 
     fn pool(capacity: usize) -> Result<Arc<ReceiveSlots>, &'static str> {
@@ -354,6 +428,41 @@ mod tests {
             assert_eq!(held_now().as_deref(), Some("0"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn concurrent_claims_and_releases_keep_the_occupancy_gauge_within_the_pool()
+    -> Result<(), &'static str> {
+        const CAPACITY: u16 = 2;
+        const CLIENTS: u16 = 8;
+        const CLAIMS_PER_CLIENT: usize = 20_000;
+        let recorder = OccupancyRecorder::default();
+        let slots = pool(usize::from(CAPACITY))?;
+
+        // The scope joins every client thread, and fails the test if one
+        // panicked.
+        std::thread::scope(|scope| {
+            for client in 0..CLIENTS {
+                let (recorder, slots) = (&recorder, &slots);
+                scope.spawn(move || {
+                    metrics::with_local_recorder(recorder, || {
+                        for _ in 0..CLAIMS_PER_CLIENT {
+                            // Claims into a full pool evict, and the evicted
+                            // slot then frees nothing.
+                            drop(slots.claim(Some(connection(client))));
+                        }
+                    });
+                });
+            }
+        });
+
+        let readings = *recorder.0.0.lock();
+        assert!(readings.lowest >= 0.0, "{readings:?}");
+        assert!(readings.highest <= f64::from(CAPACITY), "{readings:?}");
+        assert!(readings.highest > 0.0, "{readings:?}");
+        assert_eq!(readings.now, 0.0, "{readings:?}");
+        assert_eq!(slots.held(), 0);
+        Ok(())
     }
 
     #[test]
