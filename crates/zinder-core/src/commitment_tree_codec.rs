@@ -222,13 +222,32 @@ fn canonical_frontier<Node>(
 where
     Node: Clone + Hashable + HashSer,
 {
+    let (frontier, tree_size) = decode_canonical_frontier(&final_state_bytes)?;
+    let final_root = memoized_frontier_root(protocol, &final_state_bytes, || {
+        root_bytes_in_rpc_order(&frontier_root(&frontier))
+    });
+    Ok(CommitmentTreeFrontier {
+        protocol,
+        tree_size,
+        final_root,
+        final_state_bytes,
+    })
+}
+
+#[cfg(feature = "commitment-tree-codec")]
+fn decode_canonical_frontier<Node>(
+    final_state_bytes: &[u8],
+) -> Result<(Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>, u32), CommitmentTreeFrontierValidationError>
+where
+    Node: Clone + Hashable + HashSer,
+{
     if final_state_bytes.len() > MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES {
         return Err(CommitmentTreeFrontierValidationError::TooLarge {
             byte_count: final_state_bytes.len(),
             max_byte_count: MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
         });
     }
-    let mut reader = Cursor::new(final_state_bytes.as_ref());
+    let mut reader = Cursor::new(final_state_bytes);
     let legacy_tree = read_commitment_tree::<Node, _, NOTE_COMMITMENT_TREE_DEPTH>(&mut reader)
         .map_err(|_| CommitmentTreeFrontierValidationError::InvalidEncoding {
             reason: "finalState is not a valid legacy CommitmentTree encoding",
@@ -250,20 +269,12 @@ where
             reason: "validated frontier could not be canonically encoded",
         }
     })?;
-    if canonical_bytes.as_slice() != final_state_bytes.as_ref() {
+    if canonical_bytes.as_slice() != final_state_bytes {
         return Err(CommitmentTreeFrontierValidationError::InvalidEncoding {
             reason: "finalState is not the canonical Zebra RPC encoding",
         });
     }
-    let final_root = memoized_frontier_root(protocol, &final_state_bytes, || {
-        root_bytes_in_rpc_order(&frontier_root(&frontier))
-    });
-    Ok(CommitmentTreeFrontier {
-        protocol,
-        tree_size,
-        final_root,
-        final_state_bytes,
-    })
+    Ok((frontier, tree_size))
 }
 
 #[cfg(test)]
@@ -782,6 +793,30 @@ impl CommitmentTreeAccumulator {
         &self.completed_subtree_roots
     }
 
+    /// Encodes the active pool's Zebra `finalState` for a wallet read, or
+    /// returns `None` before the pool activates. Checks that the canonical
+    /// bytes decode to the accumulated frontier without deriving a root.
+    pub fn final_state_bytes(
+        &self,
+        protocol: ShieldedProtocol,
+    ) -> Result<Option<Box<[u8]>>, CommitmentTreeAccumulatorError> {
+        match protocol {
+            ShieldedProtocol::Sapling => self
+                .sapling
+                .as_ref()
+                .map(|pool| served_pool_bytes(protocol, pool)),
+            ShieldedProtocol::Orchard => self
+                .orchard
+                .as_ref()
+                .map(|pool| served_pool_bytes(protocol, pool)),
+            ShieldedProtocol::Ironwood => self
+                .ironwood
+                .as_ref()
+                .map(|pool| served_pool_bytes(protocol, pool)),
+        }
+        .transpose()
+    }
+
     /// Produces canonical, revalidated Zebra `finalState` checkpoints.
     ///
     /// Each pool's frontier is encoded with the official codec and validated
@@ -1231,11 +1266,10 @@ where
     })
 }
 
-fn snapshot_pool<Node>(
+fn encode_pool<Node>(
     protocol: ShieldedProtocol,
     pool: &PoolAccumulator<Node>,
-    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
-) -> Result<CommitmentTreeFrontier, CommitmentTreeAccumulatorError>
+) -> Result<Box<[u8]>, CommitmentTreeAccumulatorError>
 where
     Node: Clone + Hashable + HashSer,
 {
@@ -1248,10 +1282,46 @@ where
     let final_state_bytes = SNAPSHOT_ENCODING_OVERRIDE
         .take()
         .unwrap_or(final_state_bytes);
+    Ok(final_state_bytes.into_boxed_slice())
+}
+
+fn served_pool_bytes<Node>(
+    protocol: ShieldedProtocol,
+    pool: &PoolAccumulator<Node>,
+) -> Result<Box<[u8]>, CommitmentTreeAccumulatorError>
+where
+    Node: Clone + Hashable + HashSer + PartialEq,
+{
+    let bytes = encode_pool(protocol, pool)?;
+    let (decoded, tree_size) = decode_canonical_frontier(&bytes).map_err(|source| {
+        CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
+    })?;
+    if decoded != pool.frontier || tree_size != pool.tree_size {
+        return Err(
+            CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                protocol,
+                source: CommitmentTreeFrontierValidationError::InvalidEncoding {
+                    reason: "encoded frontier differs from the accumulated tree",
+                },
+            },
+        );
+    }
+    Ok(bytes)
+}
+
+fn snapshot_pool<Node>(
+    protocol: ShieldedProtocol,
+    pool: &PoolAccumulator<Node>,
+    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+) -> Result<CommitmentTreeFrontier, CommitmentTreeAccumulatorError>
+where
+    Node: Clone + Hashable + HashSer,
+{
+    let final_state_bytes = encode_pool(protocol, pool)?;
     let validation_failed = |source| {
         CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
     };
-    let snapshot = canonical_frontier(protocol, final_state_bytes.into(), root_bytes_in_rpc_order)
+    let snapshot = canonical_frontier(protocol, final_state_bytes, root_bytes_in_rpc_order)
         .map_err(validation_failed)?;
     // A root already derived from the in-memory frontier must agree with the
     // root of its canonical encoding.
@@ -1995,6 +2065,58 @@ mod tests {
             &block.orchard,
             &block.ironwood,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_frontier_bytes_round_trip_without_deriving_roots() -> TestResult {
+        let block = BlockCommitments {
+            sapling: vec![commitment(1), commitment(2), commitment(3)],
+            orchard: vec![commitment(4)],
+            ironwood: vec![],
+        };
+        let expected = NodeTrees::after(&block)?.checkpoint()?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            &pool_activations(1, 1, 1)?,
+        )?;
+        assert_eq!(
+            accumulator.final_state_bytes(ShieldedProtocol::Sapling)?,
+            None
+        );
+        append_block(&mut accumulator, &block)?;
+        forget_derived_roots();
+        let before = root_computations();
+        for protocol in [
+            ShieldedProtocol::Sapling,
+            ShieldedProtocol::Orchard,
+            ShieldedProtocol::Ironwood,
+        ] {
+            assert_eq!(
+                accumulator.final_state_bytes(protocol)?.as_deref(),
+                expected
+                    .get(protocol)
+                    .map(CommitmentTreeFrontier::final_state_bytes)
+            );
+        }
+        assert_eq!(root_computations(), before);
+
+        let wrong = NodeTrees::after(&BlockCommitments {
+            sapling: vec![commitment(9), commitment(2), commitment(3)],
+            ..BlockCommitments::default()
+        })?
+        .checkpoint()?;
+        encode_next_snapshot_as(wrong.sapling().ok_or("Sapling must be active")?);
+        assert!(matches!(
+            accumulator.final_state_bytes(ShieldedProtocol::Sapling),
+            Err(
+                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                    protocol: ShieldedProtocol::Sapling,
+                    ..
+                }
+            )
+        ));
         Ok(())
     }
 
