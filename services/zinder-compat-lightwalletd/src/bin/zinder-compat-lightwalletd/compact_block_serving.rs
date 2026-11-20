@@ -68,6 +68,20 @@ async fn tear_down_on_blocking_thread<T: Send + 'static>(
     Ok(())
 }
 
+async fn close_unpublished_generation<T: Send + 'static>(generation: Option<T>) {
+    let Some(generation) = generation else {
+        return;
+    };
+    if let Err(error) = tokio::task::spawn_blocking(move || drop(generation)).await {
+        tracing::error!(
+            target: "zinder::compat_lightwalletd",
+            event = "compact_serving_candidate_teardown_failed",
+            error = %error,
+            "unpublished compact-block generation teardown failed"
+        );
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ConvergenceFailure {
     #[error("writer status transport failed: {0}")]
@@ -451,6 +465,7 @@ impl CompactBlockPublisher {
         };
         let admitted = admit_generation(candidate).await;
         if shutdown.is_cancelled() {
+            close_unpublished_generation(admitted.ok()).await;
             return;
         }
         let Ok(reader) = admitted else {
@@ -688,7 +703,10 @@ async fn open_generation_awaiting_schedule(
     let mut waiting_logged = false;
     while !shutdown.is_cancelled() {
         match open_generation(config, generation).await {
-            _ if shutdown.is_cancelled() => break,
+            opened if shutdown.is_cancelled() => {
+                close_unpublished_generation(opened.ok()).await;
+                break;
+            }
             Ok(candidate) => return Ok(Some(candidate)),
             Err(CompactBlockServingError::Storage(
                 CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
@@ -748,10 +766,10 @@ async fn converge_candidate<'a>(
         shutdown,
     )
     .await;
-    match outcome {
+    let unpublished = match outcome {
         Ok(CanonicalFenceConvergence::Converged(attesting_status)) => {
             let candidate = probe.candidate.ok_or_else(candidate_unavailable)?;
-            Ok(Some((candidate, *attesting_status)))
+            return Ok(Some((candidate, *attesting_status)));
         }
         Ok(CanonicalFenceConvergence::Cancelled) => Ok(None),
         Ok(CanonicalFenceConvergence::Trailing(_))
@@ -762,7 +780,9 @@ async fn converge_candidate<'a>(
         Err(CanonicalFenceConvergenceError::Diverged(_)) => {
             Err(ConvergenceFailure::WriterFenceDiverged)
         }
-    }
+    };
+    close_unpublished_generation(probe.candidate).await;
+    unpublished
 }
 
 #[cfg(test)]
@@ -1911,10 +1931,56 @@ mod tests {
         assert_shutdown_interrupts_stalled_read(true).await
     }
 
+    #[test]
+    fn cancelled_convergence_waits_for_the_blocking_pool_to_close_its_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        one_blocking_thread_runtime()?.block_on(async {
+            let mut harness = publisher_with_stalled_writer_read(true).await?;
+            let shutdown = CancellationToken::new();
+            {
+                let mut refresh = std::pin::pin!(harness.publisher.refresh_once(&shutdown));
+                tokio::select! {
+                    () = harness.control.stalled_read.notified() => {}
+                    () = &mut refresh => return Err("refresh ended before the candidate's writer read".into()),
+                }
+                let held = BlockingGate::hold().await?;
+                shutdown.cancel();
+                assert!(
+                    poll_once(&mut refresh).is_pending(),
+                    "the refresh must wait for the held blocking thread to close its candidate"
+                );
+                held.release().await?;
+                refresh.await;
+            }
+            harness.stop().await
+        })
+    }
+
     #[tokio::test]
     async fn shutdown_interrupts_the_initial_writer_read() -> Result<(), Box<dyn std::error::Error>>
     {
         assert_shutdown_interrupts_stalled_read(false).await
+    }
+
+    async fn publisher_with_stalled_writer_read(
+        converge_candidate: bool,
+    ) -> Result<LongRangeHarness, Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(2);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
+        )
+        .await?;
+        harness.writer.append_live_block(&chain)?;
+        if converge_candidate {
+            harness
+                .control
+                .queue_writer_status(lifecycle_writer_status(harness.writer.canonical_primary()?));
+        }
+        harness.control.stall();
+        harness.publisher.config.convergence_timeout = Duration::from_mins(1);
+        Ok(harness)
     }
 
     #[expect(
@@ -1927,22 +1993,8 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let metrics = recorder.handle();
         let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
-            .extend_blocks(2);
-        let mut harness = LongRangeHarness::start(
-            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
-        )
-        .await?;
+        let harness = publisher_with_stalled_writer_read(converge_candidate).await?;
         let published = harness.slot.capture();
-        harness.writer.append_live_block(&chain)?;
-        if converge_candidate {
-            harness
-                .control
-                .queue_writer_status(lifecycle_writer_status(harness.writer.canonical_primary()?));
-        }
-        harness.control.stall();
-        harness.publisher.config.convergence_timeout = Duration::from_mins(1);
         let cancel = CancellationToken::new();
         let drained = CancellationToken::new();
         let publisher_task = harness.publisher.spawn(cancel.clone(), drained.clone());
@@ -5015,7 +5067,42 @@ mod tests {
 
 #[cfg(test)]
 mod teardown_tests {
-    use super::{CompactBlockServingError, tear_down_on_blocking_thread};
+    use super::{
+        CompactBlockServingError, close_unpublished_generation, tear_down_on_blocking_thread,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Notify, mpsc};
+
+    #[tokio::test]
+    async fn a_slow_candidate_close_leaves_the_async_worker_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct SlowClose {
+            started: Arc<Notify>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Drop for SlowClose {
+            fn drop(&mut self) {
+                self.started.notify_one();
+                let _ = self.release.blocking_recv();
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let (release, receiver) = mpsc::channel(1);
+        let closing = tokio::spawn(close_unpublished_generation(Some(SlowClose {
+            started: Arc::clone(&started),
+            release: receiver,
+        })));
+        started.notified().await;
+        assert!(
+            !closing.is_finished(),
+            "cleanup must wait for the close to finish"
+        );
+        release.send(()).await?;
+        closing.await?;
+        Ok(())
+    }
 
     /// Stands in for a publisher whose secondary panics while closing.
     struct PanicsWhenDropped;

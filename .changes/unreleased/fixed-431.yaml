@@ -1,5 +1,5 @@
 kind: fixed
-body: In compact-blocks mode, zinder-compat-lightwalletd stops waiting for writer status and catch-up retries when shutdown begins. An interrupted refresh keeps the published reader and records no refresh failure.
+body: On shutdown, zinder-compat-lightwalletd interrupts pending writer-status reads and catch-up retries in compact-blocks mode, keeping the published reader and skipping refresh-failure reporting. In-flight RocksDB work and closing secondaries can extend shutdown beyond the wallet-serving entrypoint's 20-second grace window.
 time: 2026-11-20T16:24:00.78994762Z
 custom:
     Bump: patch
