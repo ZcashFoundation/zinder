@@ -44,4 +44,4 @@ The lightwalletd `GetMempoolStream` contract also requires the stream to close w
 
 ## Revision history
 
-- 2026-11-20. Both mempool cursor expiration reasons direct wallet clients to take a fresh snapshot.
+- 2026-11-20. In native contract revision 11, both mempool cursor expiration reasons direct wallet clients to take a fresh snapshot.
