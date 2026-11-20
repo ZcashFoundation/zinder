@@ -1,4 +1,4 @@
-use std::{convert::Infallible, future::Future, net::SocketAddr, time::Duration};
+use std::{convert::Infallible, future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use tonic::{Status, body::Body, server::NamedService, transport::server::TcpIncoming};
@@ -22,16 +22,15 @@ pub(super) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), Lightw
     Ok((incoming, bound_addr))
 }
 
+type GrpcServer = Pin<Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>>;
+
 pub(super) fn serve<S>(
     runtime: &zinder_runtime::SupervisedRuntime,
     wallet_service: S,
     incoming: TcpIncoming,
     config: &LightwalletdConfig,
     readiness: &zinder_runtime::Readiness,
-) -> Result<
-    impl Future<Output = Result<(), tonic::transport::Error>> + use<S>,
-    tonic_reflection::server::Error,
->
+) -> Result<GrpcServer, tonic_reflection::server::Error>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
         + NamedService

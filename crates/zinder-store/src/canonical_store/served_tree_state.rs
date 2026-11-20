@@ -215,7 +215,7 @@ impl From<CommitmentTreeFrontier> for ServedFrontier {
 /// nodes as the official codec does. Node bytes are skipped without being
 /// decoded, so neither a node that is not a canonical field element nor a
 /// stored root that the nodes do not derive is detected here.
-fn framed_tree_size(
+pub(in crate::canonical_store) fn framed_tree_size(
     final_state_bytes: &[u8],
 ) -> Result<u32, CommitmentTreeFrontierValidationError> {
     let invalid = |reason| CommitmentTreeFrontierValidationError::InvalidEncoding { reason };

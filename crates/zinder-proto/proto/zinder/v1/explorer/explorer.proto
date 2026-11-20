@@ -2072,7 +2072,8 @@ service ExplorerQuery {
       returns (DisplacedBlockDetailResponse);
 
   // Returns rolling counts of mempool events from the durable per-second
-  // counter column family.
+  // counter column family. A window with no indexed counts fails with
+  // ARTIFACT_UNAVAILABLE.
   // Capability: `explorer.mempool.event_counts_v1`.
   rpc MempoolEventCounts(MempoolEventCountsRequest)
       returns (MempoolEventCountsResponse);
@@ -2892,24 +2893,12 @@ message DisplacedBlockDetailResponse {
   DisplacedBlockArchiveCoverage coverage = 5;
 }
 
-// Typed error returned when a materialized-view RPC cursor has expired.
-//
-// Per the explorer-plane cursor contract (see
-// `docs/architecture/explorer-plane.md`): cursors are valid for the
-// lifetime of the column-family snapshot at issue time. The server
-// rejects a cursor that references a height range no longer in the store
-// (reorged out, or rolled off retention) with this typed error attached
-// to the gRPC status's `details`. Consumers re-issue from the start of
-// the range or jump to `recommended_resume_height`.
+// Reserved for cursor expiry. ExplorerQuery does not currently emit this detail.
 message CursorExpiredError {
-  // Recommended restart height for a fresh
-  // cursor. Set to the canonical tip when the consumer should restart at
-  // the head of the materialized view; set to the lowest still-indexed height
-  // when the consumer should restart earlier.
+  // Recommended restart height for a fresh cursor.
   uint32 recommended_resume_height = 1;
 
-  // Short reason hint a UI can render verbatim. The canonical sentences
-  // live in `crates/zinder-core/src/explorer_reasons.rs`.
+  // Short reason a UI can display.
   string hint = 2;
 }
 
@@ -2946,7 +2935,7 @@ message OverviewSnapshotRequest {
 //
 // All present sub-fields are read against the snapshot identified by
 // `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Optional
-// fields whose wallet capability is structurally unavailable are identified in
+// fields without an index or a supported wallet capability are identified in
 // `freshness.unavailable`. The handler reads the wallet tip once and every
 // materialized-view field once, in one pass, then assembles the single
 // freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
@@ -2969,7 +2958,8 @@ message OverviewSnapshotResponse {
   OverviewMempool mempool = 3;
 
   // Rolling counts of mempool events over a sliding window ending at the
-  // bundle's observation instant.
+  // bundle's observation instant. Absent when the window has no indexed counts. In that
+  // case, `freshness.unavailable` lists `mempool_events`.
   OverviewMempoolEvents mempool_events = 4;
 
   // Fee summary over the last `fee_summary_block_count` blocks ending at

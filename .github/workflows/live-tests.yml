@@ -34,6 +34,7 @@ on:
       - "deploy/zakura/**"
       - "deploy/zebra/**"
       - "scripts/mine-live-regtest.sh"
+      - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"

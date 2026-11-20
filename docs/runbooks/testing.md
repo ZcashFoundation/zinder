@@ -128,13 +128,15 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
+  --file crates/zinder-store/src/canonical_store/block_load/codec.rs \
+  --file crates/zinder-store/src/canonical_store/reader.rs \
   --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_replay.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_densification.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
   --file services/zinder-ingest/src/artifact_builder.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|read_stored_final_note_commitment_roots_in_range|decode_stored_tree_state_roots|decode_checked_stored_roots|resolve_stored_roots_headers|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
 ```
 
 ## Run one test or one tier
@@ -463,6 +465,122 @@ stops the proxy, and checks that a broadcast moves to the fallback with cause
 
 The Zingolib flow cannot run on this chain. Zingolib 5.0.0 supports upgrades
 only through NU6.2, and the test refuses a tip at or past NU6.3.
+
+### Light-wallet serving qualification
+
+Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
+The qualification build serves wallet RPCs with one canonical store and ingest
+control. It uses the node for transparent balances, UTXOs, address history,
+transaction submission, and the recommended fee. Each forwarded request checks
+that the node holds the served tip on its best chain. If the canonical fence or
+schedule revision changes during verification, the request returns `UNAVAILABLE`.
+Requests share evidence of broadcast support and agreement with the writer's
+schedule through the next block for up to one minute. A failed tip check, a
+new schedule revision, or a change to the upgrade active at the next block
+requires fresh discovery. If discovery fails, concurrent callers waiting for it
+return the refusal or a retryable error. The next request can retry immediately.
+The node can advance while answering. Compare forwarded
+answers with wallet serving while the node stays at the same hash and height.
+
+The node orders UTXOs within a block by position. Qualification needs every
+matching output in the last block of a wallet's request to sort them by wallet
+transaction ID. A request can match more than 100,000 outputs across multiple
+blocks. Qualification uses bounded prefixes to finish the last requested
+height. A tip change between successful reads returns `UNAVAILABLE`.
+
+In the synthetic cutoff fixture, one height supplies 100,000 outputs and a
+later height supplies one more. The node has no ending-height filter, so
+qualification returns `RESOURCE_EXHAUSTED` when it cannot establish wallet
+order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
+32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
+
+Each qualification instance admits one nonempty UTXO request and one
+address-history request at a time. `GetTaddressTxids` and
+`GetTaddressTransactions` share the history slot. Each request holds its slot
+while it reads from the node and while the client drains the stream. A request
+for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
+
+Build the two qualification binaries:
+
+```bash
+cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd \
+  --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
+```
+
+In a shell with the Regtest node authentication from the preceding section,
+start ingest with a fresh store. The example uses the default ingest-control
+listener on port 9100. Set the same storage policy on both processes.
+
+```bash
+unset ZINDER_NETWORK
+export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
+export ZINDER_STORAGE__RAW_BLOB_POLICY=none
+mkdir -p .tmp
+ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving \
+  target/debug/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/qualification-canonical >.tmp/qualification-ingest.log 2>&1 &
+```
+
+Once ingest reaches the mined tip and its `/readyz` on port 9105 returns 200,
+start compatibility from the same shell:
+
+```bash
+target/debug/zinder-compat-lightwalletd --network zcash-regtest \
+  --serving light-wallet-qualification --listen-addr 127.0.0.1:9089 \
+  --canonical-primary-path .tmp/qualification-canonical \
+  --canonical-secondary-root .tmp/qualification-secondary
+```
+
+The canonical reader serves compact blocks, nullifiers, tree states, and subtree
+roots. A subtree-root stream returns roots completed by its starting tip.
+It can continue across an append and returns `UNAVAILABLE` if a later page
+finds that tip has left the best chain. A writer halt observed by ingest control
+closes admission until the publisher verifies the recovered writer's fence.
+
+Both mempool methods use ingest control. If an address-history lookup
+exceeds a row or byte limit, qualification splits it into disjoint height ranges.
+Before looking up transaction IDs, the stream records the hash at the end of
+the requested range. Each page is read in order. For each transaction, one
+verbose node call obtains its bytes and mined height, then a block-hash
+lookup checks the range before the wallet receives the row. The stream also
+checks the hash for empty pages and before reporting completion. A replacement
+returns `UNAVAILABLE`, and cancelling the stream stops further calls. If one
+height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
+With `none`, `GetTransaction` fetches the bytes from
+the node. To exercise local mined-transaction reads, repeat with fresh store
+paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
+projector or wallet store. The feature is for qualification only. Release
+builds accept `wallet` and `compact-blocks`.
+
+Use `GetAddressUtxosStream` when a wallet may receive a large set. The
+generated Rust client's default unary decoding limit is 4 MiB. The
+100,000-output transport fixture produces a 10,748,600-byte unary response.
+The default client streams all rows, and a client configured with a 16 MiB
+decoding limit also receives the complete unary response.
+
+The parity workflow compares this build with ordinary wallet serving on
+both pinned nodes. To repeat it, use the workflow's disposable height-150 chain
+and its wallet-serving process on port 9087. The harness calls
+`getblockchaininfo` without credentials at the host's loopback endpoint and at
+`127.0.0.1:39232` inside the node container. Both compatibility processes use
+`ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0` because the fixture has historical
+block timestamps and the outage removes the node witness for its tip.
+Copy the qualification binaries
+before running the default-feature test client. With the Regtest node
+authentication exported, run the following in place of the two manual processes
+above. The harness creates fresh stores for both policies. It submits one
+signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and
+`GetMempoolStream` on the ordinary wallet endpoint and both qualification
+instances. It stops the named node for the outage checks and restarts it on exit.
+Use `zakura-regtest` for the Zakura lane.
+
+```bash
+mkdir -p .tmp/qualification-bin
+cp target/debug/{zinder-ingest,zinder-compat-lightwalletd} .tmp/qualification-bin/
+ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  scripts/test-light-wallet-qualification.sh .tmp/qualification-bin \
+  zebra-regtest http://127.0.0.1:9087
+```
 
 ### Testnet
 

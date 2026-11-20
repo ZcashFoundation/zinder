@@ -122,7 +122,7 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
     Ok(())
 }
 
-async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {
+pub(super) async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
     let ops_address = reservation.local_addr()?;
     drop(reservation);

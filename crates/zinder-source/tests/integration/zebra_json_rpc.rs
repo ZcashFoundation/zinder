@@ -48,6 +48,60 @@ fn testnet_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, Sour
 }
 
 #[tokio::test]
+async fn mined_transaction_bytes_require_a_matching_id_and_best_chain_location() -> eyre::Result<()>
+{
+    let id = TransactionId::from_bytes([0x12; 32]);
+    let txid = zinder_core::wire::encode_rpc_transaction_id_hex(id);
+    let hash = "ab".repeat(32);
+    let good = json!({"txid": txid, "height": 5, "blockhash": hash, "hex": "0102"});
+    let replies = [
+        RpcReply::result(good.clone()),
+        RpcReply::result(json!({"txid": txid,"hex":"0102"})),
+        RpcReply::result(json!({"txid": txid,"height":-1,"blockhash":hash,"hex":"0102"})),
+        RpcReply::error_with_code(-5, "transaction not found"),
+    ];
+    let malformed = [
+        ("txid", json!("ab".repeat(32))),
+        ("height", json!(u64::from(u32::MAX) + 1)),
+        ("blockhash", Value::Null),
+        ("hex", json!("zz")),
+        ("hex", json!("")),
+    ];
+    let server = JsonRpcTestServer::start(
+        replies
+            .into_iter()
+            .chain(malformed.map(|(key, field)| {
+                let mut reply = good.clone();
+                reply[key] = field;
+                RpcReply::result(reply)
+            }))
+            .map(|reply| method("getrawtransaction").reply(reply)),
+    )?;
+    let source = regtest_source(&server)?;
+    assert_eq!(
+        source.fetch_mined_transaction_bytes(id).await?,
+        Some((
+            BlockId::new(BlockHeight::new(5), decode_rpc_block_hash(&hash)?),
+            vec![1, 2]
+        ))
+    );
+    for _ in 0..3 {
+        assert!(source.fetch_mined_transaction_bytes(id).await?.is_none());
+    }
+    for _ in 0..5 {
+        assert!(matches!(
+            source.fetch_mined_transaction_bytes(id).await,
+            Err(SourceError::SourceProtocolMismatch { .. }
+                | SourceError::InvalidRawTransactionHex { .. })
+        ));
+    }
+    let calls = server.requests_for("getrawtransaction")?;
+    assert_eq!(calls.len(), 9);
+    assert!(calls.iter().all(|call| call.params == json!([txid, 1])));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
     // `fetch_block_at` keys the required RPCs on the requested height
     // directly; no separate `getblockhash` or redundant `getblockheader`

@@ -4946,6 +4946,16 @@ fn fixture_subtree_root_hash(index: u32) -> SubtreeRootHash {
 fn store_with_sapling_subtree_roots(
     sapling_root_count: u32,
 ) -> eyre::Result<(AcceptanceStore, BlockHeight)> {
+    let (writer, chain) = writer_with_sapling_subtree_roots(sapling_root_count)?;
+    let completing_height = chain
+        .tip_height()
+        .ok_or_else(|| eyre!("missing completing block"))?;
+    Ok((acceptance_store_from_writer(writer)?, completing_height))
+}
+
+pub(super) fn writer_with_sapling_subtree_roots(
+    sapling_root_count: u32,
+) -> eyre::Result<(CanonicalWriterFixture, ChainFixture)> {
     let activations = sample_regtest_upgrade_activations();
     let completing_height = activations
         .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
@@ -4990,9 +5000,10 @@ fn store_with_sapling_subtree_roots(
             });
         }
     }
-    let store =
-        acceptance_store_from_writer(CanonicalWriterFixture::publish(&baseline, &activations)?)?;
-    Ok((store, completing_height))
+    Ok((
+        CanonicalWriterFixture::publish(&baseline, &activations)?,
+        chain,
+    ))
 }
 
 fn sapling_subtree_roots_request(

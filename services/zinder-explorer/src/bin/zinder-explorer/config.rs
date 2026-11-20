@@ -11,6 +11,7 @@ use zinder_runtime::{
     SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
     guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
     require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
+    section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 
@@ -87,13 +88,8 @@ pub(crate) fn load_explorer_config(
     overrides: ExplorerConfigOverrides,
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let raw: ExplorerRawConfig = ConfigLoader::new()
-        // Storage defaults match the canonical Zinder layout. The explorer
-        // locates the materialized-view primary beneath `storage.path` and
-        // keeps its process-owned secondary metadata beneath
-        // `storage.secondary_path`; it does not open the canonical primary.
-        // Operators override via env vars (`ZINDER_STORAGE__PATH`,
-        // `ZINDER_STORAGE__SECONDARY_PATH`) or CLI flags.
-        .with_default("storage.path", "/var/lib/zinder/store")?
+        // Explorer locates its materialized-view primary beneath the canonical root.
+        .with_default("storage.path", DEFAULT_CANONICAL_PATH)?
         .with_default(
             "storage.secondary_path",
             "/var/lib/zinder/explorer-secondary",

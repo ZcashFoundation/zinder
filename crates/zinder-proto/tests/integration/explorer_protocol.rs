@@ -16,6 +16,23 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::{explorer, wallet};
 
 #[test]
+fn missing_overview_counts_round_trip_with_an_unavailable_field() -> eyre::Result<()> {
+    let missing = explorer::OverviewSnapshotResponse {
+        freshness: Some(explorer::ExplorerFreshness {
+            unavailable: vec![explorer::UnavailableField {
+                field_path: zinder_proto::wire::OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH.to_owned(),
+                reason: explorer::UnavailableReason::UnavailableNotIndexed.into(),
+                human_reason: String::new(),
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(round_trip(&missing)?, missing);
+    Ok(())
+}
+
+#[test]
 fn upstream_tip_round_trips_through_prost() -> eyre::Result<()> {
     let upstream_tip = wallet::UpstreamTip {
         committed_height: Some(2_530_000),

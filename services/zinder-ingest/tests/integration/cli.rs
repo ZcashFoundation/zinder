@@ -823,6 +823,7 @@ fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result
     Ok(())
 }
 
+#[cfg(not(feature = "light-wallet-qualification"))]
 #[test]
 fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
@@ -839,6 +840,30 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
         &[],
         "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"",
     )
+}
+
+#[cfg(feature = "light-wallet-qualification")]
+#[test]
+fn qualification_accepts_wallet_coverage_without_transaction_blobs() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
+        "[storage]\n",
+        "[storage]\nraw_blob_policy = \"none\"\n",
+        1,
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
+
+    Ok(())
 }
 
 #[test]
@@ -1146,14 +1171,9 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<dyn Error>> {
-    // The binary's default for `storage.path` matches the canonical Zinder
-    // layout under `/var/lib/zinder/store`. Operators on non-PaaS hosts
-    // override via `ZINDER_STORAGE__PATH` or the `--storage-path` flag.
-    // This test guards the default's stability so the env-only deployment
-    // shape (single-container Docker image) keeps working without a TOML
-    // file or a `--config` argument.
+fn storage_path_env_override_keeps_the_legacy_store() -> Result<(), Box<dyn Error>> {
     let output = zinder_ingest_command()
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/store")
         .args([
             "--print-config",
             "--network",
@@ -1170,11 +1190,10 @@ fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<
         "print-config failed: stderr=\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(
-        stdout.contains("path = \"/var/lib/zinder/store\"")
-            || stdout.contains("path = '/var/lib/zinder/store'"),
-        "stdout does not carry the canonical storage.path default:\n{stdout}"
+    let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    assert_eq!(
+        config["storage"]["path"].as_str(),
+        Some("/var/lib/zinder/store")
     );
 
     Ok(())
