@@ -2048,6 +2048,14 @@ impl ChainEventStreamProgression {
                     "settlement must preserve or advance the previous settled tip",
                 ));
             }
+            if let ChainEvent::ChainReorged { reverted, .. } = &envelope.event
+                && reverted.block_range.start <= previous.settled_tip_height
+            {
+                return Err(IndexerError::malformed(
+                    "chain_reorged.reverted.block_range.start",
+                    "reorg would replace a previously reported settled block",
+                ));
+            }
         }
         self.events
             .validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
@@ -2890,11 +2898,21 @@ mod tests {
     }
 
     fn committed_event_message(sequence: u64, cursor: Vec<u8>) -> wallet::ChainEventEnvelope {
-        let epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+        committed_event_at_epoch(synthetic_chain_epoch(EXPECTED_NETWORK), sequence, cursor)
+    }
+
+    fn committed_event_at_epoch(
+        epoch: wallet::ChainEpoch,
+        sequence: u64,
+        cursor: Vec<u8>,
+    ) -> wallet::ChainEventEnvelope {
         wallet::ChainEventEnvelope {
             cursor,
             event_sequence: sequence,
-            chain_view: Some(synthetic_chain_view(EXPECTED_NETWORK)),
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(epoch.clone()),
+                ..Default::default()
+            }),
             event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
                 wallet::ChainCommitted {
                     committed: Some(wallet::ChainEpochCommitted {
@@ -3404,6 +3422,67 @@ mod tests {
         first.chain_epoch.settled_tip_height = BlockHeight::new(41);
         first.chain_epoch.settled_tip_hash = BlockHash::from_bytes([0x33; 32]);
         state.validate(&first)
+    }
+
+    #[test]
+    fn reorg_cannot_undo_settlement_reported_by_a_previous_event() -> Result<(), IndexerError> {
+        let mut previous_epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+        previous_epoch.chain_epoch_id = 5;
+        let previous = chain_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            committed_event_at_epoch(previous_epoch, 5, vec![5]),
+        )?;
+        let mut progression = ChainEventStreamProgression::new();
+        progression.validate(&previous)?;
+
+        let mut reorg = chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
+        let ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } = &mut reorg.event
+        else {
+            return Err(IndexerError::malformed("event", "expected a reorg"));
+        };
+        reverted.chain_epoch.settled_tip_height = BlockHeight::new(39);
+        reverted.block_range.start = BlockHeight::new(40);
+        committed.block_range.start = reverted.block_range.start;
+        committed.chain_epoch.settled_tip_height = BlockHeight::new(41);
+        reorg.chain_epoch = committed.chain_epoch;
+        reorg.settled_tip_height = committed.chain_epoch.settled_tip_height;
+        validate_reorg_relationship(reverted, committed)?;
+        assert!(matches!(
+            progression.validate(&reorg),
+            Err(IndexerError::MalformedResponse {
+                field: "chain_reorged.reverted.block_range.start",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_recovery_followed_by_an_older_retained_epoch_is_refused() -> Result<(), IndexerError>
+    {
+        ensure_supported_contract_revision(9)?;
+        let mut recovery =
+            chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
+        recovery.event_sequence = 2;
+        let mut retained_epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+        retained_epoch.chain_epoch_id = 3;
+        let tail = chain_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            committed_event_at_epoch(retained_epoch, 3, vec![3]),
+        )?;
+        let mut progression = ChainEventStreamProgression::new();
+        progression.validate(&recovery)?;
+        assert!(matches!(
+            progression.validate(&tail),
+            Err(IndexerError::MalformedResponse {
+                field: "chain_view.chain_epoch.chain_epoch_id",
+                ..
+            })
+        ));
+        Ok(())
     }
 
     #[test]
