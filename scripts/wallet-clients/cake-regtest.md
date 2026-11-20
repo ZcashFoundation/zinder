@@ -17,7 +17,7 @@ cargo +1.100.0 build --locked --jobs 2 \
   --features graphql,bundled-sapling-params,ledger
 ```
 
-Start a disposable Regtest fixture with all upgrades through NU6.2 at height 1, NU6.3 at 250, NU7 disabled, and a tip above 250. The command below reads the endpoint and mining RPC from its readiness receipt. The fixture advances the chain by 104 blocks. Give each run exclusive control of mining.
+Start a disposable Regtest fixture with all upgrades through NU6.2 at height 1, NU6.3 at 250, NU7 disabled, and a tip above 250. The adapter checks the node's block hash at the height in the immutable fixture receipt before creating or funding accounts. The fixture advances the chain by 104 blocks. Give each run exclusive control of mining.
 
 ```bash
 fixture=/absolute/path/to/ready.initial.json
@@ -25,7 +25,7 @@ python3 -O scripts/wallet-clients/cake-regtest.py \
   --engine "$case_dir/engine/target/debug/zkool_graphql" \
   --trace scripts/trace-wallet-endpoint.py \
   --fixture "$fixture" \
-  --endpoint "$(jq -r '.client_endpoint // .lightwalletd' "$fixture")" \
+  --endpoint "$(jq -r .lightwalletd "$fixture")" \
   --node "$(jq -r .node_rpc "$fixture")" \
   --run "$case_dir/run"
 ```
@@ -49,3 +49,7 @@ python3 scripts/run-wallet-lifecycle.py \
 ```
 
 The shared gate executes a fresh funded run. Its `summary.json` records the restore, transaction linkage, endpoint tracing, restart, and subsequent block progress. [Shared test harness](../../docs/runbooks/testing.md)
+
+To test a candidate service on the same node, keep the release fixture as
+`--fixture` and add `--candidate "$candidate_receipt"` to the generator.
+For a direct adapter run, also set `--endpoint` to the candidate's `client_endpoint`.

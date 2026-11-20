@@ -6,7 +6,6 @@ import re
 import json
 import os
 from pathlib import Path
-import signal
 import sys
 import subprocess
 import time
@@ -68,11 +67,7 @@ def main():
         trace_dir = logdir / f'trace-{time.time_ns()}'
         if online:
             full_command = [sys.executable, a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace_dir), '--', *full_command]
-        process = subprocess.Popen(full_command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=90)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+        with subprocess.Popen(full_command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
             stdout, stderr = process.communicate()
         run = subprocess.CompletedProcess(full_command, process.returncode, stdout, stderr)
         if command != ['recovery_info']:

@@ -17,8 +17,7 @@ from decimal import Decimal
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, utils
+from wallet_fixture import binding
 
 
 STEPS = ("bootstrap", "restore", "transparent-discovery", "shielded-discovery",
@@ -77,6 +76,9 @@ def until(fn, timeout=50):
 
 
 def credentials(folder):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+
     key = ec.generate_private_key(ec.SECP256R1())
     (folder / "jwt.pub").write_bytes(key.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
@@ -180,10 +182,8 @@ def run_suite(args):
     rpc = args.node
     loopback(rpc)
     loopback(args.endpoint)
-    ready = json.loads(args.fixture.read_text())
-    require(ready["network"] == "zcash-regtest" and ready["node_rpc"] == rpc
-            and args.endpoint in (ready.get("client_endpoint"), ready.get("lightwalletd")),
-            "fixture does not identify these disposable endpoints")
+    _, _, height, block_hash = binding(args.fixture, args.candidate, args.endpoint, rpc)
+    require(node(rpc, "getblockhash", height) == block_hash, "fixture block hash mismatch")
     info = node(rpc, "getblockchaininfo")
     upgrades = {v["name"]: v["activationheight"] for v in info["upgrades"].values()}
     require(info["chain"] in ("test", "regtest") and upgrades.get("NU6.3") == 250
@@ -293,6 +293,7 @@ def main():
     p.add_argument("--engine", type=Path, required=True, help="pinned zkool_graphql executable")
     p.add_argument("--trace", type=Path, required=True, help="Zinder trace-wallet-endpoint.py")
     p.add_argument("--fixture", type=Path, required=True, help="disposable stack readiness receipt")
+    p.add_argument("--candidate", type=Path, help="candidate service receipt for the same fixture")
     p.add_argument("--endpoint", required=True)
     p.add_argument("--node", required=True)
     dirs = p.add_mutually_exclusive_group(required=True)

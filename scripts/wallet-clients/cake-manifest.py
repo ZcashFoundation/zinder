@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import shutil
 import sys
+from wallet_fixture import binding
 
 
 ENGINE_LOCK_SHA256 = "e58b4de00913ddcb33e0d4af56936872140cafa4e97407babffddb379de0a9a2"
@@ -21,6 +22,7 @@ def main():
     parser.add_argument("--engine-lock", required=True, type=Path)
     parser.add_argument("--released-pubspec", required=True, type=Path, help="Cake v6.5.4 cw_zcash/pubspec.yaml")
     parser.add_argument("--fixture", required=True, type=Path, help="disposable Regtest readiness receipt")
+    parser.add_argument("--candidate", type=Path, help="candidate service receipt for the same fixture")
     parser.add_argument("--source-input", action="append", default=[], type=Path, help="additional build or source receipt to pin")
     parser.add_argument("--trace", type=Path, default=scripts / "trace-wallet-endpoint.py")
     parser.add_argument("--runner", type=Path, default=scripts / "run-wallet-lifecycle.py")
@@ -41,25 +43,23 @@ def main():
             parser.error("the wallet engine and strace must both be executable")
         paths = [client, python, trace, runner, Path(gate["benchmark"].__file__), adapter,
                  args.engine_lock, args.released_pubspec,
-                 fixture, Path(strace), Path(__file__), *args.source_input]
+                 fixture, Path(strace), Path(__file__), adapter.with_name("wallet_fixture.py"), *args.source_input]
+        if args.candidate:
+            paths.append(args.candidate)
         inputs = {str(p.resolve(strict=True)): sha256(p) for p in paths}
         for file, expected in ((args.engine_lock, ENGINE_LOCK_SHA256),
                                (args.released_pubspec, RELEASED_PUBSPEC_SHA256),
                                (client, args.engine_sha256)):
             if expected is not None and inputs[str(file.resolve())] != expected:
                 parser.error(f"unexpected digest for {file}")
-        ready = json.loads(fixture.read_text())
-        if ready["network"] != "zcash-regtest":
-            parser.error("the fixture must identify disposable Regtest")
-        endpoint = ready.get("client_endpoint") or ready["lightwalletd"]
-        loopback = runpy.run_path(str(adapter))["loopback"]
-        loopback(endpoint)
-        loopback(ready["node_rpc"])
+        endpoint, node, _, _ = binding(fixture, args.candidate)
 
         def command(step):
             argv = [str(python), "-O", str(adapter), "--step", step, "--scratch", "{scratch}",
-                    "--report", "{report}", "--endpoint", "{endpoint}", "--node", ready["node_rpc"],
+                    "--report", "{report}", "--endpoint", "{endpoint}", "--node", node,
                     "--engine", str(client), "--trace", str(trace), "--fixture", str(fixture)]
+            if args.candidate:
+                argv.extend(["--candidate", str(args.candidate.resolve())])
             assertion = "suite_ran" if step == "prepare" else step
             return {"command": argv, "expect": {"/assertions/" + assertion: True}}
 

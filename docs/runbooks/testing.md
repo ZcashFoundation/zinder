@@ -1229,7 +1229,10 @@ same retention policy before starting the wallet.
 To run the pinned zcash-devtool case, start the all-at-one Regtest fixture and
 set `fixture_ready` to its `ready.initial.json`. From the Zinder checkout, build
 the wallet in a private directory and pass its lockfile and binary digest to
-the runner. The runner creates fresh wallet and evidence directories.
+the runner. Each step checks the node's block hash at the recorded fixture
+height. To exercise a candidate service on the same node, keep the release
+fixture as `--ready` and pass its service receipt with `--candidate`.
+The runner creates fresh wallet and evidence directories.
 
 ```bash
 case_dir=$(mktemp -d)

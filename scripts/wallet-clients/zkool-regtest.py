@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import signal
 import sys
 import sqlite3
 import subprocess
@@ -57,11 +56,7 @@ def main():
         if online:
             command = [sys.executable, a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace), '--', *command]
         env = dict(os.environ, ZINDER_ZKOOL_USE_INTERNAL='true' if a.variant == 'internal-enabled' else 'false')
-        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=180)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
             stdout, stderr = process.communicate()
         (logs / f'{op}-{time.time_ns()}.json').write_text(json.dumps({'operation': op, 'pid': process.pid, 'exit': process.returncode, 'stdout': stdout, 'stderr': stderr}))
         if not process.returncode == 0:

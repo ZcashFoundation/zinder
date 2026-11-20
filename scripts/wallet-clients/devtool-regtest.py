@@ -13,6 +13,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
+from wallet_fixture import binding
 
 STEPS = ("bootstrap", "restore", "transparent-discovery", "shielded-discovery",
          "send", "pending", "mined", "scanned", "restart", "resume")
@@ -116,6 +117,9 @@ class Wallet:
         return result["result"]
 
     def verify_chain(self):
+        _, _, height, block_hash = binding(self.args.ready, self.args.candidate,
+                                           self.args.endpoint, self.args.node)
+        require(self.rpc("getblockhash", [height]) == block_hash, "fixture block hash mismatch")
         require(self.rpc("getblockhash", [0]) == REGTEST_GENESIS, "expected a Zebra Regtest chain")
         info = self.rpc("getblockchaininfo")
         upgrades = {v["name"].lower().replace(".", "_"): v["activationheight"]
@@ -280,6 +284,8 @@ def main():
     parser.add_argument("--trace-tool", required=True, type=Path)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--node", required=True)
+    parser.add_argument("--ready", required=True, type=Path, help="immutable Regtest fixture receipt")
+    parser.add_argument("--candidate", type=Path, help="candidate service receipt for the same fixture")
     parser.add_argument("--scratch", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path, help="new private directory per campaign")
     parser.add_argument("--report", required=True, type=Path)

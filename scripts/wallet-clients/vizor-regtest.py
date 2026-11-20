@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -31,6 +32,18 @@ def loopback(url):
     parts = urlsplit(url)
     require(url == f"http://127.0.0.1:{parts.port}" and parts.port, "local endpoint required")
     return parts.port
+
+
+def serving_at_tip(opener, ops, tip):
+    try:
+        with opener.open(ops + "/readyz", timeout=5) as response:
+            served = json.load(response)
+    except HTTPError as error:
+        if error.code != 503:
+            raise
+        error.close()
+        return False
+    return served.get("status") == "ready" and served.get("current_height") == tip
 
 
 def run(args):
@@ -94,9 +107,7 @@ def run(args):
         # A burst of new coinbases can put the served pair one refresh interval behind Zebra.
         deadline = time.monotonic() + 150
         while time.monotonic() < deadline:
-            with opener.open(ops + "/readyz", timeout=5) as response:
-                served = json.load(response)
-            if served.get("current_height") != tip or served.get("status") != "ready":
+            if not serving_at_tip(opener, ops, tip):
                 time.sleep(1)
                 continue
             response = wallet(command)

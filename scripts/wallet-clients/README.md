@@ -80,6 +80,10 @@ For Zingo, use `--wallet zingo`, omit `--variant`, and supply the CLI binary and
 
 ## Read the receipts
 
+The lifecycle runner owns each wallet step's process group and enforces its
+600-second deadline. On timeout or interruption it stops the adapter, tracer,
+and wallet together before removing scratch state.
+
 Each step uses explicit checks that remain enforced under optimized Python. The adapters additionally refuse optimized startup, so a misconfigured invocation cannot silently discard a check. The `send`, `pending`, `mined`, and `scanned` records fingerprint the same canonical display transaction ID and match the canonical inclusion height to the wallet record. Restore compares independent database identities, public wallet identities, and known preexisting transaction activity. Zingo passes its generated recovery phrase through the restore process environment and excludes the recovery command's output from retained logs. Zkool passes its public Regtest vector as a driver argument.
 
 Publisher retention can delay an accelerated Regtest chain. `wait-serving-fence.py` polls the actual serving endpoint for its tip, block, block range, and tree state, with a 180-second deadline. A block and range may differ in transparent fields because their default filters differ; the probe compares their canonical height and hash. Publication delay is retained separately from client execution.
