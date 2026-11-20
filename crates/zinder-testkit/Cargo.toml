@@ -26,10 +26,12 @@ secp256k1 = { workspace = true, default-features = false, features = ["alloc"] }
 sapling.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
+tonic-health.workspace = true
+tonic-reflection.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zcash_address = { workspace = true, features = ["std"] }

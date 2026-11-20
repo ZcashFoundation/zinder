@@ -19,6 +19,9 @@
 //!   so a parent test can reopen the store and assert crash recovery.
 //! - [`TransparentTestKey`] signs transparent and shielding spends of a fixed
 //!   test seed's outputs, and [`OrchardTestKey`] receives their shielded notes.
+//! - [`PublicListenerProbe`] checks a public wallet listener's gRPC health
+//!   against its runtime's `/readyz` and lists the services reflection
+//!   describes.
 //! - [`MockTransactionBroadcaster`] implements
 //!   [`zinder_source::TransactionBroadcaster`] with configurable per-call
 //!   outcomes and a recording mode that captures calls for later inspection.
@@ -56,6 +59,7 @@ pub mod note_commitment_chain;
 pub mod ops_healthcheck;
 pub mod orchard_test_key;
 pub mod process_crash;
+pub mod public_listener_probe;
 pub mod release_image_config;
 pub mod repeated_request_fields;
 pub mod runtime_allocator;
@@ -93,6 +97,9 @@ pub use network_upgrade_fixtures::{
 pub use note_commitment_chain::{commitment_tree_checkpoints, with_note_commitments};
 pub use ops_healthcheck::{OpsEndpointStub, check_binary_healthcheck};
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
+pub use public_listener_probe::{
+    PROBE_WAIT_LIMIT, PublicListenerProbe, next_watch_status, watch_ends,
+};
 pub use release_image_config::check_release_image_config;
 pub use repeated_request_fields::{RepeatedRequestField, repeated_request_fields};
 pub use runtime_allocator::check_binary_allocates_through_jemalloc;

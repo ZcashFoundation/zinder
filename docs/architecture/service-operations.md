@@ -60,6 +60,13 @@ accepting new requests. It then cancels background tasks, waits for its
 servers and owned tasks, and closes its operational endpoint. Only the owner
 of a store closes it, and readers make no final writes.
 
+`zinder-query` and `zinder-compat-lightwalletd` publish `shutting_down`
+before their gRPC listener starts to drain, so `/readyz` and their
+[gRPC health service](../reference/readiness.md#grpc-health) report
+`NOT_SERVING` together, and gRPC load balancers and Kubernetes `grpc` probes
+stop routing to them while the drain runs. Open health `Watch` streams then
+end, so they do not hold the drain open.
+
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
 streams never end on their own. `zinder-query` and

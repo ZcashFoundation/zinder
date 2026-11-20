@@ -54,6 +54,8 @@ grpcurl -plaintext -d '{"start_height": 1, "end_height": 10}' 127.0.0.1:9102 \
   zinder.v1.wallet.WalletQuery/CompactBlocksInRange
 ```
 
+It also serves `grpc.health.v1.Health`, which agrees with `/readyz`; see [gRPC health](readiness.md#grpc-health).
+
 To generate a client, vendor the `.proto` files from `crates/zinder-proto/proto/` and keep the `zinder/v1/...` layout. The files import nothing outside this set.
 
 | If you call | Vendor |

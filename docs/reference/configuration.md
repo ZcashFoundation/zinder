@@ -327,6 +327,7 @@ transport policy.
 | Time a client stream may go without sending a whole message | 20 s | `DEADLINE_EXCEEDED` |
 | Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` |
 | HTTP/2 keepalive | Ping after 60 s without a frame; close if unanswered for 20 s | Connection closed |
+| Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query` and `zinder-compat-lightwalletd`) | 1,024 | `RESOURCE_EXHAUSTED` |
 
 A unary or server-streaming call holds its receive slot only until its request
 has arrived. Long response streams such as `ChainEvents`,

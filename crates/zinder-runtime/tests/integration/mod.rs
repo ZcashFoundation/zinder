@@ -4,5 +4,6 @@ mod env_var_docs;
 mod http_listener;
 mod ops_endpoint;
 mod ops_healthcheck;
+mod public_grpc_health;
 mod public_grpc_server;
 mod startup_phase;

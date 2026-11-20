@@ -21,6 +21,9 @@ The operational endpoint serves without authentication. Keep it private, as
 [Service operations](../architecture/service-operations.md#security-boundary)
 describes.
 
+`zinder-query` and `zinder-compat-lightwalletd` also answer the same question
+on their gRPC listeners, as [gRPC health](#grpc-health) describes.
+
 ## Response bodies
 
 `/healthz` returns `status` (`alive`), `service`, `version`, `git_commit`,
@@ -108,6 +111,78 @@ path that changes the ops address, override the healthcheck with the same
 `zinder-ingest healthcheck --path /healthz`. The two wallet-serving images
 run their own healthcheck script, described in
 [Single-volume deployment](../runbooks/deploying-single-volume.md).
+
+## gRPC health
+
+`zinder-query` and `zinder-compat-lightwalletd`, in both of its serving modes,
+serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
+(`Check` and `Watch`) on their wallet gRPC listener. gRPC-aware load
+balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
+directly, without an HTTP probe on the ops port. `zinder-ingest`,
+`zinder-projector`, and `zinder-explorer` do not serve it.
+
+The status comes from the same readiness state as `/readyz`, so the two never
+disagree:
+
+| Status | When |
+| --- | --- |
+| `SERVING` | `/readyz` answers 200. Causes that admit traffic with a warning, such as `serving_pair_stale`, and a dependency that is degraded but not required to serve, stay `SERVING`. |
+| `NOT_SERVING` | `/readyz` answers 503, including `shutting_down` once shutdown starts. |
+
+An empty service name asks about the whole listener. The name of the service
+the listener serves (`zinder.v1.wallet.WalletQuery` or
+`cash.z.wallet.sdk.rpc.CompactTxStreamer`) returns the same status. Any other
+name fails `Check` with `NOT_FOUND`, and `Watch` reports `SERVICE_UNKNOWN`.
+There is no per-method or per-capability status.
+
+The health service and gRPC reflection stay reachable while the runtime
+refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
+`grpc.health.v1.Health` beside the wallet service, so `grpcurl` needs no proto
+files to call it.
+
+`Watch` sends the current status at once and again on every change, as soon
+as readiness publishes it. Changes that land before the stream can send them
+are not lost: it sends each status readiness passed through, in order, ending
+with the current one, so a client sees an outage or a recovery however
+quickly it reversed. A run of more than three such changes is shortened to
+two or three messages, which still send both statuses and end with the
+current one.
+
+The process bounds how many `Watch` streams stay open across all
+connections, as [Public gRPC listeners](configuration.md#public-grpc-listeners)
+lists; `Check` has no such bound.
+
+On a termination signal the runtime publishes `shutting_down` before its
+listener drains, so `Check`, `Watch`, and `/readyz` report it together. When
+the drain starts, every open `Watch` stream ends. A stream on the listener's
+status first sends `NOT_SERVING` unless that was its last message, and
+drops any recovery it had not yet sent, so a balancer stops routing to the
+listener while it closes. A `SERVING` the stream was already sending as the
+drain began can still arrive just before that final `NOT_SERVING`. A stream that reported `SERVICE_UNKNOWN` ends
+without another message.
+
+A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
+the runtime, not its ops port:
+
+```yaml
+readinessProbe:
+  grpc:
+    port: 9102
+  periodSeconds: 5
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 9106
+```
+
+Keep liveness on `/healthz`. A readiness failure should only remove the pod
+from the load balancer, not restart it. The ports are the Mainnet defaults
+from [Deploying Zinder](../runbooks/deploying.md#what-you-deploy), and
+`grpcurl` can run the same check:
+
+```bash
+grpcurl -plaintext -d '{}' 127.0.0.1:9102 grpc.health.v1.Health/Check
+```
 
 ## Readiness causes
 

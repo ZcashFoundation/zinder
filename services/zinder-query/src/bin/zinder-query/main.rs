@@ -20,9 +20,8 @@ use zinder_query::{
 };
 use zinder_runtime::{
     OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TracingSubscriberError, TrafficReadinessInterceptor, cancel_on_terminating_signal,
-    install_metrics_recorder_for_service, install_tracing_subscriber,
-    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    TracingSubscriberError, cancel_on_terminating_signal, install_metrics_recorder_for_service,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
 
@@ -251,8 +250,6 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .with_traffic_readiness(readiness.clone())
         .with_shutdown(cancel.clone());
 
-    let reflection_service =
-        zinder_runtime::public_grpc_reflection(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)?;
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
         pair_slot,
@@ -278,16 +275,13 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     let serving_runtime_drained = CancellationToken::new();
     let publisher_handle = pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
-    let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
-    let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
-    let grpc_service = tonic::service::interceptor::InterceptedService::new(
+    let listener_drain = CancellationToken::new();
+    let router = zinder_runtime::public_grpc_router(
         grpc_adapter.into_server(),
-        traffic_readiness,
-    );
-    let reflection_service = tonic::service::interceptor::InterceptedService::new(
-        reflection_service,
-        reflection_readiness,
-    );
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        &readiness,
+        &listener_drain,
+    )?;
 
     tracing::info!(
         target: "zinder::query",
@@ -299,15 +293,16 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = zinder_runtime::public_grpc_server()
-        .add_service(grpc_service)
-        .add_service(reflection_service)
-        .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned());
+    let server = router.serve_with_shutdown(
+        query_config.listen_addr,
+        listener_drain.clone().cancelled_owned(),
+    );
     supervise_query_runtime(
         server,
         cancel,
         &serving_readiness,
         QueryBackgroundTasks {
+            listener_drain,
             serving_pair_publisher: publisher_handle,
             serving_runtime_drained,
             node_readiness_probe: node_readiness_handle,
@@ -344,6 +339,8 @@ fn build_node_broadcast(
 }
 
 struct QueryBackgroundTasks {
+    /// Starts the gRPC listener's drain once shutdown has been published.
+    listener_drain: CancellationToken,
     serving_pair_publisher: tokio::task::JoinHandle<()>,
     serving_runtime_drained: CancellationToken,
     node_readiness_probe: tokio::task::JoinHandle<()>,
@@ -374,6 +371,7 @@ where
     Server: Future<Output = Result<(), tonic::transport::Error>>,
 {
     let QueryBackgroundTasks {
+        listener_drain,
         mut serving_pair_publisher,
         serving_runtime_drained,
         mut node_readiness_probe,
@@ -399,7 +397,10 @@ where
         }
     };
 
+    // `/readyz` and gRPC health must report the shutdown before the listener
+    // starts draining.
     readiness.publish_shutting_down();
+    listener_drain.cancel();
     cancel.cancel();
     let operations_shutdown = shutdown_operations(&mut operations).await;
 
@@ -727,7 +728,8 @@ mod tests {
         let ingest_control_probe = tokio::spawn(async move {
             ingest_control_cancel.cancelled().await;
         });
-        let server_cancel = cancel.clone();
+        let listener_drain = CancellationToken::new();
+        let server_cancel = listener_drain.clone();
         let server = async move {
             server_cancel.cancelled().await;
             Ok(())
@@ -738,6 +740,7 @@ mod tests {
             cancel,
             &serving_readiness,
             QueryBackgroundTasks {
+                listener_drain,
                 serving_pair_publisher: publisher,
                 serving_runtime_drained: CancellationToken::new(),
                 node_readiness_probe: node_probe,
@@ -779,7 +782,8 @@ mod tests {
         let ingest_control_probe = tokio::spawn(async move {
             ingest_control_cancel.cancelled().await;
         });
-        let server_cancel = cancel.clone();
+        let listener_drain = CancellationToken::new();
+        let server_cancel = listener_drain.clone();
         let server_runtime_drained = serving_runtime_drained.clone();
         let server = async move {
             server_cancel.cancelled().await;
@@ -793,6 +797,7 @@ mod tests {
             cancel,
             &serving_readiness,
             QueryBackgroundTasks {
+                listener_drain,
                 serving_pair_publisher: publisher,
                 serving_runtime_drained,
                 node_readiness_probe: node_probe,
@@ -807,6 +812,56 @@ mod tests {
             runtime_readiness.report().cause,
             ReadinessCause::ShuttingDown
         ));
+    }
+
+    /// Load balancers read `/readyz` and gRPC health, so both must report
+    /// `shutting_down` before the listener stops accepting calls.
+    #[tokio::test]
+    async fn requested_shutdown_publishes_shutting_down_before_the_listener_drains() {
+        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
+        let serving_readiness = WalletServingReadiness::pair_only(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let publisher_cancel = cancel.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_cancel.cancelled().await;
+        });
+        let node_cancel = cancel.clone();
+        let node_probe = tokio::spawn(async move {
+            node_cancel.cancelled().await;
+        });
+        let ingest_control_cancel = cancel.clone();
+        let ingest_control_probe = tokio::spawn(async move {
+            ingest_control_cancel.cancelled().await;
+        });
+        let listener_drain = CancellationToken::new();
+        let server_drain = listener_drain.clone();
+        let server_readiness = runtime_readiness.clone();
+        let server = async move {
+            server_drain.cancelled().await;
+            assert!(matches!(
+                server_readiness.report().cause,
+                ReadinessCause::ShuttingDown
+            ));
+            Ok(())
+        };
+        cancel.cancel();
+
+        let runtime_outcome = supervise_query_runtime(
+            server,
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                listener_drain,
+                serving_pair_publisher: publisher,
+                serving_runtime_drained: CancellationToken::new(),
+                node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(runtime_outcome.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -837,6 +892,7 @@ mod tests {
             cancel,
             &serving_readiness,
             QueryBackgroundTasks {
+                listener_drain: CancellationToken::new(),
                 serving_pair_publisher: publisher,
                 serving_runtime_drained,
                 node_readiness_probe: node_probe,
@@ -871,7 +927,8 @@ mod tests {
         let ingest_control_probe = tokio::spawn(async move {
             ingest_control_cancel.cancelled().await;
         });
-        let server_cancel = cancel.clone();
+        let listener_drain = CancellationToken::new();
+        let server_cancel = listener_drain.clone();
         let server = async move {
             server_cancel.cancelled().await;
             Ok(())
@@ -882,6 +939,7 @@ mod tests {
             cancel,
             &serving_readiness,
             QueryBackgroundTasks {
+                listener_drain,
                 serving_pair_publisher: publisher,
                 serving_runtime_drained: CancellationToken::new(),
                 node_readiness_probe: node_probe,
@@ -919,7 +977,8 @@ mod tests {
         });
         let ingest_control_probe = tokio::spawn(future::pending::<()>());
         ingest_control_probe.abort();
-        let server_cancel = cancel.clone();
+        let listener_drain = CancellationToken::new();
+        let server_cancel = listener_drain.clone();
         let server = async move {
             server_cancel.cancelled().await;
             Ok(())
@@ -930,6 +989,7 @@ mod tests {
             cancel,
             &serving_readiness,
             QueryBackgroundTasks {
+                listener_drain,
                 serving_pair_publisher: publisher,
                 serving_runtime_drained: CancellationToken::new(),
                 node_readiness_probe: node_probe,

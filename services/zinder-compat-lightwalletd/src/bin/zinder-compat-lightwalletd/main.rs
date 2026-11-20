@@ -18,9 +18,8 @@ use zinder_compat_lightwalletd::{
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TracingSubscriberError, TrafficReadinessInterceptor, cancel_on_terminating_signal,
-    install_metrics_recorder_for_service, install_tracing_subscriber,
-    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    TracingSubscriberError, cancel_on_terminating_signal, install_metrics_recorder_for_service,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
@@ -361,39 +360,31 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         "lightwalletd-compatible gRPC server started"
     );
 
-    // Expose `grpc.reflection.v1.ServerReflection` so legacy lightwalletd
-    // wallets and `grpcurl` can discover the served `CompactTxStreamer`
-    // surface without an out-of-band proto.
-    let reflection_service = zinder_runtime::public_grpc_reflection(
+    // The listener exposes `grpc.reflection.v1.ServerReflection` so legacy
+    // lightwalletd wallets and `grpcurl` can discover the served
+    // `CompactTxStreamer` surface without an out-of-band proto.
+    let listener_drain = CancellationToken::new();
+    let router = zinder_runtime::public_grpc_router(
+        grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        &readiness,
+        &listener_drain,
     )?;
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
-    let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
-    let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
-    let grpc_service = tonic::service::interceptor::InterceptedService::new(
-        grpc_adapter.into_server(),
-        traffic_readiness,
-    );
-    let reflection_service = tonic::service::interceptor::InterceptedService::new(
-        reflection_service,
-        reflection_readiness,
-    );
     let server_result = serve_with_bounded_drain(
-        zinder_runtime::public_grpc_server()
-            .add_service(grpc_service)
-            .add_service(reflection_service)
-            .serve_with_shutdown(
-                lightwalletd_config.listen_addr,
-                cancel.clone().cancelled_owned(),
-            ),
+        router.serve_with_shutdown(
+            lightwalletd_config.listen_addr,
+            listener_drain.clone().cancelled_owned(),
+        ),
         &cancel,
+        &listener_drain,
+        || serving_readiness.publish_shutting_down(),
     )
     .await;
 
-    serving_readiness.publish_shutting_down();
     cancel.cancel();
     serving_runtime_drained.cancel();
 
@@ -572,33 +563,25 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let reflection_service = zinder_runtime::public_grpc_reflection(
+    let listener_drain = CancellationToken::new();
+    let router = zinder_runtime::public_grpc_router(
+        grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        &serving_readiness.runtime(),
+        &listener_drain,
     )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let traffic_readiness = TrafficReadinessInterceptor::new(serving_readiness.runtime());
-    let reflection_readiness = TrafficReadinessInterceptor::new(serving_readiness.runtime());
-    let grpc_service = tonic::service::interceptor::InterceptedService::new(
-        grpc_adapter.into_server(),
-        traffic_readiness,
-    );
-    let reflection_service = tonic::service::interceptor::InterceptedService::new(
-        reflection_service,
-        reflection_readiness,
-    );
     let server_result = serve_with_bounded_drain(
-        zinder_runtime::public_grpc_server()
-            .add_service(grpc_service)
-            .add_service(reflection_service)
-            .serve_with_shutdown(
-                lightwalletd_config.listen_addr,
-                cancel.clone().cancelled_owned(),
-            ),
+        router.serve_with_shutdown(
+            lightwalletd_config.listen_addr,
+            listener_drain.clone().cancelled_owned(),
+        ),
         &cancel,
+        &listener_drain,
+        || serving_readiness.publish_shutting_down(),
     )
     .await;
-    serving_readiness.publish_shutting_down();
     cancel.cancel();
     serving_runtime_drained.cancel();
     tracing::info!(
@@ -623,20 +606,31 @@ async fn run_compact_blocks(
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
-/// Runs the gRPC server until it stops, abandoning the calls still open
-/// [`GRPC_SERVER_DRAIN_TIMEOUT`] after `shutdown` is cancelled.
+/// Runs the gRPC server until it stops or `shutdown` is cancelled.
+///
+/// On shutdown it calls `publish_shutting_down` and only then cancels
+/// `listener_drain`, the server's shutdown signal, so `/readyz` and gRPC
+/// health report the shutdown before the listener stops accepting calls. It
+/// abandons the calls still open [`GRPC_SERVER_DRAIN_TIMEOUT`] after that.
 async fn serve_with_bounded_drain<Server>(
     server: Server,
     shutdown: &CancellationToken,
+    listener_drain: &CancellationToken,
+    publish_shutting_down: impl FnOnce(),
 ) -> Result<(), tonic::transport::Error>
 where
     Server: Future<Output = Result<(), tonic::transport::Error>>,
 {
     let mut server = std::pin::pin!(server);
     tokio::select! {
-        server_outcome = &mut server => return server_outcome,
+        server_outcome = &mut server => {
+            publish_shutting_down();
+            return server_outcome;
+        }
         () = shutdown.cancelled() => {}
     }
+    publish_shutting_down();
+    listener_drain.cancel();
     if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_DRAIN_TIMEOUT, server).await {
         return server_outcome;
     }
@@ -852,15 +846,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
         let shutdown = CancellationToken::new();
-        let server_shutdown = shutdown.clone();
+        let listener_drain = CancellationToken::new();
+        let server_drain = listener_drain.clone();
         let server = async move {
-            server_shutdown.cancelled().await;
+            server_drain.cancelled().await;
             std::future::pending::<Result<(), tonic::transport::Error>>().await
         };
         let started_at = tokio::time::Instant::now();
         shutdown.cancel();
 
-        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+        let server_outcome =
+            serve_with_bounded_drain(server, &shutdown, &listener_drain, || {}).await;
 
         assert!(server_outcome.is_ok());
         assert_eq!(started_at.elapsed(), GRPC_SERVER_DRAIN_TIMEOUT);
@@ -869,16 +865,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_server_that_drains_within_the_bound_stops_when_it_drains() {
         let shutdown = CancellationToken::new();
-        let server_shutdown = shutdown.clone();
+        let listener_drain = CancellationToken::new();
+        let server_drain = listener_drain.clone();
         let server = async move {
-            server_shutdown.cancelled().await;
+            server_drain.cancelled().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
             Ok(())
         };
         let started_at = tokio::time::Instant::now();
         shutdown.cancel();
 
-        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+        let server_outcome =
+            serve_with_bounded_drain(server, &shutdown, &listener_drain, || {}).await;
 
         assert!(server_outcome.is_ok());
         assert_eq!(started_at.elapsed(), Duration::from_secs(2));
@@ -887,12 +885,49 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_server_that_stops_on_its_own_does_not_wait_for_shutdown() {
         let shutdown = CancellationToken::new();
+        let listener_drain = CancellationToken::new();
+        let runtime_readiness = Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+        let serving_readiness =
+            compact_block_serving::CompactServingReadiness::new(runtime_readiness.clone());
         let server = async { Ok(()) };
         let started_at = tokio::time::Instant::now();
 
-        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+        let server_outcome = serve_with_bounded_drain(server, &shutdown, &listener_drain, || {
+            serving_readiness.publish_shutting_down();
+        })
+        .await;
 
         assert!(server_outcome.is_ok());
         assert_eq!(started_at.elapsed(), Duration::ZERO);
+        assert!(!runtime_readiness.report().is_ready);
+    }
+
+    /// Load balancers read `/readyz` and gRPC health, so both must report
+    /// `shutting_down` before the listener stops accepting calls.
+    #[tokio::test]
+    async fn shutdown_is_published_before_the_listener_drains() {
+        let shutdown = CancellationToken::new();
+        let listener_drain = CancellationToken::new();
+        let runtime_readiness = Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+        let serving_readiness =
+            compact_block_serving::CompactServingReadiness::new(runtime_readiness.clone());
+        let server_drain = listener_drain.clone();
+        let server_readiness = runtime_readiness.clone();
+        let server = async move {
+            server_drain.cancelled().await;
+            assert!(matches!(
+                server_readiness.report().cause,
+                zinder_runtime::ReadinessCause::ShuttingDown
+            ));
+            Ok(())
+        };
+        shutdown.cancel();
+
+        let server_outcome = serve_with_bounded_drain(server, &shutdown, &listener_drain, || {
+            serving_readiness.publish_shutting_down();
+        })
+        .await;
+
+        assert!(server_outcome.is_ok());
     }
 }
