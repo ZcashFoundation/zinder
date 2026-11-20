@@ -357,6 +357,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        lightwalletd_config.client_address_source,
         &readiness,
     )?;
 
@@ -487,6 +488,7 @@ async fn run_compact_blocks(
     let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        lightwalletd_config.client_address_source,
         &serving_readiness.runtime(),
     )?;
     start_api_phase.complete();

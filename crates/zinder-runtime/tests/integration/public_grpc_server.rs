@@ -12,6 +12,8 @@ use eyre::{Result, bail, eyre};
 use http::uri::PathAndQuery;
 use http_body::Frame;
 use http_body_util::{BodyExt as _, StreamBody};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 use tokio_stream::{
@@ -38,7 +40,9 @@ use tonic_reflection::pb::v1::{
 };
 use tower::ServiceExt as _;
 use zinder_runtime::{
-    GrpcReceiveLimits, MAX_DECODING_MESSAGE_BYTES, public_grpc_reflection, public_grpc_server_with,
+    ClientAddressSource, DEFAULT_GRPC_RECEIVE_SLOTS, GrpcReceiveLimits, MAX_DECODING_MESSAGE_BYTES,
+    PROXY_CLIENT_ADDRESS_HEADER, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
+    public_grpc_reflection, public_grpc_server_with,
 };
 
 const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
@@ -74,13 +78,20 @@ impl TestServer {
 /// reflection (bidirectional) behind the public server builder, the way
 /// public Zinder listeners do.
 async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
-    serve_with_send_stall(slots, receive_timeout, SHORT_SEND_STALL_TIMEOUT).await
+    serve_with(
+        slots,
+        receive_timeout,
+        SHORT_SEND_STALL_TIMEOUT,
+        ClientAddressSource::Connection,
+    )
+    .await
 }
 
-async fn serve_with_send_stall(
+async fn serve_with(
     slots: usize,
     receive_timeout: Duration,
     send_stall_timeout: Duration,
+    client_address: ClientAddressSource,
 ) -> Result<TestServer> {
     let slots = NonZeroUsize::new(slots).ok_or_else(|| eyre!("slots must be non-zero"))?;
     let (health, health_server) = tonic_health::server::health_reporter();
@@ -91,6 +102,7 @@ async fn serve_with_send_stall(
         public_grpc_server_with(
             GrpcReceiveLimits::new(slots, receive_timeout),
             send_stall_timeout,
+            client_address,
         )
         .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
         .add_service(reflection)
@@ -413,7 +425,13 @@ async fn an_evicted_reflection_stream_ends_with_unavailable() -> Result<()> {
 
 #[tokio::test]
 async fn an_evicted_reflection_stream_whose_client_stopped_reading_ends_at_once() -> Result<()> {
-    let server = serve_with_send_stall(1, Duration::from_secs(30), Duration::from_hours(1)).await?;
+    let server = serve_with(
+        1,
+        Duration::from_secs(30),
+        Duration::from_hours(1),
+        ClientAddressSource::Connection,
+    )
+    .await?;
     let attacker = small_stream_window_connection(&server).await?;
     let (sender, mut stalled) = unread_reflection_answers(&attacker).await?;
     tokio::time::sleep(CLAIM_SETTLE).await;
@@ -574,6 +592,145 @@ async fn connections_holding_equal_shares_are_refused_across_the_process() -> Re
         .chain(&second_stalled)
         .any(JoinHandle::is_finished)
     {
+        bail!("a refused request evicted a stalled call");
+    }
+    Ok(())
+}
+
+/// Starts a reverse proxy in front of the listener at `upstream` and returns
+/// its address.
+///
+/// Like the reference Caddy configuration, the proxy forwards every client's
+/// requests over one shared HTTP/2 connection and names each client
+/// connection in [`PROXY_CLIENT_ADDRESS_HEADER`].
+async fn spawn_proxy(upstream: SocketAddr) -> Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let upstream = Endpoint::new(format!("http://{upstream}"))?
+        .connect()
+        .await?;
+    tokio::spawn(async move {
+        while let Ok((stream, client)) = listener.accept().await {
+            let client_header = http::HeaderValue::try_from(client.to_string());
+            let upstream = upstream.clone();
+            let forward = hyper::service::service_fn(move |request: http::Request<Incoming>| {
+                let mut request = request.map(Body::new);
+                if let Ok(client_header) = &client_header {
+                    request
+                        .headers_mut()
+                        .insert(PROXY_CLIENT_ADDRESS_HEADER, client_header.clone());
+                }
+                upstream.clone().oneshot(request)
+            });
+            tokio::spawn(
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), forward),
+            );
+        }
+    });
+    Ok(address)
+}
+
+async fn connect_through(proxy: SocketAddr) -> Result<Channel> {
+    Ok(Endpoint::new(format!("http://{proxy}"))?.connect().await?)
+}
+
+#[tokio::test]
+async fn one_client_behind_a_trusted_proxy_cannot_lock_other_clients_out() -> Result<()> {
+    let server = serve_with(
+        4,
+        Duration::from_secs(30),
+        SHORT_SEND_STALL_TIMEOUT,
+        ClientAddressSource::ProxyHeader,
+    )
+    .await?;
+    let proxy = spawn_proxy(server.address).await?;
+    let attacker = connect_through(proxy).await?;
+    let victim = connect_through(proxy).await?;
+
+    let mut stalled = stall_checks(&attacker, 4).await;
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("a stalled call ended before holding a slot");
+    }
+    // Every request reaches Zinder over the proxy's one connection, yet the
+    // attacker alone holds every slot, so only its own next request is
+    // refused.
+    assert_eq!(
+        check(&attacker).await.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+
+    check(&victim).await?;
+    let oldest = stalled.remove(0);
+    assert_eq!(outcome(oldest).await?, Some(Code::Unavailable));
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("more than the oldest stalled call lost its slot");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_supervised_wallet_listener_tells_clients_behind_a_trusted_proxy_apart() -> Result<()> {
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
+    let readiness = Readiness::new(ReadinessState::ready(Some(1)));
+    let stand_in_wallet_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+    let router = runtime.public_grpc_router(
+        stand_in_wallet_service,
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ClientAddressSource::ProxyHeader,
+        &readiness,
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener_address = listener.local_addr()?;
+    let _server = tokio::spawn(router.serve_with_incoming_shutdown(
+        TcpListenerStream::new(listener),
+        runtime.grpc_server_shutdown(),
+    ));
+    let proxy = spawn_proxy(listener_address).await?;
+    let attacker = connect_through(proxy).await?;
+    let victim = connect_through(proxy).await?;
+
+    let mut stalled = stall_checks(&attacker, DEFAULT_GRPC_RECEIVE_SLOTS.get()).await;
+    wait_until("the attacker holds every request slot", || {
+        let attacker = attacker.clone();
+        async move {
+            check(&attacker).await.err().map(|status| status.code()) == Some(Code::Unavailable)
+        }
+    })
+    .await?;
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("a stalled call ended before holding a slot");
+    }
+
+    check(&victim).await?;
+    let oldest = stalled.remove(0);
+    assert_eq!(outcome(oldest).await?, Some(Code::Unavailable));
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("more than the oldest stalled call lost its slot");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_listener_that_trusts_no_proxy_counts_every_proxied_client_as_one() -> Result<()> {
+    let server = serve(4, Duration::from_secs(30)).await?;
+    let proxy = spawn_proxy(server.address).await?;
+    let attacker = connect_through(proxy).await?;
+    let victim = connect_through(proxy).await?;
+
+    let stalled = stall_checks(&attacker, 4).await;
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("a stalled call ended before holding a slot");
+    }
+    // The header names a different client, but this listener ignores it and
+    // sees one connection that already holds every slot.
+    assert_eq!(
+        check(&victim).await.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+    if stalled.iter().any(JoinHandle::is_finished) {
         bail!("a refused request evicted a stalled call");
     }
     Ok(())

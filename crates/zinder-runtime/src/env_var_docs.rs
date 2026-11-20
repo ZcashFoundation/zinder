@@ -1119,6 +1119,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       default 2-second wait.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
+        toml_path: "query.trust_proxy_client_address",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Counts each WalletQuery request against the client connection that a \
+                      reverse proxy names in the `x-zinder-client-address` header, instead of \
+                      the proxy's own connection, when the receive limit picks which client to \
+                      refuse. Set it only when clients reach the listener solely through a \
+                      proxy that replaces the header. Defaults to false.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__LISTEN_ADDR",
         toml_path: "compat.listen_addr",
         used_by: &["zinder-compat-lightwalletd"],
@@ -1216,6 +1228,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       for as long as the client asks, so enable it only on a server you are \
                       load testing. Defaults to false, which refuses `Ping` with \
                       `FAILED_PRECONDITION`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
+        toml_path: "compat.trust_proxy_client_address",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Counts each lightwalletd-compatible request against the client connection that a \
+                      reverse proxy names in the `x-zinder-client-address` header, instead of \
+                      the proxy's own connection, when the receive limit picks which client to \
+                      refuse. Set it only when clients reach the listener solely through a \
+                      proxy that replaces the header. Defaults to false.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
@@ -1785,6 +1809,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068.",
     },
     EnvVarDoc {
+        name: "ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS",
+        toml_path: "explorer.trust_proxy_client_address",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Counts each ExplorerQuery request against the client connection that a \
+                      reverse proxy names in the `x-zinder-client-address` header, instead of \
+                      the proxy's own connection, when the receive limit picks which client to \
+                      refuse. Set it only when clients reach the listener solely through a \
+                      proxy that replaces the header. Defaults to false.",
+    },
+    EnvVarDoc {
         name: "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",
         toml_path: "explorer.wallet_query_endpoint",
         used_by: &["zinder-explorer"],
@@ -1999,6 +2035,7 @@ mod tests {
                 "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+                "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );
         let compat_specific = ENVIRONMENT_VARIABLES
@@ -2018,6 +2055,7 @@ mod tests {
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
                 "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
+                "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );
     }

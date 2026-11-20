@@ -5,14 +5,25 @@
 //! that a checkpoint pass densified answers every settled height directly. A
 //! run given the server's metrics endpoint reports the server's own counts
 //! over the run instead of inferring them from the 100-block stride.
+//!
+//! The same reads show how full the public listener's receive pools got,
+//! which requests they refused or evicted, and whether a proxy in front of
+//! the server named each client. The slots each pool holds are also read
+//! every second during the run, so their mean covers the whole run.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
 };
+use tokio_util::task::AbortOnDropHandle;
 use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name};
 
 const TREE_STATE_RECONSTRUCTIONS: &str = "zinder_query_tree_state_replayed_blocks_count";
@@ -31,10 +42,20 @@ const BLOCK_RANGE_SLOT_WAIT_COUNT: &str =
 const BLOCK_RANGE_STAGE_SUM: &str = "zinder_compat_block_range_stage_duration_seconds_sum";
 const BLOCK_RANGE_STAGE_COUNT: &str = "zinder_compat_block_range_stage_duration_seconds_count";
 const RECEIVE_REFUSALS: &str = "zinder_grpc_request_receive_refusals_total";
+const RECEIVE_EVICTIONS: &str = "zinder_grpc_request_receive_evictions_total";
+const RECEIVE_SLOTS_HELD: &str = "zinder_grpc_request_receive_slots_held";
+const RECEIVE_SLOTS_HELD_COUNT: &str = "zinder_grpc_request_receive_slots_held_at_admission_count";
+const RECEIVE_SLOTS_HELD_SUM: &str = "zinder_grpc_request_receive_slots_held_at_admission_sum";
+const RECEIVE_SLOTS_HELD_BUCKET: &str =
+    "zinder_grpc_request_receive_slots_held_at_admission_bucket";
+const RECEIVE_SLOT_HOLD_SUM: &str = "zinder_grpc_request_receive_slot_hold_duration_seconds_sum";
+const RECEIVE_SLOT_HOLD_COUNT: &str =
+    "zinder_grpc_request_receive_slot_hold_duration_seconds_count";
+const PROXY_CLIENT_ADDRESS_FALLBACKS: &str = "zinder_grpc_proxy_client_address_fallbacks_total";
 const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 
 /// Every counter the observation subtracts, checked for a reset.
-const OBSERVED_COUNTERS: [&str; 15] = [
+const OBSERVED_COUNTERS: [&str; 22] = [
     TREE_STATE_RECONSTRUCTIONS,
     TREE_STATE_REPLAYED_BLOCKS,
     TREE_STATE_READS,
@@ -49,11 +70,21 @@ const OBSERVED_COUNTERS: [&str; 15] = [
     BLOCK_RANGE_STAGE_SUM,
     BLOCK_RANGE_STAGE_COUNT,
     RECEIVE_REFUSALS,
+    RECEIVE_EVICTIONS,
+    RECEIVE_SLOTS_HELD_COUNT,
+    RECEIVE_SLOTS_HELD_SUM,
+    RECEIVE_SLOTS_HELD_BUCKET,
+    RECEIVE_SLOT_HOLD_SUM,
+    RECEIVE_SLOT_HOLD_COUNT,
+    PROXY_CLIENT_ADDRESS_FALLBACKS,
     STALE_TIP_REFUSALS,
 ];
 
 /// Longest one scrape may take, from connecting to the end of the response.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a run waits between reads of the slots each receive pool holds.
+const HELD_SLOTS_READ_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Most bytes a scrape reads. A Zinder `/metrics` page is far smaller; an
 /// endpoint that sends more fails the scrape instead of filling memory.
@@ -89,6 +120,16 @@ pub(crate) struct ServerObserved {
     /// Time block-range chunks spent in each stage, by stage name.
     block_range_stages: BTreeMap<String, StageTime>,
     receive_refusals: u64,
+    /// Requests that lost their receive slot to a client holding fewer.
+    receive_evictions: u64,
+    /// How each receive pool of the public gRPC listener was used, by `pool`
+    /// label.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    receive_pools: BTreeMap<String, ReceivePoolUse>,
+    /// Requests on a listener that trusts its proxy's client address that
+    /// counted against the proxy's own connection, by `reason` label.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    proxy_client_address_fallbacks: BTreeMap<String, u64>,
     stale_tip_refusals: u64,
 }
 
@@ -99,13 +140,204 @@ pub(crate) struct StageTime {
     chunks: u64,
 }
 
+/// How one receive pool of the server's public gRPC listener was used over
+/// a run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct ReceivePoolUse {
+    /// Requests the pool admitted.
+    admissions: u64,
+    refusals: u64,
+    evictions: u64,
+    /// Slots the pool held once it admitted a request, the request's own
+    /// included, averaged over admissions.
+    mean_slots_held_at_admission: f64,
+    /// The smallest histogram bucket that holds every admission: no request
+    /// found more slots held than this. Absent when nothing was admitted, or
+    /// when an admission exceeded every finite bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_slots_held_at_most: Option<f64>,
+    /// Mean time a request held its slot, over the slots freed or taken
+    /// during the run.
+    mean_slot_hold_seconds: f64,
+    /// The mean number of slots held at once over the run, from the slots
+    /// the pool held at each read. It counts the slots held across the
+    /// start or end of the run, and never exceeds the pool's size.
+    mean_slots_held: f64,
+}
+
+/// The server's metrics read when a run starts, and the reads of its held
+/// receive slots that continue until the run ends.
+#[derive(Debug)]
+pub(super) struct RunObservation {
+    url: String,
+    before: Vec<MetricSample>,
+    held_slots: HeldSlotsSampler,
+}
+
+impl RunObservation {
+    /// Reads the server's metrics at `url` and starts reading its held
+    /// receive slots.
+    pub(super) async fn start(url: &str) -> Result<Self, String> {
+        let before = scrape(url).await?;
+        let held_slots = HeldSlotsSampler::start(url, &before);
+        Ok(Self {
+            url: url.to_owned(),
+            before,
+            held_slots,
+        })
+    }
+
+    /// Reads the server's metrics after the run and returns what the server
+    /// counted, or why its counts are missing.
+    ///
+    /// A failed read keeps the run's results, because the wallets' work is
+    /// already done and would otherwise be lost.
+    pub(super) async fn finish(self) -> (Option<ServerObserved>, Option<String>) {
+        match self.held_slots.finish(&self.url).await {
+            Ok((after, held_slots)) => {
+                match ServerObserved::between(&self.before, &after, &held_slots) {
+                    Ok(observed) => (Some(observed), None),
+                    Err(reason) => (None, Some(reason)),
+                }
+            }
+            Err(error) => (None, Some(error)),
+        }
+    }
+}
+
+/// The slots each receive pool held, read from the server at moments of a
+/// run, in the order they were read.
+#[derive(Clone, Debug, Default)]
+struct HeldSlotsTimeline {
+    readings: Vec<HeldSlotsReading>,
+}
+
+#[derive(Clone, Debug)]
+struct HeldSlotsReading {
+    /// Time since the run's first read.
+    at: Duration,
+    by_pool: BTreeMap<String, f64>,
+}
+
+impl HeldSlotsTimeline {
+    /// Adds the slots each pool held in `samples`, read `at` into the run.
+    fn record(&mut self, at: Duration, samples: &[MetricSample]) {
+        let mut by_pool = BTreeMap::<String, f64>::new();
+        for sample in samples
+            .iter()
+            .filter(|sample| sample.name == RECEIVE_SLOTS_HELD)
+        {
+            if let Some(pool) = sample.label("pool") {
+                *by_pool.entry(pool.to_owned()).or_default() += sample.reading;
+            }
+        }
+        self.readings.push(HeldSlotsReading { at, by_pool });
+    }
+
+    /// Ends the timeline at `ended`, the moment the run ended, with the
+    /// slots each pool held in `samples`, the scrape taken after it.
+    ///
+    /// Reads that completed after `ended` are left out, and `samples` counts
+    /// as read at `ended` however long its scrape took, so the mean covers
+    /// the run and none of the time spent reading after it.
+    fn close(&mut self, ended: Duration, samples: &[MetricSample]) {
+        self.readings.retain(|reading| reading.at <= ended);
+        self.record(ended, samples);
+    }
+
+    /// The slots `pool` held on average from the first read to the last.
+    ///
+    /// Between two reads, the pool counts as holding the mean of both. The
+    /// result weighs each span by the time it covers, so it never exceeds
+    /// the most slots any read found.
+    fn mean(&self, pool: &str) -> f64 {
+        let held = |reading: &HeldSlotsReading| reading.by_pool.get(pool).copied().unwrap_or(0.0);
+        let (slot_seconds, observed) = self
+            .readings
+            .iter()
+            .zip(self.readings.iter().skip(1))
+            .map(|(earlier, later)| {
+                let span = later.at.saturating_sub(earlier.at).as_secs_f64();
+                (span * f64::midpoint(held(earlier), held(later)), span)
+            })
+            .fold((0.0, 0.0), |(slot_seconds, observed), (held_for, span)| {
+                (slot_seconds + held_for, observed + span)
+            });
+        if observed > 0.0 {
+            slot_seconds / observed
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Reads the slots each receive pool of the server holds, every
+/// [`HELD_SLOTS_READ_INTERVAL`] until the run ends.
+#[derive(Debug)]
+struct HeldSlotsSampler {
+    started: Instant,
+    timeline: Arc<Mutex<HeldSlotsTimeline>>,
+    reader: AbortOnDropHandle<()>,
+}
+
+impl HeldSlotsSampler {
+    /// Starts reading `url`, with `before`, the scrape just taken, as the
+    /// run's first read.
+    fn start(url: &str, before: &[MetricSample]) -> Self {
+        let started = Instant::now();
+        let mut timeline = HeldSlotsTimeline::default();
+        timeline.record(Duration::ZERO, before);
+        let timeline = Arc::new(Mutex::new(timeline));
+        let reader = AbortOnDropHandle::new(tokio::spawn(read_held_slots(
+            url.to_owned(),
+            started,
+            Arc::clone(&timeline),
+        )));
+        Self {
+            started,
+            timeline,
+            reader,
+        }
+    }
+
+    /// Ends the run now: stops reading, then scrapes `url` once more and
+    /// returns that scrape with the reads, the scrape as the last.
+    ///
+    /// The reader stops before the closing scrape starts, so no read shows
+    /// the server after that scrape. The timeline ends when this is called,
+    /// before either step, as [`HeldSlotsTimeline::close`] describes.
+    async fn finish(self, url: &str) -> Result<(Vec<MetricSample>, HeldSlotsTimeline), String> {
+        let ended = self.started.elapsed();
+        self.reader.abort();
+        let _ = self.reader.await;
+        let after = scrape(url).await?;
+        let mut timeline = std::mem::take(&mut *self.timeline.lock());
+        timeline.close(ended, &after);
+        Ok((after, timeline))
+    }
+}
+
+async fn read_held_slots(url: String, started: Instant, timeline: Arc<Mutex<HeldSlotsTimeline>>) {
+    loop {
+        tokio::time::sleep(HELD_SLOTS_READ_INTERVAL).await;
+        // A failed read only widens the span between the reads around it.
+        if let Ok(samples) = scrape(&url).await {
+            timeline.lock().record(started.elapsed(), &samples);
+        }
+    }
+}
+
 impl ServerObserved {
     /// The counter increases from `before` to `after`.
     ///
     /// Fails when a counter series went down or disappeared, as it does when
     /// the server restarts during the run: the increases would then mix two
     /// processes' counts, and a per-band count could exceed its total.
-    pub(super) fn between(before: &[MetricSample], after: &[MetricSample]) -> Result<Self, String> {
+    fn between(
+        before: &[MetricSample],
+        after: &[MetricSample],
+        held_slots: &HeldSlotsTimeline,
+    ) -> Result<Self, String> {
         if let Some(series) = reset_series(before, after) {
             return Err(format!(
                 "server counter {series} went down during the run, so the server likely \
@@ -156,9 +388,126 @@ impl ServerObserved {
             block_range_slot_waits: count(BLOCK_RANGE_SLOT_WAIT_COUNT),
             block_range_stages,
             receive_refusals: count(RECEIVE_REFUSALS),
+            receive_evictions: count(RECEIVE_EVICTIONS),
+            receive_pools: receive_pools(before, after, held_slots),
+            proxy_client_address_fallbacks: increases_by_label(
+                before,
+                after,
+                PROXY_CLIENT_ADDRESS_FALLBACKS,
+                "reason",
+            ),
             stale_tip_refusals: count(STALE_TIP_REFUSALS),
         })
     }
+}
+
+/// Each receive pool's use during the run, by `pool` label, for every pool
+/// that held a slot, or admitted, refused, or evicted a request.
+fn receive_pools(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    held_slots: &HeldSlotsTimeline,
+) -> BTreeMap<String, ReceivePoolUse> {
+    let pool_labels = after
+        .iter()
+        .filter(|sample| {
+            [
+                RECEIVE_SLOTS_HELD,
+                RECEIVE_SLOTS_HELD_COUNT,
+                RECEIVE_REFUSALS,
+                RECEIVE_EVICTIONS,
+            ]
+            .contains(&sample.name.as_str())
+        })
+        .filter_map(|sample| sample.label("pool").map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    pool_labels
+        .into_iter()
+        .filter_map(|pool| {
+            let in_pool = Some(("pool", pool.as_str()));
+            let increase = |name| after_minus_before(before, after, name, in_pool).max(0.0);
+            let admissions = increase(RECEIVE_SLOTS_HELD_COUNT);
+            let holds = increase(RECEIVE_SLOT_HOLD_COUNT);
+            let hold_seconds = increase(RECEIVE_SLOT_HOLD_SUM);
+            let ratio = |numerator: f64, denominator: f64| {
+                if denominator > 0.0 {
+                    numerator / denominator
+                } else {
+                    0.0
+                }
+            };
+            let used = ReceivePoolUse {
+                admissions: counter_value(admissions),
+                refusals: counter_value(increase(RECEIVE_REFUSALS)),
+                evictions: counter_value(increase(RECEIVE_EVICTIONS)),
+                mean_slots_held_at_admission: ratio(increase(RECEIVE_SLOTS_HELD_SUM), admissions),
+                peak_slots_held_at_most: peak_bucket(before, after, &pool, admissions),
+                mean_slot_hold_seconds: ratio(hold_seconds, holds),
+                mean_slots_held: held_slots.mean(&pool),
+            };
+            (used != ReceivePoolUse::default()).then_some((pool, used))
+        })
+        .collect()
+}
+
+/// The smallest finite `le` bucket of the occupancy histogram whose increase
+/// over the run covers all `admissions` in `pool`.
+fn peak_bucket(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    pool: &str,
+    admissions: f64,
+) -> Option<f64> {
+    if admissions <= 0.0 {
+        return None;
+    }
+    after
+        .iter()
+        .filter(|sample| {
+            sample.name == RECEIVE_SLOTS_HELD_BUCKET && sample.label("pool") == Some(pool)
+        })
+        .filter_map(|sample| {
+            let bound = sample.label("le")?;
+            let upper = bound
+                .parse::<f64>()
+                .ok()
+                .filter(|upper| upper.is_finite())?;
+            let covered = sample.reading
+                - before
+                    .iter()
+                    .find(|earlier| {
+                        earlier.name == RECEIVE_SLOTS_HELD_BUCKET
+                            && earlier.label("pool") == Some(pool)
+                            && earlier.label("le") == Some(bound)
+                    })
+                    .map_or(0.0, |earlier| earlier.reading);
+            (covered >= admissions).then_some(upper)
+        })
+        .min_by(f64::total_cmp)
+}
+
+/// The increase of every series of `name`, by its `label`, leaving out the
+/// labels that did not increase.
+fn increases_by_label(
+    before: &[MetricSample],
+    after: &[MetricSample],
+    name: &str,
+    label: &str,
+) -> BTreeMap<String, u64> {
+    after
+        .iter()
+        .filter(|sample| sample.name == name)
+        .filter_map(|sample| sample.label(label).map(str::to_owned))
+        .filter_map(|label_value| {
+            let increase = counter_value(after_minus_before(
+                before,
+                after,
+                name,
+                Some((label, &label_value)),
+            ));
+            (increase > 0).then_some((label_value, increase))
+        })
+        .collect()
 }
 
 /// The first observed counter series, rendered with its labels, whose
@@ -245,7 +594,7 @@ fn counter_value(increase: f64) -> u64 {
 }
 
 /// Reads the Prometheus exposition at an `http://host:port/path` URL.
-pub(super) async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
+async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
     scrape_within(url, SCRAPE_TIMEOUT, MAX_SCRAPE_BYTES).await
 }
 
@@ -351,11 +700,36 @@ mod tests {
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpListener,
     };
-    use zinder_bench::metrics_scrape::parse_prometheus_samples;
+    use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name};
 
-    use std::time::Duration;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
-    use super::{ServerObserved, scrape, scrape_within};
+    use super::{
+        HeldSlotsSampler, HeldSlotsTimeline, RunObservation, ServerObserved, scrape, scrape_within,
+    };
+
+    const RUN: Duration = Duration::from_secs(10);
+
+    /// A run whose only reads are the scrapes before and after it.
+    fn read_at_both_ends(before: &[MetricSample], after: &[MetricSample]) -> HeldSlotsTimeline {
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, before);
+        held_slots.record(RUN, after);
+        held_slots
+    }
+
+    fn held_in_request_pool(held: u32) -> Vec<MetricSample> {
+        parse_prometheus_samples(&format!(
+            "zinder_grpc_request_receive_slots_held{{pool=\"request\"}} {held}\n"
+        ))
+    }
 
     #[test]
     fn counts_are_increases_over_the_run() -> Result<(), String> {
@@ -371,7 +745,8 @@ mod tests {
              zinder_grpc_request_receive_refusals_total{pool=\"client_stream\"} 1\n",
         );
 
-        let observed = ServerObserved::between(&before, &after)?;
+        let observed =
+            ServerObserved::between(&before, &after, &read_at_both_ends(&before, &after))?;
 
         assert_eq!(observed.tree_state_reconstructions, 6);
         assert_eq!(observed.tree_state_replayed_blocks, 420);
@@ -398,7 +773,8 @@ mod tests {
         );
 
         for after in [restarted, missing] {
-            let refused = ServerObserved::between(&before, &after).err();
+            let refused =
+                ServerObserved::between(&before, &after, &read_at_both_ends(&before, &after)).err();
 
             assert!(
                 refused.is_some_and(|reason| reason.contains("height_band=\"a\"")),
@@ -408,7 +784,14 @@ mod tests {
         // A metric the observation does not read may go down.
         let unrelated_before = parse_prometheus_samples("process_resident_memory_bytes 9\n");
         let unrelated_after = parse_prometheus_samples("process_resident_memory_bytes 1\n");
-        assert!(ServerObserved::between(&unrelated_before, &unrelated_after).is_ok());
+        assert!(
+            ServerObserved::between(
+                &unrelated_before,
+                &unrelated_after,
+                &HeldSlotsTimeline::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -429,7 +812,8 @@ mod tests {
              zinder_compat_block_range_stage_duration_seconds_count{stage=\"send\"} 9\n",
         );
 
-        let observed = ServerObserved::between(&before, &after)?;
+        let observed =
+            ServerObserved::between(&before, &after, &read_at_both_ends(&before, &after))?;
 
         assert_eq!(observed.tree_state_stored_reads, 5);
         assert_eq!(observed.tree_state_replayed_reads, 4);
@@ -441,6 +825,290 @@ mod tests {
         assert!((read.seconds - 2.5).abs() < 1e-9);
         assert_eq!(read.chunks, 10);
         assert_eq!(observed.block_range_stages["send"].chunks, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn receive_pools_report_occupancy_evictions_refusals_and_proxy_fallbacks() -> Result<(), String>
+    {
+        let before = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"1\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"2\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"4\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"+Inf\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_sum{pool=\"request\"} 10\n\
+             zinder_grpc_request_receive_slots_held_at_admission_count{pool=\"request\"} 10\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 0.5\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 10\n\
+             zinder_grpc_request_receive_slots_held{pool=\"request\"} 0\n",
+        );
+        let after = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"1\"} 70\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"2\"} 100\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"4\"} 110\n\
+             zinder_grpc_request_receive_slots_held_at_admission_bucket{pool=\"request\",le=\"+Inf\"} 110\n\
+             zinder_grpc_request_receive_slots_held_at_admission_sum{pool=\"request\"} 160\n\
+             zinder_grpc_request_receive_slots_held_at_admission_count{pool=\"request\"} 110\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 2.5\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 110\n\
+             zinder_grpc_request_receive_slots_held{pool=\"request\"} 1\n\
+             zinder_grpc_request_receive_evictions_total{pool=\"request\"} 3\n\
+             zinder_grpc_request_receive_refusals_total{pool=\"client_stream\"} 2\n\
+             zinder_grpc_proxy_client_address_fallbacks_total{reason=\"missing\"} 4\n\
+             zinder_grpc_proxy_client_address_fallbacks_total{reason=\"repeated\"} 0\n",
+        );
+
+        let observed =
+            ServerObserved::between(&before, &after, &read_at_both_ends(&before, &after))?;
+
+        assert_eq!(observed.receive_evictions, 3);
+        assert_eq!(observed.receive_refusals, 2);
+        let request = &observed.receive_pools["request"];
+        assert_eq!(request.admissions, 100);
+        assert_eq!(request.evictions, 3);
+        assert_eq!(request.refusals, 0);
+        assert!((request.mean_slots_held_at_admission - 1.5).abs() < 1e-9);
+        // Every admission in the run fell at or below 4 slots, not all at 2.
+        assert_eq!(request.peak_slots_held_at_most, Some(4.0));
+        assert!((request.mean_slot_hold_seconds - 0.02).abs() < 1e-9);
+        // No read between the scrapes, so the pool counts as holding the
+        // mean of 0 and 1 slots.
+        assert!((request.mean_slots_held - 0.5).abs() < 1e-9);
+        let client_stream = &observed.receive_pools["client_stream"];
+        assert_eq!(client_stream.refusals, 2);
+        assert_eq!(client_stream.admissions, 0);
+        assert_eq!(client_stream.peak_slots_held_at_most, None);
+        assert_eq!(
+            observed.proxy_client_address_fallbacks,
+            BTreeMap::from([("missing".to_owned(), 4)])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mean_slots_held_counts_only_slot_time_inside_the_run() -> Result<(), String> {
+        // A full 32-slot pool. Requests that took their slots long before the
+        // run free them during it, for 2,519 slot-seconds of holds, and the
+        // requests that replace them still hold their slots when it ends.
+        let before = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held{pool=\"request\"} 32\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 0\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 0\n",
+        );
+        let after = parse_prometheus_samples(
+            "zinder_grpc_request_receive_slots_held{pool=\"request\"} 32\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_sum{pool=\"request\"} 2519\n\
+             zinder_grpc_request_receive_slot_hold_duration_seconds_count{pool=\"request\"} 32\n",
+        );
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, &before);
+        for second in 1..10 {
+            // One slot stands free for the read at 5 seconds.
+            let held = if second == 5 { 31 } else { 32 };
+            held_slots.record(Duration::from_secs(second), &held_in_request_pool(held));
+        }
+        held_slots.record(RUN, &after);
+
+        let observed = ServerObserved::between(&before, &after, &held_slots)?;
+
+        let request = &observed.receive_pools["request"];
+        assert!(
+            request.mean_slots_held <= 32.0,
+            "{}",
+            request.mean_slots_held
+        );
+        // 320 slot-seconds, less half a slot over each of the two seconds
+        // around the read at 5 seconds.
+        assert!(
+            (request.mean_slots_held - 31.9).abs() < 1e-9,
+            "{}",
+            request.mean_slots_held
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mean_slots_held_counts_slots_held_across_both_ends_of_the_run() -> Result<(), String> {
+        // Every slot is held from before the run until after it, so no hold
+        // ends during the run.
+        let before = held_in_request_pool(32);
+        let after = held_in_request_pool(32);
+
+        let observed =
+            ServerObserved::between(&before, &after, &read_at_both_ends(&before, &after))?;
+
+        let request = &observed.receive_pools["request"];
+        assert!((request.mean_slots_held - 32.0).abs() < 1e-9);
+        assert_eq!(request.admissions, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mean_slots_held_never_exceeds_the_most_slots_any_read_found() {
+        // A read that lands just after the closing one leaves the timeline
+        // out of order. The pool is full at every read.
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, &held_in_request_pool(32));
+        held_slots.record(RUN + Duration::from_millis(1), &held_in_request_pool(32));
+        held_slots.record(RUN, &held_in_request_pool(32));
+
+        let mean = held_slots.mean("request");
+
+        assert!((mean - 32.0).abs() < 1e-9, "{mean}");
+    }
+
+    #[test]
+    fn mean_slots_held_leaves_out_the_time_after_the_run_ends() {
+        // The pool holds 8 slots for the run's last second and frees them
+        // once the run ends at 2 seconds, so both a background read that
+        // completes after the end and the closing scrape find none held.
+        let ended = Duration::from_secs(2);
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, &held_in_request_pool(0));
+        held_slots.record(Duration::from_secs(1), &held_in_request_pool(8));
+        held_slots.record(ended, &held_in_request_pool(8));
+        held_slots.record(Duration::from_millis(2_400), &held_in_request_pool(0));
+
+        held_slots.close(ended, &held_in_request_pool(0));
+
+        assert!(
+            held_slots
+                .readings
+                .iter()
+                .all(|reading| reading.at <= ended),
+            "{held_slots:?}"
+        );
+        assert_eq!(
+            held_slots.readings.last().map(|reading| reading.at),
+            Some(ended)
+        );
+        // 4 slot-seconds over the first second and 8 over the second.
+        let mean = held_slots.mean("request");
+        assert!((mean - 6.0).abs() < 1e-9, "{mean}");
+    }
+
+    #[tokio::test]
+    async fn the_sampler_stops_reading_before_its_closing_scrape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\n\r\n\
+            zinder_grpc_request_receive_slots_held{pool=\"request\"} 8\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let (first_read_answered, answered) = tokio::sync::oneshot::channel();
+        let later_requests = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let later_requests = Arc::clone(&later_requests);
+            async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0_u8; 512];
+                let _ = socket.read(&mut request).await?;
+                socket.write_all(RESPONSE).await?;
+                drop(socket);
+                let _ = first_read_answered.send(());
+                // Every later answer takes longer than a read interval, so
+                // a reader still running during the closing scrape reads too.
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    later_requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut request = [0_u8; 512];
+                        let _ = socket.read(&mut request).await;
+                        tokio::time::sleep(super::HELD_SLOTS_READ_INTERVAL * 2).await;
+                        let _ = socket.write_all(RESPONSE).await;
+                    });
+                }
+                Ok::<_, std::io::Error>(())
+            }
+        });
+
+        let sampler = HeldSlotsSampler::start(&url, &held_in_request_pool(0));
+        answered.await?;
+        let run_ended = sampler.started.elapsed();
+        let (after, held_slots) = sampler.finish(&url).await?;
+        server.abort();
+
+        assert_eq!(
+            later_requests.load(Ordering::SeqCst),
+            1,
+            "only the closing scrape reaches the server once it starts"
+        );
+        assert!((sum_by_name(&after, super::RECEIVE_SLOTS_HELD) - 8.0).abs() < 1e-9);
+        assert!(
+            held_slots
+                .readings
+                .windows(2)
+                .all(|pair| pair[0].at <= pair[1].at),
+            "{held_slots:?}"
+        );
+        // The closing scrape took two read intervals, but counts as read
+        // when the run ended.
+        assert!(
+            held_slots.readings.last().is_some_and(|closing| {
+                closing.at >= run_ended && closing.at < run_ended + super::HELD_SLOTS_READ_INTERVAL
+            }),
+            "{run_ended:?} {held_slots:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sampler_reads_held_slots_until_the_run_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 512];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.0 200 OK\r\n\r\n\
+                          zinder_grpc_request_receive_slots_held{pool=\"request\"} 8\n",
+                    )
+                    .await;
+            }
+        });
+
+        let sampler = HeldSlotsSampler::start(&url, &held_in_request_pool(0));
+        tokio::time::sleep(super::HELD_SLOTS_READ_INTERVAL * 2 + Duration::from_millis(500)).await;
+        let (_, held_slots) = sampler.finish(&url).await?;
+        server.abort();
+
+        // The reads at both ends, and at least one between them.
+        assert!(held_slots.readings.len() >= 3, "{held_slots:?}");
+        assert!(
+            held_slots
+                .readings
+                .windows(2)
+                .all(|pair| pair[0].at <= pair[1].at)
+        );
+        let mean = held_slots.mean("request");
+        assert!(mean > 0.0 && mean < 8.0, "{mean}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_scrape_after_the_run_keeps_the_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            // Answer the read before the run, then stop listening.
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request).await?;
+            socket.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let observation = RunObservation::start(&url).await?;
+        server.await??;
+
+        let (observed, error) = observation.finish().await;
+
+        assert!(observed.is_none());
+        assert!(
+            error.is_some_and(|error| error.contains(&url)),
+            "the error names the metrics URL"
+        );
         Ok(())
     }
 
@@ -465,7 +1133,8 @@ mod tests {
         server.await??;
 
         assert_eq!(
-            ServerObserved::between(&[], &samples)?.tree_state_replay_refusals,
+            ServerObserved::between(&[], &samples, &HeldSlotsTimeline::default())?
+                .tree_state_replay_refusals,
             5
         );
         assert!(scrape("https://127.0.0.1:1/metrics").await.is_err());

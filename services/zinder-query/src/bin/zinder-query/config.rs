@@ -16,8 +16,8 @@ use zinder_query::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
-    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
+    ClientAddressSource, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
+    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
     ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
     RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
     guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
@@ -41,6 +41,8 @@ pub(super) struct QueryConfig {
     pub(super) listen_addr: SocketAddr,
     pub(super) ops_listen_addr: Option<SocketAddr>,
     pub(super) allow_public_bind: bool,
+    /// How the gRPC listener tells clients apart for its receive limit.
+    pub(super) client_address_source: ClientAddressSource,
     pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(super) pair_convergence_attempts: NonZeroU8,
     /// Longest a tree-state rebuild waits for a rebuild slot.
@@ -165,6 +167,7 @@ struct QuerySection {
     pair_convergence_attempts: Option<u8>,
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
+    trust_proxy_client_address: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -235,6 +238,9 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         listen_addr,
         ops_listen_addr,
         allow_public_bind,
+        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
+            config.query.trust_proxy_client_address.unwrap_or(false),
+        ),
         canonical_reorg_policy,
         pair_convergence_attempts,
         tree_state_replay_wait,
@@ -384,6 +390,9 @@ impl QueryConfigToml {
                 tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
                     .unwrap_or(u64::MAX),
                 tree_state_replay_waiters_per_slot: config.tree_state_replay_waiters_per_slot.get(),
+                trust_proxy_client_address: config
+                    .client_address_source
+                    .trust_proxy_client_address(),
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -398,6 +407,7 @@ struct QueryToml {
     pair_convergence_attempts: u8,
     tree_state_replay_wait_ms: u64,
     tree_state_replay_waiters_per_slot: u32,
+    trust_proxy_client_address: bool,
 }
 
 #[derive(Serialize)]

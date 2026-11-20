@@ -43,9 +43,10 @@ use tower::{
 };
 
 use crate::{
-    GrpcCallTerminationLayer, GrpcReceiveLimitLayer, GrpcSendStallLayer, OpsEndpointHandle,
+    ClientAddressSource, DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTerminationLayer,
+    GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStallLayer, OpsEndpointHandle,
     OpsServerError, Readiness, RuntimeService, cancel_on_terminating_signal,
-    public_grpc_server::{OpenGrpcCalls, supervised_wallet_router},
+    public_grpc_server::{OpenGrpcCalls, supervised_grpc_layers, supervised_wallet_router},
 };
 
 /// Longest a supervised gRPC server may drain after the runtime starts
@@ -153,7 +154,7 @@ impl SupervisedRuntime {
     }
 
     /// Assembles this runtime's public wallet listener, which serves
-    /// `wallet_service`.
+    /// `wallet_service` and tells clients apart by `client_address`.
     ///
     /// The router serves, on the transport policy of
     /// [`crate::public_grpc_server`]:
@@ -183,6 +184,7 @@ impl SupervisedRuntime {
         &self,
         wallet_service: S,
         wallet_descriptor_set: &'static [u8],
+        client_address: ClientAddressSource,
         readiness: &Readiness,
     ) -> Result<SupervisedGrpcRouter, tonic_reflection::server::Error>
     where
@@ -195,7 +197,12 @@ impl SupervisedRuntime {
         S::Future: Send + 'static,
     {
         supervised_wallet_router(
-            Arc::clone(&self.open_calls),
+            supervised_grpc_layers(
+                Arc::clone(&self.open_calls),
+                GrpcReceiveLimits::default(),
+                DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+                client_address,
+            ),
             wallet_service,
             wallet_descriptor_set,
             readiness,

@@ -21,8 +21,8 @@ use zinder_query::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
-    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
+    ClientAddressSource, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
+    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
     ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
     RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
     guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
@@ -69,6 +69,8 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
+    /// How the gRPC listener tells clients apart for its receive limit.
+    pub(crate) client_address_source: ClientAddressSource,
     pub(crate) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(crate) pair_convergence_attempts: NonZeroU8,
     pub(crate) max_concurrent_block_range_streams: NonZeroU32,
@@ -243,6 +245,7 @@ struct CompatSection {
     stale_tip_limit_ms: Option<u64>,
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
+    trust_proxy_client_address: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -264,30 +267,10 @@ fn resolve_lightwalletd_config(
         )
         .into());
     }
-    let wallet = wallet.unwrap_or_default();
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
     let (wallet_primary_path, wallet_secondary_root, wallet_rocksdb_budget) =
-        if matches!(serving, CompatServing::Wallet) {
-            let wallet_primary_path = require_field(wallet.path, "wallet.path")?;
-            let wallet_secondary_root =
-                require_field(wallet.secondary_path, "wallet.secondary_path")?;
-            let wallet_rocksdb_budget =
-                resolve_wallet_projection_reader_rocksdb_budget(wallet.rocksdb)?;
-            require_distinct_storage_paths(
-                &storage.path,
-                &storage.secondary_path,
-                &wallet_primary_path,
-                &wallet_secondary_root,
-            )?;
-            (
-                Some(wallet_primary_path),
-                Some(wallet_secondary_root),
-                Some(wallet_rocksdb_budget),
-            )
-        } else {
-            (None, None, None)
-        };
+        resolve_wallet_storage(serving, wallet.unwrap_or_default(), &storage)?;
     let (tree_state_replay_wait, tree_state_replay_waiters_per_slot) =
         resolve_tree_state_replay(serving, &config.compat)?;
     let ResolvedIngestControlReader {
@@ -327,6 +310,9 @@ fn resolve_lightwalletd_config(
         listen_addr,
         ops_listen_addr,
         allow_public_bind,
+        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
+            config.compat.trust_proxy_client_address.unwrap_or(false),
+        ),
         canonical_reorg_policy,
         pair_convergence_attempts,
         max_concurrent_block_range_streams,
@@ -337,6 +323,38 @@ fn resolve_lightwalletd_config(
         broadcaster,
         node_fallbacks,
     })
+}
+
+/// The wallet primary path, secondary root, and `RocksDB` budget that wallet
+/// serving opens. Compact-block serving opens none.
+type WalletStorage = (
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<RocksDbResourceBudget>,
+);
+
+fn resolve_wallet_storage(
+    serving: CompatServing,
+    wallet: WalletSection,
+    storage: &ResolvedCanonicalSecondaryStorage,
+) -> Result<WalletStorage, LightwalletdConfigError> {
+    if matches!(serving, CompatServing::CompactBlocks) {
+        return Ok((None, None, None));
+    }
+    let wallet_primary_path = require_field(wallet.path, "wallet.path")?;
+    let wallet_secondary_root = require_field(wallet.secondary_path, "wallet.secondary_path")?;
+    let wallet_rocksdb_budget = resolve_wallet_projection_reader_rocksdb_budget(wallet.rocksdb)?;
+    require_distinct_storage_paths(
+        &storage.path,
+        &storage.secondary_path,
+        &wallet_primary_path,
+        &wallet_secondary_root,
+    )?;
+    Ok((
+        Some(wallet_primary_path),
+        Some(wallet_secondary_root),
+        Some(wallet_rocksdb_budget),
+    ))
 }
 
 /// Resolves the wallet-mode broadcast node and its fallbacks.
@@ -419,6 +437,9 @@ impl LightwalletdConfigToml {
                 }),
                 ping_very_insecure: config.ping_very_insecure,
                 serving: config.serving,
+                trust_proxy_client_address: config
+                    .client_address_source
+                    .trust_proxy_client_address(),
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -439,6 +460,7 @@ struct CompatToml {
     stale_tip_limit_ms: u64,
     ping_very_insecure: bool,
     serving: CompatServing,
+    trust_proxy_client_address: bool,
 }
 
 #[derive(Serialize)]

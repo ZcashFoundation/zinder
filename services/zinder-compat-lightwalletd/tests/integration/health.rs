@@ -53,6 +53,7 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
     let router = runtime.public_grpc_router(
         LightwalletdGrpcAdapter::new(wallet_query).into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        zinder_runtime::ClientAddressSource::Connection,
         &readiness,
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

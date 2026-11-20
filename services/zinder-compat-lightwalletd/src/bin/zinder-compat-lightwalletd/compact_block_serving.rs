@@ -4697,6 +4697,7 @@ mod tests {
             CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)))
                 .into_server(),
             zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+            zinder_runtime::ClientAddressSource::Connection,
             &serving_readiness.runtime(),
         )?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;

@@ -968,6 +968,23 @@ identity, the workload's constants, and, over all wallets:
   state reads are also split by `height_band`, the first height of the
   250,000-block band that holds the requested height, in
   `tree_state_stored_reads_by_band` and `tree_state_replayed_reads_by_band`.
+  `receive_evictions` counts requests that lost their receive slot to a
+  client holding fewer, and `receive_pools` describes each receive pool of
+  the server's public gRPC listener: the requests it admitted, refused, and
+  evicted, the slots it held on average when it admitted a request,
+  `peak_slots_held_at_most`, the smallest histogram bucket that holds every
+  admission, the mean time a request held its slot, and `mean_slots_held`,
+  the mean number of slots held at once. The run reads the server's
+  `zinder_grpc_request_receive_slots_held` gauge when it starts, when it ends,
+  and every second between, leaving out reads that fail, and averages the
+  reads over time, so `mean_slots_held` counts slots held across either end of
+  the run and never exceeds the pool's size. The read after the run counts as
+  taken when the wallets finished, however long its scrape takes, and reads
+  that complete after that moment are left out, so the mean covers the run
+  alone. Behind a proxy,
+  `proxy_client_address_fallbacks` counts, by reason, the requests that
+  counted against the proxy's own connection because they lacked one valid
+  client address header.
   A metric the server does not export reads as zero. If the read after the
   run fails, or a counter series went down or disappeared because the server
   restarted during the run, the report keeps its client-side results, leaves

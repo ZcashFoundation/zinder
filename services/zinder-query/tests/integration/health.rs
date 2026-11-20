@@ -42,6 +42,7 @@ async fn native_listener_health_follows_readyz_through_readiness_and_shutdown() 
             .with_traffic_readiness(readiness.clone())
             .into_server(),
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        zinder_runtime::ClientAddressSource::Connection,
         &readiness,
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

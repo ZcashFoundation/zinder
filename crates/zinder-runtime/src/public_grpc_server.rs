@@ -18,6 +18,13 @@
 //! process reads at once across connections. The receive limit does, so
 //! many large requests sent together cannot exhaust memory.
 //!
+//! The receive limit keeps one client from locking the others out by
+//! counting each client's slots. A client is the remote address of its
+//! connection, unless the listener trusts a reverse proxy to name it
+//! ([`ClientAddressSource::ProxyHeader`]). A proxy reaches the listener over
+//! a few pooled connections, so without that header every client behind it
+//! counts as the same few.
+//!
 //! A wallet listener, which [`crate::SupervisedRuntime::public_grpc_router`]
 //! assembles, serves the wallet service behind the
 //! [`TrafficReadinessInterceptor`], and gRPC reflection and
@@ -113,9 +120,22 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
     "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
 ];
 
+/// Request header in which a trusted reverse proxy names the client
+/// connection a request arrived on, as one `ip:port` address.
+///
+/// Read only when the listener uses [`ClientAddressSource::ProxyHeader`].
+pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
+
 const RECEIVE_REFUSALS_METRIC: &str = "zinder_grpc_request_receive_refusals_total";
 const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_total";
 const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
+const RECEIVE_SLOTS_HELD_METRIC: &str = "zinder_grpc_request_receive_slots_held";
+pub(crate) const RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC: &str =
+    "zinder_grpc_request_receive_slots_held_at_admission";
+const RECEIVE_SLOT_HOLD_DURATION_METRIC: &str =
+    "zinder_grpc_request_receive_slot_hold_duration_seconds";
+const PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC: &str =
+    "zinder_grpc_proxy_client_address_fallbacks_total";
 const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
 
 /// The layers every public Zinder listener applies to its requests.
@@ -132,14 +152,16 @@ pub(crate) type SupervisedGrpcLayers = Stack<
 >;
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
-/// default receive limits and send stall timeout.
+/// default receive limits and send stall timeout, telling clients apart by
+/// `client_address`.
 ///
 /// Add services and serve as with [`tonic::transport::Server::builder`].
 #[must_use]
-pub fn public_grpc_server() -> PublicGrpcServer {
+pub fn public_grpc_server(client_address: ClientAddressSource) -> PublicGrpcServer {
     public_grpc_server_with(
         GrpcReceiveLimits::default(),
         DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+        client_address,
     )
 }
 
@@ -152,14 +174,16 @@ pub fn public_grpc_server() -> PublicGrpcServer {
 pub fn public_grpc_server_with(
     limits: GrpcReceiveLimits,
     send_stall_timeout: Duration,
+    client_address: ClientAddressSource,
 ) -> PublicGrpcServer {
     describe_limit_metrics();
     public_grpc_transport()
-        .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcReceiveLimitLayer::new(limits, client_address))
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
 
-/// The layers of a supervised listener.
+/// The layers of a supervised listener, telling clients apart by
+/// `client_address`.
 ///
 /// Call termination wraps the others, so a terminated call drops what the
 /// send stall bound still holds of its response, and a refused call never
@@ -168,11 +192,12 @@ pub(crate) fn supervised_grpc_layers(
     calls: Arc<OpenGrpcCalls>,
     limits: GrpcReceiveLimits,
     send_stall_timeout: Duration,
+    client_address: ClientAddressSource,
 ) -> SupervisedGrpcLayers {
     describe_limit_metrics();
     ServiceBuilder::new()
         .layer(GrpcCallTerminationLayer::new(calls))
-        .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcReceiveLimitLayer::new(limits, client_address))
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
         .into_inner()
 }
@@ -188,10 +213,11 @@ fn public_grpc_transport() -> Server {
 /// Assembles a supervised wallet listener that serves `wallet_service`
 /// behind the traffic gate, and reflection and health outside it.
 ///
-/// `calls` can end every call the listener serves, and open health `Watch`
-/// streams end once `drain` is cancelled.
+/// `layers`, from [`supervised_grpc_layers`], apply to every call the
+/// listener serves, and open health `Watch` streams end once `drain` is
+/// cancelled.
 pub(crate) fn supervised_wallet_router<S>(
-    calls: Arc<OpenGrpcCalls>,
+    layers: SupervisedGrpcLayers,
     wallet_service: S,
     wallet_descriptor_set: &'static [u8],
     readiness: &Readiness,
@@ -214,14 +240,50 @@ where
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
     Ok(public_grpc_transport()
-        .layer(supervised_grpc_layers(
-            calls,
-            GrpcReceiveLimits::default(),
-            DEFAULT_GRPC_SEND_STALL_TIMEOUT,
-        ))
+        .layer(layers)
         .add_service(gated_wallet_service)
         .add_service(reflection)
         .add_service(health))
+}
+
+/// Where a public listener learns which client sent a request, so that the
+/// receive limit can keep one client from locking the others out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientAddressSource {
+    /// The remote address of the connection the request arrived on. Use it
+    /// when clients connect to the listener directly.
+    #[default]
+    Connection,
+    /// The [`PROXY_CLIENT_ADDRESS_HEADER`] that a reverse proxy sets on every
+    /// request it forwards. A request counts against the connection's remote
+    /// address instead when it carries no such header, carries it more than
+    /// once or as a comma-separated list, or carries a value that is not one
+    /// `ip:port` address.
+    ///
+    /// Any client that reaches the listener can set the header, so use this
+    /// only when the listener is reachable solely through a proxy that
+    /// replaces it.
+    ProxyHeader,
+}
+
+impl ClientAddressSource {
+    /// The source for a listener whose `trust_proxy_client_address` setting
+    /// is `trusted`.
+    #[must_use]
+    pub const fn from_trust_proxy_client_address(trusted: bool) -> Self {
+        if trusted {
+            Self::ProxyHeader
+        } else {
+            Self::Connection
+        }
+    }
+
+    /// The `trust_proxy_client_address` setting that selects this source.
+    #[must_use]
+    pub const fn trust_proxy_client_address(self) -> bool {
+        matches!(self, Self::ProxyHeader)
+    }
 }
 
 /// Returns the gRPC reflection v1 service for a public Zinder listener,
@@ -266,7 +328,31 @@ fn describe_limit_metrics() {
         RECEIVE_EVICTIONS_METRIC,
         metrics::Unit::Count,
         "gRPC requests cancelled with UNAVAILABLE because a full pool gave their slot to a \
-         request from a connection holding fewer slots. Label: pool (request|client_stream)."
+         request from a client holding fewer slots. Label: pool (request|client_stream)."
+    );
+    metrics::describe_gauge!(
+        RECEIVE_SLOTS_HELD_METRIC,
+        metrics::Unit::Count,
+        "Receive slots a pool holds now. Label: pool (request|client_stream)."
+    );
+    metrics::describe_histogram!(
+        RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC,
+        metrics::Unit::Count,
+        "Receive slots a pool held once it admitted a gRPC request, the request's own slot \
+         included. Label: pool (request|client_stream)."
+    );
+    metrics::describe_histogram!(
+        RECEIVE_SLOT_HOLD_DURATION_METRIC,
+        metrics::Unit::Seconds,
+        "Time an admitted gRPC request held its receive slot, until its request arrived, its \
+         client stream ended, or another client's request took the slot. \
+         Label: pool (request|client_stream)."
+    );
+    metrics::describe_counter!(
+        PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+        metrics::Unit::Count,
+        "gRPC requests on a listener that trusts its proxy's client address that counted \
+         against the proxy's own connection. Label: reason (missing|repeated|invalid)."
     );
     metrics::describe_counter!(
         SEND_STALLS_METRIC,
@@ -331,10 +417,11 @@ impl Default for GrpcReceiveLimits {
 ///   `DEADLINE_EXCEEDED`.
 ///
 /// When a pool is full, a new request takes the oldest slot of the client
-/// connection holding the most slots, provided that connection holds more
-/// than the requester's; the evicted request fails with `UNAVAILABLE`.
-/// Otherwise the new request is refused with `UNAVAILABLE` and its body is
-/// never read. One connection therefore cannot lock the others out.
+/// holding the most slots, provided that client holds more than the
+/// requester; the evicted request fails with `UNAVAILABLE`. Otherwise the
+/// new request is refused with `UNAVAILABLE` and its body is never read. One
+/// client therefore cannot lock the others out. A client is the address that
+/// [`ClientAddressSource`] names.
 ///
 /// Every clone shares the same slots, so one layer bounds the whole server.
 #[derive(Clone, Debug)]
@@ -343,14 +430,16 @@ pub struct GrpcReceiveLimitLayer {
 }
 
 impl GrpcReceiveLimitLayer {
-    /// Creates a layer whose slots are shared by every connection it wraps.
+    /// Creates a layer whose slots are shared by every connection it wraps,
+    /// telling clients apart by `client_address`.
     #[must_use]
-    pub fn new(limits: GrpcReceiveLimits) -> Self {
+    pub fn new(limits: GrpcReceiveLimits, client_address: ClientAddressSource) -> Self {
         Self {
             pools: ReceivePools {
-                requests: ReceiveSlots::new(limits.slots_per_pool),
-                client_streams: ReceiveSlots::new(limits.slots_per_pool),
+                requests: ReceiveSlots::new(limits.slots_per_pool, ReceivePool::Request),
+                client_streams: ReceiveSlots::new(limits.slots_per_pool, ReceivePool::ClientStream),
                 receive_timeout: limits.receive_timeout,
+                client_address,
             },
         }
     }
@@ -388,7 +477,8 @@ where
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let pool = ReceivePool::for_path(request.uri().path());
-        let Some(admission) = self.pools.slots(pool).claim(remote_address(&request)) else {
+        let client = client_address(&request, self.pools.client_address);
+        let Some(admission) = self.pools.slots(pool).claim(client) else {
             metrics::counter!(RECEIVE_REFUSALS_METRIC, "pool" => pool.label()).increment(1);
             return Either::Left(ready(Ok(too_many_requests().into_http())));
         };
@@ -422,6 +512,67 @@ where
     }
 }
 
+/// The client a request counts against, as `source` names it.
+fn client_address<B>(
+    request: &http::Request<B>,
+    source: ClientAddressSource,
+) -> Option<SocketAddr> {
+    match source {
+        ClientAddressSource::Connection => remote_address(request),
+        ClientAddressSource::ProxyHeader => match proxy_named_client(request.headers()) {
+            Ok(client) => Some(client),
+            Err(fallback) => {
+                metrics::counter!(
+                    PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+                    "reason" => fallback.label()
+                )
+                .increment(1);
+                remote_address(request)
+            }
+        },
+    }
+}
+
+/// Why a request on a listener that trusts its proxy counts against the
+/// proxy's own connection instead of the client the proxy names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyHeaderFallback {
+    /// The request carries no [`PROXY_CLIENT_ADDRESS_HEADER`].
+    Missing,
+    /// The request carries the header more than once, or as a
+    /// comma-separated list. Which value the proxy set is unknown, and a
+    /// proxy that appends to the header rather than replacing it forwards
+    /// the client's own value first.
+    Repeated,
+    /// The header is not one `ip:port` address.
+    Invalid,
+}
+
+impl ProxyHeaderFallback {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Repeated => "repeated",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// The client connection that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in
+/// `headers` names.
+fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHeaderFallback> {
+    let mut fields = headers.get_all(PROXY_CLIENT_ADDRESS_HEADER).iter();
+    let field = fields.next().ok_or(ProxyHeaderFallback::Missing)?;
+    if fields.next().is_some() {
+        return Err(ProxyHeaderFallback::Repeated);
+    }
+    let address = field.to_str().map_err(|_| ProxyHeaderFallback::Invalid)?;
+    if address.contains(',') {
+        return Err(ProxyHeaderFallback::Repeated);
+    }
+    address.parse().map_err(|_| ProxyHeaderFallback::Invalid)
+}
+
 /// The remote address of the connection a request arrived on, which tonic
 /// records in the request extensions before any user layer runs.
 fn remote_address<B>(request: &http::Request<B>) -> Option<SocketAddr> {
@@ -445,6 +596,7 @@ struct ReceivePools {
     requests: Arc<ReceiveSlots>,
     client_streams: Arc<ReceiveSlots>,
     receive_timeout: Duration,
+    client_address: ClientAddressSource,
 }
 
 impl ReceivePools {
@@ -599,12 +751,123 @@ fn timeout_status(pool: ReceivePool) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use prost::Message as _;
     use prost_types::FileDescriptorSet;
+    use tonic::transport::server::TcpConnectInfo;
 
-    use super::CLIENT_STREAMING_METHOD_PATHS;
+    use super::{
+        CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, PROXY_CLIENT_ADDRESS_HEADER,
+        client_address,
+    };
+
+    const PROXY_CONNECTION: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
+
+    /// A request arriving on the proxy's connection, carrying one
+    /// [`PROXY_CLIENT_ADDRESS_HEADER`] field per entry of `fields`.
+    fn proxied_request(fields: &[&str]) -> Result<http::Request<()>, http::Error> {
+        let mut builder = http::Request::builder();
+        for field in fields {
+            builder = builder.header(PROXY_CLIENT_ADDRESS_HEADER, *field);
+        }
+        let mut request = builder.body(())?;
+        request.extensions_mut().insert(TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(PROXY_CONNECTION),
+        });
+        Ok(request)
+    }
+
+    #[test]
+    fn a_trusted_proxy_header_names_the_client() -> Result<(), Box<dyn std::error::Error>> {
+        for (header, client) in [
+            ("203.0.113.7:51234", "203.0.113.7:51234"),
+            ("[2001:db8::7]:443", "[2001:db8::7]:443"),
+        ] {
+            let request = proxied_request(&[header])?;
+            assert_eq!(
+                client_address(&request, ClientAddressSource::ProxyHeader),
+                Some(client.parse()?)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_listener_that_trusts_no_proxy_ignores_the_header() -> Result<(), http::Error> {
+        let request = proxied_request(&["203.0.113.7:51234"])?;
+        assert_eq!(
+            client_address(&request, ClientAddressSource::Connection),
+            Some(PROXY_CONNECTION)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_proxy_header_that_is_not_one_address_counts_the_connection() -> Result<(), http::Error> {
+        let not_one_address: [&[&str]; 9] = [
+            &[],
+            &["203.0.113.7"],
+            &["client-1"],
+            &[""],
+            &[" 203.0.113.7:51234"],
+            &["203.0.113.7:51234, 198.51.100.4:443"],
+            &["203.0.113.7:51234,"],
+            // A proxy that appends instead of replacing forwards the
+            // client's value first.
+            &["198.51.100.4:443", "203.0.113.7:51234"],
+            &["203.0.113.7:51234", "203.0.113.7:51234"],
+        ];
+        for fields in not_one_address {
+            let request = proxied_request(fields)?;
+            assert_eq!(
+                client_address(&request, ClientAddressSource::ProxyHeader),
+                Some(PROXY_CONNECTION),
+                "{fields:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_header_fallbacks_are_counted_by_reason_without_the_address() -> Result<(), http::Error>
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let requests = [
+            proxied_request(&[])?,
+            proxied_request(&["198.51.100.4:443", "203.0.113.7:51234"])?,
+            proxied_request(&["203.0.113.7:51234, 198.51.100.4:443"])?,
+            proxied_request(&["203.0.113.7"])?,
+            proxied_request(&["203.0.113.7:51234"])?,
+        ];
+
+        metrics::with_local_recorder(&recorder, || {
+            for request in &requests {
+                let _ = client_address(request, ClientAddressSource::ProxyHeader);
+            }
+            // A listener that trusts no proxy never reads the header.
+            let _ = client_address(&requests[0], ClientAddressSource::Connection);
+        });
+
+        let exposition = handle.render();
+        for expected in [
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"missing\"} 1",
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"repeated\"} 2",
+            "zinder_grpc_proxy_client_address_fallbacks_total{reason=\"invalid\"} 1",
+        ] {
+            assert!(exposition.contains(expected), "{expected}\n{exposition}");
+        }
+        for address in ["203.0.113.7", "198.51.100.4", "127.0.0.1"] {
+            assert!(!exposition.contains(address), "{exposition}");
+        }
+        Ok(())
+    }
 
     /// Every client-streaming method a public server can register.
     #[test]

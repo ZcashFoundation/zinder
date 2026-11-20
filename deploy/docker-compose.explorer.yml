@@ -53,6 +53,9 @@ services:
       ZINDER_EXPLORER__LISTEN_ADDR: "[::]:9068"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9069"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      # Same trust rule as ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS in
+      # docker-compose.yml.
+      ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "zinder-explorer", "healthcheck"]
       interval: 30s

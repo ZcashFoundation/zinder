@@ -632,7 +632,9 @@ mod tests {
     use tower::{Layer as _, Service as _, ServiceExt as _, service_fn};
 
     use super::{GrpcCallTerminationLayer, OpenGrpcCalls};
-    use crate::{GrpcReceiveLimits, public_grpc_server::supervised_grpc_layers};
+    use crate::{
+        ClientAddressSource, GrpcReceiveLimits, public_grpc_server::supervised_grpc_layers,
+    };
 
     type TestError = Box<dyn std::error::Error + Send + Sync>;
     type TestResult = Result<(), TestError>;
@@ -939,6 +941,7 @@ mod tests {
             Arc::clone(&calls),
             GrpcReceiveLimits::default(),
             Duration::from_hours(1),
+            ClientAddressSource::Connection,
         )
         .layer(service_fn(move |_request: http::Request<Body>| {
             let frames = tokio_stream::once(Ok::<_, Status>(http_body::Frame::data(chunk.clone())))
