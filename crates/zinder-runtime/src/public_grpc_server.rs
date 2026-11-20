@@ -25,11 +25,11 @@
 //! a few pooled connections, so without that header every client behind it
 //! counts as the same few.
 //!
-//! A wallet listener, which [`crate::SupervisedRuntime::public_grpc_router`]
-//! assembles, serves the wallet service behind the
+//! A public gRPC listener, which [`crate::SupervisedRuntime::public_grpc_router`]
+//! assembles, serves the application service behind the
 //! [`TrafficReadinessInterceptor`], and gRPC reflection and
 //! `grpc.health.v1.Health` outside it, so both keep answering while the
-//! runtime refuses wallet calls. Both reflection versions apply the public
+//! runtime refuses application calls. Both reflection versions apply the public
 //! request size bound. Every call on the listener also passes through
 //! [`GrpcCallTerminationLayer`], outside every other layer, which ends the
 //! calls still open once the runtime's drain deadline passes.
@@ -216,36 +216,39 @@ pub(crate) fn public_grpc_transport() -> Server {
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
 }
 
-/// Assembles a supervised wallet listener that serves `wallet_service`
+/// Assembles a supervised listener that serves `application_service`
 /// behind the traffic gate, and reflection and health outside it.
 ///
 /// Open health `Watch` streams end once `drain` is cancelled.
-pub(crate) fn supervised_wallet_router<S, L>(
+pub(crate) fn supervised_router<S, L, ResponseBody>(
     mut server: Server<L>,
-    wallet_service: S,
-    wallet_descriptor_set: &'static [u8],
+    application_service: S,
+    descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
 ) -> Result<Router<L>, tonic_reflection::server::Error>
 where
     L: Clone,
-    S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
+    S: Service<http::Request<Body>, Response = http::Response<ResponseBody>, Error = Infallible>
         + NamedService
         + Clone
         + Send
         + Sync
         + 'static,
     S::Future: Send + 'static,
+    ResponseBody: http_body::Body<Data = Bytes, Error: Into<axum::BoxError>> + Send + 'static,
 {
     let health = public_grpc_health(readiness, drain, S::NAME);
-    let gated_wallet_service = InterceptedService::new(
-        wallet_service,
+    let gated_application_service = InterceptedService::new(
+        application_service,
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
-    let mut router = server.add_service(gated_wallet_service).add_service(health);
+    let mut router = server
+        .add_service(gated_application_service)
+        .add_service(health);
     let descriptors = || {
         ReflectionBuilder::configure()
-            .register_encoded_file_descriptor_set(wallet_descriptor_set)
+            .register_encoded_file_descriptor_set(descriptor_set)
             .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
     };
     let mut v1 = descriptors();

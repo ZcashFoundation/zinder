@@ -264,9 +264,10 @@ where
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = tokio::time::sleep(poll_interval) => {
+                () = async {
+                    tokio::time::sleep(poll_interval).await;
                     run_upstream_observation_probe_once(source.as_ref(), &cache).await;
-                }
+                } => {}
             }
         }
     })
