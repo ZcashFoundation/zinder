@@ -228,9 +228,11 @@ pub struct WalletTransitionLimitExceededDetail {
 pub struct CanonicalStoreDamagedDetail {
     /// Height of the first stored row that failed verification. A damaged
     /// table block that holds several rows is reported at the first height it
-    /// may hold.
-    #[prost(uint32, tag = "1")]
-    pub height: u32,
+    /// may hold. Absent when ingest cannot tell where the damage is because it
+    /// cannot read the record of its last verification, until a full
+    /// verification passes.
+    #[prost(uint32, optional, tag = "1")]
+    pub height: ::core::option::Option<u32>,
     /// Node RPC name of the pool whose frontier failed: `sapling`, `orchard`, or
     /// `ironwood`. Absent when the row failed outside any one pool, such as a
     /// key that is not a height or a block that fails its checksum.

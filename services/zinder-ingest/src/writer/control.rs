@@ -1995,7 +1995,9 @@ pub(crate) mod test_support {
         assert_eq!(attested.canonical_store_damaged, None);
 
         let damage = CanonicalStoreDamage {
-            height: zinder_core::BlockHeight::new(1),
+            site: crate::tree_state_verification::CanonicalStoreDamageSite::Row(
+                zinder_core::BlockHeight::new(1),
+            ),
             pool: Some(zinder_core::ShieldedProtocol::Sapling),
         };
         store_damage.report(damage);

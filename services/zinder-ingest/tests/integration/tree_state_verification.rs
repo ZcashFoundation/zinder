@@ -15,7 +15,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol};
 use zinder_ingest::{
-    CanonicalStoreDamage, CanonicalStoreDamageSignal, HistoricalWorkGate,
+    CanonicalStoreDamage, CanonicalStoreDamageSignal, CanonicalStoreDamageSite, HistoricalWorkGate,
     TREE_STATE_VERIFICATION_WATERMARK_FILE, TreeStateVerificationConfig,
     TreeStateVerificationContext, spawn_tree_state_verification_task,
 };
@@ -38,9 +38,19 @@ const DAMAGED_HEIGHT: u32 = 200;
 
 fn damaged_row() -> CanonicalStoreDamage {
     CanonicalStoreDamage {
-        height: BlockHeight::new(DAMAGED_HEIGHT),
+        site: CanonicalStoreDamageSite::Row(BlockHeight::new(DAMAGED_HEIGHT)),
         pool: Some(ShieldedProtocol::Sapling),
     }
+}
+
+/// The record a pass that found the damaged row leaves.
+fn damaged_row_record(store: &PublishedStore) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "construction_manifest_sha256": store.manifest_sha256,
+        "next_height": DAMAGED_HEIGHT,
+        "damaged": {"site": "row", "height": DAMAGED_HEIGHT, "pool": "sapling"},
+    })
 }
 
 fn damaged_cause() -> ReadinessCause {
@@ -95,9 +105,7 @@ async fn a_damaged_row_is_reported_to_readers_and_parks_readiness() -> eyre::Res
     );
     let watermark = store.watermark()?;
     eyre::ensure!(
-        watermark["next_height"] == DAMAGED_HEIGHT
-            && watermark["damaged"]["height"] == DAMAGED_HEIGHT
-            && watermark["damaged"]["pool"] == "sapling",
+        watermark == damaged_row_record(&store),
         "the pass must record the damaged row so a restart reports it again: {watermark}"
     );
     Ok(())
@@ -164,12 +172,7 @@ async fn a_restart_reports_recorded_damage_at_once_and_confirms_it_without_histo
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recorded_damage_the_row_no_longer_shows_is_cleared() -> eyre::Result<()> {
     let store = PublishedStore::new()?;
-    store.write_watermark(&serde_json::json!({
-        "version": 1,
-        "construction_manifest_sha256": store.manifest_sha256,
-        "next_height": DAMAGED_HEIGHT,
-        "damaged": {"height": DAMAGED_HEIGHT, "pool": "sapling"},
-    }))?;
+    store.write_watermark(&damaged_row_record(&store))?;
     let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
     eyre::ensure!(store_damage.current() == Some(damaged_row()));
     let closed_gate = closed_gate();
@@ -218,11 +221,7 @@ async fn damage_found_under_a_reorg_halt_keeps_the_halt() -> eyre::Result<()> {
 async fn damage_is_reported_before_its_record_is_written() -> eyre::Result<()> {
     let store = PublishedStore::new()?;
     store.flip_first_root_byte(DAMAGED_HEIGHT)?;
-    // Opening a FIFO for writing blocks until a reader opens it, so the
-    // record's staged write cannot finish until the test reads it.
-    let staged = store.watermark_path().with_extension("json.tmp");
-    let fifo = std::process::Command::new("mkfifo").arg(&staged).status()?;
-    eyre::ensure!(fifo.success(), "mkfifo failed");
+    let staged = store.block_record_on_a_fifo()?;
     let gate = following_tip_gate();
     let store_damage = CanonicalStoreDamageSignal::default();
     let task = store.spawn_pass(&gate, &store_damage, CancellationToken::new())?;
@@ -230,7 +229,11 @@ async fn damage_is_reported_before_its_record_is_written() -> eyre::Result<()> {
     let reported = wait_until(|| store_damage.current().is_some()).await;
     let parked = gate.readiness().admission_state().cause == damaged_cause();
     let unwritten = !store.watermark_path().exists();
-    let drained = tokio::task::spawn_blocking(move || std::fs::read(&staged)).await??;
+    let staged_path = staged.clone();
+    let drained = tokio::task::spawn_blocking(move || std::fs::read(&staged_path)).await??;
+    // A FIFO cannot be synced, so that write fails; the next one writes a
+    // file once the FIFO is gone.
+    std::fs::remove_file(&staged)?;
     tokio::time::timeout(PASS_DEADLINE, task)
         .await
         .map_err(|_| eyre::eyre!("the pass must end once its record is written"))??;
@@ -239,6 +242,138 @@ async fn damage_is_reported_before_its_record_is_written() -> eyre::Result<()> {
     eyre::ensure!(parked, "readiness must be parked while the record waits");
     eyre::ensure!(unwritten, "the record must still be waiting on the disk");
     eyre::ensure!(!drained.is_empty(), "the pass then writes its record");
+    eyre::ensure!(store.watermark()? == damaged_row_record(&store));
+    Ok(())
+}
+
+/// A damage record that fails to reach the disk is written again until it
+/// does, and the damage stays reported meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_damage_record_is_written_again_until_it_succeeds() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    let staged = store.block_record_on_a_fifo()?;
+    let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
+    let task = store.spawn_pass(&gate, &store_damage, CancellationToken::new())?;
+
+    // Opening the FIFO returns once the pass opens it to write the record;
+    // closing it at once fails that write.
+    let staged_path = staged.clone();
+    tokio::time::timeout(
+        PASS_DEADLINE,
+        tokio::task::spawn_blocking(move || std::fs::File::open(&staged_path).map(drop)),
+    )
+    .await
+    .map_err(|_| eyre::eyre!("the pass must try to write its record"))???;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let retrying = !task.is_finished();
+    let reported_while_unwritten =
+        store_damage.current() == Some(damaged_row()) && !store.watermark_path().exists();
+    std::fs::remove_file(&staged)?;
+    tokio::time::timeout(PASS_DEADLINE, task)
+        .await
+        .map_err(|_| eyre::eyre!("the pass must end once its record is written"))??;
+
+    eyre::ensure!(retrying, "a failed damage record must be written again");
+    eyre::ensure!(
+        reported_while_unwritten,
+        "the damage must stay reported while its record is not written"
+    );
+    eyre::ensure!(
+        store.watermark()? == damaged_row_record(&store),
+        "the retried write must record the damage"
+    );
+    eyre::ensure!(store_damage.current() == Some(damaged_row()));
+    eyre::ensure!(gate.readiness().admission_state().cause == damaged_cause());
+    Ok(())
+}
+
+/// Damage recorded at a row clears only once that row is stored and passes.
+///
+/// The row at 200 is the cadence checkpoint every reconstruction from 200 to
+/// 299 seeds from, so a restart that finds it gone keeps reporting the
+/// damage even though every row above it passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_damage_at_a_row_that_is_gone_stays_reported() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.write_watermark(&damaged_row_record(&store))?;
+    delete_checkpoint_row(&store.primary_path, DAMAGED_HEIGHT)?;
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    let closed_gate = closed_gate();
+
+    store
+        .run_until_the_pass_ends(&closed_gate, &store_damage)
+        .await?;
+
+    eyre::ensure!(
+        store_damage.current() == Some(damaged_row()),
+        "a missing damaged row must stay reported, got {:?}",
+        store_damage.current()
+    );
+    eyre::ensure!(
+        closed_gate.readiness().admission_state().cause == damaged_cause(),
+        "a missing damaged row must park readiness"
+    );
+    eyre::ensure!(store.watermark()? == damaged_row_record(&store));
+    Ok(())
+}
+
+/// A record ingest cannot read is damage at an unknown height, reported from
+/// the start, until a full cycle passes without historical work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_record_is_damage_until_a_full_cycle_passes() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    std::fs::write(store.watermark_path(), b"{\"version\": 1, \"next_he")?;
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    eyre::ensure!(
+        store_damage.current()
+            == Some(CanonicalStoreDamage {
+                site: CanonicalStoreDamageSite::Unknown,
+                pool: None,
+            }),
+        "an unreadable record must be reported as damage, got {:?}",
+        store_damage.current()
+    );
+    let closed_gate = closed_gate();
+    let cancel = CancellationToken::new();
+    let task = store.spawn_pass(&closed_gate, &store_damage, cancel.clone())?;
+
+    let cleared = wait_until(|| store_damage.current().is_none()).await;
+    let recorded = store.watermark();
+    cancel.cancel();
+    task.await?;
+
+    cleared.map_err(|_| eyre::eyre!("a full cycle must clear damage at an unknown height"))?;
+    let recorded = recorded?;
+    eyre::ensure!(
+        recorded["next_height"] == 0 && recorded.get("damaged").is_none(),
+        "the passed cycle must replace the unreadable record: {recorded}"
+    );
+    eyre::ensure!(
+        closed_gate.readiness().admission_state().cause == ReadinessCause::Starting,
+        "a passed cycle must not park readiness"
+    );
+    Ok(())
+}
+
+/// The full cycle behind an unreadable record finds damage the record may
+/// have held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_record_over_a_damaged_row_reports_that_row() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    std::fs::write(store.watermark_path(), b"not json")?;
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    let closed_gate = closed_gate();
+
+    store
+        .run_until_the_pass_ends(&closed_gate, &store_damage)
+        .await?;
+
+    eyre::ensure!(store_damage.current() == Some(damaged_row()));
+    eyre::ensure!(closed_gate.readiness().admission_state().cause == damaged_cause());
+    eyre::ensure!(store.watermark()? == damaged_row_record(&store));
     Ok(())
 }
 
@@ -375,6 +510,18 @@ impl PublishedStore {
         Ok(())
     }
 
+    /// Puts a FIFO where the pass stages its record and returns its path.
+    ///
+    /// Opening a FIFO for writing blocks until a reader opens it, so the
+    /// staged write cannot finish until the test reads it, and a FIFO cannot
+    /// be synced, so that write then fails.
+    fn block_record_on_a_fifo(&self) -> eyre::Result<PathBuf> {
+        let staged = self.watermark_path().with_extension("json.tmp");
+        let fifo = std::process::Command::new("mkfifo").arg(&staged).status()?;
+        eyre::ensure!(fifo.success(), "mkfifo failed");
+        Ok(staged)
+    }
+
     /// Flips a byte of the first stored root of the row at `height`, which
     /// follows the block time and the presence bitmap.
     fn flip_first_root_byte(&self, height: u32) -> eyre::Result<()> {
@@ -386,6 +533,21 @@ impl PublishedStore {
             Ok(())
         })
     }
+}
+
+fn delete_checkpoint_row(primary_path: &Path, height: u32) -> eyre::Result<()> {
+    let options = rust_rocksdb::Options::default();
+    let column_families = rust_rocksdb::DB::list_cf(&options, primary_path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, primary_path, &column_families)?;
+    let family = db
+        .cf_handle("tree_state_checkpoint")
+        .ok_or_else(|| eyre::eyre!("a canonical store owns the tree-state checkpoint family"))?;
+    db.delete_cf(
+        &family,
+        zinder_core::wire::encode_height_key_ascending(BlockHeight::new(height)),
+    )?;
+    db.flush_cf(&family)?;
+    Ok(())
 }
 
 fn rewrite_checkpoint_row(

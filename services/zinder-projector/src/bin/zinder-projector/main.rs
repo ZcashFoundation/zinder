@@ -2854,7 +2854,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut probe = BurstProbe::new(2, None);
         probe.store_damage = Some(zinder_proto::wire::canonical_store_damaged_detail(
-            BlockHeight::new(1),
+            Some(BlockHeight::new(1)),
             None,
         ));
 

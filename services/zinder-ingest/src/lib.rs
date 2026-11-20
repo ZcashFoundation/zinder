@@ -76,7 +76,7 @@ pub use tree_state_densification::{
     TreeStateStrideWriter, spawn_tree_state_densification_task,
 };
 pub use tree_state_verification::{
-    CanonicalStoreDamage, CanonicalStoreDamageSignal,
+    CanonicalStoreDamage, CanonicalStoreDamageSignal, CanonicalStoreDamageSite,
     DEFAULT_TREE_STATE_VERIFICATION_MAX_ROWS_PER_SECOND, TREE_STATE_VERIFICATION_WATERMARK_FILE,
     TreeStateVerificationConfig, TreeStateVerificationContext, spawn_tree_state_verification_task,
 };

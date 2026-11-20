@@ -5203,14 +5203,14 @@ mod tests {
 
         control.set_writer_status(CanonicalWriterStatusResponse {
             canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
-                BlockHeight::new(1),
+                Some(BlockHeight::new(1)),
                 Some(zinder_core::ShieldedProtocol::Sapling),
             )),
             ..writer_status_for_store(&canonical_primary)
         });
         publisher.refresh_once().await?;
         let damaged = zinder_runtime::ReadinessCause::CanonicalStoreDamaged {
-            height: 1,
+            height: Some(1),
             pool: Some("sapling"),
         };
         assert_eq!(readiness.report().cause, damaged);

@@ -102,7 +102,9 @@ pub use tree_state_densification::{
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
 pub use tree_state_verification::{
-    TreeStateCheckpointMismatch, TreeStateCheckpointVerification, TreeStateVerificationError,
+    RocksDbTreeStateVerifier, TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
+    TreeStateCheckpointRowVerification, TreeStateCheckpointVerification,
+    TreeStateVerificationError,
 };
 
 /// Exact persisted identity of the clean canonical store.

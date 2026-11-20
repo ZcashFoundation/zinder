@@ -1160,7 +1160,7 @@ mod tests {
     fn damaged_store_writer_status() -> CanonicalWriterStatusResponse {
         CanonicalWriterStatusResponse {
             canonical_store_damaged: Some(canonical_store_damaged_detail(
-                BlockHeight::new(42),
+                Some(BlockHeight::new(42)),
                 Some(ShieldedProtocol::Orchard),
             )),
             ..following_writer_status()
@@ -1176,7 +1176,7 @@ mod tests {
         let damaged = ReadinessState {
             current_height: Some(7),
             ..ReadinessState::not_ready(ReadinessCause::CanonicalStoreDamaged {
-                height: 42,
+                height: Some(42),
                 pool: Some("orchard"),
             })
         };

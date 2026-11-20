@@ -808,7 +808,7 @@ mod tests {
 
         let parked = composed.park_admission_unless_parked(ReadinessState::not_ready(
             ReadinessCause::CanonicalStoreDamaged {
-                height: 5,
+                height: Some(5),
                 pool: None,
             },
         ));
@@ -823,7 +823,7 @@ mod tests {
         assert!(
             unparked.park_admission_unless_parked(ReadinessState::not_ready(
                 ReadinessCause::CanonicalStoreDamaged {
-                    height: 5,
+                    height: Some(5),
                     pool: None,
                 },
             ))
@@ -831,7 +831,7 @@ mod tests {
         unparked.publish_admission(ReadinessState::ready(Some(11)));
         assert!(matches!(
             unparked.admission_state().cause,
-            ReadinessCause::CanonicalStoreDamaged { height: 5, .. }
+            ReadinessCause::CanonicalStoreDamaged { height: Some(5), .. }
         ));
     }
 

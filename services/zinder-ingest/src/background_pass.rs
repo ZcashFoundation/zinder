@@ -11,8 +11,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbResourceBudget, RocksDbTreeStateVerifier,
 };
 
 use crate::runtime_config::{
@@ -34,6 +34,52 @@ pub(crate) struct BackgroundSecondary<'pass> {
     pub(crate) resource_budget: RocksDbResourceBudget,
 }
 
+/// A canonical secondary handle a background pass reads through.
+pub(crate) trait BackgroundSecondaryHandle: Sized + Send + 'static {
+    /// Opens the handle as `RocksDbCanonicalSecondary::open_ready` does.
+    fn open_ready(opening: &SecondaryOpening) -> Result<Self, CanonicalStoreError>;
+}
+
+impl BackgroundSecondaryHandle for RocksDbCanonicalSecondary {
+    fn open_ready(opening: &SecondaryOpening) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready(
+            &opening.primary_path,
+            &opening.secondary_path,
+            &opening.activations,
+            opening.workload,
+            opening.raw_blob_retention,
+            opening.reorg_policy,
+            opening.resource_budget,
+        )
+    }
+}
+
+impl BackgroundSecondaryHandle for RocksDbTreeStateVerifier {
+    fn open_ready(opening: &SecondaryOpening) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready(
+            &opening.primary_path,
+            &opening.secondary_path,
+            &opening.activations,
+            opening.workload,
+            opening.raw_blob_retention,
+            opening.reorg_policy,
+            opening.resource_budget,
+        )
+    }
+}
+
+/// What one open of a background secondary needs, owned so it can move to a
+/// blocking thread.
+pub(crate) struct SecondaryOpening {
+    primary_path: PathBuf,
+    secondary_path: PathBuf,
+    activations: Arc<NetworkUpgradeActivations>,
+    workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
+    reorg_policy: CanonicalReorgPolicy,
+    resource_budget: RocksDbResourceBudget,
+}
+
 impl BackgroundSecondary<'_> {
     /// Opens the secondary once a READY store is published, retrying while
     /// none is, or returns `None` once `cancel` fires.
@@ -42,12 +88,12 @@ impl BackgroundSecondary<'_> {
     /// retained history, so each attempt runs off the async workers live
     /// ingest uses and, when `gate` is set, waits for it first. The first
     /// failed attempt logs `unavailable_event`.
-    pub(crate) async fn open_when_published(
+    pub(crate) async fn open_when_published<Handle: BackgroundSecondaryHandle>(
         &self,
         gate: Option<&HistoricalWorkGate>,
         cancel: &CancellationToken,
         unavailable_event: &'static str,
-    ) -> Option<RocksDbCanonicalSecondary> {
+    ) -> Option<Handle> {
         let mut waiting_logged = false;
         loop {
             if let Some(gate) = gate
@@ -78,27 +124,18 @@ impl BackgroundSecondary<'_> {
         }
     }
 
-    async fn open(&self) -> Result<RocksDbCanonicalSecondary, String> {
-        let primary_path = self.canonical_primary_path.to_path_buf();
-        let secondary_path = self.secondary_path.to_path_buf();
-        let activations = Arc::clone(self.network_upgrade_activations);
-        let (workload, raw_blob_retention, reorg_policy, resource_budget) = (
-            self.workload,
-            self.raw_blob_retention,
-            self.reorg_policy,
-            self.resource_budget,
-        );
+    async fn open<Handle: BackgroundSecondaryHandle>(&self) -> Result<Handle, String> {
+        let opening = SecondaryOpening {
+            primary_path: self.canonical_primary_path.to_path_buf(),
+            secondary_path: self.secondary_path.to_path_buf(),
+            activations: Arc::clone(self.network_upgrade_activations),
+            workload: self.workload,
+            raw_blob_retention: self.raw_blob_retention,
+            reorg_policy: self.reorg_policy,
+            resource_budget: self.resource_budget,
+        };
         tokio::task::spawn_blocking(move || {
-            RocksDbCanonicalSecondary::open_ready(
-                primary_path,
-                secondary_path,
-                &activations,
-                workload,
-                raw_blob_retention,
-                reorg_policy,
-                resource_budget,
-            )
-            .map_err(|error| error.to_string())
+            Handle::open_ready(&opening).map_err(|error| error.to_string())
         })
         .await
         .unwrap_or_else(|error| Err(error.to_string()))

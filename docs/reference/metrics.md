@@ -137,7 +137,7 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_tree_state_densification_stride_duration_seconds` | histogram | | Time to replay one stride. |
 | `zinder_ingest_tree_state_densification_retries_total` | counter | | Steps the pass retried after a store or writer error. |
 | `zinder_ingest_tree_state_verification_rows_total` | counter | | Stored tree-state checkpoint rows the verification pass checked and found intact. |
-| `zinder_ingest_tree_state_verification_mismatches_total` | counter | | Rows or table blocks that failed verification, including recorded damage a restart confirmed. Any increase is store damage: ingest reports `canonical_store_damaged` and the pass stops. |
+| `zinder_ingest_tree_state_verification_mismatches_total` | counter | | Rows or table blocks that failed verification, including recorded damage a restart confirmed and a recorded row a restart found gone. Any increase is store damage: ingest reports `canonical_store_damaged` and the pass stops. |
 | `zinder_ingest_tree_state_verification_watermark_height` | gauge | | Height the current verification cycle continues from. It returns to 0 when a cycle ends. |
 | `zinder_ingest_tree_state_verification_cycles_total` | counter | | Cycles that checked every settled row. The time between increments is the pass's detection bound. |
 | `zinder_ingest_tree_state_verification_retries_total` | counter | | Steps the verification pass retried after a store error, such as a table file compacted away under its secondary. Rows a failed step checked first are counted in `rows_total` and not checked again. |

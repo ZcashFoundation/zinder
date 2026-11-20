@@ -188,8 +188,11 @@ pub enum ReadinessCause {
     /// control plane up; it and the store's wallet-serving readers refuse
     /// traffic until an operator rebuilds the store.
     CanonicalStoreDamaged {
-        /// Height of the first stored row that failed verification.
-        height: u32,
+        /// Height of the first stored row that failed verification, or
+        /// `None` when ingest cannot tell where the damage is because it
+        /// cannot read the record of its last verification.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
         /// Node RPC name of the pool whose frontier failed, or `None` when
         /// the row failed outside any one pool.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1181,15 +1184,19 @@ impl From<&ops_proto::CanonicalStoreDamagedDetail> for ReadinessCause {
 }
 
 impl ReadinessCause {
-    /// Returns the cause that reports a damaged stored row at `height`,
-    /// naming `pool` when the failure is in that pool's frontier.
+    /// Returns the cause that reports damage at `height`, or at an unknown
+    /// height when `height` is `None`, naming `pool` when the failure is in
+    /// that pool's frontier.
     #[must_use]
     pub const fn canonical_store_damaged(
-        height: BlockHeight,
+        height: Option<BlockHeight>,
         pool: Option<ShieldedProtocol>,
     ) -> Self {
         Self::CanonicalStoreDamaged {
-            height: height.value(),
+            height: match height {
+                Some(height) => Some(height.value()),
+                None => None,
+            },
             pool: match pool {
                 Some(pool) => Some(pool.rpc_pool_name()),
                 None => None,
@@ -1832,7 +1839,7 @@ mod tests {
                 retention_hours: 0,
             },
             ReadinessCause::CanonicalStoreDamaged {
-                height: 0,
+                height: Some(0),
                 pool: None,
             },
             ReadinessCause::ShuttingDown,
@@ -1946,7 +1953,7 @@ mod tests {
                 retention_hours: 0,
             },
             ReadinessCause::CanonicalStoreDamaged {
-                height: 0,
+                height: Some(0),
                 pool: None,
             },
             ReadinessCause::ShuttingDown,
@@ -1967,14 +1974,14 @@ mod tests {
     #[test]
     fn canonical_store_damage_carries_its_row_to_every_surface() -> Result<(), serde_json::Error> {
         let detail = zinder_proto::wire::canonical_store_damaged_detail(
-            BlockHeight::new(1_687_104),
+            Some(BlockHeight::new(1_687_104)),
             Some(ShieldedProtocol::Ironwood),
         );
         let cause = ReadinessCause::from(&detail);
         assert_eq!(
             cause,
             ReadinessCause::canonical_store_damaged(
-                BlockHeight::new(1_687_104),
+                Some(BlockHeight::new(1_687_104)),
                 Some(ShieldedProtocol::Ironwood)
             )
         );
@@ -2000,10 +2007,22 @@ mod tests {
                 .and_then(|info| info.metadata.get("readiness_cause").cloned()),
             Some("canonical_store_damaged".to_owned())
         );
-        let without_pool = ReadinessCause::canonical_store_damaged(BlockHeight::new(7), None);
+        let without_pool = ReadinessCause::canonical_store_damaged(Some(BlockHeight::new(7)), None);
         assert_eq!(
             serde_json::to_value(&without_pool)?,
             serde_json::json!({"canonical_store_damaged": {"height": 7}})
+        );
+        let unlocated = ReadinessCause::from(&zinder_proto::wire::canonical_store_damaged_detail(
+            None, None,
+        ));
+        assert_eq!(
+            unlocated,
+            ReadinessCause::canonical_store_damaged(None, None)
+        );
+        assert!(!unlocated.permits_traffic());
+        assert_eq!(
+            serde_json::to_value(&unlocated)?,
+            serde_json::json!({"canonical_store_damaged": {}})
         );
         Ok(())
     }

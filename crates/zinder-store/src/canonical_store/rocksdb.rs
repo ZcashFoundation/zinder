@@ -12,7 +12,8 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, keep_blocks_of_dropped_table_files, open_bounded_rocksdb,
+    build_block_based_table_factory, keep_blocks_of_dropped_table_files,
+    kv::build_uncached_block_based_table_factory, open_bounded_rocksdb,
 };
 
 use super::{
@@ -994,6 +995,29 @@ pub(super) fn canonical_column_family_descriptors(
         .into_iter()
         .map(|name| {
             ColumnFamilyDescriptor::new(name, canonical_data_options(block_cache, resource_budget))
+        })
+        .collect()
+}
+
+/// Column families of a canonical secondary that verifies stored tree-state
+/// checkpoints.
+///
+/// They match [`canonical_column_family_descriptors`] except that the
+/// tree-state checkpoint family reads through no block cache, so every read
+/// of a checkpoint takes its blocks from the table file and checks their
+/// checksums.
+pub(super) fn canonical_verification_column_family_descriptors(
+    block_cache: &Cache,
+    resource_budget: RocksDbResourceBudget,
+) -> Vec<ColumnFamilyDescriptor> {
+    CANONICAL_DATA_COLUMN_FAMILIES
+        .into_iter()
+        .map(|name| {
+            let mut options = canonical_data_options(block_cache, resource_budget);
+            if name == TREE_STATE_CHECKPOINT_COLUMN_FAMILY {
+                options.set_block_based_table_factory(&build_uncached_block_based_table_factory());
+            }
+            ColumnFamilyDescriptor::new(name, options)
         })
         .collect()
 }

@@ -956,7 +956,7 @@ fn canonical_writer_status_round_trips_an_unconfirmed_tip() -> eyre::Result<()> 
 #[test]
 fn canonical_writer_status_round_trips_store_damage_beside_the_fence() -> eyre::Result<()> {
     let damage = zinder_proto::wire::canonical_store_damaged_detail(
-        BlockHeight::new(1_687_104),
+        Some(BlockHeight::new(1_687_104)),
         Some(zinder_core::ShieldedProtocol::Orchard),
     );
     let response = ingest::CanonicalWriterStatusResponse {
@@ -979,7 +979,7 @@ fn canonical_writer_status_round_trips_store_damage_beside_the_fence() -> eyre::
         .canonical_store_damaged
         .as_ref()
         .ok_or_else(|| eyre!("canonical_store_damaged missing"))?;
-    assert_eq!(decoded_damage.height, 1_687_104);
+    assert_eq!(decoded_damage.height, Some(1_687_104));
     assert_eq!(
         zinder_proto::wire::canonical_store_damaged_pool(decoded_damage),
         Some(zinder_core::ShieldedProtocol::Orchard)
@@ -987,6 +987,23 @@ fn canonical_writer_status_round_trips_store_damage_beside_the_fence() -> eyre::
     assert_eq!(
         decoded.fence.as_ref().map(|fence| fence.visible_tip_height),
         Some(2_000)
+    );
+    // Damage at an unknown height keeps the field set with no height, which
+    // is apart from damage reported at height 0.
+    let unlocated = ingest::CanonicalWriterStatusResponse {
+        canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+            None, None,
+        )),
+        ..decoded.clone()
+    };
+    let decoded_unlocated = round_trip(&unlocated)?;
+    assert_eq!(decoded_unlocated, unlocated);
+    assert_eq!(
+        decoded_unlocated
+            .canonical_store_damaged
+            .as_ref()
+            .map(|damage| damage.height),
+        Some(None)
     );
     // A writer that predates the field encodes nothing, which decodes as an
     // undamaged store.
@@ -1558,7 +1575,7 @@ fn ops_readiness_report_round_trips_canonical_store_damage() -> eyre::Result<()>
         detail: Some(ops::ReadinessCauseDetail {
             payload: Some(ops::readiness_cause_detail::Payload::CanonicalStoreDamaged(
                 zinder_proto::wire::canonical_store_damaged_detail(
-                    BlockHeight::new(1_687_104),
+                    Some(BlockHeight::new(1_687_104)),
                     None,
                 ),
             )),

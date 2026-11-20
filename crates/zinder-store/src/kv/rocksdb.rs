@@ -905,6 +905,20 @@ pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     bbt
 }
 
+/// Builds `BlockBasedOptions` that read through no block cache.
+///
+/// A read through a block cache takes a block another read cached without
+/// reading the file again, so it cannot see damage done to the file since,
+/// whatever its `ReadOptions` set. A family opened with these options reads
+/// every data block from the file and checks its checksum. Index and filter
+/// blocks stay in table-reader memory instead of a cache.
+#[must_use]
+pub(crate) fn build_uncached_block_based_table_factory() -> BlockBasedOptions {
+    let mut bbt = BlockBasedOptions::default();
+    bbt.disable_cache();
+    bbt
+}
+
 /// Keeps the cached blocks of a table file the instance stops referencing.
 ///
 /// Serving processes open several secondaries of one store on one

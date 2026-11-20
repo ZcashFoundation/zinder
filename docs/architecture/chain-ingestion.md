@@ -250,7 +250,7 @@ again, as a writer checks a row it stores:
 
 The pass starts when densification does: once ingest follows the tip, and
 Explorer views have caught up when they are enabled. A restart over a store
-it recorded as damaged starts it sooner, as described below. It reads through
+it reports as damaged starts it sooner, as described below. It reads through
 its own canonical secondary and writes nothing to the store, so it runs
 without `ingest_control.listen_addr`; without that listener, no reader
 attests the store, and ingest readiness alone reports the damage.
@@ -258,8 +258,9 @@ attests the store, and ingest readiness alone reports the damage.
 The pass works in cycles. A cycle checks every row from the history
 predecessor through the settled tip, including rows that densification or
 live following added since the previous cycle. The next cycle starts 5
-minutes after one ends. A row above the settled tip is checked in the first
-cycle that starts after the tip passes it.
+minutes after one ends. The pass never reads an entry above the settled tip,
+including a key that is not a height just past it, so a row above the tip is
+checked in the first cycle that starts after the tip passes it.
 
 `ingest.tree_state_verification.max_rows_per_second` (25 by default) bounds
 how many rows the pass checks per second, on average. The pass reads 100 rows
@@ -277,12 +278,13 @@ per cycle at the default rate. A real cycle takes longer: checking adds up to
 4.3 ms per row, the pass waits while historical work is closed, a store error
 costs a 30-second retry, and a restart can check up to a minute of rows again.
 
-The pass keeps the checkpoint blocks it reads out of the RocksDB block cache,
-so each cycle reads them from disk again and checks their checksums. A block that fails its
-checksum is damage, reported like a row that fails a check, at the first
-height it may hold. A table file that the writer's compaction deleted under
-the pass's secondary is not damage: the step stops, and the pass retries it
-after catching up.
+The checkpoint family of the pass's secondary has no RocksDB block cache, so
+every read takes the checkpoint blocks from their table files and checks
+their checksums, whatever another read of the secondary loaded before. A
+block that fails its checksum is damage, reported like a row that fails a
+check, at the first height it may hold. A table file that the writer's
+compaction deleted under the pass's secondary is not damage: the step stops,
+and the pass retries it after catching up.
 
 The pass records the height its current cycle continues from in
 `tree-state-verification-watermark.json` inside the canonical store
@@ -309,9 +311,13 @@ this order:
    whose frontier failed (`sapling`, `orchard`, `ironwood`, or `none` when the
    row fails outside any frontier), and the check that failed, and counts the
    row in `zinder_ingest_tree_state_verification_mismatches_total`.
-4. It records the damaged row and its height in its progress file. That
-   write waits on two syncs, which is why the report comes first.
-5. It stops.
+4. It records the damage and its height in its progress file. That write
+   waits on two syncs, which is why the report comes first. A write that
+   fails is logged as `tree_state_verification_damage_record_failed` and
+   tried again after 1 second, then after twice as long each time, up to 30
+   seconds, until it succeeds or ingest stops. The damage stays reported
+   meanwhile.
+5. Once the record is written, it stops.
 
 The writer keeps following the tip. Wallet-serving readers, and
 compatibility in compact-blocks mode, refuse traffic with
@@ -323,11 +329,28 @@ When ingest starts over a store whose progress file records damage, its
 control plane reports that damage from its first `WriterStatus` answer, so no
 reader attests the store again. The pass then opens its secondary as soon as
 the store is published, without waiting for historical work, and checks the
-recorded row again. Damage that is still there parks readiness again and the
-pass stops. A row that now passes clears the report, which ingest logs as
+damage again:
+
+- Damage recorded at a row clears only once a row stored at that height
+  passes. A row that is gone stays damage, because the store never drops a
+  settled row and every reconstruction that seeds from it fails without it.
+- Damage recorded where the pass could not read an entry as a row, such as a
+  key that is not a height, clears once the rows from that height pass.
+
+Damage that is still there parks readiness again and the pass stops. Damage
+that clears stops being reported, which ingest logs as
 `tree_state_verification_recorded_damage_cleared`, and the cycle continues.
-Damage recorded for another store is discarded. With the pass disabled,
-recorded damage stays reported. Rebuild the canonical store, as
+Damage recorded for another store is discarded.
+
+A progress file that ingest cannot read or parse, or that another version
+wrote, is damage at an unknown height, logged as
+`tree_state_verification_record_unreadable`. `WriterStatus` reports
+`canonical_store_damaged` without a height from its first answer, and the
+pass runs a full cycle from the history predecessor without waiting for
+historical work. The damage clears once that cycle passes, and it is
+confirmed at the row the cycle finds damaged. A missing file only starts a
+new cycle. With the pass disabled, recorded damage, and damage behind an
+unreadable file, stays reported. Rebuild the canonical store, as
 [Recovery](service-operations.md#recovery) describes.
 
 The pass checks each row on its own and does not replay blocks. It cannot see

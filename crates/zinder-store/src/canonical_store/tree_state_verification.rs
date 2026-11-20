@@ -9,14 +9,15 @@
 //! A caller repeats bounded verifications over settled history, so a damaged
 //! row is found within one pass over it.
 //!
-//! Verification keeps the blocks it reads out of the block cache, so a later
-//! pass reads them from disk again and its checksum check sees damage done
-//! since. A
-//! block that fails that check is damage, reported like a row that fails a
-//! row check. A table file the primary has since deleted is not damage: it is
-//! an ordinary store error that clears once the secondary catches up.
+//! Verification reads through a [`RocksDbTreeStateVerifier`], a canonical
+//! secondary whose checkpoint family has no block cache, so every read takes
+//! its blocks from the table file and checks their checksums. A block that an
+//! earlier read cached cannot hide damage done to the file since. A block
+//! that fails that check is damage, reported like a row that fails a row
+//! check. A table file the primary has since deleted is not damage: it is an
+//! ordinary store error that clears once the secondary catches up.
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, path::Path};
 
 use rust_rocksdb::{Direction, ErrorKind, IteratorMode, ReadOptions};
 use thiserror::Error;
@@ -26,11 +27,28 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalStoreError, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    block_load::decode_tree_state_checkpoint, frontier_presence_mismatch,
-    publication::column_family, reader::CanonicalServingRead,
-    rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    CanonicalReorgPolicy, CanonicalSecondaryCatchupOutcome, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    block_load::{decode_tree_state_checkpoint, encode_block_position},
+    frontier_presence_mismatch,
+    publication::column_family,
+    reader::CanonicalServingRead,
+    rocksdb::{
+        CanonicalStoreAdmissionExpectation, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        canonical_verification_column_family_descriptors,
+    },
 };
+use crate::{RawBlobRetention, RocksDbResourceBudget};
+
+/// A canonical secondary opened to verify stored tree-state checkpoints.
+///
+/// Its tree-state checkpoint family reads through no block cache, so each
+/// verification reads the checkpoint blocks from their table files and
+/// checks their checksums, whatever an earlier read loaded. It serves no
+/// other read.
+pub struct RocksDbTreeStateVerifier {
+    pub(super) secondary: RocksDbCanonicalSecondary,
+}
 
 /// What one bounded verification of stored tree-state checkpoints found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,18 +65,43 @@ pub struct TreeStateCheckpointVerification {
     pub reached_settled_tip: bool,
 }
 
+/// What verifying the checkpoint stored at one height found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TreeStateCheckpointRowVerification {
+    /// The row passed every check.
+    Intact,
+    /// No row is stored at the height.
+    Absent,
+    /// The row failed a check.
+    Mismatch(TreeStateCheckpointMismatch),
+}
+
 /// A stored tree-state checkpoint that failed verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeStateCheckpointMismatch {
-    /// Height the row is stored at. For a key that is not a height, or a
-    /// table block that fails its checksum, the first height the damage may
-    /// cover: the height above the last row verified.
+    /// Height the row is stored at. For an
+    /// [`TreeStateCheckpointMismatchKind::UnreadableEntry`], the first height
+    /// the damage may cover: the height above the last row verified.
     pub height: BlockHeight,
+    /// What `height` names.
+    pub kind: TreeStateCheckpointMismatchKind,
     /// Pool whose frontier failed, or `None` when the row failed outside any
     /// one frontier, such as a value that ends inside its block time.
     pub pool: Option<ShieldedProtocol>,
     /// The check that failed.
     pub reason: String,
+}
+
+/// What the height of a [`TreeStateCheckpointMismatch`] names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeStateCheckpointMismatchKind {
+    /// The row stored at the height failed a check, or its block failed its
+    /// checksum.
+    Row,
+    /// A scan could not read an entry as a row: a key that is not a height,
+    /// or a table block that fails its checksum. The damage lies at or above
+    /// the height.
+    UnreadableEntry,
 }
 
 /// A verification that stopped on a store error before it found a mismatch
@@ -79,7 +122,55 @@ pub struct TreeStateVerificationError {
     pub source: CanonicalStoreError,
 }
 
-impl RocksDbCanonicalSecondary {
+impl RocksDbTreeStateVerifier {
+    /// Opens one exactly admitted secondary for verification and catches it
+    /// up to the primary's current state, as
+    /// [`RocksDbCanonicalSecondary::open_ready`] does.
+    ///
+    /// `resource_budget` bounds every family but the checkpoint family,
+    /// which reads through no block cache.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
+    )]
+    pub fn open_ready(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        expected_network_upgrade_activations: &NetworkUpgradeActivations,
+        expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
+        expected_reorg_policy: CanonicalReorgPolicy,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Self, CanonicalStoreError> {
+        RocksDbCanonicalSecondary::open_ready_with_expectation(
+            primary_path.as_ref(),
+            secondary_path.as_ref(),
+            &CanonicalStoreAdmissionExpectation::from_activations(
+                expected_network_upgrade_activations,
+                expected_workload,
+                expected_raw_blob_retention,
+                expected_reorg_policy,
+            ),
+            resource_budget.into(),
+            canonical_verification_column_family_descriptors,
+        )
+        .map(|secondary| Self { secondary })
+    }
+
+    /// Catches the secondary up, as
+    /// [`RocksDbCanonicalSecondary::try_catch_up`] does.
+    pub fn try_catch_up(
+        &mut self,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.secondary.try_catch_up()
+    }
+
+    /// Returns the currently admitted READY evidence.
+    #[must_use]
+    pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
+        self.secondary.ready_evidence()
+    }
+
     /// Verifies up to `max_rows` stored tree-state checkpoints, in height
     /// order, from `from` through the settled tip.
     ///
@@ -89,30 +180,79 @@ impl RocksDbCanonicalSecondary {
     /// `network_upgrade_activations` activates at or below its height. The
     /// first row that fails is reported in
     /// [`TreeStateCheckpointVerification::mismatch`], as is a key that is not
-    /// a height and a table block that fails its checksum. An error means the
-    /// store could not be read or does not admit the activation table.
+    /// a height and a table block that fails its checksum. Entries above the
+    /// settled tip are never read, so damage there waits for the tip to pass
+    /// it. An error means the store could not be read or does not admit the
+    /// activation table.
     pub fn verify_tree_state_checkpoints(
         &self,
         from: BlockHeight,
         max_rows: NonZeroU32,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<TreeStateCheckpointVerification, TreeStateVerificationError> {
-        verify_tree_state_checkpoints(self, from, max_rows, network_upgrade_activations)
+        verify_tree_state_checkpoints(&self.secondary, from, max_rows, network_upgrade_activations)
+    }
+
+    /// Verifies the checkpoint stored at exactly `height` with the checks
+    /// [`Self::verify_tree_state_checkpoints`] applies.
+    ///
+    /// A block that fails its checksum is a mismatch of that row. An error
+    /// means the store could not be read or does not admit the activation
+    /// table.
+    pub fn verify_tree_state_checkpoint_at(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<TreeStateCheckpointRowVerification, CanonicalStoreError> {
+        let store = &self.secondary;
+        require_admitted_activations(store, network_upgrade_activations)?;
+        let db = &store.serving_open().db;
+        let family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+        let mut read_options = ReadOptions::default();
+        read_options.set_verify_checksums(true);
+        match db.get_cf_opt(&family, encode_block_position(height), &read_options) {
+            Ok(None) => Ok(TreeStateCheckpointRowVerification::Absent),
+            Ok(Some(encoded)) => Ok(verify_row(network_upgrade_activations, height, &encoded)
+                .map_or(
+                    TreeStateCheckpointRowVerification::Intact,
+                    TreeStateCheckpointRowVerification::Mismatch,
+                )),
+            Err(source) if source.kind() == ErrorKind::Corruption => Ok(
+                TreeStateCheckpointRowVerification::Mismatch(TreeStateCheckpointMismatch {
+                    height,
+                    kind: TreeStateCheckpointMismatchKind::Row,
+                    pool: None,
+                    reason: format!(
+                        "the stored tree_state_checkpoint block holding this height is corrupt: {source}"
+                    ),
+                }),
+            ),
+            Err(source) => Err(CanonicalStoreError::RocksDbOperation {
+                operation: "tree-state verification read",
+                source,
+            }),
+        }
     }
 }
 
-impl RocksDbCanonicalStore {
-    /// Verifies up to `max_rows` stored tree-state checkpoints from `from`
-    /// through the settled tip; see
-    /// [`RocksDbCanonicalSecondary::verify_tree_state_checkpoints`].
-    pub fn verify_tree_state_checkpoints(
-        &self,
-        from: BlockHeight,
-        max_rows: NonZeroU32,
-        network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<TreeStateCheckpointVerification, TreeStateVerificationError> {
-        verify_tree_state_checkpoints(self, from, max_rows, network_upgrade_activations)
+/// Refuses an activation table the store does not admit at or below its
+/// settled tip, which would judge each row's pools by another schedule.
+fn require_admitted_activations(
+    store: &impl CanonicalServingRead,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> Result<(), CanonicalStoreError> {
+    let settled_height = store
+        .serving_ready_evidence()
+        .sequence_checkpoint
+        .through()
+        .height;
+    if store.serving_admits_activations_through(network_upgrade_activations, settled_height) {
+        return Ok(());
     }
+    Err(CanonicalStoreError::admission(
+        store.serving_open().db.path(),
+        "tree-state verification activation table differs from the admitted schedule at or below the settled tip",
+    ))
 }
 
 fn verify_tree_state_checkpoints(
@@ -133,26 +273,24 @@ fn verify_tree_state_checkpoints(
             next_from: verification.next_from,
             source,
         };
+    require_admitted_activations(store, network_upgrade_activations)
+        .map_err(|source| interrupted(&verification, source))?;
     let settled_height = store
         .serving_ready_evidence()
         .sequence_checkpoint
         .through()
         .height;
     let db = &store.serving_open().db;
-    if !store.serving_admits_activations_through(network_upgrade_activations, settled_height) {
-        return Err(interrupted(
-            &verification,
-            CanonicalStoreError::admission(
-                db.path(),
-                "tree-state verification activation table differs from the admitted schedule at or below the settled tip",
-            ),
-        ));
-    }
     let family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
         .map_err(|source| interrupted(&verification, source))?;
     let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
     read_options.set_verify_checksums(true);
+    // A scan of heights through the settled tip ends where a scan from the
+    // height above it starts, so it never reads an entry above settlement,
+    // a key that extends the settled tip's key included.
+    if let Some(above_settled) = settled_height.next() {
+        read_options.set_iterate_upper_bound(ascending_height_key_scan_start(above_settled));
+    }
     let start = ascending_height_key_scan_start(from);
     for entry in db.iterator_cf_opt(
         &family,
@@ -165,15 +303,13 @@ fn verify_tree_state_checkpoints(
                 ScannedEntry::Unreadable { reason } => {
                     verification.mismatch = Some(TreeStateCheckpointMismatch {
                         height: verification.next_from,
+                        kind: TreeStateCheckpointMismatchKind::UnreadableEntry,
                         pool: None,
                         reason,
                     });
                     return Ok(verification);
                 }
             };
-        if height > settled_height {
-            break;
-        }
         if verification.verified_rows >= max_rows.get() {
             return Ok(verification);
         }
@@ -242,6 +378,7 @@ fn verify_row(
 ) -> Option<TreeStateCheckpointMismatch> {
     let mismatch = |pool, reason| TreeStateCheckpointMismatch {
         height,
+        kind: TreeStateCheckpointMismatchKind::Row,
         pool,
         reason,
     };
