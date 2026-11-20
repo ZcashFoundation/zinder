@@ -463,9 +463,11 @@ async fn project_wallet(
     let joined_build = tokio::task::spawn_blocking(move || {
         let mut canonical_control = canonical_control;
         let mut canonical_lease = canonical_lease;
+        let mut shutdown_at_heartbeat = false;
         let mut heartbeat =
             |phase, wallet_lease: zinder_wallet_projection::WalletProjectionBuildLease| {
                 if build_cancel.is_cancelled() {
+                    shutdown_at_heartbeat = true;
                     return Err(
                         zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled,
                     );
@@ -537,6 +539,11 @@ async fn project_wallet(
             wallet_lease_execution,
             &mut heartbeat,
         );
+        let build_outcome = match build_outcome {
+            Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
+                if shutdown_at_heartbeat => Ok(None),
+            outcome => outcome.map(Some),
+        };
         (build_outcome, canonical, canonical_control, canonical_lease)
     })
     .await;
@@ -550,7 +557,11 @@ async fn project_wallet(
     };
 
     let outcome = match build_result {
-        Ok(outcome) => outcome,
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => {
+            canonical_control.release(&canonical_lease).await?;
+            return Ok(());
+        }
         Err(build_error) => {
             if let Err(release_error) = canonical_control.release(&canonical_lease).await {
                 tracing::error!(

@@ -46,9 +46,10 @@ use zinder_store::{
     CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     RocksDbResourceBudget,
 };
-use zinder_wallet_projection::WalletCanonicalSourceIdentity;
+use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionBuildOwner};
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletStore, build_wallet_from_canonical,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletStore,
+    build_wallet_from_canonical,
 };
 
 use crate::{
@@ -129,6 +130,77 @@ async fn fresh_and_resumed_wallets_complete_startup_at_the_writer_fence() -> Tes
         );
     }
     server_cancel.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_build_shutdown_distinguishes_cancellation_from_a_refused_renewal() -> TestResult {
+    for refuse_renewal in [false, true] {
+        let Some(listener) = bind_loopback().await? else {
+            return Ok(());
+        };
+        let root = TempDir::new()?;
+        let policy = CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?;
+        let (mut writer, _) = baseline_writer(&root.path().join("canonical"), policy)?;
+        writer
+            .admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())?;
+        let cancel = CancellationToken::new();
+        let mut control = RecordingCanonicalControl::new(writer);
+        if refuse_renewal {
+            control.refuse_renewal_during_shutdown = Some(cancel.clone());
+        } else {
+            control.shutdown_on_acquire = Some(cancel.clone());
+        }
+        let calls = control.calls.clone();
+        let server_cancel = CancellationToken::new();
+        let endpoint = spawn_canonical_control(listener, control, server_cancel.clone())?;
+        let config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+        let readiness = Readiness::default();
+        let outcome = tokio::time::timeout(
+            WAIT_TIMEOUT,
+            Box::pin(crate::run_owned_projector(&config, &readiness, cancel)),
+        )
+        .await?;
+        server_cancel.cancel();
+
+        let counts = calls.snapshot();
+        assert_eq!(counts.acquires, 1);
+        assert_eq!(counts.releases, 1);
+        RocksDbWalletBuildStore::open(
+            &config.wallet_path,
+            config.network,
+            config.wallet_rocksdb_budget,
+        )?
+        .discard_unpublished(
+            WalletProjectionBuildOwner::from_bytes([0x99; 16]),
+            UnixTimestampMillis::now(),
+        )?;
+        assert!(!readiness.report().is_ready);
+        let events = capture.events();
+        let recovery_exits: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.field("phase") == Some("recover_state")
+                    && event.field("phase_state") == Some("exit")
+            })
+            .collect();
+        let [exit] = recovery_exits.as_slice() else {
+            return Err(format!("expected one recovery exit, got {recovery_exits:?}").into());
+        };
+        if refuse_renewal {
+            let error = outcome
+                .err()
+                .ok_or("a refused renewal must fail the build")?;
+            assert_eq!(counts.renews, 1);
+            assert_eq!(exit.field("outcome"), Some("failed"));
+            assert_eq!(exit.field("reason"), Some(error.to_string().as_str()));
+        } else {
+            assert_eq!(exit.field("outcome"), Some("aborted"));
+            assert_eq!(exit.field("reason"), None);
+            outcome?;
+        }
+    }
     Ok(())
 }
 
@@ -706,6 +778,8 @@ impl RecordedCalls {
 struct RecordingCanonicalControl {
     writer: Arc<Mutex<Option<RocksDbCanonicalStore>>>,
     calls: Arc<RecordedCalls>,
+    shutdown_on_acquire: Option<CancellationToken>,
+    refuse_renewal_during_shutdown: Option<CancellationToken>,
 }
 
 impl RecordingCanonicalControl {
@@ -713,6 +787,8 @@ impl RecordingCanonicalControl {
         Self {
             writer: Arc::new(Mutex::new(Some(writer))),
             calls: Arc::new(RecordedCalls::default()),
+            shutdown_on_acquire: None,
+            refuse_renewal_during_shutdown: None,
         }
     }
 
@@ -858,6 +934,9 @@ impl CanonicalControl for RecordingCanonicalControl {
         request: Request<AcquireCanonicalProjectionBuildLeaseRequest>,
     ) -> Result<Response<CanonicalProjectionBuildLeaseResponse>, Status> {
         self.calls.acquires.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = &self.shutdown_on_acquire {
+            cancel.cancel();
+        }
         let mut lease = request
             .into_inner()
             .lease
@@ -873,6 +952,10 @@ impl CanonicalControl for RecordingCanonicalControl {
         request: Request<RenewCanonicalProjectionBuildLeaseRequest>,
     ) -> Result<Response<CanonicalProjectionBuildLeaseResponse>, Status> {
         self.calls.renews.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = &self.refuse_renewal_during_shutdown {
+            cancel.cancel();
+            return Err(Status::failed_precondition("build lease renewal refused"));
+        }
         Ok(Response::new(CanonicalProjectionBuildLeaseResponse {
             lease: request.into_inner().lease,
         }))
