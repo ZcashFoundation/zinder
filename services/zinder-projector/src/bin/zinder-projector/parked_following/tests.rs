@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use zinder_core::{
     BlockHash, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
     Network, TransactionComponentCounts, TransactionVersion, TransparentAddressScriptHash,
@@ -48,14 +48,14 @@ use zinder_store::{
 };
 use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionBuildOwner};
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletStore,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletStore,
     build_wallet_from_canonical,
 };
 
 use crate::{
     ProjectorControlTasks, acquire_following_retention_lease, bootstrap_resumed_wallet_following,
-    canonical_writer_control::CanonicalWriterControlClient,
-    config::{ProjectorBuildConfig, ProjectorConfig, ProjectorFollowConfig},
+    canonical_writer_control::{CanonicalWriterControlClient, CanonicalWriterControlError},
+    config::{ProjectorBuildConfig, ProjectorConfig, ProjectorError, ProjectorFollowConfig},
     run_continuous_wallet_following,
     tests::{baseline_writer, empty_canonical_block, writer_retained_event},
 };
@@ -134,8 +134,114 @@ async fn fresh_and_resumed_wallets_complete_startup_at_the_writer_fence() -> Tes
 }
 
 #[tokio::test]
+async fn startup_attributes_wallet_open_and_writer_fence_errors_to_their_own_phases() -> TestResult
+{
+    let Some(listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let policy = CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?;
+    let (mut writer, _) = baseline_writer(&root.path().join("canonical"), policy)?;
+    writer.admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())?;
+    let control = RecordingCanonicalControl::new(writer);
+    let server_cancel = CancellationToken::new();
+    let endpoint = spawn_canonical_control(listener, control.clone(), server_cancel.clone())?;
+    let config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
+    std::fs::write(&config.wallet_path, b"not a wallet directory")?;
+
+    let error = startup_failure(&config, "recover_state", "admit_ingest_control").await?;
+    assert!(matches!(error, ProjectorError::WalletStore(_)));
+    assert_eq!(control.calls.snapshot().writer_statuses, 0);
+
+    std::fs::remove_file(&config.wallet_path)?;
+    let _committing_writer = control
+        .writer
+        .lock()
+        .take()
+        .ok_or("missing fixture writer")?;
+    let error = startup_failure(&config, "admit_ingest_control", "recover_state").await?;
+    assert!(matches!(error, ProjectorError::CanonicalControl(
+        CanonicalWriterControlError::Status(status)
+    ) if status.code() == Code::Unavailable));
+    assert_eq!(control.calls.snapshot().writer_statuses, 1);
+    server_cancel.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_control_bind_failure_aborts_resumed_wallet_recovery() -> TestResult {
+    let Some(listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let control_addr = listener.local_addr()?;
+    let root = TempDir::new()?;
+    let ParkFixture {
+        mut writer,
+        secondary,
+        wallet,
+    } = ParkFixture::build(root.path())?;
+    writer.admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())?;
+    let successor = writer.event_fence().chain_event_sequence();
+    writer.prune_canonical_events_before(successor, UnixTimestampMillis::now())?;
+    drop((wallet, secondary));
+
+    let server_cancel = CancellationToken::new();
+    let endpoint = spawn_canonical_control(
+        listener,
+        RecordingCanonicalControl::new(writer),
+        server_cancel.clone(),
+    )?;
+    let config = park_config(root.path(), &endpoint, control_addr)?;
+    let error = startup_failure(&config, "start_api", "recover_state").await?;
+    assert!(
+        matches!(error, ProjectorError::ProjectorControlBind { source, .. }
+        if source.kind() == std::io::ErrorKind::AddrInUse)
+    );
+    server_cancel.cancel();
+    Ok(())
+}
+
+async fn startup_failure(
+    config: &ProjectorConfig,
+    failed: &str,
+    aborted: &str,
+) -> TestResult<ProjectorError> {
+    let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+    let readiness = Readiness::default();
+    let error = tokio::time::timeout(
+        WAIT_TIMEOUT,
+        Box::pin(crate::run_owned_projector(
+            config,
+            &readiness,
+            CancellationToken::new(),
+        )),
+    )
+    .await?
+    .err()
+    .ok_or("expected startup to fail")?;
+    let reason = error.to_string();
+    let events = capture.events();
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event.field("outcome") == Some("failed"))
+        .map(|event| (event.field("phase"), event.field("reason")))
+        .collect();
+    assert_eq!(failures, [(Some(failed), Some(reason.as_str()))]);
+    assert!(capture.any(|event| event.field("phase") == Some(aborted)
+        && event.field("outcome") == Some("aborted")
+        && event.field("reason").is_none()));
+    assert!(!readiness.report().is_ready);
+    Ok(error)
+}
+
+#[tokio::test]
 async fn wallet_build_shutdown_distinguishes_cancellation_from_a_refused_renewal() -> TestResult {
-    for refuse_renewal in [false, true] {
+    for (refuse_renewal, release_error) in [
+        (false, None),
+        (false, Some(Code::Unavailable)),
+        (false, Some(Code::InvalidArgument)),
+        (true, Some(Code::Unavailable)),
+    ] {
         let Some(listener) = bind_loopback().await? else {
             return Ok(());
         };
@@ -146,6 +252,7 @@ async fn wallet_build_shutdown_distinguishes_cancellation_from_a_refused_renewal
             .admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())?;
         let cancel = CancellationToken::new();
         let mut control = RecordingCanonicalControl::new(writer);
+        control.release_error = release_error;
         if refuse_renewal {
             control.refuse_renewal_during_shutdown = Some(cancel.clone());
         } else {
@@ -155,7 +262,7 @@ async fn wallet_build_shutdown_distinguishes_cancellation_from_a_refused_renewal
         let server_cancel = CancellationToken::new();
         let endpoint = spawn_canonical_control(listener, control, server_cancel.clone())?;
         let config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
-        let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+        let capture = zinder_testkit::LogCapture::install();
         let readiness = Readiness::default();
         let outcome = tokio::time::timeout(
             WAIT_TIMEOUT,
@@ -177,30 +284,55 @@ async fn wallet_build_shutdown_distinguishes_cancellation_from_a_refused_renewal
             UnixTimestampMillis::now(),
         )?;
         assert!(!readiness.report().is_ready);
-        let events = capture.events();
-        let recovery_exits: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                event.field("phase") == Some("recover_state")
-                    && event.field("phase_state") == Some("exit")
-            })
-            .collect();
-        let [exit] = recovery_exits.as_slice() else {
-            return Err(format!("expected one recovery exit, got {recovery_exits:?}").into());
-        };
-        if refuse_renewal {
-            let error = outcome
-                .err()
-                .ok_or("a refused renewal must fail the build")?;
-            assert_eq!(counts.renews, 1);
-            assert_eq!(exit.field("outcome"), Some("failed"));
-            assert_eq!(exit.field("reason"), Some(error.to_string().as_str()));
-        } else {
-            assert_eq!(exit.field("outcome"), Some("aborted"));
-            assert_eq!(exit.field("reason"), None);
-            outcome?;
-        }
+        assert_eq!(counts.renews, u32::from(refuse_renewal));
+        assert_build_shutdown(&capture, outcome, refuse_renewal, release_error)?;
     }
+    Ok(())
+}
+
+fn assert_build_shutdown(
+    capture: &zinder_testkit::LogCapture,
+    outcome: Result<(), ProjectorError>,
+    refuse_renewal: bool,
+    release_error: Option<Code>,
+) -> TestResult {
+    let events = capture.events();
+    let recovery_exits: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.field("phase") == Some("recover_state")
+                && event.field("phase_state") == Some("exit")
+        })
+        .collect();
+    let [exit] = recovery_exits.as_slice() else {
+        return Err(format!("expected one recovery exit, got {recovery_exits:?}").into());
+    };
+    if refuse_renewal || release_error == Some(Code::InvalidArgument) {
+        let error = outcome.err().ok_or("a refused lease operation must fail")?;
+        assert_eq!(exit.field("outcome"), Some("failed"));
+        assert_eq!(exit.field("reason"), Some(error.to_string().as_str()));
+        if refuse_renewal {
+            assert!(matches!(
+                error,
+                ProjectorError::WalletStore(RocksDbWalletError::ProjectionBuildCancelled)
+            ));
+        } else {
+            assert!(
+                matches!(error, ProjectorError::CanonicalControl(CanonicalWriterControlError::Status(status))
+                    if status.code() == Code::InvalidArgument)
+            );
+        }
+    } else {
+        outcome?;
+        assert_eq!(exit.field("outcome"), Some("aborted"));
+        assert_eq!(exit.field("reason"), None);
+    }
+    assert_eq!(
+        capture.any(|event| event.target == "zinder::projector"
+            && event.level == tracing::Level::WARN
+            && event.field("expires_at_unix_millis").is_some()),
+        !refuse_renewal && release_error == Some(Code::Unavailable)
+    );
     Ok(())
 }
 
@@ -780,6 +912,7 @@ struct RecordingCanonicalControl {
     calls: Arc<RecordedCalls>,
     shutdown_on_acquire: Option<CancellationToken>,
     refuse_renewal_during_shutdown: Option<CancellationToken>,
+    release_error: Option<Code>,
 }
 
 impl RecordingCanonicalControl {
@@ -789,6 +922,7 @@ impl RecordingCanonicalControl {
             calls: Arc::new(RecordedCalls::default()),
             shutdown_on_acquire: None,
             refuse_renewal_during_shutdown: None,
+            release_error: None,
         }
     }
 
@@ -966,6 +1100,9 @@ impl CanonicalControl for RecordingCanonicalControl {
         _request: Request<ReleaseCanonicalProjectionBuildLeaseRequest>,
     ) -> Result<Response<ReleaseCanonicalProjectionBuildLeaseResponse>, Status> {
         self.calls.releases.fetch_add(1, Ordering::SeqCst);
+        if let Some(code) = self.release_error {
+            return Err(Status::new(code, "canonical lease release failed"));
+        }
         Ok(Response::new(
             ReleaseCanonicalProjectionBuildLeaseResponse::default(),
         ))

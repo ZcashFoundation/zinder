@@ -1,0 +1,6 @@
+kind: fixed
+body: The projector reports which startup operation failed when it opens a wallet, checks the writer fence, or binds its control listener. If ingest is unavailable when a cancelled wallet build releases its retention lease, the projector logs the expiry and completes shutdown.
+time: 2026-11-20T17:24:53.552864227Z
+custom:
+    Bump: patch
+    PR: "434"

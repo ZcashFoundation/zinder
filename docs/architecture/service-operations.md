@@ -34,6 +34,10 @@ bootstrap from the next retained event, recovery covers that first transition.
 The projector reports `ready` once, when the wallet first catches up to the
 attested writer fence. Use `/readyz` for its current state.
 
+Wallet recovery and ingest admission overlap during startup. An error opening
+the wallet fails `recover_state`. An error checking the initial writer fence
+fails `admit_ingest_control`. The other unfinished phase reports `aborted`.
+
 Only ingest contacts a node during startup. The projector, `zinder-query`,
 and `zinder-compat-lightwalletd` open storage with the network-upgrade
 schedule that ingest admitted. They therefore start while the node is down or
@@ -64,6 +68,12 @@ On a termination signal, a runtime reports `shutting_down` at once and stops
 accepting new requests. It then stops its background tasks and its servers,
 including the operational endpoint, and waits for them. Only the owner of a
 store closes it, and readers make no final writes.
+
+When shutdown interrupts an initial wallet build, the projector asks ingest
+to release its canonical retention lease. If the release returns
+`UNAVAILABLE`, the projector logs the lease expiry and continues shutdown.
+Any remaining lease stops protecting its anchor at expiry. A refused renewal
+still fails the build, even if shutdown begins while the renewal is in flight.
 
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
