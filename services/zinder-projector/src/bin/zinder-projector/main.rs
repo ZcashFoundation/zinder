@@ -647,6 +647,7 @@ async fn run_continuous_wallet_following(
     mut canonical_lease: CanonicalRetentionLease,
     mut control: ProjectorControlTasks,
 ) -> Result<(), ProjectorError> {
+    wallet.record_resource_gauges();
     let mut following_readiness = FollowingReadiness::for_wallet(
         readiness,
         WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence())
@@ -1344,6 +1345,7 @@ fn raise_wallet_reorg_depth(
     let reorg_window_blocks = canonical_reorg_policy.reorg_window_blocks();
     wallet.raise_supported_reorg_depth(reorg_window_blocks)?;
     if previous_depth != reorg_window_blocks {
+        wallet.record_resource_gauges();
         tracing::info!(
             target: "zinder::projector",
             event = "wallet_projection_reorg_depth_raised",
@@ -1420,7 +1422,7 @@ fn apply_next_wallet_transition(
         }
     };
     match transition_result {
-        Ok(()) => {}
+        Ok(()) => wallet.record_resource_gauges(),
         Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionTransitionCancelled)
             if cancel.is_cancelled() =>
         {

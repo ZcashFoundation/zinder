@@ -973,6 +973,14 @@ impl RocksDbCanonicalStore {
         CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
     }
 
+    /// Publishes throttled resource gauges for the canonical writer.
+    pub fn record_resource_gauges(&self) {
+        self.bounded_open.record_resource_gauges(
+            crate::StoreRole::CanonicalPrimary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
     #[must_use]
     pub const fn io_mode(&self) -> RocksDbIoMode {

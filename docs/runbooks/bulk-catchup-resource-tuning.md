@@ -22,7 +22,7 @@ metrics on the ops endpoint at `/metrics`.
 | Memory | Exit code 137 or a cgroup out-of-memory event from the platform. `zinder_ingest_memory_pressure_ratio`, the non-reclaimable memory divided by the container limit, approaches 1 |
 | Node RPC | `zinder_ingest_source_request_duration_seconds` is high, `zinder_ingest_source_retry_total` rises, and `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds` shows construction waiting for the next segment from the node |
 | CPU | The process uses all its CPUs while `zinder_ingest_source_fetch_queue_bytes` stays near its limit, so fetched blocks wait for preparation |
-| Disk IO | Host disk utilization is saturated. `zinder_store_rocksdb_property` reports a rising `rocksdb.estimate-pending-compaction-bytes`, a non-zero `rocksdb.actual-delayed-write-rate`, or `rocksdb.is-write-stopped` equal to 1 |
+| Disk IO | Host disk utilization is saturated. After a canonical bulk load commits, `zinder_store_rocksdb_property{store_role="canonical_primary"}` reports a rising `rocksdb.estimate-pending-compaction-bytes`, a non-zero `rocksdb.actual-delayed-write-rate`, or `rocksdb.is-write-stopped` equal to 1 |
 
 Change one setting at a time. Compare throughput and peak memory on the same
 chain range before and after.

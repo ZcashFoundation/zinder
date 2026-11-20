@@ -327,6 +327,14 @@ impl RocksDbCanonicalBuilder {
         self.confirmed_source_tip_checkpoint.is_some()
     }
 
+    /// Publishes throttled resource gauges for the canonical writer.
+    pub fn record_resource_gauges(&self) {
+        self.bounded_open.record_resource_gauges(
+            crate::StoreRole::CanonicalPrimary,
+            &super::rocksdb::CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
     #[must_use]
     pub const fn io_mode(&self) -> RocksDbIoMode {

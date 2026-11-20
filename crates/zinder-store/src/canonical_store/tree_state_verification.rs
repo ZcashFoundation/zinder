@@ -35,11 +35,12 @@ use super::{
     publication::column_family,
     reader::{CanonicalServingRead, decode_block_header},
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, canonical_verification_column_family_descriptors,
+        BLOCK_HEADER_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
+        CanonicalStoreAdmissionExpectation, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        canonical_verification_column_family_descriptors,
     },
 };
-use crate::{RawBlobRetention, RocksDbResourceBudget};
+use crate::{RawBlobRetention, RocksDbResourceBudget, StoreRole};
 
 /// A canonical secondary opened to verify stored tree-state checkpoints.
 ///
@@ -159,6 +160,14 @@ impl RocksDbTreeStateVerifier {
             canonical_verification_column_family_descriptors,
         )
         .map(|secondary| Self { secondary })
+    }
+
+    /// Publishes this verifier's resource gauges independently of replay and serving readers.
+    pub fn record_resource_gauges(&self) {
+        self.secondary.bounded_open.record_resource_gauges(
+            StoreRole::TreeStateVerificationSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
     }
 
     /// Catches the secondary up, as

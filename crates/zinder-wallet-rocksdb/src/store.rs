@@ -1383,6 +1383,14 @@ impl RocksDbWalletFollowingStore {
         self.store.control.supported_reorg_depth
     }
 
+    /// Publishes throttled resource gauges for the wallet writer.
+    pub fn record_resource_gauges(&self) {
+        self.store.bounded_open.record_resource_gauges(
+            zinder_store::StoreRole::WalletPrimary,
+            &WALLET_DATA_COLUMN_FAMILIES.map(|(name, _)| name),
+        );
+    }
+
     /// Returns the DB-wide `RocksDB` statistics ticker count since this
     /// handle opened, or zero when the resource budget turned statistics off.
     #[must_use]

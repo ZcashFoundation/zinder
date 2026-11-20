@@ -78,8 +78,8 @@ use zinder_source::{
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
-    RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache, StoreRole,
-    record_instance_memory_gauges, record_shared_block_cache_gauges,
+    RocksDbOpenResources, RocksDbResourceBudget, SharedSecondaryResources, StoreRole,
+    record_instance_memory_gauges,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -1044,10 +1044,9 @@ pub struct WalletServingPairPublisher {
     readiness: WalletServingReadiness,
     serving_pair_slot: Option<WalletServingPairSlot>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
-    /// The block caches every generation opens on. They outlive any one
-    /// generation, so a generation that closes leaves its cached blocks to
-    /// the others and to the next cold open.
-    block_caches: ServingBlockCaches,
+    /// Closing a generation preserves both its cached blocks and its contribution
+    /// to the store's cumulative tickers.
+    store_resources: ServingStoreResources,
     /// Gates the memory sample of the open generations, whose table-cache
     /// lookups are too costly to repeat on every refresh.
     instance_memory_throttle: ResourceGaugeThrottle,
@@ -1110,9 +1109,9 @@ impl WalletServingPairPublisher {
     ) -> Result<(Self, WalletServingPairSlot), WalletServingPairError> {
         let generations =
             std::array::from_fn(|generation| SecondaryGeneration::new(&config, generation));
-        let block_caches = ServingBlockCaches {
-            canonical: SharedBlockCache::new(config.canonical_resource_budget.block_cache_bytes),
-            wallet: SharedBlockCache::new(config.wallet_resource_budget.block_cache_bytes),
+        let store_resources = ServingStoreResources {
+            canonical: SharedSecondaryResources::new(config.canonical_resource_budget),
+            wallet: SharedSecondaryResources::new(config.wallet_resource_budget),
         };
         let writer_attestation =
             WriterAttestation::new(config.network, config.serving_pair_staleness_ceiling);
@@ -1122,7 +1121,7 @@ impl WalletServingPairPublisher {
             readiness,
             serving_pair_slot: None,
             generations,
-            block_caches,
+            store_resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             published_generation: None,
             retired_pairs: Vec::with_capacity(SECONDARY_GENERATION_COUNT),
@@ -1259,15 +1258,16 @@ impl WalletServingPairPublisher {
         self.converge_and_publish(generation).await
     }
 
-    /// Publishes the two shared block caches and the number of open
+    /// Publishes shared cache usage, cumulative tickers, and the number of open
     /// generations, and once per throttle interval the memory the open
     /// generations hold outside the caches.
     async fn record_resource_gauges(&mut self) {
-        record_shared_block_cache_gauges(
-            StoreRole::CanonicalSecondary,
-            &self.block_caches.canonical,
-        );
-        record_shared_block_cache_gauges(StoreRole::WalletSecondary, &self.block_caches.wallet);
+        self.store_resources
+            .canonical
+            .record_resource_gauges(StoreRole::CanonicalSecondary);
+        self.store_resources
+            .wallet
+            .record_resource_gauges(StoreRole::WalletSecondary);
         let open_generations = self
             .generations
             .iter()
@@ -1310,6 +1310,11 @@ impl WalletServingPairPublisher {
             })
             .collect::<Vec<_>>();
         let sampled = tokio::task::spawn_blocking(move || {
+            // Every published pair sees the same two caches, even when a retired pair is pinned.
+            if let Some((canonical, wallet)) = published.first() {
+                canonical.record_block_cache_entry_gauges();
+                wallet.record_block_cache_entry_gauges();
+            }
             let canonical = published
                 .iter()
                 .map(|(canonical, _)| canonical.instance_memory())
@@ -1596,14 +1601,8 @@ impl WalletServingPairPublisher {
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
         let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
-        let canonical_resources = RocksDbOpenResources::with_shared_block_cache(
-            self.config.canonical_resource_budget,
-            &self.block_caches.canonical,
-        );
-        let wallet_resources = RocksDbOpenResources::with_shared_block_cache(
-            self.config.wallet_resource_budget,
-            &self.block_caches.wallet,
-        );
+        let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
+        let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;
         let started_at = Instant::now();
         let opened = tokio::task::spawn_blocking(move || {
@@ -2029,11 +2028,10 @@ enum ActiveWriterRelation {
     Refusing,
 }
 
-/// The block cache of each store that every generation of one publisher
-/// reads through.
-struct ServingBlockCaches {
-    canonical: SharedBlockCache,
-    wallet: SharedBlockCache,
+/// The cache and statistics of each store shared by all serving generations.
+struct ServingStoreResources {
+    canonical: SharedSecondaryResources,
+    wallet: SharedSecondaryResources,
 }
 
 struct SecondaryGeneration {
@@ -6934,8 +6932,8 @@ mod tests {
         let (mut publisher, slot) = primaries
             .bootstrap_publisher(zinder_runtime::Readiness::default())
             .await?;
-        let canonical_cache = publisher.block_caches.canonical.clone();
-        let wallet_cache = publisher.block_caches.wallet.clone();
+        let canonical_cache = publisher.store_resources.canonical.block_cache().clone();
+        let wallet_cache = publisher.store_resources.wallet.block_cache().clone();
         assert_eq!(
             gauge_sample(
                 &rendered_metrics.render(),
@@ -7017,6 +7015,13 @@ mod tests {
         store_role: &str,
         block_cache: &zinder_store::SharedBlockCache,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            exposition
+                .lines()
+                .any(|line| line.starts_with("zinder_store_rocksdb_ticker{")
+                    && line.contains(&format!("store_role=\"{store_role}\""))
+                    && line.contains("ticker=\"rocksdb.bytes.read\""))
+        );
         let budget = RocksDbResourceBudget::for_local_tests();
         let open_generations = u32::try_from(SECONDARY_GENERATION_COUNT)?;
         let gauge = |name: &str| {

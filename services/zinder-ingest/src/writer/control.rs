@@ -1062,13 +1062,16 @@ fn commit_tree_state_stride(
 ) {
     send_control_response(
         reply,
-        store.commit_tree_state_stride(stride).map_err(|error| {
-            if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
-                Status::data_loss(error.to_string())
-            } else {
-                map_store_error(&error)
-            }
-        }),
+        store
+            .commit_tree_state_stride(stride)
+            .inspect(|_| store.record_resource_gauges())
+            .map_err(|error| {
+                if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
+                    Status::data_loss(error.to_string())
+                } else {
+                    map_store_error(&error)
+                }
+            }),
     );
 }
 

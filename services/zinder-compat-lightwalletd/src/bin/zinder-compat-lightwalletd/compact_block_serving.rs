@@ -32,7 +32,7 @@ use zinder_runtime::{
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
     ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
-    SharedBlockCache, StoreRole, record_instance_memory_gauges, record_shared_block_cache_gauges,
+    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 
 const GENERATION_COUNT: usize = 2;
@@ -168,10 +168,9 @@ pub(crate) struct CompactBlockPublisher {
     slot: CanonicalReaderSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalReader>>,
-    /// The block cache both generations open on, sized by the configured
-    /// budget. It outlives each generation, so a cold open on a refresh
-    /// starts with the blocks the replaced generation loaded.
-    block_cache: SharedBlockCache,
+    /// Both generations use this cache and statistics base so retirement preserves
+    /// the blocks and read counts from the replaced generation.
+    resources: SharedSecondaryResources,
     /// Gates the memory sample of the open generations, whose table-cache
     /// lookups are too costly to repeat on every refresh.
     instance_memory_throttle: ResourceGaugeThrottle,
@@ -191,14 +190,14 @@ impl CompactBlockPublisher {
         let mut writer_status = WriterStatus::connect(writer_status_endpoint, bearer_token)
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
-        let block_cache = SharedBlockCache::new(config.resource_budget.block_cache_bytes);
+        let resources = SharedSecondaryResources::new(config.resource_budget);
         let mut writer_attestation =
             WriterAttestation::new(config.network, config.staleness_ceiling);
         let (candidate, attesting_status) = converge_candidate(
             &mut writer_status,
             &config,
             CandidateGeneration {
-                block_cache: &block_cache,
+                resources: &resources,
                 generation: 0,
             },
             ServedReader {
@@ -235,7 +234,7 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
-            block_cache,
+            resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
         };
@@ -379,7 +378,7 @@ impl CompactBlockPublisher {
             &mut self.writer_status,
             &self.config,
             CandidateGeneration {
-                block_cache: &self.block_cache,
+                resources: &self.resources,
                 generation: candidate_generation,
             },
             ServedReader {
@@ -461,23 +460,24 @@ impl CompactBlockPublisher {
         );
     }
 
-    /// Publishes the shared block cache and, once per throttle interval, the
+    /// Publishes shared cache usage, cumulative tickers, and once per throttle interval the
     /// summed memory of the active generation and of a replaced one that
     /// requests still hold.
     ///
     /// The memory sample looks up every table file's reader, so it runs on
     /// the blocking pool instead of the publisher task.
     async fn record_resource_gauges(&self) {
-        record_shared_block_cache_gauges(StoreRole::CanonicalSecondary, &self.block_cache);
+        self.resources
+            .record_resource_gauges(StoreRole::CanonicalSecondary);
         if !self.instance_memory_throttle.should_sample() {
             return;
         }
-        let generations = std::iter::once(self.slot.capture())
-            .chain(self.retired.clone())
-            .collect::<Vec<_>>();
+        let active = self.slot.capture();
+        let retired = self.retired.clone();
         let sampled = tokio::task::spawn_blocking(move || {
-            generations
-                .iter()
+            active.secondary().record_block_cache_entry_gauges();
+            std::iter::once(active)
+                .chain(retired)
                 .map(|generation| generation.secondary().instance_memory())
                 .sum()
         })
@@ -530,7 +530,7 @@ async fn open_generation(
     candidate: CandidateGeneration<'_>,
 ) -> Result<RocksDbCanonicalSecondary, CompactBlockServingError> {
     let CandidateGeneration {
-        block_cache,
+        resources,
         generation,
     } = candidate;
     let primary = config.canonical_primary_path.clone();
@@ -538,8 +538,7 @@ async fn open_generation(
     let network = config.network;
     let retention = config.raw_blob_retention;
     let reorg = config.reorg_policy;
-    let resources =
-        RocksDbOpenResources::with_shared_block_cache(config.resource_budget, block_cache);
+    let resources = RocksDbOpenResources::from(resources);
     tokio::task::spawn_blocking(move || {
         let secondary = secondary_root.join(format!("generation-{generation}"));
         std::fs::create_dir_all(&secondary).map_err(|error| {
@@ -596,7 +595,7 @@ async fn catch_up_generation(
 /// The generation slot a candidate opens in, on the publisher's shared cache.
 #[derive(Clone, Copy)]
 struct CandidateGeneration<'a> {
-    block_cache: &'a SharedBlockCache,
+    resources: &'a SharedSecondaryResources,
     generation: usize,
 }
 
@@ -1426,7 +1425,7 @@ mod tests {
         };
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
-        let block_cache = publisher.block_cache.clone();
+        let block_cache = publisher.resources.block_cache().clone();
         let initial = slot.capture();
         let first_block = initial.compact_block_at(BlockHeight::new(1)).await?;
         let loaded = block_cache.usage_bytes();
@@ -1477,6 +1476,11 @@ mod tests {
                     .ok()
             })
         };
+        assert!(rendered_metrics.render().lines().any(|line| {
+            line.starts_with("zinder_store_rocksdb_ticker{")
+                && line.contains("store_role=\"canonical_secondary\"")
+                && line.contains("ticker=\"rocksdb.bytes.read\"")
+        }));
         let generation_memtable_budget = u32::try_from(budget.memtable_budget_bytes)?;
         publisher.record_resource_gauges().await;
         assert_eq!(
