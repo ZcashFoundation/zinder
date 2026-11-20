@@ -1,0 +1,6 @@
+kind: fixed
+body: The RocksDB storage lifecycle harness now accepts benchmark reports from canonical store schema 7.
+time: 2026-11-20T14:41:23.169226993Z
+custom:
+    Bump: patch
+    PR: "419"
