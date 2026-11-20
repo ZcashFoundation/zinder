@@ -312,6 +312,7 @@ async fn a_refused_bootstrap_transition_parks_behind_the_owner_control_endpoint(
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
 
+    let mut recovery_phase = Some(zinder_runtime::StartupPhase::RecoverState.start());
     let mut following = Box::pin(bootstrap_resumed_wallet_following(
         &config,
         &readiness,
@@ -320,7 +321,7 @@ async fn a_refused_bootstrap_transition_parks_behind_the_owner_control_endpoint(
         canonical_control,
         chain.wallet,
         first_retained_event_sequence,
-        zinder_runtime::StartupPhase::RecoverState.start(),
+        &mut recovery_phase,
     ));
     let script =
         drive_bootstrap_park_and_resume(&control, &readiness, projector_control_addr, &cancel);
@@ -590,7 +591,19 @@ async fn the_canonical_secondary_waits_for_the_writers_first_schedule_admission(
     config.fence_convergence_timeout = Duration::from_millis(200);
     let cancel = CancellationToken::new();
 
-    let refused = crate::open_canonical_secondary(&config, reorg_policy, &cancel).await;
+    let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
+    let refused = Box::pin(crate::run_owned_projector(
+        &config,
+        &Readiness::default(),
+        cancel.clone(),
+    ))
+    .await;
+    assert!(
+        capture.any(|event| event.field("phase") == Some("open_storage")
+            && event.field("outcome") == Some("failed")
+            && event.field("reason").is_some())
+    );
+
     assert!(
         matches!(
             refused,

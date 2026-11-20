@@ -214,17 +214,19 @@ async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
         network_name: encode_zinder_native_chain_name(config.network),
         advertised_capabilities: Arc::from([]),
     };
-    if config.ops_listen_addr.is_some() {
-        install_metrics_recorder(&ops_server).map_err(OpsServerError::from)?;
+    if config.ops_listen_addr.is_some()
+        && let Err(error) = install_metrics_recorder(&ops_server).map_err(OpsServerError::from)
+    {
+        load_config.fail(&error);
+        return Err(error.into());
     }
     load_config.complete();
 
     let readiness = Readiness::default();
     let ops_handle = if let Some(address) = config.ops_listen_addr {
         let start_api = StartupPhase::StartApi.start();
-        let handle = spawn_ops_endpoint(address, ops_server, readiness.clone()).await?;
-        start_api.complete();
-        Some(handle)
+        let listener = spawn_ops_endpoint(address, ops_server, readiness.clone()).await;
+        Some(finish_startup_phase(start_api, listener)?)
     } else {
         None
     };
@@ -257,26 +259,69 @@ async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the projector ownership sequence is intentionally visible in one fail-closed order"
-)]
+fn finish_startup_phase<T, E: std::fmt::Display>(
+    phase: StartupPhaseGuard,
+    outcome: Result<T, E>,
+) -> Result<T, E> {
+    match &outcome {
+        Ok(_) => phase.complete(),
+        Err(error) => phase.fail(error),
+    }
+    outcome
+}
+
+#[derive(Default)]
+struct ProjectorStartup {
+    storage: Option<StartupPhaseGuard>,
+    ingest_control: Option<StartupPhaseGuard>,
+    recovery: Option<StartupPhaseGuard>,
+}
+
+fn complete_pending_phase(phase: &mut Option<StartupPhaseGuard>) {
+    if let Some(phase) = phase.take() {
+        phase.complete();
+    }
+}
+
 async fn run_owned_projector(
     config: &config::ProjectorConfig,
     readiness: &Readiness,
     cancel: CancellationToken,
+) -> Result<(), ProjectorError> {
+    let mut startup = ProjectorStartup::default();
+    let outcome = Box::pin(project_wallet(config, readiness, cancel, &mut startup)).await;
+    if let Err(error) = &outcome {
+        for phase in [startup.recovery, startup.ingest_control, startup.storage]
+            .into_iter()
+            .flatten()
+        {
+            phase.fail(error);
+        }
+    }
+    outcome
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the projector ownership sequence is intentionally visible in one fail-closed order"
+)]
+async fn project_wallet(
+    config: &config::ProjectorConfig,
+    readiness: &Readiness,
+    cancel: CancellationToken,
+    startup: &mut ProjectorStartup,
 ) -> Result<(), ProjectorError> {
     let reorg_policy = CanonicalReorgPolicy::new(config.reorg_window_blocks).map_err(|error| {
         zinder_runtime::ConfigError::invalid(format!(
             "projector.reorg_window_blocks is invalid: {error}"
         ))
     })?;
-    let open_storage = StartupPhase::OpenStorage.start();
+    startup.storage = Some(StartupPhase::OpenStorage.start());
     let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
         return Ok(());
     };
-    open_storage.complete();
-    let admit_ingest_control = StartupPhase::AdmitIngestControl.start();
+    complete_pending_phase(&mut startup.storage);
+    startup.ingest_control = Some(StartupPhase::AdmitIngestControl.start());
     let Some(mut canonical_control) = CanonicalWriterControlClient::connect_at_startup(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
@@ -287,7 +332,7 @@ async fn run_owned_projector(
     else {
         return Ok(());
     };
-    let recover_state = StartupPhase::RecoverState.start();
+    startup.recovery = Some(StartupPhase::RecoverState.start());
     let resumable_wallet = open_resumable_wallet(config, canonical.reorg_policy())?;
     let resumable_source = resumable_wallet
         .as_ref()
@@ -317,7 +362,7 @@ async fn run_owned_projector(
         return Ok(());
     };
 
-    admit_ingest_control.complete();
+    complete_pending_phase(&mut startup.ingest_control);
     if let Some(wallet) = resumable_wallet {
         let wallet_source =
             WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
@@ -325,7 +370,7 @@ async fn run_owned_projector(
             .await?
         {
             ResumedFollowingAdmission::Anchored(canonical_lease) => {
-                recover_state.complete();
+                complete_pending_phase(&mut startup.recovery);
                 tracing::info!(
                     target: "zinder::projector",
                     event = "wallet_projection_following_resumed",
@@ -366,7 +411,7 @@ async fn run_owned_projector(
                     canonical_control,
                     wallet,
                     first_retained_event_sequence,
-                    recover_state,
+                    &mut startup.recovery,
                 ))
                 .await;
             }
@@ -545,7 +590,7 @@ async fn run_owned_projector(
         config.lease_duration,
     )
     .await?;
-    recover_state.complete();
+    complete_pending_phase(&mut startup.recovery);
     let ready_height = report.source_position.tip.height.value();
     tracing::info!(
         target: "zinder::projector",
@@ -795,6 +840,15 @@ impl ProjectorControlTasks {
             return Ok(Self::disabled());
         };
         let start_api = StartupPhase::StartApi.start();
+        let bound = Self::bind(config, listen_addr, cancel).await;
+        finish_startup_phase(start_api, bound)
+    }
+
+    async fn bind(
+        config: &zinder_runtime::ResolvedProjectorControl,
+        listen_addr: std::net::SocketAddr,
+        cancel: &CancellationToken,
+    ) -> Result<Self, ProjectorError> {
         let Some(bearer_token) = config.bearer_token.clone() else {
             return Err(ProjectorError::ProjectorControlTokenMissing);
         };
@@ -816,7 +870,6 @@ impl ProjectorControlTasks {
                 )
                 .await
         });
-        start_api.complete();
         Ok(Self {
             commands: Some(commands),
             server: Some(server),
@@ -1004,7 +1057,7 @@ async fn bootstrap_resumed_wallet_following(
     mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     first_retained_event_sequence: u64,
-    recover_state: StartupPhaseGuard,
+    recover_state: &mut Option<StartupPhaseGuard>,
 ) -> Result<(), ProjectorError> {
     let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
     let mut following_readiness = FollowingReadiness::for_wallet(
@@ -1169,7 +1222,7 @@ async fn bootstrap_resumed_wallet_following(
             config.lease_duration,
         )
         .await?;
-        recover_state.complete();
+        complete_pending_phase(recover_state);
         return run_continuous_wallet_following(
             config,
             readiness,
@@ -2686,6 +2739,7 @@ mod tests {
             checkpoint_staging_root: PathBuf::from("checkpoint-staging"),
         };
 
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
         let error = ProjectorControlTasks::start(&config, &CancellationToken::new())
             .await
             .err()
@@ -2697,6 +2751,13 @@ mod tests {
                 ..
             } if observed == address
         ));
+        let reason = error.to_string();
+        assert!(
+            capture.any(|event| event.field("phase") == Some("start_api")
+                && event.field("phase_state") == Some("exit")
+                && event.field("outcome") == Some("failed")
+                && event.field("reason") == Some(reason.as_str()))
+        );
         Ok(())
     }
 
