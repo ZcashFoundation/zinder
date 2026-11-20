@@ -762,6 +762,36 @@ ready:
 4. A sent transaction appears in `GetMempoolStream`, then in
    `GetTransaction` after it is mined.
 
+#### Measure a Zkool restore on a fixed fixture
+
+Build the Zkool evaluator and prepare a loopback lightwalletd fixture using
+the [pinned zcash-sync-evals workflow](https://github.com/craftsoldier/zcash-sync-evals/blob/f0928f9fcc2292ea6be6b406d67355108aa61177/.github/workflows/bench.yml).
+The workflow records the Zkool revision, corpus checksum, and served height
+for each window. The evaluator uses a public test seed and the Mainnet
+consensus rules for the frozen corpus.
+
+For the Sapling fixture, run the evaluator against the server capped at
+height 1,499,999. Use a scratch path that does not exist and whose parent does.
+
+```sh
+python3 scripts/run-zkool-restore.py \
+  --binary /path/to/zkool_sync_eval \
+  --endpoint http://127.0.0.1:9067 \
+  --birthday 1300000 \
+  --expected-tip 1499999 \
+  --scratch .tmp/zkool-restore
+```
+
+The command saves the wallet database and evaluator logs under the scratch
+path. It prints JSON only after the evaluator reports the expected tip.
+`sync_seconds` measures the restore and synchronization, with database
+reporting outside the timed interval. The JSON records the evaluator SHA-256,
+which you can require with `--expected-sha256`. When comparing endpoints,
+verify that the final height, balances, note count, and history count agree
+before comparing timings. Record the evaluator revision and corpus checksum
+alongside the reports. This Sapling window exercises a restore with zero
+wallet activity.
+
 ## Failure interpretation
 
 | Message or symptom | Cause | Fix |
