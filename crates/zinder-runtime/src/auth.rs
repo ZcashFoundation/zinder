@@ -245,6 +245,7 @@ pub type AuthenticatedChannel = InterceptedService<Channel, BearerTokenClientInt
 
 /// Errors returned by [`crate::transport::connect_zinder_grpc`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BearerTokenConnectError {
     /// The endpoint URL could not be parsed.
     #[error("zinder gRPC endpoint URL is invalid: {0}")]

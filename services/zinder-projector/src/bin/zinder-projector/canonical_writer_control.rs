@@ -1,6 +1,7 @@
 //! Authenticated client for canonical retained-event lease ownership.
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use zinder_core::UnixTimestampMillis;
 use zinder_proto::v1::ingest::{
     AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
@@ -13,7 +14,7 @@ use zinder_proto::v1::ingest::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, bearer_metadata,
-    connect_zinder_grpc,
+    connect_zinder_grpc, connect_zinder_grpc_at_startup,
 };
 
 /// Exact lease identity and anchor owned by one projector process.
@@ -120,10 +121,33 @@ impl CanonicalWriterControlClient {
         checkpoint_bearer_token: Option<&BearerToken>,
     ) -> Result<Self, CanonicalWriterControlError> {
         let channel = connect_zinder_grpc(endpoint, bearer_token).await?;
-        Ok(Self {
+        Ok(Self::from_channel(channel, checkpoint_bearer_token))
+    }
+
+    /// Connects while the projector starts, dialing again after each dial
+    /// that times out, so a writer that is slow to come up delays startup
+    /// instead of ending it. Returns `None` when `cancel` fires first.
+    pub(crate) async fn connect_at_startup(
+        endpoint: &str,
+        bearer_token: Option<&BearerToken>,
+        checkpoint_bearer_token: Option<&BearerToken>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Self>, CanonicalWriterControlError> {
+        Ok(
+            connect_zinder_grpc_at_startup(endpoint, bearer_token, cancel)
+                .await?
+                .map(|channel| Self::from_channel(channel, checkpoint_bearer_token)),
+        )
+    }
+
+    fn from_channel(
+        channel: AuthenticatedChannel,
+        checkpoint_bearer_token: Option<&BearerToken>,
+    ) -> Self {
+        Self {
             client: CanonicalControlClient::new(channel),
             checkpoint_bearer_token: checkpoint_bearer_token.cloned(),
-        })
+        }
     }
 
     /// Reads the writer fence used to authenticate the canonical secondary.

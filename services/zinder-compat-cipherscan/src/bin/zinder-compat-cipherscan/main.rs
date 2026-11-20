@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    HttpListenerLimits, Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
-    TracingSubscriberError, cancel_on_terminating_signal, connect_zinder_grpc,
-    install_tracing_subscriber, serve_http, spawn_ops_endpoint_for,
+    HttpListenerLimits, OpsEndpointHandle, Readiness, ReadinessCause, ReadinessState,
+    RuntimeService, StartupPhase, TracingSubscriberError, cancel_on_terminating_signal,
+    connect_zinder_grpc_at_startup, install_tracing_subscriber, serve_http, spawn_ops_endpoint_for,
 };
 
 mod config;
@@ -127,16 +127,26 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     )
     .await?;
 
-    let explorer_channel = connect_zinder_grpc(
+    let cancel = CancellationToken::new();
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let Some(explorer_channel) = connect_zinder_grpc_at_startup(
         &cipherscan_config.explorer_query_endpoint,
         cipherscan_config.bearer_token.as_ref(),
+        &cancel,
     )
-    .await?;
-    let wallet_channel = connect_zinder_grpc(
+    .await?
+    else {
+        return shut_down_ops_endpoint(ops_handle).await;
+    };
+    let Some(wallet_channel) = connect_zinder_grpc_at_startup(
         &cipherscan_config.wallet_query_endpoint,
         cipherscan_config.bearer_token.as_ref(),
+        &cancel,
     )
-    .await?;
+    .await?
+    else {
+        return shut_down_ops_endpoint(ops_handle).await;
+    };
     let listener = TcpListener::bind(cipherscan_config.listen_addr)
         .await
         .map_err(|source| CipherscanConfigError::Bind {
@@ -144,8 +154,6 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
             source,
         })?;
 
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let adapter = CipherscanRestAdapter::new(
         cipherscan_config.network,
         explorer_channel,
@@ -186,10 +194,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         "Cipherscan-compatible REST adapter stopped"
     );
 
-    let ops_shutdown_result = match ops_handle {
-        Some(handle) => handle.shutdown().await,
-        None => Ok(()),
-    };
+    let ops_shutdown_result = shut_down_ops_endpoint(ops_handle).await;
 
     match serve_result {
         Err(error) => {
@@ -203,7 +208,16 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
             }
             Err(CipherscanConfigError::Serve(error))
         }
-        Ok(()) => ops_shutdown_result.map_err(CipherscanConfigError::from),
+        Ok(()) => ops_shutdown_result,
+    }
+}
+
+async fn shut_down_ops_endpoint(
+    ops_handle: Option<OpsEndpointHandle>,
+) -> Result<(), CipherscanConfigError> {
+    match ops_handle {
+        Some(handle) => handle.shutdown().await.map_err(CipherscanConfigError::from),
+        None => Ok(()),
     }
 }
 
