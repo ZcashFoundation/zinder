@@ -24,8 +24,11 @@ const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-
 const DEPLOY_DIRECTORY: &str = "../../deploy";
 const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
 
-/// The base Compose file and every overlay whose usage merges it, as
-/// `(file name, contents)` pairs.
+/// The base Compose file and every overlay that adds to its `zinder-ingest`
+/// service, as `(file name, contents)` pairs.
+///
+/// An overlay's `zinder-ingest` names no image: only the base file defines
+/// how the service is built, so the overlay runs merged with it.
 fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(DEPLOY_DIRECTORY)? {
@@ -38,8 +41,9 @@ fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
             continue;
         }
         let contents = fs::read_to_string(&path)?;
-        let merges_base = contents.contains(&format!("-f deploy/{BASE_COMPOSE_FILE}"));
-        if name == BASE_COMPOSE_FILE || merges_base {
+        let overlays_ingest = ingest_service(&contents)
+            .is_some_and(|service| !service.iter().any(|line| line.starts_with("    image:")));
+        if name == BASE_COMPOSE_FILE || overlays_ingest {
             files.push((name.to_owned(), contents));
         }
     }
@@ -109,20 +113,69 @@ fn section<'doc>(document: &'doc str, heading: &str) -> Result<&'doc str> {
     Ok(body.find("\n## ").map_or(body, |end| &body[..end]))
 }
 
+/// The lines of the Compose `zinder-ingest` service, without its own line,
+/// or `None` when the file does not define it.
+fn ingest_service(compose: &str) -> Option<Vec<&str>> {
+    let mut lines = compose
+        .lines()
+        .skip_while(|line| *line != "  zinder-ingest:");
+    lines.next()?;
+    Some(
+        lines
+            .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+            .collect(),
+    )
+}
+
 /// The networks the Compose `zinder-ingest` service joins. Every public
 /// listener runs in its network namespace.
-fn ingest_networks(compose: &str) -> Vec<&str> {
-    compose
-        .lines()
-        .skip_while(|line| *line != "  zinder-ingest:")
-        .skip(1)
-        .take_while(|line| line.is_empty() || line.starts_with("    "))
-        .skip_while(|line| *line != "    networks:")
-        .skip(1)
-        .take_while(|line| line.starts_with("      "))
-        .filter(|line| !line.starts_with("       "))
-        .filter_map(|line| line.trim().strip_suffix(':'))
-        .collect()
+///
+/// Reads the map form, the list form, and the flow form `[a, b]`, and fails
+/// on a `networks` key it cannot read, so a new form is never read as no
+/// networks.
+fn ingest_networks(compose: &str) -> Result<Vec<&str>> {
+    let service = ingest_service(compose).unwrap_or_default();
+    let Some(key) = service
+        .iter()
+        .position(|line| line.starts_with("    networks:"))
+    else {
+        return Ok(Vec::new());
+    };
+    let inline = service[key]["    networks:".len()..].trim();
+    let names = if inline.is_empty() {
+        service[key + 1..]
+            .iter()
+            .map(|line| line.trim_end())
+            .take_while(|line| line.is_empty() || line.starts_with("      "))
+            .filter(|line| !(line.is_empty() || line.starts_with("       ")))
+            .map(str::trim)
+            .filter(|entry| !entry.starts_with('#'))
+            .map(|entry| {
+                entry
+                    .strip_prefix("- ")
+                    .or_else(|| entry.split_once(':').map(|(name, _)| name))
+                    .ok_or_else(|| eyre!("unreadable zinder-ingest network entry {entry:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        inline
+            .strip_prefix('[')
+            .and_then(|flow| flow.strip_suffix(']'))
+            .ok_or_else(|| eyre!("unreadable zinder-ingest networks value {inline:?}"))?
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect()
+    };
+    let names = names
+        .into_iter()
+        .map(|name| name.trim().trim_matches(['"', '\'']))
+        .collect::<Vec<_>>();
+    ensure!(
+        !names.is_empty(),
+        "zinder-ingest has a networks key that names no network"
+    );
+    Ok(names)
 }
 
 #[test]
@@ -204,7 +257,9 @@ fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<
     );
     let mut checked = 0;
     for (file, contents) in &compose_files {
-        for network in ingest_networks(contents) {
+        let networks =
+            ingest_networks(contents).map_err(|error| eyre!("deploy/{file}: {error}"))?;
+        for network in networks {
             ensure!(
                 requirements.contains(&format!("Compose `{network}` network")),
                 "the public listeners share zinder-ingest's namespace, which deploy/{file} \
@@ -243,5 +298,44 @@ fn ingest_networks_are_read_from_the_service_block() {
     ]
     .join("\n");
 
-    assert_eq!(ingest_networks(&compose), ["node", "observability"]);
+    assert_eq!(
+        ingest_networks(&compose).ok(),
+        Some(vec!["node", "observability"])
+    );
+}
+
+#[test]
+fn ingest_networks_are_read_in_the_list_and_flow_forms() {
+    let list = [
+        "services:",
+        "  zinder-ingest:",
+        "    networks:",
+        "      - node",
+        "      # A wallet-facing network.",
+        "      - \"node-fallback\"",
+        "    volumes:",
+        "      - data:/var/lib/zinder",
+    ]
+    .join("\n");
+    let flow = "services:\n  zinder-ingest:\n    networks: [node, node-fallback]\n";
+
+    for compose in [list.as_str(), flow] {
+        assert_eq!(
+            ingest_networks(compose).ok(),
+            Some(vec!["node", "node-fallback"]),
+            "{compose}"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_ingest_networks_key_fails() {
+    for compose in [
+        "services:\n  zinder-ingest:\n    networks: node\n",
+        "services:\n  zinder-ingest:\n    networks: {node: {}}\n",
+        "services:\n  zinder-ingest:\n    networks: []\n",
+        "services:\n  zinder-ingest:\n    networks:\n    volumes:\n",
+    ] {
+        assert!(ingest_networks(compose).is_err(), "{compose}");
+    }
 }
