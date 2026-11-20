@@ -22,11 +22,10 @@ const NON_PRIMARY_MAX_FILE_OPENING_THREADS: i32 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RocksDbIoMode {
     /// Direct reads, and for primary stores direct flush and compaction I/O.
-    /// An open that requests it falls back to [`Self::Buffered`] when the
-    /// filesystem or platform rejects direct I/O.
+    /// If this open fails, the next attempt uses [`Self::Buffered`].
     Direct,
     /// Buffered filesystem I/O through the page cache. An open resolves to it
-    /// when the budget requests it or when direct I/O was rejected.
+    /// when the budget requests it or a buffered retry succeeds.
     Buffered,
 }
 
@@ -382,7 +381,7 @@ impl BoundedRocksDbOpen {
 /// The open builds a block cache of its own unless `resources` name a
 /// [`SharedBlockCache`]. The column-family descriptors are rebuilt for each
 /// open attempt because their options hold references to that cache. On
-/// direct I/O failure, the function logs the unsupported mode and retries with
+/// a failed direct open, the function logs the error and retries with
 /// the same bounded resource budget under buffered I/O. A budget whose
 /// [`RocksDbResourceBudget::preferred_io_mode`] is [`RocksDbIoMode::Buffered`]
 /// skips the direct attempt.
@@ -476,7 +475,7 @@ where
             Err(direct_error) => {
                 tracing::warn!(
                     target: "zinder::store",
-                    event = "rocksdb_direct_io_unsupported",
+                    event = "rocksdb_direct_io_open_failed",
                     store_path = %open_attempt.role.store_path().display(),
                     role = open_attempt.role.as_str(),
                     error = %direct_error,
@@ -557,7 +556,10 @@ where
     {
         column_families.push(ColumnFamilyDescriptor::new(
             DEFAULT_COLUMN_FAMILY_NAME,
-            default_column_family_options(open_attempt.block_cache),
+            default_column_family_options(
+                open_attempt.block_cache,
+                open_attempt.rocksdb_resource_budget,
+            ),
         ));
     }
 
@@ -590,11 +592,12 @@ where
 /// instance. Pinning Snappy keeps new control-row files in the codec that
 /// existing stores already hold, and the shared table factory makes the
 /// family read through `cache`, so the configured cache bounds every family.
-/// Every other option keeps `RocksDB`'s default.
-fn default_column_family_options(cache: &Cache) -> Options {
+fn default_column_family_options(cache: &Cache, budget: RocksDbResourceBudget) -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Snappy);
     options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+    options.set_write_buffer_size(usize::try_from(budget.write_buffer_bytes).unwrap_or(usize::MAX));
+    options.set_max_write_buffer_number(budget.max_write_buffer_count);
     keep_blocks_of_dropped_table_files(&mut options);
     options
 }
@@ -966,6 +969,8 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     let mut bbt = BlockBasedOptions::default();
+    // Keep the bundled engine's current SST format when upstream changes its default.
+    bbt.set_format_version(7);
     bbt.set_block_cache(cache);
     bbt.set_cache_index_and_filter_blocks(true);
     bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
@@ -1813,28 +1818,109 @@ mod tests {
     }
 
     #[test]
-    fn default_family_compresses_with_snappy() -> Result<(), Box<dyn std::error::Error>> {
+    fn bounded_writer_reads_an_older_table_and_flushes_format_seven()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let store_dir = tempfile::tempdir()?;
+        let mut older_table = BlockBasedOptions::default();
+        older_table.set_format_version(6);
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_block_based_table_factory(&older_table);
+        {
+            let db = DB::open(&options, store_dir.path())?;
+            db.put(b"existing", b"old row")?;
+            db.flush()?;
+        }
+        let opened = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary {
+                path: store_dir.path(),
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            |_, _| Vec::new(),
+        )?;
+        assert_eq!(
+            opened.db.get(b"existing")?.as_deref(),
+            Some(b"old row".as_slice())
+        );
+        opened.db.put(b"new", b"new row")?;
+        opened.db.flush()?;
+
+        let mut versions = Vec::new();
+        for table in opened.db.live_files()? {
+            let mut sst =
+                fs::File::open(store_dir.path().join(table.name.trim_start_matches('/')))?;
+            // The block-based footer ends with a little-endian u32 version and u64 magic.
+            sst.seek(SeekFrom::End(-12))?;
+            let mut version = [0; 4];
+            let mut magic = [0; 8];
+            sst.read_exact(&mut version)?;
+            sst.read_exact(&mut magic)?;
+            assert_eq!(u64::from_le_bytes(magic), 0x88e2_41b7_85f4_cff7);
+            versions.push(u32::from_le_bytes(version));
+        }
+        versions.sort_unstable();
+        assert_eq!(versions, [6, 7]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_direct_open_logs_the_error_and_retries_buffered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file = tempfile::NamedTempFile::new()?;
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        let attempts = std::cell::Cell::new(0);
+        let opened = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path: file.path() },
+            RocksDbResourceBudget::for_local_tests(),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Vec::new()
+            },
+        );
+        assert!(opened.is_err());
+        assert_eq!(attempts.get(), 2);
+        assert!(capture.any(|event| {
+            event.field("event") == Some("rocksdb_direct_io_open_failed")
+                && event.field("error").is_some()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn default_family_uses_snappy_and_the_configured_write_buffers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.max_write_buffer_count = 3;
         let _bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary {
                 path: store_dir.path(),
             },
-            RocksDbResourceBudget::for_local_tests(),
+            budget,
             |_, _| vec![ColumnFamilyDescriptor::new("rows", Options::default())],
         )?;
-        assert_eq!(
-            persisted_compression(store_dir.path(), DEFAULT_COLUMN_FAMILY_NAME)?,
-            Some("kSnappyCompression".to_owned())
-        );
+        let options = persisted_family_options(store_dir.path(), DEFAULT_COLUMN_FAMILY_NAME)?;
+        for (name, expected) in [
+            ("compression", "kSnappyCompression".to_owned()),
+            ("write_buffer_size", budget.write_buffer_bytes.to_string()),
+            (
+                "max_write_buffer_number",
+                budget.max_write_buffer_count.to_string(),
+            ),
+        ] {
+            assert_eq!(options.get(name), Some(&expected), "{name}");
+        }
         Ok(())
     }
 
-    /// Reads `compression` for `family` from the newest `OPTIONS-*` file, which
+    /// Reads the settings for `family` from the newest `OPTIONS-*` file, which
     /// `RocksDB` writes on every open from the options it applied.
-    fn persisted_compression(
+    fn persisted_family_options(
         store: &Path,
         family: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    ) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
         let mut newest: Option<(u64, String)> = None;
         for entry in fs::read_dir(store)? {
             let file_name = entry?
@@ -1860,7 +1946,9 @@ mod tests {
             .skip_while(|line| *line != section)
             .skip(1)
             .take_while(|line| !line.starts_with('['))
-            .find_map(|line| line.trim().strip_prefix("compression=").map(str::to_owned)))
+            .filter_map(|line| line.trim().split_once('='))
+            .map(|(name, setting)| (name.to_owned(), setting.to_owned()))
+            .collect())
     }
 
     fn record_gauges_on_fresh_store(

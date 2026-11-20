@@ -47,12 +47,10 @@ pub fn canonical_reader_block_cache_bytes() -> u64 {
     container_memory_budget_bytes().map_or(FLOOR, |budget| (budget / 8).clamp(FLOOR, CAP))
 }
 
-/// Derives the canonical-reader `max_open_files` from the container memory budget.
+/// Derives the canonical reader's open-file budget from its default block cache.
 ///
-/// Rule: `max(128, budget / 128 MiB * 64)`, capped at 1024. On a 1 GiB container
-/// the default budget is 128 MiB (8 of container), giving 64 handles. Each doubling
-/// of available block cache adds 64 handles so the table-cache matches the expanded
-/// block cache. Cap at 1024 to avoid exhausting OS file-descriptor limits.
+/// Each full 128 MiB allows 64 open files, with a floor of 128 files.
+/// The 512 MiB cache ceiling gives a maximum default of 256 files.
 #[must_use]
 pub fn canonical_reader_max_open_files() -> i32 {
     const FLOOR: i32 = 128;

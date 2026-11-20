@@ -11,10 +11,9 @@
 //!   [`RocksDbResourceBudget::preferred_io_mode`], which the benchmark harness
 //!   sets to buffered to skip the direct attempt; no configuration section
 //!   exposes it.
-//! - **Bounded resource budget** lives here. The numbers below cap the
-//!   block-cache, table-cache, WAL, primary-writer background jobs,
-//!   per-column-family write buffers, and total memtable memory surfaces so a
-//!   crash-replay open or bulk write does not OOM the host. The defaults target
+//! - **Bounded resource budget** lives here. The settings govern the
+//!   block cache, table cache, WAL, primary-writer background jobs,
+//!   per-column-family write buffers, and shared memtable budget. The defaults target
 //!   a mainnet-sized store and are documented in
 //!   [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
 //!
@@ -26,10 +25,6 @@
 use crate::RocksDbIoMode;
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
-///
-/// The fields together cap the resident-memory peak at roughly
-/// `block_cache_bytes + max_wal_bytes + memtable_budget_bytes` regardless of
-/// store size. Each field has a single concrete effect:
 ///
 /// - `block_cache_bytes` is the size of the bounded LRU cache shared by
 ///   data blocks, index blocks, and the filter blocks of any column family
@@ -52,8 +47,11 @@ use crate::RocksDbIoMode;
 ///   background job pool used for flushes and compactions. `OpenAsSecondary`
 ///   disables automatic flushes and compactions, so secondary opens retain the
 ///   field in this uniform budget type but do not apply it.
-/// - `memtable_budget_bytes` caps total memtable memory across column
-///   families via `RocksDB`'s write-buffer manager.
+/// - `memtable_budget_bytes` applies to one open database across its column
+///   families. On a primary, the write-buffer manager uses it to trigger
+///   flushes. Usage can exceed the budget while flushes are pending. Secondary
+///   WAL replay can exceed the budget until catch-up sees a primary flush
+///   and releases the old read view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RocksDbResourceBudget {
     /// Bounded LRU cache size for data, index, and filter blocks.
@@ -69,14 +67,14 @@ pub struct RocksDbResourceBudget {
     pub max_write_buffer_count: i32,
     /// Primary-writer background flush and compaction job limit.
     pub max_background_jobs: i32,
-    /// Total mutable and immutable memtable memory budget across column families.
+    /// Memtable memory budget for one open database, across all its column families.
     pub memtable_budget_bytes: u64,
     /// `RocksDB` statistics collection gate.
     pub statistics_level: RocksDbStatisticsLevel,
     /// Filesystem I/O mode the open attempts first.
     ///
     /// Every profile defaults to [`RocksDbIoMode::Direct`], which falls back
-    /// to buffered I/O when the filesystem rejects direct I/O.
+    /// to buffered I/O if the direct open fails.
     /// [`RocksDbIoMode::Buffered`] skips the direct attempt. Only the
     /// benchmark harness overrides it; no configuration section exposes it.
     pub preferred_io_mode: RocksDbIoMode,
@@ -146,8 +144,8 @@ impl RocksDbResourceBudget {
     /// `512 MiB` total memtable budget. Replay writes many consumer families in
     /// every ordered dispatch; the larger shared memtable envelope lets hot
     /// families rotate while compaction catches up instead of turning flush
-    /// churn into write stalls. The write-buffer manager remains the hard
-    /// aggregate bound.
+    /// churn into write stalls. Reaching the shared budget triggers flushes.
+    /// Total memtable usage can exceed it while flushes are pending.
     #[must_use]
     pub const fn materialized_view_writer_defaults() -> Self {
         Self {

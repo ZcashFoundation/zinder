@@ -439,16 +439,16 @@ export no storage series.
 | `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
 | `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
 | `zinder_store_wal_bytes` | gauge | `store_role` | Live WAL size. |
-| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. |
-| `zinder_store_max_background_jobs` | gauge | `store_role` | Effective RocksDB background jobs. |
+| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. Only primary opens apply it. |
+| `zinder_store_max_background_jobs` | gauge | `store_role` | Configured background job limit on a primary. |
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes. |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
-Query and compatibility export only the block cache, memtable, and
-table-reader series. One block cache serves every open pair slot of a store.
-In a serving process, resident memory minus those three is memory that is not
-cache.
+Query and compatibility export the block cache, memtable, and table-reader
+series for each store they serve. Compact-block mode serves only the canonical
+store. Cache usage includes pinned bytes and counts the shared cache once
+across generations.
 
 ## Structured logs
 
@@ -467,6 +467,8 @@ information and query.
 
 | Event | Runtime | Meaning |
 | --- | --- | --- |
+| `rocksdb_direct_io_open_failed` | All store runtimes | The direct I/O open failed. The `error` field holds the RocksDB error, and the process retries with buffered I/O. |
+| `rocksdb_io_mode` | All store runtimes | A successful open resolved to `mode=direct` or `mode=buffered`. |
 | `canonical_writer_started` | ingest | The writer started. |
 | `canonical_ready_store_reopened` | ingest | An existing store was reopened. |
 | `canonical_empty_construction_staging_removed`, `canonical_unpublished_construction_restarted` | ingest | A first sync restarted from scratch. |
