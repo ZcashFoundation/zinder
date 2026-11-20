@@ -1705,8 +1705,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Whether ingest verifies its stored tree-state checkpoints in the \
                       background, in repeated cycles over every settled row: each row must \
-                      derive the roots stored in it and carry a frontier for exactly the \
-                      pools active at its height. A row that fails parks ingest \
+                      derive the roots stored in it, carry a frontier for exactly the \
+                      pools active at its height, and carry the block time of the \
+                      canonical block at that height. A row that fails parks ingest \
                       readiness with `canonical_store_damaged` and makes the store's \
                       wallet-serving readers refuse traffic, until the store is rebuilt. \
                       With the pass disabled, damage it recorded before stays reported. \
