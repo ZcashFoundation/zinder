@@ -10,8 +10,7 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbInstanceMemory, RocksDbIoMode,
-    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceBudget, RocksDbResourceGaugeInputs,
-    StoreRole, open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceBudget, StoreRole, open_bounded_rocksdb,
 };
 
 use super::{
@@ -81,7 +80,6 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
-    resource_budget: RocksDbResourceBudget,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -193,7 +191,6 @@ impl RocksDbCanonicalSecondary {
         resources
             .validate()
             .map_err(|reason| CanonicalStoreError::InvalidResourceBudget { reason })?;
-        let resource_budget = resources.budget();
         let primary_path = canonical_store_path(primary_path)?;
         if secondary_path == primary_path {
             return Err(CanonicalStoreError::admission(
@@ -281,7 +278,6 @@ impl RocksDbCanonicalSecondary {
             activation_schedule,
             reorg_policy,
             replay_tail,
-            resource_budget,
         })
     }
 
@@ -292,16 +288,16 @@ impl RocksDbCanonicalSecondary {
     /// periodically, so its block-cache hit rate and device reads are
     /// observable beside the walk they serve.
     pub fn record_resource_gauges(&self) {
-        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
-            db: &self.bounded_open.db,
-            store_role: StoreRole::CanonicalSecondary,
-            column_family_names: &CANONICAL_DATA_COLUMN_FAMILIES,
-            block_cache: &self.bounded_open.block_cache,
-            write_buffer_manager: &self.bounded_open.write_buffer_manager,
-            statistics: &self.bounded_open.statistics,
-            io_mode: self.bounded_open.io_mode,
-            resource_budget: self.resource_budget,
-        });
+        self.bounded_open.record_resource_gauges(
+            StoreRole::CanonicalSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
+    /// Publishes cache composition through one serving generation.
+    pub fn record_block_cache_entry_gauges(&self) {
+        self.bounded_open
+            .record_block_cache_entry_gauges(StoreRole::CanonicalSecondary);
     }
 
     /// Samples the memory this secondary holds outside its block cache.

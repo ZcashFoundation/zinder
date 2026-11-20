@@ -1794,6 +1794,7 @@ async fn wait_for_mempool_hydration_change(
 }
 
 fn record_fence_metrics(store: &RocksDbCanonicalStore, observed_tip: BlockId) {
+    store.record_resource_gauges();
     let fence = store.event_fence();
     metrics::gauge!("zinder_ingest_canonical_chain_epoch").set(f64::from(
         u32::try_from(fence.chain_epoch_id().value()).unwrap_or(u32::MAX),

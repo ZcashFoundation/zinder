@@ -419,22 +419,24 @@ Any runtime that calls a node exports these series. `source` is
 
 ## Storage
 
-`store_role` is `canonical_secondary`, `wallet_secondary`,
-`materialized_view_primary`, or `materialized_view_secondary`. The canonical
-primary that ingest writes, and the wallet primary that the projector writes,
-export no storage series.
+The `store_role` label identifies the RocksDB handle or shared serving cache
+within each process.
 
 | Runtime | Roles |
 | --- | --- |
-| `zinder-ingest` | `canonical_secondary` (the copy view replay reads), `materialized_view_primary` |
+| `zinder-ingest` | `canonical_primary` (including wallet-only ingest), `canonical_secondary` (materialized-view replay), `tree_state_verification_secondary`, and `materialized_view_primary` |
+| `zinder-projector` | `wallet_primary` |
 | `zinder-explorer` | `materialized_view_secondary` |
-| `zinder-query`, `zinder-compat-lightwalletd` | `canonical_secondary`, `wallet_secondary`, with the smaller set below |
+| `zinder-query`, wallet-mode `zinder-compat-lightwalletd` | `canonical_secondary` and `wallet_secondary` |
+| Compact-blocks-mode `zinder-compat-lightwalletd` | `canonical_secondary` |
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. |
 | `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
+| `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
+| `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
 | `zinder_store_memtable_budget_bytes` | gauge | `store_role` | Memtable budget. Readers sum it over open pair slots. |
 | `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
 | `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
@@ -445,10 +447,40 @@ export no storage series.
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes. |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
-Query and compatibility export the block cache, memtable, and table-reader
-series for each store they serve. Compact-block mode serves only the canonical
-store. Cache usage includes pinned bytes and counts the shared cache once
-across generations.
+Ingest samples the canonical primary after bulk loads, while following the
+tip, and after checkpoint densification commits. The projector samples the
+wallet primary during following. Commit bursts refresh the writer gauges at
+most once per second. Writers sample WAL size at most once every 15 seconds.
+
+For each data column family, `rocksdb.num-files-at-level0` includes zero.
+Levels 1 through 6 acquire a file-count series when they hold SSTs.
+When a level empties, its previous count clears to zero. The `cf` label is
+`__db__` for database-wide write pressure.
+
+Inspect `rocksdb.aggregated-table-properties` offline for index and filter
+sizes. RocksDB can open every uncached SST to collect them. Per-level
+compression ratios also belong in offline inspection because RocksDB visits
+every file's in-memory metadata. Replay and materialized-view stores retain
+their existing estimates of live data size, total SST size, and table-reader
+memory.
+
+Serving publishers report the cache footprint, cache entries, tickers, and
+summed instance memory. Compact-block mode serves only the canonical store.
+Cache usage includes pinned bytes. Each store shares one cache and one set of tickers
+across generations. Recycling a generation preserves its reads in the
+cumulative totals. Serving publishers sample cache composition on the blocking
+pool, using one handle per cache at the 15-second instance-memory cadence.
+
+`zinder_store_rocksdb_ticker` uses upstream names for its `ticker` label.
+The store's `statistics_level` must be `tickers` or `full`.
+
+| To measure | Tickers |
+| --- | --- |
+| File opens and errors | `rocksdb.no.file.opens`, `rocksdb.no.file.errors` |
+| Bytes served from cache | `rocksdb.block.cache.bytes.read` |
+| Where point reads hit | `rocksdb.memtable.hit`, `rocksdb.l0.hit`, `rocksdb.l1.hit`, `rocksdb.l2andup.hit` |
+| Iterator work | `rocksdb.number.db.seek`, `rocksdb.number.db.next`, `rocksdb.db.iter.bytes.read` |
+| Readahead | `rocksdb.prefetch.bytes`, `rocksdb.prefetch.bytes.useful`, `rocksdb.readahead.trimmed` |
 
 ## Structured logs
 

@@ -2730,7 +2730,7 @@ impl MaterializedViewStore {
         } else {
             StoreRole::MaterializedViewPrimary
         };
-        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
+        let inputs = RocksDbResourceGaugeInputs {
             db: &self.db,
             store_role,
             column_family_names: &column_family_names,
@@ -2739,7 +2739,8 @@ impl MaterializedViewStore {
             statistics: &self.statistics,
             io_mode: self.io_mode,
             resource_budget: self.rocksdb_resource_budget,
-        });
+        };
+        record_rocksdb_resource_gauges(&inputs);
         self.record_materialized_view_rocksdb_properties(store_role);
     }
 

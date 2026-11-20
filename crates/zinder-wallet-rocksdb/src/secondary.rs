@@ -298,6 +298,13 @@ impl RocksDbWalletSecondary {
         self.store.io_mode()
     }
 
+    /// Publishes cache composition through one serving generation.
+    pub fn record_block_cache_entry_gauges(&self) {
+        self.store
+            .bounded_open
+            .record_block_cache_entry_gauges(zinder_store::StoreRole::WalletSecondary);
+    }
+
     /// Samples the memory this secondary holds outside its block cache.
     #[must_use]
     pub fn instance_memory(&self) -> RocksDbInstanceMemory {

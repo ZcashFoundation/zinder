@@ -1,3 +1,5 @@
+mod properties;
+
 use std::{
     fs,
     path::Path,
@@ -12,6 +14,7 @@ use rust_rocksdb::{
     statistics::{StatsLevel, Ticker},
 };
 
+use self::properties::{record_cache_entries, record_level_gauges};
 use crate::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
@@ -77,6 +80,10 @@ pub enum StoreRole {
     CanonicalPrimary,
     /// Canonical chain store opened as a secondary reader.
     CanonicalSecondary,
+    /// Canonical secondary dedicated to verifying settled tree-state checkpoints.
+    TreeStateVerificationSecondary,
+    /// Wallet-projection store opened as the primary writer.
+    WalletPrimary,
     /// Materialized-view store opened as the primary writer.
     MaterializedViewPrimary,
     /// Materialized-view store opened as a secondary reader.
@@ -94,16 +101,21 @@ impl StoreRole {
             Self::CanonicalSecondary => "canonical_secondary",
             Self::MaterializedViewPrimary => "materialized_view_primary",
             Self::MaterializedViewSecondary => "materialized_view_secondary",
+            Self::TreeStateVerificationSecondary => "tree_state_verification_secondary",
+            Self::WalletPrimary => "wallet_primary",
             Self::WalletSecondary => "wallet_secondary",
         }
     }
 
     const fn open_posture(self) -> RocksDbOpenPosture {
         match self {
-            Self::CanonicalPrimary | Self::MaterializedViewPrimary => RocksDbOpenPosture::Primary,
-            Self::CanonicalSecondary | Self::MaterializedViewSecondary | Self::WalletSecondary => {
-                RocksDbOpenPosture::Secondary
+            Self::CanonicalPrimary | Self::MaterializedViewPrimary | Self::WalletPrimary => {
+                RocksDbOpenPosture::Primary
             }
+            Self::CanonicalSecondary
+            | Self::TreeStateVerificationSecondary
+            | Self::MaterializedViewSecondary
+            | Self::WalletSecondary => RocksDbOpenPosture::Secondary,
         }
     }
 }
@@ -166,15 +178,54 @@ impl std::fmt::Debug for SharedBlockCache {
     }
 }
 
+/// The cache and cumulative statistics shared by secondary generations of one store.
+#[derive(Clone)]
+pub struct SharedSecondaryResources {
+    budget: RocksDbResourceBudget,
+    block_cache: SharedBlockCache,
+    options: Arc<Options>,
+}
+
+impl SharedSecondaryResources {
+    /// Allocates a cache and applies the store's statistics level once for all generations.
+    #[must_use]
+    pub fn new(budget: RocksDbResourceBudget) -> Self {
+        let block_cache = SharedBlockCache::new(budget.block_cache_bytes);
+        let options = build_secondary_db_options(None, budget, &block_cache.cache);
+        Self {
+            budget,
+            block_cache,
+            options: Arc::new(options),
+        }
+    }
+
+    /// Returns the block cache used by every generation.
+    #[must_use]
+    pub const fn block_cache(&self) -> &SharedBlockCache {
+        &self.block_cache
+    }
+
+    /// Publishes the cache footprint and cumulative tickers across generations.
+    pub fn record_resource_gauges(&self, store_role: StoreRole) {
+        record_shared_block_cache_gauges(store_role, &self.block_cache);
+        if self.budget.statistics_level != RocksDbStatisticsLevel::Off {
+            record_rocksdb_ticker_gauges(&self.options, store_role.as_str());
+        }
+    }
+}
+
 /// The bounded resources one `RocksDB` open applies.
 ///
 /// A [`RocksDbResourceBudget`] converts into resources whose open builds a
 /// block cache of its own. [`Self::with_shared_block_cache`] instead opens the
 /// instance on a cache that other instances of the same store read through.
-#[derive(Clone, Debug)]
+/// A serving publisher passes a reference to its [`SharedSecondaryResources`]
+/// to share both the cache and statistics across secondary opens.
+#[derive(Clone)]
 pub struct RocksDbOpenResources {
     budget: RocksDbResourceBudget,
     shared_block_cache: Option<SharedBlockCache>,
+    secondary_options: Option<Arc<Options>>,
 }
 
 impl RocksDbOpenResources {
@@ -192,6 +243,7 @@ impl RocksDbOpenResources {
         Self {
             budget,
             shared_block_cache: Some(block_cache.clone()),
+            secondary_options: None,
         }
     }
 
@@ -216,11 +268,32 @@ impl RocksDbOpenResources {
     }
 }
 
+impl std::fmt::Debug for RocksDbOpenResources {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RocksDbOpenResources")
+            .field("budget", &self.budget)
+            .field("shared_block_cache", &self.shared_block_cache)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<&SharedSecondaryResources> for RocksDbOpenResources {
+    fn from(resources: &SharedSecondaryResources) -> Self {
+        Self {
+            budget: resources.budget,
+            shared_block_cache: Some(resources.block_cache.clone()),
+            secondary_options: Some(Arc::clone(&resources.options)),
+        }
+    }
+}
+
 impl From<RocksDbResourceBudget> for RocksDbOpenResources {
     fn from(budget: RocksDbResourceBudget) -> Self {
         Self {
             budget,
             shared_block_cache: None,
+            secondary_options: None,
         }
     }
 }
@@ -343,9 +416,37 @@ pub struct BoundedRocksDbOpen {
     /// Open options retained so the DB-wide statistics tickers stay readable
     /// for metric export.
     pub statistics: Arc<Options>,
+    resource_budget: RocksDbResourceBudget,
+    resource_gauge_throttle: ResourceGaugeThrottle,
+    wal_size_throttle: ResourceGaugeThrottle,
 }
 
 impl BoundedRocksDbOpen {
+    /// Publishes resource gauges for a single-instance role at most once per second.
+    pub fn record_resource_gauges(&self, role: StoreRole, families: &[&'static str]) {
+        if !self.resource_gauge_throttle.should_sample() {
+            return;
+        }
+        let inputs = RocksDbResourceGaugeInputs {
+            db: &self.db,
+            store_role: role,
+            column_family_names: families,
+            block_cache: &self.block_cache,
+            write_buffer_manager: &self.write_buffer_manager,
+            statistics: &self.statistics,
+            io_mode: self.io_mode,
+            resource_budget: self.resource_budget,
+        };
+        record_single_instance_resource_gauges(&inputs, self.wal_size_throttle.should_sample());
+    }
+
+    /// Scans the cache for entry counts and charges.
+    /// Serving publishers call this on the blocking pool, once per shared cache
+    /// at the instance-memory cadence.
+    pub fn record_block_cache_entry_gauges(&self, role: StoreRole) {
+        record_cache_entries(&self.db, role);
+    }
+
     /// Samples the memory this instance holds outside its block cache.
     ///
     /// The table-reader estimate looks up the reader of every table file in
@@ -393,6 +494,7 @@ pub fn open_bounded_rocksdb(
     let RocksDbOpenResources {
         budget: rocksdb_resource_budget,
         shared_block_cache,
+        secondary_options,
     } = resources.into();
     if matches!(
         role,
@@ -412,6 +514,7 @@ pub fn open_bounded_rocksdb(
         block_cache: &block_cache,
         write_buffer_manager: &write_buffer_manager,
         build_column_families: &build_column_families,
+        secondary_options: secondary_options.as_deref(),
     };
     let (db, statistics, io_mode) = open_with_preferred_io_mode(&open_attempt)?;
     record_rocksdb_io_mode(role, io_mode);
@@ -421,6 +524,9 @@ pub fn open_bounded_rocksdb(
         write_buffer_manager,
         io_mode,
         statistics: Arc::new(statistics),
+        resource_budget: rocksdb_resource_budget,
+        resource_gauge_throttle: ResourceGaugeThrottle::default(),
+        wal_size_throttle: ResourceGaugeThrottle::for_instance_memory(),
     })
 }
 
@@ -493,6 +599,7 @@ where
     BuildColumnFamilies: Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
 {
     role: RocksDbOpenRole<'path>,
+    secondary_options: Option<&'attempt Options>,
     rocksdb_resource_budget: RocksDbResourceBudget,
     block_cache: &'attempt Cache,
     write_buffer_manager: &'attempt WriteBufferManager,
@@ -517,12 +624,16 @@ where
             open_attempt.block_cache,
             false,
         ),
-        RocksDbOpenRole::Secondary { .. } | RocksDbOpenRole::ReadOnlyProbe { .. } => {
-            build_secondary_db_options(
-                open_attempt.rocksdb_resource_budget,
-                open_attempt.block_cache,
-            )
-        }
+        RocksDbOpenRole::Secondary { .. } => build_secondary_db_options(
+            open_attempt.secondary_options,
+            open_attempt.rocksdb_resource_budget,
+            open_attempt.block_cache,
+        ),
+        RocksDbOpenRole::ReadOnlyProbe { .. } => build_secondary_db_options(
+            None,
+            open_attempt.rocksdb_resource_budget,
+            open_attempt.block_cache,
+        ),
     };
     if let Some(max_background_jobs) = open_attempt
         .role
@@ -619,7 +730,7 @@ pub struct RocksDbResourceGaugeInputs<'sample> {
     pub db: &'sample DB,
     /// Store domain and open posture, emitted as the `store_role` label.
     pub store_role: StoreRole,
-    /// Column families to probe for the per-CF integer properties.
+    /// Column families to probe for table and level properties.
     pub column_family_names: &'sample [&'static str],
     /// Shared block cache retained for the database lifetime.
     pub block_cache: &'sample Cache,
@@ -658,17 +769,34 @@ fn wal_size_bytes(db: &DB) -> Option<u64> {
 
 /// Publishes the bounded-`RocksDB` resource gauges under a `store_role` label.
 ///
-/// Shared by the canonical chain store and the materialized-view store so both instances
-/// contribute distinguishable cache, memtable, WAL, and per-CF footprints to
-/// the same series. `store_role` keeps the aggregate resident set attributable
-/// to each instance. Primary-only controls are omitted for secondary roles.
+/// Each single-instance role reports its own cache, memtables, WAL, column
+/// families, and DB-wide statistics. Primary roles also report writer controls.
 pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
+    record_single_instance_resource_gauges(inputs, true);
+}
+
+fn record_single_instance_resource_gauges(
+    inputs: &RocksDbResourceGaugeInputs<'_>,
+    sample_wal: bool,
+) {
     let store_role = inputs.store_role.as_str();
+    // Replay and materialized views already expose these file-by-file estimates.
+    // Adding them to a writer commit would make sampling scale with its SST count.
+    let per_file_properties: &[&str] = match inputs.store_role {
+        StoreRole::CanonicalSecondary
+        | StoreRole::MaterializedViewPrimary
+        | StoreRole::MaterializedViewSecondary => &PER_FILE_PROPERTIES,
+        StoreRole::CanonicalPrimary
+        | StoreRole::WalletPrimary
+        | StoreRole::WalletSecondary
+        | StoreRole::TreeStateVerificationSecondary => &[],
+    };
     for cf_name in inputs.column_family_names {
         let Some(column_family) = inputs.db.cf_handle(cf_name) else {
             continue;
         };
-        for property in PER_CF_INT_PROPERTIES {
+        record_level_gauges(inputs, cf_name, &column_family);
+        for &property in PER_CF_INT_PROPERTIES.iter().chain(per_file_properties) {
             let Ok(Some(property_sample)) =
                 inputs.db.property_int_value_cf(&column_family, property)
             else {
@@ -695,7 +823,7 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
         )
         .set(u64_to_f64(property_sample));
     }
-    if let Some(wal_bytes) = wal_size_bytes(inputs.db) {
+    if sample_wal && let Some(wal_bytes) = wal_size_bytes(inputs.db) {
         metrics::gauge!("zinder_store_wal_bytes", "store_role" => store_role)
             .set(u64_to_f64(wal_bytes));
     }
@@ -728,9 +856,8 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
 /// Publishes one shared block cache under `store_role`.
 ///
 /// The gauges describe the one cache, however many instances share it.
-/// Per-instance properties and tickers are not exported, because the
-/// instances would overwrite one another's series;
-/// [`record_instance_memory_gauges`] publishes their summed memory instead.
+/// [`SharedSecondaryResources::record_resource_gauges`] also publishes the
+/// tickers collected across those instances.
 pub fn record_shared_block_cache_gauges(store_role: StoreRole, block_cache: &SharedBlockCache) {
     record_block_cache_gauges(store_role.as_str(), &block_cache.cache);
 }
@@ -762,9 +889,8 @@ fn record_block_cache_gauges(store_role: &'static str, block_cache: &Cache) {
 /// DB-wide `RocksDB` statistics tickers exported as monotonic gauges.
 ///
 /// Every ticker is aggregated across all column families of one store. The
-/// canonical and materialized-view stores that export these series configure
-/// no filter, so their `BloomFilter*` entries read zero. The wallet store,
-/// whose hash-keyed families carry filters, does not export its tickers here.
+/// wallet's filtered families contribute Bloom tickers. Canonical and wallet
+/// serving secondaries retain their counters across recycled generations.
 const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::BloomFilterUseful,
     Ticker::BloomFilterFullPositive,
@@ -778,6 +904,19 @@ const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::NumberMultigetCalls,
     Ticker::NumberMultigetKeysRead,
     Ticker::NumberMultigetBytesRead,
+    Ticker::NoFileOpens,
+    Ticker::NoFileErrors,
+    Ticker::BlockCacheBytesRead,
+    Ticker::MemtableHit,
+    Ticker::GetHitL0,
+    Ticker::GetHitL1,
+    Ticker::GetHitL2AndUp,
+    Ticker::NumberDbSeek,
+    Ticker::NumberDbNext,
+    Ticker::IterBytesRead,
+    Ticker::PrefetchBytes,
+    Ticker::PrefetchBytesUseful,
+    Ticker::ReadaheadTrimmed,
     Ticker::BytesRead,
     Ticker::BytesWritten,
     Ticker::WalFileBytes,
@@ -866,14 +1005,15 @@ impl Default for ResourceGaugeThrottle {
     }
 }
 
-/// Applies [`RocksDbResourceBudget::statistics_level`] to `db_options`.
+/// Builds the base options for a store's [`RocksDbResourceBudget::statistics_level`].
 ///
 /// `RocksDbStatisticsLevel::Off` skips `enable_statistics()` entirely, so
 /// `db_options.get_ticker_count` reads a null statistics pointer and
 /// returns `0` rather than erroring; [`record_rocksdb_resource_gauges`]
 /// still skips the ticker export at this level so the exported series
 /// stays absent rather than reporting fabricated zeros.
-fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLevel) {
+fn statistics_options(level: RocksDbStatisticsLevel) -> Options {
+    let mut db_options = Options::default();
     match level {
         RocksDbStatisticsLevel::Off => {}
         RocksDbStatisticsLevel::Tickers => {
@@ -882,6 +1022,7 @@ fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLeve
         }
         RocksDbStatisticsLevel::Full => db_options.enable_statistics(),
     }
+    db_options
 }
 
 /// Builds `RocksDB` options for any writer-posture instance in the workspace.
@@ -901,10 +1042,9 @@ fn build_primary_db_options(
     cache: &Cache,
     create_missing: bool,
 ) -> Options {
-    let mut db_options = Options::default();
+    let mut db_options = statistics_options(rocksdb_resource_budget.statistics_level);
     db_options.create_if_missing(create_missing);
     db_options.create_missing_column_families(create_missing);
-    apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_total_wal_size(rocksdb_resource_budget.max_wal_bytes);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_atomic_flush(true);
@@ -924,13 +1064,17 @@ fn build_primary_db_options(
 /// bound the secondary's open-time RAM peak as the store grows.
 #[must_use]
 fn build_secondary_db_options(
+    base: Option<&Options>,
     rocksdb_resource_budget: RocksDbResourceBudget,
     cache: &Cache,
 ) -> Options {
-    let mut db_options = Options::default();
+    if let Some(base) = base {
+        // Copying Options preserves RocksDB's shared Statistics pointer.
+        return base.clone();
+    }
+    let mut db_options = statistics_options(rocksdb_resource_budget.statistics_level);
     db_options.create_if_missing(false);
     db_options.create_missing_column_families(false);
-    apply_statistics_level(&mut db_options, rocksdb_resource_budget.statistics_level);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
@@ -1040,15 +1184,17 @@ fn names_table_file(status_part: &str) -> bool {
         })
 }
 
-const PER_CF_INT_PROPERTIES: [&str; 13] = [
+const PER_FILE_PROPERTIES: [&str; 3] = [
     "rocksdb.estimate-live-data-size",
     "rocksdb.total-sst-files-size",
+    TABLE_READERS_MEMORY_PROPERTY,
+];
+
+const PER_CF_INT_PROPERTIES: [&str; 9] = [
     "rocksdb.size-all-mem-tables",
     "rocksdb.cur-size-active-mem-table",
-    TABLE_READERS_MEMORY_PROPERTY,
     "rocksdb.estimate-pending-compaction-bytes",
     "rocksdb.num-running-compactions",
-    "rocksdb.num-files-at-level0",
     "rocksdb.num-immutable-mem-table",
     "rocksdb.mem-table-flush-pending",
     "rocksdb.num-running-flushes",
@@ -1180,7 +1326,6 @@ mod tests {
     #[test]
     fn property_export_covers_flush_and_compaction_pressure() {
         for property in [
-            "rocksdb.num-files-at-level0",
             "rocksdb.num-immutable-mem-table",
             "rocksdb.mem-table-flush-pending",
             "rocksdb.num-running-flushes",
@@ -1238,6 +1383,7 @@ mod tests {
 
         for role in [
             StoreRole::CanonicalPrimary,
+            StoreRole::WalletPrimary,
             StoreRole::MaterializedViewPrimary,
         ] {
             assert_eq!(
@@ -1247,6 +1393,7 @@ mod tests {
         }
         for role in [
             StoreRole::CanonicalSecondary,
+            StoreRole::TreeStateVerificationSecondary,
             StoreRole::MaterializedViewSecondary,
             StoreRole::WalletSecondary,
         ] {
@@ -1448,6 +1595,165 @@ mod tests {
         Ok(open.db.get_cf(&rows, b"key"))
     }
 
+    #[test]
+    fn shared_secondary_tickers_include_retired_generations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let primary_path = root.path().join("primary");
+        let primary = open_rows_primary(&primary_path)?;
+        write_row(&primary, 1)?;
+        let shared = SharedSecondaryResources::new(RocksDbResourceBudget::for_local_tests());
+        let generation = |path: &Path| {
+            open_bounded_rocksdb(
+                RocksDbOpenRole::Secondary {
+                    primary_path: &primary_path,
+                    secondary_path: path,
+                },
+                &shared,
+                rows_family,
+            )
+        };
+        let first = generation(&root.path().join("first"))?;
+        let second = generation(&root.path().join("second"))?;
+        let ticker = Ticker::NumberKeysRead;
+        let before = second.statistics.get_ticker_count(ticker);
+        assert!(read_row(&first)??.is_some());
+        assert!(read_row(&second)??.is_some());
+        assert_eq!(first.statistics.get_ticker_count(ticker), before + 2);
+        drop(first);
+        assert_eq!(second.statistics.get_ticker_count(ticker), before + 2);
+        assert!(read_row(&second)??.is_some());
+        assert_eq!(second.statistics.get_ticker_count(ticker), before + 3);
+        drop(second);
+        assert_eq!(shared.options.get_ticker_count(ticker), before + 3);
+        let reopened = generation(&root.path().join("second"))?;
+        assert!(read_row(&reopened)??.is_some());
+        assert_eq!(shared.options.get_ticker_count(ticker), before + 4);
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_off_omits_shared_tickers() -> Result<(), Box<dyn std::error::Error>> {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.statistics_level = RocksDbStatisticsLevel::Off;
+        let root = tempfile::tempdir()?;
+        let primary_path = root.path().join("primary");
+        let primary = open_rows_primary(&primary_path)?;
+        write_row(&primary, 1)?;
+        let shared = SharedSecondaryResources::new(budget);
+        let secondary = open_bounded_rocksdb(
+            RocksDbOpenRole::Secondary {
+                primary_path: &primary_path,
+                secondary_path: &root.path().join("secondary"),
+            },
+            &shared,
+            rows_family,
+        )?;
+        assert!(read_row(&secondary)??.is_some());
+        assert_eq!(
+            secondary
+                .statistics
+                .get_ticker_count(Ticker::NumberKeysRead),
+            0
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            shared.record_resource_gauges(StoreRole::WalletSecondary);
+        });
+        let exposition = recorder.handle().render();
+        assert!(exposition.contains("zinder_store_block_cache_capacity_bytes"));
+        assert!(!exposition.contains("zinder_store_rocksdb_ticker"));
+        Ok(())
+    }
+
+    #[test]
+    fn primary_reports_level_counts_without_expensive_properties()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let mut primary = open_rows_primary(root.path())?;
+        primary.resource_gauge_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        write_row(&primary, 7)?;
+        assert!(read_row(&primary)??.is_some());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let record = || primary.record_resource_gauges(StoreRole::CanonicalPrimary, &["rows"]);
+        record();
+        let first = recorder.handle().render();
+        let property = |exposition: &str, label: &str| {
+            primary_gauge(exposition, "zinder_store_rocksdb_property{", label)
+        };
+        assert_eq!(property(&first, "rocksdb.num-files-at-level0"), Some(1.0));
+        assert_eq!(property(&first, "rocksdb.num-files-at-level1"), None);
+        for per_file_property in super::PER_FILE_PROPERTIES {
+            assert_eq!(property(&first, per_file_property), None);
+        }
+        assert!(!first.contains("compression-ratio-at-level"));
+        assert!(!first.contains("zinder_store_table_metadata_bytes"));
+        assert!(first.contains("zinder_store_block_cache_usage_bytes"));
+        assert!(!first.contains("zinder_store_block_cache_entries"));
+        assert!(!first.contains("zinder_store_block_cache_entry_bytes"));
+        let rows = primary.db.cf_handle("rows").ok_or("rows must open")?;
+        primary
+            .db
+            .compact_range_cf(&rows, None::<&[u8]>, None::<&[u8]>);
+        record();
+        let compacted = recorder.handle().render();
+        assert_eq!(
+            property(&compacted, "rocksdb.num-files-at-level0"),
+            Some(0.0)
+        );
+        let occupied_property = (1..=6)
+            .map(|level| format!("rocksdb.num-files-at-level{level}"))
+            .find(|name| property(&compacted, name) == Some(1.0))
+            .ok_or("compaction must move the SST above level 0")?;
+        drop(rows);
+        drop(primary);
+
+        let empty = tempfile::tempdir()?;
+        let reopened = open_rows_primary(empty.path())?;
+        reopened.record_resource_gauges(StoreRole::CanonicalPrimary, &["rows"]);
+        let after_reopen = recorder.handle().render();
+        assert_eq!(property(&after_reopen, &occupied_property), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_exports_cache_composition_on_explicit_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary_dir = tempfile::tempdir()?;
+        let secondary_dir = tempfile::tempdir()?;
+        let primary = open_rows_primary(primary_dir.path())?;
+        write_row(&primary, 7)?;
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let cache = SharedBlockCache::new(budget.block_cache_bytes);
+        let secondary = open_rows_secondary(primary_dir.path(), secondary_dir.path(), &cache)?;
+        assert!(read_row(&secondary)??.is_some());
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        secondary.record_block_cache_entry_gauges(StoreRole::CanonicalSecondary);
+        let exposition = recorder.handle().render();
+        assert!(exposition.lines().any(|line| {
+            line.starts_with("zinder_store_block_cache_entries{")
+                && line.contains("entry_role=\"Misc\"")
+                && line.contains("store_role=\"canonical_secondary\"")
+                && line
+                    .rsplit_once(' ')
+                    .is_some_and(|(_, count)| count.parse::<f64>().is_ok_and(|count| count > 0.0))
+        }));
+        assert!(exposition.contains("zinder_store_block_cache_entry_bytes"));
+        Ok(())
+    }
+
+    fn primary_gauge(exposition: &str, metric: &str, label: &str) -> Option<f64> {
+        let line = exposition.lines().find(|line| {
+            line.starts_with(metric)
+                && line.contains(label)
+                && line.contains("store_role=\"canonical_primary\"")
+        })?;
+        line.rsplit_once(' ')?.1.parse().ok()
+    }
+
     fn table_file_names(store: &Path) -> Result<Vec<String>, std::io::Error> {
         let mut names = fs::read_dir(store)?
             .filter_map(Result::ok)
@@ -1603,12 +1909,10 @@ mod tests {
         drop(private_probe);
 
         let local_budget = RocksDbResourceBudget::for_local_tests();
-        let shared = SharedBlockCache::new(local_budget.block_cache_bytes);
-        let shared_probe = open_bounded_rocksdb_read_only_probe(
-            store_dir.path(),
-            &column_families,
-            RocksDbOpenResources::with_shared_block_cache(local_budget, &shared),
-        )?;
+        let resources = SharedSecondaryResources::new(local_budget);
+        let shared = resources.block_cache();
+        let shared_probe =
+            open_bounded_rocksdb_read_only_probe(store_dir.path(), &column_families, &resources)?;
         assert_eq!(
             usize_to_u64(shared_probe.block_cache.get_capacity()),
             shared.capacity_bytes()
@@ -1619,6 +1923,10 @@ mod tests {
             Some(vec![9; ISOLATION_ROW_BYTES])
         );
         assert!(shared.usage_bytes() >= cached_before + u64::try_from(ISOLATION_ROW_BYTES)?);
+        assert_eq!(
+            resources.options.get_ticker_count(Ticker::NumberKeysRead),
+            0
+        );
         Ok(())
     }
 

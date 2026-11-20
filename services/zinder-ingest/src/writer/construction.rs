@@ -501,6 +501,7 @@ where
         }
     }
     let subtree_root_evidence = builder.load_subtree_roots(derived_subtree_roots)?;
+    builder.record_resource_gauges();
     record_construction_phase("source_families", started_at);
     Ok(CanonicalSourceLoadOutcome {
         builder,
@@ -872,6 +873,7 @@ where
         let evidence = builder
             .bulk_load_blocks(&network_upgrade_activations, &mut build_blocks)
             .map_err(canonical_build_error)?;
+        builder.record_resource_gauges();
         let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
         drop(build_blocks);
         // Blocks complete different pools' subtrees in any order, while the

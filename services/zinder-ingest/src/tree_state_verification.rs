@@ -597,7 +597,9 @@ impl VerificationPass {
         let checked = tokio::task::spawn_blocking(move || {
             let mut verifier = verifier.lock();
             verifier.try_catch_up()?;
-            verifier.verify_tree_state_checkpoint_at(height, &activations)
+            let checked = verifier.verify_tree_state_checkpoint_at(height, &activations);
+            verifier.record_resource_gauges();
+            checked
         })
         .await
         .map_err(|error| error.to_string())
@@ -663,13 +665,14 @@ impl VerificationPass {
             verifier
                 .try_catch_up()
                 .map_err(StepFailure::before_any_row)?;
-            verifier
-                .verify_tree_state_checkpoints(from, STEP_ROWS, &activations)
-                .map_err(|error| StepFailure {
-                    verified_rows: error.verified_rows,
-                    next_from: Some(error.next_from),
-                    reason: error.to_string(),
-                })
+            let checked = verifier.verify_tree_state_checkpoints(from, STEP_ROWS, &activations);
+            verifier.record_resource_gauges();
+            drop(verifier);
+            checked.map_err(|error| StepFailure {
+                verified_rows: error.verified_rows,
+                next_from: Some(error.next_from),
+                reason: error.to_string(),
+            })
         })
         .await
         .map_err(StepFailure::before_any_row)?
