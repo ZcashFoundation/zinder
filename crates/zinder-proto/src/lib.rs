@@ -23,6 +23,10 @@ pub use error_policy::{
 /// advertised capabilities satisfy their requirements.
 pub const CONTRACT_REVISION: u32 = 11;
 
+/// Milliseconds an ingest-control caller can wait for `MempoolEvents` response
+/// headers. Unlike a gRPC deadline, this budget ends once the stream opens.
+pub const MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER: &str = "x-zinder-mempool-events-open-timeout-ms";
+
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///
 /// Wire it into `tonic_reflection::server::Builder::configure().register_encoded_file_descriptor_set(...)`

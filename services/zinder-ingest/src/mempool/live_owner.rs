@@ -2487,6 +2487,63 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stream_establishment_spends_one_deadline_across_the_gate_and_owner()
+    -> Result<(), Box<dyn Error>> {
+        use zinder_proto::v1::{ingest::ingest_control_server::IngestControl as _, wallet};
+        let (canonical, mut commands) = canonical_control_channel();
+        let owner = LiveMempoolOwner::new();
+        let network = zinder_core::Network::ZcashRegtest;
+        let adapter = crate::CanonicalIngestControlGrpcAdapter::new(
+            network,
+            canonical,
+            owner.clone(),
+            Arc::new(zinder_source::ZebraJsonRpcSource::new(
+                network,
+                "http://127.0.0.1:1",
+                zinder_source::NodeAuth::None,
+                Duration::from_secs(1),
+            )?),
+            zinder_runtime::ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]),
+        );
+        for hold_gate in [true, false] {
+            let gate = owner.mutation_gate.lock().await;
+            let mut request = tonic::Request::new(wallet::MempoolEventsRequest {
+                start: Some(zinder_store::event_stream_start_message(
+                    &zinder_store::EventStreamStartPosition::LiveTail,
+                )),
+            });
+            request.set_timeout(Duration::from_secs(4));
+            let open = adapter.mempool_events(request);
+            tokio::pin!(open);
+            assert!(futures_util::poll!(&mut open).is_pending());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let gate = if hold_gate {
+                Some(gate)
+            } else {
+                drop(gate);
+                None
+            };
+            assert!(futures_util::poll!(&mut open).is_pending());
+            assert_eq!(commands.len(), usize::from(!hold_gate));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let status = open.await.err().ok_or("stalled stream opened")?;
+            assert_eq!(status.code(), Code::Unavailable);
+            assert_eq!(
+                status
+                    .get_error_details()
+                    .error_info()
+                    .map(|detail| detail.reason.as_str()),
+                Some(ErrorReason::StorageUnavailable.as_str_name())
+            );
+            drop(gate);
+            if !hold_gate {
+                let _held = commands.try_recv()?;
+            }
+        }
+        Ok(())
+    }
+
     /// The tip-transition bound also covers the wait for the mutation gate,
     /// so a read queued behind a long reconciliation still answers in time.
     #[tokio::test]

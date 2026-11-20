@@ -40,7 +40,7 @@ use zinder_store::{
 
 use crate::{
     CanonicalControlHandle, LiveMempoolOwner,
-    writer::control::{CanonicalIngestEvent, CanonicalWriterSnapshot},
+    writer::control::{CanonicalIngestEvent, CanonicalReadDeadline, CanonicalWriterSnapshot},
 };
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
@@ -151,7 +151,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
 
     async fn writer_status(
         &self,
-        _request: Request<WriterStatusRequest>,
+        request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let readiness_report = self.readiness.runtime_readiness().report();
         // Fresh construction has no published epoch, and the writer services
@@ -167,7 +167,10 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         // A parked writer reports its frozen fence while it still answers;
         // once its owner loop has stopped, readers still need the typed halt
         // rather than an unavailable control channel.
-        let chain_epoch = match self.current_chain_epoch().await {
+        let chain_epoch = match CanonicalReadDeadline::from_request(&request)
+            .wait(self.current_chain_epoch())
+            .await
+        {
             Ok(snapshot) => Some(snapshot.chain_epoch),
             Err(_)
                 if matches!(
@@ -191,6 +194,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::EventStreamStart>,
     ) -> Result<Response<Self::VisibleChainEventsStream>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let after_cursor = match request
             .into_inner()
             .position
@@ -199,7 +203,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             wallet::event_stream_start::Position::AfterCursor(cursor) => Some(cursor),
             wallet::event_stream_start::Position::EarliestRetained(_) => None,
             wallet::event_stream_start::Position::LiveTail(_) => {
-                let snapshot = self.current_chain_epoch().await?;
+                let snapshot = deadline.wait(self.current_chain_epoch()).await?;
                 (snapshot.fence.chain_event_sequence() != 0)
                     .then(|| {
                         zinder_store::CanonicalEventCursor::at(
@@ -223,17 +227,17 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let request = request.into_inner();
         // The owner captures the canonical fence before touching the mempool
         // page. A tip committed during or after the page read is therefore
         // observable as a strictly newer chain event by tip-coherent consumers.
-        let (chain_epoch, page) = self
-            .mempool
-            .snapshot_page_at_canonical_tip(
+        let (chain_epoch, page) = deadline
+            .wait(self.mempool.snapshot_page_at_canonical_tip(
                 &self.canonical,
                 bounded_snapshot_page_size(request.max_entries),
                 request.from_cursor,
-            )
+            ))
             .await?;
         Ok(Response::new(wallet::MempoolSnapshotResponse {
             chain_view: Some(chain_view_message(chain_epoch)),
@@ -256,10 +260,13 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let transaction_id = transaction_id_from_rpc_hex(&request.into_inner().transaction_id)?;
-        let (chain_epoch, entry) = self
-            .mempool
-            .entry_at_canonical_tip(&self.canonical, transaction_id)
+        let (chain_epoch, entry) = deadline
+            .wait(
+                self.mempool
+                    .entry_at_canonical_tip(&self.canonical, transaction_id),
+            )
             .await?;
         let entry = entry.ok_or_else(|| {
             TransactionAbsence::at_epoch(chain_epoch, true)
@@ -279,12 +286,12 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::MempoolEventsRequest>,
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        let deadline = CanonicalReadDeadline::for_mempool_events(&request);
         let request = request.into_inner();
         let start = event_stream_start_from_message(request.start)
             .ok_or_else(|| Status::invalid_argument("event stream start is required"))?;
-        let after_cursor = self
-            .mempool
-            .resolve_event_start(&self.canonical, start)
+        let after_cursor = deadline
+            .wait(self.mempool.resolve_event_start(&self.canonical, start))
             .await?;
         Ok(Response::new(spawn_mempool_event_stream(
             self.mempool.clone(),
@@ -295,7 +302,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
 
     async fn chain_value_pools_at_tip(
         &self,
-        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+        request: Request<wallet::ChainValuePoolsAtTipRequest>,
     ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
         if !self
             .node_source
@@ -306,7 +313,9 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 "upstream node does not advertise chain_value_pools",
             ));
         }
-        let snapshot = self.current_chain_epoch().await?;
+        let snapshot = CanonicalReadDeadline::from_request(&request)
+            .wait(self.current_chain_epoch())
+            .await?;
         let value_pools = self
             .node_source
             .fetch_chain_value_pools_at_tip()

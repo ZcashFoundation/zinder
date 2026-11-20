@@ -651,7 +651,7 @@ where
             // stream is not cancelled after the unary request timeout.
             let response = tokio::time::timeout(
                 WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-                client.mempool_events(Request::new(request.into_inner())),
+                client.mempool_events(crate::wallet_mempool_events_request(request.into_inner())),
             )
             .await
             .map_err(|_| {
