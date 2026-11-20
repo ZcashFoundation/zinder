@@ -469,9 +469,11 @@ only through NU6.2, and the test refuses a tip at or past NU6.3.
 Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
 The qualification build serves wallet RPCs with one canonical store and ingest
 control. It uses the node for transparent balances, UTXOs, address history,
-transaction submission, and the recommended fee. Forwarded answers are not
-epoch-pinned. Compare them with wallet serving while the node stays at the
-same block hash and height.
+transaction submission, and the recommended fee. Before forwarding a request,
+it checks that the node supports transaction broadcast, agrees with the
+writer's activation schedule through the next block, and holds the served tip
+on its best chain. The node can advance while answering. Compare forwarded
+answers with wallet serving while the node stays at the same hash and height.
 
 Build the two qualification binaries:
 
@@ -505,7 +507,12 @@ target/debug/zinder-compat-lightwalletd --network zcash-regtest \
 ```
 
 The canonical reader serves compact blocks, nullifiers, tree states, and subtree
-roots. Both mempool methods use ingest control. Each address-history stream
+roots. A subtree-root stream returns roots completed by its starting tip.
+It can continue across an append and returns `UNAVAILABLE` if a later page
+finds that tip has left the best chain. A writer halt observed by ingest control
+closes admission until the publisher verifies the recovered writer's fence.
+
+Both mempool methods use ingest control. Each address-history stream
 hydrates one transaction at a time through the node. Dropping the stream
 cancels the active read. With `none`, `GetTransaction` fetches the bytes from
 the node. To exercise local mined-transaction reads, repeat with fresh store

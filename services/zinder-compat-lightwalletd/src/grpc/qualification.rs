@@ -6,7 +6,7 @@ use tokio_stream::{self as stream, Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address;
 use zinder_core::{
-    BlockHeight, ChainEpochId, Network, RawTransactionBytes, SubtreeRootRange, TransactionId,
+    BlockHeight, ChainEpoch, Network, RawTransactionBytes, SubtreeRootRange, TransactionId,
     wire::{
         decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_internal_transaction_id,
     },
@@ -51,8 +51,28 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
         replay_wait: Duration,
         replay_waiters_per_slot: NonZeroU32,
     ) -> Self {
-        let query = QualificationWalletQuery::new(node, replay_wait, replay_waiters_per_slot);
+        let readers = slot.clone();
+        let query = QualificationWalletQuery::new(
+            move || readers.capture(),
+            node,
+            replay_wait,
+            replay_waiters_per_slot,
+        );
         Self::new(QualificationWallet { slot, query })
+    }
+
+    /// Observes the node against the same canonical tip and schedule used for forwarding.
+    #[must_use]
+    pub fn spawn_node_readiness_probe(
+        &self,
+        readiness: zinder_query::WalletServingReadiness,
+        interval: Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        self.query_api
+            .query
+            .clone()
+            .spawn_node_readiness_probe(readiness, interval, cancel)
     }
 
     async fn qualification_transaction(
@@ -66,12 +86,8 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             .map_err(|e| wire_decode_error_to_status(&e))?;
         let reader = self.query_api.slot.capture();
         if !reader.raw_blob_retention().retains_transaction_blobs() {
-            let node = self
-                .query_api
-                .query
-                .verified_node(&reader)
-                .await
-                .map_err(node_status)?;
+            drop(reader);
+            let node = self.query_api.node().await?;
             return forwarded_transaction(node, id, None).await;
         }
         let miss = match reader.mined_transaction(id).await {
@@ -103,9 +119,9 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
 impl QualificationWallet {
     async fn node(&self) -> Result<&ZebraJsonRpcSource, Status> {
         self.query
-            .verified_node(&self.slot.capture())
+            .verified_node()
             .await
-            .map_err(node_status)
+            .map_err(|error| status_from_query_error(&QueryError::Node(error)))
     }
 
     async fn balance(
@@ -360,15 +376,9 @@ impl SubtreeRootReads for QualificationWallet {
     async fn read_subtree_roots(
         &self,
         range: SubtreeRootRange,
-        epoch: ChainEpochId,
+        epoch: ChainEpoch,
     ) -> Result<SubtreeRoots, QueryError> {
-        let reader = self.slot.capture();
-        if reader.chain_epoch().id != epoch {
-            return Err(QueryError::ChainEpochPinUnavailable {
-                chain_epoch_id: epoch,
-            });
-        }
-        QualificationWalletQuery::subtree_roots(&reader, range).await
+        self.query.subtree_roots(epoch, range).await
     }
 }
 
@@ -455,11 +465,10 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::RawTransaction>,
     ) -> Result<Response<lightwalletd::SendResponse>, Status> {
-        let reader = self.query_api.slot.capture();
         let outcome = self
             .query_api
             .query
-            .broadcast(&reader, RawTransactionBytes::new(request.into_inner().data))
+            .broadcast(RawTransactionBytes::new(request.into_inner().data))
             .await
             .map_err(|e| status_from_query_error(&e))?;
         Ok(Response::new(send_response_from_broadcast_outcome(outcome)))
@@ -579,7 +588,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::GetSubtreeRootsArg>,
     ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
-        let epoch = self.query_api.slot.capture().chain_epoch().id;
+        let epoch = self.query_api.slot.capture().chain_epoch();
         let request = request.into_inner();
         let source = SubtreeRootsStream::start(
             self.query_api.clone(),

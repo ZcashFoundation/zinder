@@ -41,8 +41,6 @@ mod observed_canonical_reader;
 mod qualification;
 #[cfg(feature = "light-wallet-qualification")]
 pub use qualification::QualificationWalletQuery;
-#[cfg(feature = "light-wallet-qualification")]
-pub use wallet_serving_pair_publisher::spawn_qualification_dependency_probe;
 mod rocksdb_serving_readers;
 mod serving_read;
 mod serving_readers;

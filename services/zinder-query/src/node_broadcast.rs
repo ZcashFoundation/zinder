@@ -225,26 +225,6 @@ impl<Source> OrderedBroadcaster<Source> {
 }
 
 impl OrderedBroadcaster<ZebraJsonRpcSource> {
-    #[cfg(feature = "light-wallet-qualification")]
-    pub(crate) async fn verify_primary_for_canonical(
-        &self,
-        reader: &dyn crate::CanonicalReader,
-    ) -> Result<(), SourceError> {
-        let schedule =
-            reader
-                .network_upgrade_schedule()
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "canonical reader has no admitted upgrade schedule",
-                })?;
-        let target = Arc::new(VerificationTarget::new(
-            reader.event_fence(),
-            schedule.activations(),
-            Some(schedule.revision()),
-        ));
-        self.inner.verifications.track(&target);
-        self.verify_against(0, &target).await
-    }
-
     /// Builds the JSON-RPC source of `primary`, position 0, and of every
     /// fallback target after it, without contacting any node.
     ///
@@ -564,7 +544,10 @@ async fn submitted_transaction_id(raw_transaction: RawTransactionBytes) -> Optio
     clippy::wildcard_enum_match_arm,
     reason = "non-exhaustive broadcast outcomes from zinder-core are counted as unknown"
 )]
-fn record_attempt(position: usize, outcome: &Result<TransactionBroadcastOutcome, SourceError>) {
+pub(crate) fn record_attempt(
+    position: usize,
+    outcome: &Result<TransactionBroadcastOutcome, SourceError>,
+) {
     let outcome = match outcome {
         Ok(TransactionBroadcastOutcome::Accepted(_)) => "accepted",
         Ok(TransactionBroadcastOutcome::Duplicate(_)) => "duplicate",
@@ -1060,7 +1043,7 @@ fn broadcast_height(fence: CanonicalEventFence) -> BlockHeight {
 /// The serving-pair evidence a verification checks endpoints against and a
 /// broadcast checks kept tables against, captured without retaining the pair
 /// across node calls.
-struct VerificationTarget {
+pub(crate) struct VerificationTarget {
     basis: VerificationBasis,
     admitted_activations: NetworkUpgradeActivations,
     broadcast_height: BlockHeight,
@@ -1070,6 +1053,32 @@ struct VerificationTarget {
 }
 
 impl VerificationTarget {
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) fn from_canonical(reader: &dyn crate::CanonicalReader) -> Result<Self, SourceError> {
+        let schedule =
+            reader
+                .network_upgrade_schedule()
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "canonical reader has no admitted upgrade schedule",
+                })?;
+        Ok(Self::new(
+            reader.event_fence(),
+            schedule.activations(),
+            Some(schedule.revision()),
+        ))
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) async fn verify(&self, source: &impl BroadcastNodeProbe) -> Result<(), SourceError> {
+        verify_node_endpoint(source, self)
+            .await
+            .map(|_| ())
+            .map_err(|failure| match failure {
+                VerificationFailure::Refused(refusal) => refusal.error(),
+                VerificationFailure::Inconclusive(error) => error,
+            })
+    }
+
     fn of(pair: &WalletServingReadPair) -> Self {
         Self::new(
             pair.canonical_fence(),

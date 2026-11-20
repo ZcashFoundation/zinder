@@ -526,10 +526,9 @@ async fn run_canonical(
             ingest,
             poll_interval,
         } => {
-            let source = *source;
             let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
                 slot,
-                source.clone(),
+                *source,
                 lightwalletd_config
                     .tree_state_replay_wait
                     .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAIT),
@@ -545,14 +544,15 @@ async fn run_canonical(
             .with_ping(configured_ping(&lightwalletd_config, &cancel));
             let (adapter, tip_publisher) =
                 with_ingest_mempool(adapter, &lightwalletd_config, &cancel);
-            let probe = zinder_query::spawn_qualification_dependency_probe(
-                source,
+            let node_probe = adapter.spawn_node_readiness_probe(
+                serving_readiness.dependencies(),
+                poll_interval,
+                cancel.clone(),
+            );
+            let ingest_probe = spawn_wallet_ingest_control_readiness_probe(
                 ingest,
                 serving_readiness.dependencies(),
-                (
-                    poll_interval,
-                    lightwalletd_config.storage.secondary_catchup_interval,
-                ),
+                lightwalletd_config.storage.secondary_catchup_interval,
                 cancel.clone(),
             );
             (
@@ -564,7 +564,8 @@ async fn run_canonical(
                     &readiness,
                 )?,
                 tasks
-                    .with("qualification dependency probe", probe)
+                    .with("qualification node probe", node_probe)
+                    .with("qualification ingest probe", ingest_probe)
                     .with("tip-change publisher", tip_publisher),
             )
         }

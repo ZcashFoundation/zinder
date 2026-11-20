@@ -1022,7 +1022,7 @@ where
         &self,
         request: Request<lightwalletd::GetSubtreeRootsArg>,
     ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
-        let at_epoch_id = self.query_api.capture_view().await?.id;
+        let epoch = self.query_api.capture_view().await?;
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
         let source = SubtreeRootsStream::start(
@@ -1030,7 +1030,7 @@ where
             protocol,
             &request,
             self.response_limits.max_subtree_roots,
-            at_epoch_id,
+            epoch,
         )
         .await?;
 
@@ -1221,7 +1221,7 @@ trait SubtreeRootReads: Send + Sync + 'static {
     fn read_subtree_roots(
         &self,
         range: SubtreeRootRange,
-        epoch: ChainEpochId,
+        epoch: ChainEpoch,
     ) -> impl Future<Output = Result<SubtreeRoots, QueryError>> + Send;
 }
 
@@ -1229,9 +1229,9 @@ impl<Query: WalletQueryApi> SubtreeRootReads for Query {
     async fn read_subtree_roots(
         &self,
         range: SubtreeRootRange,
-        epoch: ChainEpochId,
+        epoch: ChainEpoch,
     ) -> Result<SubtreeRoots, QueryError> {
-        self.subtree_roots(range, Some(epoch)).await
+        self.subtree_roots(range, Some(epoch.id)).await
     }
 }
 
@@ -1243,7 +1243,7 @@ impl<Query: WalletQueryApi> SubtreeRootReads for Query {
 struct SubtreeRootsStream<QueryApi> {
     query_api: QueryApi,
     protocol: ShieldedProtocol,
-    at_epoch_id: ChainEpochId,
+    epoch: ChainEpoch,
     /// Index of the next root to read, or `None` once the stream is complete.
     next_index: Option<u32>,
     /// Roots still to return. `maxEntries = 0` ("all") starts at `u32::MAX`,
@@ -1262,12 +1262,12 @@ where
         protocol: ShieldedProtocol,
         request: &lightwalletd::GetSubtreeRootsArg,
         page_limit: NonZeroU32,
-        at_epoch_id: ChainEpochId,
+        epoch: ChainEpoch,
     ) -> Result<Self, Status> {
         let mut stream = Self {
             query_api,
             protocol,
-            at_epoch_id,
+            epoch,
             next_index: Some(request.start_index),
             remaining: if request.max_entries == 0 {
                 u32::MAX
@@ -1297,7 +1297,7 @@ where
                     SubtreeRootIndex::new(start_index),
                     page_entries,
                 ),
-                self.at_epoch_id,
+                self.epoch,
             )
             .await
             .map_err(|error| subtree_roots_status(&error))?;

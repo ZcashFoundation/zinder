@@ -12,57 +12,68 @@ use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
 };
-use zinder_core::{BlockHeight, Network};
+use zinder_core::Network;
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as _,
 };
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
-    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, RocksDbCanonicalReader,
-    spawn_qualification_dependency_probe,
+    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, RocksDbCanonicalReader, WalletServingReadiness,
+    spawn_wallet_ingest_control_readiness_probe,
 };
-use zinder_runtime::{ComposedReadiness, Readiness, ReadinessInput, ReadinessState};
+use zinder_runtime::{Readiness, ReadinessState};
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, JsonRpcStub, JsonRpcTestServer, RpcReply,
     WalletServingStoreFixture, method,
 };
 
+mod canonical;
+
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 
 struct Fixture {
     adapter: LightwalletdGrpcAdapter<QualificationWallet>,
     node: JsonRpcTestServer,
-    source: ZebraJsonRpcSource,
+    slot: CanonicalReaderSlot,
     _store: WalletServingStoreFixture,
 }
 
 impl Fixture {
     fn new(replies: impl IntoIterator<Item = JsonRpcStub>) -> Result<Self> {
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        Self::from_chain(&chain, &one_upgrade_per_height()?, replies)
+    }
+
+    fn from_chain(
+        chain: &ChainFixture,
+        schedule: &zinder_core::NetworkUpgradeActivations,
+        replies: impl IntoIterator<Item = JsonRpcStub>,
+    ) -> Result<Self> {
         let tip = chain
-            .block_at(BlockHeight::new(1))
+            .blocks()
+            .last()
             .ok_or_else(|| eyre!("missing fixture tip"))?;
-        let schedule = one_upgrade_per_height()?;
-        let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+        let mut store = WalletServingStoreFixture::from_chain(chain, schedule)?;
         let (canonical, _) = store.take_readers()?;
-        let node = verifiable_node(&schedule, tip.hash, replies)?;
+        let node = verifiable_node(schedule, tip.hash, replies)?;
         let source = ZebraJsonRpcSource::new(
             Network::ZcashRegtest,
             node.url(),
             NodeAuth::None,
             Duration::from_secs(2),
         )?;
+        let slot = CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(canonical)?));
         let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
-            CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(canonical)?)),
-            source.clone(),
+            slot.clone(),
+            source,
             DEFAULT_TREE_STATE_REPLAY_WAIT,
             DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
         );
         Ok(Self {
             adapter,
             node,
-            source,
+            slot,
             _store: store,
         })
     }
@@ -203,25 +214,26 @@ async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> 
             .height,
         1
     );
+    assert_degraded_node_readiness(&fixture.adapter).await
+}
+
+async fn assert_degraded_node_readiness(
+    adapter: &LightwalletdGrpcAdapter<QualificationWallet>,
+) -> Result<()> {
     let readiness = Readiness::default();
-    let composed = ComposedReadiness::with_dependency_inputs(
-        readiness.clone(),
-        &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
-    );
-    composed.publish_admission(ReadinessState::ready(Some(1)));
+    let composed = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
+    composed
+        .canonical_admission()
+        .publish_admission(ReadinessState::ready(Some(1)));
     let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
     let ingest =
         AdmittedIngestControl::connect(control.endpoint(), None, Network::ZcashRegtest).await?;
     let (address, _ops) = super::health::spawn_readyz(&readiness).await?;
     let cancel = CancellationToken::new();
     let interval = Duration::from_millis(20);
-    let task = spawn_qualification_dependency_probe(
-        fixture.source,
-        ingest,
-        composed,
-        (interval, interval),
-        cancel.clone(),
-    );
+    let task = adapter.spawn_node_readiness_probe(composed.clone(), interval, cancel.clone());
+    let ingest_task =
+        spawn_wallet_ingest_control_readiness_probe(ingest, composed, interval, cancel.clone());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let report = reqwest::get(format!("http://{address}/readyz")).await?;
@@ -242,6 +254,7 @@ async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> 
     .await??;
     cancel.cancel();
     task.await?;
+    ingest_task.await?;
     control.shutdown().await?;
     Ok(())
 }

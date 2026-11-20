@@ -3,14 +3,14 @@
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use zinder_core::{
-    BlockHeight, RawTransactionBytes, SubtreeRootRange, TransactionBroadcastOutcome,
+    BlockHeight, BlockId, ChainEpoch, RawTransactionBytes, SubtreeRootRange,
+    TransactionBroadcastOutcome,
 };
 use zinder_source::{SourceError, TransactionBroadcaster, ZebraJsonRpcSource};
-use zinder_store::{ArtifactFamily, TreeStateLookup, TreeStateReplayOutcome};
+use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup, TreeStateReplayOutcome};
 
 use crate::{
-    ArtifactKey, CanonicalReader, OrderedBroadcaster, QueryError, RocksDbCanonicalReader,
-    SubtreeRoots, TreeState,
+    ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
     tree_state_replay_limit::TreeStateReplayLimit,
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
@@ -20,16 +20,21 @@ use crate::{
 #[derive(Clone)]
 pub struct QualificationWalletQuery {
     source: ZebraJsonRpcSource,
-    nodes: OrderedBroadcaster<ZebraJsonRpcSource>,
+    capture: Arc<dyn Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync>,
     replays: TreeStateReplayLimit,
 }
 
 impl QualificationWalletQuery {
     /// Uses the primary node for forwarding and the wallet replay bounds for canonical reads.
     #[must_use]
-    pub fn new(source: ZebraJsonRpcSource, wait: Duration, waiters_per_slot: NonZeroU32) -> Self {
+    pub fn new(
+        capture: impl Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync + 'static,
+        source: ZebraJsonRpcSource,
+        wait: Duration,
+        waiters_per_slot: NonZeroU32,
+    ) -> Self {
         Self {
-            nodes: OrderedBroadcaster::new(source.clone(), []),
+            capture: Arc::new(capture),
             source,
             replays: TreeStateReplayLimit::for_available_parallelism(wait)
                 .with_waiters_per_slot(waiters_per_slot),
@@ -37,18 +42,16 @@ impl QualificationWalletQuery {
     }
 
     /// Verifies the configured node against the writer-admitted schedule and tip before forwarding.
-    pub async fn verified_node(
-        &self,
-        reader: &RocksDbCanonicalReader,
-    ) -> Result<&ZebraJsonRpcSource, SourceError> {
-        self.nodes.verify_primary_for_canonical(reader).await?;
+    pub async fn verified_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
+        let target =
+            crate::node_broadcast::VerificationTarget::from_canonical((self.capture)().as_ref())?;
+        target.verify(&self.source).await?;
         Ok(&self.source)
     }
 
     /// Submits a transaction through the verified endpoint under the wallet broadcast byte budget.
     pub async fn broadcast(
         &self,
-        reader: &RocksDbCanonicalReader,
         bytes: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, QueryError> {
         if bytes.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
@@ -58,11 +61,14 @@ impl QualificationWalletQuery {
             });
         }
         let reservation = BroadcastByteBudget::process().try_reserve(bytes.len())?;
-        self.verified_node(reader).await.map_err(QueryError::Node)?;
+        let node = self.verified_node().await.map_err(QueryError::Node)?;
         reservation
-            .hold_during(self.nodes.broadcast_transaction(bytes))
+            .hold_during(async {
+                let outcome = node.broadcast_transaction(bytes).await;
+                crate::node_broadcast::record_attempt(0, &outcome);
+                outcome.map_err(QueryError::Node)
+            })
             .await
-            .map_err(QueryError::Node)
     }
 
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
@@ -88,37 +94,74 @@ impl QualificationWalletQuery {
             .await
             .map_err(QueryError::canonical_read)?
             .ok_or(QueryError::BlockNotInBestChain)?;
-        let state = match lookup {
-            TreeStateLookup::Stored(state) => state,
-            TreeStateLookup::Replay(replay) => {
-                let permit = self.replays.admit().await?;
-                let outcome = tokio::spawn(async move {
-                    let _permit = permit;
-                    reader.replay_tree_state(replay).await
-                })
-                .await
-                .map_err(|error| QueryError::BlockingTaskFailed {
-                    reason: error.to_string(),
-                })?
-                .map_err(QueryError::canonical_read)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-                match outcome {
-                    TreeStateReplayOutcome::Stored(state)
-                    | TreeStateReplayOutcome::Replayed {
-                        tree_state: state, ..
-                    } => state,
-                }
-            }
+        let replay = match lookup {
+            TreeStateLookup::Stored(state) => return Ok(tree_state_response(epoch, state)),
+            TreeStateLookup::Replay(replay) => replay,
         };
-        Ok(tree_state_response(epoch, state))
+        let block = reader
+            .block_header_at(height)
+            .await
+            .map_err(QueryError::canonical_read)?
+            .ok_or(QueryError::BlockNotInBestChain)?;
+        let expected = BlockId::new(height, block.block_hash);
+        drop(reader);
+        let permit = self.replays.admit().await?;
+        let reader = (self.capture)();
+        let replay_epoch = reader.chain_epoch();
+        if !retains_block(&reader, epoch, expected).await? {
+            return Err(QueryError::BlockNotInBestChain);
+        }
+        let outcome = tokio::spawn(async move {
+            let _permit = permit;
+            reader.replay_tree_state(replay).await
+        })
+        .await
+        .map_err(|error| QueryError::BlockingTaskFailed {
+            reason: error.to_string(),
+        })?
+        .map_err(QueryError::canonical_read)?
+        .ok_or(QueryError::BlockNotInBestChain)?;
+        let state = match outcome {
+            TreeStateReplayOutcome::Stored(state)
+            | TreeStateReplayOutcome::Replayed {
+                tree_state: state, ..
+            } => state,
+        };
+        Ok(tree_state_response(replay_epoch, state))
     }
 
-    /// Returns the completed roots in one bounded page at the reader's epoch.
+    /// Returns the completed roots in one bounded page as of the captured epoch, while its tip remains canonical.
     pub async fn subtree_roots(
-        reader: &RocksDbCanonicalReader,
+        &self,
+        epoch: ChainEpoch,
         range: SubtreeRootRange,
     ) -> Result<SubtreeRoots, QueryError> {
         crate::validate_subtree_root_range(range)?;
-        canonical_subtree_roots(reader, reader.chain_epoch(), range).await
+        let reader = (self.capture)();
+        let initial_tip = BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash);
+        if !retains_block(&reader, epoch, initial_tip).await? {
+            return Err(QueryError::ChainEpochPinUnavailable {
+                chain_epoch_id: epoch.id,
+            });
+        }
+        canonical_subtree_roots(reader.as_ref(), epoch, range).await
     }
 }
+
+async fn retains_block(
+    reader: &RocksDbCanonicalReader,
+    captured_epoch: ChainEpoch,
+    block: BlockId,
+) -> Result<bool, QueryError> {
+    if reader.chain_epoch() == captured_epoch {
+        return Ok(true);
+    }
+    let resolved = reader
+        .block_hash_lookup(block.hash)
+        .await
+        .map_err(QueryError::canonical_read)?;
+    Ok(resolved == BlockHashLookup::Resolved(block))
+}
+
+#[cfg(test)]
+mod tests;

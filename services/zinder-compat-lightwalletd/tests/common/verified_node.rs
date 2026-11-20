@@ -24,7 +24,7 @@ pub(crate) fn one_upgrade_per_height() -> eyre::Result<NetworkUpgradeActivations
     )?)
 }
 
-/// Starts a node double that passes first-contact verification once for a
+/// Starts a node double that passes verification for a
 /// pair serving `schedule` with `tip_hash` at its tip, then serves the additional RPC replies.
 pub(crate) fn verifiable_node(
     schedule: &NetworkUpgradeActivations,
@@ -46,16 +46,20 @@ pub(crate) fn verifiable_node(
         })
         .collect();
     let admission = [
-        method("rpc.discover").reply(RpcReply::result(json!({
-            "openrpc": "1.3.2",
-            "methods": [
-                {"name": "rpc.discover"},
-                {"name": "sendrawtransaction"},
-                {"name": "getstandardfee"},
-            ],
-        }))),
-        method("getblockchaininfo").reply(RpcReply::result(json!({ "upgrades": upgrades }))),
-        method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(tip_hash)))),
+        method("rpc.discover").reply_with(|_| {
+            RpcReply::result(json!({
+                "openrpc": "1.3.2",
+                "methods": [
+                    {"name": "rpc.discover"},
+                    {"name": "sendrawtransaction"},
+                    {"name": "getstandardfee"},
+                ],
+            }))
+        }),
+        method("getblockchaininfo")
+            .reply_with(move |_| RpcReply::result(json!({ "upgrades": upgrades }))),
+        method("getblockhash")
+            .reply_with(move |_| RpcReply::result(json!(encode_rpc_block_hash_hex(tip_hash)))),
     ];
     JsonRpcTestServer::start(admission.into_iter().chain(replies))
 }

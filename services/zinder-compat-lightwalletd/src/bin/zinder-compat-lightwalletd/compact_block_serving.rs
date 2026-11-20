@@ -24,10 +24,10 @@ use zinder_query::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
-    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
-    ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
-    classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
-    expected_writer_fence, refresh_within_stale_deadline,
+    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation, Readiness,
+    ReadinessCause, ReadinessState, WriterAttestation, classify_canonical_writer_fence,
+    connect_zinder_grpc, converge_on_canonical_writer_fence, expected_writer_fence,
+    refresh_within_stale_deadline,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
@@ -88,49 +88,45 @@ enum ConvergenceFailure {
 /// generation alone: no compact-blocks method calls the node.
 #[derive(Clone)]
 pub(crate) struct CompactServingReadiness {
-    composed: ComposedReadiness,
+    inputs: zinder_query::WalletServingReadiness,
 }
 
 impl CompactServingReadiness {
     pub(crate) fn new(runtime: Readiness) -> Self {
         Self {
-            composed: ComposedReadiness::new(runtime, &[]),
+            inputs: zinder_query::WalletServingReadiness::pair_only(runtime),
         }
     }
 
     #[cfg(feature = "light-wallet-qualification")]
     pub(crate) fn for_qualification(runtime: Readiness) -> Self {
-        use zinder_runtime::ReadinessInput::{IngestControl, NodeSource};
         Self {
-            composed: ComposedReadiness::with_dependency_inputs(
-                runtime,
-                &[NodeSource, IngestControl],
-            ),
+            inputs: zinder_query::WalletServingReadiness::with_node_and_ingest_control(runtime),
         }
     }
 
     #[cfg(feature = "light-wallet-qualification")]
-    pub(crate) fn dependencies(&self) -> ComposedReadiness {
-        self.composed.clone()
+    pub(crate) fn dependencies(&self) -> zinder_query::WalletServingReadiness {
+        self.inputs.clone()
     }
 
     pub(crate) fn runtime(&self) -> Readiness {
-        self.composed.runtime_readiness()
+        self.inputs.runtime_readiness()
     }
 
     pub(crate) fn publish_storage(&self, storage: ReadinessState) {
-        self.composed.publish_admission(storage);
+        self.inputs.canonical_admission().publish_admission(storage);
     }
 
     /// Records the writer's commit time of the chain epoch `reader` serves.
     fn publish_served_epoch(&self, reader: &RocksDbCanonicalReader) {
-        self.composed
+        self.inputs
             .runtime_readiness()
             .set_served_epoch_committed_at(reader.chain_epoch().created_at);
     }
 
     pub(crate) fn publish_shutting_down(&self) {
-        self.composed.publish_shutting_down();
+        self.inputs.publish_shutting_down();
     }
 }
 
@@ -282,7 +278,7 @@ impl CompactBlockPublisher {
                     () = self.writer_attestation.stale_deadline().passed() => {}
                 }
                 let deadline = self.writer_attestation.stale_deadline();
-                let admission = self.readiness.composed.clone();
+                let admission = self.readiness.inputs.canonical_admission().clone();
                 refresh_within_stale_deadline(deadline, &admission, self.refresh()).await;
                 self.writer_attestation.end_lapsed_allowance();
                 self.record_resource_gauges().await;
@@ -298,6 +294,11 @@ impl CompactBlockPublisher {
     )]
     async fn refresh(&mut self) {
         let active = self.slot.capture();
+        #[cfg(feature = "light-wallet-qualification")]
+        self.readiness.inputs.begin_canonical_refresh(
+            &mut self.writer_attestation,
+            active.event_fence().visible_tip().height.value(),
+        );
         let status = match self.writer_status.fetch().await {
             Ok(status) => status,
             Err(_error) => {
@@ -336,6 +337,8 @@ impl CompactBlockPublisher {
             }
             CanonicalFenceRelation::Matches => {
                 self.writer_attestation.attest();
+                #[cfg(feature = "light-wallet-qualification")]
+                self.readiness.inputs.confirm_canonical_attestation();
                 self.readiness.publish_storage(ReadinessState::ready(Some(
                     active.event_fence().visible_tip().height.value(),
                 )));
@@ -470,6 +473,8 @@ impl CompactBlockPublisher {
             .observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             self.writer_attestation.attest();
+            #[cfg(feature = "light-wallet-qualification")]
+            self.readiness.inputs.confirm_canonical_attestation();
         }
         self.readiness.publish_storage(
             refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
@@ -2569,6 +2574,14 @@ mod tests {
         async fn start(
             baseline: &zinder_testkit::CanonicalBaseline<'_>,
         ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::start_with_readiness(baseline, CompactServingReadiness::new(Readiness::default()))
+                .await
+        }
+
+        async fn start_with_readiness(
+            baseline: &zinder_testkit::CanonicalBaseline<'_>,
+            serving_readiness: CompactServingReadiness,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let activations = zinder_testkit::sample_regtest_upgrade_activations();
             let writer = zinder_testkit::CanonicalWriterFixture::publish(baseline, &activations)?;
             let control =
@@ -2591,8 +2604,7 @@ mod tests {
                 }
             });
             let secondaries = tempfile::tempdir()?;
-            let readiness = Readiness::default();
-            let serving_readiness = CompactServingReadiness::new(readiness.clone());
+            let readiness = serving_readiness.runtime();
             let config = CompactBlockServingConfig {
                 canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
                 canonical_secondary_root: secondaries.path().to_path_buf(),
@@ -2704,6 +2716,80 @@ mod tests {
                 child.height, parent.height
             );
         }
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    #[tokio::test]
+    async fn qualification_probe_halt_requires_a_confirmed_writer_at_the_served_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_query::{AdmittedIngestControl, spawn_wallet_ingest_control_readiness_probe};
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(2);
+        let readiness = CompactServingReadiness::for_qualification(Readiness::default());
+        let mut harness = LongRangeHarness::start_with_readiness(
+            &zinder_testkit::CanonicalBaseline::new(&chain),
+            readiness.clone(),
+        )
+        .await?;
+        let control = zinder_testkit::IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest =
+            AdmittedIngestControl::connect(control.endpoint(), None, Network::ZcashRegtest).await?;
+        control.set_reorg_window_exceeded(Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 101,
+            configured: 100,
+            covered: Some(100),
+        }));
+        let cancel = CancellationToken::new();
+        let probe = spawn_wallet_ingest_control_readiness_probe(
+            ingest,
+            readiness.dependencies(),
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        let is_halted = || {
+            matches!(
+                readiness.runtime().report().cause,
+                ReadinessCause::ReorgWindowExceeded { .. }
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !is_halted() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        control.set_reorg_window_exceeded(None);
+        let confirmed = lifecycle_writer_status(harness.writer.canonical_primary()?);
+        for status in [
+            CanonicalWriterStatusResponse {
+                tip_unconfirmed: true,
+                ..confirmed.clone()
+            },
+            CanonicalWriterStatusResponse {
+                fence: None,
+                ..confirmed
+            },
+        ] {
+            harness.control.set_writer_status(status);
+            harness.publisher.refresh().await;
+            assert!(is_halted(), "{:?}", readiness.runtime().report());
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                harness.refresh_at_writer_fence().await?;
+                if readiness.runtime().report().is_ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        cancel.cancel();
+        probe.await?;
+        control.shutdown().await?;
+        harness.stop().await
     }
 
     /// A stream that waits on a slow client holds no generation, so the
