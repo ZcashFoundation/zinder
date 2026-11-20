@@ -672,6 +672,34 @@ checkpoint, the replayed blocks and note commitments, and its cold and warm
 seconds. `cold_seconds` and `warm_seconds` summarize the anchors as
 nearest-rank p50, p90, and p99 and the maximum.
 
+To compare the same historical reads across sparse and dense stores, replace
+`--from-height`, `--to-height`, and `--max-anchors` with
+`--heights-file ./frontiers.txt`. The file contains one decimal u32 height per
+line. Every listed height is measured in order, including duplicates and stored
+checkpoints; no sampling limit applies. The explicit window includes the build
+plan's history-predecessor checkpoint through the visible tip. For a full-history
+store whose first retained block is 1, height 0 is a valid stored read. Empty
+files, blank or malformed lines, and heights outside that served window fail
+the command. This option conflicts
+with the three sampling options; omitting it preserves the default sampling and
+stored-checkpoint skipping behavior.
+
+Report format version 3 adds `heights_file_sha256` (null for default sampling)
+and `source` (`stored` or `replayed`) on each anchor. `read_path` distinguishes
+`wallet-query-store` for explicit heights from the default
+`validated-checkpoint` diagnostic. Explicit reads measure `tree_state_lookup`
+and, when needed, `replay_tree_state` together, matching WalletQuery's storage
+path without repeating final checkpoint root validation. Selection performs no
+seed reads outside that measured region. These counters cover the store calls,
+not RPC admission, scheduling, response encoding, or transport. Stored outcomes record zero
+replayed blocks and commitments while retaining the same cold/warm timing and
+RocksDB counters as replays. Logical key reads and thread-local block read
+counts/bytes come from the existing read measurement primitive. The labels
+cold/warm describe first and immediate repeat reads in this secondary; they do
+not prove an empty operating-system page cache. Use identical height-file and
+binary digests for paired sparse/dense measurements. These local read counters
+do not measure a network request or wallet scan end to end.
+
 ### Attribute compact-block and subtree-root reads
 
 Use the following release build to match the x86-64 CPU flags used in Zinder's

@@ -665,6 +665,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tree_state_heights_are_in_help_and_conflict_with_sampling()
+    -> Result<(), Box<dyn Error>> {
+        let base = [
+            "zinder-bench",
+            "rocksdb-tree-state-replay",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+            "--secondary-root",
+            "secondary",
+            "--software-revision",
+            "revision",
+            "--heights-file",
+            "frontiers.txt",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for flag in ["--from-height", "--to-height", "--max-anchors"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([flag, "100"])).is_err());
+        }
+        let help = Cli::try_parse_from(["zinder-bench", "rocksdb-tree-state-replay", "--help"])
+            .err()
+            .ok_or("help should exit")?;
+        assert!(help.to_string().contains("--heights-file"));
+        Ok(())
+    }
+
+    #[test]
     fn lightwalletd_wallet_load_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
         let load = |workload: &str| {
             Cli::try_parse_from([
