@@ -141,7 +141,6 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
             listen_addr: Some(grpc),
             ops_listen_addr: Some(ops),
             wallet_query_endpoint: Some(format!("http://{}", wallet.local_addr()?)),
-            ..ExplorerConfigOverrides::default()
         },
     )?;
     let runtime =
@@ -198,5 +197,71 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
     );
     timeout(PROBE_WAIT_LIMIT, server).await???;
     assert_eq!(readiness.report().cause, ReadinessCause::ShuttingDown);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_joins_an_upstream_observation_waiting_on_the_node() -> Result<()> {
+    let node = TcpListener::bind("127.0.0.1:0").await?;
+    let settings = ExplorerServerInfoSettings::default();
+    let source = ZebraJsonRpcSource::new(
+        settings.network,
+        format!("http://{}", node.local_addr()?),
+        zinder_source::NodeAuth::None,
+        Duration::from_secs(60),
+    )?;
+    let cancel = CancellationToken::new();
+    let observation = ExplorerQueryGrpcAdapter::new(settings).spawn_upstream_observation_probe(
+        Arc::new(source),
+        Duration::from_millis(1),
+        cancel.clone(),
+    );
+    let (_unanswered, _) = timeout(PROBE_WAIT_LIMIT, node.accept()).await??;
+    cancel.cancel();
+    timeout(PROBE_WAIT_LIMIT, observation).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn losing_the_operations_endpoint_stops_explorer() -> Result<()> {
+    // Dropping the endpoint's executor fails its server task while Explorer is still running.
+    let operations = tokio::task::spawn_blocking(|| -> Result<_> {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(executor.block_on(spawn_ops_endpoint_for(
+            RuntimeService::Explorer,
+            Some("127.0.0.1:0".parse()?),
+            "test",
+            "zcash-regtest",
+            Readiness::default(),
+            Arc::from([]),
+        ))?)
+    })
+    .await??;
+    let runtime = SupervisedRuntime::new(RuntimeService::Explorer);
+    let stop = runtime.grpc_server_shutdown();
+    let outcome = timeout(
+        PROBE_WAIT_LIMIT,
+        runtime.supervise(
+            async {
+                stop.await;
+                Ok(())
+            },
+            supervised_tasks(operations, None, None),
+            || {},
+        ),
+    )
+    .await?;
+    assert!(
+        matches!(
+            outcome,
+            Err(RuntimeSupervisionError::TaskFailed {
+                task: "operations endpoint",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
     Ok(())
 }
