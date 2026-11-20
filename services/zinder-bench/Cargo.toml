@@ -56,7 +56,7 @@ eyre.workspace = true
 http.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tower.workspace = true
 zinder-compat-lightwalletd.workspace = true
 zinder-testkit.workspace = true

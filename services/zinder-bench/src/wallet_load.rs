@@ -12,6 +12,8 @@ mod calls;
 mod classic_sdk;
 #[cfg(test)]
 mod mock_streamer;
+#[cfg(test)]
+mod pepper_sync_client;
 mod point_reads;
 mod server_metrics;
 mod setup;
