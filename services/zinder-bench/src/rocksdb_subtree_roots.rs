@@ -14,7 +14,7 @@ use zinder_query::{CanonicalReader, RocksDbCanonicalReader, read_on_blocking_thr
 use zinder_store::RocksDbStatisticsLevel;
 
 use crate::rocksdb_read_bench::{
-    ReadCounters, ReadEnvironment, ReadStoreArgs, ReadyFenceSummary, TimedRead, measure,
+    ReadCounters, ReadEnvironment, ReadStore, ReadStoreArgs, ReadyFenceSummary, TimedRead, measure,
     measure_reader,
 };
 
@@ -44,6 +44,12 @@ pub(crate) struct SubtreeReport {
     report_format_version: u16,
     #[serde(flatten)]
     environment: ReadEnvironment,
+    #[serde(flatten)]
+    page: SubtreePage,
+}
+
+#[derive(Serialize)]
+struct SubtreePage {
     ready_fence: ReadyFenceSummary,
     protocol: &'static str,
     start_index: u32,
@@ -79,28 +85,42 @@ impl From<TimedRead<Vec<SubtreeRootArtifact>>> for SubtreeMeasurement {
 
 pub(crate) async fn run(args: &SubtreeArgs) -> Result<SubtreeReport, BenchError> {
     let (store, environment) = args.store.prepare()?;
+    let page = measure_page(&store, args.protocol, args.start_index, args.max_entries).await?;
+    Ok(SubtreeReport {
+        contract_identity: "rocksdb-subtree-roots",
+        report_format_version: 1,
+        environment,
+        page,
+    })
+}
+
+async fn measure_page(
+    store: &ReadStore,
+    protocol: ShieldedProtocol,
+    start_index: Option<u32>,
+    max_entries: u32,
+) -> Result<SubtreePage, BenchError> {
     let (direct, direct_open) = store.open("direct", None)?;
     let ready = direct.ready_evidence();
-    let start = args.start_index.unwrap_or_else(|| {
+    let start = start_index.unwrap_or_else(|| {
         direct
             .build_plan()
             .history_predecessor()
             .tip_metadata()
-            .completed_subtree_count(args.protocol)
+            .completed_subtree_count(protocol)
     });
     let completed = direct
         .chain_epoch()?
         .tip_metadata
-        .completed_subtree_count(args.protocol);
-    let count = NonZeroU32::new(args.max_entries.min(completed.saturating_sub(start))).ok_or_else(
-        || {
+        .completed_subtree_count(protocol);
+    let count =
+        NonZeroU32::new(max_entries.min(completed.saturating_sub(start))).ok_or_else(|| {
             BenchError::invalid_argument(format!(
                 "{} has no completed root at index {start} (completed {completed})",
-                args.protocol.rpc_pool_name()
+                protocol.rpc_pool_name()
             ))
-        },
-    )?;
-    let range = SubtreeRootRange::new(args.protocol, SubtreeRootIndex::new(start), count);
+        })?;
+    let range = SubtreeRootRange::new(protocol, SubtreeRootIndex::new(start), count);
     let level = store.budget.statistics_level;
     let direct_read = || measure(&direct, level, || Ok(direct.subtree_roots(range)?));
     let cold = direct_read()?;
@@ -123,14 +143,11 @@ pub(crate) async fn run(args: &SubtreeArgs) -> Result<SubtreeReport, BenchError>
         ));
     }
     let output_digest_sha256 = page_digest(&cold.rows, range)?;
-    Ok(SubtreeReport {
-        contract_identity: "rocksdb-subtree-roots",
-        report_format_version: 1,
-        environment,
+    Ok(SubtreePage {
         ready_fence: ready.into(),
-        protocol: args.protocol.rpc_pool_name(),
+        protocol: protocol.rpc_pool_name(),
         start_index: start,
-        max_entries: args.max_entries,
+        max_entries,
         returned_roots: count.get(),
         output_digest_sha256,
         direct: SubtreeCase {
@@ -176,4 +193,123 @@ fn page_digest(
         digest.update(root.completing_block_hash.as_bytes());
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use eyre::{Result, eyre};
+    use zinder_core::{
+        BlockHeight, BlockId, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+        CompactBlockArtifact, CompactChainMetadata, Network, SUBTREE_LEAF_COUNT, SubtreeRootHash,
+    };
+    use zinder_store::{
+        CanonicalBuildSubtreeRoot, CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget,
+    };
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, frontier_of_size,
+        sample_regtest_upgrade_activations,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn subtree_page_starts_after_the_predecessor_and_clamps_to_the_visible_tip() -> Result<()>
+    {
+        let scratch = tempfile::tempdir()?;
+        let (writer, root) = retained_sapling_subtree()?;
+        let store = ReadStore {
+            primary: writer.canonical_primary_path().to_path_buf(),
+            secondary_root: scratch.path().to_path_buf(),
+            activations: sample_regtest_upgrade_activations(),
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: writer.canonical_primary()?.reorg_policy(),
+            budget: RocksDbResourceBudget::for_local_tests(),
+        };
+        let page = measure_page(&store, ShieldedProtocol::Sapling, None, 4).await?;
+        assert_eq!(page.start_index, 1);
+        assert_eq!(page.max_entries, 4);
+        assert_eq!(page.returned_roots, 1);
+        assert_eq!(
+            page.output_digest_sha256,
+            page_digest(
+                std::slice::from_ref(&root),
+                SubtreeRootRange::new(
+                    ShieldedProtocol::Sapling,
+                    SubtreeRootIndex::new(1),
+                    NonZeroU32::MIN,
+                )
+            )?
+        );
+
+        let empty_secondary = tempfile::tempdir()?;
+        let empty_pool = measure_page(
+            &ReadStore {
+                secondary_root: empty_secondary.path().to_path_buf(),
+                ..store
+            },
+            ShieldedProtocol::Orchard,
+            None,
+            4,
+        )
+        .await;
+        assert!(matches!(
+            empty_pool,
+            Err(BenchError::InvalidArgument { reason })
+                if reason == "orchard has no completed root at index 0 (completed 0)"
+        ));
+        Ok(())
+    }
+
+    fn retained_sapling_subtree() -> Result<(CanonicalWriterFixture, SubtreeRootArtifact)> {
+        let floor = BlockHeight::new(2);
+        let tip = BlockHeight::new(3);
+        let mut chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(tip.value());
+        for (height, completed) in [(floor, 1), (tip, 2)] {
+            let block = chain
+                .block_at(height)
+                .ok_or_else(|| eyre!("missing fixture block"))?;
+            let tree_size = completed * SUBTREE_LEAF_COUNT;
+            let compact = CompactBlockArtifact::empty(
+                BlockId::new(height, block.hash),
+                block.parent_hash,
+                block.block_time_seconds,
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: tree_size,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            );
+            let frontiers = CommitmentTreeFrontiers::from_validated_parts(
+                Some(frontier_of_size(ShieldedProtocol::Sapling, tree_size)?),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+                None,
+            )?;
+            chain = chain
+                .with_compact_block_artifact(compact)
+                .with_commitment_tree_frontiers_at(height, frontiers);
+        }
+        let root = SubtreeRootArtifact::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(1),
+            SubtreeRootHash::from_bytes([0x17; 32]),
+            tip,
+            chain
+                .tip_hash()
+                .ok_or_else(|| eyre!("missing fixture tip"))?,
+        );
+        let baseline = CanonicalBaseline::new(&chain)
+            .with_history_floor(floor)
+            .with_subtree_root(CanonicalBuildSubtreeRoot {
+                protocol: root.protocol,
+                subtree_index: root.subtree_index,
+                root_hash: root.root_hash,
+                completing_block_height: root.completing_block_height,
+            });
+        let writer =
+            CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?;
+        Ok((writer, root))
+    }
 }

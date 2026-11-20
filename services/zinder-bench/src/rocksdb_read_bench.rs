@@ -362,8 +362,20 @@ impl From<CanonicalStoreReadyEvidence> for ReadyFenceSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::output_path;
-    use std::fs;
+    use std::{fs, sync::Arc};
+
+    use rust_rocksdb::{
+        PerfMetric,
+        statistics::{Histogram, Ticker},
+    };
+    use zinder_core::{BlockHeight, BlockHeightRange, Network};
+    use zinder_query::{CanonicalReader, RocksDbCanonicalReader, read_on_blocking_thread};
+    use zinder_store::{
+        CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLevel,
+    };
+    use zinder_testkit::{CanonicalBaseline, CanonicalWriterFixture, ChainFixture};
+
+    use super::{ReadCounters, ReadStore, measure, measure_reader, output_path};
 
     #[test]
     fn outputs_cannot_be_created_beneath_a_primary() -> Result<(), Box<dyn std::error::Error>> {
@@ -380,6 +392,104 @@ mod tests {
             std::os::unix::fs::symlink(&primary, &alias)?;
             assert!(output_path(&alias.join("report.json"), &primary).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn read_measurements_do_not_carry_counters_into_the_next_sample() -> eyre::Result<()> {
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(4);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let writer =
+            CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+        let scratch = tempfile::tempdir()?;
+        let level = RocksDbStatisticsLevel::Full;
+        let store = ReadStore {
+            primary: writer.canonical_primary_path().to_path_buf(),
+            secondary_root: scratch.path().to_owned(),
+            activations,
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: writer.canonical_primary()?.reorg_policy(),
+            budget: RocksDbResourceBudget {
+                statistics_level: level,
+                ..RocksDbResourceBudget::canonical_reader_defaults()
+            },
+        };
+        let range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(3));
+        let (direct, _) = store.open("direct", None)?;
+        let direct_read = measure(
+            &direct,
+            level,
+            || Ok(direct.compact_blocks_in_range(range)?),
+        )?;
+        assert_eq!(direct_read.rows.len(), 2);
+        assert_multiget_activity(&direct_read.counters);
+        assert_no_read_activity(&measure(&direct, level, || Ok(()))?.counters)?;
+
+        let (secondary, _) = store.open("reader", Some(&direct.ready_evidence()))?;
+        let reader = Arc::new(RocksDbCanonicalReader::new(secondary)?);
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                let reader_read = measure_reader(Arc::clone(&reader), level, move |reader| {
+                    let rows = read_on_blocking_thread(reader.compact_blocks_in_range(range))?;
+                    Ok((rows, std::thread::current().id()))
+                })
+                .await?;
+                let idle =
+                    measure_reader(reader, level, |_| Ok(std::thread::current().id())).await?;
+                assert_eq!(reader_read.rows, (direct_read.rows, idle.rows));
+                assert_multiget_activity(&reader_read.counters);
+                assert_no_read_activity(&idle.counters)
+            })
+    }
+
+    fn assert_multiget_activity(counters: &ReadCounters) {
+        assert_eq!(
+            counters
+                .ticker_deltas
+                .as_ref()
+                .and_then(|deltas| deltas.get(Ticker::NumberMultigetCalls.name())),
+            Some(&1)
+        );
+        assert_eq!(
+            counters
+                .histogram_deltas
+                .as_ref()
+                .and_then(|deltas| deltas.get(Histogram::DbMultiget.name()))
+                .map(|totals| totals.count),
+            Some(1)
+        );
+        assert!(counters.perf_context[PerfMetric::MultigetReadBytes.name()] > 0);
+    }
+
+    fn assert_no_read_activity(counters: &ReadCounters) -> eyre::Result<()> {
+        let tickers = counters
+            .ticker_deltas
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("full statistics must report ticker deltas"))?;
+        let histograms = counters
+            .histogram_deltas
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("full statistics must report histogram deltas"))?;
+        assert_eq!(tickers.len(), super::TICKERS.len());
+        assert_eq!(histograms.len(), super::HISTOGRAMS.len());
+        assert_eq!(counters.perf_context.len(), super::PERF_METRICS.len());
+        assert!(tickers.values().all(|delta| *delta == 0), "{tickers:?}");
+        assert!(
+            histograms
+                .values()
+                .all(|totals| totals.count == 0 && totals.sum_micros == 0),
+            "{histograms:?}"
+        );
+        assert!(
+            counters.perf_context.values().all(|delta| *delta == 0),
+            "{:?}",
+            counters.perf_context
+        );
         Ok(())
     }
 }

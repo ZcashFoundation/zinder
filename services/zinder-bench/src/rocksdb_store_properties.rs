@@ -172,7 +172,9 @@ fn sst_format_version(path: &Path) -> Result<u32, BenchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate;
+    use std::fs;
+
+    use super::{BenchError, aggregate, sst_format_version};
 
     #[test]
     fn aggregate_reads_index_flags_and_rejects_missing_measurements()
@@ -183,6 +185,40 @@ mod tests {
         assert_eq!(parsed["filter_size"], 0);
         assert!(aggregate("data block size=322").is_err());
         assert!(aggregate(&properties.replace("=13", "=unknown")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sst_footer_reads_a_little_endian_version_without_mutating_the_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("000001.sst");
+        let mut bytes = vec![0xff; 53];
+        bytes.extend_from_slice(&[7, 0, 0, 0, 0xf7, 0xcf, 0xf4, 0x85, 0xb7, 0x41, 0xe2, 0x88]);
+        fs::write(&path, &bytes)?;
+
+        assert_eq!(sst_format_version(&path)?, 7);
+        assert_eq!(fs::read(&path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn sst_footer_rejects_invalid_magic_and_truncated_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let invalid_magic = directory.path().join("000001.sst");
+        let truncated = directory.path().join("000002.sst");
+        fs::write(&invalid_magic, [0; 12])?;
+        fs::write(&truncated, [0; 11])?;
+
+        assert!(matches!(
+            sst_format_version(&invalid_magic),
+            Err(BenchError::ReportFormat { .. })
+        ));
+        assert!(matches!(
+            sst_format_version(&truncated),
+            Err(BenchError::Io { .. })
+        ));
         Ok(())
     }
 }
