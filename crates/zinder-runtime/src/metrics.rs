@@ -3,7 +3,9 @@
 use std::{io, sync::OnceLock, thread, time::Duration};
 
 use metrics::{Unit, describe_gauge};
-use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{
+    BuildError, Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -142,16 +144,10 @@ fn install_metrics_recorder_with_identity(
                 network_name,
             ));
         }
-        let recorder = prometheus_builder()
-            .map_err(|source| MetricsInstallError::Install { source })?
-            .build_recorder();
-        let prometheus = recorder.handle();
-        let upkeep = prometheus.clone();
-        spawn_upkeep(UPKEEP_INTERVAL, move || upkeep.run_upkeep())
-            .map_err(|source| MetricsInstallError::Upkeep { source })?;
-        metrics::set_global_recorder(recorder).map_err(|source| MetricsInstallError::Install {
-            source: BuildError::from(source),
-        })?;
+        let prometheus = install_global_recorder(
+            |recorder| metrics::set_global_recorder(recorder).map_err(BuildError::from),
+            |prometheus| drain_on_schedule(prometheus, UPKEEP_INTERVAL),
+        )?;
         let installed = MetricsHandle { prometheus };
         let _ = PROMETHEUS_HANDLE.set(installed.clone());
         installed
@@ -163,6 +159,28 @@ fn install_metrics_recorder_with_identity(
         service_version,
         network_name,
     ))
+}
+
+/// Builds the recorder, makes it global through `set_global`, and only then
+/// starts its upkeep through `start_upkeep`, so a recorder that never becomes
+/// the global one leaves no upkeep thread behind.
+fn install_global_recorder(
+    set_global: impl FnOnce(PrometheusRecorder) -> Result<(), BuildError>,
+    start_upkeep: impl FnOnce(PrometheusHandle) -> io::Result<()>,
+) -> Result<PrometheusHandle, MetricsInstallError> {
+    let recorder = prometheus_builder()
+        .map_err(|source| MetricsInstallError::Install { source })?
+        .build_recorder();
+    let prometheus = recorder.handle();
+    set_global(recorder).map_err(|source| MetricsInstallError::Install { source })?;
+    start_upkeep(prometheus.clone()).map_err(|source| MetricsInstallError::Upkeep { source })?;
+    Ok(prometheus)
+}
+
+/// Moves the histogram samples that `prometheus` buffers into their buckets
+/// or summaries every `interval`.
+fn drain_on_schedule(prometheus: PrometheusHandle, interval: Duration) -> io::Result<()> {
+    spawn_upkeep(interval, move || prometheus.run_upkeep())
 }
 
 /// Runs `upkeep` every `interval` on a thread of its own until the process
@@ -222,9 +240,90 @@ fn record_build_info(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, time::Duration};
+    use std::{cell::Cell, sync::mpsc, thread, time::Duration};
 
-    use super::{RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, prometheus_builder, spawn_upkeep};
+    use metrics::SetRecorderError;
+    use metrics_exporter_prometheus::{PrometheusHandle, PrometheusRecorder};
+
+    use super::{
+        MetricsInstallError, RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, drain_on_schedule,
+        install_global_recorder, prometheus_builder, spawn_upkeep,
+    };
+
+    /// A histogram no bucket matcher names, so it renders as a summary.
+    const UPKEEP_PROBE_METRIC: &str = "zinder_test_upkeep_probe";
+
+    /// Records 64 samples of 1, waits for `pause`, records one sample of 100,
+    /// and returns the smallest sample the rendered summary still counts.
+    ///
+    /// The recorder buffers samples in fixed-size blocks that 64 samples fill
+    /// exactly, so the sample of 100 starts a block of its own, and a drain
+    /// takes the newest block first. The summary starts its window at the
+    /// first sample it takes in and drops any older one. Drained together,
+    /// the samples of 1 arrive after the sample of 100 and are dropped.
+    /// Drained before it, they all count.
+    fn smallest_counted_sample(
+        recorder: &PrometheusRecorder,
+        prometheus: &PrometheusHandle,
+        pause: Duration,
+    ) -> Option<f64> {
+        metrics::with_local_recorder(recorder, || {
+            let histogram = metrics::histogram!(UPKEEP_PROBE_METRIC);
+            for _ in 0..64 {
+                histogram.record(1.0);
+            }
+            thread::sleep(pause);
+            histogram.record(100.0);
+        });
+        let quantile_line = format!("{UPKEEP_PROBE_METRIC}{{quantile=\"0\"}} ");
+        prometheus
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&quantile_line))
+            .and_then(|smallest| smallest.parse().ok())
+    }
+
+    #[test]
+    fn scheduled_upkeep_drains_buffered_samples() -> Result<(), Box<dyn std::error::Error>> {
+        // Unless one render drains the samples of 1 only after the sample of
+        // 100, the probe cannot tell an upkeep that drains from one that does
+        // nothing.
+        let unattended = prometheus_builder()?.build_recorder();
+        let unattended_handle = unattended.handle();
+        let smallest = smallest_counted_sample(&unattended, &unattended_handle, Duration::ZERO);
+        assert!(
+            smallest.is_some_and(|smallest| smallest > 50.0),
+            "{smallest:?}"
+        );
+
+        let recorder = prometheus_builder()?.build_recorder();
+        let prometheus = recorder.handle();
+        drain_on_schedule(prometheus.clone(), Duration::from_millis(2))?;
+        let smallest = smallest_counted_sample(&recorder, &prometheus, Duration::from_millis(500));
+        assert!(
+            smallest.is_some_and(|smallest| smallest < 50.0),
+            "{smallest:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorder_that_does_not_become_global_starts_no_upkeep() {
+        let upkeep_started = Cell::new(false);
+        let installed = install_global_recorder(
+            |recorder| Err(SetRecorderError(recorder).into()),
+            |_| {
+                upkeep_started.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            installed,
+            Err(MetricsInstallError::Install { .. })
+        ));
+        assert!(!upkeep_started.get());
+    }
 
     #[test]
     fn upkeep_runs_again_after_every_interval() -> Result<(), Box<dyn std::error::Error>> {
