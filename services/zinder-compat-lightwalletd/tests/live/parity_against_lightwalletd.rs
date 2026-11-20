@@ -497,34 +497,34 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
     let broadcast_txid = decode_rpc_transaction_id_hex(&send_response.error_message)
         .map_err(|error| eyre!("SendTransaction success message was not a txid: {error}"))?;
 
-    let zinder_raw =
-        wait_for_mempool_stream_snapshot_transaction(&mut zinder, &raw_transaction, "Zinder")
-            .await?;
-    let reference_raw =
-        wait_for_mempool_stream_snapshot_transaction(&mut reference, &raw_transaction, "reference")
-            .await?;
-    assert_eq!(zinder_raw.height, 0, "Zinder mempool RawTransaction height");
-    assert_eq!(
-        reference_raw.height, 0,
-        "reference mempool RawTransaction height"
-    );
-
-    assert_pending_transaction_matches_reference(
-        &mut zinder,
+    let expected = accepted_mempool_transaction(
         &mut reference,
         broadcast_txid,
         &raw_transaction,
+        "reference",
     )
     .await?;
-
-    let zinder_compact =
-        wait_for_compact_mempool_transaction(&mut zinder, broadcast_txid, "Zinder").await?;
-    let reference_compact =
-        wait_for_compact_mempool_transaction(&mut reference, broadcast_txid, "reference").await?;
+    let observed =
+        accepted_mempool_transaction(&mut zinder, broadcast_txid, &raw_transaction, "Zinder")
+            .await?;
     assert_eq!(
-        zinder_compact, reference_compact,
-        "transparent mempool CompactTx diverged after accepted send",
+        observed, expected,
+        "transparent mempool CompactTx diverged after accepted send"
     );
+    if let Some(addr) = optional_env("ZINDER_TEST_QUALIFICATION_RETAINED_ADDR")? {
+        let mut retained = CompactTxStreamerClient::new(Endpoint::new(addr)?.connect().await?);
+        let observed = accepted_mempool_transaction(
+            &mut retained,
+            broadcast_txid,
+            &raw_transaction,
+            "retained qualification",
+        )
+        .await?;
+        assert_eq!(
+            observed, expected,
+            "retained qualification mempool CompactTx diverged"
+        );
+    }
     Ok(())
 }
 
@@ -1890,7 +1890,7 @@ fn normalize_compact_transactions(
     normalized
 }
 
-fn parity_transparent_address() -> Result<String> {
+pub(super) fn parity_transparent_address() -> Result<String> {
     Ok(optional_env("ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS")?
         .unwrap_or_else(|| DEFAULT_PARITY_TRANSPARENT_ADDRESS.to_owned()))
 }
@@ -2000,33 +2000,35 @@ async fn select_spendable_lightwalletd_utxo(
 
 /// Both servers answer `GetTransaction` for a pending transaction with its
 /// bytes at height 0, the protocol's "in the mempool" sentinel.
-async fn assert_pending_transaction_matches_reference(
-    zinder: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    reference: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+async fn accepted_mempool_transaction(
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     transaction_id: TransactionId,
     raw_transaction: &[u8],
-) -> Result<()> {
-    let pending_filter = || TxFilter {
-        block: None,
-        index: 0,
-        hash: encode_internal_transaction_id(transaction_id).to_vec(),
-    };
-    let zinder_pending = zinder.get_transaction(pending_filter()).await?.into_inner();
-    let reference_pending = reference
-        .get_transaction(pending_filter())
+    source_name: &str,
+) -> Result<lightwalletd::CompactTx> {
+    let streamed =
+        wait_for_mempool_stream_snapshot_transaction(client, raw_transaction, source_name).await?;
+    assert_eq!(
+        streamed.height, 0,
+        "{source_name} mempool RawTransaction height"
+    );
+    let pending = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: encode_internal_transaction_id(transaction_id).to_vec(),
+        })
         .await?
         .into_inner();
     assert_eq!(
-        zinder_pending.height, 0,
-        "Zinder pending GetTransaction height"
+        pending.height, 0,
+        "{source_name} pending GetTransaction height"
     );
     assert_eq!(
-        reference_pending.height, 0,
-        "reference pending GetTransaction height"
+        pending.data, raw_transaction,
+        "{source_name} pending GetTransaction bytes"
     );
-    assert_eq!(zinder_pending.data, raw_transaction);
-    assert_eq!(zinder_pending.data, reference_pending.data);
-    Ok(())
+    wait_for_compact_mempool_transaction(client, transaction_id, source_name).await
 }
 
 async fn wait_for_mempool_stream_snapshot_transaction(
@@ -2208,7 +2210,7 @@ fn assert_matching_status_code(
     );
 }
 
-async fn open_parity_clients() -> Result<
+pub(super) async fn open_parity_clients() -> Result<
     Option<(
         CompactTxStreamerClient<tonic::transport::Channel>,
         CompactTxStreamerClient<tonic::transport::Channel>,

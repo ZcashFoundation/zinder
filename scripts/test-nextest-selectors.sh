@@ -38,3 +38,5 @@ fi
 
 check_selectors .config/nextest.toml --ignore-default-filter
 check_selectors .github/workflows/live-tests.yml --profile=ci-live
+check_selectors .github/workflows/parity-compat.yml --profile=ci-live
+check_selectors scripts/test-light-wallet-qualification.sh --profile=ci-live
