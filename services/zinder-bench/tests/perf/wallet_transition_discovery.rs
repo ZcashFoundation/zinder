@@ -481,9 +481,12 @@ fn prepare_fixture(stratum: Stratum) -> Result<PreparedFixture> {
         build_plan,
         CANONICAL_WRITER_BUDGET,
     )?;
-    builder.bulk_load_blocks([Ok::<_, std::io::Error>(canonical_build_block(
-        baseline_facts,
-    ))])?;
+    builder.bulk_load_blocks(
+        &activations,
+        [Ok::<_, std::io::Error>(canonical_build_block(
+            baseline_facts,
+        ))],
+    )?;
     builder.load_subtree_roots(std::iter::empty())?;
     builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
         baseline_tip,

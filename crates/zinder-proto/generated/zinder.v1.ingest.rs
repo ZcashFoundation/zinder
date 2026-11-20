@@ -135,6 +135,19 @@ pub struct CanonicalWriterStatusResponse {
     /// readers then attest the fence as before. ADR-0010.
     #[prost(bool, tag = "6")]
     pub tip_unconfirmed: bool,
+    /// Set while the canonical writer reports damage in its store: a stored row
+    /// failed verification, the writer reopened a store it last found damaged
+    /// and has not yet checked that row again, or it cannot read the record of
+    /// its last verification and has not yet verified the store again. `fence`
+    /// stays the writer's current fence and the writer keeps committing, so the
+    /// projector may keep converging on it, but wallet-serving readers must
+    /// refuse traffic with the typed cause instead of attesting it. A parked
+    /// writer can set this beside `reorg_window_exceeded`, whose halt readers
+    /// report first. Writers that predate this field never set it.
+    #[prost(message, optional, tag = "7")]
+    pub canonical_store_damaged: ::core::option::Option<
+        super::ops::CanonicalStoreDamagedDetail,
+    >,
 }
 /// One node-advertised network-upgrade activation in an admitted schedule.
 #[allow(clippy::all)]

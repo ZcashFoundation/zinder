@@ -870,7 +870,7 @@ where
             stage_timers: BlockLoaderStageTimers::register(workload),
         };
         let evidence = builder
-            .bulk_load_blocks(&mut build_blocks)
+            .bulk_load_blocks(&network_upgrade_activations, &mut build_blocks)
             .map_err(canonical_build_error)?;
         let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
         drop(build_blocks);

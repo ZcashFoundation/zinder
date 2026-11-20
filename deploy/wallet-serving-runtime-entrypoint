@@ -139,11 +139,13 @@ probe_connect_seconds=""
 probe_failure_class=""
 probe_report=""
 probe_halted=0
+probe_damaged=0
 probe_parked=0
 probe_upstream_outage=0
 probe_node_unreachable=0
 ingest_node_unreachable_since_epoch=0
 writer_halt_reported=0
+store_damage_reported=0
 projector_park_reported=0
 
 # curl writes the status code and connect time after the body; a newline
@@ -375,6 +377,24 @@ readiness_cause_is_writer_halt() {
   esac
 }
 
+# A canonical store in which ingest found a damaged row stays damaged until an
+# operator rebuilds it, but the topology is still doing its job: ingest keeps
+# following and keeps its control listener, and query and compatibility refuse
+# wallets with the typed `canonical_store_damaged` cause. Ingest finds the same
+# row again on every start, so restarting would only repeat that refusal after
+# a restart's worth of refused connections, and a damaged plane counts as
+# serving.
+readiness_cause_is_store_damage() {
+  case "$1" in
+    canonical_store_damaged)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # A projector that refused a wallet transition over its logical-byte limit
 # stays parked until an operator raises the limit and restarts it, but the
 # topology is still doing its job: ingest keeps the canonical store current,
@@ -555,6 +575,10 @@ await_readiness() {
       log "$role serves the canonical writer halt; continuing so wallets receive the typed refusal: $probe_report"
       return 0
     fi
+    if readiness_cause_is_store_damage "$probe_cause"; then
+      log "$role reports canonical store damage; continuing so wallets receive the typed refusal: $probe_report"
+      return 0
+    fi
     if readiness_cause_is_projector_park "$probe_cause"; then
       log "$role is parked on a wallet transition over its logical-byte limit; continuing so the topology stays up: $probe_report"
       return 0
@@ -578,16 +602,17 @@ await_readiness() {
 }
 
 # Returns zero while the plane admits traffic, serves the canonical writer
-# halt, or reports the projector park, and sets `probe_halted` or
-# `probe_parked` for the latter two. Returns non-zero for every other unready
-# cause, so the caller can time how long it persists, and sets
-# `probe_upstream_outage` when that cause is an upstream outage and
-# `probe_node_unreachable` when it is `node_unavailable`.
+# halt, reports canonical store damage, or reports the projector park, and sets
+# `probe_halted`, `probe_damaged`, or `probe_parked` for the latter three.
+# Returns non-zero for every other unready cause, so the caller can time how
+# long it persists, and sets `probe_upstream_outage` when that cause is an
+# upstream outage and `probe_node_unreachable` when it is `node_unavailable`.
 observe_plane_readiness() {
   role="$1"
   ops_addr="$2"
 
   probe_halted=0
+  probe_damaged=0
   probe_parked=0
   probe_upstream_outage=0
   probe_node_unreachable=0
@@ -597,6 +622,10 @@ observe_plane_readiness() {
   fi
   if readiness_cause_is_writer_halt "$probe_cause"; then
     probe_halted=1
+    return 0
+  fi
+  if readiness_cause_is_store_damage "$probe_cause"; then
+    probe_damaged=1
     return 0
   fi
   if readiness_cause_is_projector_park "$probe_cause"; then
@@ -964,7 +993,9 @@ compat_flap_ready_since_epoch="$startup_completed_epoch"
 # signal that liveness cannot. A canonical writer parked on an oversized reorg
 # is the exception: its planes report `reorg_window_exceeded`, the readers
 # refuse wallets with the typed status, and the container keeps that refusal
-# up instead of restarting into the same park. A projector parked on a wallet
+# up instead of restarting into the same park. A canonical store that ingest
+# found damaged is kept up the same way, with `canonical_store_damaged`. A
+# projector parked on a wallet
 # transition over its logical-byte limit is the other: it reports
 # `wallet_transition_limit_exceeded`, the readers' answered refusals behind it
 # count as serving, and the container stays up for the same reason. When
@@ -983,6 +1014,7 @@ while true; do
   # plane's own flap history stays accurate even in polls where another plane
   # is also unready.
   plane_halted=0
+  plane_damaged=0
   ingest_ready=0
   if observe_plane_readiness zinder-ingest "$ingest_ops_addr"; then
     ingest_ready=1
@@ -997,6 +1029,7 @@ while true; do
     ingest_unreachable=1
   fi
   plane_halted=$((plane_halted | probe_halted))
+  plane_damaged=$((plane_damaged | probe_damaged))
 
   projector_ready=0
   if observe_plane_readiness zinder-projector "$projector_ops_addr"; then
@@ -1008,6 +1041,7 @@ while true; do
     projector_unreachable=1
   fi
   plane_halted=$((plane_halted | probe_halted))
+  plane_damaged=$((plane_damaged | probe_damaged))
   projector_parked="$probe_parked"
 
   query_ready=0
@@ -1030,6 +1064,7 @@ while true; do
       query_unreachable=1
     fi
     plane_halted=$((plane_halted | probe_halted))
+    plane_damaged=$((plane_damaged | probe_damaged))
   fi
 
   # Startup starts compatibility with query, so it is stopped only behind the
@@ -1049,6 +1084,7 @@ while true; do
       compat_unreachable=1
     fi
     plane_halted=$((plane_halted | probe_halted))
+    plane_damaged=$((plane_damaged | probe_damaged))
   fi
 
   case "$(writer_node_outage_behind_syncing_ingest "$ingest_cause" "$ingest_body" \
@@ -1083,6 +1119,14 @@ while true; do
   elif [ "$plane_halted" -eq 0 ] && [ "$writer_halt_reported" -eq 1 ]; then
     log "no plane reports the canonical writer halt any longer"
     writer_halt_reported=0
+  fi
+
+  if [ "$plane_damaged" -eq 1 ] && [ "$store_damage_reported" -eq 0 ]; then
+    log "zinder-ingest found a damaged row in the canonical store; wallets receive SERVICE_NOT_READY with canonical_store_damaged until an operator rebuilds the canonical store: $ingest_report"
+    store_damage_reported=1
+  elif [ "$plane_damaged" -eq 0 ] && [ "$store_damage_reported" -eq 1 ]; then
+    log "no plane reports canonical store damage any longer"
+    store_damage_reported=0
   fi
 
   if [ "$projector_parked" -eq 1 ] && [ "$projector_park_reported" -eq 0 ]; then

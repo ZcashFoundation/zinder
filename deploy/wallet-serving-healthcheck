@@ -4,9 +4,11 @@
 #
 # Healthy means both wallet readers answer wallets usefully: native query and,
 # unless ZINDER_WALLET_SERVING__LIGHTWALLETD turns it off, lightwalletd
-# compatibility. They serve the same pair, so each must be ready or refuse
+# compatibility. They serve the same pair, so each must be ready, refuse
 # every request with the typed REORG_WINDOW_EXCEEDED halt because the
-# canonical writer is parked. A projector parked on a wallet transition over
+# canonical writer is parked, or refuse it with `canonical_store_damaged`
+# because ingest found a damaged row in the canonical store. A projector
+# parked on a wallet transition over
 # its logical-byte limit is healthy too, whether the readers answer unready
 # behind it or were never started because they cannot publish a serving pair
 # there. The entrypoint deliberately keeps a parked topology up, so an
@@ -19,8 +21,9 @@ query_ops_addr="${1:-127.0.0.1:9106}"
 projector_ops_addr="${2:-127.0.0.1:9110}"
 compat_ops_addr="${3:-127.0.0.1:9107}"
 
-# Succeeds when the reader whose operational endpoint is $1 admits traffic or
-# serves the canonical writer halt. The image HEALTHCHECK allows five seconds
+# Succeeds when the reader whose operational endpoint is $1 admits traffic,
+# serves the canonical writer halt, or reports canonical store damage. The
+# image HEALTHCHECK allows five seconds
 # in total, which the two reader probes and the projector probe share.
 reader_serves() {
   readiness_body="$(
@@ -35,7 +38,7 @@ reader_serves() {
   fi
 
   case "$readiness_body" in
-    *'"reorg_window_exceeded"'*) return 0 ;;
+    *'"reorg_window_exceeded"'* | *'"canonical_store_damaged"'*) return 0 ;;
     *) return 1 ;;
   esac
 }

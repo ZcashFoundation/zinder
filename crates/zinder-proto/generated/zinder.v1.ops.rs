@@ -104,7 +104,7 @@ pub struct ReadinessDependency {
 pub struct ReadinessCauseDetail {
     #[prost(
         oneof = "readiness_cause_detail::Payload",
-        tags = "1, 2, 3, 4, 5, 8, 9, 10, 11"
+        tags = "1, 2, 3, 4, 5, 8, 9, 10, 11, 12"
     )]
     pub payload: ::core::option::Option<readiness_cause_detail::Payload>,
 }
@@ -131,6 +131,8 @@ pub mod readiness_cause_detail {
         ServingPairStale(super::ServingPairStaleDetail),
         #[prost(message, tag = "11")]
         WalletTransitionLimitExceeded(super::WalletTransitionLimitExceededDetail),
+        #[prost(message, tag = "12")]
+        CanonicalStoreDamaged(super::CanonicalStoreDamagedDetail),
     }
 }
 /// Detail for READINESS_CAUSE_SYNCING.
@@ -217,6 +219,25 @@ pub struct WalletTransitionLimitExceededDetail {
     /// `projector.follow.max_transition_logical_bytes`.
     #[prost(uint64, tag = "2")]
     pub configured_bytes: u64,
+}
+/// Detail for READINESS_CAUSE_CANONICAL_STORE_DAMAGED.
+///
+/// Names the stored row an operator finds in the ingest log.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CanonicalStoreDamagedDetail {
+    /// Height of the first stored row that failed verification. A damaged
+    /// table block that holds several rows is reported at the first height it
+    /// may hold. Absent when ingest cannot tell where the damage is because it
+    /// cannot read the record of its last verification, until a full
+    /// verification passes.
+    #[prost(uint32, optional, tag = "1")]
+    pub height: ::core::option::Option<u32>,
+    /// Node RPC name of the pool whose frontier failed: `sapling`, `orchard`, or
+    /// `ironwood`. Absent when the row failed outside any one pool, such as a
+    /// key that is not a height or a block that fails its checksum.
+    #[prost(string, optional, tag = "2")]
+    pub pool: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Detail for READINESS_CAUSE_NODE_UNAVAILABLE.
 ///
@@ -337,6 +358,11 @@ pub enum ReadinessCause {
     /// stays parked with the wallet unchanged until it restarts with a larger
     /// limit or a later canonical event changes the transition.
     WalletTransitionLimitExceeded = 20,
+    /// Ingest found a stored canonical row that fails verification, so the
+    /// canonical store is damaged. The writer keeps following and keeps its
+    /// control plane up, and wallet-serving readers refuse traffic, until an
+    /// operator rebuilds the store.
+    CanonicalStoreDamaged = 21,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -367,6 +393,7 @@ impl ReadinessCause {
             Self::WalletTransitionLimitExceeded => {
                 "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED"
             }
+            Self::CanonicalStoreDamaged => "READINESS_CAUSE_CANONICAL_STORE_DAMAGED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -399,6 +426,9 @@ impl ReadinessCause {
             }
             "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED" => {
                 Some(Self::WalletTransitionLimitExceeded)
+            }
+            "READINESS_CAUSE_CANONICAL_STORE_DAMAGED" => {
+                Some(Self::CanonicalStoreDamaged)
             }
             _ => None,
         }

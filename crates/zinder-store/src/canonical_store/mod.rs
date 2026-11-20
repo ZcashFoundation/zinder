@@ -38,6 +38,9 @@ mod tree_state_densification_tests;
 mod tree_state_replay;
 #[cfg(test)]
 mod tree_state_replay_tests;
+mod tree_state_verification;
+#[cfg(test)]
+mod tree_state_verification_tests;
 mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};
@@ -98,6 +101,11 @@ pub use tree_state_densification::{
     TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan,
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
+pub use tree_state_verification::{
+    RocksDbTreeStateVerifier, TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
+    TreeStateCheckpointRowVerification, TreeStateCheckpointVerification,
+    TreeStateVerificationError,
+};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
@@ -417,24 +425,73 @@ fn validate_checkpoint_frontier_presence(
     checkpoint: BlockId,
     frontiers: &CommitmentTreeFrontiers,
 ) -> Result<(), CanonicalStoreBuildPlanError> {
-    for protocol in [
+    frontier_presence_mismatch(network_upgrade_activations, checkpoint.height, frontiers).map_or(
+        Ok(()),
+        |mismatch| {
+            Err(
+                CanonicalStoreBuildPlanError::PredecessorFrontierActivationMismatch {
+                    protocol: mismatch.protocol,
+                    checkpoint_height: checkpoint.height.value(),
+                },
+            )
+        },
+    )
+}
+
+/// A pool whose frontier presence in a checkpoint disagrees with its
+/// activation at the checkpoint's height.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FrontierPresenceMismatch {
+    /// The pool that disagrees.
+    pub(super) protocol: ShieldedProtocol,
+    /// Whether the checkpoint carries a frontier for it.
+    pub(super) frontier_present: bool,
+}
+
+impl FrontierPresenceMismatch {
+    /// Describes the mismatch for an error or log reason.
+    pub(super) fn describe(self) -> String {
+        if self.frontier_present {
+            format!(
+                "carries a frontier for the {:?} pool before it activates",
+                self.protocol
+            )
+        } else {
+            format!(
+                "has no frontier for the {:?} pool although it is active",
+                self.protocol
+            )
+        }
+    }
+}
+
+/// Returns the first pool whose frontier presence disagrees with its
+/// activation at `height`.
+///
+/// An active pool carries a frontier even while its tree is empty, and an
+/// inactive pool carries none. Tree sizes cannot show the difference, because
+/// an omitted pool and an empty one both have size zero.
+pub(super) fn frontier_presence_mismatch(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+    frontiers: &CommitmentTreeFrontiers,
+) -> Option<FrontierPresenceMismatch> {
+    [
         ShieldedProtocol::Sapling,
         ShieldedProtocol::Orchard,
         ShieldedProtocol::Ironwood,
-    ] {
+    ]
+    .into_iter()
+    .find_map(|protocol| {
         let is_active = network_upgrade_activations
             .activation_height_by_name(protocol.activation_upgrade_name())
-            .is_some_and(|activation_height| activation_height <= checkpoint.height);
-        if frontiers.get(protocol).is_some() != is_active {
-            return Err(
-                CanonicalStoreBuildPlanError::PredecessorFrontierActivationMismatch {
-                    protocol,
-                    checkpoint_height: checkpoint.height.value(),
-                },
-            );
-        }
-    }
-    Ok(())
+            .is_some_and(|activation_height| activation_height <= height);
+        let frontier_present = frontiers.get(protocol).is_some();
+        (frontier_present != is_active).then_some(FrontierPresenceMismatch {
+            protocol,
+            frontier_present,
+        })
+    })
 }
 
 /// Failure while streaming source facts into a fresh canonical build.

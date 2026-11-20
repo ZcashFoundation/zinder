@@ -1259,7 +1259,7 @@ fn assert_second_reads_only_cached_blocks(
 ///
 /// Automatic compaction stays off for the family so the files survive until
 /// [`compact_away_table_files`] replaces them.
-fn split_rows_into_table_files(
+pub(super) fn split_rows_into_table_files(
     db: &rust_rocksdb::DB,
     family: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1277,7 +1277,7 @@ fn split_rows_into_table_files(
 
 /// Compacts `family` on the primary and waits until its L0 table files are
 /// deleted, as routine compaction does under a serving secondary.
-fn compact_away_table_files(
+pub(super) fn compact_away_table_files(
     db: &rust_rocksdb::DB,
     family: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1299,7 +1299,7 @@ fn compact_away_table_files(
 /// The compaction takes every level-0 file overlapping `heights` and every
 /// file of the level it writes to that overlaps them, so with each row in a
 /// file of its own it leaves the files of the other rows in place.
-fn compact_away_rows_in(
+pub(super) fn compact_away_rows_in(
     db: &rust_rocksdb::DB,
     family: &str,
     heights: BlockHeightRange,
@@ -1339,7 +1339,7 @@ fn wait_until_deleted(replaced: &[std::path::PathBuf]) -> Result<(), Box<dyn std
 
 /// Rewrites `family` on the primary so that every row is in a bottom-level
 /// table file of its own, and no level-0 file remains.
-fn split_rows_into_bottom_level_files(
+pub(super) fn split_rows_into_bottom_level_files(
     db: &rust_rocksdb::DB,
     family: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1436,7 +1436,7 @@ fn replayed_tree_state(
     Ok(tree_state)
 }
 
-fn table_file_path(file: &rust_rocksdb::LiveFile) -> std::path::PathBuf {
+pub(super) fn table_file_path(file: &rust_rocksdb::LiveFile) -> std::path::PathBuf {
     std::path::Path::new(&file.directory).join(file.name.trim_start_matches('/'))
 }
 

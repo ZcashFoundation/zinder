@@ -1922,8 +1922,9 @@ impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
     }
 
     /// The projector waits for the writer-admitted schedule revision, but
-    /// converges on a parked or unconfirmed writer's fence: only serving
-    /// readers refuse that fence.
+    /// converges on the fence of a parked or unconfirmed writer, or of one
+    /// that reports damage in its store: only serving readers refuse that
+    /// fence, so the projector keeps following instead of failing.
     fn attests_writer_schedule(
         &self,
         status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
@@ -2538,7 +2539,7 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::convert::Infallible>(block_one)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,
@@ -2839,6 +2840,33 @@ mod tests {
             probe.deadlines >= 1,
             "expected at least one passed deadline"
         );
+        assert_eq!(probe.secondary_sequence, probe.writer_sequence);
+        Ok(())
+    }
+
+    /// The projector converges on a writer that reports store damage.
+    ///
+    /// That writer keeps attesting its fence while it commits, so the
+    /// projector treats it as it treats a parked writer's fence instead of
+    /// failing, and the deployment does not restart into the same damage.
+    #[tokio::test]
+    async fn a_writer_reporting_store_damage_is_converged_on_like_a_parked_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut probe = BurstProbe::new(2, None);
+        probe.store_damage = Some(zinder_proto::wire::canonical_store_damaged_detail(
+            Some(BlockHeight::new(1)),
+            None,
+        ));
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(outcome, Some(FollowingConvergence::Attested));
         assert_eq!(probe.secondary_sequence, probe.writer_sequence);
         Ok(())
     }
@@ -3204,6 +3232,8 @@ mod tests {
         /// Event sequence of the open wallet; `None` for a fresh build.
         wallet_sequence: Option<u64>,
         writer_sequence_override: Option<u64>,
+        /// Store damage every status reports.
+        store_damage: Option<zinder_proto::v1::ops::CanonicalStoreDamagedDetail>,
         catch_ups: u32,
         deadlines: u32,
     }
@@ -3216,6 +3246,7 @@ mod tests {
                 burst_commits_remaining: burst_commits,
                 wallet_sequence,
                 writer_sequence_override: None,
+                store_damage: None,
                 catch_ups: 0,
                 deadlines: 0,
             }
@@ -3250,6 +3281,7 @@ mod tests {
                 network_name: encode_zinder_native_chain_name(test_network()).to_owned(),
                 fence: Some(scripted_writer_fence(writer_sequence)),
                 oldest_retained_event_sequence: 1,
+                canonical_store_damaged: self.store_damage.clone(),
                 ..CanonicalWriterStatusResponse::default()
             }))
         }
@@ -3381,7 +3413,7 @@ mod tests {
             )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::convert::Infallible>(block_one)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             block_one_id,
@@ -3577,6 +3609,7 @@ mod tests {
             network_upgrade_schedule: None,
             reorg_window_exceeded: None,
             tip_unconfirmed: false,
+            canonical_store_damaged: None,
         }
     }
 

@@ -12,6 +12,7 @@
 //! generated `zinder_proto::v1::*` enums.
 
 mod activation_schedule;
+mod canonical_store_damaged;
 mod canonical_writer_fence;
 mod explorer_field_path;
 mod privacy_shape;
@@ -24,6 +25,7 @@ pub use activation_schedule::{
     ActivationScheduleWireError, decode_canonical_network_upgrade_schedule,
     encode_canonical_network_upgrade_schedule,
 };
+pub use canonical_store_damaged::{canonical_store_damaged_detail, canonical_store_damaged_pool};
 pub use canonical_writer_fence::canonical_writer_fence_message;
 pub use explorer_field_path::TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH;
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};

@@ -18,7 +18,8 @@ use zinder_ingest::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, DEFAULT_TREE_STATE_COMMITMENT_BUDGET, IngestError,
     IngestRuntimeConfig, MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig,
-    RawBlobPolicy, TreeStateDensificationConfig, container_memory_budget_bytes,
+    RawBlobPolicy, TreeStateDensificationConfig, TreeStateVerificationConfig,
+    container_memory_budget_bytes,
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
@@ -61,6 +62,7 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) allow_public_bind: bool,
     pub(crate) retention: ResolvedRetention,
     pub(crate) tree_state_densification: TreeStateDensificationConfig,
+    pub(crate) tree_state_verification: TreeStateVerificationConfig,
 }
 
 /// Coverage policy applied to the [`CanonicalRunOverrides`] bootstrap path.
@@ -327,6 +329,8 @@ struct IngestSection {
     run_overrides: IngestRunOverridesSection,
     /// Background densification of settled tree-state checkpoints.
     tree_state_densification: IngestTreeStateDensificationSection,
+    /// Background verification of stored tree-state checkpoints.
+    tree_state_verification: IngestTreeStateVerificationSection,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -337,6 +341,13 @@ struct IngestTreeStateDensificationSection {
     commitment_budget: Option<u32>,
     workers: Option<u32>,
     max_blocks_per_second: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestTreeStateVerificationSection {
+    enabled: Option<bool>,
+    max_rows_per_second: Option<u32>,
 }
 
 /// Configured name of a tree-state checkpoint selection.
@@ -626,6 +637,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let retention = resolve_retention(config.retention)?;
     let tree_state_densification =
         resolve_tree_state_densification(config.ingest.tree_state_densification)?;
+    let tree_state_verification =
+        resolve_tree_state_verification(config.ingest.tree_state_verification)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
     guard_optional_serving_bind(
@@ -694,6 +707,25 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         allow_public_bind,
         retention,
         tree_state_densification,
+        tree_state_verification,
+    })
+}
+
+fn resolve_tree_state_verification(
+    section: IngestTreeStateVerificationSection,
+) -> Result<TreeStateVerificationConfig, ConfigError> {
+    let defaults = TreeStateVerificationConfig::default();
+    let max_rows_per_second = match section.max_rows_per_second {
+        None => defaults.max_rows_per_second,
+        Some(configured) => NonZeroU32::new(configured).ok_or_else(|| {
+            ConfigError::invalid(
+                "ingest.tree_state_verification.max_rows_per_second must be greater than zero",
+            )
+        })?,
+    };
+    Ok(TreeStateVerificationConfig {
+        enabled: section.enabled.unwrap_or(defaults.enabled),
+        max_rows_per_second,
     })
 }
 
@@ -890,6 +922,10 @@ impl RedactedIngestConfigToml {
                 tree_state_densification: IngestTreeStateDensificationToml::from_resolved(
                     config.tree_state_densification,
                 ),
+                tree_state_verification: IngestTreeStateVerificationToml {
+                    enabled: config.tree_state_verification.enabled,
+                    max_rows_per_second: config.tree_state_verification.max_rows_per_second.get(),
+                },
             },
             ingest_control: IngestControlWriterToml::from_resolved(
                 config.ingest_control_listen_addr,
@@ -916,6 +952,13 @@ struct IngestToml {
     follow: IngestFollowToml,
     run_overrides: IngestRunOverridesToml,
     tree_state_densification: IngestTreeStateDensificationToml,
+    tree_state_verification: IngestTreeStateVerificationToml,
+}
+
+#[derive(Serialize)]
+struct IngestTreeStateVerificationToml {
+    enabled: bool,
+    max_rows_per_second: u32,
 }
 
 #[derive(Serialize)]
@@ -1123,6 +1166,37 @@ mod tests {
                 .map_or_default(|error| error.to_string());
             assert!(error.contains(field), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn tree_state_verification_defaults_to_on_at_a_conservative_rate_and_rejects_zero() {
+        assert_eq!(
+            resolve_tree_state_verification(IngestTreeStateVerificationSection::default()).ok(),
+            Some(TreeStateVerificationConfig {
+                enabled: true,
+                max_rows_per_second: NonZeroU32::MIN.saturating_add(24),
+            })
+        );
+        assert!(matches!(
+            resolve_tree_state_verification(IngestTreeStateVerificationSection {
+                enabled: Some(false),
+                max_rows_per_second: Some(200),
+            }),
+            Ok(TreeStateVerificationConfig {
+                enabled: false,
+                max_rows_per_second,
+            }) if max_rows_per_second.get() == 200
+        ));
+        let error = resolve_tree_state_verification(IngestTreeStateVerificationSection {
+            max_rows_per_second: Some(0),
+            ..IngestTreeStateVerificationSection::default()
+        })
+        .err()
+        .map_or_default(|error| error.to_string());
+        assert!(
+            error.contains("ingest.tree_state_verification.max_rows_per_second"),
+            "{error}"
+        );
     }
 
     #[test]

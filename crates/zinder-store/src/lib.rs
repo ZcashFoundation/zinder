@@ -36,9 +36,11 @@ pub use canonical_store::{
     DisplacedBlockPage, HeightOrder, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
     MAX_TREE_STATE_STRIDE_SCAN_READS, PreparedCanonicalBaselinePublication, ProjectionBuildAnchor,
     ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState,
-    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection, TreeStateLookup, TreeStateReplay,
-    TreeStateReplayOutcome, TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbTreeStateVerifier, ServedTreeState,
+    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
+    TreeStateCheckpointRowVerification, TreeStateCheckpointSelection,
+    TreeStateCheckpointVerification, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan, TreeStateVerificationError,
     ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_event::{

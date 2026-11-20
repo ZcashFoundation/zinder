@@ -1214,7 +1214,7 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let block = canonical_build_block(tip, [2; 32], [1; 32], activations)?;
-        builder.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+        builder.bulk_load_blocks(activations, [Ok::<_, std::io::Error>(block)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             build_tip,
@@ -1284,7 +1284,7 @@ mod tests {
             activations,
         )?;
         let tip = canonical_build_block(BlockHeight::new(2), [2; 32], [1; 32], activations)?;
-        builder.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok(tip)])?;
+        builder.bulk_load_blocks(activations, [Ok::<_, std::io::Error>(first), Ok(tip)])?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             build_tip,

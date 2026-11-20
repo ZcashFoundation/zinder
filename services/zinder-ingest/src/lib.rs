@@ -6,6 +6,7 @@
 //! `zinder-store`.
 
 mod artifact_builder;
+mod background_pass;
 mod canonical_block_context;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
@@ -18,6 +19,7 @@ mod runtime_config;
 mod source_recovery;
 mod transaction_component_backfill;
 mod tree_state_densification;
+mod tree_state_verification;
 mod upstream_health_probe;
 mod writer;
 
@@ -72,6 +74,11 @@ pub use tree_state_densification::{
     DEFAULT_TREE_STATE_DENSIFICATION_WORKERS, TREE_STATE_DENSIFICATION_WATERMARK_FILE,
     TreeStateDensificationConfig, TreeStateDensificationContext, TreeStateStrideWriteError,
     TreeStateStrideWriter, spawn_tree_state_densification_task,
+};
+pub use tree_state_verification::{
+    CanonicalStoreDamage, CanonicalStoreDamageSignal, CanonicalStoreDamageSite,
+    DEFAULT_TREE_STATE_VERIFICATION_MAX_ROWS_PER_SECOND, TREE_STATE_VERIFICATION_WATERMARK_FILE,
+    TreeStateVerificationConfig, TreeStateVerificationContext, spawn_tree_state_verification_task,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
 pub use writer::construction::{

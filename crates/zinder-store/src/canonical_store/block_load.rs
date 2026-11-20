@@ -14,8 +14,8 @@ use zinder_core::{
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, SerializedBytesDigest,
-    TransactionBlobArtifact, TransactionLocation,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact,
+    NetworkUpgradeActivations, SerializedBytesDigest, TransactionBlobArtifact, TransactionLocation,
 };
 use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
@@ -38,6 +38,7 @@ use super::{
     CanonicalStoreError, CanonicalStoreWorkload, TREE_STATE_CHECKPOINT_STRIDE,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     construction_manifest::CanonicalConstructionFamilyEvidence,
+    frontier_presence_mismatch,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
@@ -178,6 +179,9 @@ pub(super) struct CanonicalBlockSstConfig<'options> {
     pub(super) options: &'options Options,
     pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: &'options CanonicalStoreBuildPlan,
+    /// The activation table the build plan fingerprints, which decides the
+    /// pools each checkpoint carries a frontier for.
+    pub(super) network_upgrade_activations: &'options NetworkUpgradeActivations,
     pub(super) sst_target_logical_bytes: u64,
     pub(super) reverse_index_sort_memory_bytes: usize,
 }
@@ -299,7 +303,12 @@ impl<'options> CanonicalBlockSstStager<'options> {
 
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
         let started_at = Instant::now();
-        validate_build_block(self.config.workload, self.config.build_plan, &block)?;
+        validate_build_block(
+            self.config.workload,
+            self.config.build_plan,
+            self.config.network_upgrade_activations,
+            &block,
+        )?;
         let validated_at = Instant::now();
         self.stage_timers
             .validate
@@ -948,6 +957,7 @@ fn validate_persisted_block_final_note_commitment_roots(
 pub(super) fn validate_build_block(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
+    network_upgrade_activations: &NetworkUpgradeActivations,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     validate_block(
@@ -955,7 +965,35 @@ pub(super) fn validate_build_block(
         build_plan.raw_blob_retention(),
         block,
         build_plan.build_tip().height,
+    )?;
+    validate_tree_state_checkpoint_pools(network_upgrade_activations, block)
+}
+
+/// Requires a loaded checkpoint to carry a frontier for exactly the pools
+/// active at its height.
+///
+/// A live commit derives its checkpoint by seeding an accumulator that checks
+/// the same rule, so only the bulk loader, which takes checkpoints as given,
+/// checks it here.
+fn validate_tree_state_checkpoint_pools(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
+    let Some(checkpoint) = &block.tree_state_checkpoint else {
+        return Ok(());
+    };
+    frontier_presence_mismatch(
+        network_upgrade_activations,
+        checkpoint.block_id.height,
+        &checkpoint.frontiers,
     )
+    .map_or(Ok(()), |mismatch| {
+        Err(CanonicalStoreError::block_load_sequence(format!(
+            "block {} tree-state checkpoint {}",
+            checkpoint.block_id.height.value(),
+            mismatch.describe()
+        )))
+    })
 }
 
 pub(super) fn validate_live_block(

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rust_rocksdb::{DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
+use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
 use zinder_core::{
     BlockHeight, BlockHeightRange, CanonicalBlockFacts, CanonicalHistoryBounds, Network,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
@@ -138,6 +138,7 @@ impl RocksDbCanonicalSecondary {
                 expected_reorg_policy,
             ),
             resources.into(),
+            canonical_column_family_descriptors,
         )
     }
 
@@ -174,6 +175,7 @@ impl RocksDbCanonicalSecondary {
                 expected_reorg_policy,
             ),
             resources.into(),
+            canonical_column_family_descriptors,
         )
     }
 
@@ -181,11 +183,12 @@ impl RocksDbCanonicalSecondary {
         clippy::too_many_lines,
         reason = "initial secondary admission binds control, schedule, manifest, and READY publication"
     )]
-    fn open_ready_with_expectation(
+    pub(super) fn open_ready_with_expectation(
         primary_path: &Path,
         secondary_path: &Path,
         expectation: &CanonicalStoreAdmissionExpectation,
         resources: RocksDbOpenResources,
+        column_families: fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
     ) -> Result<Self, CanonicalStoreError> {
         resources
             .validate()
@@ -205,7 +208,7 @@ impl RocksDbCanonicalSecondary {
                 secondary_path,
             },
             resources,
-            canonical_column_family_descriptors,
+            column_families,
         )
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "open canonical secondary",

@@ -38,7 +38,7 @@ use zinder_runtime::{
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
     ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
     classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
-    expected_writer_fence,
+    expected_writer_fence, refresh_within_stale_deadline,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
@@ -186,8 +186,9 @@ impl WriterStatus {
         })
     }
 
-    /// Bounded, so a writer that accepts the call and never answers cannot
-    /// hold the publisher's refresh past its staleness ceiling.
+    /// Bounded by the wallet ingest-control request timeout, so a writer that
+    /// accepts the call and never answers cannot hold the publisher's refresh
+    /// open. Admission ends at the staleness ceiling meanwhile.
     async fn fetch(&mut self) -> Result<CanonicalWriterStatusResponse, Status> {
         self.client
             .writer_status(wallet_ingest_control_request(
@@ -230,12 +231,19 @@ impl CompactBlockPublisher {
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
         let block_cache = SharedBlockCache::new(config.resource_budget.block_cache_bytes);
+        let mut writer_attestation =
+            WriterAttestation::new(config.network, config.staleness_ceiling);
         let (candidate, attesting_status) = converge_candidate(
             &mut writer_status,
             &config,
             CandidateGeneration {
                 block_cache: &block_cache,
                 generation: 0,
+            },
+            ServedReader {
+                attestation: &mut writer_attestation,
+                readiness: &readiness,
+                visible_height: None,
             },
         )
         .await
@@ -251,8 +259,6 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
-        let mut writer_attestation =
-            WriterAttestation::new(config.network, config.staleness_ceiling);
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             writer_attestation.attest();
@@ -286,14 +292,24 @@ impl CompactBlockPublisher {
         serving_drained: CancellationToken,
     ) -> JoinHandle<Result<(), CompactBlockServingError>> {
         tokio::spawn(async move {
+            // Refreshing at least every half ceiling lets a writer that
+            // answers attest the reader before the ceiling passes. The
+            // deadline ends admission only for a refresh left unanswered,
+            // even while it still runs, or for a loop that starts late.
+            let refresh_interval = self
+                .writer_attestation
+                .refresh_interval(self.config.catchup_interval);
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(self.config.catchup_interval) => {
-                        self.refresh().await;
-                        self.record_resource_gauges().await;
-                    }
+                    () = tokio::time::sleep(refresh_interval) => {}
+                    () = self.writer_attestation.stale_deadline().passed() => {}
                 }
+                let deadline = self.writer_attestation.stale_deadline();
+                let admission = self.readiness.composed.clone();
+                refresh_within_stale_deadline(deadline, &admission, self.refresh()).await;
+                self.writer_attestation.end_lapsed_allowance();
+                self.record_resource_gauges().await;
             }
             serving_drained.cancelled().await;
             tear_down_on_blocking_thread(self).await
@@ -388,16 +404,27 @@ impl CompactBlockPublisher {
             }
         }
         let candidate_generation = (self.active_generation + 1) % GENERATION_COUNT;
-        let (candidate, attesting_status) = match converge_candidate(
+        let converged = converge_candidate(
             &mut self.writer_status,
             &self.config,
             CandidateGeneration {
                 block_cache: &self.block_cache,
                 generation: candidate_generation,
             },
+            ServedReader {
+                attestation: &mut self.writer_attestation,
+                readiness: &self.readiness,
+                visible_height: Some(active.event_fence().visible_tip().height.value()),
+            },
         )
-        .await
-        {
+        .await;
+        // A halt or store damage a status read during convergence reported
+        // outlasts the failure that ended it.
+        if let (Err(_), Some(halt)) = (&converged, self.writer_attestation.remembered_halt()) {
+            self.readiness.publish_storage(halt);
+            return;
+        }
+        let (candidate, attesting_status) = match converged {
             Ok(converged) => converged,
             Err(ConvergenceFailure::WriterStatusTransport(_)) => {
                 let cause = self.writer_attestation.stale_allowance().map_or(
@@ -583,6 +610,16 @@ struct CandidateGeneration<'a> {
 struct CandidateFenceProbe<'a> {
     writer_status: &'a mut WriterStatus,
     candidate: Option<RocksDbCanonicalSecondary>,
+    served: ServedReader<'a>,
+}
+
+/// The reader a converging candidate would replace, which every writer
+/// status the convergence reads may refuse.
+struct ServedReader<'a> {
+    attestation: &'a mut WriterAttestation,
+    readiness: &'a CompactServingReadiness,
+    /// Visible tip height of the active reader, or `None` at bootstrap.
+    visible_height: Option<u32>,
 }
 
 impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
@@ -603,6 +640,18 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
             .fetch()
             .await
             .map_err(|error| ConvergenceFailure::WriterStatusTransport(error.message().to_owned()))
+    }
+
+    /// A halt or store damage the writer reports while the candidate trails
+    /// refuses traffic on the active reader at once.
+    fn observe_writer_status(&mut self, status: &CanonicalWriterStatusResponse) {
+        if let Some(refusal) = self
+            .served
+            .attestation
+            .observe(status, self.served.visible_height)
+        {
+            self.served.readiness.publish_storage(refusal);
+        }
     }
 }
 
@@ -664,16 +713,18 @@ async fn open_generation_awaiting_schedule(
 
 /// Opens a candidate in `generation`, converges it on the writer fence, and
 /// returns it with the writer status that attested it.
-async fn converge_candidate(
-    writer_status: &mut WriterStatus,
+async fn converge_candidate<'a>(
+    writer_status: &'a mut WriterStatus,
     config: &CompactBlockServingConfig,
     generation: CandidateGeneration<'_>,
+    served: ServedReader<'a>,
 ) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
     let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
     let candidate = open_generation_awaiting_schedule(config, generation, retry_delay).await?;
     let mut probe = CandidateFenceProbe {
         writer_status,
         candidate: Some(candidate),
+        served,
     };
     let outcome = converge_on_canonical_writer_fence(
         &mut probe,
@@ -1563,11 +1614,15 @@ mod tests {
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
-        /// Answers served once each, in order, before `writer_status`.
-        queued_statuses: Arc<Mutex<std::collections::VecDeque<CanonicalWriterStatusResponse>>>,
+        /// Answers served once each, in order, before `writer_status`; `None`
+        /// answers with an outage.
+        queued_statuses:
+            Arc<Mutex<std::collections::VecDeque<Option<CanonicalWriterStatusResponse>>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
         /// Accepts each writer-status call and never answers it.
         stalled: Arc<std::sync::atomic::AtomicBool>,
+        /// How long each writer-status call waits before it answers.
+        answer_delay: Arc<Mutex<Duration>>,
     }
 
     impl MutableCanonicalControl {
@@ -1577,6 +1632,7 @@ mod tests {
                 queued_statuses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                answer_delay: Arc::new(Mutex::new(Duration::ZERO)),
             }
         }
 
@@ -1585,8 +1641,16 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        fn delay_answers(&self, delay: Duration) {
+            *self.answer_delay.lock() = delay;
+        }
+
         fn queue_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
-            self.queued_statuses.lock().push_back(writer_status);
+            self.queued_statuses.lock().push_back(Some(writer_status));
+        }
+
+        fn queue_outage(&self) {
+            self.queued_statuses.lock().push_back(None);
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -1608,13 +1672,21 @@ mod tests {
             if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
+            let answer_delay = *self.answer_delay.lock();
+            if !answer_delay.is_zero() {
+                tokio::time::sleep(answer_delay).await;
+            }
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(tonic::Status::unavailable("fixture writer status outage"));
             }
             let queued = self.queued_statuses.lock().pop_front();
-            Ok(tonic::Response::new(
-                queued.unwrap_or_else(|| self.writer_status.lock().clone()),
-            ))
+            match queued {
+                Some(Some(writer_status)) => Ok(tonic::Response::new(writer_status)),
+                Some(None) => Err(tonic::Status::unavailable(
+                    "fixture queued writer status outage",
+                )),
+                None => Ok(tonic::Response::new(self.writer_status.lock().clone())),
+            }
         }
 
         async fn event_page(
@@ -1772,6 +1844,7 @@ mod tests {
             }),
             reorg_window_exceeded: None,
             tip_unconfirmed: false,
+            canonical_store_damaged: None,
         }
     }
 
@@ -1818,9 +1891,13 @@ mod tests {
             builder_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks(std::iter::once(Ok::<_, std::io::Error>(
-            lifecycle_build_block(&first, activations)?,
-        )))?;
+        builder.bulk_load_blocks(
+            activations,
+            std::iter::once(Ok::<_, std::io::Error>(lifecycle_build_block(
+                &first,
+                activations,
+            )?)),
+        )?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             BlockId::new(first.height, first.hash),
@@ -2557,6 +2634,374 @@ mod tests {
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())
+    }
+
+    /// Compact serving refuses at once while the writer reports store damage.
+    ///
+    /// It refuses on the next refresh, keeps refusing through a
+    /// writer-status outage, and admits traffic again once a status reports
+    /// no damage.
+    #[tokio::test]
+    async fn publisher_refuses_at_once_while_the_writer_reports_store_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (mut publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_mins(1))?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                Some(BlockHeight::new(1)),
+                None,
+            )),
+            ..lifecycle_writer_status(&primary)
+        });
+        publisher.refresh().await;
+        let damaged = ReadinessCause::CanonicalStoreDamaged {
+            height: Some(1),
+            pool: None,
+        };
+        assert_eq!(readiness.report().cause, damaged);
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        publisher.refresh().await;
+        assert_eq!(readiness.report().cause, damaged);
+
+        control.set_available(true);
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// Store damage reported while a candidate trails the writer outlasts an
+    /// outage.
+    ///
+    /// The damage refuses traffic at once, and a writer-status outage that
+    /// then ends the refresh keeps refusing instead of admitting traffic
+    /// under the staleness allowance.
+    #[tokio::test]
+    async fn damage_reported_while_a_candidate_trails_survives_a_later_outage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (mut publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_mins(1))?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        // The first status shows the writer one epoch ahead, so the refresh
+        // converges a candidate that trails it; the writer reports damage on
+        // the next status and then stops answering.
+        let mut ahead = lifecycle_writer_status(&primary);
+        let fence = ahead
+            .fence
+            .as_mut()
+            .ok_or("lifecycle writer status has no fence")?;
+        fence.chain_epoch_id += 1;
+        fence.event_sequence += 1;
+        fence.visible_tip_height += 1;
+        control.queue_writer_status(ahead.clone());
+        control.queue_writer_status(CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                Some(BlockHeight::new(1)),
+                None,
+            )),
+            ..ahead
+        });
+        control.queue_outage();
+        publisher.refresh().await;
+
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalStoreDamaged {
+                height: Some(1),
+                pool: None,
+            }
+        );
+        assert!(!readiness.report().is_ready);
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// The staleness ceiling holds when the catch-up interval is longer.
+    ///
+    /// The publisher stops admitting traffic on an unattested reader once
+    /// the ceiling passes, before its next scheduled refresh.
+    #[tokio::test]
+    async fn the_staleness_ceiling_holds_with_a_longer_catch_up_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_millis(200);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_available(false);
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(staleness_ceiling * 4).await;
+        let after_ceiling = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            !after_ceiling.is_ready,
+            "an unattested reader must stop admitting traffic at the ceiling: {:?}",
+            after_ceiling.cause
+        );
+        drop(slot);
+        drop(primary);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// A writer-status read that stalls cannot hold admission past the
+    /// staleness ceiling.
+    ///
+    /// Each read waits until the wallet ingest-control bound ends it, so a
+    /// read is always in flight when the ceiling passes; the reader stops
+    /// admitting traffic at the ceiling instead of when that read ends.
+    #[tokio::test]
+    async fn a_stalled_writer_status_read_ends_admission_at_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_secs(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.stall();
+        tokio::time::pause();
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        let before_ceiling = readiness.report();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after_ceiling = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert!(before_ceiling.is_ready, "{:?}", before_ceiling.cause);
+        assert_eq!(after_ceiling.cause, ReadinessCause::WriterStatusUnavailable);
+        drop(slot);
+        drop(primary);
+        drop(shutdown_sender);
+        server.abort();
+        let _join_outcome = server.await;
+        Ok(())
+    }
+
+    /// A publisher that starts its loop after the ceiling has passed ends
+    /// admission at once instead of after its catch-up interval.
+    #[tokio::test]
+    async fn a_publisher_that_starts_after_the_staleness_ceiling_ends_admission_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+
+        control.stall();
+        tokio::time::pause();
+        tokio::time::advance(staleness_ceiling + Duration::from_secs(1)).await;
+        assert!(readiness.report().is_ready);
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let at_start = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert_eq!(at_start.cause, ReadinessCause::WriterStatusUnavailable);
+        drop(slot);
+        drop(primary);
+        drop(shutdown_sender);
+        server.abort();
+        let _join_outcome = server.await;
+        Ok(())
+    }
+
+    /// A writer that answers keeps a reader admitting traffic when the
+    /// catch-up interval is longer than the staleness ceiling.
+    ///
+    /// Each answer takes 100 ms, so a refresh that started only once the
+    /// ceiling passed would refuse traffic until the writer answered it. The
+    /// test runs on the real clock because the paused clock can advance past
+    /// a pending socket read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answering_writer_keeps_admission_past_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_secs(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.delay_answers(Duration::from_millis(100));
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        let mut refusals = Vec::new();
+        let sampled_until = tokio::time::Instant::now() + staleness_ceiling * 3;
+        while tokio::time::Instant::now() < sampled_until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let report = readiness.report();
+            if !report.is_ready {
+                refusals.push(report.cause);
+            }
+        }
+        cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            refusals.is_empty(),
+            "an answering writer must keep the reader admitted: {refusals:?}"
+        );
+        drop(slot);
+        drop(primary);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// Serves `control` until the returned sender fires.
+    async fn serve_control(
+        control: &MutableCanonicalControl,
+    ) -> Result<
+        (
+            String,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        Ok((endpoint, shutdown_sender, server))
+    }
+
+    fn compact_serving_config(
+        temporary: &tempfile::TempDir,
+        catchup_interval: Duration,
+        staleness_ceiling: Duration,
+    ) -> Result<CompactBlockServingConfig, Box<dyn std::error::Error>> {
+        Ok(CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval,
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling,
+            lag_threshold: 0,
+        })
     }
 
     /// Compact serving refuses a writer that has not confirmed its tip since

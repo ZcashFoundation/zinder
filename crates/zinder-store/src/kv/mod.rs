@@ -1,5 +1,6 @@
 mod rocksdb;
 
+pub(crate) use rocksdb::build_uncached_block_based_table_factory;
 pub use rocksdb::{
     BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbInstanceMemory, RocksDbIoMode,
     RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceGaugeInputs, SharedBlockCache, StoreRole,

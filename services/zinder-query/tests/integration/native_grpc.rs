@@ -416,7 +416,7 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
     assert_eq!(grpc_responses.latest_tree_state_checkpoint.height, 1);
     assert_eq!(
         grpc_responses.latest_tree_state_checkpoint.payload_bytes,
-        b"{}"
+        br#"{"sapling":{"commitments":{"finalState":"000000"}}}"#
     );
     assert!(
         grpc_responses.subtree_roots.subtree_roots.is_empty(),

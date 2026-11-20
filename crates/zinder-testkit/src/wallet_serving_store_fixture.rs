@@ -32,9 +32,6 @@ pub struct WalletServingStoreFixture {
 impl WalletServingStoreFixture {
     /// Builds READY primaries from `chain_fixture` and opens immutable secondaries.
     ///
-    /// Checkpoints omit the frontier of every pool whose tree is still empty,
-    /// so an empty-tree checkpoint serves an empty tree-state payload.
-    ///
     /// # Errors
     ///
     /// Returns an error when the fixture is empty, omits a transaction blob,
@@ -45,7 +42,7 @@ impl WalletServingStoreFixture {
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
         CanonicalWriterFixture::publish(
-            &CanonicalBaseline::new(chain_fixture).omitting_empty_frontiers(),
+            &CanonicalBaseline::new(chain_fixture),
             network_upgrade_activations,
         )?
         .into_serving_store_fixture()

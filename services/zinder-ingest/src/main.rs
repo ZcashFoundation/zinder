@@ -18,19 +18,20 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalControlHandle, CanonicalFollowConfig,
-    CanonicalIngestControlGrpcAdapter, CanonicalRunOverrides, CanonicalWriterConfig,
-    ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
-    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    EndpointAdmission, FailoverReadiness, HistoricalWorkGate, IngestError, LiveMempoolOwner,
-    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolReadySignal,
-    MempoolRetentionSettings, NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor,
-    NodeFailover, NodeFailoverPolicy, NodeSourceKind, ReplayPrevoutCaches,
-    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
-    TreeStateDensificationContext, VolumeSpaceGuard, admit_canonical_store,
-    canonical_control_channel, check_single_endpoint_genesis, classify_phase,
-    follow_admitted_canonical_store, mempool_ready_channel, missing_required_capability,
-    open_primary_materialized_view_store, run_live_mempool_owner, run_mempool_retention,
-    seed_backfill_owned_consumer_cursors, spawn_conventional_fee_distribution_backfill_task,
+    CanonicalIngestControlGrpcAdapter, CanonicalRunOverrides, CanonicalStoreDamageSignal,
+    CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
+    ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, EndpointAdmission, FailoverReadiness,
+    HistoricalWorkGate, IngestError, LiveMempoolOwner, MaterializedViewReplayConfig,
+    MaterializedViewTailer, MempoolReadySignal, MempoolRetentionSettings, NoNodeEndpointAdmitted,
+    NodeEndpointAdmissions, NodeEndpointMonitor, NodeFailover, NodeFailoverPolicy, NodeSourceKind,
+    ReplayPrevoutCaches, TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
+    TreeStateDensificationContext, TreeStateVerificationContext, VolumeSpaceGuard,
+    admit_canonical_store, canonical_control_channel, check_single_endpoint_genesis,
+    classify_phase, follow_admitted_canonical_store, mempool_ready_channel,
+    missing_required_capability, open_primary_materialized_view_store, run_live_mempool_owner,
+    run_mempool_retention, seed_backfill_owned_consumer_cursors,
+    spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_node_endpoint_monitor, spawn_runtime_memory_metrics_task,
     spawn_transaction_component_backfill_task, spawn_undo_index_pruning_task,
@@ -323,6 +324,10 @@ async fn run_ingest(
     } else {
         HistoricalWorkGate::without_materialized_views(writer_readiness.clone())
     };
+    // Created before the control plane answers, so a restart over a store
+    // ingest found damaged reports that damage from its first writer status.
+    let store_damage =
+        CanonicalStoreDamageSignal::recorded_in(&command_config.runtime_config.storage_path);
     let mut worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config,
@@ -351,6 +356,16 @@ async fn run_ingest(
             )
         }),
         tree_state_densification: None,
+        tree_state_verification: zinder_ingest::spawn_tree_state_verification_task(
+            tree_state_verification_context(
+                &command_config,
+                Arc::clone(&network_upgrade_activations),
+                canonical_reorg_policy,
+                historical_work_gate.clone(),
+                store_damage.clone(),
+            ),
+            worker_cancel.clone(),
+        ),
     };
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
@@ -361,7 +376,7 @@ async fn run_ingest(
     let mut canonical_control_tasks = spawn_canonical_control_tasks(
         &command_config,
         &nodes,
-        &writer_readiness,
+        (&writer_readiness, &store_damage),
         &control_server_cancel,
         &mut writer_config,
     );
@@ -494,7 +509,7 @@ impl CanonicalControlTasks {
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     nodes: &NodeSet<ZebraJsonRpcSource>,
-    writer_readiness: &ComposedReadiness,
+    (writer_readiness, store_damage): (&ComposedReadiness, &CanonicalStoreDamageSignal),
     server_cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
@@ -535,6 +550,7 @@ fn spawn_canonical_control_tasks(
                     .clone(),
             ),
             command_config.runtime_config.canonical_rocksdb_budget,
+            store_damage.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone())
         .with_checkpoint_bearer_token(
@@ -763,6 +779,7 @@ struct IngestWorkerTaskHandles {
     materialized_view_plane: JoinHandle<()>,
     replay_budget_metrics: Option<JoinHandle<()>>,
     tree_state_densification: Option<JoinHandle<()>>,
+    tree_state_verification: JoinHandle<()>,
 }
 
 async fn shutdown_ingest_worker_tasks(
@@ -799,20 +816,34 @@ async fn shutdown_ingest_worker_tasks(
     if let Some(tree_state_densification) = worker_tasks.tree_state_densification {
         await_worker_task("tree_state_densification", tree_state_densification).await;
     }
+    await_worker_task(
+        "tree_state_verification",
+        worker_tasks.tree_state_verification,
+    )
+    .await;
 }
 
 const TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX: &str = ".tree-state-densification-secondary";
-/// The pass reads each stride once, so its secondary needs only a small block
-/// cache beside the writer's own. Open files stay at the canonical budget,
-/// as for the other ingest secondaries.
-const TREE_STATE_DENSIFICATION_BLOCK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const TREE_STATE_VERIFICATION_SECONDARY_PATH_SUFFIX: &str = ".tree-state-verification-secondary";
+/// Each tree-state pass reads a stride or row once, so its secondary needs
+/// only a small block cache beside the writer's own. Open files stay at the
+/// canonical budget, as for the other ingest secondaries.
+const TREE_STATE_PASS_BLOCK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn densification_secondary_budget(canonical: RocksDbResourceBudget) -> RocksDbResourceBudget {
+fn tree_state_pass_secondary_budget(canonical: RocksDbResourceBudget) -> RocksDbResourceBudget {
     let mut budget = canonical;
     budget.block_cache_bytes = canonical
         .block_cache_bytes
-        .min(TREE_STATE_DENSIFICATION_BLOCK_CACHE_BYTES);
+        .min(TREE_STATE_PASS_BLOCK_CACHE_BYTES);
     budget
+}
+
+/// Returns the canonical store path with `suffix` appended, the path of a
+/// background pass's own secondary.
+fn sibling_secondary_path(command_config: &IngestCommandConfig, suffix: &str) -> PathBuf {
+    let mut secondary_path = OsString::from(command_config.runtime_config.storage_path.as_os_str());
+    secondary_path.push(suffix);
+    PathBuf::from(secondary_path)
 }
 
 fn tree_state_densification_context(
@@ -822,19 +853,45 @@ fn tree_state_densification_context(
     (writer, gate): (CanonicalControlHandle, HistoricalWorkGate),
 ) -> TreeStateDensificationContext<CanonicalControlHandle> {
     let runtime_config = &command_config.runtime_config;
-    let mut secondary_path = OsString::from(runtime_config.storage_path.as_os_str());
-    secondary_path.push(TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX);
     TreeStateDensificationContext {
         canonical_primary_path: runtime_config.storage_path.clone(),
-        secondary_path: PathBuf::from(secondary_path),
+        secondary_path: sibling_secondary_path(
+            command_config,
+            TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX,
+        ),
         network_upgrade_activations,
         workload: CanonicalStoreWorkload::Wallet,
         raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
         reorg_policy,
-        resource_budget: densification_secondary_budget(runtime_config.canonical_rocksdb_budget),
+        resource_budget: tree_state_pass_secondary_budget(runtime_config.canonical_rocksdb_budget),
         writer,
         gate,
         config: command_config.tree_state_densification,
+    }
+}
+
+fn tree_state_verification_context(
+    command_config: &IngestCommandConfig,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    reorg_policy: CanonicalReorgPolicy,
+    gate: HistoricalWorkGate,
+    store_damage: CanonicalStoreDamageSignal,
+) -> TreeStateVerificationContext {
+    let runtime_config = &command_config.runtime_config;
+    TreeStateVerificationContext {
+        canonical_primary_path: runtime_config.storage_path.clone(),
+        secondary_path: sibling_secondary_path(
+            command_config,
+            TREE_STATE_VERIFICATION_SECONDARY_PATH_SUFFIX,
+        ),
+        network_upgrade_activations,
+        workload: CanonicalStoreWorkload::Wallet,
+        raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
+        reorg_policy,
+        resource_budget: tree_state_pass_secondary_budget(runtime_config.canonical_rocksdb_budget),
+        gate,
+        store_damage,
+        config: command_config.tree_state_verification,
     }
 }
 

@@ -796,9 +796,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Longest a wallet-serving pair keeps admitting traffic, in milliseconds, \
-                      after the last writer attestation. Past it the cause of the failed \
-                      refresh replaces `serving_pair_stale` and traffic stops. Defaults to \
-                      300000. Must be greater than zero.",
+                      after the last writer attestation. The reader refreshes at least every \
+                      half ceiling, even if `storage.secondary_catchup_interval_ms` is longer, \
+                      so a writer that answers attests it again before the ceiling passes. \
+                      Traffic stops when the ceiling passes, even while a refresh is still \
+                      waiting for the writer. Defaults to 300000. Must be greater than zero.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL_PATH",
@@ -1694,6 +1696,35 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Each block costs about two reads and adds at most one row, so this \
                       bounds the pass's reads and writes. Must be greater than zero. \
                       Defaults to 500.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_VERIFICATION__ENABLED",
+        toml_path: "ingest.tree_state_verification.enabled",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Whether ingest verifies its stored tree-state checkpoints in the \
+                      background, in repeated cycles over every settled row: each row must \
+                      derive the roots stored in it, carry a frontier for exactly the \
+                      pools active at its height, and carry the block time of the \
+                      canonical block at that height. A row that fails parks ingest \
+                      readiness with `canonical_store_damaged` and makes the store's \
+                      wallet-serving readers refuse traffic, until the store is rebuilt. \
+                      With the pass disabled, damage it recorded before stays reported. \
+                      Defaults to `true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_VERIFICATION__MAX_ROWS_PER_SECOND",
+        toml_path: "ingest.tree_state_verification.max_rows_per_second",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Average ceiling on stored tree-state checkpoint rows the verification \
+                      pass checks per second, which sets both its cost and how long one \
+                      cycle over settled history takes. A row with three pools costs about \
+                      4.3 ms of CPU, so the default holds the pass near a tenth of one CPU \
+                      and verifies about 2.2 million rows a day. Must be greater than zero. \
+                      Defaults to 25.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",
