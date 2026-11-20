@@ -4672,8 +4672,9 @@ mod tests {
 
     /// The compact-blocks listener's health follows `/readyz`.
     ///
-    /// The listener is assembled as the runtime assembles it, and the drain
-    /// starts separately from the shutdown publication.
+    /// The listener is assembled and supervised as the runtime assembles and
+    /// supervises it. The test publishes the shutdown itself first, so it
+    /// can check health while the listener still answers.
     #[tokio::test]
     async fn compact_blocks_listener_health_follows_readyz_through_readiness_and_shutdown()
     -> eyre::Result<()> {
@@ -4689,34 +4690,29 @@ mod tests {
         drop(wallet);
         let readiness = Readiness::default();
         let serving_readiness = CompactServingReadiness::new(readiness.clone());
-        let drain = CancellationToken::new();
-        let router = zinder_runtime::public_grpc_router(
+        let runtime = zinder_runtime::SupervisedRuntime::new(
+            zinder_runtime::RuntimeService::CompatLightwalletd,
+        );
+        let router = runtime.public_grpc_router(
             CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)))
                 .into_server(),
             zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
             &serving_readiness.runtime(),
-            &drain,
         )?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let listener_address = listener.local_addr()?;
-        tokio::spawn(router.serve_with_incoming_shutdown(
+        let server = router.serve_with_incoming_shutdown(
             TcpListenerStream::new(listener),
-            drain.clone().cancelled_owned(),
-        ));
-        let ops_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let ops_address = ops_reservation.local_addr()?;
-        drop(ops_reservation);
-        let _readyz = zinder_runtime::spawn_ops_endpoint(
-            ops_address,
-            zinder_runtime::OpsServer {
-                service_name: "zinder-compat-lightwalletd",
-                service_version: "0.0.0",
-                network_name: "zcash-regtest",
-                advertised_capabilities: Arc::from([]),
-            },
-            readiness.clone(),
-        )
-        .await?;
+            runtime.grpc_server_shutdown(),
+        );
+        let shutdown = runtime.shutdown_request();
+        let supervised = tokio::spawn({
+            let serving_readiness = serving_readiness.clone();
+            runtime.supervise(server, zinder_runtime::SupervisedTasks::new(), move || {
+                serving_readiness.publish_shutting_down();
+            })
+        });
+        let (ops_address, _readyz) = spawn_readyz(&readiness).await?;
         let probe = PublicListenerProbe::connect(listener_address, ops_address).await?;
         let mut streamer = CompactTxStreamerClient::new(probe.channel());
         let mut watch = probe.watch("").await?;
@@ -4754,8 +4750,30 @@ mod tests {
             ServingStatus::NotServing
         );
 
-        drain.cancel();
-        watch_ends(&mut watch).await
+        shutdown.request();
+        watch_ends(&mut watch).await?;
+        supervised.await??;
+        Ok(())
+    }
+
+    async fn spawn_readyz(
+        readiness: &Readiness,
+    ) -> eyre::Result<(std::net::SocketAddr, zinder_runtime::OpsEndpointHandle)> {
+        let ops_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let ops_address = ops_reservation.local_addr()?;
+        drop(ops_reservation);
+        let handle = zinder_runtime::spawn_ops_endpoint(
+            ops_address,
+            zinder_runtime::OpsServer {
+                service_name: "zinder-compat-lightwalletd",
+                service_version: "0.0.0",
+                network_name: "zcash-regtest",
+                advertised_capabilities: Arc::from([]),
+            },
+            readiness.clone(),
+        )
+        .await?;
+        Ok((ops_address, handle))
     }
 }
 

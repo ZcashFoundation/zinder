@@ -16,8 +16,8 @@ use zinder_compat_lightwalletd::{
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
-    TracingSubscriberError, install_metrics_recorder_for_service,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    TracingSubscriberError, install_metrics_recorder_for_service, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
@@ -354,11 +354,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     // The listener exposes `grpc.reflection.v1.ServerReflection` so legacy
     // lightwalletd wallets and `grpcurl` can discover the served
     // `CompactTxStreamer` surface without an out-of-band proto.
-    let router = zinder_runtime::public_grpc_router(
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         &readiness,
-        &cancel,
     )?;
 
     start_api_phase.complete();
@@ -485,11 +484,10 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let router = zinder_runtime::public_grpc_router(
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         &serving_readiness.runtime(),
-        &cancel,
     )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();

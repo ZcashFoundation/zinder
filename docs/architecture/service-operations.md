@@ -60,23 +60,19 @@ accepting new requests. It then stops its background tasks and its servers,
 including the operational endpoint, and waits for them. Only the owner of a
 store closes it, and readers make no final writes.
 
-`zinder-query` and `zinder-compat-lightwalletd` publish `shutting_down`
-before their gRPC listener starts to drain, so `/readyz` and their
-[gRPC health service](../reference/readiness.md#grpc-health) report
-`NOT_SERVING` together, and gRPC load balancers and Kubernetes `grpc` probes
-stop routing to them while the drain runs. Open health `Watch` streams then
-end, so they do not hold the drain open.
-
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
 streams never end on their own.
 
 `zinder-query` and `zinder-compat-lightwalletd` stop in this order:
 
-1. They report `shutting_down`, so `/readyz` and new requests see it before
-   anything stops.
+1. They report `shutting_down`, so `/readyz`, their
+   [gRPC health service](../reference/readiness.md#grpc-health), and new
+   requests see it before anything stops. gRPC load balancers and
+   Kubernetes `grpc` probes then stop routing to them while the drain runs.
 2. They stop their background tasks and their operational endpoint, and
-   start the gRPC server's graceful drain at the same time.
+   start the gRPC server's graceful drain at the same time. Open health
+   `Watch` streams end as the drain starts, so they do not hold it open.
 3. They wait up to 10 seconds for the drain.
 4. They end every call still open, such as a block-range stream to a client
    that reads slowly, with `UNAVAILABLE`, and refuse any later call the same

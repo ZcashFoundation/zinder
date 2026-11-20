@@ -12,13 +12,19 @@ use tokio_stream::{
     StreamExt as _,
     wrappers::{ReceiverStream, TcpListenerStream},
 };
-use tonic::{Code, Status, transport::Endpoint};
+use tonic::{Code, Request, Status, transport::Endpoint};
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+};
 use tonic_reflection::pb::v1::{
     ServerReflectionRequest, ServerReflectionResponse,
     server_reflection_client::ServerReflectionClient, server_reflection_request::MessageRequest,
 };
 use tonic_types::StatusExt as _;
-use zinder_runtime::{RuntimeService, SupervisedRuntime, SupervisedTasks, public_grpc_reflection};
+use zinder_runtime::{
+    Readiness, ReadinessCause, ReadinessState, RuntimeService, SupervisedRuntime, SupervisedTasks,
+};
+use zinder_testkit::{next_watch_status, watch_ends};
 
 /// Bound on each wait in these tests; every expected outcome arrives well within it.
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
@@ -43,6 +49,31 @@ async fn within_wait_limit<T>(future: impl Future<Output = T>) -> Result<T> {
     tokio::time::timeout(WAIT_LIMIT, future)
         .await
         .map_err(|_| eyre!("no outcome within {WAIT_LIMIT:?}"))
+}
+
+/// Serves `runtime`'s wallet listener on `listener`, with a stand-in for the
+/// wallet service, until the runtime starts stopping.
+fn serve_wallet_listener(
+    runtime: &SupervisedRuntime,
+    readiness: &Readiness,
+    listener: TcpListener,
+) -> Result<impl Future<Output = Result<(), tonic::transport::Error>> + use<>> {
+    let stand_in_wallet_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+    let router = runtime.public_grpc_router(
+        stand_in_wallet_service,
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        readiness,
+    )?;
+    Ok(router.serve_with_incoming_shutdown(
+        TcpListenerStream::new(listener),
+        runtime.grpc_server_shutdown(),
+    ))
+}
+
+fn ready() -> Readiness {
+    Readiness::new(ReadinessState::ready(Some(1)))
 }
 
 /// Checks that a call ended with the status a stopping runtime ends its open
@@ -106,15 +137,7 @@ async fn a_call_open_at_the_drain_deadline_ends_before_serving_generations_are_r
     let serving_drained = runtime.serving_drained();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = runtime
-        .public_grpc_server()
-        .add_service(public_grpc_reflection(
-            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
-        )?)
-        .serve_with_incoming_shutdown(
-            TcpListenerStream::new(listener),
-            runtime.grpc_server_shutdown(),
-        );
+    let server = serve_wallet_listener(&runtime, &ready(), listener)?;
     let shutdown = runtime.shutdown_request();
     let supervised = tokio::spawn(runtime.supervise(server, SupervisedTasks::new(), || {}));
     let (sender, mut reflection) = open_reflection_stream(&address.to_string()).await?;
@@ -127,6 +150,51 @@ async fn a_call_open_at_the_drain_deadline_ends_before_serving_generations_are_r
     let _ = sender.send(list_services()).await;
     assert!(within_wait_limit(reflection.next()).await?.is_none());
 
+    within_wait_limit(supervised).await???;
+    Ok(())
+}
+
+/// Health answers on a supervised listener, and a `Watch` open at shutdown
+/// ends cleanly as the drain starts.
+///
+/// The stream reports `NOT_SERVING` and then ends with an `OK` status. It
+/// does not hold the drain open until the deadline ends it as `UNAVAILABLE`.
+#[tokio::test]
+async fn health_answers_on_a_supervised_listener_and_its_watch_ends_at_shutdown() -> Result<()> {
+    let readiness = ready();
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = serve_wallet_listener(&runtime, &readiness, listener)?;
+    let shutdown = runtime.shutdown_request();
+    let supervised = tokio::spawn({
+        let readiness = readiness.clone();
+        runtime.supervise(server, SupervisedTasks::new(), move || {
+            readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        })
+    });
+    let channel = Endpoint::new(format!("http://{address}"))?
+        .connect()
+        .await?;
+    let mut health = HealthClient::new(channel);
+    let listener_health = || {
+        Request::new(HealthCheckRequest {
+            service: String::new(),
+        })
+    };
+
+    let checked = health.check(listener_health()).await?.into_inner();
+    ensure!(
+        checked.status == i32::from(ServingStatus::Serving),
+        "{checked:?}"
+    );
+    let mut watch = health.watch(listener_health()).await?.into_inner();
+    ensure!(next_watch_status(&mut watch).await? == ServingStatus::Serving);
+
+    shutdown.request();
+
+    ensure!(next_watch_status(&mut watch).await? == ServingStatus::NotServing);
+    watch_ends(&mut watch).await?;
     within_wait_limit(supervised).await???;
     Ok(())
 }
@@ -207,15 +275,7 @@ async fn serve_reflection_until_terminated() -> Result<()> {
     let _signal = runtime.request_shutdown_on_terminating_signal();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = runtime
-        .public_grpc_server()
-        .add_service(public_grpc_reflection(
-            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
-        )?)
-        .serve_with_incoming_shutdown(
-            TcpListenerStream::new(listener),
-            runtime.grpc_server_shutdown(),
-        );
+    let server = serve_wallet_listener(&runtime, &ready(), listener)?;
     #[allow(
         clippy::print_stdout,
         reason = "the parent test reads the child's listen address from its stdout"

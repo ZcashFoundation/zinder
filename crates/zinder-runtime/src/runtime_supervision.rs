@@ -7,10 +7,12 @@
 //! its gRPC server stops, or when one of its tasks ends, and always in the
 //! same order:
 //!
-//! 1. It reports `shutting_down` through the runtime's readiness hook.
+//! 1. It reports `shutting_down` through the runtime's readiness hook, so
+//!    `/readyz` and gRPC health report it before anything stops.
 //! 2. It cancels [`SupervisedRuntime::stopping`], which stops the background
 //!    tasks, the operational endpoint among them, and starts the gRPC
-//!    server's graceful drain at the same time.
+//!    server's graceful drain at the same time. Open health `Watch` streams
+//!    end as the drain starts, so they never hold it open.
 //! 3. It waits up to the drain timeout for the server to drain.
 //! 4. It ends every call the listener still serves. Once it has, no handler
 //!    future or response body of the listener remains, and each ended
@@ -28,18 +30,22 @@
 //! observe it, so a request can never look like a server or task stopping on
 //! its own.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use thiserror::Error;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use tower::layer::util::{Identity, Stack};
+use tonic::{body::Body, server::NamedService};
+use tower::{
+    Service,
+    layer::util::{Identity, Stack},
+};
 
 use crate::{
     GrpcCallTerminationLayer, GrpcReceiveLimitLayer, GrpcSendStallLayer, OpsEndpointHandle,
-    OpsServerError, RuntimeService, cancel_on_terminating_signal,
-    public_grpc_server::{OpenGrpcCalls, supervised_grpc_server},
+    OpsServerError, Readiness, RuntimeService, cancel_on_terminating_signal,
+    public_grpc_server::{OpenGrpcCalls, supervised_wallet_router},
 };
 
 /// Longest a supervised gRPC server may drain after the runtime starts
@@ -61,9 +67,9 @@ pub const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// entrypoint's 20-second grace window.
 pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The tonic server type that [`SupervisedRuntime::public_grpc_server`]
+/// The tonic router type that [`SupervisedRuntime::public_grpc_router`]
 /// returns.
-pub type SupervisedGrpcServer = tonic::transport::Server<
+pub type SupervisedGrpcRouter = tonic::transport::server::Router<
     Stack<
         Stack<
             GrpcSendStallLayer,
@@ -76,7 +82,7 @@ pub type SupervisedGrpcServer = tonic::transport::Server<
 /// A runtime's public gRPC listener and background tasks, supervised so that
 /// they stop together.
 ///
-/// Build the listener with [`Self::public_grpc_server`], serve it until
+/// Build the listener with [`Self::public_grpc_router`], serve it until
 /// [`Self::grpc_server_shutdown`] resolves, give background tasks
 /// [`Self::stopping`], and pass both to [`Self::supervise`].
 #[derive(Debug)]
@@ -146,13 +152,55 @@ impl SupervisedRuntime {
         self.serving_drained.clone()
     }
 
-    /// The public gRPC server builder for this runtime's listener.
+    /// Assembles this runtime's public wallet listener, which serves
+    /// `wallet_service`.
     ///
-    /// It applies the policy of [`crate::public_grpc_server`], and lets the
-    /// supervisor end every call still open once the drain deadline passes.
-    #[must_use]
-    pub fn public_grpc_server(&self) -> SupervisedGrpcServer {
-        supervised_grpc_server(Arc::clone(&self.open_calls))
+    /// The router serves, on the transport policy of
+    /// [`crate::public_grpc_server`]:
+    ///
+    /// - `wallet_service`, behind a [`crate::TrafficReadinessInterceptor`]
+    ///   over `readiness`;
+    /// - gRPC reflection v1, describing `wallet_descriptor_set` and
+    ///   `grpc.health.v1`; and
+    /// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
+    ///   traffic, as `/readyz` reports it.
+    ///
+    /// Reflection and health stay outside the traffic gate, so they answer
+    /// while the runtime refuses wallet calls. Every call first passes
+    /// through [`GrpcCallTerminationLayer`], so the supervisor can end the
+    /// calls still open at the drain deadline.
+    ///
+    /// Serve the router until [`Self::grpc_server_shutdown`] resolves, and
+    /// publish `shutting_down` to `readiness` from the hook
+    /// [`Self::supervise`] runs first. Health then reports `NOT_SERVING`
+    /// together with `/readyz` before the drain starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reflection cannot describe
+    /// `wallet_descriptor_set`.
+    pub fn public_grpc_router<S>(
+        &self,
+        wallet_service: S,
+        wallet_descriptor_set: &'static [u8],
+        readiness: &Readiness,
+    ) -> Result<SupervisedGrpcRouter, tonic_reflection::server::Error>
+    where
+        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
+            + NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        supervised_wallet_router(
+            Arc::clone(&self.open_calls),
+            wallet_service,
+            wallet_descriptor_set,
+            readiness,
+            &self.stopping,
+        )
     }
 
     /// The shutdown signal to serve the gRPC listener with, which resolves
@@ -761,6 +809,32 @@ mod tests {
         assert!(run.published_shutting_down);
         assert!(run.server_stopped);
         assert!(run.server_drained_before_release);
+        Ok(())
+    }
+
+    /// Load balancers read `/readyz` and gRPC health, so the runtime reports
+    /// `shutting_down` before the listener drains or any task stops.
+    #[tokio::test]
+    async fn shutting_down_is_published_before_the_runtime_starts_stopping()
+    -> Result<(), RuntimeSupervisionError> {
+        let runtime = SupervisedRuntime::new(RuntimeService::Query);
+        let stopping = runtime.stopping();
+        let tasks = SupervisedTasks::new().with("task", until_stopping(&runtime));
+        let shutdown = runtime.grpc_server_shutdown();
+        let server = async move {
+            shutdown.await;
+            Ok(())
+        };
+        runtime.shutdown_request().request();
+        let mut stopping_when_published = None;
+
+        runtime
+            .supervise(server, tasks, || {
+                stopping_when_published = Some(stopping.is_cancelled());
+            })
+            .await?;
+
+        assert_eq!(stopping_when_published, Some(false));
         Ok(())
     }
 

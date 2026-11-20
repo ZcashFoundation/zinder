@@ -263,11 +263,10 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         cancel.clone(),
     );
     let publisher_handle = pair_publisher.spawn(cancel, runtime.serving_drained());
-    let router = zinder_runtime::public_grpc_router(
+    let router = runtime.public_grpc_router(
         grpc_adapter.into_server(),
         zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
         &readiness,
-        &runtime.stopping(),
     )?;
 
     tracing::info!(
@@ -280,7 +279,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = router.serve_with_shutdown(query_config.listen_addr, runtime.grpc_server_shutdown());
+    let server =
+        router.serve_with_shutdown(query_config.listen_addr, runtime.grpc_server_shutdown());
     runtime
         .supervise(
             server,

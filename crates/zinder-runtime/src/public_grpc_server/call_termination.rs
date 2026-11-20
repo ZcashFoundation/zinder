@@ -153,7 +153,7 @@ impl CallShard {
 /// Tower layer that lets a supervised runtime end every call its gRPC
 /// listener serves.
 ///
-/// [`crate::SupervisedRuntime::public_grpc_server`] adds it outside every
+/// [`crate::SupervisedRuntime::public_grpc_router`] adds it outside every
 /// other layer. Once the runtime stops serving, each open call's handler is
 /// dropped and the call ends with `UNAVAILABLE` and `SERVICE_NOT_READY`; a
 /// call that arrives later is refused the same way before the service it
