@@ -16,7 +16,9 @@ use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, TreeStateCheckpointSelection, TreeStateStride,
     block_load::{encode_block_position, encode_tree_state_checkpoint},
-    live_replacement_tests::{published_fork_store, published_store},
+    live_replacement_tests::{
+        published_fork_store, published_note_commitment_store, published_store,
+    },
     publication::column_family,
     rocksdb::{
         BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
@@ -484,6 +486,166 @@ fn a_budget_stride_refuses_a_damaged_header_at_a_height_it_neither_compares_nor_
     Ok(())
 }
 
+#[test]
+fn a_stride_that_ends_at_the_settled_tip_is_found_replayed_committed_and_satisfied() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(100))?;
+    let activations = activations()?;
+    let one = std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?;
+
+    assert_eq!(
+        store.next_tree_state_stride(BlockHeight::new(0), EVERY_BLOCK)?,
+        Some(stride(0, 100))
+    );
+    let scan = store.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, one)?;
+    assert_eq!(scan.incomplete, vec![stride(0, 100)]);
+    assert_eq!(scan.examined, 1);
+    assert!(!scan.reached_unsettled);
+    assert!(!store.tree_state_stride_satisfied(BlockHeight::new(100), EVERY_BLOCK)?);
+
+    assert_eq!(
+        densify_all(&store, &activations, EVERY_BLOCK)?,
+        vec![(stride(0, 100), 99)]
+    );
+    assert!(store.tree_state_stride_satisfied(BlockHeight::new(100), EVERY_BLOCK)?);
+    Ok(())
+}
+
+#[test]
+fn a_stride_above_the_settled_tip_is_unsatisfied_though_its_rows_need_no_checkpoint() -> TestResult
+{
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(99))?;
+    let one = std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?;
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(one);
+
+    assert!(!store.tree_state_stride_satisfied(BlockHeight::new(100), budget)?);
+    Ok(())
+}
+
+#[test]
+fn a_stride_is_unsatisfied_when_a_row_is_missing_right_after_its_seed() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    densify_all(&store, &activations()?, EVERY_BLOCK)?;
+    assert!(store.tree_state_stride_satisfied(BlockHeight::new(100), EVERY_BLOCK)?);
+
+    delete_row(&store, BlockHeight::new(1))?;
+
+    assert!(!store.tree_state_stride_satisfied(BlockHeight::new(100), EVERY_BLOCK)?);
+    Ok(())
+}
+
+#[test]
+fn a_search_from_the_middle_of_a_stride_starts_at_the_next_cadence_seed() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = long_densification_store(&temporary)?;
+
+    for (from, expected) in [
+        (0, stride(0, 100)),
+        (50, stride(100, 200)),
+        (100, stride(100, 200)),
+    ] {
+        assert_eq!(
+            store.next_tree_state_stride(BlockHeight::new(from), EVERY_BLOCK)?,
+            Some(expected),
+            "search from height {from}"
+        );
+    }
+    // The stride that starts at 200 ends above the settled tip.
+    for from in [101, 150, 200] {
+        assert_eq!(
+            store.next_tree_state_stride(BlockHeight::new(from), EVERY_BLOCK)?,
+            None,
+            "search from height {from}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_scan_examines_every_settled_stride_its_read_budget_allows() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = long_densification_store(&temporary)?;
+    let wide = std::num::NonZeroU32::new(1_000).ok_or("budget must be nonzero")?;
+
+    let scan = store.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, wide)?;
+
+    assert_eq!(scan.incomplete, vec![stride(0, 100), stride(100, 200)]);
+    assert_eq!(scan.examined, 2);
+    assert_eq!(scan.reads, 2);
+    assert_eq!(scan.next_from, BlockHeight::new(200));
+    assert!(scan.reached_unsettled);
+
+    let from_middle = store.scan_tree_state_strides(BlockHeight::new(50), EVERY_BLOCK, wide)?;
+    assert_eq!(from_middle.incomplete, vec![stride(100, 200)]);
+    assert_eq!(from_middle.examined, 1);
+    Ok(())
+}
+
+#[test]
+fn a_replayed_stride_counts_the_commitments_of_every_pool_it_appended() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = note_commitment_store(&temporary, None)?;
+    let activations = activations()?;
+
+    // Ironwood activates at height 10 and adds one commitment at each odd
+    // height, so the first stride appends 45 and the second 50.
+    for (seed, end, ironwood) in [(0, 100, 45), (100, 200, 50)] {
+        let densified =
+            store.densify_tree_state_stride(stride(seed, end), EVERY_BLOCK, &activations)?;
+
+        let before = tree_sizes_after(&store, seed)?;
+        let after = tree_sizes_after(&store, end)?;
+        let appended = [
+            after.sapling_commitment_tree_size - before.sapling_commitment_tree_size,
+            after.orchard_commitment_tree_size - before.orchard_commitment_tree_size,
+            after.ironwood_commitment_tree_size - before.ironwood_commitment_tree_size,
+        ];
+        assert!(
+            appended.iter().all(|pool| *pool > 0),
+            "the stride from {seed} appends to every pool: {appended:?}"
+        );
+        assert_eq!(appended[2], ironwood, "ironwood commitments from {seed}");
+        assert_eq!(
+            densified.replayed_commitment_count(),
+            appended.iter().copied().map(u64::from).sum::<u64>(),
+            "commitments replayed from {seed}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_history_predecessor_off_the_cadence_seeds_a_stride_that_ends_at_the_next_cadence_height()
+-> TestResult {
+    let temporary = TempDir::new()?;
+    let store = note_commitment_store(&temporary, Some(BlockHeight::new(130)))?;
+    let activations = activations()?;
+
+    assert_eq!(
+        store.next_tree_state_stride(BlockHeight::new(0), EVERY_BLOCK)?,
+        Some(stride(130, 200))
+    );
+    let densified = store.densify_tree_state_stride(stride(130, 200), EVERY_BLOCK, &activations)?;
+    let before = store.build_plan().history_predecessor().tip_metadata();
+    let after = tree_sizes_after(&store, 200)?;
+
+    assert_eq!(
+        densified.replayed_commitment_count(),
+        u64::from(after.sapling_commitment_tree_size - before.sapling_commitment_tree_size)
+            + u64::from(after.orchard_commitment_tree_size - before.orchard_commitment_tree_size)
+            + u64::from(after.ironwood_commitment_tree_size - before.ironwood_commitment_tree_size)
+    );
+    assert_eq!(store.commit_tree_state_stride(&densified)?.rows_written, 69);
+    assert_eq!(
+        store.next_tree_state_stride(BlockHeight::new(0), EVERY_BLOCK)?,
+        None,
+        "the next stride ends above the settled tip"
+    );
+    Ok(())
+}
+
 fn densification_store(
     temporary: &TempDir,
     settled_height: BlockHeight,
@@ -494,6 +656,57 @@ fn densification_store(
         BlockHeight::new(TIP_HEIGHT),
         settled_height,
     )
+}
+
+/// A store settled through 250.
+///
+/// The strides ending at 100 and 200 are settled and the one ending at 300 is
+/// not. Test block hashes repeat one byte of the height, so 255 is the
+/// tallest chain the fixture builds.
+fn long_densification_store(
+    temporary: &TempDir,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_store(
+        &temporary.path().join("canonical"),
+        REORG_WINDOW,
+        BlockHeight::new(250),
+        BlockHeight::new(250),
+    )
+}
+
+/// A store settled through 250 whose blocks carry note commitments in every
+/// pool, with the strides ending at 100 and 200 settled.
+///
+/// With a `history_floor`, the store retains only the blocks above it.
+fn note_commitment_store(
+    temporary: &TempDir,
+    history_floor: Option<BlockHeight>,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_note_commitment_store(
+        &temporary.path().join("canonical"),
+        REORG_WINDOW,
+        BlockHeight::new(250),
+        BlockHeight::new(250),
+        history_floor,
+    )
+}
+
+/// The commitment-tree sizes after the block at `height`, empty at genesis.
+fn tree_sizes_after(
+    store: &RocksDbCanonicalStore,
+    height: u32,
+) -> Result<zinder_core::CompactChainMetadata, Box<dyn std::error::Error>> {
+    if height == 0 {
+        return Ok(zinder_core::CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        });
+    }
+    Ok(store
+        .compact_block_at(BlockHeight::new(height))?
+        .ok_or("compact block is absent")?
+        .chain_metadata())
 }
 
 fn activations() -> Result<NetworkUpgradeActivations, Box<dyn std::error::Error>> {

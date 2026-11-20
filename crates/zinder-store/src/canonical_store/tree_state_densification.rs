@@ -638,9 +638,10 @@ fn replay_stride(
             let height = trees.tip().height;
             let commitments = commitment_count(trees.tree_sizes());
             let stored = stored_rows.at(height);
-            let selected = height < stride.end_height
-                && selection
-                    .requires_checkpoint(commitments.saturating_sub(checkpoint_commitments));
+            // The end row is always stored, so the end height is replayed and
+            // compared whether or not the selection picks it.
+            let selected =
+                selection.requires_checkpoint(commitments.saturating_sub(checkpoint_commitments));
             if !selected && stored.is_none() {
                 return Ok(());
             }

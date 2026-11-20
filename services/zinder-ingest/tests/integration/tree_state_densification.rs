@@ -225,6 +225,30 @@ fn every_densified_checkpoint_is_the_tree_state_a_read_reconstructs() -> eyre::R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_stride_counts_the_note_commitments_it_appended() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+
+    harness.with_primary(|primary| {
+        for seed in [0, 100, 200] {
+            let stride = primary
+                .next_tree_state_stride(BlockHeight::new(seed), EVERY_BLOCK)?
+                .ok_or_else(|| eyre::eyre!("the stride from {seed} needs densifying"))?;
+            let densified =
+                primary.densify_tree_state_stride(stride, EVERY_BLOCK, &harness.activations)?;
+            let appended =
+                commitments_through(primary, seed + 100)? - commitments_through(primary, seed)?;
+            eyre::ensure!(appended > 0, "the stride from {seed} has no commitments");
+            eyre::ensure!(
+                densified.replayed_commitment_count() == appended,
+                "the stride from {seed} appended {appended} commitments, not {}",
+                densified.replayed_commitment_count()
+            );
+        }
+        Ok(())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_completed_pass_records_its_progress_and_a_restart_commits_nothing() -> eyre::Result<()> {
     let harness = Harness::new()?;
     harness

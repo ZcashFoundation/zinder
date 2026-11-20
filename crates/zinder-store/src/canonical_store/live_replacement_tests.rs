@@ -12,6 +12,7 @@ use zinder_core::{
     UnsupportedSection, encode_canonical_block_replay,
 };
 
+use super::note_commitment_trees_tests::NoteCommitmentTrees;
 use super::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
@@ -1948,6 +1949,8 @@ pub(super) fn published_store_with_retention(
         PublishedChain {
             raw_blob_retention,
             fork_tag: 0,
+            note_commitments: false,
+            history_floor: None,
         },
     )
 }
@@ -1972,6 +1975,34 @@ pub(super) fn published_fork_store(
         PublishedChain {
             raw_blob_retention: RawBlobRetention::Transactions,
             fork_tag,
+            note_commitments: false,
+            history_floor: None,
+        },
+    )
+}
+
+/// Publishes the [`published_store`] chain with note commitments in every
+/// block, in each pool its activation table makes active.
+///
+/// With a `history_floor`, the store retains only the blocks above it, and the
+/// floor block's trees are the history predecessor.
+pub(super) fn published_note_commitment_store(
+    path: &Path,
+    reorg_window: u32,
+    build_tip_height: BlockHeight,
+    settled_height: BlockHeight,
+    history_floor: Option<BlockHeight>,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_chain_store(
+        path,
+        reorg_window,
+        build_tip_height,
+        settled_height,
+        PublishedChain {
+            raw_blob_retention: RawBlobRetention::Transactions,
+            fork_tag: 0,
+            note_commitments: true,
+            history_floor,
         },
     )
 }
@@ -1980,6 +2011,10 @@ pub(super) fn published_fork_store(
 struct PublishedChain {
     raw_blob_retention: RawBlobRetention,
     fork_tag: u8,
+    /// Whether each block carries note commitments in every active pool.
+    note_commitments: bool,
+    /// Height of the history predecessor, or `None` for complete history.
+    history_floor: Option<BlockHeight>,
 }
 
 fn fork_block_hash(height: u32, fork_tag: u8) -> Result<[u8; 32], std::num::TryFromIntError> {
@@ -1995,66 +2030,125 @@ fn published_chain_store(
     settled_height: BlockHeight,
     chain: PublishedChain,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-    let PublishedChain {
-        raw_blob_retention,
-        fork_tag,
-    } = chain;
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let tip_hash = fork_block_hash(build_tip_height.value(), fork_tag)?;
-    let build_plan = CanonicalStoreBuildPlan::complete(
-        &activations,
-        0,
-        BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash)),
-        raw_blob_retention,
-        CanonicalReorgPolicy::new(reorg_window)?,
-    )?;
+    let tip_hash = fork_block_hash(build_tip_height.value(), chain.fork_tag)?;
+    let tip_id = BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash));
+    let PublishedBlocks {
+        blocks,
+        predecessor,
+        tip_frontiers,
+    } = published_blocks(&activations, build_tip_height, chain)?;
+    let reorg_policy = CanonicalReorgPolicy::new(reorg_window)?;
+    let build_plan = match predecessor {
+        Some(predecessor) => CanonicalStoreBuildPlan::checkpointed(
+            &activations,
+            predecessor,
+            tip_id,
+            chain.raw_blob_retention,
+            reorg_policy,
+        )?,
+        None => CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            tip_id,
+            chain.raw_blob_retention,
+            reorg_policy,
+        )?,
+    };
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         path,
         CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let mut blocks = Vec::new();
-    for height in 1..=build_tip_height.value() {
-        let height = BlockHeight::new(height);
-        let hash_byte = u8::try_from(height.value())?;
-        let parent_hash = if height.value() == 1 {
-            Network::ZcashTestnet.genesis_hash().as_bytes()
-        } else {
-            fork_block_hash(height.value() - 1, fork_tag)?
-        };
-        let mut block = canonical_block(
-            height,
-            fork_block_hash(height.value(), fork_tag)?,
-            parent_hash,
-            100 + hash_byte,
-        );
-        apply_raw_blob_retention(&mut block, raw_blob_retention, 100 + hash_byte);
-        if height == build_tip_height
-            || height
-                .value()
-                .is_multiple_of(super::TREE_STATE_CHECKPOINT_STRIDE)
-        {
-            add_checkpoint(&mut block)?;
-        }
-        blocks.push(Ok::<_, std::io::Error>(block));
-    }
-    builder.bulk_load_blocks(blocks)?;
+    builder.bulk_load_blocks(blocks.into_iter().map(Ok::<_, std::io::Error>))?;
     builder.load_subtree_roots(std::iter::empty())?;
     builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
-        BlockId::new(build_tip_height, BlockHash::from_bytes(tip_hash)),
+        tip_id,
         build_tip_height.value(),
-        super::test_checkpoint_frontiers(&activations, build_tip_height)?,
+        tip_frontiers,
     ))?;
     let validated = builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         BlockId::new(
             settled_height,
-            BlockHash::from_bytes(fork_block_hash(settled_height.value(), fork_tag)?),
+            BlockHash::from_bytes(fork_block_hash(settled_height.value(), chain.fork_tag)?),
         ),
         UnixTimestampMillis::new(1_750_000_000_001),
     ))?;
     Ok(validated.publish_baseline(publication)?)
+}
+
+/// The blocks a published test store loads and the trees around them.
+struct PublishedBlocks {
+    blocks: Vec<CanonicalBuildBlock>,
+    /// The floor block's checkpoint when the history starts above genesis.
+    predecessor: Option<zinder_core::CommitmentTreeCheckpoint>,
+    tip_frontiers: zinder_core::CommitmentTreeFrontiers,
+}
+
+fn published_blocks(
+    activations: &zinder_core::NetworkUpgradeActivations,
+    build_tip_height: BlockHeight,
+    chain: PublishedChain,
+) -> Result<PublishedBlocks, Box<dyn std::error::Error>> {
+    let mut trees = chain
+        .note_commitments
+        .then(|| NoteCommitmentTrees::new(activations))
+        .transpose()?;
+    let mut blocks = Vec::new();
+    let mut predecessor = None;
+    let mut tip_frontiers = super::test_checkpoint_frontiers(activations, build_tip_height)?;
+    for height in 1..=build_tip_height.value() {
+        let height = BlockHeight::new(height);
+        let hash_byte = u8::try_from(height.value())?;
+        // Heights 1 through 255 map to distinct tags, so the chain can be as
+        // tall as the one-byte block hash allows.
+        let transaction_tag = hash_byte.wrapping_add(100);
+        let parent_hash = if height.value() == 1 {
+            Network::ZcashTestnet.genesis_hash().as_bytes()
+        } else {
+            fork_block_hash(height.value() - 1, chain.fork_tag)?
+        };
+        let mut block = canonical_block(
+            height,
+            fork_block_hash(height.value(), chain.fork_tag)?,
+            parent_hash,
+            transaction_tag,
+        );
+        apply_raw_blob_retention(&mut block, chain.raw_blob_retention, transaction_tag);
+        if let Some(trees) = trees.as_mut() {
+            trees.append_block(&mut block)?;
+        }
+        let is_floor = chain.history_floor == Some(height);
+        if is_floor
+            || height == build_tip_height
+            || height
+                .value()
+                .is_multiple_of(super::TREE_STATE_CHECKPOINT_STRIDE)
+        {
+            match trees.as_mut() {
+                Some(trees) => block.tree_state_checkpoint = Some(trees.checkpoint(&block)?),
+                None => add_checkpoint(&mut block)?,
+            }
+        }
+        if is_floor {
+            predecessor = block.tree_state_checkpoint.clone();
+        }
+        if height == build_tip_height
+            && let Some(checkpoint) = &block.tree_state_checkpoint
+        {
+            tip_frontiers = checkpoint.frontiers.clone();
+        }
+        if chain.history_floor.is_none_or(|floor| height > floor) {
+            blocks.push(block);
+        }
+    }
+    Ok(PublishedBlocks {
+        blocks,
+        predecessor,
+        tip_frontiers,
+    })
 }
 
 pub(super) fn open_store(
