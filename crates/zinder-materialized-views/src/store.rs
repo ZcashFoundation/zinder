@@ -2962,11 +2962,11 @@ fn decode_consumer_manifest_entries(
 ) -> Result<BTreeMap<String, ConsumerManifestEntry>, MaterializedViewStoreError> {
     let mut manifest = BTreeMap::new();
     for entry in iterator {
-        let (key, payload) =
-            entry.map_err(|source| MaterializedViewStoreError::ConsumerManifest {
-                operation: "read_manifest",
-                reason: source.to_string(),
-            })?;
+        let (key, payload) = entry.map_err(|source| MaterializedViewStoreError::Operation {
+            operation: "read_manifest",
+            column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
+            source,
+        })?;
         let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
             break;
         };
@@ -3838,6 +3838,22 @@ mod tests {
                 column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_sst_during_manifest_iteration_can_retry() -> Result<()> {
+        let temporary = tempdir()?;
+        let options = rust_rocksdb::Options::default();
+        let mut writer = rust_rocksdb::SstFileWriter::create(&options);
+        let missing_table = temporary.path().join("absent").join("000001.sst");
+        let Err(source) = writer.open(missing_table) else {
+            eyre::bail!("an SST in a missing directory must fail to open");
+        };
+        let Err(error) = decode_consumer_manifest_entries(std::iter::once(Err(source))) else {
+            eyre::bail!("manifest iteration must report the RocksDB error");
+        };
+        assert!(is_transient_secondary_missing_sst(&error), "{error}");
         Ok(())
     }
 
