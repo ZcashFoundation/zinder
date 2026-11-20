@@ -4,17 +4,27 @@
 //! A `GetBlockRange` is served as a sequence of chunk reads. A chunk holds at
 //! most 1,000 blocks and at most [`BLOCK_RANGE_CHUNK_MAX_BYTES`] of stored
 //! compact blocks, or one block when that block alone is larger, so a range
-//! of large blocks is read and sent in smaller chunks. Each chunk after the
-//! first is read at the chain view current when the server reads it, so a
-//! stream never holds a serving pair or a compact-blocks generation while it
-//! waits for its client. A later chunk continues the stream only when it
-//! links by hash to the last block the stream sent. A block hash commits to
-//! its parent, so that one link proves the blocks sent and the blocks to come
-//! form one chain. Otherwise a reorg replaced a block the stream needs, and
-//! the stream ends after the blocks it already sent with the code lightwalletd
-//! returns for the same case: `ABORTED` for a broken link, and `OUT_OF_RANGE`
-//! when the visible tip fell below a height still to send. ADR-0015,
-//! "Compatibility block-range streams", records the contract.
+//! of large blocks is read and sent in smaller chunks. The first chunk holds
+//! at most [`BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES`], so a response opens after a
+//! small read. [`BlockRangeChunks`] offers each read up to 1,000 heights from
+//! the next height to send, so every read can fill its byte budget. When a
+//! read finds a height outside retained history while heights an earlier
+//! read checked are unsent, the stream reads those heights alone, so it sends
+//! every height a read checked before that failure ends it.
+//!
+//! Each chunk after the first is read at the chain view current when the
+//! server reads it, so a stream never holds a serving pair or a
+//! compact-blocks generation while it waits for its client. The stream's
+//! reader reads the next chunk while the response sends the one before it,
+//! and the stream holds at most those two chunks. A later chunk continues
+//! the stream only when it links by hash to the last block the stream sent.
+//! A block hash commits to its parent, so that one link proves the blocks
+//! sent and the blocks to come form one chain. Otherwise a reorg replaced a
+//! block the stream needs, and the stream ends after the blocks it already
+//! sent with the code lightwalletd returns for the same case: `ABORTED` for a
+//! broken link, and `OUT_OF_RANGE` when the visible tip fell below a height
+//! still to send. ADR-0015, "Compatibility block-range streams", records the
+//! contract.
 //!
 //! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
 //! its admission until its response is dropped and every chunk read of the
@@ -33,11 +43,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{
-    OwnedSemaphorePermit, Semaphore,
-    mpsc::{self, error::SendError},
-    oneshot,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tonic::Status;
 use zinder_core::{
@@ -54,6 +60,17 @@ use zinder_store::HeightOrder;
 /// as `GetBlockRange`.
 pub const BLOCK_RANGE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// Stored compact-block bytes the first chunk of a block-range stream keeps
+/// at most, counted as [`BLOCK_RANGE_CHUNK_MAX_BYTES`] counts them.
+///
+/// The response opens once this chunk is read and converted, so the read
+/// before a stream's first block keeps at most an eighth of what a later
+/// chunk keeps, or one block when that block alone is larger. A thousand
+/// blocks of up to 262 stored bytes each fit, so a request for that many
+/// small blocks is served by one read. A denser range opens after its first
+/// few blocks, and the server reads on while it sends them.
+pub const BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES: usize = 256 * 1024;
+
 /// Default for the process-wide limit on concurrent `GetBlockRange` and
 /// `GetBlockRangeNullifiers` streams.
 pub const DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS: NonZeroU32 =
@@ -65,14 +82,28 @@ pub const DEFAULT_BLOCK_RANGE_ADMISSION_WAIT: Duration = Duration::from_secs(10)
 
 /// Plans the chunk reads of one block-range stream in wire order.
 ///
-/// [`Self::next_chunk`] offers up to 1,000 heights at the end of the
+/// [`Self::next_chunk`] offers up to 1,000 heights from the end of the
 /// remaining range that the stream sends first. A byte-bounded read keeps a
 /// run of them from that end, and [`Self::advance`] moves past the blocks it
-/// kept, so the next chunk starts at the next height to send.
+/// kept, so the next chunk starts at the next height to send and every read
+/// can fill its byte budget.
+///
+/// A read checks every height it is offered against retained history before
+/// it keeps any, so a read offered heights past those the last read checked
+/// and did not keep can fail before it sends them. [`Self::checked_heights`]
+/// then offers the checked heights alone until they are sent, so the stream
+/// sends every height a read has checked before a read past them fails, such
+/// as at height 0 at the end of a descending range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlockRangeChunks {
     /// Heights no chunk has covered yet, or `None` once every height has.
     remaining: Option<BlockHeightRange>,
+    /// Heights at the sending end of `remaining` that the last read checked
+    /// against retained history and did not keep.
+    checked_unkept: u32,
+    /// Whether the next read is offered the `checked_unkept` heights alone,
+    /// which holds only while some remain.
+    only_checked: bool,
     is_descending: bool,
 }
 
@@ -87,6 +118,8 @@ impl BlockRangeChunks {
         };
         Self {
             remaining,
+            checked_unkept: 0,
+            only_checked: false,
             is_descending,
         }
     }
@@ -107,12 +140,18 @@ impl BlockRangeChunks {
         }
     }
 
-    /// Returns the heights the next chunk read may cover: up to 1,000 at the
-    /// end of the remaining range that the stream sends first.
+    /// Returns the heights the next chunk read may cover, at the end of the
+    /// remaining range that the stream sends first: up to 1,000, or the
+    /// heights [`Self::checked_heights`] offers alone.
     #[must_use]
     pub(crate) fn next_chunk(&self) -> Option<BlockHeightRange> {
         let remaining = self.remaining?;
-        let span = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_sub(1);
+        let heights = if self.only_checked {
+            self.checked_unkept
+        } else {
+            DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
+        };
+        let span = heights.saturating_sub(1);
         Some(if self.is_descending {
             let start = remaining
                 .end
@@ -130,19 +169,44 @@ impl BlockRangeChunks {
         })
     }
 
+    /// Returns the heights the last read checked and did not keep, and the
+    /// plan that offers them alone until the stream has sent them, when
+    /// [`Self::next_chunk`] offers heights past them too.
+    ///
+    /// A stream reads these after the read of [`Self::next_chunk`] finds a
+    /// height outside retained history, so it sends the heights an earlier
+    /// read checked before that failure ends it. Returns `None` when no such
+    /// heights remain or the next chunk is already them alone, and the
+    /// failure stands.
+    #[must_use]
+    pub(crate) fn checked_heights(&self) -> Option<(BlockHeightRange, Self)> {
+        let offered = self.next_chunk()?;
+        if self.checked_unkept == 0 || offered_heights(offered) <= self.checked_unkept {
+            return None;
+        }
+        let only_checked = Self {
+            only_checked: true,
+            ..*self
+        };
+        Some((only_checked.next_chunk()?, only_checked))
+    }
+
     /// Moves past `read_blocks` heights at the end of the remaining range
-    /// that the stream sends first.
+    /// that the stream sends first, the blocks a read of
+    /// [`Self::next_chunk`] kept.
     ///
     /// A read that kept no block leaves the plan unchanged. Its caller must
     /// end the stream, as the continuity check of an empty chunk does.
     pub(crate) fn advance(&mut self, read_blocks: usize) {
-        let Some(remaining) = self.remaining else {
+        let (Some(remaining), Some(offered)) = (self.remaining, self.next_chunk()) else {
             return;
         };
         let span = remaining.end.value() - remaining.start.value();
         match u32::try_from(read_blocks) {
             Ok(0) => {}
             Ok(read_blocks) if read_blocks <= span => {
+                self.checked_unkept = offered_heights(offered).saturating_sub(read_blocks);
+                self.only_checked &= self.checked_unkept > 0;
                 self.remaining = Some(if self.is_descending {
                     BlockHeightRange::inclusive(
                         remaining.start,
@@ -158,6 +222,15 @@ impl BlockRangeChunks {
             _ => self.remaining = None,
         }
     }
+}
+
+/// Returns how many heights `chunk`, a chunk the plan offered, covers.
+const fn offered_heights(chunk: BlockHeightRange) -> u32 {
+    chunk
+        .end
+        .value()
+        .saturating_sub(chunk.start.value())
+        .saturating_add(1)
 }
 
 /// Gauge of the block-range streams that hold a slot.
@@ -184,9 +257,11 @@ pub(crate) enum BlockRangeStage {
     /// Converting the chunk's blocks to lightwalletd messages and pruning
     /// them to the requested pools.
     Convert,
-    /// Waiting for the client to make room for the chunk's messages. Only the
-    /// chunks after the first have this stage, because the first chunk is
-    /// part of the response itself.
+    /// Waiting for room for the chunk in the response before it is read. A
+    /// stream holds at most two chunks, so a chunk waits until the gRPC
+    /// server has taken every block of the chunk two before it to send. Only
+    /// the chunks after the first have this stage, because the first chunk
+    /// is part of the response itself.
     Send,
 }
 
@@ -444,7 +519,8 @@ pub(crate) type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message>
 /// The slot returns to the limit once every holder has dropped it: the
 /// response, the [`BlockRangeSink`] of the stream's reader for a stream of
 /// more than one chunk, and a read run with [`Self::hold_during`] that has
-/// not finished.
+/// not finished. A reader drops its sink once it has no chunk left to read
+/// or its response is gone and its read in flight has finished.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockRangeStreamSlot {
     _open_stream: Arc<OpenStream>,
@@ -490,38 +566,34 @@ impl BlockRangeStreamSlot {
         self.hold_for_stream(Box::pin(tokio_stream::iter(messages)))
     }
 
-    /// Returns a response that sends `first_messages` and then what `reader`
-    /// queues, at most `capacity` messages ahead of the client, and spawns
-    /// `reader` to read the later chunks.
+    /// Returns a response that sends `first_messages` and then each chunk
+    /// `reader` hands it, and spawns `reader` to read the later chunks.
+    ///
+    /// The response sends a chunk's messages from the chunk itself and takes
+    /// the next chunk only once it has sent them all, and the sink gives
+    /// `reader` room for one chunk at a time. The stream therefore holds at
+    /// most two chunks however slowly its client reads: the one the response
+    /// sends and the one `reader` reads or has read next.
     ///
     /// The response and the reader's sink each hold this slot, so the reader
-    /// keeps the slot while it reads, even after the client has gone away.
-    /// The response tells the sink once its consumer polls for a message past
-    /// `first_messages`, which [`BlockRangeSink::first_chunk_taken`] waits
-    /// for. The consumer is tonic, which polls messages as it fills its send
-    /// buffer, so it can poll past `first_messages` before the client has
-    /// received any of them.
+    /// keeps the slot while a read runs, even after the client has gone away.
     pub(crate) fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,
-        capacity: usize,
         reader: impl FnOnce(BlockRangeSink<Message>) -> Reader,
     ) -> BlockRangeResponse<Message>
     where
         Message: Send + 'static,
         Reader: Future<Output = ()> + Send + 'static,
     {
-        let (messages, queued_messages) = mpsc::channel(capacity);
-        let (first_chunk_taken, first_chunk_taken_receiver) = oneshot::channel();
+        let (next_chunk, next_chunks) = mpsc::channel(1);
         tokio::spawn(reader(BlockRangeSink {
-            messages,
-            first_chunk_taken: Some(first_chunk_taken_receiver),
+            next_chunk,
             _stream_slot: self.clone(),
         }));
-        self.hold_for_stream(Box::pin(QueuedChunks {
-            first_messages: Some(tokio_stream::iter(first_messages)),
-            first_chunk_taken: Some(first_chunk_taken),
-            queued_messages,
+        self.hold_for_stream(Box::pin(ChunkedMessages {
+            current: Some(tokio_stream::iter(first_messages)),
+            next_chunks,
         }))
     }
 
@@ -536,87 +608,92 @@ impl BlockRangeStreamSlot {
     }
 }
 
-/// Where the reader of a stream's later chunks queues their messages.
+/// Where the reader of a stream's later chunks hands them to the response.
 ///
 /// It holds the stream's slot until the reader drops it.
 #[derive(Debug)]
 pub(crate) struct BlockRangeSink<Message> {
-    messages: mpsc::Sender<Message>,
-    /// Resolves once the response's consumer has polled for a message past
-    /// the first chunk, or `None` once it has.
-    first_chunk_taken: Option<oneshot::Receiver<()>>,
+    next_chunk: mpsc::Sender<Vec<Message>>,
     _stream_slot: BlockRangeStreamSlot,
 }
 
 impl<Message> BlockRangeSink<Message> {
-    /// Queues `message` for the client, waiting while the queue is full.
+    /// Waits until the response has room for one more chunk and returns
+    /// that room.
     ///
-    /// # Errors
+    /// The response has room once it has taken every chunk handed to it
+    /// before, which it does when it has sent every message of the chunk
+    /// before that. A reader that takes this room before each read therefore
+    /// holds one chunk beside the one the response sends.
     ///
-    /// Returns the message when the client has dropped the response.
-    pub(crate) async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
-        self.messages.send(message).await
+    /// Returns `None` once the client has dropped the response, so a reader
+    /// that asks before each read starts no read after its client went away.
+    pub(crate) async fn room_for_chunk(&self) -> Option<ChunkRoom<'_, Message>> {
+        let permit = self.next_chunk.reserve().await.ok()?;
+        Some(ChunkRoom { permit })
     }
 
-    /// Waits until the response's consumer has taken every message of the
-    /// stream's first chunk and polled for the next, and returns at once
-    /// after that.
-    ///
-    /// A queue of `capacity` messages could otherwise fill with as many
-    /// one-block chunks, each up to [`BLOCK_RANGE_CHUNK_MAX_BYTES`], before
-    /// tonic takes any message. A reader that waits here before each read
-    /// after its first reads at most two chunks until tonic has taken the
-    /// first chunk to send. Tonic takes messages as it fills its send buffer,
-    /// so the client may not yet have received them.
-    ///
-    /// Returns `false` when the response was dropped first.
-    pub(crate) async fn first_chunk_taken(&mut self) -> bool {
-        match self.first_chunk_taken.take() {
-            Some(taken) => taken.await.is_ok(),
-            None => true,
-        }
+    /// Returns whether the client has dropped the response, so a reader
+    /// that already holds room can start no further read after its client
+    /// went away.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.next_chunk.is_closed()
     }
 }
 
-/// The messages of a stream with later chunks: those of its first chunk,
-/// then those its reader queues.
-struct QueuedChunks<Message> {
-    /// The first chunk's messages, which yield to the runtime as a one-chunk
-    /// response does, or `None` once they have all been taken.
-    first_messages: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
-    /// Told when polling moves past the first chunk to the queued messages.
-    first_chunk_taken: Option<oneshot::Sender<()>>,
-    queued_messages: mpsc::Receiver<Message>,
+/// Room for one chunk in a block-range response, which the read that fills
+/// it holds.
+pub(crate) struct ChunkRoom<'sink, Message> {
+    permit: mpsc::Permit<'sink, Vec<Message>>,
+}
+
+impl<Message> ChunkRoom<'_, Message> {
+    /// Hands `messages` to the response, which sends them after the chunk
+    /// before them. A response the client has dropped drops them.
+    pub(crate) fn fill(self, messages: Vec<Message>) {
+        self.permit.send(messages);
+    }
+}
+
+/// The messages of a stream with later chunks, sent from one chunk at a
+/// time.
+struct ChunkedMessages<Message> {
+    /// The messages of the chunk being sent that the client has not taken,
+    /// which yield to the runtime as a one-chunk response does, or `None`
+    /// once they have all been taken.
+    current: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
+    /// The chunks the stream's reader hands on, at most one ahead.
+    next_chunks: mpsc::Receiver<Vec<Message>>,
 }
 
 // No field is pinned: the stream moves its messages out by value.
-impl<Message> Unpin for QueuedChunks<Message> {}
+impl<Message> Unpin for ChunkedMessages<Message> {}
 
-impl<Message> Stream for QueuedChunks<Message> {
+impl<Message> Stream for ChunkedMessages<Message> {
     type Item = Message;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
-        if let Some(first_messages) = self.first_messages.as_mut() {
-            match Pin::new(first_messages).poll_next(context) {
-                Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    self.first_messages = None;
-                    if let Some(first_chunk_taken) = self.first_chunk_taken.take() {
-                        let _ = first_chunk_taken.send(());
-                    }
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                match Pin::new(current).poll_next(context) {
+                    Poll::Ready(Some(message)) => return Poll::Ready(Some(message)),
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => self.current = None,
                 }
             }
+            let Some(next_chunk) = std::task::ready!(self.next_chunks.poll_recv(context)) else {
+                return Poll::Ready(None);
+            };
+            self.current = Some(tokio_stream::iter(next_chunk));
         }
-        self.queued_messages.poll_recv(context)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let first_messages = self
-            .first_messages
+        let current = self
+            .current
             .as_ref()
-            .map_or(0, |first_messages| first_messages.size_hint().0);
-        (first_messages, None)
+            .map_or(0, |current| current.size_hint().0);
+        (current, None)
     }
 }
 
@@ -847,11 +924,22 @@ impl BlockRangeContinuity {
     reason = "Admission tests hold slots and join handles until the step that releases or awaits them."
 )]
 mod tests {
-    use std::{num::NonZeroU32, pin::Pin, task::Poll, time::Duration};
+    use std::{
+        num::NonZeroU32,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+        task::Poll,
+        time::Duration,
+    };
 
-    use tokio::sync::{mpsc, oneshot};
-    use tokio::time::Instant;
-    use tokio_stream::Stream;
+    use tokio::{
+        sync::{Semaphore, mpsc},
+        time::Instant,
+    };
+    use tokio_stream::{Stream, StreamExt as _};
     use tonic::{Code, Status};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
@@ -862,8 +950,9 @@ mod tests {
     use zinder_store::HeightOrder;
 
     use super::{
-        BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, QueuedChunks,
+        BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
+        BlockRangeContinuity, BlockRangeStreamLimit, ChunkedMessages,
+        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
     };
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
@@ -1115,18 +1204,20 @@ mod tests {
     }
 
     #[test]
-    fn the_next_chunk_starts_after_the_blocks_a_read_kept() {
+    fn each_chunk_is_offered_up_to_1000_heights_from_the_next_height_to_send() {
         let mut ascending = BlockRangeChunks::new(range(1, 3_000), false);
         assert_eq!(ascending.next_chunk(), Some(range(1, 1_000)));
         // A byte-bounded read kept 120 of the 1,000 heights it was offered.
         ascending.advance(120);
         assert_eq!(ascending.next_chunk(), Some(range(121, 1_120)));
-        ascending.advance(1);
-        assert_eq!(ascending.next_chunk(), Some(range(122, 1_121)));
         // A read that kept nothing leaves the plan where it was.
         ascending.advance(0);
-        assert_eq!(ascending.next_chunk(), Some(range(122, 1_121)));
-        ascending.advance(2_878);
+        assert_eq!(ascending.next_chunk(), Some(range(121, 1_120)));
+        ascending.advance(1_000);
+        assert_eq!(ascending.next_chunk(), Some(range(1_121, 2_120)));
+        ascending.advance(880);
+        assert_eq!(ascending.next_chunk(), Some(range(2_001, 3_000)));
+        ascending.advance(999);
         assert_eq!(ascending.next_chunk(), Some(range(3_000, 3_000)));
         ascending.advance(1);
         assert_eq!(ascending.next_chunk(), None);
@@ -1137,6 +1228,230 @@ mod tests {
         assert_eq!(descending.next_chunk(), Some(range(1_881, 2_880)));
         descending.advance(2_880);
         assert!(!descending.has_remaining());
+    }
+
+    /// Returns how many reads a stream over `range` makes when every block
+    /// holds `block_bytes` stored bytes and each read keeps as many blocks
+    /// of the heights it is offered as its byte budget holds.
+    fn reads_of_equal_blocks(
+        range: BlockHeightRange,
+        is_descending: bool,
+        block_bytes: usize,
+    ) -> usize {
+        let mut chunks = BlockRangeChunks::new(range, is_descending);
+        let mut max_bytes = BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES;
+        let mut reads = 0;
+        while let Some(chunk) = chunks.next_chunk() {
+            let kept = (max_bytes / block_bytes).clamp(1, chunk.into_iter().len());
+            chunks.advance(kept);
+            max_bytes = BLOCK_RANGE_CHUNK_MAX_BYTES;
+            reads += 1;
+        }
+        reads
+    }
+
+    /// A dense range takes one read for each chunk its byte budget holds.
+    ///
+    /// A read fills its budget whatever heights the read before it was
+    /// offered, so blocks that just overflow a 1,000-block chunk take one
+    /// read per 998 blocks rather than two per 1,000 heights.
+    #[test]
+    fn a_dense_range_takes_one_read_for_each_byte_capped_chunk() {
+        const BLOCK_BYTES: usize = 2_100;
+        let whole = range(1, 100_000);
+        let first_chunk_blocks = BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES / BLOCK_BYTES;
+        let later_chunk_blocks = BLOCK_RANGE_CHUNK_MAX_BYTES / BLOCK_BYTES;
+        assert_eq!(
+            (first_chunk_blocks, later_chunk_blocks),
+            (124, 998),
+            "a later read must keep just under 1,000 blocks"
+        );
+        let heights = whole.into_iter().len();
+        let expected_reads = 1 + (heights - first_chunk_blocks).div_ceil(later_chunk_blocks);
+        assert_eq!(expected_reads, 102);
+        for is_descending in [false, true] {
+            assert_eq!(
+                reads_of_equal_blocks(whole, is_descending, BLOCK_BYTES),
+                expected_reads,
+                "descending: {is_descending}"
+            );
+        }
+    }
+
+    /// A descending range whose last height is outside retained history
+    /// sends every height an earlier read checked before a read reaches it.
+    ///
+    /// A read checks every height it is offered, so the read offered height
+    /// 0 with the 936 heights the first read checked and did not keep fails
+    /// them all. The stream then reads those 936 alone, until it has sent
+    /// them.
+    #[test]
+    fn a_read_past_the_checked_heights_gives_way_to_them_alone() -> Result<(), &'static str> {
+        let mut descending = BlockRangeChunks::new(range(0, 1_000), true);
+        assert_eq!(descending.next_chunk(), Some(range(1, 1_000)));
+        assert_eq!(
+            descending.checked_heights(),
+            None,
+            "no read has checked a height"
+        );
+        descending.advance(64);
+        assert_eq!(descending.next_chunk(), Some(range(0, 936)));
+
+        let (checked, mut only_checked) = descending
+            .checked_heights()
+            .ok_or("the first read checked 936 heights it did not keep")?;
+        assert_eq!(checked, range(1, 936));
+        assert_eq!(only_checked.next_chunk(), Some(checked));
+        assert_eq!(
+            only_checked.checked_heights(),
+            None,
+            "a read of the checked heights alone has no smaller retry"
+        );
+        only_checked.advance(900);
+        assert_eq!(only_checked.next_chunk(), Some(range(1, 36)));
+        only_checked.advance(36);
+        assert_eq!(only_checked.next_chunk(), Some(range(0, 0)));
+        assert_eq!(
+            only_checked.checked_heights(),
+            None,
+            "every checked height was sent"
+        );
+
+        // Once the checked heights are sent, reads are offered 1,000 new
+        // heights again.
+        let mut ascending = BlockRangeChunks::new(range(1, 3_000), false);
+        ascending.advance(100);
+        let (checked, mut only_checked) = ascending
+            .checked_heights()
+            .ok_or("the first read checked 900 heights it did not keep")?;
+        assert_eq!(checked, range(101, 1_000));
+        only_checked.advance(900);
+        assert_eq!(only_checked.next_chunk(), Some(range(1_001, 2_000)));
+
+        // A read offered only heights the last read checked has no retry.
+        let mut short = BlockRangeChunks::new(range(1, 500), false);
+        short.advance(100);
+        assert_eq!(short.next_chunk(), Some(range(101, 500)));
+        assert_eq!(short.checked_heights(), None);
+        Ok(())
+    }
+
+    /// Lets every spawned task run until it waits.
+    async fn let_tasks_run() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A stream of one-message chunks whose reader counts the reads it
+    /// starts, on a limit of one slot.
+    struct CountedStream {
+        limit: BlockRangeStreamLimit,
+        response: super::BlockRangeResponse<u32>,
+        reads_started: Arc<AtomicUsize>,
+    }
+
+    impl CountedStream {
+        /// Opens a stream whose response holds `first_messages` and whose
+        /// reader reads one-message chunks from 100 on, each once `gate`
+        /// gives it a permit.
+        async fn open(
+            first_messages: Vec<u32>,
+            gate: Arc<tokio::sync::Semaphore>,
+        ) -> Result<Self, Status> {
+            let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN).with_max_wait(Duration::ZERO);
+            let reads_started = Arc::new(AtomicUsize::new(0));
+            let reader_reads = Arc::clone(&reads_started);
+            let response =
+                limit
+                    .open()
+                    .await?
+                    .hold_with_reader(first_messages, |sink| async move {
+                        for message in 100_u32.. {
+                            let Some(room) = sink.room_for_chunk().await else {
+                                return;
+                            };
+                            reader_reads.fetch_add(1, AtomicOrdering::SeqCst);
+                            let Ok(_permit) = gate.acquire().await else {
+                                return;
+                            };
+                            room.fill(vec![message]);
+                        }
+                    });
+            Ok(Self {
+                limit,
+                response,
+                reads_started,
+            })
+        }
+
+        fn reads_started(&self) -> usize {
+            self.reads_started.load(AtomicOrdering::SeqCst)
+        }
+
+        async fn next(&mut self) -> Option<u32> {
+            self.response.next().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_holds_the_chunk_it_sends_and_at_most_one_more() -> Result<(), Status> {
+        let open_gate = Arc::new(tokio::sync::Semaphore::new(Semaphore::MAX_PERMITS));
+        let mut stream = CountedStream::open(vec![1, 2], open_gate).await?;
+        let_tasks_run().await;
+        assert_eq!(
+            stream.reads_started(),
+            1,
+            "a stream whose client takes nothing reads one chunk past its first"
+        );
+
+        assert_eq!(stream.next().await, Some(1));
+        assert_eq!(stream.next().await, Some(2));
+        let_tasks_run().await;
+        assert_eq!(
+            stream.reads_started(),
+            1,
+            "a client that has not asked past the first chunk makes no room"
+        );
+
+        // Asking past the first chunk takes the second, which makes room for
+        // the third, and no more, however long the client then stalls.
+        assert_eq!(stream.next().await, Some(100));
+        let_tasks_run().await;
+        assert_eq!(stream.reads_started(), 2);
+        assert_eq!(stream.next().await, Some(101));
+        let_tasks_run().await;
+        assert_eq!(stream.reads_started(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_starts_no_read_and_returns_its_slot_after_the_one_in_flight()
+    -> Result<(), Status> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut stream = CountedStream::open(vec![1], Arc::clone(&gate)).await?;
+        assert_eq!(stream.next().await, Some(1));
+        let_tasks_run().await;
+        assert_eq!(stream.reads_started(), 1, "the second chunk's read waits");
+
+        let CountedStream {
+            limit,
+            response,
+            reads_started,
+        } = stream;
+        drop(response);
+        let_tasks_run().await;
+        assert_unavailable(limit.open().await);
+
+        gate.add_permits(1);
+        let_tasks_run().await;
+        assert_eq!(
+            reads_started.load(AtomicOrdering::SeqCst),
+            1,
+            "a reader whose client went away starts no read after the one in flight"
+        );
+        drop(limit.open().await?);
+        Ok(())
     }
 
     fn join_failed(error: &tokio::task::JoinError) -> Status {
@@ -1361,25 +1676,23 @@ mod tests {
         }
     }
 
-    /// The first chunk of a stream with later chunks yields to the runtime
-    /// as a one-chunk response does. Once polling moves past it, the
-    /// response drops its messages and tells the reader.
+    /// A chunk of a stream with later chunks yields to the runtime as a
+    /// one-chunk response does. Once every message of it has been taken, the
+    /// response drops it before the reader hands on the next chunk.
     #[tokio::test]
-    async fn the_first_chunk_yields_to_the_runtime_and_is_released_once_taken() {
+    async fn a_chunk_yields_to_the_runtime_and_is_released_once_taken() {
         const FIRST_CHUNK_MESSAGES: usize = 1_000;
         let first_messages = (0..FIRST_CHUNK_MESSAGES).collect::<Vec<_>>();
-        let (messages, queued_messages) = mpsc::channel(1);
-        let (first_chunk_taken, mut first_chunk_taken_receiver) = oneshot::channel();
-        let mut queued_chunks = QueuedChunks {
-            first_messages: Some(tokio_stream::iter(first_messages.clone())),
-            first_chunk_taken: Some(first_chunk_taken),
-            queued_messages,
+        let (next_chunk, next_chunks) = mpsc::channel(1);
+        let mut chunked_messages = ChunkedMessages {
+            current: Some(tokio_stream::iter(first_messages.clone())),
+            next_chunks,
         };
 
         let mut sent = Vec::new();
         let mut first_chunk_yields = 0;
         while sent.len() < FIRST_CHUNK_MESSAGES {
-            let (message, yields) = next_counting_yields(&mut queued_chunks).await;
+            let (message, yields) = next_counting_yields(&mut chunked_messages).await;
             first_chunk_yields += yields;
             let Some(message) = message else {
                 break;
@@ -1391,21 +1704,22 @@ mod tests {
             first_chunk_yields > 0,
             "the first chunk must yield to the runtime while it is sent"
         );
+
+        // A poll past the chunk may first spend its turn yielding, so two
+        // polls reach the empty hand-off.
+        for _ in 0..2 {
+            assert!(
+                poll_once(&mut chunked_messages).await.is_pending(),
+                "no later chunk has been handed on"
+            );
+        }
         assert!(
-            first_chunk_taken_receiver.try_recv().is_err(),
-            "the reader must not be told before polling moves past the first chunk"
+            chunked_messages.current.is_none(),
+            "the response must drop a chunk once every message of it is taken"
         );
 
-        assert!(messages.try_send(FIRST_CHUNK_MESSAGES).is_ok());
-        let (queued, _) = next_counting_yields(&mut queued_chunks).await;
-        assert_eq!(queued, Some(FIRST_CHUNK_MESSAGES));
-        assert!(
-            first_chunk_taken_receiver.try_recv().is_ok(),
-            "the reader must be told once polling moves past the first chunk"
-        );
-        assert!(
-            queued_chunks.first_messages.is_none(),
-            "the response must drop the first chunk once it is taken"
-        );
+        assert!(next_chunk.try_send(vec![FIRST_CHUNK_MESSAGES]).is_ok());
+        let (handed_on, _) = next_counting_yields(&mut chunked_messages).await;
+        assert_eq!(handed_on, Some(FIRST_CHUNK_MESSAGES));
     }
 }

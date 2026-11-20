@@ -22,9 +22,9 @@ use zebra_chain::{
     transparent::Address as ZebraTransparentAddress,
 };
 use zinder_compat_lightwalletd::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, CanonicalReaderSlot, CompactBlocksGrpcAdapter,
-    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdGrpcAdapter, LightwalletdPing,
-    NodeTipWitness, StaleTipLimit,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, CanonicalReaderSlot,
+    CompactBlocksGrpcAdapter, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdGrpcAdapter,
+    LightwalletdPing, NodeTipWitness, StaleTipLimit,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -47,8 +47,8 @@ use zinder_query::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream,
     MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, OrderedBroadcaster, QueryError, RawTransaction,
-    RocksDbCanonicalReader, RocksDbWalletReader, SettledTipBlock, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    RocksDbCanonicalReader, RocksDbWalletReader, SettledTipBlock, StorageReadError, SubtreeRoots,
+    Transaction, TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, VisibleTipBlock, WalletQueryApi,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
@@ -1654,37 +1654,69 @@ fn stored_block_bytes(view: &SyntheticView, height: u32) -> eyre::Result<usize> 
     Ok(encode_compact_block_artifact(&view.compact_block_at(BlockHeight::new(height))?).len())
 }
 
-/// Asserts that chunk reads were capped by bytes and covered a range.
+/// Asserts that chunk reads were capped by bytes, were offered the heights
+/// the chunk plan gives, and covered a range.
 ///
-/// `reads` are the heights each chunk read kept. They must cover
-/// `first_height..=last_height` in wire order, and each must keep as many
-/// blocks of `view` as fit [`BLOCK_RANGE_CHUNK_MAX_BYTES`] and no more.
+/// `reads` are the heights each chunk read kept and `offered` the heights it
+/// was offered, which must cover `first_height..=last_height` in wire order.
+/// Each read keeps as many blocks of `view` as fit its cap, which is
+/// [`BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES`] for the first read and
+/// [`BLOCK_RANGE_CHUNK_MAX_BYTES`] for the others, or every height it was
+/// offered. Each read is offered up to 1,000 heights from the one it starts
+/// at, however many the read before it was offered.
 fn assert_byte_capped_chunks(
     view: &SyntheticView,
     reads: &[BlockHeightRange],
+    offered: &[BlockHeightRange],
     first_height: u32,
     last_height: u32,
 ) -> eyre::Result<()> {
+    assert_eq!(
+        reads.len(),
+        offered.len(),
+        "each read must be recorded once"
+    );
     let is_descending = first_height > last_height;
-    let mut expected_next = Some(first_height);
-    for (read_index, read) in reads.iter().enumerate() {
-        let (read_first, read_last) = if is_descending {
-            (read.end.value(), read.start.value())
+    let in_wire_order = |range: &BlockHeightRange| {
+        if is_descending {
+            (range.end.value(), range.start.value())
         } else {
-            (read.start.value(), read.end.value())
-        };
+            (range.start.value(), range.end.value())
+        }
+    };
+    let new_heights_end = |from: u32| {
+        if is_descending {
+            from.saturating_sub(999).max(last_height)
+        } else {
+            from.saturating_add(999).min(last_height)
+        }
+    };
+    let mut expected_next = Some(first_height);
+    for (read_index, (read, offered)) in reads.iter().zip(offered).enumerate() {
+        let (read_first, read_last) = in_wire_order(read);
+        let (offered_first, offered_last) = in_wire_order(offered);
         assert_eq!(
             Some(read_first),
             expected_next,
             "chunk {read_index} must start where the one before it stopped"
         );
+        assert_eq!(
+            (offered_first, offered_last),
+            (read_first, new_heights_end(read_first)),
+            "chunk {read_index} must be offered up to 1,000 heights from the one it starts at"
+        );
+        let cap = if read_index == 0 {
+            BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES
+        } else {
+            BLOCK_RANGE_CHUNK_MAX_BYTES
+        };
         let read_bytes = read
             .into_iter()
             .map(|height| stored_block_bytes(view, height.value()))
             .sum::<eyre::Result<usize>>()?;
         assert!(
-            read_bytes <= BLOCK_RANGE_CHUNK_MAX_BYTES,
-            "chunk {read_index} kept {read_bytes} bytes, above the chunk cap"
+            read_bytes <= cap,
+            "chunk {read_index} kept {read_bytes} bytes, above its {cap}-byte cap"
         );
         expected_next = if read_last == last_height {
             None
@@ -1693,10 +1725,10 @@ fn assert_byte_capped_chunks(
         } else {
             Some(read_last + 1)
         };
-        if let Some(next_height) = expected_next {
+        if let Some(next_height) = expected_next.filter(|_| read_last != offered_last) {
             assert!(
-                read_bytes + stored_block_bytes(view, next_height)? > BLOCK_RANGE_CHUNK_MAX_BYTES,
-                "chunk {read_index} stopped before its next block would pass the cap"
+                read_bytes + stored_block_bytes(view, next_height)? > cap,
+                "chunk {read_index} stopped before its next block would pass its cap"
             );
         }
     }
@@ -1743,7 +1775,18 @@ async fn get_block_range_sends_large_blocks_in_byte_capped_chunks() -> eyre::Res
         ascending_reads.len() > 2,
         "the range must span several chunks: {ascending_reads:?}"
     );
-    assert_byte_capped_chunks(&view, &ascending_reads, 1, LARGE_BLOCK_TIP)?;
+    assert!(
+        ascending_reads.first().map(|read| read.into_iter().len())
+            < ascending_reads.get(1).map(|read| read.into_iter().len()),
+        "the first chunk must keep fewer blocks than a later one: {ascending_reads:?}"
+    );
+    assert_byte_capped_chunks(
+        &view,
+        &ascending_reads,
+        &recorder.offered_compact_block_ranges(),
+        1,
+        LARGE_BLOCK_TIP,
+    )?;
     assert!(
         ascending == one_block_reads(&adapter, 1..=LARGE_BLOCK_TIP).await?,
         "byte-capped chunks must send the blocks that one-block reads return"
@@ -1755,6 +1798,7 @@ async fn get_block_range_sends_large_blocks_in_byte_capped_chunks() -> eyre::Res
     assert_byte_capped_chunks(
         &view,
         &recorder.recorded_compact_block_ranges(),
+        &recorder.offered_compact_block_ranges(),
         LARGE_BLOCK_TIP,
         1,
     )?;
@@ -2017,27 +2061,38 @@ async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -
     Ok(())
 }
 
-/// The reader of a stream's later chunks keeps the stream's slot while it
-/// reads, even after the client dropped the stream, so the next stream is
-/// admitted only once that read has finished.
+/// A dropped stream keeps its slot only while its read in flight runs.
+///
+/// The reader of the stream's later chunks finishes that read after the
+/// client went away and starts no other, so the next stream is admitted once
+/// that read has finished.
 #[tokio::test]
-async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() -> eyre::Result<()> {
+async fn a_dropped_block_range_stream_keeps_its_slot_only_for_the_read_in_flight()
+-> eyre::Result<()> {
+    use tokio_stream::StreamExt as _;
+
     let store_fixture = acceptance_store_fixture()?;
     let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
     let recorder = EpochPinRecorder::new(store_fixture.query())
-        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500))
+        .with_synthetic_compact_blocks_to(BlockHeight::new(3_500))
         .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
-    let adapter = LightwalletdGrpcAdapter::new(recorder)
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
         .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
         .with_block_range_admission_wait(REFUSAL_WAIT);
 
-    let wide = adapter
-        .get_block_range(Request::new(block_range_request(1, 2_500)))
+    let mut wide = adapter
+        .get_block_range(Request::new(block_range_request(1, 3_500)))
         .await?
         .into_inner();
-    drop(wide);
+    // The client takes the first chunk while the read of the second is held.
+    for _ in 0..1_000 {
+        wide.next()
+            .await
+            .ok_or_else(|| eyre!("the stream ended inside its first chunk"))??;
+    }
     // Give the reader time to reach the held read of its second chunk.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(wide);
     assert_eq!(
         adapter
             .get_block_range(Request::new(block_range_request(1, 10)))
@@ -2045,11 +2100,217 @@ async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() ->
             .err()
             .map(|status| status.code()),
         Some(Code::Unavailable),
-        "the reader of a dropped stream must keep its slot while it reads"
+        "the reader of a dropped stream must keep its slot while its read runs"
     );
 
+    // Each read returns the permit it took, so a read after the held one
+    // would run too.
     later_chunk_gate.add_permits(1);
     wait_for_block_range_slot(&adapter).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let range =
+        |start, end| BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        vec![range(1, 1_000), range(1_001, 2_000), range(1, 10)],
+        "a reader whose client went away must start no read after the one in flight"
+    );
+    Ok(())
+}
+
+/// A later read that finds a height outside retained history after the
+/// client went away is the stream's last read.
+///
+/// While the client holds the stream, the server then reads the heights an
+/// earlier read checked and sends them before the stream ends with
+/// `NOT_FOUND`. Once the client has dropped the stream, it reads none of
+/// them, so the stream's slot returns as soon as the failed read finishes.
+#[tokio::test]
+async fn a_dropped_stream_reads_no_checked_heights_after_a_read_outside_retained_history()
+-> eyre::Result<()> {
+    // Heights 1,000 down to 0: the first read checks 1,000 down to 1 and
+    // keeps a few large blocks, so the second is offered the heights it did
+    // not keep together with unretained height 0.
+    const TIP: u32 = 1_000;
+    let store_fixture = acceptance_store_fixture()?;
+    let view =
+        SyntheticView::entry(ENTRY_EPOCH, TIP).with_sapling_outputs(LARGE_BLOCK_SAPLING_OUTPUTS);
+    let request = || block_range_request(u64::from(TIP), 0);
+
+    let held = stream_across_views(&store_fixture, request(), vec![view]).await?;
+    assert_one_linked_chain(&held.blocks, u64::from(TIP), 1);
+    assert_stream_ended_with(held.ending.as_ref(), Code::NotFound);
+
+    let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_views(vec![view])
+        .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
+    let dropped = adapter
+        .get_block_range(Request::new(request()))
+        .await?
+        .into_inner();
+    later_chunk_read_at_gate(&recorder).await?;
+    drop(dropped);
+    later_chunk_gate.add_permits(1);
+    wait_for_block_range_slot(&adapter).await?;
+
+    let first_chunk_start = recorder
+        .recorded_compact_block_ranges()
+        .first()
+        .map(|read| read.start.value())
+        .ok_or_else(|| eyre!("the stream must read its first chunk"))?;
+    let range =
+        |start, end| BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        vec![
+            range(1, TIP),
+            range(0, first_chunk_start.saturating_sub(1)),
+            range(1, 10)
+        ],
+        "a reader whose client went away must not read the checked heights after a failed read"
+    );
+    Ok(())
+}
+
+/// Waits until `recorder` has recorded at least `reads` compact-block range
+/// reads, lets the stream's reader run on, and returns how many it recorded.
+async fn settled_compact_block_reads<Inner: Sync>(
+    recorder: &EpochPinRecorder<Inner>,
+    reads: usize,
+) -> eyre::Result<usize> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while recorder.recorded_compact_block_ranges().len() < reads {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(recorder.recorded_compact_block_ranges().len())
+}
+
+/// Waits until a later block-range chunk read of `recorder` waits on the gate
+/// of [`EpochPinRecorder::with_later_chunk_gate`], for up to ten seconds.
+///
+/// Returns at once when a read has reached the gate since the last wait.
+async fn later_chunk_read_at_gate<Inner: Sync>(
+    recorder: &EpochPinRecorder<Inner>,
+) -> eyre::Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        recorder.later_chunk_gate_reached.notified(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// A stream holds at most two chunks however long its client stalls: the
+/// one the client takes and the one the server reads next.
+#[tokio::test]
+async fn a_stalled_block_range_client_leaves_the_stream_two_chunks() -> eyre::Result<()> {
+    use tokio_stream::StreamExt as _;
+
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(vec![
+        SyntheticView::entry(ENTRY_EPOCH, LARGE_BLOCK_TIP)
+            .with_sapling_outputs(LARGE_BLOCK_SAPLING_OUTPUTS),
+    ]);
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+    let tip = u64::from(LARGE_BLOCK_TIP);
+    let mut stream = adapter
+        .get_block_range(Request::new(block_range_request(1, tip)))
+        .await?
+        .into_inner();
+    assert_eq!(
+        settled_compact_block_reads(&recorder, 2).await?,
+        2,
+        "a stream whose client takes nothing reads one chunk past its first"
+    );
+
+    // Asking past the first chunk takes the second, which lets the server
+    // read the third and no more.
+    let first_chunk_blocks = recorder
+        .recorded_compact_block_ranges()
+        .first()
+        .map(|read| read.into_iter().len())
+        .ok_or_else(|| eyre!("the stream must read its first chunk"))?;
+    let mut blocks = Vec::new();
+    while blocks.len() <= first_chunk_blocks {
+        blocks.push(
+            stream
+                .next()
+                .await
+                .ok_or_else(|| eyre!("the stream ended early"))??,
+        );
+    }
+    assert_eq!(
+        settled_compact_block_reads(&recorder, 3).await?,
+        3,
+        "a client that stalls inside the second chunk leaves the stream the second and third"
+    );
+
+    while let Some(block) = stream.next().await {
+        blocks.push(block?);
+    }
+    assert_one_linked_chain(&blocks, 1, tip);
+    Ok(())
+}
+
+/// A missing block fails the call only when the first chunk's read reaches it.
+///
+/// A block missing inside retained history that the read of the first chunk
+/// reaches fails the call with `UNAVAILABLE`. That read reaches the block
+/// just past the first chunk too, because it looks at that block to learn
+/// that it does not fit. Past that read, the stream opens and ends with
+/// `UNAVAILABLE` after the chunks before the one whose read reaches it.
+#[tokio::test]
+async fn a_block_missing_past_the_first_chunk_ends_the_stream_unavailable() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let large = SyntheticView::entry(ENTRY_EPOCH, LARGE_BLOCK_TIP)
+        .with_sapling_outputs(LARGE_BLOCK_SAPLING_OUTPUTS);
+    let tip = u64::from(LARGE_BLOCK_TIP);
+    let plain = EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(vec![large]);
+    collect_block_range(
+        &LightwalletdGrpcAdapter::new(plain.clone()),
+        block_range_request(1, tip),
+    )
+    .await?;
+    let first_chunk_end = plain
+        .recorded_compact_block_ranges()
+        .first()
+        .map(|read| read.end.value())
+        .ok_or_else(|| eyre!("the stream must read its first chunk"))?;
+
+    for (missing_height, place) in [
+        (first_chunk_end, "the last block of the first chunk"),
+        (first_chunk_end + 1, "the block just past the first chunk"),
+    ] {
+        let reached_by_the_first_read = LightwalletdGrpcAdapter::new(
+            EpochPinRecorder::new(store_fixture.query())
+                .with_synthetic_views(vec![large.with_missing_block(missing_height)]),
+        );
+        assert_eq!(
+            reached_by_the_first_read
+                .get_block_range(Request::new(block_range_request(1, tip)))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable),
+            "a missing block at {place}, height {missing_height}, must fail the call"
+        );
+    }
+
+    let past_first_chunk = stream_across_views(
+        &store_fixture,
+        block_range_request(1, tip),
+        vec![large.with_missing_block(first_chunk_end + 20)],
+    )
+    .await?;
+    assert_one_linked_chain(&past_first_chunk.blocks, 1, u64::from(first_chunk_end));
+    assert_stream_ended_with(past_first_chunk.ending.as_ref(), Code::Unavailable);
     Ok(())
 }
 
@@ -2554,6 +2815,9 @@ struct EpochPinRecorder<Inner> {
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
+    /// Heights each compact-block range read was offered, which it checks in
+    /// full however few blocks its byte budget keeps.
+    offered_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
     transparent_address_balance: Option<TransparentAddressBalance>,
     /// Synthetic chain views served in place of `inner`'s blocks.
     synthetic_views: Option<Arc<[SyntheticView]>>,
@@ -2566,6 +2830,8 @@ struct EpochPinRecorder<Inner> {
     /// Holds every unpinned compact-block range read, the read of a later
     /// block-range chunk, until it has a permit.
     later_chunk_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Notified each time a read waits on `later_chunk_gate`.
+    later_chunk_gate_reached: Arc<tokio::sync::Notify>,
     /// Holds the next pinned compact-block range read, the read of a
     /// block-range stream's first chunk, until the gate opens. Only one read
     /// waits on it.
@@ -2602,6 +2868,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             inner,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
+            offered_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             transparent_address_balance: None,
             synthetic_views: None,
             later_views: Arc::from(Vec::new()),
@@ -2609,6 +2876,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
+            later_chunk_gate_reached: Arc::new(tokio::sync::Notify::new()),
             first_chunk_gate: Arc::new(Mutex::new(None)),
             refuses_tree_state_rebuilds: false,
             block_time_override: Arc::new(Mutex::new(None)),
@@ -2685,6 +2953,10 @@ impl<Inner> EpochPinRecorder<Inner> {
         self.recorded_compact_block_ranges.lock().clone()
     }
 
+    fn offered_compact_block_ranges(&self) -> Vec<BlockHeightRange> {
+        self.offered_compact_block_ranges.lock().clone()
+    }
+
     fn served_compact_block_epochs(&self) -> Vec<ChainEpochId> {
         self.served_compact_block_epochs.lock().clone()
     }
@@ -2724,6 +2996,7 @@ fn synthetic_block_hash(height: u32, branch: u8) -> BlockHash {
 
 /// One chain view a synthetic recorder serves: heights `1..=visible_tip_height`
 /// of branch 0 below `fork_height`, and of `branch` from `fork_height` on.
+/// Height 0 lies outside retained history, as in a store.
 #[derive(Clone, Copy, Debug)]
 struct SyntheticView {
     epoch_id: ChainEpochId,
@@ -2733,6 +3006,9 @@ struct SyntheticView {
     /// Sapling outputs in each block's one transaction; zero leaves blocks
     /// empty.
     sapling_outputs_per_block: u16,
+    /// A retained height whose block is missing, as store damage leaves it,
+    /// so a read that reaches it fails as unavailable storage.
+    missing_block_height: Option<u32>,
 }
 
 impl SyntheticView {
@@ -2744,6 +3020,7 @@ impl SyntheticView {
             branch: 0,
             fork_height: u32::MAX,
             sapling_outputs_per_block: 0,
+            missing_block_height: None,
         }
     }
 
@@ -2756,6 +3033,7 @@ impl SyntheticView {
             branch,
             fork_height,
             sapling_outputs_per_block: 0,
+            missing_block_height: None,
         }
     }
 
@@ -2763,6 +3041,12 @@ impl SyntheticView {
     /// about 120 encoded bytes each.
     const fn with_sapling_outputs(mut self, sapling_outputs: u16) -> Self {
         self.sapling_outputs_per_block = sapling_outputs;
+        self
+    }
+
+    /// The same view with the block at `height` missing.
+    const fn with_missing_block(mut self, height: u32) -> Self {
+        self.missing_block_height = Some(height);
         self
     }
 
@@ -2827,8 +3111,10 @@ impl SyntheticView {
     /// read.
     ///
     /// The read walks the range in `order` and keeps blocks while their stored
-    /// bytes fit `max_bytes`, always keeping the first. It returns the heights
-    /// kept and their blocks in ascending order.
+    /// bytes fit `max_bytes`, always keeping the first. Once the kept blocks
+    /// take at least `max_bytes`, it stops without looking at the next
+    /// height. It returns the heights kept and their blocks in ascending
+    /// order.
     fn compact_blocks_up_to(
         &self,
         block_range: BlockHeightRange,
@@ -2840,10 +3126,15 @@ impl SyntheticView {
         if requested > maximum {
             return Err(QueryError::BlockRangeTooLarge { requested, maximum });
         }
-        if block_range.end > self.visible_tip_height {
+        let unretained_height = if block_range.end > self.visible_tip_height {
+            Some(block_range.end)
+        } else {
+            (block_range.start.value() == 0).then_some(block_range.start)
+        };
+        if let Some(height) = unretained_height {
             return Err(QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::CompactBlock,
-                key: ArtifactKey::BlockHeight(block_range.end),
+                key: ArtifactKey::BlockHeight(height),
             });
         }
         let mut heights = block_range.into_iter().collect::<Vec<_>>();
@@ -2853,6 +3144,14 @@ impl SyntheticView {
         let mut compact_blocks = Vec::new();
         let mut kept_bytes = 0_usize;
         for height in heights {
+            if !compact_blocks.is_empty() && kept_bytes >= max_bytes {
+                break;
+            }
+            if self.missing_block_height == Some(height.value()) {
+                return Err(QueryError::canonical_read(StorageReadError::Unavailable {
+                    source: format!("compact block at height {} is absent", height.value()).into(),
+                }));
+            }
             let compact_block = self.compact_block_at(height)?;
             let block_bytes = encode_compact_block_artifact(&compact_block).len();
             if !compact_blocks.is_empty() && kept_bytes.saturating_add(block_bytes) > max_bytes {
@@ -2995,9 +3294,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         if at_epoch_id.is_none()
             && let Some(gate) = &self.later_chunk_gate
         {
+            self.later_chunk_gate_reached.notify_one();
             let _permit = gate.acquire().await;
         }
         self.record(at_epoch_id);
+        self.offered_compact_block_ranges.lock().push(block_range);
         let view_index = self.view_index();
         let compact_block_range = if let Some(view) = self.synthetic_view(view_index) {
             let chain_epoch = self.visible_tip_block(at_epoch_id).await;

@@ -8,8 +8,8 @@
 //! `RocksDbCanonicalReader` of its published generation. A request captures
 //! one chain view and makes every read at it, so one response never mixes two
 //! chain epochs. A block-range stream reads its first chunk at that view and
-//! each later chunk at the view current when it is read, as the `block_range`
-//! module describes.
+//! each later chunk at the view current when it is read, while the chunk
+//! before it is sent, as the `block_range` module describes.
 //!
 //! A chunk's lightwalletd messages are built on the blocking pool, and a
 //! chunk whose blocks cannot all be converted sends none of them. Tonic
@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tonic::Status;
+use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     NetworkUpgradeActivations,
@@ -31,7 +31,8 @@ use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
 use zinder_store::HeightOrder;
 
 use crate::block_range::{
-    BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
+    BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
     BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 use crate::compact_block_messages::{CompactBlockShape, compact_block_to_lightwalletd};
@@ -55,6 +56,10 @@ pub(crate) struct ChunkRead<View> {
     pub(crate) chunk: BlockHeightRange,
     /// The end of `chunk` the read starts from.
     pub(crate) order: HeightOrder,
+    /// Stored compact-block bytes the read keeps, except that it always
+    /// keeps its first block. Every height of `chunk` is checked against
+    /// retained history, however few blocks this keeps.
+    pub(crate) max_bytes: usize,
     /// The view the read answers at.
     pub(crate) view: ChunkView<View>,
 }
@@ -113,10 +118,6 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// One captured chain view, which every read of one request answers at.
     type View: Send + Sync + 'static;
 
-    /// Blocks a block-range stream queues ahead of a slow client, on top of
-    /// the chunk the stream's reader is sending.
-    const BLOCK_RANGE_QUEUE_CAPACITY: usize;
-
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
 
@@ -142,11 +143,10 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         block: RequestedBlock,
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
 
-    /// Reads the blocks of `read.chunk` that fit
-    /// [`BLOCK_RANGE_CHUNK_MAX_BYTES`](crate::BLOCK_RANGE_CHUNK_MAX_BYTES),
-    /// from the end `read.order` visits first, and runs `convert` on the
-    /// blocking pool with the chain epoch they were read at and the blocks in
-    /// ascending height order.
+    /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
+    /// end `read.order` visits first, and runs `convert` on the blocking pool
+    /// with the chain epoch they were read at and the blocks in ascending
+    /// height order.
     ///
     /// The read first checks [`view_reaches`] at the view it answers at, and
     /// reads nothing when that view does not reach the chunk.
@@ -296,10 +296,12 @@ impl BlockMethods {
     ///
     /// lightwalletd puts no width bound on `BlockRange`, so
     /// [`BlockRangeChunks`] splits the range into chunks read in wire order,
-    /// and at most one bounded chunk is materialized at a time. The first
-    /// chunk is read at the view the request's bounds were checked against,
-    /// before the response, so an unreadable range fails the call rather than
-    /// a stream the client has already opened. Later chunks follow
+    /// and at most two bounded chunks are materialized at a time: the one
+    /// the response sends and the one read next. The first chunk is read at
+    /// the view the request's bounds were checked against, before the
+    /// response, so a range whose first 1,000 heights are not all retained,
+    /// or whose first chunk cannot be read, fails the call rather than a
+    /// stream the client has already opened. Later chunks follow
     /// [`BlockRangeContinuity`].
     ///
     /// The stream holds a slot of the block-range limit from admission until
@@ -334,11 +336,9 @@ impl BlockMethods {
             return Ok(stream_slot.hold_for(first_messages));
         };
         let reads = reads.clone();
-        Ok(stream_slot.hold_with_reader(
-            first_messages,
-            Reads::BLOCK_RANGE_QUEUE_CAPACITY,
-            |sink| stream_later_chunks(reads, chunks, continuity, conversion, sink),
-        ))
+        Ok(stream_slot.hold_with_reader(first_messages, |sink| {
+            stream_later_chunks(reads, chunks, continuity, conversion, sink)
+        }))
     }
 
     /// Captures the current view, reads the times of its tip for the tip call
@@ -591,6 +591,10 @@ impl ChunkTimings {
 /// Reads and converts the first chunk of a range at `view`, the view the
 /// request's bounds were checked against.
 ///
+/// The read keeps at most [`BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES`], so the
+/// response opens after a small read, and checks every height it is offered,
+/// up to 1,000, against retained history.
+///
 /// When heights remain after the blocks the read kept, also returns the plan
 /// and the continuity that later chunks must follow. The caller runs this
 /// under [`crate::block_range::BlockRangeStreamSlot::hold_during`], because
@@ -608,6 +612,7 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
+        max_bytes: BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
         view: ChunkView::Captured(view),
     };
     read_chunk(&reads, read, move |read_at, blocks, timings| {
@@ -635,49 +640,55 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
     })
 }
 
-/// Streams every chunk after the first, each read at the view current when
-/// it is read.
+/// Reads every chunk after the first, each at the view current when it is
+/// read, and hands each to the response.
 ///
-/// The task holds no view while it waits for a read or for the client, so a
-/// slow client cannot keep a serving pair or a generation from being
-/// replaced. A read failure, a reorg ending, or a chunk that cannot be
-/// converted ends the stream with that status, and a client that stops
-/// draining ends it on the next send.
-///
-/// Before it reads the third chunk, the task waits until tonic has taken
-/// every message of the first from the response, so a stream reads at most
-/// two chunks until tonic has taken the first, however few blocks each holds.
+/// Before each read the task waits for room in the response, which it has
+/// once the client has taken every block of the chunk two before, so the
+/// task reads the next chunk while the client takes the one before it and
+/// the stream holds at most those two. The task holds no view while it
+/// waits, so a slow client cannot keep a serving pair or a generation from
+/// being replaced. A read failure, a reorg ending, or a chunk that cannot be
+/// converted ends the stream with that status after the blocks before it.
+/// A read that finds a height outside retained history, which fails with
+/// `NOT_FOUND`, is followed by a read of the heights an earlier read checked
+/// and the stream has not sent, when there are any and the client still
+/// holds the response, so the stream sends them before it ends. Once the
+/// client has dropped the response, the task
+/// finishes the read in flight and starts no other, so it holds the stream's
+/// slot only while that read runs.
 async fn stream_later_chunks<Reads: CompactBlockReads>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
     conversion: ChunkConversion,
-    mut sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
+    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
 ) {
     while let Some(chunk) = chunks.next_chunk() {
-        let messages = match read_later_chunk(&reads, chunk, chunks, continuity, conversion).await {
+        let Some(room) = BlockRangeStage::Send
+            .time_async(sink.room_for_chunk())
+            .await
+        else {
+            return;
+        };
+        let mut outcome = read_later_chunk(&reads, chunk, chunks, continuity, conversion).await;
+        if let Err(status) = &outcome
+            && status.code() == Code::NotFound
+            && !sink.is_closed()
+            && let Some((checked, only_checked)) = chunks.checked_heights()
+        {
+            outcome = read_later_chunk(&reads, checked, only_checked, continuity, conversion).await;
+        }
+        match outcome {
             Ok((next_chunks, next_continuity, messages)) => {
                 chunks = next_chunks;
                 continuity = next_continuity;
-                messages
+                room.fill(messages);
             }
             Err(status) => {
-                let _ = sink.send(Err(status)).await;
+                room.fill(vec![Err(status)]);
                 return;
             }
-        };
-        let sent_chunk = BlockRangeStage::Send
-            .time_async(async {
-                for message in messages {
-                    if sink.send(message).await.is_err() {
-                        return false;
-                    }
-                }
-                sink.first_chunk_taken().await
-            })
-            .await;
-        if !sent_chunk {
-            return;
         }
     }
 }
@@ -700,6 +711,7 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
+        max_bytes: BLOCK_RANGE_CHUNK_MAX_BYTES,
         view: ChunkView::Current,
     };
     let sent = continuity;
@@ -817,8 +829,6 @@ mod tests {
 
     impl CompactBlockReads for SlowTipHeaderReads {
         type View = ChainEpoch;
-
-        const BLOCK_RANGE_QUEUE_CAPACITY: usize = 1;
 
         fn capture_view(&self) -> impl Future<Output = Result<ChainEpoch, Status>> + Send {
             std::future::ready(Ok(ChainEpoch {

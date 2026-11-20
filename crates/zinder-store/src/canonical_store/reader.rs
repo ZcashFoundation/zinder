@@ -216,7 +216,13 @@ macro_rules! impl_canonical_typed_reads {
             /// first, so a range that reaches outside it fails with
             /// [`CanonicalStoreError::ArtifactUnavailable`] exactly as
             /// [`Self::compact_blocks_in_range`] does, even where the byte
-            /// budget would stop the read before that height.
+            /// budget would stop the read before that height. A row missing
+            /// inside retained history fails the read as store damage once
+            /// the read reaches it. Unless the kept blocks take at least
+            /// `max_bytes`, as they do when they fill it or when the first
+            /// block alone is larger, the read reaches the row after the last
+            /// block it keeps, which it looks at to learn whether that row
+            /// fits.
             pub fn compact_blocks_in_range_up_to(
                 &self,
                 range: zinder_core::BlockHeightRange,

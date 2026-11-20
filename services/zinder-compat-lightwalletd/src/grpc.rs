@@ -42,7 +42,6 @@ use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
     CompactBlockReads, RequestedBlock, requested_block, view_reaches,
 };
-use crate::block_range::BLOCK_RANGE_CHUNK_MAX_BYTES;
 use crate::compact_block_messages::{
     CompactBlockPayloadMode, CompactBlockPoolSelection, CompactBlockShape,
     compact_transaction_data_to_lightwalletd, compact_transaction_has_payload, prune_compact_block,
@@ -336,8 +335,6 @@ where
 {
     type View = ChainEpoch;
 
-    const BLOCK_RANGE_QUEUE_CAPACITY: usize = 16;
-
     async fn capture_view(&self) -> Result<ChainEpoch, Status> {
         self.visible_tip_block(None)
             .await
@@ -408,12 +405,7 @@ where
         };
         let started_at = Instant::now();
         let compact_block_range = self
-            .compact_blocks_in_range_up_to(
-                read.chunk,
-                read.order,
-                BLOCK_RANGE_CHUNK_MAX_BYTES,
-                at_epoch_id,
-            )
+            .compact_blocks_in_range_up_to(read.chunk, read.order, read.max_bytes, at_epoch_id)
             .await;
         // The read stage ends when the query returns, so it leaves out the
         // conversion's wait for a blocking thread.

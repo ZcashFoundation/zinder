@@ -19,7 +19,6 @@ use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
     CompactBlockReads, RequestedBlock, view_reaches,
 };
-use crate::block_range::BLOCK_RANGE_CHUNK_MAX_BYTES;
 use crate::compact_block_messages::{CompactBlockPoolSelection, CompactBlockShape};
 use crate::grpc::GrpcStream;
 use crate::node_tip_witness::NodeTipWitness;
@@ -68,8 +67,6 @@ impl CanonicalReaderSlot {
 /// read of one view answers at that reader's fence.
 impl CompactBlockReads for CanonicalReaderSlot {
     type View = Arc<RocksDbCanonicalReader>;
-
-    const BLOCK_RANGE_QUEUE_CAPACITY: usize = 8;
 
     fn capture_view(
         &self,
@@ -166,7 +163,12 @@ fn read_chunk_on_this_thread<Output>(
     read: ChunkRead<Arc<RocksDbCanonicalReader>>,
     convert: impl FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output,
 ) -> ChunkReadOutcome<Output> {
-    let ChunkRead { chunk, order, view } = read;
+    let ChunkRead {
+        chunk,
+        order,
+        max_bytes,
+        view,
+    } = read;
     let reader = match view {
         ChunkView::Captured(reader) => reader,
         ChunkView::Current => slot.capture(),
@@ -176,11 +178,8 @@ fn read_chunk_on_this_thread<Output>(
         return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(read_at));
     }
     let started_at = Instant::now();
-    let blocks = read_on_blocking_thread(reader.compact_blocks_in_range_up_to(
-        chunk,
-        order,
-        BLOCK_RANGE_CHUNK_MAX_BYTES,
-    ));
+    let blocks =
+        read_on_blocking_thread(reader.compact_blocks_in_range_up_to(chunk, order, max_bytes));
     let read_duration = started_at.elapsed();
     drop(reader);
     ChunkReadOutcome {
