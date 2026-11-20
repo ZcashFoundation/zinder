@@ -469,10 +469,13 @@ only through NU6.2, and the test refuses a tip at or past NU6.3.
 Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
 The qualification build serves wallet RPCs with one canonical store and ingest
 control. It uses the node for transparent balances, UTXOs, address history,
-transaction submission, and the recommended fee. Before forwarding a request,
-it checks that the node supports transaction broadcast, agrees with the
-writer's activation schedule through the next block, and holds the served tip
-on its best chain. The node can advance while answering. Compare forwarded
+transaction submission, and the recommended fee. Each forwarded request checks
+that the node holds the served tip on its best chain. If the canonical fence or
+schedule revision changes during verification, the request returns `UNAVAILABLE`.
+Requests share evidence of broadcast support and agreement with the writer's
+schedule through the next block for up to one minute. A failed tip check, a
+new schedule revision, or a change to the upgrade active at the next block
+requires fresh discovery. The node can advance while answering. Compare forwarded
 answers with wallet serving while the node stays at the same hash and height.
 
 The node orders UTXOs within a block by position. Qualification needs every

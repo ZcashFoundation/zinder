@@ -24,6 +24,7 @@ pub struct QualificationWalletQuery {
     source: ZebraJsonRpcSource,
     capture: Arc<dyn Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync>,
     replays: TreeStateReplayLimit,
+    verification: Arc<crate::node_broadcast::QualificationNodeVerification>,
 }
 
 impl QualificationWalletQuery {
@@ -38,6 +39,7 @@ impl QualificationWalletQuery {
         Self {
             capture: Arc::new(capture),
             source,
+            verification: Arc::default(),
             replays: TreeStateReplayLimit::for_available_parallelism(wait)
                 .with_waiters_per_slot(waiters_per_slot),
         }
@@ -47,7 +49,14 @@ impl QualificationWalletQuery {
     pub async fn verified_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
         let target =
             crate::node_broadcast::VerificationTarget::from_canonical((self.capture)().as_ref())?;
-        target.verify(&self.source).await?;
+        self.verification.verify(&self.source, &target).await?;
+        if !target.still_served_by((self.capture)().as_ref()) {
+            return Err(SourceError::NodeUnavailable {
+                reason:
+                    "served canonical fence or upgrade schedule changed during node verification"
+                        .to_owned(),
+            });
+        }
         Ok(&self.source)
     }
 

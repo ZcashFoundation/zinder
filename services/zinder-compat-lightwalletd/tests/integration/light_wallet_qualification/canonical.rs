@@ -209,6 +209,156 @@ async fn forwarding_rechecks_the_captured_tip_and_recovers_after_a_fork() -> Res
             .collect::<Vec<_>>(),
         [json!([12]), json!([13]), json!([13]), json!([13])],
     );
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_forwarding_shares_discovery_and_schedule_but_checks_each_tip() -> Result<()> {
+    let broadcasts = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let advertised = Arc::clone(&broadcasts);
+    let fixture = Fixture::new([
+        method("rpc.discover").reply_with(move |_| {
+            let methods = if advertised.load(std::sync::atomic::Ordering::Relaxed) {
+                json!([{"name": "getblockchaininfo"}, {"name": "sendrawtransaction"}])
+            } else {
+                json!([])
+            };
+            RpcReply::result(json!({"methods": methods}))
+        }),
+        method("sendrawtransaction").reply_with(|_| RpcReply::result(json!("01".repeat(32)))),
+    ])?;
+    let other = fixture.adapter.clone();
+    let _ = tokio::try_join!(
+        fixture.adapter.send_transaction(send()),
+        other.send_transaction(send())
+    )?;
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
+    assert_eq!(fixture.node.requests_for("getblockchaininfo")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 2);
+    fixture.adapter.send_transaction(send()).await?;
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
+    assert_eq!(fixture.node.requests_for("getblockchaininfo")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 3);
+
+    broadcasts.store(false, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let refusal = fixture
+        .adapter
+        .send_transaction(send())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an expired capability allowed forwarding"))?;
+    assert_eq!(refusal.code(), Code::FailedPrecondition);
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 3);
+
+    broadcasts.store(true, std::sync::atomic::Ordering::Relaxed);
+    fixture.adapter.send_transaction(send()).await?;
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_changed_fence_during_the_node_tip_check_refuses_the_broadcast() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let schedule = super::one_upgrade_per_height()?;
+    let mut initial =
+        super::WalletServingStoreFixture::from_chain_after_live_append(&chain, &schedule)?;
+    let mut replacement = super::WalletServingStoreFixture::from_chain_after_live_append(
+        &chain.extend_blocks(1),
+        &schedule,
+    )?;
+    check_publication_during_tip_lookup(&schedule, &mut initial, &mut replacement, false).await
+}
+
+#[tokio::test]
+async fn a_changed_schedule_during_the_node_tip_check_refuses_the_broadcast() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let schedule = super::one_upgrade_per_height()?;
+    let mut upgrades = schedule.activations().to_vec();
+    upgrades.push(zinder_core::NetworkUpgradeActivation {
+        branch_id: zinder_core::ConsensusBranchId::new(0x5a1d_e008),
+        activation_height: BlockHeight::new(1_000),
+        name: "NU8".to_owned(),
+    });
+    let revised = zinder_core::NetworkUpgradeActivations::new(Network::ZcashRegtest, upgrades)?;
+    let mut initial =
+        super::WalletServingStoreFixture::from_chain_after_live_append(&chain, &schedule)?;
+    let mut replacement = super::WalletServingStoreFixture::from_chain_after_admitted_live_append(
+        &chain, &schedule, &revised,
+    )?;
+    check_publication_during_tip_lookup(&schedule, &mut initial, &mut replacement, true).await
+}
+
+async fn check_publication_during_tip_lookup(
+    schedule: &zinder_core::NetworkUpgradeActivations,
+    initial: &mut super::WalletServingStoreFixture,
+    replacement: &mut super::WalletServingStoreFixture,
+    same_fence: bool,
+) -> Result<()> {
+    let initial = Arc::new(super::RocksDbCanonicalReader::new(
+        initial.take_readers()?.0,
+    )?);
+    let replacement = Arc::new(super::RocksDbCanonicalReader::new(
+        replacement.take_readers()?.0,
+    )?);
+    assert_eq!(
+        initial.event_fence() == replacement.event_fence(),
+        same_fence
+    );
+    let revision = |reader: &super::RocksDbCanonicalReader| {
+        reader
+            .network_upgrade_schedule()
+            .map(zinder_store::CanonicalActivationSchedule::revision)
+    };
+    assert_eq!(revision(&initial) == revision(&replacement), !same_fence);
+    let old_tip = initial.event_fence().visible_tip();
+    let new_tip = replacement.event_fence().visible_tip();
+    let slot = super::CanonicalReaderSlot::new(initial);
+    let publisher = slot.clone();
+    let node = super::verifiable_node(
+        schedule,
+        old_tip.hash,
+        [
+            method("getblockhash").reply_with(move |params| {
+                drop(publisher.publish(Arc::clone(&replacement)));
+                let tip = if params == &json!([old_tip.height.value()]) {
+                    old_tip
+                } else {
+                    new_tip
+                };
+                RpcReply::result(json!(encode_rpc_block_hash_hex(tip.hash)))
+            }),
+            method("sendrawtransaction").reply_with(|_| RpcReply::result(json!("01".repeat(32)))),
+        ],
+    )?;
+    let source = super::ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        super::NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let adapter = super::LightwalletdGrpcAdapter::for_light_wallet_qualification(
+        slot,
+        source,
+        super::DEFAULT_TREE_STATE_REPLAY_WAIT,
+        super::DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    );
+    node_unavailable(
+        &adapter
+            .send_transaction(send())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("broadcast crossed a changed publication"))?,
+    );
+    assert!(node.requests_for("sendrawtransaction")?.is_empty());
+    adapter.send_transaction(send()).await?;
+    assert_eq!(node.requests_for("sendrawtransaction")?.len(), 1);
+    assert_eq!(node.requests_for("rpc.discover")?.len(), 2);
     Ok(())
 }
 
