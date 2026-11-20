@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -19,6 +20,7 @@ use parking_lot::Mutex;
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Response, Status, Streaming, transport::Server};
+use zinder_core::CommitmentTreeFrontier;
 use zinder_proto::compat::lightwalletd::{
     Address, AddressList, Balance, BlockId, BlockRange, ChainMetadata, ChainSpec, CompactBlock,
     CompactOrchardAction, CompactSaplingOutput, CompactTx, Duration as PingDuration, Empty,
@@ -75,10 +77,23 @@ pub(super) struct RequestLog {
     pub(super) transaction_txids: Mutex<Vec<Vec<u8>>>,
     /// `GetBlockRange` `poolTypes`.
     pub(super) block_range_pool_types: Mutex<Vec<Vec<i32>>>,
+    pub(super) block_ranges: Mutex<Vec<(u64, u64)>>,
+    pub(super) transparent_history_ranges: Mutex<Vec<(u64, u64)>>,
     /// `GetMempoolTx` `poolTypes`.
     pub(super) mempool_pool_types: Mutex<Vec<Vec<i32>>>,
     /// `GetSubtreeRoots` `shieldedProtocol` values.
     pub(super) subtree_root_protocols: Mutex<Vec<i32>>,
+    pub(super) subtree_root_requests: Mutex<Vec<(i32, u32, u32)>>,
+    pub(super) mempool_streams: AtomicU64,
+    pub(super) connections: Mutex<BTreeSet<SocketAddr>>,
+}
+
+impl RequestLog {
+    fn record_connection<T>(&self, request: &Request<T>) {
+        if let Some(address) = request.remote_addr() {
+            self.connections.lock().insert(address);
+        }
+    }
 }
 
 /// The `chainMetadata` `GetBlock` sends with each block.
@@ -97,6 +112,10 @@ pub(super) enum BlockChainMetadata {
 #[derive(Clone)]
 pub(super) struct MockStreamer {
     pub(super) range_ending: RangeEnding,
+    /// Return `DEADLINE_EXCEEDED` after this many blocks of the first range.
+    pub(super) first_range_deadline_after: Option<u64>,
+    /// Enable the fixed-tip Mainnet fixture with this Sapling frontier at every requested height.
+    pub(super) mainnet_sapling_frontier: Option<CommitmentTreeFrontier>,
     /// How long each tree-state request is held before it is answered.
     pub(super) tree_state_delay: Duration,
     pub(super) held_tree_states: Arc<HeldRequests>,
@@ -162,6 +181,8 @@ impl MockStreamer {
     pub(super) fn new(range_ending: RangeEnding) -> Self {
         Self {
             range_ending,
+            first_range_deadline_after: None,
+            mainnet_sapling_frontier: None,
             tree_state_delay: Duration::ZERO,
             held_tree_states: Arc::default(),
             tip_height: 250,
@@ -188,6 +209,23 @@ impl MockStreamer {
             transparent_balance: 0,
             transparent_utxos: Vec::new(),
         }
+    }
+
+    fn range_block(&self, height: u64) -> CompactBlock {
+        if let Some(frontier) = &self.mainnet_sapling_frontier {
+            return CompactBlock {
+                height,
+                hash: tip_hash(height),
+                prev_hash: tip_hash(height.saturating_sub(1)),
+                time: 1_760_000_000,
+                chain_metadata: Some(ChainMetadata {
+                    sapling_commitment_tree_size: frontier.tree_size(),
+                    ..ChainMetadata::default()
+                }),
+                ..CompactBlock::default()
+            };
+        }
+        block(height)
     }
 }
 
@@ -233,7 +271,7 @@ pub(super) fn block(height: u64) -> CompactBlock {
 }
 
 /// The hash `GetLatestBlock` reports for a tip at `height`.
-fn tip_hash(height: u64) -> Vec<u8> {
+pub(super) fn tip_hash(height: u64) -> Vec<u8> {
     height.to_le_bytes().repeat(4)
 }
 
@@ -276,6 +314,7 @@ impl CompactTxStreamer for MockStreamer {
         &self,
         request: Request<BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        self.requests.record_connection(&request);
         let range = request.into_inner();
         self.requests
             .block_range_pool_types
@@ -285,14 +324,27 @@ impl CompactTxStreamer for MockStreamer {
             && range.pool_types.contains(&(PoolType::Transparent as i32));
         let height = |id: Option<BlockId>| id.map_or(0, |id| id.height);
         let (start, end) = (height(range.start), height(range.end));
+        let first_range = {
+            let mut ranges = self.requests.block_ranges.lock();
+            ranges.push((start, end));
+            ranges.len() == 1
+        };
+        let mut last_reply = end;
         let ending = match self.range_ending {
+            RangeEnding::Clean
+                if let Some(delivered) =
+                    self.first_range_deadline_after.filter(|_| first_range) =>
+            {
+                last_reply = start.saturating_add(delivered.saturating_sub(1)).min(end);
+                vec![Err(Status::deadline_exceeded("fixture stream interrupted"))]
+            }
             RangeEnding::Clean => Vec::new(),
             RangeEnding::ExtraBlock => vec![Ok(block(end + 1))],
             RangeEnding::Status(code) => vec![Err(Status::new(code, "stream failed at its end"))],
         };
-        let replies = (start..=end)
+        let replies = (start..=last_reply)
             .map(|height| {
-                let mut cb = block(height);
+                let mut cb = self.range_block(height);
                 if self.shielded_heights.contains(&height) {
                     cb.vtx.push(CompactTx {
                         txid: height.to_le_bytes().to_vec(),
@@ -326,11 +378,23 @@ impl CompactTxStreamer for MockStreamer {
         &self,
         request: Request<BlockId>,
     ) -> Result<Response<TreeState>, Status> {
+        self.requests.record_connection(&request);
         self.held_tree_states.enter();
         tokio::time::sleep(self.tree_state_delay).await;
         self.held_tree_states.leave();
         let height = request.into_inner().height;
         self.requests.tree_state_heights.lock().push(height);
+        if let Some(frontier) = &self.mainnet_sapling_frontier {
+            return Ok(Response::new(TreeState {
+                network: "main".to_owned(),
+                height,
+                hash: hex::encode(tip_hash(height).into_iter().rev().collect::<Vec<_>>()),
+                time: 1_760_000_000,
+                sapling_tree: hex::encode(frontier.final_state_bytes()),
+                orchard_tree: "000000".to_owned(),
+                ..TreeState::default()
+            }));
+        }
         let frontier = |pool: &str, heights: &BTreeSet<u64>| match heights.range(..=height).count()
         {
             0 => String::new(),
@@ -344,7 +408,11 @@ impl CompactTxStreamer for MockStreamer {
         }))
     }
 
-    async fn get_latest_block(&self, _: Request<ChainSpec>) -> Result<Response<BlockId>, Status> {
+    async fn get_latest_block(
+        &self,
+        request: Request<ChainSpec>,
+    ) -> Result<Response<BlockId>, Status> {
+        self.requests.record_connection(&request);
         let reads = self.latest_block_reads.fetch_add(1, Ordering::Relaxed) + 1;
         let height = self.tip_height + reads.min(self.tip_advancing_reads);
         Ok(Response::new(BlockId {
@@ -377,7 +445,7 @@ impl CompactTxStreamer for MockStreamer {
         Ok(Response::new(CompactBlock {
             chain_metadata,
             hash: self.block_hash.clone().unwrap_or_else(|| tip_hash(height)),
-            ..block(height)
+            ..self.range_block(height)
         }))
     }
 
@@ -417,8 +485,17 @@ impl CompactTxStreamer for MockStreamer {
 
     async fn get_taddress_txids(
         &self,
-        _: Request<TransparentAddressBlockFilter>,
+        request: Request<TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
+        self.requests.record_connection(&request);
+        if let Some(range) = request.into_inner().range {
+            let start = range.start.map_or(0, |start| start.height);
+            let end = range.end.map_or(0, |end| end.height);
+            self.requests
+                .transparent_history_ranges
+                .lock()
+                .push((start, end));
+        }
         Ok(replay(&self.transparent_txs))
     }
 
@@ -477,8 +554,15 @@ impl CompactTxStreamer for MockStreamer {
 
     async fn get_mempool_stream(
         &self,
-        _: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
+        self.requests.record_connection(&request);
+        self.requests
+            .mempool_streams
+            .fetch_add(1, Ordering::Relaxed);
+        if self.mainnet_sapling_frontier.is_some() {
+            return Ok(Response::new(stream::pending().boxed()));
+        }
         unimplemented()
     }
 
@@ -493,11 +577,17 @@ impl CompactTxStreamer for MockStreamer {
         &self,
         request: Request<GetSubtreeRootsArg>,
     ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
+        self.requests.record_connection(&request);
         let arg = request.into_inner();
         self.requests
             .subtree_root_protocols
             .lock()
             .push(arg.shielded_protocol);
+        self.requests.subtree_root_requests.lock().push((
+            arg.shielded_protocol,
+            arg.start_index,
+            arg.max_entries,
+        ));
         if self.subtree_root_endless {
             let roots = stream::unfold(0_u32, |index| async move {
                 tokio::time::sleep(Duration::from_millis(2)).await;
@@ -551,13 +641,22 @@ impl CompactTxStreamer for MockStreamer {
         Ok(replay(&self.transparent_utxos))
     }
 
-    async fn get_lightd_info(&self, _: Request<Empty>) -> Result<Response<LightdInfo>, Status> {
+    async fn get_lightd_info(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<LightdInfo>, Status> {
+        self.requests.record_connection(&request);
+        let (chain_name, sapling_activation_height) = if self.mainnet_sapling_frontier.is_some() {
+            ("main", 419_200)
+        } else {
+            ("regtest", 1)
+        };
         Ok(Response::new(LightdInfo {
             vendor: "zinder-mock".to_owned(),
             version: "0.0.0-test".to_owned(),
-            chain_name: "regtest".to_owned(),
+            chain_name: chain_name.to_owned(),
             block_height: self.tip_height,
-            sapling_activation_height: 1,
+            sapling_activation_height,
             lightwallet_protocol_version: self.lightwallet_protocol_version.clone(),
             ..LightdInfo::default()
         }))

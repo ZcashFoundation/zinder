@@ -1093,6 +1093,48 @@ not finished within 10 seconds, and sends no HTTP/2 keep-alive pings. Go lightwa
 more often than every five minutes, so pinging would end streams a real
 wallet keeps.
 
+### Verify PepperSync restore requests locally
+
+Run the real PepperSync engine against a synthetic loopback gRPC fixture to
+reproduce a fresh, unfunded restore on a fixed tip. Zingo Mobile 3.0.0-324
+pins Zingolib 8.0.0 at `81d799775f11e882896e8710e8af12d6d4d29a41`. Build
+the CLI from that revision in direct test mode, which lets it use the
+loopback indexer.
+[Zingo Mobile binding pin](https://github.com/zingolabs/zingo-mobile/blob/5fd3662f39dc20f953e4f93c2be738a4c03d3690/binding-layer.json)
+
+From the Zinder repository, with Rust 1.99.1 and `protoc` installed:
+
+```bash
+zingolib_source="$PWD/.tmp/zingolib-81d7997"
+mkdir -p "$zingolib_source"
+curl -fsSL https://codeload.github.com/zingolabs/zingolib/tar.gz/81d799775f11e882896e8710e8af12d6d4d29a41 \
+  | tar -xz --strip-components=1 -C "$zingolib_source"
+cargo +1.99.1 build --manifest-path "$zingolib_source/Cargo.toml" --locked \
+  -p zingo-cli --no-default-features --features nakednet-test-mode
+ZINDER_TEST_PEPPER_SYNC_BIN="$zingolib_source/target/debug/zingo-cli" \
+  cargo nextest run -p zinder-bench --profile=ci --run-ignored=all \
+  -E 'test(pepper_sync_fresh_restore_requests)'
+```
+
+The test restores a disposable wallet over blocks 3,424,811 through
+3,424,874. It checks that one connection carries the mempool subscription and
+the sync requests, including the predecessor, tip, and birthday tree states.
+The fixture has empty transparent history and one Sapling subtree completed
+before the birthday. The client makes 21 `GetTaddressTxids` requests from
+1,000 blocks below the birthday through the tip. It requests each shielded
+pool's roots from index zero, then confirms the end of the Sapling roots
+with an empty reply from index one. It requests a 10-block range, resumes
+from the fifth block after the fixture interrupts the first stream with
+`DEADLINE_EXCEEDED`, and requests the remaining 54 blocks. Every range
+selects Sapling, Orchard, and Ironwood. The CLI reports all 64 blocks
+scanned.
+
+The fixture exercises the pinned client's direct gRPC path through sync
+completion over a span with no new note commitments. On a populated chain,
+subtree boundaries and discovered transactions change which ranges
+PepperSync prioritizes. Wallets with history can trigger additional lookups.
+[PepperSync sync loop](https://github.com/zingolabs/zingolib/blob/81d799775f11e882896e8710e8af12d6d4d29a41/pepper-sync/src/sync.rs)
+
 ## Report fields
 
 - `contract_identity`: exact benchmark report contract identity. The current identity is
