@@ -46,7 +46,7 @@ use crate::{
     ClientAddressSource, DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTerminationLayer,
     GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStallLayer, OpsEndpointHandle,
     OpsServerError, Readiness, RuntimeService, cancel_on_terminating_signal,
-    public_grpc_server::{OpenGrpcCalls, supervised_grpc_layers, supervised_wallet_router},
+    public_grpc_server::{OpenGrpcCalls, supervised_grpc_layers, supervised_router},
 };
 
 /// Longest a supervised gRPC server may drain after the runtime starts
@@ -153,21 +153,21 @@ impl SupervisedRuntime {
         self.serving_drained.clone()
     }
 
-    /// Assembles this runtime's public wallet listener, which serves
-    /// `wallet_service` and tells clients apart by `client_address`.
+    /// Assembles this runtime's public gRPC listener, which serves
+    /// `application_service` and tells clients apart by `client_address`.
     ///
     /// The router serves, on the transport policy of
     /// [`crate::public_grpc_server`]:
     ///
-    /// - `wallet_service`, behind a [`crate::TrafficReadinessInterceptor`]
+    /// - `application_service`, behind a [`crate::TrafficReadinessInterceptor`]
     ///   over `readiness`;
     /// - gRPC reflection v1, plus v1alpha for `CompactTxStreamer`, describing
-    ///   the wallet, health, and reflection services; and
+    ///   the application, health, and reflection services; and
     /// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
     ///   traffic, as `/readyz` reports it.
     ///
     /// Reflection and health stay outside the traffic gate, so they answer
-    /// while the runtime refuses wallet calls. Every call first passes
+    /// while the runtime refuses application calls. Every call first passes
     /// through [`GrpcCallTerminationLayer`], so the supervisor can end the
     /// calls still open at the drain deadline.
     ///
@@ -179,55 +179,65 @@ impl SupervisedRuntime {
     /// # Errors
     ///
     /// Returns an error when reflection cannot describe
-    /// `wallet_descriptor_set`.
-    pub fn public_grpc_router<S>(
+    /// `descriptor_set`.
+    pub fn public_grpc_router<S, ResponseBody>(
         &self,
-        wallet_service: S,
-        wallet_descriptor_set: &'static [u8],
+        application_service: S,
+        descriptor_set: &'static [u8],
         client_address: ClientAddressSource,
         readiness: &Readiness,
     ) -> Result<SupervisedGrpcRouter, tonic_reflection::server::Error>
     where
-        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
-            + NamedService
+        S: Service<
+                http::Request<Body>,
+                Response = http::Response<ResponseBody>,
+                Error = Infallible,
+            > + NamedService
             + Clone
             + Send
             + Sync
             + 'static,
         S::Future: Send + 'static,
+        ResponseBody:
+            http_body::Body<Data = bytes::Bytes, Error: Into<axum::BoxError>> + Send + 'static,
     {
         self.public_grpc_router_with_transport(
-            (wallet_service, wallet_descriptor_set),
+            (application_service, descriptor_set),
             client_address,
             readiness,
             std::convert::identity,
         )
     }
 
-    /// Builds the same supervised wallet router with an outer transport adapter.
-    /// Pass the wallet service with its reflection descriptor set.
+    /// Builds the same supervised router with an outer transport adapter.
+    /// Pass the application service with its reflection descriptor set.
     /// The adapter translates incoming requests before the supervisor and receive
     /// limits inspect native gRPC frames.
     ///
     /// # Errors
     ///
-    /// Returns an error when reflection cannot describe the wallet service.
-    pub fn public_grpc_router_with_transport<S, L>(
+    /// Returns an error when reflection cannot describe the application service.
+    pub fn public_grpc_router_with_transport<S, L, ResponseBody>(
         &self,
-        (wallet_service, descriptor_set): (S, &'static [u8]),
+        (application_service, descriptor_set): (S, &'static [u8]),
         client_address: ClientAddressSource,
         readiness: &Readiness,
         transport: impl FnOnce(tonic::transport::Server) -> tonic::transport::Server<L>,
     ) -> Result<SupervisedGrpcRouter<L>, tonic_reflection::server::Error>
     where
         L: Clone,
-        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
-            + NamedService
+        S: Service<
+                http::Request<Body>,
+                Response = http::Response<ResponseBody>,
+                Error = Infallible,
+            > + NamedService
             + Clone
             + Send
             + Sync
             + 'static,
         S::Future: Send + 'static,
+        ResponseBody:
+            http_body::Body<Data = bytes::Bytes, Error: Into<axum::BoxError>> + Send + 'static,
     {
         let server = transport(crate::public_grpc_server::public_grpc_transport()).layer(
             supervised_grpc_layers(
@@ -237,9 +247,9 @@ impl SupervisedRuntime {
                 client_address,
             ),
         );
-        supervised_wallet_router(
+        supervised_router(
             server,
-            wallet_service,
+            application_service,
             descriptor_set,
             readiness,
             &self.stopping,

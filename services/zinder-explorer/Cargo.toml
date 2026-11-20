@@ -51,6 +51,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
+tonic-health.workspace = true
 tracing.workspace = true
 zinder-ingest.workspace = true
 zinder-query.workspace = true

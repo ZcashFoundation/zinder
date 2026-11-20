@@ -6184,6 +6184,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-health",
  "tonic-reflection",
  "tonic-types",
  "tracing",
