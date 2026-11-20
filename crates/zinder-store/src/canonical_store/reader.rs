@@ -1044,6 +1044,15 @@ fn read_subtree_roots(
     };
     let mut indices = range.into_iter();
     let mut roots = Vec::new();
+    let read_point = |index| {
+        let key = encode_subtree_root_position(range.protocol, index);
+        let row = db.get_cf(&family, key);
+        decode_subtree_root_row(range.protocol, index, coverage_start, &key, row)
+    };
+    // Stop at the first unavailable history row before fetching a complete page.
+    for (_, index) in (range.start_index.value()..coverage_start).zip(indices.by_ref()) {
+        roots.push(read_point(index)?);
+    }
     while indices.len() >= SUBTREE_ROOT_PAGE_SIZE {
         let mut keys = Vec::with_capacity(SUBTREE_ROOT_PAGE_SIZE);
         keys.extend(
@@ -1065,15 +1074,7 @@ fn read_subtree_roots(
         }
     }
     for index in indices {
-        let key = encode_subtree_root_position(range.protocol, index);
-        let row = db.get_cf(&family, key);
-        roots.push(decode_subtree_root_row(
-            range.protocol,
-            index,
-            coverage_start,
-            &key,
-            row,
-        )?);
+        roots.push(read_point(index)?);
     }
     Ok(roots)
 }

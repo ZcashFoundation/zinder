@@ -1093,22 +1093,10 @@ mod tests {
     #[test]
     fn subtree_root_pages_batch_full_pages_and_get_partial_tails_in_index_order()
     -> Result<(), Box<dyn std::error::Error>> {
-        use rust_rocksdb::statistics::Ticker;
         let page_size = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST;
         let temporary = tempdir()?;
         let store =
             published_retained_roots(&temporary.path().join("canonical"), 2 * page_size + 3)?;
-        let counters = || {
-            [
-                Ticker::NumberKeysRead,
-                Ticker::NumberMultigetCalls,
-                Ticker::NumberMultigetKeysRead,
-                Ticker::NumberDbSeek,
-                Ticker::NumberDbNext,
-                Ticker::NumberDbPrev,
-            ]
-            .map(|ticker| store.bounded_open.statistics.get_ticker_count(ticker))
-        };
         for count in [
             1,
             page_size - 1,
@@ -1121,9 +1109,9 @@ mod tests {
                 SubtreeRootIndex::new(2),
                 NonZeroU32::new(count).ok_or("page length must be nonzero")?,
             );
-            let before = counters();
+            let before = subtree_read_counts(&store);
             let page = store.subtree_roots(range)?;
-            let after = counters();
+            let after = subtree_read_counts(&store);
             assert_eq!(
                 page,
                 (2..2 + count)
@@ -1143,7 +1131,78 @@ mod tests {
                 ]
             );
         }
+
         Ok(())
+    }
+
+    #[test]
+    fn subtree_root_pages_check_history_before_batching() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let page_size = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST;
+        let temporary = tempdir()?;
+        let store = published_retained_roots(&temporary.path().join("canonical"), page_size + 1)?;
+        let unavailable = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(page_size).ok_or("page must be nonempty")?,
+        );
+        let before = subtree_read_counts(&store);
+        assert!(matches!(
+            store.subtree_roots(unavailable),
+            Err(CanonicalStoreError::SubtreeRootUnavailable {
+                protocol: ShieldedProtocol::Sapling,
+                subtree_index,
+            }) if subtree_index == SubtreeRootIndex::new(0)
+        ));
+        let after = subtree_read_counts(&store);
+        assert_eq!(
+            std::array::from_fn(|i| after[i] - before[i]),
+            [1, 0, 0, 0, 0, 0]
+        );
+
+        let prefix = retained_sapling_root(0);
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        store.bounded_open.db.put_cf(
+            &family,
+            encode_subtree_root_key(&prefix),
+            encode_subtree_root_value(&prefix),
+        )?;
+        let with_prefix = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            prefix.subtree_index,
+            NonZeroU32::new(page_size + 1).ok_or("prefix and page must be nonempty")?,
+        );
+        let before = subtree_read_counts(&store);
+        let roots = store.subtree_roots(with_prefix)?;
+        let after = subtree_read_counts(&store);
+        assert_eq!(
+            roots,
+            (0..=page_size)
+                .map(retained_sapling_root)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::array::from_fn(|i| after[i] - before[i]),
+            [1, 1, u64::from(page_size), 0, 0, 0]
+        );
+        Ok(())
+    }
+
+    fn subtree_read_counts(store: &RocksDbCanonicalStore) -> [u64; 6] {
+        use rust_rocksdb::statistics::Ticker;
+        [
+            Ticker::NumberKeysRead,
+            Ticker::NumberMultigetCalls,
+            Ticker::NumberMultigetKeysRead,
+            Ticker::NumberDbSeek,
+            Ticker::NumberDbNext,
+            Ticker::NumberDbPrev,
+        ]
+        .map(|ticker| store.bounded_open.statistics.get_ticker_count(ticker))
     }
 
     #[test]
