@@ -1,6 +1,0 @@
-kind: fixed
-body: Compact-blocks serving can start and stay ready at a matching canonical fence when ingest omits the upgrade schedule or reports a different revision.
-time: 2026-11-20T16:45:16.497251877Z
-custom:
-    Bump: patch
-    PR: "433"
