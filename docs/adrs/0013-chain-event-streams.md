@@ -47,3 +47,5 @@ Some changes revise what an existing RPC means without changing its name or fiel
 - 2026-11-20. Contract revision 10 makes a synthesized reorg a complete resume
   position and requires increasing epoch IDs and monotonic settlement across
   delivered chain events.
+- 2026-11-20. Contract revision 12 requires a writer to withdraw a stale live
+  mempool tail and to honor the wallet’s mempool stream opening budget.
