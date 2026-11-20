@@ -31,6 +31,34 @@ grep -Fq ".fixture.fixture_format_version == $producer_fixture_format_version" \
   "$validator" ||
   fail "campaign validator does not require producer fixture format $producer_fixture_format_version"
 
+producer_store_version() {
+  local constant="$1" source="$2"
+  sed -nE "s/^pub const ${constant}: u16 = ([A-Z0-9_]+);$/\1/p" "$repository_root/$source"
+}
+
+check_lifecycle_pin() {
+  local field="$1" expected="$2" pinned
+  [[ "$expected" =~ ^[0-9]+$ ]] || fail "could not resolve producer version for $field"
+  pinned="$(sed -nE "s/^[[:space:]]+and [.]$field == ([0-9]+)[)]?[[:space:]]*$/\1/p" \
+    "$storage_lifecycle_validator")"
+  [[ "$pinned" == "$expected" ]] ||
+    fail "lifecycle validator pins $field to ${pinned:-<missing>}, producer requires $expected"
+}
+
+projection_source=crates/zinder-wallet-projection/src/lib.rs
+projection_schema="$(producer_store_version WALLET_PROJECTION_SCHEMA_VERSION "$projection_source")"
+wallet_schema="$(producer_store_version WALLET_ROCKSDB_SCHEMA_VERSION crates/zinder-wallet-rocksdb/src/store.rs)"
+if [[ "$wallet_schema" == "WALLET_PROJECTION_SCHEMA_VERSION" ]]; then
+  wallet_schema="$projection_schema"
+fi
+
+check_lifecycle_pin canonical_store_schema_version \
+  "$(producer_store_version CANONICAL_STORE_SCHEMA_VERSION crates/zinder-store/src/canonical_store/mod.rs)"
+check_lifecycle_pin wallet_store_schema_version "$wallet_schema"
+check_lifecycle_pin wallet_projection_schema_version "$projection_schema"
+check_lifecycle_pin wallet_value_encoding_version \
+  "$(producer_store_version WALLET_PROJECTION_VALUE_ENCODING_VERSION "$projection_source")"
+
 write_report() {
   local candidate="$1"
   local trial_id="$2"
