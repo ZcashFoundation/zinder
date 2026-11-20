@@ -69,7 +69,8 @@ store closes it, and readers make no final writes.
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
 streams never end on their own.
 
-`zinder-query` and `zinder-compat-lightwalletd` stop in this order:
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` share the
+following shutdown order.
 
 1. They report `shutting_down`, so `/readyz`, their
    [gRPC health service](../reference/readiness.md#grpc-health), and new
@@ -85,7 +86,7 @@ streams never end on their own.
    `shutting_down` readiness cause.
 5. If the drain timed out, they wait up to 2 more seconds for the server to
    send those calls their status and close its connections.
-6. They release their serving generations.
+6. Wallet-serving publishers release their serving generations.
 7. They wait for their background tasks to stop.
 
 When step 4 completes, no call handler or response of the gRPC server
@@ -105,11 +106,11 @@ entrypoint's 20-second window for its processes to exit.
 
 ### Background task failure
 
-Each background task of `zinder-query` and `zinder-compat-lightwalletd` runs
-until shutdown cancels it, so a task that ends earlier has failed. A task that
-ended quietly would leave the server answering from that task's last state:
-readiness would stop tracking its dependency, and a serving pair published as
-ready would stay ready past `storage.serving_pair_staleness_ceiling_ms`.
+The supervised tasks below run until shutdown cancels them. A task that ends
+earlier has failed. If the Explorer's upstream-observation probe ended
+quietly, it could keep serving the last node tip it observed. A wallet
+serving-pair publisher that ended quietly could leave a stale pair ready
+past `storage.serving_pair_staleness_ceiling_ms`.
 
 Each runtime therefore watches its tasks next to its gRPC server. When one
 exits, or the server stops without a shutdown request, the runtime stops in
@@ -122,6 +123,7 @@ stopping, so a signal never looks like the server stopping on its own.
 | `zinder-query` | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, and operational endpoint |
 | `zinder-compat-lightwalletd`, wallet serving | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, tip-change publisher, node-tip witness, and operational endpoint |
 | `zinder-compat-lightwalletd`, compact-blocks serving | Compact-block publisher, node-tip witness, and operational endpoint |
+| `zinder-explorer` | Materialized-view catch-up when a view store is open, upstream-observation probe when a node is configured, and operational endpoint when enabled |
 
 A task that had already ended when the runtime started stopping counts as
 failed, even when the runtime stopped for a shutdown request. A publisher
@@ -166,8 +168,8 @@ you expose a deployment, do three things:
    listener (`zinder-query`), the lightwalletd listener
    (`zinder-compat-lightwalletd`), and the Cipherscan REST adapter serve
    plaintext without client authentication. The Explorer listener serves
-   plaintext and can require one shared bearer token
-   (`explorer.bearer_token_path`).
+   plaintext and can require one shared bearer token for `ExplorerQuery`
+   (`explorer.bearer_token_path`). Health and reflection accept calls without a token.
    [Exposing over TLS](../runbooks/exposing-over-tls.md) shows one setup.
 2. **Keep the operational endpoint private.** `/healthz`, `/readyz`, and
    `/metrics` serve without authentication. The endpoint accepts at most 64

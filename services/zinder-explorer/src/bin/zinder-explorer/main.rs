@@ -18,9 +18,9 @@ use zinder_explorer::{
 };
 use zinder_runtime::{
     ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
-    ReadinessInput, ReadinessState, RuntimeService, StartupPhase, TracingSubscriberError,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    ReadinessInput, ReadinessState, RuntimeService, StartupPhase, SupervisedRuntime,
+    SupervisedTasks, TracingSubscriberError, host_cpu_meets_compiled_baseline,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
@@ -135,10 +135,6 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "startup keeps configuration, secondary admission, and server wiring in one path"
-)]
 async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
@@ -152,8 +148,16 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             return Err(error);
         }
     };
-    let readiness = Readiness::default();
-    readiness.set(ReadinessState::starting());
+    let runtime = SupervisedRuntime::new(RuntimeService::Explorer);
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
+    serve_explorer(explorer_config, runtime, Readiness::default()).await
+}
+
+async fn serve_explorer(
+    explorer_config: ExplorerConfig,
+    runtime: SupervisedRuntime,
+    readiness: Readiness,
+) -> Result<(), ExplorerConfigError> {
     let start_api_phase = StartupPhase::StartApi.start();
 
     let materialized_view_store = match open_materialized_view_store(&explorer_config) {
@@ -171,25 +175,14 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     };
     let composed_readiness = ComposedReadiness::new(readiness.clone(), required_inputs);
 
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-
-    let materialized_view_catchup_handle =
-        materialized_view_store
-            .clone()
-            .map(|materialized_view_store| {
-                spawn_materialized_view_catchup_task(
-                    move || materialized_view_store.try_catch_up(),
-                    composed_readiness.clone(),
-                    MATERIALIZED_VIEW_CATCHUP_INTERVAL,
-                    cancel.clone(),
-                )
-            });
-    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store);
-    let upstream_observation_handle =
-        spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
+    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store.clone());
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
-
+    let router = runtime.public_grpc_router(
+        grpc_adapter.clone().into_server(),
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        explorer_config.client_address_source,
+        &readiness,
+    )?;
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Explorer,
         explorer_config.ops_listen_addr,
@@ -200,6 +193,17 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     )
     .await?;
     describe_request_metrics();
+    let upstream_observation =
+        spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, runtime.stopping())?;
+    let materialized_view_catchup = materialized_view_store.map(|store| {
+        spawn_materialized_view_catchup_task(
+            move || store.try_catch_up(),
+            composed_readiness.clone(),
+            MATERIALIZED_VIEW_CATCHUP_INTERVAL,
+            runtime.stopping(),
+        )
+    });
+    let tasks = supervised_tasks(ops_handle, upstream_observation, materialized_view_catchup);
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
@@ -214,46 +218,18 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         "explorer query gRPC server started"
     );
 
-    let server_result = zinder_runtime::public_grpc_server(explorer_config.client_address_source)
-        .add_service(grpc_adapter.into_server())
-        .serve_with_shutdown(
-            explorer_config.listen_addr,
-            drain_readiness_on_cancel(cancel.clone(), composed_readiness),
-        )
-        .await;
+    let server =
+        router.serve_with_shutdown(explorer_config.listen_addr, runtime.grpc_server_shutdown());
+    runtime
+        .supervise(server, tasks, || composed_readiness.publish_shutting_down())
+        .await?;
 
     tracing::info!(
         target: "zinder::explorer",
         event = "explorer_stopped",
         "explorer query gRPC server stopped"
     );
-
-    let background_shutdown_result = shutdown_background_tasks(
-        ops_handle,
-        upstream_observation_handle,
-        materialized_view_catchup_handle,
-    )
-    .await;
-
-    match server_result {
-        Err(error) => {
-            if let Err(ops_error) = background_shutdown_result {
-                tracing::warn!(
-                    target: "zinder::explorer",
-                    event = "ops_endpoint_shutdown_failed",
-                    error = %ops_error,
-                    "operational endpoint shutdown also failed"
-                );
-            }
-            Err(ExplorerConfigError::Transport(error))
-        }
-        Ok(()) => background_shutdown_result.map_err(ExplorerConfigError::from),
-    }
-}
-
-async fn drain_readiness_on_cancel(cancel: CancellationToken, readiness: ComposedReadiness) {
-    cancel.cancelled().await;
-    readiness.publish_shutting_down();
+    Ok(())
 }
 
 fn report_materialized_view_identities(
@@ -271,22 +247,19 @@ fn report_materialized_view_identities(
     );
 }
 
-async fn shutdown_background_tasks(
-    ops_handle: Option<OpsEndpointHandle>,
-    upstream_observation_handle: Option<JoinHandle<()>>,
-    materialized_view_catchup_handle: Option<JoinHandle<()>>,
-) -> Result<(), zinder_runtime::OpsServerError> {
-    let ops_shutdown_result = match ops_handle {
-        Some(handle) => handle.shutdown().await,
-        None => Ok(()),
-    };
-    if let Some(handle) = upstream_observation_handle {
-        let _ = handle.await;
+fn supervised_tasks(
+    operations: Option<OpsEndpointHandle>,
+    upstream_observation: Option<JoinHandle<()>>,
+    materialized_view_catchup: Option<JoinHandle<()>>,
+) -> SupervisedTasks {
+    let mut tasks = SupervisedTasks::new().with_operations_endpoint(operations);
+    if let Some(handle) = upstream_observation {
+        tasks = tasks.with("upstream-observation probe", handle);
     }
-    if let Some(handle) = materialized_view_catchup_handle {
-        let _ = handle.await;
+    if let Some(handle) = materialized_view_catchup {
+        tasks = tasks.with("materialized-view catch-up", handle);
     }
-    ops_shutdown_result
+    tasks
 }
 
 fn spawn_upstream_observation_probe(
@@ -545,7 +518,7 @@ mod tests {
         ComposedReadiness, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
     };
 
-    use super::{drain_readiness_on_cancel, spawn_materialized_view_catchup_task};
+    use super::spawn_materialized_view_catchup_task;
 
     async fn wait_for_cause(readiness: &Readiness, expected: &ReadinessCause) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -628,18 +601,7 @@ mod tests {
         assert!(readiness.report().is_ready);
         Ok(())
     }
-
-    #[tokio::test]
-    async fn cancellation_drains_readiness_before_server_shutdown() {
-        let readiness = Readiness::default();
-        let composed = ComposedReadiness::new(readiness.clone(), &[]);
-        composed.publish_admission(ReadinessState::ready(None));
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        drain_readiness_on_cancel(cancel, composed).await;
-
-        assert_eq!(readiness.report().cause, ReadinessCause::ShuttingDown);
-        assert!(!readiness.report().is_ready);
-    }
 }
+
+#[cfg(test)]
+mod supervision_tests;

@@ -65,8 +65,8 @@ pub(crate) enum ExplorerConfigError {
     #[error("explorer runtime failed: {0}")]
     Runtime(#[from] zinder_explorer::MaterializedViewError),
 
-    #[error("gRPC transport failed: {0}")]
-    Transport(#[from] tonic::transport::Error),
+    #[error(transparent)]
+    Supervision(#[from] zinder_runtime::RuntimeSupervisionError),
 
     #[error("gRPC reflection initialization failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),

@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::{ArrayParams, BatchRequestBuilder};
-use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient};
+use jsonrpsee::http_client::{HeaderMap, HeaderValue};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
@@ -50,6 +50,7 @@ use crate::{
     source_transparent_address::{
         UtxoRowBound, ZebraAddressBalance, ZebraAddressUtxo, decode_address_utxos,
     },
+    transport::ZebraSourceClient,
     zebra_ready_endpoint::ZebraReadyClient,
 };
 
@@ -154,7 +155,7 @@ const ZEBRA_JSON_RPC_PEER_LABEL: &str = "zebra_json_rpc";
 #[derive(Clone)]
 pub struct ZebraJsonRpcSource {
     network: Network,
-    client: ResilientClient<HttpClient>,
+    client: ResilientClient<ZebraSourceClient>,
     awaited_cookie: Option<Arc<AwaitedCookie>>,
     max_response_bytes: NonZeroU64,
     broadcast_timeout: Option<Duration>,
@@ -173,8 +174,8 @@ struct JsonRpcClientSettings {
 }
 
 impl JsonRpcClientSettings {
-    fn client_with(&self, headers: HeaderMap) -> Result<HttpClient, ZebraTransportError> {
-        crate::transport::build_zebra_json_rpc_client(
+    fn client_with(&self, headers: HeaderMap) -> Result<ZebraSourceClient, ZebraTransportError> {
+        crate::transport::build_zebra_source_client(
             &self.json_rpc_addr,
             self.request_timeout,
             self.max_response_bytes,
@@ -182,7 +183,7 @@ impl JsonRpcClientSettings {
         )
     }
 
-    fn authorized_client(&self) -> Result<HttpClient, SourceError> {
+    fn authorized_client(&self) -> Result<ZebraSourceClient, SourceError> {
         let headers = derive_authorization_headers(&self.node_auth)?;
         self.client_with(headers)
             .map_err(|error| SourceError::NodeUnavailable {
@@ -576,7 +577,7 @@ impl ZebraJsonRpcSource {
     ///
     /// While a cookie file awaited since construction is unread, this reads
     /// it first and fails when it is still missing or empty.
-    fn request_client(&self) -> Result<Arc<HttpClient>, SourceError> {
+    fn request_client(&self) -> Result<Arc<ZebraSourceClient>, SourceError> {
         if let Some(awaited) = &self.awaited_cookie
             && !awaited.read.load(Ordering::Acquire)
         {
@@ -778,11 +779,10 @@ impl ZebraJsonRpcSource {
             }
         };
 
-        let mut responses = batch_response.into_iter();
         let mut blocks = Vec::with_capacity(heights.len());
         let mut response_payload_bytes = 0_u64;
-        for height in heights {
-            let raw_block_value = next_batch_value(&mut responses, height, "getblock")?;
+        for (height, response) in heights.into_iter().zip(batch_response) {
+            let raw_block_value = response.map_err(|error| batch_block_error(height, &error))?;
             let raw_block_hex = raw_block_value.as_str().ok_or({
                 SourceError::SourceProtocolMismatch {
                     reason: "batched getblock response is not a hex string",
@@ -799,12 +799,6 @@ impl ZebraJsonRpcSource {
                 SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes_outcome)?;
             record_block_decode_stage("block_header", header_started_at);
             blocks.push(source_block);
-        }
-
-        if responses.next().is_some() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "batched block response contained more entries than requested",
-            });
         }
 
         Ok(BatchedSourceBlocks {
@@ -2111,25 +2105,8 @@ fn offending_range_split_retry_accounting(
     }
 }
 
-fn next_batch_value<'a>(
-    responses: &mut impl Iterator<Item = Result<Value, ErrorObject<'a>>>,
-    height: BlockHeight,
-    method: &'static str,
-) -> Result<Value, SourceError> {
-    match responses.next() {
-        Some(Ok(response_value)) => Ok(response_value),
-        Some(Err(error)) => Err(block_read_error(
-            height,
-            batch_call_error_message(method, &error),
-        )),
-        None => Err(SourceError::SourceProtocolMismatch {
-            reason: "batched block response contained fewer entries than requested",
-        }),
-    }
-}
-
-fn batch_call_error_message(method: &str, error: &ErrorObject<'_>) -> String {
-    format!("{method}: {}", error.message())
+fn batch_block_error(height: BlockHeight, error: &ErrorObject<'_>) -> SourceError {
+    block_read_error(height, format!("getblock: {}", error.message()))
 }
 
 pub(crate) fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
@@ -2771,6 +2748,11 @@ fn map_transport_error(
     operation: &'static str,
     max_response_bytes: NonZeroU64,
 ) -> SourceError {
+    if let ClientError::Transport(source) = error
+        && let Some(SourceError::SourceProtocolMismatch { reason }) = source.downcast_ref()
+    {
+        return SourceError::SourceProtocolMismatch { reason };
+    }
     if source_response_too_large_for_operation(error, operation) {
         SourceError::SourceResponseTooLarge {
             operation,
@@ -2827,12 +2809,8 @@ fn source_response_too_large_for_operation(error: &ClientError, operation: &'sta
 /// Bridges a raw jsonrpsee result into the transport-class signal
 /// [`ResilientClient::record_outcome`] consumes.
 ///
-/// A server-side JSON-RPC error ([`ClientError::Call`]) means the wire
-/// is fine but the server rejected the request; that must not advance
-/// the rebuild counter. Every other [`ClientError`] variant is a
-/// transport-layer failure (closed connection, deserialization on the
-/// transport layer, dispatch failure) and surfaces as
-/// [`SourceError::NodeUnavailable`] so the wrapper can react.
+/// A reply confirms the connection even when the node refuses a call or
+/// the batch fails the response size or ID checks.
 fn jsonrpsee_transport_signal<Response>(
     outcome: &Result<Response, ClientError>,
     operation: &'static str,
@@ -2840,8 +2818,14 @@ fn jsonrpsee_transport_signal<Response>(
 ) -> Result<(), SourceError> {
     match outcome {
         Ok(_) | Err(ClientError::Call(_)) => Ok(()),
-        Err(error) if source_response_too_large_for_operation(error, operation) => Ok(()),
-        Err(error) => Err(map_transport_error(error, operation, max_response_bytes)),
+        Err(error) => {
+            let source_error = map_transport_error(error, operation, max_response_bytes);
+            if crate::is_transport_failure(&source_error) {
+                Err(source_error)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -3005,19 +2989,13 @@ mod tests {
         );
         let out_of_range = ErrorObject::owned(-8, "height out of range", None::<()>);
 
-        let unreadable_outcome =
-            next_batch_value(&mut std::iter::once(Err(unreadable)), height, "getblock");
-        let out_of_range_outcome =
-            next_batch_value(&mut std::iter::once(Err(out_of_range)), height, "getblock");
-
         assert!(matches!(
-            unreadable_outcome,
-            Err(SourceError::HistoricalBlockBodyUnavailable { height: refused, .. })
-                if refused == height
+            batch_block_error(height, &unreadable),
+            SourceError::HistoricalBlockBodyUnavailable { height: refused, .. } if refused == height
         ));
         assert!(matches!(
-            out_of_range_outcome,
-            Err(SourceError::BlockUnavailable { height: refused, .. }) if refused == height
+            batch_block_error(height, &out_of_range),
+            SourceError::BlockUnavailable { height: refused, .. } if refused == height
         ));
     }
 
