@@ -68,6 +68,11 @@ enum ReadinessCause {
   // stays parked with the wallet unchanged until it restarts with a larger
   // limit or a later canonical event changes the transition.
   READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED = 20;
+  // Ingest found a stored canonical row that fails verification, so the
+  // canonical store is damaged. The writer keeps following and keeps its
+  // control plane up, and wallet-serving readers refuse traffic, until an
+  // operator rebuilds the store.
+  READINESS_CAUSE_CANONICAL_STORE_DAMAGED = 21;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.
@@ -136,6 +141,7 @@ message ReadinessCauseDetail {
     UpstreamNotReadyDetail upstream_not_ready = 9;
     ServingPairStaleDetail serving_pair_stale = 10;
     WalletTransitionLimitExceededDetail wallet_transition_limit_exceeded = 11;
+    CanonicalStoreDamagedDetail canonical_store_damaged = 12;
   }
 }
 
@@ -203,6 +209,20 @@ message WalletTransitionLimitExceededDetail {
   // Configured logical-byte limit for one following transition,
   // `projector.follow.max_transition_logical_bytes`.
   uint64 configured_bytes = 2;
+}
+
+// Detail for READINESS_CAUSE_CANONICAL_STORE_DAMAGED.
+//
+// Names the stored row an operator finds in the ingest log.
+message CanonicalStoreDamagedDetail {
+  // Height of the first stored row that failed verification. A damaged
+  // table block that holds several rows is reported at the first height it
+  // may hold.
+  uint32 height = 1;
+  // Node RPC name of the pool whose frontier failed: `sapling`, `orchard`, or
+  // `ironwood`. Absent when the row failed outside any one pool, such as a
+  // key that is not a height or a block that fails its checksum.
+  optional string pool = 2;
 }
 
 // Detail for READINESS_CAUSE_NODE_UNAVAILABLE.

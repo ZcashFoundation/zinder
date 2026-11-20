@@ -1098,6 +1098,7 @@ fn writer_status_for_fence(
         }),
         reorg_window_exceeded: None,
         tip_unconfirmed: false,
+        canonical_store_damaged: None,
     }
 }
 

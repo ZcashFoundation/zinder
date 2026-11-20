@@ -62,6 +62,15 @@ impl ShieldedProtocol {
         }
     }
 
+    /// Resolves a node RPC pool name, as [`Self::rpc_pool_name`] returns it,
+    /// into a known protocol.
+    #[must_use]
+    pub fn from_rpc_pool_name(pool_name: &str) -> Option<Self> {
+        [Self::Sapling, Self::Orchard, Self::Ironwood]
+            .into_iter()
+            .find(|protocol| protocol.rpc_pool_name() == pool_name)
+    }
+
     /// Returns the node-advertised upgrade name that activates this pool.
     #[must_use]
     pub const fn activation_upgrade_name(self) -> &'static str {

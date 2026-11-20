@@ -821,6 +821,7 @@ fn canonical_writer_status_admitted_schedule_round_trips_through_prost() -> eyre
         ),
         reorg_window_exceeded: None,
         tip_unconfirmed: false,
+        canonical_store_damaged: None,
     };
     let schedule = round_trip(&response)?
         .network_upgrade_schedule
@@ -912,6 +913,7 @@ fn parked_canonical_writer_status_round_trips_its_reorg_halt_with_the_frozen_fen
         network_upgrade_schedule: None,
         reorg_window_exceeded: Some(halt),
         tip_unconfirmed: true,
+        canonical_store_damaged: None,
     };
     let decoded = round_trip(&response)?;
     assert_eq!(decoded.reorg_window_exceeded, Some(halt));
@@ -936,6 +938,7 @@ fn canonical_writer_status_round_trips_an_unconfirmed_tip() -> eyre::Result<()> 
         network_upgrade_schedule: None,
         reorg_window_exceeded: None,
         tip_unconfirmed: true,
+        canonical_store_damaged: None,
     };
     let decoded = round_trip(&response)?;
     assert!(decoded.tip_unconfirmed);
@@ -947,6 +950,51 @@ fn canonical_writer_status_round_trips_an_unconfirmed_tip() -> eyre::Result<()> 
         ..decoded
     };
     assert!(!round_trip(&legacy)?.tip_unconfirmed);
+    Ok(())
+}
+
+#[test]
+fn canonical_writer_status_round_trips_store_damage_beside_the_fence() -> eyre::Result<()> {
+    let damage = zinder_proto::wire::canonical_store_damaged_detail(
+        BlockHeight::new(1_687_104),
+        Some(zinder_core::ShieldedProtocol::Orchard),
+    );
+    let response = ingest::CanonicalWriterStatusResponse {
+        network_name: "zcash-regtest".to_owned(),
+        fence: Some(ingest::CanonicalWriterFence {
+            chain_epoch_id: 7,
+            event_sequence: 7,
+            visible_tip_height: 2_000,
+            ..ingest::CanonicalWriterFence::default()
+        }),
+        oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: None,
+        reorg_window_exceeded: None,
+        tip_unconfirmed: false,
+        canonical_store_damaged: Some(damage),
+    };
+    let decoded = round_trip(&response)?;
+    assert_eq!(decoded, response);
+    let decoded_damage = decoded
+        .canonical_store_damaged
+        .as_ref()
+        .ok_or_else(|| eyre!("canonical_store_damaged missing"))?;
+    assert_eq!(decoded_damage.height, 1_687_104);
+    assert_eq!(
+        zinder_proto::wire::canonical_store_damaged_pool(decoded_damage),
+        Some(zinder_core::ShieldedProtocol::Orchard)
+    );
+    assert_eq!(
+        decoded.fence.as_ref().map(|fence| fence.visible_tip_height),
+        Some(2_000)
+    );
+    // A writer that predates the field encodes nothing, which decodes as an
+    // undamaged store.
+    let legacy = ingest::CanonicalWriterStatusResponse {
+        canonical_store_damaged: None,
+        ..decoded
+    };
+    assert_eq!(round_trip(&legacy)?.canonical_store_damaged, None);
     Ok(())
 }
 
@@ -1497,6 +1545,40 @@ fn ops_readiness_report_round_trips_a_wallet_transition_limit_park() -> eyre::Re
     assert_eq!(
         ops::ReadinessCause::WalletTransitionLimitExceeded.as_str_name(),
         "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED"
+    );
+    Ok(())
+}
+
+#[test]
+fn ops_readiness_report_round_trips_canonical_store_damage() -> eyre::Result<()> {
+    let report = ops::ReadinessReport {
+        cause: ops::ReadinessCause::CanonicalStoreDamaged as i32,
+        current_height: Some(4_602_673),
+        target_height: None,
+        detail: Some(ops::ReadinessCauseDetail {
+            payload: Some(ops::readiness_cause_detail::Payload::CanonicalStoreDamaged(
+                zinder_proto::wire::canonical_store_damaged_detail(
+                    BlockHeight::new(1_687_104),
+                    None,
+                ),
+            )),
+        }),
+        materialized_view_identities: Vec::new(),
+        degraded: Vec::new(),
+        served_epoch_age_seconds: None,
+        active_node: None,
+    };
+
+    let decoded = round_trip(&report)?;
+
+    assert_eq!(decoded, report);
+    assert_eq!(
+        ops::ReadinessCause::try_from(21)?,
+        ops::ReadinessCause::CanonicalStoreDamaged
+    );
+    assert_eq!(
+        ops::ReadinessCause::CanonicalStoreDamaged.as_str_name(),
+        "READINESS_CAUSE_CANONICAL_STORE_DAMAGED"
     );
     Ok(())
 }

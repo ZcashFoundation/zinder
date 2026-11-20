@@ -27,6 +27,7 @@ entrypoint_function() {
 for function_name in \
   readiness_cause_is_terminal \
   readiness_cause_is_writer_halt \
+  readiness_cause_is_store_damage \
   readiness_cause_is_projector_park \
   readiness_cause_is_upstream_outage \
   writer_node_outage_behind_syncing_ingest \
@@ -135,6 +136,7 @@ serve() {
 }
 
 halted_body='{"ready":false,"cause":{"reorg_window_exceeded":{"depth":1001,"configured":1000}},"current_height":4200}'
+damaged_body='{"ready":false,"phase":"following_tip","cause":{"canonical_store_damaged":{"height":1687104,"pool":"orchard"}},"current_height":4602673}'
 schema_body='{"ready":false,"cause":"schema_mismatch"}'
 syncing_body='{"ready":false,"cause":{"syncing":{"lag_blocks":12}}}'
 ready_body='{"ready":true,"cause":"ready"}'
@@ -170,6 +172,40 @@ fi
 if readiness_cause_is_writer_halt wallet_transition_limit_exceeded; then
   test_failure "a projector park is not a writer halt"
 fi
+
+# Ingest that found a damaged row in the canonical store, and the readers that
+# refuse wallets over it, keep the topology up: every start finds the same
+# row, so a restart would only repeat the refusal.
+if readiness_cause_is_terminal canonical_store_damaged; then
+  test_failure "canonical store damage must not terminate the container"
+fi
+readiness_cause_is_store_damage canonical_store_damaged \
+  || test_failure "canonical_store_damaged must be served as store damage"
+for other_cause in storage_unavailable writer_status_unavailable reorg_window_exceeded syncing; do
+  if readiness_cause_is_store_damage "$other_cause"; then
+    test_failure "$other_cause is not canonical store damage"
+  fi
+done
+serve 503 "$damaged_body"
+probe_readiness 127.0.0.1:9105
+# shellcheck disable=SC2154 # assigned by the evaluated probe_readiness
+[ "$probe_cause" = "canonical_store_damaged" ] \
+  || test_failure "probe parsed cause '$probe_cause' from a damaged store's readiness"
+for damaged_role in zinder-ingest zinder-query zinder-compat-lightwalletd; do
+  serve 503 "$damaged_body"
+  observe_plane_readiness "$damaged_role" 127.0.0.1:9105 \
+    || test_failure "$damaged_role reporting canonical store damage must count as serving"
+  # shellcheck disable=SC2154 # assigned by the evaluated observe_plane_readiness
+  [ "$probe_damaged" -eq 1 ] || test_failure "$damaged_role's store damage must be reported"
+  [ "$probe_halted" -eq 0 ] || test_failure "store damage is not a writer halt"
+done
+serve 503 "$damaged_body"
+sleep_count=0
+fail_message=""
+await_readiness zinder-ingest 127.0.0.1:9105 60 \
+  || test_failure "startup must continue past a damaged canonical store"
+[ -z "$fail_message" ] || test_failure "startup failed on a damaged canonical store: $fail_message"
+[ "$sleep_count" -eq 0 ] || test_failure "startup waited on a damaged canonical store"
 
 serve 503 "$halted_body"
 probe_readiness 127.0.0.1:9106
@@ -901,6 +937,8 @@ run_healthcheck 200 "$ready_body" \
   || test_failure "the healthcheck must pass a ready query plane"
 run_healthcheck 503 "$halted_body" \
   || test_failure "the healthcheck must pass a query plane serving the writer halt"
+run_healthcheck 503 "$damaged_body" \
+  || test_failure "the healthcheck must pass a query plane refusing a damaged canonical store"
 if run_healthcheck 503 "$syncing_body"; then
   test_failure "the healthcheck must fail a syncing query plane"
 fi
@@ -929,6 +967,8 @@ run_compat_healthcheck 200 "$ready_body" \
   || test_failure "the healthcheck must pass two ready readers"
 run_compat_healthcheck 503 "$halted_body" \
   || test_failure "the healthcheck must pass a compatibility plane serving the writer halt"
+run_compat_healthcheck 503 "$damaged_body" \
+  || test_failure "the healthcheck must pass a compatibility plane refusing a damaged canonical store"
 if run_compat_healthcheck 503 "$syncing_body"; then
   test_failure "the healthcheck must fail a syncing compatibility plane behind a ready query plane"
 fi

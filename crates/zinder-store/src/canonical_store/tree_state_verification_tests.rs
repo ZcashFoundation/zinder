@@ -9,18 +9,21 @@ use std::num::NonZeroU32;
 
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHeight, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
+    BlockHeight, BlockHeightRange, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
     NetworkUpgradeActivations, ShieldedProtocol,
 };
 
 use super::{
-    RocksDbCanonicalStore, TreeStateCheckpointMismatch, TreeStateCheckpointSelection,
+    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    TreeStateCheckpointMismatch, TreeStateCheckpointSelection,
     block_load::{encode_block_position, encode_tree_state_checkpoint},
     live_replacement_tests::published_store,
     publication::column_family,
     rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    secondary_tests::{compact_away_rows_in, split_rows_into_bottom_level_files, table_file_path},
     test_network_upgrade_activations,
 };
+use crate::{RawBlobRetention, RocksDbResourceBudget};
 
 const TIP_HEIGHT: u32 = 150;
 const SETTLED_HEIGHT: u32 = 120;
@@ -180,6 +183,133 @@ fn a_row_that_fails_outside_any_frontier_is_a_mismatch_without_a_pool() -> TestR
     Ok(())
 }
 
+/// A key that extends a height key is found again from its reported height.
+///
+/// Such a key sorts between two heights, so a restart that resumes at the
+/// reported height finds the damage instead of skipping it.
+#[test]
+fn a_key_extending_a_height_key_is_found_again_from_its_reported_height() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    let family = column_family(&store.bounded_open.db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    let mut extended_key = encode_block_position(BlockHeight::new(40)).to_vec();
+    extended_key.push(0);
+    let row = stored_row(&store, BlockHeight::new(40))?;
+    store.bounded_open.db.put_cf(&family, extended_key, row)?;
+    let activations = activations()?;
+
+    let first =
+        store.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
+    let mismatch = first
+        .mismatch
+        .ok_or("a key that is not a height must fail")?;
+    assert_eq!(
+        (mismatch.height, mismatch.pool),
+        (BlockHeight::new(41), None)
+    );
+    assert_eq!(first.verified_rows, 41);
+
+    let again = store.verify_tree_state_checkpoints(mismatch.height, rows(1_000)?, &activations)?;
+    assert_eq!(
+        again.mismatch.map(|mismatch| mismatch.height),
+        Some(BlockHeight::new(41))
+    );
+    assert_eq!(again.verified_rows, 0);
+    Ok(())
+}
+
+/// A table block that fails its checksum is damage, reported like a row that
+/// fails a check, even when an earlier pass read the same block intact.
+#[test]
+fn a_corrupt_table_block_is_a_mismatch_even_after_an_intact_pass() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    split_rows_into_bottom_level_files(
+        &store.bounded_open.db,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    )?;
+    let activations = activations()?;
+    let intact =
+        store.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
+    assert_eq!(intact.mismatch, None);
+
+    let corrupted_height = BlockHeight::new(50);
+    corrupt_table_file_holding(&store, corrupted_height)?;
+    let verification =
+        store.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
+
+    let mismatch = verification
+        .mismatch
+        .ok_or("a corrupt table block must fail verification")?;
+    assert_eq!((mismatch.height, mismatch.pool), (corrupted_height, None));
+    assert!(mismatch.reason.contains("corrupt"), "{}", mismatch.reason);
+    assert_eq!(verification.verified_rows, 50);
+    assert_eq!(verification.next_from, corrupted_height);
+    Ok(())
+}
+
+/// A table file the primary deleted under a secondary is not damage.
+///
+/// The verification stops with an error that keeps the rows it already
+/// verified, and continues from there once the secondary catches up.
+#[test]
+fn a_compacted_away_table_file_stops_verification_with_its_progress() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    let db = &store.bounded_open.db;
+    split_rows_into_bottom_level_files(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    let activations = activations()?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        temporary.path().join("canonical"),
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    for height in 60..=100 {
+        let height = BlockHeight::new(height);
+        db.put_cf(
+            &family,
+            encode_block_position(height),
+            stored_row(&store, height)?,
+        )?;
+    }
+    db.flush_cf(&family)?;
+    compact_away_rows_in(
+        db,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(BlockHeight::new(60), BlockHeight::new(100)),
+    )?;
+
+    let interrupted = secondary
+        .verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)
+        .err()
+        .ok_or("a deleted table file must stop verification")?;
+    assert!(
+        interrupted.source.is_missing_table_file(),
+        "{:?}",
+        interrupted.source
+    );
+    assert_eq!(
+        (interrupted.verified_rows, interrupted.next_from),
+        (60, BlockHeight::new(60))
+    );
+
+    secondary.try_catch_up()?;
+    let resumed = secondary.verify_tree_state_checkpoints(
+        interrupted.next_from,
+        rows(1_000)?,
+        &activations,
+    )?;
+    assert_eq!(resumed.mismatch, None);
+    assert_eq!(resumed.verified_rows, SETTLED_ROWS - 60);
+    assert!(resumed.reached_settled_tip);
+    Ok(())
+}
+
 #[test]
 fn rows_above_the_settled_tip_are_not_verified() -> TestResult {
     let temporary = TempDir::new()?;
@@ -267,5 +397,31 @@ fn replace_row(store: &RocksDbCanonicalStore, height: BlockHeight, row: &[u8]) -
         .bounded_open
         .db
         .put_cf(&family, encode_block_position(height), row)?;
+    Ok(())
+}
+
+/// Flips the first byte of the table file that holds only the row at
+/// `height`, which breaks its first data block's checksum without touching
+/// the footer or index.
+fn corrupt_table_file_holding(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestResult {
+    let key = encode_block_position(height);
+    let file = store
+        .bounded_open
+        .db
+        .live_files()?
+        .into_iter()
+        .find(|file| {
+            file.column_family_name == TREE_STATE_CHECKPOINT_COLUMN_FAMILY
+                && file.start_key.as_deref() == Some(key.as_slice())
+                && file.end_key.as_deref() == Some(key.as_slice())
+        })
+        .map(|file| table_file_path(&file))
+        .ok_or("the row must have a table file of its own")?;
+    let mut table_bytes = std::fs::read(&file)?;
+    let first_byte = table_bytes
+        .first_mut()
+        .ok_or("a table file is never empty")?;
+    *first_byte ^= 0xff;
+    std::fs::write(&file, table_bytes)?;
     Ok(())
 }

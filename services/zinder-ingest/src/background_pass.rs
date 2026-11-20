@@ -39,18 +39,23 @@ impl BackgroundSecondary<'_> {
     /// none is, or returns `None` once `cancel` fires.
     ///
     /// Opening catches the secondary up and admits the store, which reads
-    /// retained history, so each attempt waits for `gate` and runs off the
-    /// async workers live ingest uses. The first failed attempt logs
-    /// `unavailable_event`.
+    /// retained history, so each attempt runs off the async workers live
+    /// ingest uses and, when `gate` is set, waits for it first. The first
+    /// failed attempt logs `unavailable_event`.
     pub(crate) async fn open_when_published(
         &self,
-        gate: &HistoricalWorkGate,
+        gate: Option<&HistoricalWorkGate>,
         cancel: &CancellationToken,
         unavailable_event: &'static str,
     ) -> Option<RocksDbCanonicalSecondary> {
         let mut waiting_logged = false;
         loop {
-            if wait_until_historical_work_or_cancelled(gate, cancel).await {
+            if let Some(gate) = gate
+                && wait_until_historical_work_or_cancelled(gate, cancel).await
+            {
+                return None;
+            }
+            if cancel.is_cancelled() {
                 return None;
             }
             match self.open().await {

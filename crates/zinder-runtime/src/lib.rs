@@ -85,7 +85,7 @@ pub use canonical_fence_attestation::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
     WriterAttestation, classify_canonical_writer_fence, compare_canonical_writer_fences,
-    converge_on_canonical_writer_fence, expected_writer_fence,
+    converge_on_canonical_writer_fence, expected_writer_fence, sleep_until_stale_deadline,
     writer_attests_network_upgrade_schedule,
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};

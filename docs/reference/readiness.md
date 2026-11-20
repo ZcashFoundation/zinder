@@ -198,7 +198,8 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
 | `node_capability_missing` | Refused | The node lacks a capability the runtime needs. Detail: `capability`. | Configure or upgrade the node to provide it. |
 | `upstream_not_ready` | Refused | The node answers but is not synchronized. Detail: node heights, verification progress, and the health source and reason. | Wait for the node to sync. |
-| `storage_unavailable` | Refused | A required store cannot be opened or read, or ingest found a damaged row in it. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). |
+| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). |
+| `canonical_store_damaged` | Refused | Ingest found a stored row of the canonical store that fails verification. Ingest and the store's wallet-serving readers report it. Detail: `height` and, when one pool's frontier failed, `pool`. | Rebuild the canonical store; see [Recovery](../architecture/service-operations.md#recovery). Restarting does not help: ingest reports the recorded damage again until it checks the row. |
 | `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). |
 | `reorg_window_exceeded` | Refused | Ingest refused a reorg deeper than its reorg window and stopped following. Detail: `depth`, `configured`, and `covered`. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores; see [Recovery](../architecture/service-operations.md#recovery). Restarting ingest parks it again. |
 | `wallet_transition_limit_exceeded` | Refused | The projector parked because its next wallet update needs more memory than `projector.follow.max_transition_logical_bytes` allows. Detail: `required_bytes`, `configured_bytes`. | Restart the projector with a larger limit, as in [Wallet transition exceeds its logical-byte limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit). It resumes without a rebuild. |
@@ -230,6 +231,10 @@ A runtime with more than one readiness input picks one cause in this order:
 
 A dependency input never supplies the cause, except for step 2.
 
+A writer that finds damage in its store while it is parked on a reorg keeps
+reporting `reorg_window_exceeded`, and so do its readers: the halt's typed
+refusal outranks the damage, which ingest still logs and reports to readers.
+
 ## Per-runtime readiness
 
 ### Ingest
@@ -246,7 +251,7 @@ snapshot for up to 30 seconds while it loads the next one.
 | `node_unavailable` | The active node fails. Ingest keeps its state and retries. |
 | `upstream_not_ready` | The `[node.health]` probe reports the node not synchronized. |
 | `reorg_window_exceeded` | A reorg was deeper than the window. Only shutdown replaces it. |
-| `storage_unavailable` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. It also refuses `CanonicalControl.WriterStatus`, and readers stop serving once their staleness ceiling passes. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
+| `canonical_store_damaged` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. Every `CanonicalControl.WriterStatus` answer reports the damage, so readers refuse traffic on their next refresh. After a restart, writer status reports the recorded damage from its first answer, and ingest reports this cause again once the verification pass confirms the row, which it checks as soon as the store is published. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
 | `cursor_at_risk` | Explorer view replay falls near the event-retention limit. |
 
 `IngestControl.WriterStatus` reports the health probe's latest observation
@@ -270,7 +275,10 @@ following the canonical store at a position the writer attests.
 
 The heights the projector reports are the wallet's, not the canonical
 store's. A parked projector stops wallet updates, so wallet-serving readers
-fall behind and stop serving once their staleness ceiling passes.
+fall behind and stop serving once their staleness ceiling passes. The
+projector keeps following a writer that reports damage in its store, as it
+follows a parked writer's fence; only the wallet-serving readers refuse
+traffic over it.
 
 ### Wallet-serving readers
 
@@ -283,8 +291,9 @@ status RPC. The pair alone decides readiness. The reasons are recorded in
 | Cause | When |
 | --- | --- |
 | `ready` | The published pair matches what the writer attests. |
-| `serving_pair_stale` | A refresh fails for a transient reason, such as lag, a status-RPC outage, or a store file compacted away. Traffic continues until `storage.serving_pair_staleness_ceiling_ms` (5 minutes by default) passes since the last attestation. |
-| `writer_status_unavailable`, `replica_lagging` | The ceiling passed. The underlying cause takes over and traffic stops. Ingest also refuses writer status once it finds a damaged row in the canonical store. Check ingest's `/readyz` for `storage_unavailable`. |
+| `serving_pair_stale` | A refresh fails for a transient reason, such as lag, a status-RPC outage, or a store file compacted away. Traffic continues until `storage.serving_pair_staleness_ceiling_ms` (5 minutes by default) passes since the last attestation. The reader refreshes when the ceiling passes even if `storage.secondary_catchup_interval_ms` is longer, so traffic stops then. |
+| `writer_status_unavailable`, `replica_lagging` | The ceiling passed. The underlying cause takes over and traffic stops. |
+| `canonical_store_damaged` | Ingest reports damage in the canonical store. Traffic stops on the next refresh, with no staleness allowance, and stays stopped through a writer-status outage until ingest reports no damage. New requests fail with `SERVICE_NOT_READY`. |
 | `canonical_tip_unconfirmed` | Ingest restarted and has not confirmed its tip. |
 | `reorg_window_exceeded` | Ingest is parked. New requests fail with `REORG_WINDOW_EXCEEDED` and open event streams end. |
 | `storage_unavailable`, `schema_mismatch` | Fail closed at once, as does a writer fence that disagrees with the pair. |

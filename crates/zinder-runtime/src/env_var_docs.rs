@@ -796,9 +796,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Longest a wallet-serving pair keeps admitting traffic, in milliseconds, \
-                      after the last writer attestation. Past it the cause of the failed \
-                      refresh replaces `serving_pair_stale` and traffic stops. Defaults to \
-                      300000. Must be greater than zero.",
+                      after the last writer attestation. The reader refreshes when it \
+                      passes, even if `storage.secondary_catchup_interval_ms` is longer, and \
+                      the cause of the failed refresh then replaces `serving_pair_stale` and \
+                      traffic stops. Defaults to 300000. Must be greater than zero.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL_PATH",
@@ -1704,8 +1705,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Whether ingest verifies its stored tree-state checkpoints in the \
                       background, in repeated cycles over every settled row: each row must \
                       derive the roots stored in it and carry a frontier for exactly the \
-                      pools active at its height. A row that fails withdraws ingest \
-                      readiness with `storage_unavailable` until the store is rebuilt. \
+                      pools active at its height. A row that fails parks ingest \
+                      readiness with `canonical_store_damaged` and makes the store's \
+                      wallet-serving readers refuse traffic, until the store is rebuilt. \
+                      With the pass disabled, damage it recorded before stays reported. \
                       Defaults to `true`.",
     },
     EnvVarDoc {

@@ -736,6 +736,7 @@ impl CanonicalControl for RecordingCanonicalControl {
                 }),
                 reorg_window_exceeded: None,
                 tip_unconfirmed: false,
+                canonical_store_damaged: None,
             })
         })
         .map(Response::new)

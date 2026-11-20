@@ -39,7 +39,8 @@ pub use canonical_store::{
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState,
     TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointMismatch, TreeStateCheckpointSelection,
     TreeStateCheckpointVerification, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
-    TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan, ValidatedRocksDbCanonicalBuild,
+    TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan, TreeStateVerificationError,
+    ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

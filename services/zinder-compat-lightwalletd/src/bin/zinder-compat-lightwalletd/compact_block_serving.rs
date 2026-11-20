@@ -38,7 +38,7 @@ use zinder_runtime::{
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
     ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
     classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
-    expected_writer_fence,
+    expected_writer_fence, sleep_until_stale_deadline,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
@@ -287,13 +287,15 @@ impl CompactBlockPublisher {
     ) -> JoinHandle<Result<(), CompactBlockServingError>> {
         tokio::spawn(async move {
             loop {
+                // The staleness deadline holds the ceiling when the catch-up
+                // interval is longer than it.
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(self.config.catchup_interval) => {
-                        self.refresh().await;
-                        self.record_resource_gauges().await;
-                    }
+                    () = tokio::time::sleep(self.config.catchup_interval) => {}
+                    () = sleep_until_stale_deadline(self.writer_attestation.stale_deadline()) => {}
                 }
+                self.refresh().await;
+                self.record_resource_gauges().await;
             }
             serving_drained.cancelled().await;
             tear_down_on_blocking_thread(self).await
@@ -1772,6 +1774,7 @@ mod tests {
             }),
             reorg_window_exceeded: None,
             tip_unconfirmed: false,
+            canonical_store_damaged: None,
         }
     }
 
@@ -2561,6 +2564,155 @@ mod tests {
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())
+    }
+
+    /// Compact serving refuses at once while the writer reports store damage.
+    ///
+    /// It refuses on the next refresh, keeps refusing through a
+    /// writer-status outage, and admits traffic again once a status reports
+    /// no damage.
+    #[tokio::test]
+    async fn publisher_refuses_at_once_while_the_writer_reports_store_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (mut publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_mins(1))?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                BlockHeight::new(1),
+                None,
+            )),
+            ..lifecycle_writer_status(&primary)
+        });
+        publisher.refresh().await;
+        let damaged = ReadinessCause::CanonicalStoreDamaged {
+            height: 1,
+            pool: None,
+        };
+        assert_eq!(readiness.report().cause, damaged);
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        publisher.refresh().await;
+        assert_eq!(readiness.report().cause, damaged);
+
+        control.set_available(true);
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// The staleness ceiling holds when the catch-up interval is longer.
+    ///
+    /// The publisher stops admitting traffic on an unattested reader once
+    /// the ceiling passes, before its next scheduled refresh.
+    #[tokio::test]
+    async fn the_staleness_ceiling_holds_with_a_longer_catch_up_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_millis(200);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_available(false);
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(staleness_ceiling * 4).await;
+        let after_ceiling = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            !after_ceiling.is_ready,
+            "an unattested reader must stop admitting traffic at the ceiling: {:?}",
+            after_ceiling.cause
+        );
+        drop(slot);
+        drop(primary);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// Serves `control` until the returned sender fires.
+    async fn serve_control(
+        control: &MutableCanonicalControl,
+    ) -> Result<
+        (
+            String,
+            oneshot::Sender<()>,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        Ok((endpoint, shutdown_sender, server))
+    }
+
+    fn compact_serving_config(
+        temporary: &tempfile::TempDir,
+        catchup_interval: Duration,
+        staleness_ceiling: Duration,
+    ) -> Result<CompactBlockServingConfig, Box<dyn std::error::Error>> {
+        Ok(CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval,
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling,
+            lag_threshold: 0,
+        })
     }
 
     /// Compact serving refuses a writer that has not confirmed its tip since

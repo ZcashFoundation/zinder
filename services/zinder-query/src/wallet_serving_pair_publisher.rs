@@ -67,7 +67,7 @@ use zinder_runtime::{
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, ComposedReadiness,
     NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
     UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation, classify_canonical_writer_fence,
-    connect_zinder_grpc, converge_on_canonical_writer_fence,
+    connect_zinder_grpc, converge_on_canonical_writer_fence, sleep_until_stale_deadline,
     writer_attests_network_upgrade_schedule,
 };
 use zinder_source::{
@@ -1142,10 +1142,13 @@ impl WalletServingPairPublisher {
     /// Runs bounded refreshes until shutdown, then retains reader ownership
     /// until the serving runtime confirms its request paths have drained.
     ///
-    /// A refresh runs every catch-up interval, and at once when a read first
-    /// finds a pair missing a table file. Every refresh failure leaves the
-    /// current immutable pair untouched and updates readiness with its typed
-    /// cause; it never falls back to a primary store.
+    /// A refresh runs every catch-up interval, at once when a read first
+    /// finds a pair missing a table file, and when the staleness ceiling
+    /// passes after the writer last attested the pair, so a catch-up interval
+    /// longer than the ceiling cannot keep admitting traffic past it. Every
+    /// refresh failure leaves the current immutable pair untouched and
+    /// updates readiness with its typed cause; it never falls back to a
+    /// primary store.
     ///
     /// The task closes the publisher's secondaries on a blocking thread once
     /// `serving_runtime_drained` is cancelled, and fails when that teardown
@@ -1166,6 +1169,7 @@ impl WalletServingPairPublisher {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {}
                     () = missing_table_file_reported(signals.as_deref()) => {}
+                    () = sleep_until_stale_deadline(self.writer_attestation.stale_deadline()) => {}
                 }
                 self.refresh_and_record().await;
             }
@@ -5157,6 +5161,142 @@ mod tests {
         Ok(())
     }
 
+    /// The pair refuses at once while the writer reports store damage.
+    ///
+    /// It refuses on the next refresh, with no staleness allowance, and keeps
+    /// refusing through a writer-status outage until a status reports no
+    /// damage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pair_refuses_at_once_while_the_writer_reports_store_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let (endpoint, cancel, server_task) = serve_canonical_control(control.clone()).await?;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, _slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                )?,
+                WalletServingReadiness::pair_only(readiness.clone()),
+                &endpoint,
+                None,
+            )
+            .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(zinder_proto::wire::canonical_store_damaged_detail(
+                BlockHeight::new(1),
+                Some(zinder_core::ShieldedProtocol::Sapling),
+            )),
+            ..writer_status_for_store(&canonical_primary)
+        });
+        publisher.refresh_once().await?;
+        let damaged = zinder_runtime::ReadinessCause::CanonicalStoreDamaged {
+            height: 1,
+            pool: Some("sapling"),
+        };
+        assert_eq!(readiness.report().cause, damaged);
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        let outage = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("refresh must fail during a writer-status outage")?;
+        publisher.record_refresh_failure(&outage);
+        assert_eq!(readiness.report().cause, damaged);
+
+        control.set_available(true);
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+        publisher.refresh_once().await?;
+        assert!(readiness.report().is_ready);
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
+    /// The staleness ceiling holds when the catch-up interval is longer.
+    ///
+    /// The reader stops admitting traffic on an unattested pair once the
+    /// ceiling passes, before its next scheduled refresh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_staleness_ceiling_holds_with_a_longer_catch_up_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_millis(200);
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let (endpoint, cancel, server_task) = serve_canonical_control(control.clone()).await?;
+        let readiness = zinder_runtime::Readiness::default();
+        let mut config = wallet_serving_pair_config(
+            canonical_primary_path.clone(),
+            temporary.path().join("canonical-secondaries"),
+            wallet_primary_path.clone(),
+            temporary.path().join("wallet-secondaries"),
+        )?;
+        config.catchup_interval = Duration::from_hours(1);
+        config.serving_pair_staleness_ceiling = staleness_ceiling;
+        let (publisher, _slot) = WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+            config,
+            WalletServingReadiness::pair_only(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_available(false);
+        let publisher_cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(publisher_cancel.clone(), drained.clone());
+        tokio::time::sleep(staleness_ceiling * 4).await;
+        let after_ceiling = readiness.report();
+        publisher_cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            !after_ceiling.is_ready,
+            "an unattested pair must stop admitting traffic at the ceiling: {:?}",
+            after_ceiling.cause
+        );
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
     /// The serving pair refuses a parked writer with its halt.
     ///
     /// A parked writer keeps attesting its frozen fence, so the publisher
@@ -7605,6 +7745,7 @@ mod tests {
             network_upgrade_schedule: None,
             reorg_window_exceeded: None,
             tip_unconfirmed: false,
+            canonical_store_damaged: None,
         }
     }
 
@@ -7855,6 +7996,7 @@ mod tests {
             network_upgrade_schedule: None,
             reorg_window_exceeded: None,
             tip_unconfirmed: false,
+            canonical_store_damaged: None,
         }
     }
 

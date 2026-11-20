@@ -59,8 +59,8 @@ pub use chain_name::{
     decode_zinder_native_chain_name, encode_bip70_chain_name, encode_zinder_native_chain_name,
 };
 pub use height_key::{
-    HEIGHT_KEY_LEN, decode_height_key_ascending, decode_height_key_descending,
-    encode_height_key_ascending, encode_height_key_descending,
+    HEIGHT_KEY_LEN, ascending_height_key_scan_start, decode_height_key_ascending,
+    decode_height_key_descending, encode_height_key_ascending, encode_height_key_descending,
 };
 pub use in_block_position::{
     IN_BLOCK_POSITION_KEY_LEN, decode_in_block_position, encode_in_block_position,

@@ -1811,7 +1811,7 @@ mod tests {
             canonical.clone(),
             CanonicalCheckpointStagingRoot::new(checkpoint_staging_root),
             RocksDbResourceBudget::for_local_tests(),
-            readiness.clone(),
+            crate::CanonicalStoreDamageSignal::default(),
         )
         .with_bearer_token(Some(bearer_token.clone()));
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(

@@ -5,7 +5,7 @@
 //! publishes before it uses that view. This module owns the comparison, the
 //! bounded catch-up loop, and the [`WriterAttestation`] rules that refuse
 //! traffic while a parked or unconfirmed writer keeps attesting a frozen
-//! fence. It holds no control-plane client or credential: callers read writer
+//! fence, or while a writer reports damage in its store. It holds no control-plane client or credential: callers read writer
 //! status through their own [`CanonicalFenceProbe`].
 
 use std::{future::Future, num::NonZeroU32, time::Duration};
@@ -324,12 +324,15 @@ where
 ///
 /// A writer parked on a reorg deeper than its window, and a writer that has
 /// not confirmed its tip since it reopened, both keep attesting their frozen
-/// fence, so their status refuses traffic instead. A halt is remembered until
-/// a valid status carries neither the halt nor an unconfirmed tip: a writer
-/// that restarts after a park reports the halt again only once it rediscovers
-/// the reorg, and a writer-status outage must not reopen traffic. Only a
-/// following writer with a confirmed tip earns the staleness allowance that
-/// keeps a lagging reader admitting traffic.
+/// fence, so their status refuses traffic instead. A writer that reports
+/// damage in its store keeps attesting its fence while it commits, and its
+/// status refuses traffic too, after a reorg halt the same status reports. A
+/// halt or store damage is remembered until a valid status carries neither
+/// it nor an unconfirmed tip: a writer that restarts after a park reports the
+/// halt again only once it rediscovers the reorg, and a writer-status outage
+/// must not reopen traffic. Only a following writer with a confirmed tip and
+/// an undamaged store earns the staleness allowance that keeps a lagging
+/// reader admitting traffic.
 #[derive(Debug)]
 pub struct WriterAttestation {
     network: Network,
@@ -353,11 +356,12 @@ impl WriterAttestation {
 
     /// Returns the not-ready state `status` imposes on a reader whose visible
     /// tip is at `visible_height`, or `None` when the writer follows with a
-    /// confirmed tip.
+    /// confirmed tip and reports no damage in its store.
     ///
-    /// A refusal withdraws the staleness allowance. A halt or unconfirmed tip
-    /// reported for another network is not honoured; such a status clears the
-    /// remembered halt and falls through to the caller's fence validation.
+    /// A refusal withdraws the staleness allowance. A halt, store damage, or
+    /// unconfirmed tip reported for another network is not honoured; such a
+    /// status clears the remembered halt and falls through to the caller's
+    /// fence validation.
     pub fn observe(
         &mut self,
         status: &CanonicalWriterStatusResponse,
@@ -383,6 +387,11 @@ impl WriterAttestation {
             let halt = refusing(ReadinessCause::from(halt), visible_height);
             self.remembered_halt = Some(halt.clone());
             return Some(halt);
+        }
+        if let Some(damage) = status.canonical_store_damaged.as_ref() {
+            let damage = refusing(ReadinessCause::from(damage), visible_height);
+            self.remembered_halt = Some(damage.clone());
+            return Some(damage);
         }
         if status.tip_unconfirmed {
             return Some(self.remembered_halt.clone().unwrap_or_else(|| {
@@ -420,8 +429,8 @@ impl WriterAttestation {
         self.attested_at = Some(Instant::now());
     }
 
-    /// Returns the halt the writer last reported, which a reader keeps
-    /// publishing through writer-status failures.
+    /// Returns the halt or store damage the writer last reported, which a
+    /// reader keeps publishing through writer-status failures.
     #[must_use]
     pub fn remembered_halt(&self) -> Option<ReadinessState> {
         self.remembered_halt.clone()
@@ -435,6 +444,32 @@ impl WriterAttestation {
         self.attested_at
             .map(|attested_at| attested_at.elapsed())
             .filter(|staleness| *staleness < self.staleness_ceiling)
+    }
+
+    /// Returns when the staleness allowance runs out, while it still runs.
+    ///
+    /// A reader refreshes no later than this instant, so a reader whose
+    /// refresh interval exceeds the ceiling still stops admitting traffic on
+    /// an unattested view once the ceiling passes. `None` once the ceiling
+    /// has passed or while no following writer with a confirmed tip has
+    /// attested the reader, so a lapsed allowance never schedules a refresh.
+    #[must_use]
+    pub fn stale_deadline(&self) -> Option<Instant> {
+        self.stale_allowance()?;
+        self.attested_at
+            .map(|attested_at| attested_at + self.staleness_ceiling)
+    }
+}
+
+/// Completes at `deadline`, or never when there is none.
+///
+/// A reader's refresh loop selects on it beside its refresh interval, with
+/// [`WriterAttestation::stale_deadline`], so the staleness ceiling holds even
+/// when the interval is longer.
+pub async fn sleep_until_stale_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -454,7 +489,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
-        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, Network,
+        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, Network, ShieldedProtocol,
         wire::encode_zinder_native_chain_name,
     };
     use zinder_proto::{
@@ -465,14 +500,15 @@ mod tests {
             },
             ops::ReorgWindowExceededDetail,
         },
-        wire::canonical_writer_fence_message,
+        wire::{canonical_store_damaged_detail, canonical_writer_fence_message},
     };
 
     use super::{
         CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
         CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
         WriterAttestation, classify_canonical_writer_fence, compare_canonical_writer_fences,
-        converge_on_canonical_writer_fence, writer_attests_network_upgrade_schedule,
+        converge_on_canonical_writer_fence, sleep_until_stale_deadline,
+        writer_attests_network_upgrade_schedule,
     };
     use crate::{ReadinessCause, ReadinessState};
 
@@ -1119,6 +1155,103 @@ mod tests {
             tip_unconfirmed: true,
             ..following_writer_status()
         }
+    }
+
+    fn damaged_store_writer_status() -> CanonicalWriterStatusResponse {
+        CanonicalWriterStatusResponse {
+            canonical_store_damaged: Some(canonical_store_damaged_detail(
+                BlockHeight::new(42),
+                Some(ShieldedProtocol::Orchard),
+            )),
+            ..following_writer_status()
+        }
+    }
+
+    /// Store damage refuses at once, without the staleness allowance, and
+    /// stays through writer-status outages until a status reports none.
+    #[test]
+    fn writer_reporting_store_damage_refuses_at_once_and_is_remembered() {
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_mins(1));
+        attestation.attest();
+        let damaged = ReadinessState {
+            current_height: Some(7),
+            ..ReadinessState::not_ready(ReadinessCause::CanonicalStoreDamaged {
+                height: 42,
+                pool: Some("orchard"),
+            })
+        };
+
+        assert_eq!(
+            attestation.observe(&damaged_store_writer_status(), Some(7)),
+            Some(damaged.clone())
+        );
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.stale_deadline(), None);
+        assert_eq!(attestation.remembered_halt(), Some(damaged.clone()));
+
+        // A restarted writer that has not confirmed its tip keeps the
+        // remembered damage instead of the unconfirmed cause.
+        assert_eq!(
+            attestation.observe(&unconfirmed_writer_status(), Some(7)),
+            Some(damaged)
+        );
+
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
+            None
+        );
+        assert_eq!(attestation.remembered_halt(), None);
+    }
+
+    /// A parked writer can also report store damage; its reorg halt keeps the
+    /// typed refusal the deep-reorg contract promises.
+    #[test]
+    fn a_reorg_halt_outranks_store_damage_in_the_same_status() {
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_mins(1));
+        let both = CanonicalWriterStatusResponse {
+            canonical_store_damaged: damaged_store_writer_status().canonical_store_damaged,
+            ..parked_writer_status()
+        };
+
+        assert_eq!(
+            attestation.observe(&both, Some(7)),
+            Some(ReadinessState::reorg_window_exceeded(
+                1_001,
+                1_000,
+                Some(1_000),
+                Some(7)
+            ))
+        );
+    }
+
+    /// The deadline runs with the allowance, ends with it, and never names an
+    /// instant already past, so a refresh loop that selects on it cannot spin.
+    #[tokio::test]
+    async fn the_stale_deadline_ends_with_the_staleness_allowance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ceiling = Duration::from_millis(50);
+        let mut attestation = WriterAttestation::new(NETWORK, ceiling);
+        assert_eq!(attestation.stale_deadline(), None);
+
+        attestation.attest();
+        let deadline = attestation
+            .stale_deadline()
+            .ok_or("an attested reader has a deadline")?;
+        assert!(deadline.saturating_duration_since(tokio::time::Instant::now()) <= ceiling);
+
+        sleep_until_stale_deadline(Some(deadline)).await;
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.stale_deadline(), None);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                sleep_until_stale_deadline(attestation.stale_deadline())
+            )
+            .await
+            .is_err(),
+            "a lapsed allowance must not schedule a refresh"
+        );
+        Ok(())
     }
 
     #[test]

@@ -135,6 +135,15 @@ message CanonicalWriterStatusResponse {
   // keep converging on it. Writers that predate this field never set it, and
   // readers then attest the fence as before. ADR-0010.
   bool tip_unconfirmed = 6;
+  // Set while the canonical writer reports damage in its store: a stored row
+  // failed verification, or the writer reopened a store it last found
+  // damaged and has not yet checked that row again. `fence` stays the
+  // writer's current fence and the writer keeps committing, so the projector
+  // may keep converging on it, but wallet-serving readers must refuse
+  // traffic with the typed cause instead of attesting it. A parked writer can
+  // set this beside `reorg_window_exceeded`, whose halt readers report first.
+  // Writers that predate this field never set it.
+  optional zinder.v1.ops.CanonicalStoreDamagedDetail canonical_store_damaged = 7;
 }
 
 // One node-advertised network-upgrade activation in an admitted schedule.

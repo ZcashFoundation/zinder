@@ -249,9 +249,11 @@ again, as a writer checks a row it stores:
   when a pool's tree is still empty.
 
 The pass starts when densification does: once ingest follows the tip, and
-Explorer views have caught up when they are enabled. It reads through its own
-canonical secondary and writes nothing to the store, so it runs without
-`ingest_control.listen_addr`.
+Explorer views have caught up when they are enabled. A restart over a store
+it recorded as damaged starts it sooner, as described below. It reads through
+its own canonical secondary and writes nothing to the store, so it runs
+without `ingest_control.listen_addr`; without that listener, no reader
+attests the store, and ingest readiness alone reports the damage.
 
 The pass works in cycles. A cycle checks every row from the history
 predecessor through the settled tip, including rows that densification or
@@ -261,41 +263,71 @@ cycle that starts after the tip passes it.
 
 `ingest.tree_state_verification.max_rows_per_second` (25 by default) bounds
 how many rows the pass checks per second, on average. The pass reads 100 rows
-at a time and then waits until it is back under that rate. A row with three
-pools costs about 4.3 ms of CPU to check, so the default holds the pass near a
-tenth of one CPU and checks about 2.2 million rows a day. The rate also sets
-the detection bound: a damaged row is found within one cycle after it is
-written or damaged, and a cycle takes the settled row count divided by the
-rate, plus 5 minutes. A Mainnet store with a row for each of about 3.5 million
-blocks takes an estimated 39 hours per cycle at the default rate.
+at a time and then waits until it is back under that rate, counting the rows
+a step checked before a store error stopped it, which it does not check
+again. A row with three pools costs about 4.3 ms of CPU to check, so the
+default holds the pass near a tenth of one CPU and checks about 2.2 million
+rows a day.
+
+The rate also sets the detection bound: a damaged row is found within one
+cycle after it is written or damaged. The waits alone take the settled row
+count divided by the rate, plus 5 minutes between cycles, so a Mainnet store
+with a row for each of about 3.5 million blocks needs an idealized 39 hours
+per cycle at the default rate. A real cycle takes longer: checking adds up to
+4.3 ms per row, the pass waits while historical work is closed, a store error
+costs a 30-second retry, and a restart can check up to a minute of rows again.
+
+The pass keeps the checkpoint blocks it reads out of the RocksDB block cache,
+so each cycle reads them from disk again and checks their checksums. A block that fails its
+checksum is damage, reported like a row that fails a check, at the first
+height it may hold. A table file that the writer's compaction deleted under
+the pass's secondary is not damage: the step stops, and the pass retries it
+after catching up.
 
 The pass records the height its current cycle continues from in
 `tree-state-verification-watermark.json` inside the canonical store
-directory, together with the store's construction manifest digest. It writes
-the file at most once a minute and at the end of each cycle, so a restart
-checks again at most a minute of rows. When ingest starts, the pass resumes at
-that height if the file names this store. Otherwise it logs
-`tree_state_verification_watermark_discarded` and starts a new cycle.
+directory, together with the store's construction manifest digest and any
+damage it found. It writes the file at most once a minute and at the end of
+each cycle, so a restart checks again at most a minute of rows. When ingest
+starts, the pass resumes at that height if the file names this store.
+Otherwise it logs `tree_state_verification_watermark_discarded` and starts a
+new cycle. A resumed scan starts just after the row below that height, so it
+also reaches a key that is not a height and sorts between the two.
 
-A row that fails a check is store damage. The pass then does four things:
+A row that fails a check is store damage. The pass then does five things, in
+this order:
 
-1. It logs `tree_state_verification_mismatch` with the row's height, the pool
+1. It reports the damage to the canonical control plane, so every
+   `CanonicalControl.WriterStatus` answer carries it in
+   `canonical_store_damaged`, with the row's height and, when one pool's
+   frontier failed, that pool.
+2. It parks ingest readiness with `canonical_store_damaged`, unless the
+   writer is already parked on a reorg deeper than its window, whose
+   `reorg_window_exceeded` stays the cause. Ingest stays not ready until it
+   stops.
+3. It logs `tree_state_verification_mismatch` with the row's height, the pool
    whose frontier failed (`sapling`, `orchard`, `ironwood`, or `none` when the
-   row fails outside any frontier), and the check that failed.
-2. It counts the row in
-   `zinder_ingest_tree_state_verification_mismatches_total`.
-3. It withdraws ingest readiness with `storage_unavailable`. Ingest stays
-   not ready until it stops.
-4. It records the damaged row's height as its progress and stops, so the next
-   start finds the row again at once.
+   row fails outside any frontier), and the check that failed, and counts the
+   row in `zinder_ingest_tree_state_verification_mismatches_total`.
+4. It records the damaged row and its height in its progress file. That
+   write waits on two syncs, which is why the report comes first.
+5. It stops.
 
-The writer keeps following the tip. While ingest reports `storage_unavailable`,
-it refuses `CanonicalControl.WriterStatus`, so no reader attests the store
-again. Wallet-serving readers, and compatibility in compact-blocks mode, keep
-serving the pair the writer last attested until
-`storage.serving_pair_staleness_ceiling_ms` passes, and then refuse traffic
-with `writer_status_unavailable`. The projector stops converging for the same
-reason. Rebuild the canonical store, as
+The writer keeps following the tip. Wallet-serving readers, and
+compatibility in compact-blocks mode, refuse traffic with
+`canonical_store_damaged` on their next writer-status read, without the
+staleness allowance, and keep refusing through a writer-status outage. The
+projector keeps following, as it does behind a parked writer.
+
+When ingest starts over a store whose progress file records damage, its
+control plane reports that damage from its first `WriterStatus` answer, so no
+reader attests the store again. The pass then opens its secondary as soon as
+the store is published, without waiting for historical work, and checks the
+recorded row again. Damage that is still there parks readiness again and the
+pass stops. A row that now passes clears the report, which ingest logs as
+`tree_state_verification_recorded_damage_cleared`, and the cycle continues.
+Damage recorded for another store is discarded. With the pass disabled,
+recorded damage stays reported. Rebuild the canonical store, as
 [Recovery](service-operations.md#recovery) describes.
 
 The pass checks each row on its own and does not replay blocks. It cannot see

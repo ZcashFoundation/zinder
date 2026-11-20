@@ -16,14 +16,14 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
-use zinder_core::UnixTimestampMillis;
+use zinder_core::{BlockHeight, ShieldedProtocol, UnixTimestampMillis};
 use zinder_proto::{
     status_with_reason_and_metadata,
     v1::{
         ingest as ingest_proto,
         ops::{self as ops_proto, ErrorReason},
     },
-    wire::encode_reorg_window_exceeded_metadata,
+    wire::{canonical_store_damaged_pool, encode_reorg_window_exceeded_metadata},
 };
 
 use crate::composed_readiness::ReadinessInput;
@@ -182,6 +182,18 @@ pub enum ReadinessCause {
         oldest_retained_age_hours: u64,
         /// Configured retention window, rounded down to whole hours.
         retention_hours: u64,
+    },
+    /// Ingest found a stored canonical row that fails verification, so the
+    /// canonical store is damaged. Ingest keeps following and keeps its
+    /// control plane up; it and the store's wallet-serving readers refuse
+    /// traffic until an operator rebuilds the store.
+    CanonicalStoreDamaged {
+        /// Height of the first stored row that failed verification.
+        height: u32,
+        /// Node RPC name of the pool whose frontier failed, or `None` when
+        /// the row failed outside any one pool.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pool: Option<&'static str>,
     },
     /// Service is shutting down and no longer accepting new traffic.
     ShuttingDown,
@@ -368,6 +380,7 @@ impl ReadinessCause {
         "ingest_control_unavailable",
         "canonical_tip_unconfirmed",
         "cursor_at_risk",
+        "canonical_store_damaged",
         "shutting_down",
         "upstream_not_ready",
     ];
@@ -391,6 +404,7 @@ impl ReadinessCause {
             Self::IngestControlUnavailable => "ingest_control_unavailable",
             Self::CanonicalTipUnconfirmed => "canonical_tip_unconfirmed",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
+            Self::CanonicalStoreDamaged { .. } => "canonical_store_damaged",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
         }
@@ -421,6 +435,7 @@ impl ReadinessCause {
             | Self::IngestControlUnavailable
             | Self::CanonicalTipUnconfirmed
             | Self::CursorAtRisk { .. }
+            | Self::CanonicalStoreDamaged { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
         }
@@ -1130,6 +1145,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::IngestControlUnavailable => Self::IngestControlUnavailable,
             ReadinessCause::CanonicalTipUnconfirmed => Self::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
+            ReadinessCause::CanonicalStoreDamaged { .. } => Self::CanonicalStoreDamaged,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
         }
@@ -1153,7 +1169,34 @@ impl From<ops_proto::ReorgWindowExceededDetail> for ReadinessCause {
     }
 }
 
+impl From<&ops_proto::CanonicalStoreDamagedDetail> for ReadinessCause {
+    /// Maps the store damage a canonical writer reports to the cause a reader
+    /// projects. A pool this release does not know is reported as none.
+    fn from(detail: &ops_proto::CanonicalStoreDamagedDetail) -> Self {
+        Self::CanonicalStoreDamaged {
+            height: detail.height,
+            pool: canonical_store_damaged_pool(detail).map(ShieldedProtocol::rpc_pool_name),
+        }
+    }
+}
+
 impl ReadinessCause {
+    /// Returns the cause that reports a damaged stored row at `height`,
+    /// naming `pool` when the failure is in that pool's frontier.
+    #[must_use]
+    pub const fn canonical_store_damaged(
+        height: BlockHeight,
+        pool: Option<ShieldedProtocol>,
+    ) -> Self {
+        Self::CanonicalStoreDamaged {
+            height: height.value(),
+            pool: match pool {
+                Some(pool) => Some(pool.rpc_pool_name()),
+                None => None,
+            },
+        }
+    }
+
     /// Returns the halt a parked writer reports for this cause, or `None`
     /// for every cause other than [`ReadinessCause::ReorgWindowExceeded`].
     #[must_use]
@@ -1254,6 +1297,14 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             ReadinessCause::UpstreamNotReady(detail) => {
                 ops_proto::readiness_cause_detail::Payload::UpstreamNotReady(
                     ops_proto::UpstreamNotReadyDetail::from(detail),
+                )
+            }
+            ReadinessCause::CanonicalStoreDamaged { height, pool } => {
+                ops_proto::readiness_cause_detail::Payload::CanonicalStoreDamaged(
+                    ops_proto::CanonicalStoreDamagedDetail {
+                        height: *height,
+                        pool: pool.map(str::to_owned),
+                    },
                 )
             }
             ReadinessCause::Starting
@@ -1780,6 +1831,10 @@ mod tests {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
             },
+            ReadinessCause::CanonicalStoreDamaged {
+                height: 0,
+                pool: None,
+            },
             ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
                 upstream_committed_height: None,
@@ -1834,6 +1889,9 @@ mod tests {
                 ops_proto::ReadinessCause::CanonicalTipUnconfirmed
             }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
+            ReadinessCause::CanonicalStoreDamaged { .. } => {
+                ops_proto::ReadinessCause::CanonicalStoreDamaged
+            }
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
         }
@@ -1887,6 +1945,10 @@ mod tests {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
             },
+            ReadinessCause::CanonicalStoreDamaged {
+                height: 0,
+                pool: None,
+            },
             ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
                 upstream_committed_height: None,
@@ -1898,6 +1960,52 @@ mod tests {
                 },
             }),
         ]
+    }
+
+    /// Store damage keeps its row and pool from the writer's detail through
+    /// the cause, `/readyz`, the proto report, and the refusal status.
+    #[test]
+    fn canonical_store_damage_carries_its_row_to_every_surface() -> Result<(), serde_json::Error> {
+        let detail = zinder_proto::wire::canonical_store_damaged_detail(
+            BlockHeight::new(1_687_104),
+            Some(ShieldedProtocol::Ironwood),
+        );
+        let cause = ReadinessCause::from(&detail);
+        assert_eq!(
+            cause,
+            ReadinessCause::canonical_store_damaged(
+                BlockHeight::new(1_687_104),
+                Some(ShieldedProtocol::Ironwood)
+            )
+        );
+        assert!(!cause.permits_traffic());
+        assert_eq!(
+            serde_json::to_value(&cause)?,
+            serde_json::json!({"canonical_store_damaged": {"height": 1_687_104, "pool": "ironwood"}})
+        );
+        assert_eq!(
+            Option::<ops_proto::ReadinessCauseDetail>::from(&cause),
+            Some(ops_proto::ReadinessCauseDetail {
+                payload: Some(
+                    ops_proto::readiness_cause_detail::Payload::CanonicalStoreDamaged(detail)
+                ),
+            })
+        );
+        let status = not_ready_status(&cause);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .and_then(|info| info.metadata.get("readiness_cause").cloned()),
+            Some("canonical_store_damaged".to_owned())
+        );
+        let without_pool = ReadinessCause::canonical_store_damaged(BlockHeight::new(7), None);
+        assert_eq!(
+            serde_json::to_value(&without_pool)?,
+            serde_json::json!({"canonical_store_damaged": {"height": 7}})
+        );
+        Ok(())
     }
 
     #[test]

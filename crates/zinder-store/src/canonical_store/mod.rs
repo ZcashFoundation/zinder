@@ -101,7 +101,9 @@ pub use tree_state_densification::{
     TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan,
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
-pub use tree_state_verification::{TreeStateCheckpointMismatch, TreeStateCheckpointVerification};
+pub use tree_state_verification::{
+    TreeStateCheckpointMismatch, TreeStateCheckpointVerification, TreeStateVerificationError,
+};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";

@@ -18,14 +18,14 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalControlHandle, CanonicalFollowConfig,
-    CanonicalIngestControlGrpcAdapter, CanonicalRunOverrides, CanonicalWriterConfig,
-    ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
-    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    EndpointAdmission, FailoverReadiness, HistoricalWorkGate, IngestError, LiveMempoolOwner,
-    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolReadySignal,
-    MempoolRetentionSettings, NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor,
-    NodeFailover, NodeFailoverPolicy, NodeSourceKind, ReplayPrevoutCaches,
-    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
+    CanonicalIngestControlGrpcAdapter, CanonicalRunOverrides, CanonicalStoreDamageSignal,
+    CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
+    ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, EndpointAdmission, FailoverReadiness,
+    HistoricalWorkGate, IngestError, LiveMempoolOwner, MaterializedViewReplayConfig,
+    MaterializedViewTailer, MempoolReadySignal, MempoolRetentionSettings, NoNodeEndpointAdmitted,
+    NodeEndpointAdmissions, NodeEndpointMonitor, NodeFailover, NodeFailoverPolicy, NodeSourceKind,
+    ReplayPrevoutCaches, TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
     TreeStateDensificationContext, TreeStateVerificationContext, VolumeSpaceGuard,
     admit_canonical_store, canonical_control_channel, check_single_endpoint_genesis,
     classify_phase, follow_admitted_canonical_store, mempool_ready_channel,
@@ -324,6 +324,10 @@ async fn run_ingest(
     } else {
         HistoricalWorkGate::without_materialized_views(writer_readiness.clone())
     };
+    // Created before the control plane answers, so a restart over a store
+    // ingest found damaged reports that damage from its first writer status.
+    let store_damage =
+        CanonicalStoreDamageSignal::recorded_in(&command_config.runtime_config.storage_path);
     let mut worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config,
@@ -358,6 +362,7 @@ async fn run_ingest(
                 Arc::clone(&network_upgrade_activations),
                 canonical_reorg_policy,
                 historical_work_gate.clone(),
+                store_damage.clone(),
             ),
             worker_cancel.clone(),
         ),
@@ -371,7 +376,7 @@ async fn run_ingest(
     let mut canonical_control_tasks = spawn_canonical_control_tasks(
         &command_config,
         &nodes,
-        &writer_readiness,
+        (&writer_readiness, &store_damage),
         &control_server_cancel,
         &mut writer_config,
     );
@@ -504,7 +509,7 @@ impl CanonicalControlTasks {
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     nodes: &NodeSet<ZebraJsonRpcSource>,
-    writer_readiness: &ComposedReadiness,
+    (writer_readiness, store_damage): (&ComposedReadiness, &CanonicalStoreDamageSignal),
     server_cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
@@ -545,7 +550,7 @@ fn spawn_canonical_control_tasks(
                     .clone(),
             ),
             command_config.runtime_config.canonical_rocksdb_budget,
-            writer_readiness.clone(),
+            store_damage.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone())
         .with_checkpoint_bearer_token(
@@ -870,6 +875,7 @@ fn tree_state_verification_context(
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     reorg_policy: CanonicalReorgPolicy,
     gate: HistoricalWorkGate,
+    store_damage: CanonicalStoreDamageSignal,
 ) -> TreeStateVerificationContext {
     let runtime_config = &command_config.runtime_config;
     TreeStateVerificationContext {
@@ -884,6 +890,7 @@ fn tree_state_verification_context(
         reorg_policy,
         resource_budget: tree_state_pass_secondary_budget(runtime_config.canonical_rocksdb_budget),
         gate,
+        store_damage,
         config: command_config.tree_state_verification,
     }
 }

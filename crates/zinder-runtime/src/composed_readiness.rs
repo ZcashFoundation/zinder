@@ -165,14 +165,29 @@ impl ComposedReadiness {
     /// may replace the halt with a recoverable cause, and the ingest phase it
     /// was parked in stays fixed. Inputs keep recording their causes, but the
     /// parked admission refuses traffic and so supplies the projection. Only
-    /// shutdown replaces it, and a shutdown already in progress keeps its cause.
+    /// shutdown and a later park replace it, and a shutdown already in
+    /// progress keeps its cause. A park that must not replace another uses
+    /// [`Self::park_admission_unless_parked`].
     pub fn park_admission(&self, admission: ReadinessState) {
+        self.publish_with(|composition| composition.park(admission));
+    }
+
+    /// Parks the admission state as [`Self::park_admission`] does unless it
+    /// is already parked, and returns whether it parked.
+    ///
+    /// A second terminal cause never replaces the first: a canonical writer
+    /// already parked on a reorg deeper than its window keeps that typed
+    /// halt when ingest then finds damage in its store.
+    #[must_use]
+    pub fn park_admission_unless_parked(&self, admission: ReadinessState) -> bool {
+        let mut parked = false;
         self.publish_with(|composition| {
-            let phase = admission.phase.or(composition.admission.phase);
-            composition.admission = admission;
-            composition.admission.phase = phase;
-            composition.is_parked = true;
+            if !composition.is_parked {
+                composition.park(admission);
+                parked = true;
+            }
         });
+        parked
     }
 
     /// Atomically mutates the admission state.
@@ -237,6 +252,17 @@ impl ComposedReadiness {
         let projected = project(&composition);
         self.runtime
             .publish_composition(projected, dependencies(&composition));
+    }
+}
+
+impl Composition {
+    /// Replaces the admission with the terminal `admission`, keeping the last
+    /// ingest phase when `admission` carries none.
+    fn park(&mut self, admission: ReadinessState) {
+        let phase = admission.phase.or(self.admission.phase);
+        self.admission = admission;
+        self.admission.phase = phase;
+        self.is_parked = true;
     }
 }
 
@@ -766,6 +792,47 @@ mod tests {
 
         composed.publish_shutting_down();
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[test]
+    fn a_park_that_must_not_replace_another_keeps_the_first_halt() {
+        let runtime = Readiness::default();
+        let composed = ComposedReadiness::new(runtime.clone(), &[]);
+        composed.publish_admission(ReadinessState::ready(Some(10)));
+        composed.park_admission(ReadinessState::reorg_window_exceeded(
+            1_001,
+            1_000,
+            Some(1_000),
+            Some(10),
+        ));
+
+        let parked = composed.park_admission_unless_parked(ReadinessState::not_ready(
+            ReadinessCause::CanonicalStoreDamaged {
+                height: 5,
+                pool: None,
+            },
+        ));
+
+        assert!(!parked);
+        assert!(matches!(
+            runtime.report().cause,
+            ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
+        ));
+
+        let unparked = ComposedReadiness::new(Readiness::default(), &[]);
+        assert!(
+            unparked.park_admission_unless_parked(ReadinessState::not_ready(
+                ReadinessCause::CanonicalStoreDamaged {
+                    height: 5,
+                    pool: None,
+                },
+            ))
+        );
+        unparked.publish_admission(ReadinessState::ready(Some(11)));
+        assert!(matches!(
+            unparked.admission_state().cause,
+            ReadinessCause::CanonicalStoreDamaged { height: 5, .. }
+        ));
     }
 
     #[test]

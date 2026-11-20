@@ -13,12 +13,13 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol};
 use zinder_ingest::{
-    HistoricalWorkGate, TREE_STATE_VERIFICATION_WATERMARK_FILE, TreeStateVerificationConfig,
+    CanonicalStoreDamage, CanonicalStoreDamageSignal, HistoricalWorkGate,
+    TREE_STATE_VERIFICATION_WATERMARK_FILE, TreeStateVerificationConfig,
     TreeStateVerificationContext, spawn_tree_state_verification_task,
 };
-use zinder_runtime::{ReadinessCause, ReadinessState};
+use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause, ReadinessState};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget,
 };
@@ -32,47 +33,72 @@ use super::tree_state_densification::following_tip_gate;
 const BASELINE_TIP: u32 = 360;
 const TEST_REORG_WINDOW: u32 = 100;
 const PASS_DEADLINE: Duration = Duration::from_mins(2);
+/// The row the damaging tests break, whose first stored root is Sapling's.
+const DAMAGED_HEIGHT: u32 = 200;
+
+fn damaged_row() -> CanonicalStoreDamage {
+    CanonicalStoreDamage {
+        height: BlockHeight::new(DAMAGED_HEIGHT),
+        pool: Some(ShieldedProtocol::Sapling),
+    }
+}
+
+fn damaged_cause() -> ReadinessCause {
+    damaged_row().readiness_cause()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_over_an_intact_store_completes_its_cycle_and_keeps_ingest_ready() -> eyre::Result<()>
 {
     let store = PublishedStore::new()?;
     let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
 
-    store.run_until_cycle_completes(&gate).await?;
+    store
+        .run_until_cycle_completes(&gate, &store_damage)
+        .await?;
 
     eyre::ensure!(
-        gate.readiness().admission_state().cause != ReadinessCause::StorageUnavailable,
-        "an intact store must not withdraw readiness"
+        gate.readiness().admission_state().cause == ReadinessCause::Starting,
+        "an intact store must leave readiness to the writer"
+    );
+    eyre::ensure!(
+        store_damage.current().is_none(),
+        "an intact store reports no damage"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_row_whose_root_does_not_match_withdraws_readiness_and_ends_the_pass() -> eyre::Result<()>
-{
+async fn a_damaged_row_is_reported_to_readers_and_parks_readiness() -> eyre::Result<()> {
     let store = PublishedStore::new()?;
-    store.flip_first_root_byte(200)?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
     let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
 
-    let task = store.spawn_pass(&gate, CancellationToken::new())?;
-    tokio::time::timeout(PASS_DEADLINE, task)
-        .await
-        .map_err(|_| eyre::eyre!("the pass must end on its own once it finds damage"))??;
+    store.run_until_the_pass_ends(&gate, &store_damage).await?;
 
+    eyre::ensure!(
+        store_damage.current() == Some(damaged_row()),
+        "the pass must report the damaged row and its pool, got {:?}",
+        store_damage.current()
+    );
     let readiness = gate.readiness();
     eyre::ensure!(
-        readiness.runtime_readiness().report().cause == ReadinessCause::StorageUnavailable,
-        "store damage must withdraw readiness with storage_unavailable"
+        readiness.runtime_readiness().report().cause == damaged_cause(),
+        "store damage must park readiness with canonical_store_damaged"
     );
     readiness.publish_admission(ReadinessState::ready(Some(BASELINE_TIP)));
     eyre::ensure!(
-        readiness.runtime_readiness().report().cause == ReadinessCause::StorageUnavailable,
+        readiness.runtime_readiness().report().cause == damaged_cause(),
         "a later admission write must not restore readiness"
     );
+    let watermark = store.watermark()?;
     eyre::ensure!(
-        store.watermark()?["next_height"] == 200,
-        "the pass must record the damaged row so a restart finds it again"
+        watermark["next_height"] == DAMAGED_HEIGHT
+            && watermark["damaged"]["height"] == DAMAGED_HEIGHT
+            && watermark["damaged"]["pool"] == "sapling",
+        "the pass must record the damaged row so a restart reports it again: {watermark}"
     );
     Ok(())
 }
@@ -82,16 +108,155 @@ async fn a_restart_resumes_its_cycle_at_the_recorded_height() -> eyre::Result<()
     let store = PublishedStore::new()?;
     // Damage below the recorded height is outside the resumed cycle.
     store.flip_first_root_byte(100)?;
-    store.write_watermark(200)?;
+    store.write_watermark(&serde_json::json!({
+        "version": 1,
+        "construction_manifest_sha256": store.manifest_sha256,
+        "next_height": DAMAGED_HEIGHT,
+    }))?;
     let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
 
-    store.run_until_cycle_completes(&gate).await?;
+    store
+        .run_until_cycle_completes(&gate, &store_damage)
+        .await?;
 
     eyre::ensure!(
-        gate.readiness().admission_state().cause != ReadinessCause::StorageUnavailable,
+        store_damage.current().is_none(),
         "the resumed cycle must start above the damaged row"
     );
     Ok(())
+}
+
+/// A restart reports the recorded damage before any writer status attests
+/// the store, and confirms it while historical work is still closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_reports_recorded_damage_at_once_and_confirms_it_without_historical_work()
+-> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    store
+        .run_until_the_pass_ends(
+            &following_tip_gate(),
+            &CanonicalStoreDamageSignal::default(),
+        )
+        .await?;
+
+    let restarted_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    eyre::ensure!(
+        restarted_damage.current() == Some(damaged_row()),
+        "a restart must report the recorded damage before the pass runs"
+    );
+    let closed_gate = closed_gate();
+    store
+        .run_until_the_pass_ends(&closed_gate, &restarted_damage)
+        .await?;
+
+    eyre::ensure!(
+        closed_gate.readiness().admission_state().cause == damaged_cause(),
+        "the pass must confirm recorded damage before historical work opens"
+    );
+    eyre::ensure!(restarted_damage.current() == Some(damaged_row()));
+    Ok(())
+}
+
+/// Recorded damage that the row no longer shows stops being reported once
+/// the pass checks it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_damage_the_row_no_longer_shows_is_cleared() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.write_watermark(&serde_json::json!({
+        "version": 1,
+        "construction_manifest_sha256": store.manifest_sha256,
+        "next_height": DAMAGED_HEIGHT,
+        "damaged": {"height": DAMAGED_HEIGHT, "pool": "sapling"},
+    }))?;
+    let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
+    eyre::ensure!(store_damage.current() == Some(damaged_row()));
+    let closed_gate = closed_gate();
+    let cancel = CancellationToken::new();
+    let task = store.spawn_pass(&closed_gate, &store_damage, cancel.clone())?;
+
+    let cleared = wait_until(|| store_damage.current().is_none()).await;
+    cancel.cancel();
+    task.await?;
+
+    cleared.map_err(|_| eyre::eyre!("an intact row must clear the recorded damage"))?;
+    eyre::ensure!(
+        store.watermark()?.get("damaged").is_none(),
+        "the cleared damage must leave the record"
+    );
+    eyre::ensure!(
+        closed_gate.readiness().admission_state().cause == ReadinessCause::Starting,
+        "cleared damage must not park readiness"
+    );
+    Ok(())
+}
+
+/// Damage found while the writer is parked on a deep reorg is still reported
+/// to readers, but the reorg halt stays ingest's typed cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_found_under_a_reorg_halt_keeps_the_halt() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    let gate = following_tip_gate();
+    let halt = ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(BASELINE_TIP));
+    gate.readiness().park_admission(halt.clone());
+    let store_damage = CanonicalStoreDamageSignal::default();
+
+    store.run_until_the_pass_ends(&gate, &store_damage).await?;
+
+    eyre::ensure!(
+        gate.readiness().admission_state().cause == halt.cause,
+        "store damage must not replace the reorg halt"
+    );
+    eyre::ensure!(store_damage.current() == Some(damaged_row()));
+    Ok(())
+}
+
+/// Readers learn of the damage while its record still waits on the disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_is_reported_before_its_record_is_written() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    // Opening a FIFO for writing blocks until a reader opens it, so the
+    // record's staged write cannot finish until the test reads it.
+    let staged = store.watermark_path().with_extension("json.tmp");
+    let fifo = std::process::Command::new("mkfifo").arg(&staged).status()?;
+    eyre::ensure!(fifo.success(), "mkfifo failed");
+    let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
+    let task = store.spawn_pass(&gate, &store_damage, CancellationToken::new())?;
+
+    let reported = wait_until(|| store_damage.current().is_some()).await;
+    let parked = gate.readiness().admission_state().cause == damaged_cause();
+    let unwritten = !store.watermark_path().exists();
+    let drained = tokio::task::spawn_blocking(move || std::fs::read(&staged)).await??;
+    tokio::time::timeout(PASS_DEADLINE, task)
+        .await
+        .map_err(|_| eyre::eyre!("the pass must end once its record is written"))??;
+
+    reported.map_err(|_| eyre::eyre!("damage must be reported while its record waits"))?;
+    eyre::ensure!(parked, "readiness must be parked while the record waits");
+    eyre::ensure!(unwritten, "the record must still be waiting on the disk");
+    eyre::ensure!(!drained.is_empty(), "the pass then writes its record");
+    Ok(())
+}
+
+/// A gate whose historical work never opens.
+fn closed_gate() -> HistoricalWorkGate {
+    HistoricalWorkGate::new(ComposedReadiness::new(Readiness::default(), &[]))
+}
+
+/// Polls `condition` until it holds or the pass deadline passes.
+async fn wait_until(
+    condition: impl Fn() -> bool + Send + Sync,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(PASS_DEADLINE, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
 }
 
 /// A published store whose canonical primary is closed.
@@ -131,6 +296,7 @@ impl PublishedStore {
     fn spawn_pass(
         &self,
         gate: &HistoricalWorkGate,
+        store_damage: &CanonicalStoreDamageSignal,
         cancel: CancellationToken,
     ) -> eyre::Result<tokio::task::JoinHandle<()>> {
         Ok(spawn_tree_state_verification_task(
@@ -143,6 +309,7 @@ impl PublishedStore {
                 reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
                 resource_budget: RocksDbResourceBudget::for_local_tests(),
                 gate: gate.clone(),
+                store_damage: store_damage.clone(),
                 config: TreeStateVerificationConfig {
                     enabled: true,
                     max_rows_per_second: std::num::NonZeroU32::MAX,
@@ -152,11 +319,29 @@ impl PublishedStore {
         ))
     }
 
+    /// Runs the pass until it ends on its own, as it does once it finds or
+    /// confirms damage.
+    async fn run_until_the_pass_ends(
+        &self,
+        gate: &HistoricalWorkGate,
+        store_damage: &CanonicalStoreDamageSignal,
+    ) -> eyre::Result<()> {
+        let task = self.spawn_pass(gate, store_damage, CancellationToken::new())?;
+        tokio::time::timeout(PASS_DEADLINE, task)
+            .await
+            .map_err(|_| eyre::eyre!("the pass must end on its own once it finds damage"))??;
+        Ok(())
+    }
+
     /// Runs the pass until it completes a cycle, which records that the next
     /// cycle starts from height 0.
-    async fn run_until_cycle_completes(&self, gate: &HistoricalWorkGate) -> eyre::Result<()> {
+    async fn run_until_cycle_completes(
+        &self,
+        gate: &HistoricalWorkGate,
+        store_damage: &CanonicalStoreDamageSignal,
+    ) -> eyre::Result<()> {
         let cancel = CancellationToken::new();
-        let task = self.spawn_pass(gate, cancel.clone())?;
+        let task = self.spawn_pass(gate, store_damage, cancel.clone())?;
         let completed = tokio::time::timeout(PASS_DEADLINE, async {
             loop {
                 if self
@@ -185,15 +370,8 @@ impl PublishedStore {
         )?)?)
     }
 
-    fn write_watermark(&self, next_height: u32) -> eyre::Result<()> {
-        std::fs::write(
-            self.watermark_path(),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "construction_manifest_sha256": self.manifest_sha256,
-                "next_height": next_height,
-            }))?,
-        )?;
+    fn write_watermark(&self, record: &serde_json::Value) -> eyre::Result<()> {
+        std::fs::write(self.watermark_path(), serde_json::to_vec(record)?)?;
         Ok(())
     }
 

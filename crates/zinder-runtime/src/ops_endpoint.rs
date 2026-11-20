@@ -483,6 +483,7 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::IngestControlUnavailable
         | crate::ReadinessCause::CanonicalTipUnconfirmed
         | crate::ReadinessCause::CursorAtRisk { .. }
+        | crate::ReadinessCause::CanonicalStoreDamaged { .. }
         | crate::ReadinessCause::ShuttingDown
         | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }
@@ -507,6 +508,7 @@ fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::IngestControlUnavailable
         | crate::ReadinessCause::CanonicalTipUnconfirmed
         | crate::ReadinessCause::CursorAtRisk { .. }
+        | crate::ReadinessCause::CanonicalStoreDamaged { .. }
         | crate::ReadinessCause::ShuttingDown
         | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }
