@@ -34,8 +34,8 @@ use zinder_testkit::{
     WalletServingStoreFixture, method,
 };
 
+mod address_validation;
 mod canonical;
-mod tex_validation;
 
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 

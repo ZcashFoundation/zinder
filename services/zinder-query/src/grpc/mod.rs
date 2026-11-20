@@ -27,9 +27,10 @@ pub use native::{
     build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
     chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_header,
     compact_blocks_in_range_item, full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
+    network_upgrade_activations_response, parse_receivable_transparent_address,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outpoint_spend_status_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use request_limits::WALLET_QUERY_FIELD_LIMITS;
 

@@ -17,7 +17,8 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_query::{
     ArtifactKey, CanonicalReader, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-    QualificationWalletQuery, QueryError, StorageReadError, SubtreeRoots, status_from_query_error,
+    QualificationWalletQuery, QueryError, StorageReadError, SubtreeRoots,
+    parse_receivable_transparent_address, status_from_query_error,
 };
 use zinder_source::{
     NodeSource as _, SourceError, SourceTransparentUnspentOutput, TransactionBroadcaster as _,
@@ -141,12 +142,8 @@ impl QualificationWallet {
         let network = self.slot.capture().network();
         let mut distinct = HashSet::new();
         while let Some(address) = addresses.next().await {
-            let parsed = indexed_address(&address?, network)?;
-            if matches!(parsed, Address::Tex { .. }) {
-                return Err(status_from_query_error(&QueryError::InvalidAddress {
-                    reason: super::UNRECEIVABLE_ADDRESS,
-                }));
-            }
+            let parsed = parse_receivable_transparent_address(&address?, network)
+                .map_err(|error| status_from_query_error(&error))?;
             distinct.insert(parsed);
             if distinct.len() > u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
                 return Err(status_from_query_error(
