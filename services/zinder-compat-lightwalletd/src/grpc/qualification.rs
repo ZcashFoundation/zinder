@@ -31,9 +31,10 @@ use super::{
     CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
     address_utxo_limit_exceeded, lightwalletd_tree_state, reject_future_tree_state_height,
-    send_response_from_broadcast_outcome, shielded_protocol_from_request, spawn_response_stream,
-    standard_fee_response, transparent_address_tx_history_request, tree_state_block_lookup_status,
-    tree_state_status, u32_to_usize, wire_decode_error_to_status,
+    require_sapling_tree_state, send_response_from_broadcast_outcome,
+    shielded_protocol_from_request, spawn_response_stream, standard_fee_response,
+    transparent_address_tx_history_request, tree_state_block_lookup_status, tree_state_status,
+    u32_to_usize, wire_decode_error_to_status,
 };
 use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
@@ -733,6 +734,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
             .tree_state(reader, Some(height))
             .await
             .map_err(|error| tree_state_status(&error))?;
+        require_sapling_tree_state(&state)?;
         Ok(Response::new(lightwalletd_tree_state(&state)))
     }
 
@@ -746,6 +748,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
             .tree_state(self.query_api.slot.capture(), None)
             .await
             .map_err(|error| tree_state_status(&error))?;
+        require_sapling_tree_state(&state)?;
         Ok(Response::new(lightwalletd_tree_state(&state)))
     }
 

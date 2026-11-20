@@ -3844,6 +3844,24 @@ async fn tree_state_requires_sapling_only_on_the_compatibility_surface() -> eyre
             }
         }
     }
+    let before_activation = AcceptanceStore::from_store_fixture(
+        WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
+            &activations,
+        )?,
+        Vec::new(),
+    )?;
+    let native = before_activation
+        .query()
+        .latest_tree_state_checkpoint(None)
+        .await?;
+    assert!(native.frontiers.sapling_final_state.is_none());
+    let status = acceptance_adapter(&before_activation)
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("pre-Sapling latest tree state succeeded"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
     Ok(())
 }
 
