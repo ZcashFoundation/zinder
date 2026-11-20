@@ -169,7 +169,7 @@ pub fn public_grpc_server_with(
 /// Serve the router with `drain` as its shutdown signal. To stop, publish
 /// `shutting_down` to `readiness` first and cancel `drain` after it: health
 /// then reports `NOT_SERVING` together with `/readyz`, and open health
-/// `Watch` streams send it and end as the drain starts.
+/// `Watch` streams end as the drain starts.
 pub fn public_grpc_router<S>(
     wallet_service: S,
     wallet_descriptor_set: &'static [u8],

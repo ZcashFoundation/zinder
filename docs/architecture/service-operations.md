@@ -65,7 +65,7 @@ before their gRPC listener starts to drain, so `/readyz` and their
 [gRPC health service](../reference/readiness.md#grpc-health) report
 `NOT_SERVING` together, and gRPC load balancers and Kubernetes `grpc` probes
 stop routing to them while the drain runs. Open health `Watch` streams then
-send `NOT_SERVING` and end, so they do not hold the drain open.
+end, so they do not hold the drain open.
 
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event

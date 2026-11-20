@@ -12,8 +12,9 @@
 //! an idle stream costs no work. Each stream holds one of
 //! [`MAX_ACTIVE_HEALTH_WATCHES`] process-wide permits and keeps no part of
 //! its request, so open streams cannot exhaust memory. Once the listener's
-//! drain starts, open streams report `NOT_SERVING` and end, so they do not
-//! hold the drain open.
+//! drain starts, open streams end, so they do not hold the drain open. A
+//! stream on the listener's status first sends `NOT_SERVING` unless that was
+//! its last message, and never sends `SERVING` after the drain starts.
 
 use std::{
     pin::Pin,
@@ -118,7 +119,7 @@ impl Health for ReadinessHealth {
             drain: self.drain.clone(),
             observed_changes,
             last_sent: None,
-            queued: None,
+            unsent_changes: 0,
             _permit: Arc::clone(&self.watch_permits)
                 .try_acquire_owned()
                 .map_err(|_| Status::resource_exhausted("too many open health watches"))?,
@@ -136,11 +137,12 @@ struct WatchState {
     subject: HealthSubject,
     admission: watch::Receiver<TrafficAdmission>,
     drain: CancellationToken,
-    /// The admission change count this stream has accounted for.
+    /// The admission change count this stream has read.
     observed_changes: u64,
     last_sent: Option<ServingStatus>,
-    /// A status to send right after the one being sent.
-    queued: Option<ServingStatus>,
+    /// Admission changes read but not sent yet, shortened by
+    /// [`coalesced_changes`].
+    unsent_changes: u64,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -152,43 +154,62 @@ impl WatchState {
 
     /// Returns the next status the stream owes its client, if any.
     ///
-    /// The admission has two values, so the change count says which values
-    /// it passed through since the last message. When it changed and changed
-    /// back before this stream woke, the stream sends the intermediate
-    /// status and then the current one, so no change goes unreported.
+    /// Once the drain has started, the stream owes at most a final
+    /// `NOT_SERVING`: changes it has not sent yet are dropped, so none of
+    /// them can report `SERVING` while the listener closes.
+    ///
+    /// Before that, every admission change flips the status, so each owed
+    /// message is the opposite of the last one sent, and the count of unsent
+    /// changes says how many are owed.
     fn owed_status(&mut self, draining: bool) -> Option<ServingStatus> {
-        match self.subject {
-            HealthSubject::Unknown => self
-                .last_sent
-                .is_none()
-                .then_some(ServingStatus::ServiceUnknown),
-            HealthSubject::Listener => {
+        match (self.subject, self.last_sent) {
+            (HealthSubject::Unknown, last_sent) => {
+                last_sent.is_none().then_some(ServingStatus::ServiceUnknown)
+            }
+            (HealthSubject::Listener, last_sent) if draining => {
+                (last_sent != Some(ServingStatus::NotServing)).then_some(ServingStatus::NotServing)
+            }
+            (HealthSubject::Listener, None) => {
                 let admission = *self.admission.borrow_and_update();
-                let unobserved_changes = admission.changes.wrapping_sub(self.observed_changes);
                 self.observed_changes = admission.changes;
-                let status = listener_status(admission.permits_traffic, draining);
-                if self.last_sent != Some(status) {
-                    return Some(status);
-                }
-                if draining || unobserved_changes == 0 {
+                Some(listener_status(admission.permits_traffic, draining))
+            }
+            (HealthSubject::Listener, Some(last_sent)) => {
+                let admission = *self.admission.borrow_and_update();
+                let read_changes = admission.changes.wrapping_sub(self.observed_changes);
+                self.observed_changes = admission.changes;
+                self.unsent_changes =
+                    coalesced_changes(self.unsent_changes.saturating_add(read_changes));
+                if self.unsent_changes == 0 {
                     return None;
                 }
-                self.queued = Some(status);
-                Some(opposite(status))
+                self.unsent_changes -= 1;
+                Some(opposite(last_sent))
             }
         }
     }
 }
 
+/// Shortens a run of unsent admission changes to at most three messages.
+///
+/// The shortened run keeps its parity, so it still ends at the current
+/// status, and a run of two or more changes still sends both statuses after
+/// the last one sent. A client therefore sees an outage that recovered, or a
+/// recovery that failed again, however quickly it reversed.
+const fn coalesced_changes(changes: u64) -> u64 {
+    if changes <= 3 {
+        changes
+    } else {
+        2 + changes % 2
+    }
+}
+
 /// Waits for the next status change, and ends the stream once the drain has
-/// started and its status has been sent.
+/// started and its final status has been sent.
 async fn next_watch_response(
     mut state: WatchState,
 ) -> Option<(Result<HealthCheckResponse, Status>, WatchState)> {
     loop {
-        if let Some(status) = state.queued.take() {
-            return Some(state.send(status));
-        }
         let draining = state.drain.is_cancelled();
         if let Some(status) = state.owed_status(draining) {
             return Some(state.send(status));
@@ -237,7 +258,7 @@ fn response(status: ServingStatus) -> HealthCheckResponse {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use futures_util::StreamExt as _;
+    use futures_util::{FutureExt as _, StreamExt as _};
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
     use tonic::{Code, Request, Status};
@@ -246,7 +267,7 @@ mod tests {
     };
 
     use super::{ReadinessHealth, WatchResponses};
-    use crate::{Readiness, ReadinessState};
+    use crate::{Readiness, ReadinessCause, ReadinessState};
 
     const SERVED: &str = "test.v1.Served";
     const WAIT_LIMIT: Duration = Duration::from_secs(5);
@@ -278,13 +299,38 @@ mod tests {
         Ok(ServingStatus::try_from(message.status)?)
     }
 
+    /// Returns every status the stream sends until it ends.
+    async fn statuses_until_end(
+        watch: &mut WatchResponses,
+    ) -> Result<Vec<ServingStatus>, Box<dyn std::error::Error>> {
+        let mut statuses = Vec::new();
+        while let Some(message) = tokio::time::timeout(WAIT_LIMIT, watch.next()).await? {
+            statuses.push(ServingStatus::try_from(message?.status)?);
+        }
+        Ok(statuses)
+    }
+
+    /// Whether the stream would wait for a readiness change before sending
+    /// anything else.
+    fn owes_nothing(watch: &mut WatchResponses) -> bool {
+        watch.next().now_or_never().is_none()
+    }
+
+    fn refusing_traffic() -> ReadinessState {
+        ReadinessState::syncing(Some(1), Some(1), Some(2))
+    }
+
+    fn admitting_traffic() -> ReadinessState {
+        ReadinessState::ready(Some(1))
+    }
+
     /// Open watches are bounded across the process, whatever names they ask
     /// about and however many connections carry them, and closing one frees
     /// its permit.
     #[tokio::test]
     async fn watches_past_the_process_limit_are_refused_until_one_closes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let readiness = Readiness::new(ReadinessState::ready(Some(1)));
+        let readiness = Readiness::new(admitting_traffic());
         let health = health(&readiness, 2);
         let listener_watch = watch(&health, "").await?;
         let unknown_watch = watch(&health, &"x".repeat(1 << 20)).await?;
@@ -312,11 +358,103 @@ mod tests {
         let mut watch = watch(&health, "").await?;
         assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
 
-        readiness.set(ReadinessState::ready(Some(1)));
-        readiness.set(ReadinessState::syncing(Some(1), Some(1), Some(2)));
+        readiness.set(admitting_traffic());
+        readiness.set(refusing_traffic());
 
         assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
         assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+        Ok(())
+    }
+
+    /// From `NOT_SERVING`, a recovery, an outage, and a second recovery that
+    /// all land before the stream wakes still show the client the outage.
+    #[tokio::test]
+    async fn watch_reports_an_outage_between_recoveries_before_the_stream_wakes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = Readiness::new(ReadinessState::starting());
+        let health = health(&readiness, 1);
+        let mut watch = watch(&health, "").await?;
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+
+        readiness.set(admitting_traffic());
+        readiness.set(refusing_traffic());
+        readiness.set(admitting_traffic());
+
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+        assert!(owes_nothing(&mut watch));
+        Ok(())
+    }
+
+    /// A long run of changes before the stream wakes is shortened, but it
+    /// still shows both statuses and ends at the current one.
+    #[tokio::test]
+    async fn watch_shortens_a_long_run_of_changes_without_hiding_either_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = Readiness::new(admitting_traffic());
+        let health = health(&readiness, 1);
+        let mut watch = watch(&health, "").await?;
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+
+        for _ in 0..3 {
+            readiness.set(refusing_traffic());
+            readiness.set(admitting_traffic());
+        }
+        readiness.set(refusing_traffic());
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+        assert!(owes_nothing(&mut watch));
+
+        for _ in 0..3 {
+            readiness.set(admitting_traffic());
+            readiness.set(refusing_traffic());
+        }
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+        assert!(owes_nothing(&mut watch));
+        Ok(())
+    }
+
+    /// A recovery still owed when shutdown starts is never sent, so a stream
+    /// cannot report `SERVING` once the drain has started.
+    #[tokio::test]
+    async fn a_drain_drops_an_owed_recovery() -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = Readiness::new(admitting_traffic());
+        let health = health(&readiness, 1);
+        let mut watch = watch(&health, "").await?;
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+
+        readiness.set(refusing_traffic());
+        readiness.set(admitting_traffic());
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
+
+        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        health.drain.cancel();
+
+        assert_eq!(statuses_until_end(&mut watch).await?, []);
+        Ok(())
+    }
+
+    /// A drain that starts while a stream still owes an outage and a
+    /// recovery ends it with `NOT_SERVING` alone.
+    #[tokio::test]
+    async fn a_drain_ends_a_stream_owing_several_changes_with_not_serving()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = Readiness::new(admitting_traffic());
+        let health = health(&readiness, 1);
+        let mut watch = watch(&health, "").await?;
+        assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
+
+        readiness.set(refusing_traffic());
+        readiness.set(admitting_traffic());
+        health.drain.cancel();
+
+        assert_eq!(
+            statuses_until_end(&mut watch).await?,
+            [ServingStatus::NotServing]
+        );
         Ok(())
     }
 }

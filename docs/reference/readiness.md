@@ -141,16 +141,24 @@ refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
 files to call it.
 
 `Watch` sends the current status at once and again on every change, as soon
-as readiness publishes it. A change that reverses before the stream sends it
-still produces a message, followed by the status readiness returned to. The
-process bounds how many `Watch` streams stay open across all connections, as
-[Public gRPC listeners](configuration.md#public-grpc-listeners) lists; `Check`
-has no such bound.
+as readiness publishes it. Changes that land before the stream can send them
+are not lost: it sends each status readiness passed through, in order, ending
+with the current one, so a client sees an outage or a recovery however
+quickly it reversed. A run of more than three such changes is shortened to
+two or three messages, which still send both statuses and end with the
+current one.
+
+The process bounds how many `Watch` streams stay open across all
+connections, as [Public gRPC listeners](configuration.md#public-grpc-listeners)
+lists; `Check` has no such bound.
 
 On a termination signal the runtime publishes `shutting_down` before its
 listener drains, so `Check`, `Watch`, and `/readyz` report it together. When
-the drain starts, open `Watch` streams send `NOT_SERVING` and end, so a
-balancer stops routing to the listener while it closes.
+the drain starts, every open `Watch` stream ends. A stream on the listener's
+status first sends `NOT_SERVING` unless that was its last message, and never
+sends `SERVING` once the drain has started, so a balancer stops routing to
+the listener while it closes. A stream that reported `SERVICE_UNKNOWN` ends
+without another message.
 
 A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
 the runtime, not its ops port:
