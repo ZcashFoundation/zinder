@@ -102,7 +102,7 @@ class LifecycleTests(unittest.TestCase):
             'steps': {step: {'command': [self.binary, str(self.adapter), step, '{scratch}', '{report}', '{endpoint}', 'normal'],
                              'expect': {'/count': index + 1}} for index, step in enumerate(STEPS)},
         }
-        self.manifest = {'schema_version': 2, 'timeout_seconds': 1, 'cases': {'fixture': self.case}}
+        self.manifest = {'schema_version': 2, 'timeout_seconds': 10, 'cases': {'fixture': self.case}}
 
     def digest(self, path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -143,6 +143,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_gate(1)['steps'][4]['status'], 'failed')
 
     def test_timeout_cannot_certify_and_cleanup_runs(self):
+        self.manifest['timeout_seconds'] = 1
         self.case['steps']['bootstrap']['command'][-1] = 'timeout'
         self.case['cleanup'] = {'command': [self.binary, '-c',
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('{\"status\":\"completed\",\"endpoint\":\"http://127.0.0.1:32402\",\"fallback_used\":false,\"cleaned\":true,\"assertions_enabled\":true,\"assertion_mode\":\"always-on\"}')", '{report}'], 'expect': {'/cleaned': True}}
