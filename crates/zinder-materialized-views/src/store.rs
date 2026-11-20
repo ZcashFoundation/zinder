@@ -34,7 +34,8 @@ use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
 use zinder_store::{
     CanonicalReorgPolicy, ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
     RocksDbResourceBudget, RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory,
-    open_bounded_rocksdb, open_bounded_rocksdb_read_only_probe, record_rocksdb_resource_gauges,
+    keep_blocks_of_dropped_table_files, open_bounded_rocksdb, open_bounded_rocksdb_read_only_probe,
+    record_rocksdb_resource_gauges,
 };
 
 use crate::{
@@ -203,6 +204,7 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
         usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
     options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
+    keep_blocks_of_dropped_table_files(&mut options);
     options.set_compression_type(DBCompressionType::Zstd);
     options
 }
@@ -3282,6 +3284,15 @@ mod tests {
             MaterializedViewStore::bundled_chain_event_consumer_names()
                 .contains(&PAID_FEE_DISTRIBUTION_SCHEMA.name)
         );
+    }
+
+    #[test]
+    fn data_families_keep_the_blocks_of_dropped_table_files() {
+        let options = column_family_options(
+            &Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        assert_eq!(options.get_uncache_aggressiveness(), 0);
     }
 
     #[test]

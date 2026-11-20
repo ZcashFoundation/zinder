@@ -29,6 +29,8 @@ finds the canonical store at `storage.canonical_path`. Wallet-serving readers
 use `wallet.secondary_path` for the wallet store. The
 [configuration reference](../reference/configuration.md) lists every key.
 
+New RocksDB SSTs use block-based table format 7 to preserve rollback compatibility across engine upgrades.
+
 ## Canonical store
 
 `RocksDbCanonicalStore` is the writer's handle, and
@@ -260,9 +262,11 @@ without `RocksDB`.
 
 ## Resource bounds
 
-Every RocksDB open goes through `RocksDbResourceBudget`, which caps the block
-cache, write-ahead log (WAL), open files, memtables, and background jobs. The
-store's size on disk does not raise process memory beyond these caps.
+The store budget sets the block cache, write-ahead log (WAL), open files,
+write buffers, and background jobs. Each column family, including `default`,
+uses the configured write-buffer size and count. When memtable usage
+approaches the shared budget, RocksDB triggers flushes. Usage can exceed
+the budget while a flush is pending.
 [ADR-0005](../adrs/0005-bounded-process-memory.md) records the memory model.
 
 | Role | Block cache | WAL | Open files | Memtable budget |
