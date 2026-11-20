@@ -290,13 +290,14 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         let request = request.into_inner();
         let start = event_stream_start_from_message(request.start)
             .ok_or_else(|| Status::invalid_argument("event stream start is required"))?;
-        let after_cursor = deadline
+        let (after_cursor, replay_through) = deadline
             .wait(self.mempool.resolve_event_start(&self.canonical, start))
             .await?;
         Ok(Response::new(spawn_mempool_event_stream(
             self.mempool.clone(),
             self.canonical.clone(),
             after_cursor,
+            replay_through,
         )))
     }
 
@@ -368,29 +369,44 @@ fn spawn_mempool_event_stream(
     mempool: LiveMempoolOwner,
     canonical: CanonicalControlHandle,
     mut after_cursor: Option<zinder_store::StreamCursorTokenV1>,
+    replay_through: Option<zinder_store::StreamCursorTokenV1>,
 ) -> MempoolEventsStream {
     let (event_sender, event_receiver) = mpsc::channel(16);
     tokio::spawn(async move {
+        let mut at_live_tail = after_cursor == replay_through;
+        let mut idle = false;
+        let mut withdrawal = std::pin::pin!(mempool.live_tail_withdrawn());
         loop {
-            match mempool.event_page(&canonical, after_cursor.clone()).await {
-                Ok(events) if events.is_empty() => {
-                    tokio::select! {
-                        () = tokio::time::sleep(EVENT_STREAM_IDLE_POLL_INTERVAL) => {}
-                        () = event_sender.closed() => return,
-                    }
+            let next_page = async {
+                if idle {
+                    tokio::time::sleep(EVENT_STREAM_IDLE_POLL_INTERVAL).await;
                 }
-                Ok(events) => {
-                    for event in events {
-                        after_cursor = Some(zinder_store::StreamCursorTokenV1::from_bytes(
-                            event.cursor.clone(),
-                        ));
-                        if event_sender.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+                mempool.event_page(&canonical, after_cursor.clone()).await
+            };
+            let page = tokio::select! {
+                biased;
+                () = event_sender.closed() => return,
+                status = &mut withdrawal, if at_live_tail => Err(status),
+                page = next_page => page,
+            };
+            let events = match page {
+                Ok(events) => events,
                 Err(status) => {
-                    let _send_result = event_sender.send(Err(status)).await;
+                    let _sent = event_sender.send(Err(status)).await;
+                    return;
+                }
+            };
+            idle = events.is_empty();
+            for event in events {
+                after_cursor = Some(zinder_store::StreamCursorTokenV1::from_bytes(
+                    event.cursor.clone(),
+                ));
+                // Replay everything retained at establishment before relying on live observation.
+                if !at_live_tail && after_cursor == replay_through {
+                    withdrawal.set(mempool.live_tail_withdrawn());
+                    at_live_tail = true;
+                }
+                if event_sender.send(Ok(event)).await.is_err() {
                     return;
                 }
             }
@@ -1878,12 +1894,9 @@ mod tests {
             .await?;
         let source_tip =
             zinder_core::BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        let endpoint = crate::mempool_ready_channel().0.observe_node_endpoint();
         let _certification = owner
-            .try_complete_hydration(
-                &canonical,
-                source_tip,
-                &crate::mempool_ready_channel().0.observe_node_endpoint(),
-            )
+            .try_complete_hydration(&canonical, source_tip, &endpoint)
             .await?;
 
         let bearer_token = BearerToken::from_str("fixture-control-token")?;

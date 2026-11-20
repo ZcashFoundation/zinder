@@ -94,7 +94,9 @@ impl CanonicalReadDeadline {
                 .min()
                 .map_or(CANONICAL_CONTROL_REPLY_TIMEOUT, |timeout| {
                     let margin = MAX_REPLY_MARGIN.min(timeout / 10);
-                    (timeout - margin).min(CANONICAL_CONTROL_REPLY_TIMEOUT)
+                    timeout
+                        .saturating_sub(margin)
+                        .min(CANONICAL_CONTROL_REPLY_TIMEOUT)
                 });
         Self(tokio::time::Instant::now() + budget)
     }

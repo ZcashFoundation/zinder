@@ -233,7 +233,8 @@ pub struct LiveMempoolOwner {
     /// durable append and its verified in-memory mutation.
     mutation_gate: Arc<Mutex<()>>,
     status: Arc<RwLock<MempoolOwnerStatus>>,
-    /// Bumped on every status change so a waiting read can retry.
+    /// Wakes readers on status changes and counts withdrawals so a live tail
+    /// still observes a withdrawal followed immediately by recertification.
     status_changes: Arc<watch::Sender<u64>>,
     /// A generation hydrating behind the serving one, or the first one.
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
@@ -271,6 +272,34 @@ impl LiveMempoolOwner {
     /// Returns a durable/index consistency error while a source reseed is required.
     pub(crate) fn require_serving(&self) -> Result<(), Status> {
         self.status.read().serving_anchor().map(|_| ())
+    }
+
+    /// Observes loss of the current live tail even while a durable page read
+    /// waits behind reconciliation. A timely replacement preserves continuity.
+    pub(crate) fn live_tail_withdrawn(&self) -> impl Future<Output = Status> + '_ {
+        let guard = self.status.read();
+        let mut changes = self.status_changes.subscribe();
+        let withdrawals = *changes.borrow_and_update();
+        let status = guard.clone();
+        drop(guard);
+        async move {
+            match status {
+                MempoolOwnerStatus::Serving { endpoint, .. } => {
+                    tokio::select! {
+                        _ = changes.wait_for(|current| *current != withdrawals) => {}
+                        () = endpoint.deactivated() => {}
+                    }
+                }
+                MempoolOwnerStatus::Halted(halt) => return halt.status(),
+                MempoolOwnerStatus::Hydrating | MempoolOwnerStatus::RebuildRequired => {}
+            }
+            self.require_not_halted().err().unwrap_or_else(|| {
+                status_for_reason(
+                    ErrorReason::NodeUnavailable,
+                    "live mempool observation was withdrawn",
+                )
+            })
+        }
     }
 
     /// Refuses with the writer's typed halt once the owner is halted.
@@ -360,7 +389,10 @@ impl LiveMempoolOwner {
             let refusal = match tokio::time::timeout_at(deadline, read(chain_epoch)).await {
                 Ok(Ok(answer)) => return Ok((chain_epoch, answer)),
                 Ok(Err(refusal)) => refusal,
-                Err(_elapsed) => return Err(tip_transition_read_expired()),
+                Err(_elapsed) => {
+                    self.require_serving()?;
+                    return Err(tip_transition_read_expired());
+                }
             };
             if tokio::time::Instant::now() >= deadline {
                 return Err(refusal);
@@ -454,10 +486,20 @@ impl LiveMempoolOwner {
         &self,
         canonical: &CanonicalControlHandle,
         start: EventStreamStartPosition,
-    ) -> Result<Option<StreamCursorTokenV1>, Status> {
+    ) -> Result<(Option<StreamCursorTokenV1>, Option<StreamCursorTokenV1>), Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.require_not_halted()?;
-        canonical.resolve_mempool_event_start(start).await
+        let head = canonical
+            .resolve_mempool_event_start(EventStreamStartPosition::LiveTail)
+            .await?;
+        let after = match start {
+            EventStreamStartPosition::LiveTail => head.clone(),
+            EventStreamStartPosition::EarliestRetained => None,
+            start @ EventStreamStartPosition::AfterCursor(_) => {
+                canonical.resolve_mempool_event_start(start).await?
+            }
+        };
+        Ok((after, head))
     }
 
     /// Reads one durable mempool event page and encodes it for the public wire.
@@ -747,9 +789,14 @@ impl LiveMempoolOwner {
             return;
         }
         record_mempool_lifecycle_status(&status);
+        let withdrew = matches!(*current, MempoolOwnerStatus::Serving { .. })
+            && !matches!(status, MempoolOwnerStatus::Serving { .. });
         *current = status;
-        self.status_changes
-            .send_modify(|changes| *changes = changes.wrapping_add(1));
+        self.status_changes.send_modify(|withdrawals| {
+            if withdrew {
+                *withdrawals = withdrawals.wrapping_add(1);
+            }
+        });
         drop(current);
     }
 
@@ -815,6 +862,7 @@ impl LiveMempoolOwner {
         let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
         let visible_tip =
             BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        self.require_active_endpoint(endpoint)?;
         if source_tip != visible_tip {
             return Ok(SnapshotCertification::PendingCanonicalTip);
         }
@@ -826,10 +874,7 @@ impl LiveMempoolOwner {
         self.reconcile_staged_generation_locked(canonical, staged_generation)
             .await
             .inspect_err(|_status| self.mark_rebuild_required())?;
-        if !endpoint.is_active() {
-            self.mark_rebuild_required();
-            return Err(inactive_mempool_endpoint());
-        }
+        self.require_active_endpoint(endpoint)?;
         self.set_status(MempoolOwnerStatus::Serving {
             replacement_deadline: None,
             endpoint: endpoint.clone(),
@@ -838,6 +883,14 @@ impl LiveMempoolOwner {
         });
         record_mempool_size_gauge(&self.index);
         Ok(SnapshotCertification::Certified)
+    }
+
+    fn require_active_endpoint(&self, endpoint: &ObservedNodeEndpoint) -> Result<(), Status> {
+        if endpoint.is_active() {
+            return Ok(());
+        }
+        self.mark_rebuild_required();
+        Err(inactive_mempool_endpoint())
     }
 
     async fn reconcile_staged_generation_locked(
@@ -2142,7 +2195,10 @@ mod tests {
 
         source_control.push_added(source_entry(0xB1)?)?;
         wait_for_staged_entries(&owner, 1).await?;
-        assert!(owner.event_page(&canonical, None).await?.is_empty());
+        assert_eq!(
+            owner.event_page(&canonical, None).await?,
+            [] as [zinder_proto::v1::wallet::MempoolEventEnvelope; 0]
+        );
         source_control.complete_initial_snapshot(observed_source_tip)?;
         tokio::time::sleep(Duration::from_millis(75)).await;
         assert_serving_at(&owner, generation_source_tip);
@@ -2250,11 +2306,9 @@ mod tests {
         }
         tokio::time::advance(super::MEMPOOL_TIP_TRANSITION_GRACE / 2).await;
         assert!(gate.admits_canonical_tip(tip));
-        assert!(
-            owner
-                .event_page(&canonical, Some(cursor.clone()))
-                .await?
-                .is_empty()
+        assert_eq!(
+            owner.event_page(&canonical, Some(cursor.clone())).await?,
+            [] as [zinder_proto::v1::wallet::MempoolEventEnvelope; 0]
         );
         // Another tip boundary cannot renew a certification which has stopped following its source.
         if !marker_received {
@@ -2265,17 +2319,7 @@ mod tests {
             .await;
         tokio::task::yield_now().await;
         assert!(!gate.admits_canonical_tip(tip));
-        assert_node_unavailable(owner.event_page(&canonical, Some(cursor.clone())).await)?;
-        assert_node_unavailable(
-            owner
-                .snapshot_page_at_canonical_tip(&canonical, 1, Vec::new())
-                .await,
-        )?;
-        assert_node_unavailable(
-            owner
-                .entry_at_canonical_tip(&canonical, transaction_id)
-                .await,
-        )?;
+        assert_expired_mempool_reads(&owner, &canonical, cursor.clone(), transaction_id).await?;
         assert_eq!(owner.event_page(&canonical, None).await?, retained);
 
         let open_count = feed.open_count();
@@ -2290,17 +2334,33 @@ mod tests {
         assert!(gate.admits_canonical_tip(recovered_tip));
         assert_eq!(feed.open_count(), open_count);
         assert_eq!(owner.event_page(&canonical, Some(cursor)).await?.len(), 1);
-        assert!(
-            owner
-                .snapshot_page_at_canonical_tip(&canonical, 1, Vec::new())
-                .await?
-                .1
-                .entries
-                .is_empty()
-        );
+        let (_, page) = owner
+            .snapshot_page_at_canonical_tip(&canonical, 1, Vec::new())
+            .await?;
+        assert_eq!(page.entries, [] as [Arc<MempoolEntry>; 0]);
         cancel.cancel();
         task.await?;
         command_task.abort();
+        Ok(())
+    }
+
+    async fn assert_expired_mempool_reads(
+        owner: &LiveMempoolOwner,
+        canonical: &CanonicalControlHandle,
+        cursor: zinder_store::StreamCursorTokenV1,
+        transaction_id: TransactionId,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_node_unavailable(owner.event_page(canonical, Some(cursor)).await)?;
+        assert_node_unavailable(
+            owner
+                .snapshot_page_at_canonical_tip(canonical, 1, Vec::new())
+                .await,
+        )?;
+        assert_node_unavailable(
+            owner
+                .entry_at_canonical_tip(canonical, transaction_id)
+                .await,
+        )?;
         Ok(())
     }
 
@@ -2484,17 +2544,15 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn stream_establishment_spends_one_deadline_across_the_gate_and_owner()
-    -> Result<(), Box<dyn Error>> {
-        use zinder_proto::v1::{ingest::ingest_control_server::IngestControl as _, wallet};
-        let (canonical, mut commands) = canonical_control_channel();
-        let owner = LiveMempoolOwner::new();
+    fn mempool_adapter(
+        canonical: CanonicalControlHandle,
+        owner: LiveMempoolOwner,
+    ) -> Result<crate::CanonicalIngestControlGrpcAdapter, Box<dyn Error>> {
         let network = zinder_core::Network::ZcashRegtest;
-        let adapter = crate::CanonicalIngestControlGrpcAdapter::new(
+        Ok(crate::CanonicalIngestControlGrpcAdapter::new(
             network,
             canonical,
-            owner.clone(),
+            owner,
             Arc::new(zinder_source::ZebraJsonRpcSource::new(
                 network,
                 "http://127.0.0.1:1",
@@ -2502,7 +2560,90 @@ mod tests {
                 Duration::from_secs(1),
             )?),
             zinder_runtime::ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]),
-        );
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caught_up_streams_observe_expiry_while_reconciliation_holds_the_gate()
+    -> Result<(), Box<dyn Error>> {
+        use tokio_stream::StreamExt as _;
+        use zinder_proto::v1::{ingest::ingest_control_server::IngestControl as _, wallet};
+        use zinder_store::EventStreamStartPosition::{EarliestRetained, LiveTail};
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let StalledAppendCanonicalControl {
+            canonical,
+            canonical_epoch,
+            append_reached,
+            release_append,
+            command_task,
+        } = stalled_append_canonical_control(store, 2)?;
+        let owner = LiveMempoolOwner::new();
+        let adapter = mempool_adapter(canonical.clone(), owner.clone())?;
+        let (source, feed) = MockMempoolSource::streaming();
+        let (signal, gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            signal,
+            cancel.clone(),
+        ));
+        let tip = fixture_source_tip();
+        wait_for_source_open(&feed, 1).await?;
+        feed.push_added(source_entry(5)?)?;
+        feed.complete_initial_snapshot(tip)?;
+        wait_for_hydration(&gate, true).await?;
+        let subscribe = |position| {
+            adapter.mempool_events(tonic::Request::new(wallet::MempoolEventsRequest {
+                start: Some(zinder_store::event_stream_start_message(&position)),
+            }))
+        };
+        let mut tail = subscribe(LiveTail).await?.into_inner();
+        let mut replay = subscribe(EarliestRetained).await?.into_inner();
+        let first = replay.next().await.ok_or("missing retained event")??;
+        let cursor = zinder_store::StreamCursorTokenV1::from_bytes(first.cursor);
+        let mut resumed = subscribe(zinder_store::EventStreamStartPosition::AfterCursor(
+            cursor.clone(),
+        ))
+        .await?
+        .into_inner();
+        let next_tip = fixture_tip(2);
+        feed.change_source_tip(tip, next_tip)?;
+        wait_for_source_open(&feed, 2).await?;
+        set_canonical_visible_tip(&canonical_epoch, next_tip);
+        feed.complete_initial_snapshot(next_tip)?;
+        append_reached.await?;
+        tokio::time::advance(super::MEMPOOL_TIP_TRANSITION_GRACE).await;
+        for stream in [&mut tail, &mut replay, &mut resumed] {
+            let terminal = tokio::time::timeout(Duration::from_millis(10), stream.next())
+                .await?
+                .ok_or("stream closed without a refusal")?;
+            assert_node_unavailable(terminal)?;
+        }
+        assert!(!gate.admits_canonical_tip(tip));
+        release_append
+            .send(None)
+            .map_err(|_| "reconciliation was cancelled")?;
+        wait_for_hydration(&gate, true).await?;
+        assert!(gate.admits_canonical_tip(next_tip));
+        let newer = owner.event_page(&canonical, Some(cursor)).await?;
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].event_sequence, first.event_sequence + 1);
+        cancel.cancel();
+        task.await?;
+        command_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_establishment_spends_one_deadline_across_the_gate_and_owner()
+    -> Result<(), Box<dyn Error>> {
+        use zinder_proto::v1::{ingest::ingest_control_server::IngestControl as _, wallet};
+        let (canonical, mut commands) = canonical_control_channel();
+        let owner = LiveMempoolOwner::new();
+        let adapter = mempool_adapter(canonical, owner.clone())?;
         for hold_gate in [true, false] {
             let gate = owner.mutation_gate.lock().await;
             let mut request = tonic::Request::new(wallet::MempoolEventsRequest {
@@ -2817,8 +2958,10 @@ mod tests {
             "the read queues behind the reconciliation"
         );
         release_append
-            .send(())
-            .map_err(|()| "the stalled append was already released")?;
+            .send(Some(tonic::Status::unavailable(
+                "injected durable mempool append failure",
+            )))
+            .map_err(|_| "the stalled append was already released")?;
 
         let outcome = tokio::time::timeout(Duration::from_secs(2), queued_read).await??;
         assert_eq!(
@@ -3878,22 +4021,22 @@ mod tests {
         canonical: CanonicalControlHandle,
         canonical_epoch: Arc<ParkingMutex<ChainEpoch>>,
         append_reached: tokio::sync::oneshot::Receiver<()>,
-        release_append: tokio::sync::oneshot::Sender<()>,
+        release_append: tokio::sync::oneshot::Sender<Option<tonic::Status>>,
         command_task: tokio::task::JoinHandle<()>,
     }
 
-    /// A mutable-epoch canonical control whose `failing_append`-th mempool
-    /// append reports that it was reached, waits for release, and then fails.
+    /// Pauses the selected append until released with success or an injected status.
     fn stalled_append_canonical_control(
         mut store: RocksDbCanonicalStore,
-        failing_append: usize,
+        stalled_append: usize,
     ) -> Result<StalledAppendCanonicalControl, Box<dyn Error>> {
         let canonical_epoch = Arc::new(ParkingMutex::new(store.chain_epoch()?));
         let command_epoch = canonical_epoch.clone();
         let canonical_fence = store.event_fence();
         let (canonical, mut commands) = canonical_control_channel();
         let (reached_sender, append_reached) = tokio::sync::oneshot::channel();
-        let (release_append, release_receiver) = tokio::sync::oneshot::channel::<()>();
+        let (release_append, release_receiver) =
+            tokio::sync::oneshot::channel::<Option<tonic::Status>>();
         let command_task = tokio::spawn(async move {
             let mut reached_sender = Some(reached_sender);
             let mut release_receiver = Some(release_receiver);
@@ -3912,22 +4055,21 @@ mod tests {
                     }
                     CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
                         append_count = append_count.saturating_add(1);
-                        if append_count != failing_append {
-                            apply_canonical_control_command(
-                                &mut store,
-                                CanonicalControlCommand::AppendMempoolEvents { events, reply },
-                            );
-                            continue;
+                        if append_count == stalled_append {
+                            if let Some(sender) = reached_sender.take() {
+                                let _send_outcome = sender.send(());
+                            }
+                            if let Some(receiver) = release_receiver.take()
+                                && let Ok(Some(status)) = receiver.await
+                            {
+                                let _send_outcome = reply.send(Err(status));
+                                continue;
+                            }
                         }
-                        if let Some(sender) = reached_sender.take() {
-                            let _send_outcome = sender.send(());
-                        }
-                        if let Some(receiver) = release_receiver.take() {
-                            let _release_outcome = receiver.await;
-                        }
-                        let _send_outcome = reply.send(Err(tonic::Status::unavailable(
-                            "injected durable mempool append failure",
-                        )));
+                        apply_canonical_control_command(
+                            &mut store,
+                            CanonicalControlCommand::AppendMempoolEvents { events, reply },
+                        );
                     }
                     command => {
                         apply_canonical_control_command(&mut store, command);

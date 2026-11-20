@@ -69,8 +69,10 @@ async fn stalled_owner_returns_storage_unavailable_through_native_wallet_query()
             );
         }
         tokio::time::pause();
-        tokio::time::advance(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT - Duration::from_millis(500))
-            .await;
+        tokio::time::advance(
+            WALLET_INGEST_CONTROL_REQUEST_TIMEOUT.saturating_sub(Duration::from_millis(500)),
+        )
+        .await;
         tokio::time::resume();
         Ok::<_, Box<dyn Error>>(held)
     };

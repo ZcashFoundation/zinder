@@ -80,6 +80,15 @@ impl ObservedNodeEndpoint {
             .as_ref()
             .is_none_or(|switches| matches!(switches.has_changed(), Ok(false)))
     }
+
+    pub(super) async fn deactivated(mut self) {
+        match self.switches.as_mut() {
+            Some(switches) => {
+                let _changed_or_closed = switches.changed().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// Read-side handle observed by the tip-follow state machine.
