@@ -107,8 +107,10 @@ the replacement, reconnect with your saved cursor and the server computes
 recovery against the tip it then serves.
 
 For durable recovery across pruning, use a server advertising `contract_revision`
-10 or later. Older servers can replay an earlier epoch after a synthesized
-reorg. The Rust SDK reports that regression as `MalformedResponse`.
+10 or later. On revisions 8 and 9, the Rust SDK replays retained events
+normally. If the server synthesizes a reorg after pruning, the SDK ends the
+stream with `ChainEventCursorExpired` before delivering the replacement or
+its cursor. Rebuild your state and start a new stream from `earliest_retained`.
 
 A `SETTLED` cursor whose block is no longer on the chain is always expired,
 because a settled stream never carries a reorg.

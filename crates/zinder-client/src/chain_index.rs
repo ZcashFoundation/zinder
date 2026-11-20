@@ -1390,6 +1390,10 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Streams visible-family chain events.
     ///
+    /// On server revisions 8 and 9, a synthesized reorg after pruning ends
+    /// the stream with [`IndexerError::ChainEventCursorExpired`]. Rebuild from
+    /// the earliest retained event. Retained events can resume normally.
+    ///
     /// The stream fails with [`IndexerError::MalformedResponse`] instead of
     /// yielding an event whose `event_sequence` does not strictly increase or
     /// whose cursor repeats one already delivered on the stream. Cursor

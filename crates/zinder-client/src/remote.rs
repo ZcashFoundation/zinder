@@ -204,6 +204,21 @@ impl RemoteChainIndex {
         }
     }
 
+    async fn wallet_server_info(
+        &self,
+        client: &mut WalletQueryClient<Channel>,
+    ) -> Result<ServerInfo, IndexerError> {
+        let response = client
+            .server_info(Request::new(wallet::ServerInfoRequest {}))
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        let wallet_info = response
+            .info
+            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
+        server_info_from_message(self.network, wallet_info)
+    }
+
     /// Reads one request-sized batch of outpoint spend statuses.
     async fn transparent_outpoint_spend_status_batch(
         &self,
@@ -902,16 +917,7 @@ fn subtree_roots_from_response(
 #[async_trait]
 impl EndpointBackedIndex for RemoteChainIndex {
     async fn server_info(&self) -> Result<ServerInfo, IndexerError> {
-        let response = self
-            .client()
-            .server_info(Request::new(wallet::ServerInfoRequest {}))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        let wallet_info = response
-            .info
-            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
-        server_info_from_message(self.network, wallet_info)
+        self.wallet_server_info(&mut self.client()).await
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
@@ -954,8 +960,8 @@ impl EndpointBackedIndex for RemoteChainIndex {
         family: ChainEventStreamFamily,
         address_filter: Vec<String>,
     ) -> Result<ChainEventStream, IndexerError> {
-        let response = self
-            .client()
+        let mut client = self.client();
+        let response = client
             .chain_events(Request::new(wallet::ChainEventsRequest {
                 start: Some(event_stream_start_to_message(&start, |cursor| {
                     cursor.as_bytes()
@@ -965,15 +971,38 @@ impl EndpointBackedIndex for RemoteChainIndex {
             }))
             .await
             .map_err(|status| self.map_status(status))?;
-        let expected_network = self.network;
-        let recovery = self.clone();
-        let mut progression = ChainEventStreamProgression::new();
-        let stream = response.into_inner().map(move |event_result| {
-            let event = event_result.map_err(|status| recovery.map_status(status))?;
-            let envelope = chain_event_envelope_from_message(expected_network, event)?;
-            progression.validate(&envelope)?;
-            Ok(envelope)
-        });
+        let state = (
+            response.into_inner(),
+            ChainEventStreamProgression::new(),
+            client,
+            self.clone(),
+        );
+        let stream = futures_util::stream::try_unfold(
+            state,
+            |(mut wire, mut progression, mut client, index)| async move {
+                let Some(message) = wire
+                    .message()
+                    .await
+                    .map_err(|status| index.map_status(status))?
+                else {
+                    return Ok(None);
+                };
+                let envelope = chain_event_envelope_from_message(index.network, message)?;
+                progression.validate(&envelope)?;
+                if may_be_legacy_reorg(&envelope)
+                    && index
+                        .wallet_server_info(&mut client)
+                        .await?
+                        .contract_revision
+                        < 10
+                {
+                    return Err(IndexerError::ChainEventCursorExpired {
+                        recovery: crate::ChainEventCursorRecovery::EarliestRetained,
+                    });
+                }
+                Ok(Some((envelope, (wire, progression, client, index))))
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -2019,6 +2048,13 @@ fn preserves_settlement(previous: &ChainEpoch, next: &ChainEpoch) -> bool {
     next.settled_tip_height > previous.settled_tip_height
         || (next.settled_tip_height == previous.settled_tip_height
             && next.settled_tip_hash == previous.settled_tip_hash)
+}
+
+// Revisions 8 and 9 number retained transitions with their resulting epoch. A
+// synthesized reorg alone reports the current epoch at the pre-retention sequence.
+fn may_be_legacy_reorg(envelope: &ChainEventEnvelope) -> bool {
+    matches!(envelope.event, ChainEvent::ChainReorged { .. })
+        && envelope.event_sequence < envelope.chain_epoch.id.value()
 }
 
 struct ChainEventStreamProgression {
@@ -3454,31 +3490,6 @@ mod tests {
             progression.validate(&reorg),
             Err(IndexerError::MalformedResponse {
                 field: "chain_reorged.reverted.block_range.start",
-                ..
-            })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_recovery_followed_by_an_older_retained_epoch_is_refused() -> Result<(), IndexerError>
-    {
-        ensure_supported_contract_revision(9)?;
-        let mut recovery =
-            chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
-        recovery.event_sequence = 2;
-        let mut retained_epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
-        retained_epoch.chain_epoch_id = 3;
-        let tail = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_at_epoch(retained_epoch, 3, vec![3]),
-        )?;
-        let mut progression = ChainEventStreamProgression::new();
-        progression.validate(&recovery)?;
-        assert!(matches!(
-            progression.validate(&tail),
-            Err(IndexerError::MalformedResponse {
-                field: "chain_view.chain_epoch.chain_epoch_id",
                 ..
             })
         ));

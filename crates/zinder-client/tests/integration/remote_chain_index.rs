@@ -19,7 +19,7 @@ use tonic::{
     Response, Status,
     body::Body as TonicBody,
     codegen::{Body, BoxFuture, Service, StdError, http},
-    server::{NamedService, ServerStreamingService},
+    server::{NamedService, ServerStreamingService, UnaryService},
     transport::Server,
 };
 use zinder_client::{
@@ -538,6 +538,171 @@ async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> e
     Ok(())
 }
 
+fn reorg_event(
+    event_sequence: u64,
+    previous: u64,
+    current: u64,
+) -> eyre::Result<wallet::ChainEventEnvelope> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let mut reverted = chain
+        .chain_epoch(zinder_client::ChainEpochId::new(previous))
+        .ok_or_else(|| eyre!("missing reverted epoch"))?;
+    let settled = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("missing settled block"))?;
+    reverted.settled_tip_height = settled.height;
+    reverted.settled_tip_hash = settled.hash;
+    let mut committed = reverted;
+    committed.id = zinder_client::ChainEpochId::new(current);
+    committed.visible_tip_hash = zinder_client::BlockHash::from_bytes([0x34; 32]);
+    let mut message = chain_event_message(
+        committed,
+        event_sequence,
+        event_sequence.to_be_bytes().to_vec(),
+    );
+    message.event = Some(wallet::chain_event_envelope::Event::ChainReorged(
+        wallet::ChainReorged {
+            reverted: Some(wallet::ChainRangeReverted {
+                chain_epoch: Some(zinder_proto::wire::chain_epoch_message(reverted)),
+                start_height: 2,
+                end_height: 2,
+            }),
+            committed: Some(wallet::ChainEpochCommitted {
+                chain_epoch: Some(zinder_proto::wire::chain_epoch_message(committed)),
+                start_height: 2,
+                end_height: 2,
+            }),
+        },
+    ));
+    Ok(message)
+}
+
+async fn chain_events_at_revision(
+    revision: Option<u32>,
+    start: EventStreamStart<zinder_client::ChainEventCursor>,
+    events: Vec<wallet::ChainEventEnvelope>,
+) -> eyre::Result<zinder_client::ChainEventStream> {
+    let endpoint = spawn_malformed_event_service::<wallet::ChainEventsRequest, _>(
+        "/zinder.v1.wallet.WalletQuery/ChainEvents",
+        events,
+        revision,
+    )
+    .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    Ok(index.chain_events(start).await?)
+}
+
+#[tokio::test]
+async fn legacy_pruned_reorg_requires_rebuild_before_delivering_its_cursor() -> eyre::Result<()> {
+    for revision in [8, 9] {
+        let cursor = zinder_client::ChainEventCursor::from_bytes([1]);
+        let mut stream = chain_events_at_revision(
+            Some(revision),
+            EventStreamStart::AfterCursor(cursor),
+            vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
+        )
+        .await?;
+        assert!(futures_util::poll!(std::pin::pin!(stream.next())).is_pending());
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(IndexerError::ChainEventCursorExpired {
+                recovery: zinder_client::ChainEventCursorRecovery::EarliestRetained,
+            }))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_reorgs_resume_and_a_later_legacy_recovery_ends_the_stream() -> eyre::Result<()> {
+    let mut stream = chain_events_at_revision(
+        Some(9),
+        EventStreamStart::AfterCursor(zinder_client::ChainEventCursor::from_bytes([1])),
+        vec![
+            reorg_event(2, 1, 2)?,
+            reorg_event(3, 2, 5)?,
+            reorg_event(4, 3, 4)?,
+        ],
+    )
+    .await?;
+    assert_eq!(
+        stream
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| eyre!("missing retained reorg"))?
+            .event_sequence,
+        2
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::ChainEventCursorExpired { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reorg_revision_probe_is_lazy_and_failures_end_the_stream() -> eyre::Result<()> {
+    let mut stream = chain_events_at_revision(
+        None,
+        EventStreamStart::LiveTail,
+        vec![
+            reorg_event(2, 1, 2)?,
+            reorg_event(3, 2, 5)?,
+            reorg_event(4, 3, 4)?,
+        ],
+    )
+    .await?;
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::ServiceUnavailable { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+
+    let mut modern = chain_events_at_revision(
+        Some(10),
+        EventStreamStart::EarliestRetained,
+        vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
+    )
+    .await?;
+    assert!(matches!(modern.next().await, Some(Ok(_))));
+    assert!(matches!(
+        modern.next().await,
+        Some(Err(IndexerError::MalformedResponse {
+            field: "chain_view.chain_epoch.chain_epoch_id",
+            ..
+        }))
+    ));
+    assert!(modern.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_network_legacy_reorg_preserves_the_network_error() -> eyre::Result<()> {
+    let mut event = reorg_event(2, 1, 4)?;
+    let epoch = event
+        .chain_view
+        .as_mut()
+        .and_then(|view| view.chain_epoch.as_mut())
+        .ok_or_else(|| eyre!("missing recovery epoch"))?;
+    epoch.network_name =
+        zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashTestnet).to_owned();
+    let mut stream =
+        chain_events_at_revision(Some(9), EventStreamStart::LiveTail, vec![event]).await?;
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::NetworkMismatch { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn remote_chain_event_stream_rejects_duplicate_sequence_from_the_wire() -> eyre::Result<()> {
     let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
@@ -720,11 +885,11 @@ fn chain_event_message(
     }
 }
 
-/// Replays a fixed list of events for one server-streaming method and answers
-/// every other method as unimplemented.
+/// Replays one stream and optionally advertises a wallet contract revision.
 struct MalformedEventService<Request, Event> {
     method_path: &'static str,
     events: Arc<Vec<Event>>,
+    revision: Option<u32>,
     request: PhantomData<fn() -> Request>,
 }
 
@@ -732,6 +897,7 @@ impl<Request, Event> Clone for MalformedEventService<Request, Event> {
     fn clone(&self) -> Self {
         Self {
             method_path: self.method_path,
+            revision: self.revision,
             events: Arc::clone(&self.events),
             request: PhantomData,
         }
@@ -762,6 +928,32 @@ where
     }
 }
 
+struct WalletRevision(u32);
+
+impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
+    type Response = wallet::ServerInfoResponse;
+    type Future = BoxFuture<Response<Self::Response>, Status>;
+
+    fn call(&mut self, _: tonic::Request<wallet::ServerInfoRequest>) -> Self::Future {
+        let revision = self.0;
+        Box::pin(async move {
+            Ok(Response::new(wallet::ServerInfoResponse {
+                info: Some(wallet::WalletServerInfo {
+                    common: Some(zinder_proto::v1::ops::ServerInfo {
+                        network: zinder_core::wire::encode_zinder_native_chain_name(
+                            Network::ZcashRegtest,
+                        )
+                        .to_owned(),
+                        contract_revision: revision,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))
+        })
+    }
+}
+
 impl<B, Req, Event> Service<http::Request<B>> for MalformedEventService<Req, Event>
 where
     B: Body + Send + 'static,
@@ -778,6 +970,15 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/zinder.v1.wallet.WalletQuery/ServerInfo"
+            && let Some(revision) = self.revision
+        {
+            return Box::pin(async move {
+                Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .unary(WalletRevision(revision), request)
+                    .await)
+            });
+        }
         if request.uri().path() != self.method_path {
             return Box::pin(async move {
                 let mut response = http::Response::new(TonicBody::default());
@@ -807,6 +1008,7 @@ where
 async fn spawn_malformed_event_service<Request, Event>(
     method_path: &'static str,
     events: Vec<Event>,
+    revision: Option<u32>,
 ) -> eyre::Result<String>
 where
     Request: tonic_prost::prost::Message + Default + Send + 'static,
@@ -817,6 +1019,7 @@ where
     let incoming = TcpListenerStream::new(listener);
     let service = MalformedEventService::<Request, Event> {
         method_path,
+        revision,
         events: Arc::new(events),
         request: PhantomData,
     };
@@ -835,6 +1038,7 @@ async fn spawn_malformed_chain_event_service(
     spawn_malformed_event_service::<wallet::ChainEventsRequest, _>(
         "/zinder.v1.wallet.WalletQuery/ChainEvents",
         events,
+        None,
     )
     .await
 }
@@ -845,6 +1049,7 @@ async fn spawn_malformed_mempool_event_service(
     spawn_malformed_event_service::<wallet::MempoolEventsRequest, _>(
         "/zinder.v1.wallet.WalletQuery/MempoolEvents",
         events,
+        None,
     )
     .await
 }
