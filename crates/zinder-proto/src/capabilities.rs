@@ -554,7 +554,8 @@ impl AdvertisePolicy {
             Self::RequiresWalletQuery => readiness.wallet_query_online,
             Self::RequiresChainValuePools => {
                 readiness.wallet_query_online
-                    && wallet.is_some_and(|info| info.supports(Capability::ChainValuePools))
+                    && wallet
+                        .is_some_and(|descriptor| descriptor.supports(Capability::ChainValuePools))
             }
             Self::RequiresCanonicalStore => readiness.canonical_store_online,
             Self::RequiresMaterializedViewStore => readiness.materialized_view_store_online,

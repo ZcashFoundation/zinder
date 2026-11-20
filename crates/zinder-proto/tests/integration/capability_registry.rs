@@ -12,6 +12,8 @@ use zinder_proto::capabilities::{
     WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1, capabilities_for_surface,
 };
 
+use zinder_proto::v1::wallet::WalletServerInfo;
+
 fn explorer_policy(capability: &str) -> Option<AdvertisePolicy> {
     capabilities_for_surface(CapabilitySurface::Explorer)
         .find(|spec| spec.string == capability)
@@ -110,7 +112,7 @@ fn explorer_value_pool_and_mempool_count_policies_require_runtime_support() {
         materialized_view_store_online: true,
         ..ExplorerReadiness::default()
     };
-    let wallet = zinder_proto::v1::wallet::WalletServerInfo {
+    let wallet = WalletServerInfo {
         common: Some(zinder_proto::v1::ops::ServerInfo {
             capabilities: vec![
                 zinder_proto::capabilities::Capability::ChainValuePools
@@ -127,7 +129,7 @@ fn explorer_value_pool_and_mempool_count_policies_require_runtime_support() {
         Some(summary)
     );
     assert!(!summary.explorer_satisfied(readiness));
-    assert!(!summary.explorer_satisfied_with_wallet(readiness, Some(&Default::default())));
+    assert!(!summary.explorer_satisfied_with_wallet(readiness, Some(&WalletServerInfo::default())));
     assert!(summary.explorer_satisfied_with_wallet(readiness, Some(&wallet)));
     assert!(!summary.explorer_satisfied_with_wallet(ExplorerReadiness::default(), Some(&wallet)));
     for capability in [

@@ -325,36 +325,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
             .await?;
 
-    let explorer_info = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
-    for unsupported in [
-        EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
-        EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
-        EXPLORER_VALUE_POOL_SUMMARY_V1,
-    ] {
-        assert!(
-            !common
-                .capabilities
-                .iter()
-                .any(|capability| capability == unsupported),
-            "advertised {unsupported}"
-        );
-    }
-    let status = client
-        .mempool_event_counts(zinder_proto::v1::explorer::MempoolEventCountsRequest::default())
-        .await
-        .err()
-        .ok_or_else(|| eyre!("empty counts view returned counts"))?;
-    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_overview_discovery(&mut client).await?;
 
     let first = client
         .overview_snapshot(OverviewSnapshotRequest {
@@ -945,6 +916,47 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
             .any(|advertised| advertised == capability),
         "expected capability {capability}",
     );
+}
+
+async fn assert_overview_discovery(client: &mut ExplorerQueryClient<Channel>) -> Result<()> {
+    let explorer_info = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
+    for unsupported in [
+        EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+        EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
+        EXPLORER_VALUE_POOL_SUMMARY_V1,
+    ] {
+        assert!(
+            !common
+                .capabilities
+                .iter()
+                .any(|capability| capability == unsupported),
+            "advertised {unsupported}"
+        );
+    }
+    let status = client
+        .mempool_event_counts(zinder_proto::v1::explorer::MempoolEventCountsRequest::default())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("empty counts view returned counts"))?;
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(
+        tonic_types::StatusExt::get_error_details(&status)
+            .error_info()
+            .map(|details| details.reason.as_str()),
+        Some(zinder_proto::v1::ops::ErrorReason::ArtifactUnavailable.as_str_name())
+    );
+
+    Ok(())
 }
 
 fn assert_overview_wallet_fields_from_production_endpoint(
