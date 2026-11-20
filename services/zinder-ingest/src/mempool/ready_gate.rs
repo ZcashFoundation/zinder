@@ -16,8 +16,8 @@
 //! certified while the owner hydrates its replacement, so the gate also
 //! admits a different certified tip for a bounded grace after the two first
 //! disagree. The certification is withdrawn only when no
-//! generation can serve: before the first snapshot completes, and while the
-//! index is rebuilt after a source failure.
+//! generation can serve: before the first snapshot completes, after its replacement
+//! exceeds the staging grace, and during a rebuild after a source failure.
 //!
 //! With fallback node endpoints, each certification also records the active
 //! endpoint the owner observed before it last found its source stream open.

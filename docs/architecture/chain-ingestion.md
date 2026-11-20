@@ -463,6 +463,12 @@ and invalidated events. Mempool state is not part of block commits. Readers get 
 through the private control API. See
 [ADR-0012](../adrs/0012-mempool-topology-and-retention.md).
 
+After a tip change, the certified mempool can serve at its own tip for up to
+30 seconds while ingest stages a replacement. Further tip changes do not
+restart the clock. At expiry, ingest withdraws mempool readiness and live
+reads return `NODE_UNAVAILABLE`. The owner keeps following the source and
+resumes serving when a complete snapshot matches the canonical tip.
+
 Live mempool reads and ingest readiness use the same endpoint certification.
 After a switch, snapshot and transaction reads and the caught-up event stream
 refuse with `NODE_UNAVAILABLE` until the new active endpoint certifies.
