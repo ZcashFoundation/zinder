@@ -18,9 +18,10 @@ lists.
 - A DNS name you control, with A and, if you publish IPv6, AAAA records that
   point to the host running Caddy.
 - A certificate and private key for that name, which you obtain and renew.
-  The template reads them from the files you name. Mobile wallets check the
-  certificate against the device's trust store, so use a publicly trusted
+  The template reads them from the files you name. Use a publicly trusted
   certificate whose subject alternative names include the exact DNS name.
+  Wallets may use platform roots or bundled WebPKI roots; installing a CA on
+  the device does not establish that every wallet will trust it.
 - Caddy v2 on the same host as Zinder, and `grpcurl` on a machine outside it.
 - Inbound TCP port 443 open to the internet. Every other Zinder port stays
   closed to the internet.
@@ -89,6 +90,120 @@ The template does four things:
   port. Caddy replaces any value the wallet sent.
 
 When you renew the certificate, replace the files and reload Caddy.
+
+## Verify a local TLS route
+
+For an isolated fixture, prepare a short-lived private CA and a loopback Caddy
+route without changing host trust, DNS, or certificate issuance. This reuses
+the production readiness and proxy configuration. It does not start Zinder.
+Use the fixture owner's gRPC and ops ports and reserve a separate TLS port.
+The output directory must not exist; its keys are private to the invoking user.
+Prerequisites are Python 3, OpenSSL, Caddy v2, GNU `timeout`, ripgrep, and grpcurl.
+
+```bash
+python3 scripts/prepare-wallet-tls-smoke.py --output .tmp/wallet-tls \
+  --port 32543 --grpc-port 32567 --ops-port 32507
+caddy adapt --config "$PWD/.tmp/wallet-tls/Caddyfile" --adapter caddyfile --validate >/dev/null
+XDG_DATA_HOME="$PWD/.tmp/wallet-tls/data" \
+XDG_CONFIG_HOME="$PWD/.tmp/wallet-tls/config" \
+  caddy run --config "$PWD/.tmp/wallet-tls/Caddyfile" --adapter caddyfile
+```
+
+Run Caddy in its own terminal. It binds only `127.0.0.1`, disables its admin
+listener and automatic HTTPS, and uses a certificate for `localhost` and
+`127.0.0.1` that expires after two days. Stop that process after the test;
+remove the scratch directory after retaining the public evidence. Do not
+archive `*-key.pem`. The generator also produces an unused client leaf for
+indexer tests; this wallet route does not require mutual TLS.
+
+With the fixture frozen and ready, run in a second terminal:
+
+```bash
+scripts/verify-wallet-tls.sh .tmp/wallet-tls 32543 32567 .tmp/wallet-tls-receipt
+```
+
+Set `GRPCURL_BIN` to an installed binary's absolute path if needed. Exit zero
+requires a verified HTTP/2 handshake, a successful `GetLightdInfo` with explicit
+CA trust, matching pinned server identity and tip height/hash from direct
+gRPC, rejection without CA trust,
+rejection of `wrong.invalid` with the correct CA, plaintext rejection on the
+TLS listener, and another successful trusted call. The output includes the
+certificate identity, tool versions, individual logs, and `result.json`.
+`estimatedHeight` is derived from wall-clock time and may differ even on a
+frozen fixture. The verifier retains every raw reply and compares the vendor,
+version, commit, network, activation height, consensus branch, protocol version,
+and transparent support. It separately compares `GetLatestBlock` height and
+hash before and after the controls and checks each `GetLightdInfo` block height
+against that tip. Rerun on a frozen fixture if the actual tip changes.
+
+The native benchmark client supports the same private CA without changing
+platform roots. For example, on a fixture containing block 150:
+
+```bash
+zinder-bench lightwalletd-wallet-load --endpoint https://127.0.0.1:32543 \
+  --tls-ca-cert .tmp/wallet-tls/ca.pem --tls-domain-name localhost \
+  --workload classic-sdk --wallets 1 --from-height 150 --to-height 150
+```
+
+A private-CA success proves that route and that client's trust configuration.
+It does not certify an unmodified wallet app. Zingolib 8.0.0 at
+`81d799775f11e882896e8710e8af12d6d4d29a41` uses `with_webpki_roots()` outside
+its unit tests. Zkool v6.37.0 at `d80892f163bc650e3b453f448da8c83eb5c32ddc`
+uses tonic's enabled roots with `tls-webpki-roots`. Neither pin exposes a
+private-CA override in the tested CLI path. Their `UnknownIssuer` failures
+with a private CA, including Zkool with `SSL_CERT_FILE`, do not identify a
+Zinder or Caddy defect. An existing endpoint with a certificate trusted by
+those roots is needed to qualify their unmodified TLS paths. The operator
+must supply its authorized hostname, routing, and certificate, or the wallet
+maintainer must provide a supported per-client CA option upstream. Do not
+patch out verification or substitute a test-only client build as app evidence.
+
+For Android clients that actually use platform trust, app-scoped trust anchors
+are available through [Network Security Configuration](https://developer.android.com/privacy-and-security/security-config).
+This does not configure a Rust library's bundled roots. On Apple devices,
+[manually installed certificate profiles need explicit SSL trust](https://support.apple.com/en-us/102390).
+Testing those paths requires an operator-owned test device or managed profile,
+the exact app build, and confirmation of its networking library. Browser
+wallets likewise need trust in the selected browser profile and the exact
+allowed origin. Leave device and browser trust changes to their owner; do not
+modify system-wide roots for this check.
+
+## Attribute wallet traffic and exclude fallback
+
+A selected URL and a successful sync do not establish which endpoint served
+the wallet. Record the exact app revision, endpoint selection, certificate
+fingerprint, and fresh wallet state. During the whole run, capture connection
+attempts from the app process and its children, including failed attempts.
+On Linux, an isolated CLI can be observed without recording payloads:
+
+```bash
+python3 scripts/trace-wallet-endpoint.py --endpoint-port 32543 \
+  --output .tmp/wallet-attribution -- "${wallet_command[@]}"
+```
+
+Set the `wallet_command` Bash array to the pinned client and its arguments.
+The wrapper requires a new private output directory and writes `connect.log`
+and `report.json`. It fails on non-loopback connections, other ports,
+unparsed Internet connect calls, no observed connection, or a failed command.
+Use a numeric loopback URL so DNS is unnecessary. Its report distinguishes
+command failure from the traffic verdict. It observes ordinary Linux process
+trees; it cannot attribute a separate pre-existing daemon or rule out traffic
+through a local proxy. Review every
+IPv4 and IPv6 destination against the configured endpoint and its DNS answers.
+For a local fixture, require loopback destinations only, apart from explicitly
+identified local resolver traffic. Record the parser or manual review that
+produced that conclusion. Repeat with the candidate endpoint stopped: the
+wallet must fail or remain pending without progress, and the trace must show
+zero attempts to bundled servers. Trace mobile apps and browser workers with
+their platform's process or network tooling; a Caddy access log alone cannot
+exclude fallback. Starting Caddy and the fixture, stopping the selected endpoint,
+and rerunning must be coordinated with their owners.
+
+A lifecycle receipt may set `fallback_used: false` only after this attribution
+is complete for that exact app run. The local verifier sets it only for its
+single-target grpcurl calls and marks wallet-app attribution unassessed.
+Missing device access, endpoint-selection support, an operator-controlled
+trusted route, or a complete process trace is an explicit qualification gap.
 
 ## Keep wallets apart in the receive limit
 
