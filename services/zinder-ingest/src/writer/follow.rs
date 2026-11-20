@@ -187,11 +187,11 @@ where
         canonical_tip: BlockId,
     ) -> TipConfirmation {
         if let Some(mempool_ready_gate) = self.config.mempool_ready_gate.as_ref() {
-            withdraw_follow_readiness_for_mempool_hydration(
+            update_follow_wait(
                 self.readiness,
                 canonical_tip,
+                None,
                 Some(mempool_ready_gate),
-                FollowWaitReason::CanonicalProgress,
             );
         }
         tip_confirmation_after_switch(switch)
@@ -682,7 +682,7 @@ where
                             &mut mempool_hydration_changes,
                             follower.readiness,
                             store.event_fence().visible_tip(),
-                            FollowWaitReason::MempoolHydrationAtTip,
+                            Some(observed_tip),
                         );
                     }
                     command = control.next_command() => {
@@ -863,11 +863,11 @@ where
     let observed_tip = source_request(config.request_timeout, cancel, source.tip_id()).await?;
     let local_tip = anchor.event_fence().visible_tip();
     if local_tip != observed_tip {
-        withdraw_follow_readiness_for_mempool_hydration(
+        update_follow_wait(
             follower.readiness,
             local_tip,
+            Some(observed_tip),
             config.mempool_ready_gate.as_ref(),
-            FollowWaitReason::CanonicalProgress,
         );
     }
     if observed_tip.height < local_tip.height
@@ -1685,7 +1685,7 @@ async fn await_follow_preparation_or_mempool_change<T>(
                 mempool_hydration_changes,
                 readiness,
                 canonical_tip,
-                FollowWaitReason::CanonicalProgress,
+                None,
             );
             None
         }
@@ -1698,13 +1698,13 @@ fn apply_mempool_hydration_change(
     mempool_hydration_changes: &mut Option<MempoolReadyGate>,
     readiness: &ComposedReadiness,
     canonical_tip: BlockId,
-    wait_reason: FollowWaitReason,
+    observed_tip: Option<BlockId>,
 ) {
-    withdraw_follow_readiness_for_mempool_hydration(
+    update_follow_wait(
         readiness,
         canonical_tip,
+        observed_tip,
         mempool_hydration_changes.as_ref(),
-        wait_reason,
     );
     if !hydration_changed {
         *mempool_hydration_changes = None;
@@ -1762,18 +1762,34 @@ fn publish_follow_readiness(readiness: &ComposedReadiness, state: ReadinessState
     });
 }
 
-fn withdraw_follow_readiness_for_mempool_hydration(
+fn update_follow_wait(
     readiness: &ComposedReadiness,
     canonical_tip: BlockId,
+    observed_tip: Option<BlockId>,
     mempool_ready_gate: Option<&MempoolReadyGate>,
-    reason: FollowWaitReason,
 ) {
+    let waiting_for_mempool =
+        mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip));
+    let reason = if waiting_for_mempool && observed_tip == Some(canonical_tip) {
+        FollowWaitReason::MempoolHydrationAtTip
+    } else {
+        FollowWaitReason::CanonicalProgress
+    };
     readiness.update_admission(|state| {
         if let ReadinessCause::Syncing { wait_reason, .. } = &mut state.cause {
             *wait_reason = Some(reason);
-        } else if state.cause.permits_traffic()
-            && mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip))
+        } else if let Some(target) = observed_tip
+            && matches!(state.cause, ReadinessCause::NodeUnavailable(_))
         {
+            let current = canonical_tip.height.value();
+            let target = target.height.value();
+            *state = ReadinessState::follow_syncing(
+                reason,
+                Some(u64::from(target.saturating_sub(current))),
+                Some(current),
+                Some(target),
+            );
+        } else if state.cause.permits_traffic() && waiting_for_mempool {
             state.cause = ReadinessCause::Syncing {
                 lag_blocks: None,
                 wait_reason: Some(reason),
@@ -1831,7 +1847,7 @@ mod tests {
         CheckpointComponent, ControlInbox, ReplacementMemory,
         await_follow_preparation_or_mempool_change, differing_checkpoint_component,
         follow_readiness, live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
-        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
+        update_follow_wait, wait_for_mempool_hydration_change,
     };
     use crate::{
         mempool_ready_channel,
@@ -2251,12 +2267,7 @@ mod tests {
         let (readiness, composed) = writer_readiness(canonical_syncing.clone());
         let canonical_tip = block_id(100, 1);
 
-        withdraw_follow_readiness_for_mempool_hydration(
-            &composed,
-            canonical_tip,
-            Some(&gate),
-            FollowWaitReason::CanonicalProgress,
-        );
+        update_follow_wait(&composed, canonical_tip, None, Some(&gate));
 
         let report = readiness.report();
         assert_eq!(report.cause, canonical_syncing.cause);

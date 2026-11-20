@@ -33,6 +33,7 @@ use zinder_ingest::{
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{
     ComposedReadiness, FollowWaitReason, NodeUnavailableDetail, Readiness, ReadinessCause,
+    ReadinessReport,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
@@ -1901,12 +1902,55 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
 #[tokio::test]
 async fn stalled_block_preparation_replaces_the_at_tip_mempool_wait()
 -> Result<(), Box<dyn std::error::Error>> {
+    let (at_tip, preparing) = reports_around_stalled_block_read(4).await?;
+    for (report, reason) in [
+        (at_tip, FollowWaitReason::MempoolHydrationAtTip),
+        (preparing, FollowWaitReason::CanonicalProgress),
+    ] {
+        assert_eq!(
+            (report.current_height, report.target_height),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            report.cause,
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(reason),
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_node_tip_ends_a_direct_outage_before_block_preparation()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The fixture has blocks through 5, so the first tip read at 99 fails.
+    let (outage, preparing) = reports_around_stalled_block_read(99).await?;
+    assert!(matches!(outage.cause, ReadinessCause::NodeUnavailable(_)));
+    assert_eq!(
+        preparing.cause,
+        ReadinessCause::Syncing {
+            lag_blocks: Some(1),
+            wait_reason: Some(FollowWaitReason::CanonicalProgress),
+        }
+    );
+    assert_eq!(
+        (preparing.current_height, preparing.target_height),
+        (Some(4), Some(5))
+    );
+    Ok(())
+}
+
+async fn reports_around_stalled_block_read(
+    initial_tip: u32,
+) -> Result<(ReadinessReport, ReadinessReport), Box<dyn std::error::Error>> {
     let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
     let extended = forked_parseable_chain(&parseable_multi_block_chain()?, 5, 5, 1)?;
     source.replace_chain(
         extended.clone(),
         checkpoints_for_parseable_chain(&extended, &activations)?,
-        BlockHeight::new(4),
+        BlockHeight::new(initial_tip),
     );
     source.clear_calls();
     let (second_tip_read, resume_tip_read) = source.pause_tip_call(2);
@@ -1934,37 +1978,20 @@ async fn stalled_block_preparation_replaces_the_at_tip_mempool_wait()
     );
     let observe = async {
         second_tip_read.notified().await;
-        let at_tip = readiness.runtime_readiness().report();
+        let before = readiness.runtime_readiness().report();
         source.set_tip_height(BlockHeight::new(5));
         resume_tip_read.notify_one();
         stalled.await?;
         let preparing = readiness.runtime_readiness().report();
         cancel.cancel();
-        Ok::<_, oneshot::error::RecvError>((at_tip, preparing))
+        Ok::<_, oneshot::error::RecvError>((before, preparing))
     };
     let (outcome, reports) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(follow_canonical_tip(store, follower), observe)
     })
     .await?;
     outcome?;
-    let (at_tip, preparing) = reports?;
-    for (report, reason) in [
-        (at_tip, FollowWaitReason::MempoolHydrationAtTip),
-        (preparing, FollowWaitReason::CanonicalProgress),
-    ] {
-        assert_eq!(
-            (report.current_height, report.target_height),
-            (Some(4), Some(4))
-        );
-        assert_eq!(
-            report.cause,
-            ReadinessCause::Syncing {
-                lag_blocks: None,
-                wait_reason: Some(reason)
-            }
-        );
-    }
-    Ok(())
+    Ok(reports?)
 }
 
 /// A reader's deadline for one `WriterStatus` request.

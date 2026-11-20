@@ -245,7 +245,9 @@ that build over. Causes that need an operator, with what to do, are in
 During wallet serving, the single-volume supervisor gives ingest 24 hours
 when it reports `node_unavailable`. A syncing ingest also qualifies when its
 current follow iteration is waiting for mempool hydration at the node's tip
-and native query relays `node_unavailable` under `ingest_control`. If the
+and native query relays `node_unavailable` under `ingest_control`. When
+the node answers a retry with a different tip, ingest clears its direct
+outage before it fetches the next block or prepares a reorg. If the
 writer starts preparing a block or falls behind while the relay continues,
 the outage clock pauses. The one-hour unready tolerance and recurrence
 budgets apply during that work. If the mempool is still waiting when ingest
