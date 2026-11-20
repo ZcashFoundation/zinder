@@ -969,7 +969,7 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     let mut bbt = BlockBasedOptions::default();
-    // Keep SSTs readable by earlier releases during rollback (ADR-0004).
+    // Keep the bundled engine's current SST format when upstream changes its default.
     bbt.set_format_version(7);
     bbt.set_block_cache(cache);
     bbt.set_cache_index_and_filter_blocks(true);

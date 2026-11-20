@@ -29,7 +29,9 @@ finds the canonical store at `storage.canonical_path`. Wallet-serving readers
 use `wallet.secondary_path` for the wallet store. The
 [configuration reference](../reference/configuration.md) lists every key.
 
-New RocksDB SSTs use block-based table format 7 to preserve rollback compatibility across engine upgrades.
+New RocksDB SSTs use block-based table format 7, the bundled engine's current
+default. The explicit setting keeps SST output at format 7 if a future engine
+changes its default.
 
 ## Canonical store
 
