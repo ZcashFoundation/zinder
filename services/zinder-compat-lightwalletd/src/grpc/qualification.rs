@@ -240,11 +240,16 @@ impl QualificationWallet {
                     "a node address history response is in progress; retry with backoff",
                 )
             })?;
+        let node = self.node().await?;
+        let end_hash = node
+            .fetch_block_hash(range.end_height)
+            .await
+            .map_err(node_status)?;
         NodeAddressHistory {
-            node: self.node().await?.clone(),
+            node: node.clone(),
             lookup,
             pending: vec![(range.start_height, range.end_height)],
-            anchor: None,
+            anchor: BlockId::new(range.end_height, end_hash),
             page: IntoIter::default(),
             page_range: (range.start_height, range.end_height),
             _permit: permit,
@@ -368,7 +373,7 @@ struct NodeAddressHistory {
     node: ZebraJsonRpcSource,
     lookup: TransparentAddressLookup,
     pending: Vec<(BlockHeight, BlockHeight)>,
-    anchor: Option<BlockId>,
+    anchor: BlockId,
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
     _permit: OwnedSemaphorePermit,
@@ -392,16 +397,7 @@ impl NodeAddressHistory {
                 .await
             {
                 Ok(ids) => {
-                    if let Some(anchor) = self.anchor
-                        && self
-                            .node
-                            .fetch_block_hash(anchor.height)
-                            .await
-                            .map_err(node_status)?
-                            != anchor.hash
-                    {
-                        return Err(history_changed());
-                    }
+                    self.verify_anchor().await?;
                     if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
                         return Err(Status::data_loss(
                             "node address history repeated a transaction ID",
@@ -416,12 +412,6 @@ impl NodeAddressHistory {
                     | SourceError::NodeResponseTooLarge { .. }
                     | SourceError::SourceResponseTooLarge { .. },
                 ) if start < end => {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(BlockId::new(
-                            end,
-                            self.node.fetch_block_hash(end).await.map_err(node_status)?,
-                        ));
-                    }
                     let mid = start.value().midpoint(end.value());
                     self.pending.push((BlockHeight::new(mid + 1), end));
                     self.pending.push((start, BlockHeight::new(mid)));
@@ -430,6 +420,19 @@ impl NodeAddressHistory {
             }
         }
         Ok(())
+    }
+
+    async fn verify_anchor(&self) -> Result<(), Status> {
+        let hash = self
+            .node
+            .fetch_block_hash(self.anchor.height)
+            .await
+            .map_err(node_status)?;
+        if hash == self.anchor.hash {
+            Ok(())
+        } else {
+            Err(history_changed())
+        }
     }
 
     async fn next(mut self) -> Result<Option<(lightwalletd::RawTransaction, Self)>, Status> {
@@ -445,6 +448,7 @@ impl NodeAddressHistory {
                 if block.height < start || block.height > end {
                     return Err(history_changed());
                 }
+                self.verify_anchor().await?;
                 self.page_range.0 = block.height;
                 return Ok(Some((
                     lightwalletd::RawTransaction {
@@ -455,6 +459,7 @@ impl NodeAddressHistory {
                 )));
             }
             if self.pending.is_empty() {
+                self.verify_anchor().await?;
                 return Ok(None);
             }
             self.read_page().await?;

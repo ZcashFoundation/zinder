@@ -349,6 +349,62 @@ async fn a_transaction_mined_outside_its_history_page_ends_the_stream() -> Resul
 }
 
 #[tokio::test]
+async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<()> {
+    for start in [1, 4] {
+        let (fixture, replaced) = history_fixture([
+            method("getaddresstxids").reply_with(|params| {
+                let start = &params[0]["start"];
+                let end = &params[0]["end"];
+                if start != end {
+                    RpcReply::error("more than 100000 transactions match; narrow the height range")
+                } else if start == 4 {
+                    RpcReply::result(json!(["01".repeat(32), "02".repeat(32)]))
+                } else {
+                    RpcReply::result(json!([]))
+                }
+            }),
+            method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 4, "01")),
+        ])?;
+        let mut history = fixture
+            .adapter
+            .get_taddress_transactions(history_request(start, 4))
+            .await?
+            .into_inner();
+        assert_eq!(
+            history.next().await.transpose()?.map(|row| row.height),
+            Some(4)
+        );
+        replaced.store(true, Ordering::Release);
+        assert!(
+            matches!(history.next().await, Some(Err(status)) if status.code() == Code::Unavailable),
+            "a replacement at the end of {start}..=4 must abort the stream"
+        );
+        assert!(history.next().await.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reorg_after_the_last_history_row_requires_retry_to_finish() -> Result<()> {
+    let (fixture, replaced) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01"))
+    ])?;
+    let mut history = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?
+        .into_inner();
+    assert!(history.next().await.transpose()?.is_some());
+    assert!(history.next().await.transpose()?.is_some());
+    replaced.store(true, Ordering::Release);
+    assert!(
+        matches!(history.next().await, Some(Err(status)) if status.code() == Code::Unavailable)
+    );
+    assert!(history.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_reorg_between_history_pages_ends_the_stream() -> Result<()> {
     let (fixture, replaced) = history_fixture([
         method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01"))

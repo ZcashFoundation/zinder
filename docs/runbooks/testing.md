@@ -532,12 +532,14 @@ closes admission until the publisher verifies the recovered writer's fence.
 
 Both mempool methods use ingest control. If an address-history lookup
 exceeds a row or byte limit, qualification splits it into disjoint height ranges.
-Each stream reads one page at a time and fetches each transaction's bytes and
-height in one verbose node call. Dropping the stream cancels the local read
-and prevents further calls.
-If one height alone exceeds the limit, the stream ends with
-`RESOURCE_EXHAUSTED`. A change to the ending block's hash between pages
-requires a retry. With `none`, `GetTransaction` fetches the bytes from
+Before looking up transaction IDs, the stream records the hash at the end of
+the requested range. Each page is read in order. For each transaction, one
+verbose node call obtains its bytes and mined height, then a block-hash
+lookup checks the range before the wallet receives the row. The stream also
+checks the hash for empty pages and before reporting completion. A replacement
+returns `UNAVAILABLE`, and cancelling the stream stops further calls. If one
+height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
+With `none`, `GetTransaction` fetches the bytes from
 the node. To exercise local mined-transaction reads, repeat with fresh store
 paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
 projector or wallet store. The feature is for qualification only. Release
