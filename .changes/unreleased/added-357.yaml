@@ -1,0 +1,6 @@
+kind: added
+body: Browser wallets can use gRPC-Web on the lightwalletd endpoint when their site is listed in `compat.browser_origins`. The same endpoint continues to serve native gRPC.
+time: 2026-11-20T08:55:27.886973944Z
+custom:
+    Bump: minor
+    PR: "357"
