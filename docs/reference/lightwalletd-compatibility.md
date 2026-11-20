@@ -138,7 +138,7 @@ The read of the first chunk checks all of the first 1,000 heights against retain
 
 Each later read is offered up to 1,000 heights from the next height to send, so every chunk can fill its 2 MiB. A read checks every height it is offered against retained history before it keeps any. When a read finds a height outside retained history while heights an earlier read checked are unsent, the server reads those heights alone, so the stream sends every height a read has checked before it ends with `NOT_FOUND`.
 
-A stream holds at most two chunks: the one the client is receiving and the next, which the server reads meanwhile. The server reads a third only once the client has received every block of the first of them. A waiting stream holds no chain epoch, so a slow client never delays new blocks. When the client goes away, the server finishes the read in flight and starts no other.
+The adapter holds at most two chunks of a stream: the one it is handing to the gRPC server and the next, which it reads meanwhile. It reads a third only once the gRPC server has taken every block of the first. The gRPC server takes blocks while the connection can send them, so encoded blocks the wallet has not received can also wait in the server's send buffers and the connection's HTTP/2 flow-control window. A waiting stream holds no chain epoch, so a slow client never delays new blocks. When the client goes away, the server finishes the read in flight and starts no other.
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 

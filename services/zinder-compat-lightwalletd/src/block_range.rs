@@ -257,11 +257,11 @@ pub(crate) enum BlockRangeStage {
     /// Converting the chunk's blocks to lightwalletd messages and pruning
     /// them to the requested pools.
     Convert,
-    /// Waiting for the client to make room for the chunk before it is read.
-    /// A stream holds at most two chunks, so a chunk waits until the client
-    /// has taken every block of the chunk two before it. Only the chunks
-    /// after the first have this stage, because the first chunk is part of
-    /// the response itself.
+    /// Waiting for room for the chunk in the response before it is read. A
+    /// stream holds at most two chunks, so a chunk waits until the gRPC
+    /// server has taken every block of the chunk two before it to send. Only
+    /// the chunks after the first have this stage, because the first chunk
+    /// is part of the response itself.
     Send,
 }
 
