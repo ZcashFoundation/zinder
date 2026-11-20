@@ -142,8 +142,8 @@ impl RocksDbResourceBudget {
     /// `512 MiB` total memtable budget. Replay writes many consumer families in
     /// every ordered dispatch; the larger shared memtable envelope lets hot
     /// families rotate while compaction catches up instead of turning flush
-    /// churn into write stalls. The write-buffer manager remains the hard
-    /// aggregate bound.
+    /// churn into write stalls. Reaching the shared budget triggers flushes.
+    /// Total memtable usage can exceed it while flushes are pending.
     #[must_use]
     pub const fn materialized_view_writer_defaults() -> Self {
         Self {
