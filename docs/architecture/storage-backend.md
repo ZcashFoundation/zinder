@@ -91,8 +91,9 @@ point lookup can still open a file that does not hold its key. That happens
 when the file's key range covers the key, or when `RocksDB` skips the range
 check. On a secondary that the primary's compaction has overtaken, a range
 read fails with the missing-table-file error only when one of its lookups
-opens a deleted file. `zinder-query` answers that error by replacing the pair,
-as [ADR-0015](../adrs/0015-wallet-runtime-composition.md) records.
+opens a deleted file. The `RocksDB` reader reports that error as an
+invalidated reader, and `zinder-query` answers it by replacing the pair, as
+[ADR-0015](../adrs/0015-wallet-runtime-composition.md) records.
 
 ## Wallet store
 
@@ -166,7 +167,9 @@ request keeps the pair it started on until it finishes.
 
 The reader rotates through four generation slots. The current pair holds one.
 The others hold the next candidate, replaced pairs, or pairs still in use by
-in-flight requests. While no slot is free, the reader does not publish, and
+in-flight requests. A slot is reused only once no pair and no storage read in
+flight holds its secondaries, because a read on the blocking pool can outlive
+the request that started it. While no slot is free, the reader does not publish, and
 its next publication jumps to the writer's latest chain event. How long a
 replaced pair stays readable is in
 [Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent).
@@ -179,6 +182,79 @@ the adapter alternates two canonical secondaries and keeps no replaced pair.
 All generations in one process share one block cache per store. The configured
 `block_cache_bytes` therefore bounds the process, not each generation. Each
 generation keeps its own table cache and memtables.
+
+## Read interfaces
+
+`zinder-query` and `zinder-compat-lightwalletd` read stored data only through
+two asynchronous interfaces in `zinder-query`: `CanonicalReader` for canonical
+data and `WalletProjectionReader` for the wallet projection. Each reader holds
+one admitted fence and never moves it. Its accessors return what it admitted,
+such as the network, the network-upgrade schedule, the event fence, the chain
+epoch, or the wallet READY evidence, without reading storage. Every other
+method reads storage.
+
+The methods answer the questions the serving runtimes ask, so a request makes
+one read where it needs several lookups:
+
+- `mined_transaction` returns a transaction's location, its block's header,
+  and its bytes, or proves the transaction absent.
+- `block_header_by_hash` and `compact_block_by_hash` resolve a block hash
+  through the best-chain index and read the block it names.
+- `total_address_balance` sums up to 256 addresses.
+- `outpoint_spend_statuses` classifies a batch of outpoints. On checkpointed
+  history a missing outpoint fails the request, so there the read ends at the
+  first one and reads none after it.
+
+No signature names a storage engine, and an engine builds every value the
+interfaces carry from what its writer stored, with constructors such as
+`CanonicalEventFence::new`, `CanonicalActivationSchedule::first_revision`, and
+`TreeStateReplay::new`. A tree-state rebuild built with `TreeStateReplay::new`
+proves nothing about its seed, so a reader rebuilds it from the seed it reads
+itself. Only a rebuild that a `RocksDB` lookup issued, on a store showing the
+same visible chain, is replayed from the seed it names.
+
+`RocksDbCanonicalReader` and `RocksDbWalletReader` implement the interfaces
+over admitted secondaries. They run each read on the blocking pool inside the
+caller's tracing span, because a direct-I/O cache miss is a synchronous
+`pread`. A caller that already holds a blocking thread drives a read with
+`read_on_blocking_thread`, and the reader then reads on that thread. Opening,
+catching up, and retiring secondaries stays engine-specific: the
+wallet-serving pair publisher and the two-generation compact-blocks refresh
+own it. A compact-blocks range chunk therefore reads through
+`CanonicalReader` on a blocking thread that captures the current generation
+itself, drives the read there, and releases the generation before encoding
+the chunk, so a chunk holds a generation only during its storage read.
+
+A storage read can outlive the request that started it. A tree-state rebuild
+therefore runs in a task of its own that holds its rebuild slot until the
+rebuild ends, even when its request is cancelled.
+
+A read that returns no value fails with `StorageReadError`. `QueryError`
+converts each variant without changing the public outcome. A storage failure
+becomes `QueryError::CanonicalStore` or `QueryError::WalletStore`, after the
+interface that failed, so the `error_class` of the `zinder_query_request_*`
+metrics stays `canonical_store` or `wallet_store`:
+
+| `StorageReadError` | Meaning | Reason on the wire |
+| --- | --- | --- |
+| `ArtifactUnavailable` | The read named an artifact the reader does not hold, such as a height outside retained history | `ARTIFACT_UNAVAILABLE` |
+| `CanonicalHistoryUnavailable` | A lookup missed in a store whose history starts after a checkpoint, so absence is unproven | `CANONICAL_HISTORY_UNAVAILABLE` |
+| `ChainEventCursorExpired` | A chain-event cursor points before retained events | `CHAIN_EVENT_CURSOR_EXPIRED` |
+| `ChainEventCursorInvalid` | A chain-event cursor is malformed or names another stream family | `CHAIN_EVENT_CURSOR_INVALID` |
+| `ReaderInvalidated` | The reader's view of storage was invalidated under it; a reader admitted afresh can answer | `STORAGE_UNAVAILABLE` |
+| `ReadTaskFailed` | The task running the read panicked or was shut down | `BLOCKING_TASK_FAILED` |
+| `Unavailable` | Storage failed to answer | `STORAGE_UNAVAILABLE` |
+
+A conformance suite in `services/zinder-query/tests/integration/read_conformance/`
+defines how every implementation answers, including bounded pages, range
+ends, proven absence, a reader that keeps its fence while the writer moves,
+and reorg replacement. It is written only against the interfaces and a
+harness that stores a chain the testkit describes. An engine runs it by
+implementing the harness and instantiating the canonical and wallet cases,
+which run separately. The `RocksDB` harness runs both in the default test
+tiers, and a canonical reader that holds its chain in memory runs the
+canonical cases, which shows the canonical interface can be implemented
+without `RocksDB`.
 
 ## Resource bounds
 

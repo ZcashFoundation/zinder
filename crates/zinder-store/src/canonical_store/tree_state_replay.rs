@@ -38,15 +38,18 @@ pub enum TreeStateLookup {
 /// A pending reconstruction of the tree state at one height from the seed
 /// checkpoint the store found below it.
 ///
-/// Only a store lookup issues one, so its seed is a validated stored
-/// checkpoint. It remembers the visible chain of the store that read the
-/// seed, and a store showing another chain reads the seed again before it
-/// replays.
+/// A store's lookup issues one from a validated stored checkpoint and
+/// remembers the visible chain of the store that read it, so a store showing
+/// that chain replays it without reading the seed again. A store showing
+/// another chain, and every store given a replay built with [`Self::new`],
+/// reads its own seed before it replays.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeStateReplay {
     seed: CommitmentTreeCheckpoint,
     height: BlockHeight,
-    seed_chain: VisibleChain,
+    /// The visible chain of the store lookup that read and revalidated
+    /// `seed`, or `None` when nothing proves where `seed` came from.
+    seed_read_at: Option<VisibleChain>,
 }
 
 /// How a store answered a [`TreeStateReplay`].
@@ -97,6 +100,23 @@ impl VisibleChain {
 }
 
 impl TreeStateReplay {
+    /// Creates the reconstruction of the tree state at `height` from `seed`,
+    /// a checkpoint stored below it, as a canonical reader of another storage
+    /// engine answers a lookup.
+    ///
+    /// Nothing records where `seed` came from, so a reader replays such a
+    /// reconstruction only from the seed it reads itself, never from `seed`.
+    ///
+    /// Returns `None` when `seed` is not below `height`.
+    #[must_use]
+    pub fn new(seed: CommitmentTreeCheckpoint, height: BlockHeight) -> Option<Self> {
+        (seed.block_id.height < height).then_some(Self {
+            seed,
+            height,
+            seed_read_at: None,
+        })
+    }
+
     /// Returns the stored checkpoint the reconstruction starts from.
     #[must_use]
     pub const fn seed(&self) -> &CommitmentTreeCheckpoint {
@@ -153,7 +173,7 @@ pub(super) fn lookup_tree_state(
         Some(TreeStateSource::Seed(seed)) => Some(TreeStateLookup::Replay(TreeStateReplay {
             seed,
             height,
-            seed_chain: VisibleChain::of(store),
+            seed_read_at: Some(VisibleChain::of(store)),
         })),
     })
 }
@@ -209,15 +229,16 @@ fn find_tree_state(
 /// Reconstructs the tree state `replay` names, reporting how it was
 /// answered.
 ///
-/// A store showing another visible chain than the one that issued `replay`
-/// looks the height up again, serving a checkpoint it stores there as stored,
-/// so `Ok(None)` means the height left that store's retained history.
+/// Only a seed a lookup read on a store showing this store's visible chain
+/// is replayed as given. For any other `replay` the store looks the height up
+/// again, serving a checkpoint it stores there as stored, so `Ok(None)` means
+/// the height left that store's retained history.
 pub(super) fn replay_tree_state(
     store: &impl CanonicalServingRead,
     replay: &TreeStateReplay,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
-    let replay = if replay.seed_chain == VisibleChain::of(store) {
+    let replay = if replay.seed_read_at == Some(VisibleChain::of(store)) {
         refuse_unadmitted_activations(store, replay.height, activations)?;
         replay.clone()
     } else {
@@ -479,4 +500,34 @@ fn replay_refused(
         "commitment trees at height {} cannot be reconstructed: {source}",
         height.value()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
+    };
+
+    use super::TreeStateReplay;
+
+    fn seed(height: u32) -> CommitmentTreeCheckpoint {
+        CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(height), BlockHash::from_bytes([1; 32])),
+            0,
+            CommitmentTreeFrontiers::default(),
+        )
+    }
+
+    /// A reconstruction built outside a store lookup names a seed below its
+    /// height and records no store that read it.
+    #[test]
+    fn a_replay_built_outside_a_lookup_starts_below_its_height_unread() {
+        let built = TreeStateReplay::new(seed(4), BlockHeight::new(7));
+        assert_eq!(
+            built.as_ref().map(TreeStateReplay::replayed_blocks),
+            Some(3)
+        );
+        assert!(built.is_some_and(|replay| replay.seed_read_at.is_none()));
+        assert_eq!(TreeStateReplay::new(seed(7), BlockHeight::new(7)), None);
+    }
 }

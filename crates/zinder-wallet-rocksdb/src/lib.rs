@@ -23,8 +23,7 @@ pub use error::RocksDbWalletError;
 pub use secondary::{RocksDbWalletSecondary, WalletSecondaryCatchupOutcome};
 pub use store::{
     RocksDbWalletBuildStore, RocksDbWalletFollowingStore, RocksDbWalletStore,
-    WALLET_ROCKSDB_SCHEMA_VERSION, WalletAddressTransactionHistoryPage,
-    WalletAddressUnspentOutputsPage, WalletOwnerCheckpointAdmission, WalletOwnerCheckpointEvidence,
+    WALLET_ROCKSDB_SCHEMA_VERSION, WalletOwnerCheckpointAdmission, WalletOwnerCheckpointEvidence,
     WalletRecoveryAdmissionConfig,
 };
 pub use transition::{MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, WalletTransitionFootprint};

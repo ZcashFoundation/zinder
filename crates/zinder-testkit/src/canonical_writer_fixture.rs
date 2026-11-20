@@ -102,6 +102,41 @@ impl<'chain> CanonicalBaseline<'chain> {
         self.subtree_roots.push(subtree_root);
         self
     }
+
+    /// Returns the chain the baseline publishes from.
+    #[must_use]
+    pub const fn chain(&self) -> &'chain ChainFixture {
+        self.chain
+    }
+
+    /// Returns the height of the published tip: the one set with
+    /// [`Self::through`], or the chain's tip.
+    #[must_use]
+    pub fn tip_height(&self) -> Option<BlockHeight> {
+        self.tip_height.or_else(|| self.chain.tip_height())
+    }
+
+    /// Returns the authenticated predecessor of checkpointed history set with
+    /// [`Self::with_history_floor`], or `None` for complete history from
+    /// height 1.
+    #[must_use]
+    pub const fn history_floor(&self) -> Option<BlockHeight> {
+        self.history_floor
+    }
+
+    /// Returns the height the baseline settles at: the one set with
+    /// [`Self::with_settled_tip`], or its tip.
+    #[must_use]
+    pub fn settled_tip_height(&self) -> Option<BlockHeight> {
+        self.settled_tip_height.or_else(|| self.tip_height())
+    }
+
+    /// Returns the subtree roots loaded with [`Self::with_subtree_root`], in
+    /// the order they were added.
+    #[must_use]
+    pub fn subtree_roots(&self) -> &[CanonicalBuildSubtreeRoot] {
+        &self.subtree_roots
+    }
 }
 
 /// A READY production canonical primary built from [`ChainFixture`] blocks.

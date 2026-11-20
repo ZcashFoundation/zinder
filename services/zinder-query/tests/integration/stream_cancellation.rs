@@ -42,21 +42,19 @@ use tonic::Code;
 use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHeight, BlockHeightRange, Network, TransactionId, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentUnspentOutput,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_query::{
+    RocksDbCanonicalReader, RocksDbWalletReader, SpendStatusReadEnd, StorageReadError,
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, WalletEndpointMetadata, WalletProjectionReader,
     WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 use zinder_wallet_projection::{
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletProjectionReadyEvidence,
-    WalletSpentOutput, WalletUnspentOutput,
-};
-use zinder_wallet_rocksdb::{
-    RocksDbWalletError, WalletAddressTransactionHistoryPage, WalletAddressUnspentOutputsPage,
+    WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage, WalletProjectionReadyEvidence,
 };
 
 /// Number of pre-committed blocks the test store carries. Picked so each
@@ -411,9 +409,9 @@ async fn spawn_unspent_output_server(
     let (canonical, wallet) = store_fixture.take_readers()?;
     let page_reads = Arc::new(AtomicUsize::new(0));
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
         Arc::new(CountingWalletReader {
-            inner: Arc::new(wallet),
+            inner: Arc::new(RocksDbWalletReader::new(wallet)),
             page_reads: Arc::clone(&page_reads),
         }),
     )?);
@@ -445,6 +443,7 @@ struct CountingWalletReader {
     page_reads: Arc<AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl WalletProjectionReader for CountingWalletReader {
     fn network(&self) -> Network {
         self.inner.network()
@@ -454,77 +453,54 @@ impl WalletProjectionReader for CountingWalletReader {
         self.inner.ready_evidence()
     }
 
-    fn address_unspent_outputs_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
-        self.page_reads.fetch_add(1, Ordering::AcqRel);
-        self.inner
-            .address_unspent_outputs_page(address_script_hash, after, page_size)
-    }
-
-    fn address_unspent_outputs_page_from_height(
+    async fn address_unspent_outputs_page_from_height(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         after: Option<WalletAddressUnspentOutputKey>,
         page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
+    ) -> Result<WalletAddressUnspentOutputsPage, StorageReadError> {
         self.page_reads.fetch_add(1, Ordering::AcqRel);
-        self.inner.address_unspent_outputs_page_from_height(
-            address_script_hash,
-            start_height,
-            after,
-            page_size,
-        )
-    }
-
-    fn address_transaction_history_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
         self.inner
-            .address_transaction_history_page(address_script_hash, after, page_size)
+            .address_unspent_outputs_page_from_height(
+                address_script_hash,
+                start_height,
+                after,
+                page_size,
+            )
+            .await
     }
 
-    fn address_transaction_history_range_page(
+    async fn address_transaction_history_range_page(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         height_range: BlockHeightRange,
         after: Option<WalletAddressTransactionKey>,
         page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
-        self.inner.address_transaction_history_range_page(
-            address_script_hash,
-            height_range,
-            after,
-            page_size,
-        )
+    ) -> Result<WalletAddressTransactionHistoryPage, StorageReadError> {
+        self.inner
+            .address_transaction_history_range_page(
+                address_script_hash,
+                height_range,
+                after,
+                page_size,
+            )
+            .await
     }
 
-    fn address_balance(
+    async fn total_address_balance(
         &self,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> Result<u64, RocksDbWalletError> {
-        self.inner.address_balance(address_script_hash)
+        addresses: Vec<TransparentAddressScriptHash>,
+    ) -> Result<u64, StorageReadError> {
+        self.inner.total_address_balance(addresses).await
     }
 
-    fn find_unspent_output(
+    async fn outpoint_spend_statuses(
         &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
-        self.inner.find_unspent_output(outpoint)
-    }
-
-    fn find_spent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
-        self.inner.find_spent_output(outpoint)
+        outpoints: Vec<TransparentOutPoint>,
+        end: SpendStatusReadEnd,
+    ) -> Result<Vec<TransparentOutpointSpendStatus>, StorageReadError> {
+        self.inner.outpoint_spend_statuses(outpoints, end).await
     }
 }
 
@@ -544,8 +520,8 @@ async fn commit_store_and_build_adapter() -> Result<(ServingAdapter, WalletServi
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;

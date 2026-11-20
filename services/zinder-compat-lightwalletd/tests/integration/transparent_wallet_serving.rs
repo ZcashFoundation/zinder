@@ -22,25 +22,25 @@ use zinder_compat_lightwalletd::{
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
 };
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, ConsensusBranchId, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentUnspentOutput, wire::encode_branch_id_hex,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, CompactBlockArtifact,
+    ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
+    TransparentUnspentOutput, wire::encode_branch_id_hex,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
     compact_tx_streamer_server::CompactTxStreamer,
 };
 use zinder_query::{
-    CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    CanonicalReader, IndexedTransaction, RocksDbCanonicalReader, RocksDbWalletReader,
+    SpendStatusReadEnd, StorageReadError, WalletProjectionReader, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState, TrafficReadinessInterceptor};
 use zinder_store::{
-    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
-    ServedTreeState,
+    CanonicalEventFence, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention, ServedTreeState,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, WalletServingStoreFixture,
@@ -334,8 +334,8 @@ async fn unretained_transactions_reject_compatibility_before_listener_binding() 
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(serving_pair));
@@ -598,8 +598,8 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
     let (mut store_fixture, address_text) = many_utxo_fixture(0x35, utxo_count)?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(serving_pair));
@@ -668,11 +668,11 @@ async fn taddress_history_streams_and_reads_each_transaction_once() -> eyre::Res
     const HISTORY: u32 = 1_001;
     let (mut store_fixture, address_text) = many_utxo_fixture(0x36, HISTORY)?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    let canonical_reader = InstrumentedCanonicalReader::new(canonical_reader);
+    let canonical_reader = InstrumentedCanonicalReader::new(canonical_reader)?;
     let blob_reads = Arc::clone(&canonical_reader.transaction_blob_reads);
     let adapter = build_wallet_serving_adapter_from_readers(
         Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?;
     let request = transparent_history_filter(address_text, 2, 2);
 
@@ -727,11 +727,11 @@ async fn taddress_history_sends_a_transaction_before_reading_the_next_history_pa
     const HISTORY: u32 = 1_001;
     let (mut store_fixture, address_text) = many_utxo_fixture(0x38, HISTORY)?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    let (gate, release) = HistoryPageGate::new();
+    let gate = HistoryPageGate::new();
     let adapter = build_wallet_serving_adapter_from_readers(
-        Arc::new(canonical_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
         Arc::new(CountingWalletReader {
-            wallet_reader,
+            wallet_reader: RocksDbWalletReader::new(wallet_reader),
             unspent_output_reads: UnspentOutputReads::default(),
             history_page_gate: Some(Arc::clone(&gate)),
         }),
@@ -766,7 +766,7 @@ async fn taddress_history_sends_a_transaction_before_reading_the_next_history_pa
             Some(history_transaction_bytes(0))
         );
 
-        release.send(())?;
+        gate.release();
         let rest = collect_stream(stream).await?;
         assert_eq!(rest.len() + 1, u32_to_usize(HISTORY));
         assert_eq!(
@@ -1001,11 +1001,11 @@ async fn taddress_history_ends_with_the_status_of_a_failure_after_partial_delive
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let canonical_reader = InstrumentedCanonicalReader {
         missing_transaction_id: Some(history_transaction_id(1)),
-        ..InstrumentedCanonicalReader::new(canonical_reader)
+        ..InstrumentedCanonicalReader::new(canonical_reader)?
     };
     let adapter = build_wallet_serving_adapter_from_readers(
         Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?;
 
     let mut stream = adapter
@@ -1236,8 +1236,8 @@ async fn production_pair_seeks_transparent_address_ranges_past_a_large_prefix() 
     assert_eq!(history.next_page_after, None);
 
     let adapter = build_wallet_serving_adapter_from_readers(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?;
     let history = collect_stream(
         adapter
@@ -1286,9 +1286,10 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let canonical_reader: Arc<dyn CanonicalReader> = Arc::new(InstrumentedCanonicalReader {
         missing_transaction_id: Some(transaction_id),
-        ..InstrumentedCanonicalReader::new(canonical_reader)
+        ..InstrumentedCanonicalReader::new(canonical_reader)?
     });
-    let wallet_reader: Arc<dyn WalletProjectionReader> = Arc::new(wallet_reader);
+    let wallet_reader: Arc<dyn WalletProjectionReader> =
+        Arc::new(RocksDbWalletReader::new(wallet_reader));
     let adapter = build_wallet_serving_adapter_from_readers(canonical_reader, wallet_reader)?;
     let request = transparent_history_filter(address_text, 1, 1);
 
@@ -1377,7 +1378,10 @@ fn build_wallet_serving_adapter(
     store_fixture: &mut WalletServingStoreFixture,
 ) -> eyre::Result<WalletServingAdapter> {
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    build_wallet_serving_adapter_from_readers(Arc::new(canonical_reader), Arc::new(wallet_reader))
+    build_wallet_serving_adapter_from_readers(
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
+    )
 }
 
 fn build_wallet_serving_adapter_from_readers(
@@ -1426,17 +1430,18 @@ fn counting_utxo_adapter(
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let outputs_read = UnspentOutputReads::default();
     let wallet_reader: Arc<dyn WalletProjectionReader> = Arc::new(CountingWalletReader {
-        wallet_reader,
+        wallet_reader: RocksDbWalletReader::new(wallet_reader),
         unspent_output_reads: outputs_read.clone(),
         history_page_gate: None,
     });
     let adapter = match response_limit {
-        None => {
-            build_wallet_serving_adapter_from_readers(Arc::new(canonical_reader), wallet_reader)?
-        }
+        None => build_wallet_serving_adapter_from_readers(
+            Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+            wallet_reader,
+        )?,
         Some(max_address_utxos) => {
             let serving_pair = Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical_reader),
+                Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
                 wallet_reader,
             )?);
             LightwalletdGrpcAdapter::with_response_limits(
@@ -1645,7 +1650,7 @@ where
 /// A wallet reader that counts the unspent outputs and pages it reads and
 /// can hold back a history page.
 struct CountingWalletReader {
-    wallet_reader: zinder_wallet_rocksdb::RocksDbWalletSecondary,
+    wallet_reader: RocksDbWalletReader,
     unspent_output_reads: UnspentOutputReads,
     history_page_gate: Option<Arc<HistoryPageGate>>,
 }
@@ -1659,7 +1664,7 @@ struct UnspentOutputReads {
 }
 
 impl UnspentOutputReads {
-    fn record(&self, page: &zinder_wallet_rocksdb::WalletAddressUnspentOutputsPage) {
+    fn record(&self, page: &zinder_wallet_projection::WalletAddressUnspentOutputsPage) {
         self.outputs.fetch_add(page.outputs.len(), Ordering::SeqCst);
         self.pages.fetch_add(1, Ordering::SeqCst);
     }
@@ -1682,28 +1687,34 @@ impl UnspentOutputReads {
 /// Holds the second history page a request reads until the test releases it.
 struct HistoryPageGate {
     pages_requested: AtomicUsize,
-    release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+    released: tokio::sync::Semaphore,
 }
 
 impl HistoryPageGate {
-    fn new() -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
-        let (release, released) = std::sync::mpsc::channel();
-        let gate = Arc::new(Self {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
             pages_requested: AtomicUsize::new(0),
-            release: parking_lot::Mutex::new(released),
-        });
-        (gate, release)
+            released: tokio::sync::Semaphore::new(0),
+        })
     }
 
-    /// Blocks the second page request since the last reset until released,
-    /// or until the test drops its release sender.
-    fn before_page(&self) {
-        if self.pages_requested.fetch_add(1, Ordering::SeqCst) == 1 {
-            let _ = self.release.lock().recv();
+    /// Waits on the second page request since the last reset until the test
+    /// releases it.
+    async fn before_page(&self) {
+        if self.pages_requested.fetch_add(1, Ordering::SeqCst) == 1
+            && let Ok(release) = self.released.acquire().await
+        {
+            release.forget();
         }
+    }
+
+    /// Lets one held page request continue.
+    fn release(&self) {
+        self.released.add_permits(1);
     }
 }
 
+#[async_trait::async_trait]
 impl WalletProjectionReader for CountingWalletReader {
     fn network(&self) -> Network {
         self.wallet_reader.network()
@@ -1713,34 +1724,13 @@ impl WalletProjectionReader for CountingWalletReader {
         self.wallet_reader.ready_evidence()
     }
 
-    fn address_unspent_outputs_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<zinder_wallet_projection::WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<
-        zinder_wallet_rocksdb::WalletAddressUnspentOutputsPage,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
-        let page = self.wallet_reader.address_unspent_outputs_page(
-            address_script_hash,
-            after,
-            page_size,
-        )?;
-        self.unspent_output_reads.record(&page);
-        Ok(page)
-    }
-
-    fn address_unspent_outputs_page_from_height(
+    async fn address_unspent_outputs_page_from_height(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         start_height: BlockHeight,
         after: Option<zinder_wallet_projection::WalletAddressUnspentOutputKey>,
         page_size: NonZeroU16,
-    ) -> Result<
-        zinder_wallet_rocksdb::WalletAddressUnspentOutputsPage,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
+    ) -> Result<zinder_wallet_projection::WalletAddressUnspentOutputsPage, StorageReadError> {
         let page = self
             .wallet_reader
             .address_unspent_outputs_page_from_height(
@@ -1748,92 +1738,75 @@ impl WalletProjectionReader for CountingWalletReader {
                 start_height,
                 after,
                 page_size,
-            )?;
+            )
+            .await?;
         self.unspent_output_reads.record(&page);
         Ok(page)
     }
 
-    fn address_transaction_history_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<zinder_wallet_projection::WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<
-        zinder_wallet_rocksdb::WalletAddressTransactionHistoryPage,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
-        self.wallet_reader
-            .address_transaction_history_page(address_script_hash, after, page_size)
-    }
-
-    fn address_transaction_history_range_page(
+    async fn address_transaction_history_range_page(
         &self,
         address_script_hash: TransparentAddressScriptHash,
         height_range: BlockHeightRange,
         after: Option<zinder_wallet_projection::WalletAddressTransactionKey>,
         page_size: NonZeroU16,
-    ) -> Result<
-        zinder_wallet_rocksdb::WalletAddressTransactionHistoryPage,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
+    ) -> Result<zinder_wallet_projection::WalletAddressTransactionHistoryPage, StorageReadError>
+    {
         if let Some(gate) = &self.history_page_gate {
-            gate.before_page();
+            gate.before_page().await;
         }
-        self.wallet_reader.address_transaction_history_range_page(
-            address_script_hash,
-            height_range,
-            after,
-            page_size,
-        )
+        self.wallet_reader
+            .address_transaction_history_range_page(
+                address_script_hash,
+                height_range,
+                after,
+                page_size,
+            )
+            .await
     }
 
-    fn address_balance(
+    async fn total_address_balance(
         &self,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> Result<u64, zinder_wallet_rocksdb::RocksDbWalletError> {
-        self.wallet_reader.address_balance(address_script_hash)
+        addresses: Vec<TransparentAddressScriptHash>,
+    ) -> Result<u64, StorageReadError> {
+        self.wallet_reader.total_address_balance(addresses).await
     }
 
-    fn find_unspent_output(
+    async fn outpoint_spend_statuses(
         &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<
-        Option<zinder_wallet_projection::WalletUnspentOutput>,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
-        self.wallet_reader.find_unspent_output(outpoint)
-    }
-
-    fn find_spent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<
-        Option<zinder_wallet_projection::WalletSpentOutput>,
-        zinder_wallet_rocksdb::RocksDbWalletError,
-    > {
-        self.wallet_reader.find_spent_output(outpoint)
+        outpoints: Vec<TransparentOutPoint>,
+        end: SpendStatusReadEnd,
+    ) -> Result<Vec<TransparentOutpointSpendStatus>, StorageReadError> {
+        self.wallet_reader
+            .outpoint_spend_statuses(outpoints, end)
+            .await
     }
 }
 
-/// A canonical reader that counts transaction-blob reads and can hide one
-/// transaction's blob.
+/// A canonical reader that counts mined-transaction reads, each of which
+/// reads the transaction's bytes, and can hide one transaction's bytes.
 struct InstrumentedCanonicalReader {
-    canonical_reader: zinder_store::RocksDbCanonicalSecondary,
+    canonical_reader: RocksDbCanonicalReader,
     missing_transaction_id: Option<TransactionId>,
     transaction_blob_reads: Arc<AtomicUsize>,
 }
 
 impl InstrumentedCanonicalReader {
-    fn new(canonical_reader: zinder_store::RocksDbCanonicalSecondary) -> Self {
-        Self {
-            canonical_reader,
+    fn new(canonical_reader: zinder_store::RocksDbCanonicalSecondary) -> eyre::Result<Self> {
+        Ok(Self {
+            canonical_reader: RocksDbCanonicalReader::new(canonical_reader)?,
             missing_transaction_id: None,
             transaction_blob_reads: Arc::new(AtomicUsize::new(0)),
-        }
+        })
     }
 }
 
+#[async_trait::async_trait]
 impl CanonicalReader for InstrumentedCanonicalReader {
+    fn network(&self) -> Network {
+        self.canonical_reader.network()
+    }
+
     fn network_upgrade_schedule(&self) -> Option<&zinder_store::CanonicalActivationSchedule> {
         self.canonical_reader.network_upgrade_schedule()
     }
@@ -1842,144 +1815,164 @@ impl CanonicalReader for InstrumentedCanonicalReader {
         self.canonical_reader.raw_blob_retention()
     }
 
-    fn network(&self) -> Network {
-        self.canonical_reader.network()
-    }
-
     fn event_fence(&self) -> CanonicalEventFence {
         self.canonical_reader.event_fence()
+    }
+
+    fn chain_epoch(&self) -> zinder_core::ChainEpoch {
+        self.canonical_reader.chain_epoch()
     }
 
     fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
         self.canonical_reader.history_bounds()
     }
 
-    fn chain_epoch(&self) -> Result<zinder_core::ChainEpoch, CanonicalStoreError> {
-        self.canonical_reader.chain_epoch()
-    }
-
-    fn chain_epoch_at(
-        &self,
-        epoch_id: zinder_core::ChainEpochId,
-    ) -> Result<zinder_core::ChainEpoch, CanonicalStoreError> {
-        self.canonical_reader.chain_epoch_at(epoch_id)
-    }
-
-    fn block_header_at(
+    async fn block_header_at(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
-        self.canonical_reader.block_header_at(height)
+    ) -> Result<Option<BlockHeaderArtifact>, StorageReadError> {
+        self.canonical_reader.block_header_at(height).await
     }
 
-    fn block_hash_lookup(
+    async fn block_hash_lookup(
         &self,
         block_hash: zinder_core::BlockHash,
-    ) -> Result<zinder_store::BlockHashLookup, CanonicalStoreError> {
-        self.canonical_reader.block_hash_lookup(block_hash)
+    ) -> Result<zinder_store::BlockHashLookup, StorageReadError> {
+        self.canonical_reader.block_hash_lookup(block_hash).await
     }
 
-    fn compact_block_at(
+    async fn block_header_by_hash(
+        &self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Result<Option<BlockHeaderArtifact>, StorageReadError> {
+        self.canonical_reader.block_header_by_hash(block_hash).await
+    }
+
+    async fn compact_block_by_hash(
+        &self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Result<Option<CompactBlockArtifact>, StorageReadError> {
+        self.canonical_reader
+            .compact_block_by_hash(block_hash)
+            .await
+    }
+
+    async fn compact_block_at(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-        self.canonical_reader.compact_block_at(height)
+    ) -> Result<Option<CompactBlockArtifact>, StorageReadError> {
+        self.canonical_reader.compact_block_at(height).await
     }
 
-    fn compact_blocks_in_range(
+    async fn compact_blocks_in_range(
         &self,
         range: BlockHeightRange,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-        self.canonical_reader.compact_blocks_in_range(range)
+    ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
+        self.canonical_reader.compact_blocks_in_range(range).await
     }
 
-    fn compact_blocks_in_range_up_to(
+    async fn compact_blocks_in_range_up_to(
         &self,
         range: BlockHeightRange,
         order: zinder_store::HeightOrder,
         max_bytes: usize,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+    ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
         self.canonical_reader
             .compact_blocks_in_range_up_to(range, order, max_bytes)
+            .await
     }
 
-    fn block_blob_at(
+    async fn block_blob_at(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
-        self.canonical_reader.block_blob_at(height)
+    ) -> Result<Option<BlockBlobArtifact>, StorageReadError> {
+        self.canonical_reader.block_blob_at(height).await
     }
 
-    fn block_blobs_in_range(
+    async fn block_blobs_in_range(
         &self,
         range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
-        self.canonical_reader.block_blobs_in_range(range)
+    ) -> Result<Vec<Option<BlockBlobArtifact>>, StorageReadError> {
+        self.canonical_reader.block_blobs_in_range(range).await
     }
 
-    fn transaction_location(
+    async fn mined_transaction(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-        self.canonical_reader.transaction_location(transaction_id)
-    }
-
-    fn transaction_location_or_proven_absence(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-        self.canonical_reader
-            .transaction_location_or_proven_absence(transaction_id)
-    }
-
-    fn transaction_blob(
-        &self,
-        location: TransactionLocation,
-    ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
-        self.transaction_blob_reads.fetch_add(1, Ordering::SeqCst);
-        if Some(location.transaction_id) == self.missing_transaction_id {
-            return Ok(None);
+    ) -> Result<Option<IndexedTransaction>, StorageReadError> {
+        let transaction = self
+            .canonical_reader
+            .mined_transaction(transaction_id)
+            .await?;
+        if transaction.is_some() {
+            self.transaction_blob_reads.fetch_add(1, Ordering::SeqCst);
         }
-        self.canonical_reader.transaction_blob(location)
+        if Some(transaction_id) == self.missing_transaction_id {
+            return Ok(transaction.map(|transaction| IndexedTransaction {
+                transaction_blob: None,
+                ..transaction
+            }));
+        }
+        Ok(transaction)
     }
 
-    fn tree_state_checkpoint_at_or_before(
+    async fn transaction_blob_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<TransactionBlobArtifact, StorageReadError> {
+        self.canonical_reader
+            .transaction_blob_by_id(transaction_id)
+            .await
+    }
+
+    async fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
-    ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
         self.canonical_reader
             .tree_state_checkpoint_at_or_before(height)
+            .await
     }
 
-    fn tree_state_checkpoint_at(
+    async fn tree_state_lookup(
         &self,
         height: BlockHeight,
-        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-        self.canonical_reader
-            .tree_state_checkpoint_at(height, network_upgrade_activations)
+    ) -> Result<Option<zinder_store::TreeStateLookup>, StorageReadError> {
+        self.canonical_reader.tree_state_lookup(height).await
     }
 
-    fn subtree_roots(
+    async fn replay_tree_state(
+        &self,
+        replay: zinder_store::TreeStateReplay,
+    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, StorageReadError> {
+        self.canonical_reader.replay_tree_state(replay).await
+    }
+
+    async fn subtree_roots(
         &self,
         range: SubtreeRootRange,
-    ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
-        self.canonical_reader.subtree_roots(range)
+    ) -> Result<Vec<SubtreeRootArtifact>, StorageReadError> {
+        self.canonical_reader.subtree_roots(range).await
     }
 
-    fn wallet_chain_event_history(
+    async fn wallet_chain_event_history(
         &self,
-        request: ChainEventHistoryRequest<'_>,
-    ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError> {
-        self.canonical_reader.wallet_chain_event_history(request)
+        from_cursor: Option<zinder_store::StreamCursorTokenV1>,
+        family: ChainEventStreamFamily,
+        max_events: NonZeroU32,
+    ) -> Result<Vec<ChainEventEnvelope>, StorageReadError> {
+        self.canonical_reader
+            .wallet_chain_event_history(from_cursor, family, max_events)
+            .await
     }
 
-    fn resolve_wallet_chain_event_stream_start(
+    async fn resolve_wallet_chain_event_stream_start(
         &self,
-        start: &EventStreamStartPosition,
+        start: EventStreamStartPosition,
         requested_family: ChainEventStreamFamily,
-    ) -> Result<ChainEventStreamResume, CanonicalStoreError> {
+    ) -> Result<ChainEventStreamResume, StorageReadError> {
         self.canonical_reader
             .resolve_wallet_chain_event_stream_start(start, requested_family)
+            .await
     }
 }

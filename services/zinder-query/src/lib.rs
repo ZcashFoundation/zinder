@@ -35,7 +35,11 @@ mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
+#[cfg(test)]
+mod observed_canonical_reader;
+mod rocksdb_serving_readers;
 mod serving_read;
+mod serving_readers;
 mod transparent_unspent_output_stream;
 mod tree_state_replay_limit;
 mod wallet_serving_pair;
@@ -66,6 +70,11 @@ pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
+pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
+pub use serving_readers::{
+    CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
+    WalletProjectionReader, read_on_blocking_thread,
+};
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
@@ -73,9 +82,7 @@ pub use tree_state_replay_limit::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
     MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
-pub use wallet_serving_pair::{
-    CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
-};
+pub use wallet_serving_pair::{WalletServingAdmissionError, WalletServingReadPair};
 pub use wallet_serving_pair_publisher::{
     WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
     WalletServingPairPublisher, WalletServingPairSlot, WalletServingPairTeardownError,
@@ -459,22 +466,6 @@ pub const FULL_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 4;
 /// request issue thousands of reads. `u32` matches the `address_count` field
 /// on the response so the bound check happens in the wire type's native width.
 pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
-
-/// Awaits a `spawn_blocking` task and flattens the join error into a
-/// `QueryError` so callers see one consistent error vocabulary.
-///
-/// Every query composition in this crate routes its storage reads through
-/// this helper, so no `RocksDB` read ever runs on a reactor thread.
-pub(crate) async fn join_blocking<Output>(
-    handle: tokio::task::JoinHandle<Result<Output, QueryError>>,
-) -> Result<Output, QueryError> {
-    match handle.await {
-        Ok(blocking_outcome) => blocking_outcome,
-        Err(join_error) => Err(QueryError::BlockingTaskFailed {
-            reason: join_error.to_string(),
-        }),
-    }
-}
 
 /// Metric pair the `WalletQuery` adapter emits per request.
 const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
@@ -1186,18 +1177,20 @@ pub enum QueryError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Canonical store returned a storage or admission failure.
+    /// A canonical read found that storage could not answer.
     ///
-    /// Converting a [`zinder_store::CanonicalStoreError`] with `From` routes an
-    /// absent height-keyed row or an uncovered subtree root to
-    /// [`QueryError::ArtifactUnavailable`], and a transaction miss below the
-    /// history floor to [`QueryError::CanonicalHistoryUnavailable`], instead.
+    /// [`QueryError::canonical_read`] routes every outcome a request can
+    /// cause to its own variant, such as [`QueryError::ArtifactUnavailable`],
+    /// so this variant carries only storage failures.
     #[error(transparent)]
-    CanonicalStore(zinder_store::CanonicalStoreError),
+    CanonicalStore(StorageReadError),
 
-    /// Wallet store returned a storage or admission failure.
+    /// A wallet projection read found that storage could not answer.
+    ///
+    /// [`QueryError::wallet_read`] routes every outcome a request can cause
+    /// to its own variant, so this variant carries only storage failures.
     #[error(transparent)]
-    WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
+    WalletStore(StorageReadError),
 
     /// Upstream node operation failed.
     #[error(transparent)]
@@ -1205,44 +1198,56 @@ pub enum QueryError {
 }
 
 impl QueryError {
-    /// Reports whether this read failed only because a table file its serving
-    /// pair still names was deleted by the canonical writer's or the wallet
-    /// projector's compaction.
-    pub(crate) fn is_missing_table_file(&self) -> bool {
-        matches!(self, Self::CanonicalStore(error) if error.is_missing_table_file())
-            || matches!(self, Self::WalletStore(error) if error.is_missing_table_file())
+    /// Converts the outcome of a failed [`CanonicalReader`] read, keeping a
+    /// storage failure as [`QueryError::CanonicalStore`].
+    #[must_use]
+    pub fn canonical_read(error: StorageReadError) -> Self {
+        Self::from_storage_read(error, Self::CanonicalStore)
     }
-}
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "CanonicalStoreError is non-exhaustive; every other store failure keeps its typed source"
-)]
-impl From<zinder_store::CanonicalStoreError> for QueryError {
-    fn from(error: zinder_store::CanonicalStoreError) -> Self {
+    /// Converts the outcome of a failed [`WalletProjectionReader`] read,
+    /// keeping a storage failure as [`QueryError::WalletStore`].
+    #[must_use]
+    pub fn wallet_read(error: StorageReadError) -> Self {
+        Self::from_storage_read(error, Self::WalletStore)
+    }
+
+    /// Reports whether this read failed only because the reader it read
+    /// through was invalidated, so a reader admitted afresh can answer it.
+    pub(crate) const fn invalidates_reader(&self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalStore(StorageReadError::ReaderInvalidated { .. })
+                | Self::WalletStore(StorageReadError::ReaderInvalidated { .. })
+        )
+    }
+
+    fn from_storage_read(
+        error: StorageReadError,
+        storage_failure: fn(StorageReadError) -> Self,
+    ) -> Self {
         match error {
-            zinder_store::CanonicalStoreError::ArtifactUnavailable { family, height } => {
-                Self::ArtifactUnavailable {
-                    family,
-                    key: ArtifactKey::BlockHeight(height),
-                }
+            StorageReadError::ArtifactUnavailable { family, key } => {
+                Self::ArtifactUnavailable { family, key }
             }
-            zinder_store::CanonicalStoreError::SubtreeRootUnavailable {
-                protocol,
-                subtree_index,
-            } => Self::ArtifactUnavailable {
-                family: ArtifactFamily::SubtreeRoot,
-                key: ArtifactKey::SubtreeRootIndex {
-                    protocol,
-                    index: subtree_index,
-                },
-            },
-            zinder_store::CanonicalStoreError::CanonicalHistoryUnavailable {
+            StorageReadError::CanonicalHistoryUnavailable {
                 first_available_height,
             } => Self::CanonicalHistoryUnavailable {
                 first_available_height,
             },
-            other => Self::CanonicalStore(other),
+            StorageReadError::ChainEventCursorExpired {
+                event_sequence,
+                oldest_retained_sequence,
+            } => Self::ChainEventCursorExpired {
+                event_sequence,
+                oldest_retained_sequence,
+            },
+            StorageReadError::ChainEventCursorInvalid { reason } => {
+                Self::ChainEventCursorInvalid { reason }
+            }
+            StorageReadError::ReadTaskFailed { reason } => Self::BlockingTaskFailed { reason },
+            failure @ (StorageReadError::ReaderInvalidated { .. }
+            | StorageReadError::Unavailable { .. }) => storage_failure(failure),
         }
     }
 }
@@ -1446,20 +1451,64 @@ mod error_reason_tests {
             QueryError::WalletProjectionRead {
                 source: Box::new(std::io::Error::other("probe")),
             },
+            QueryError::CanonicalStore(StorageReadError::Unavailable {
+                source: Box::new(std::io::Error::other("probe")),
+            }),
+            QueryError::WalletStore(StorageReadError::Unavailable {
+                source: Box::new(std::io::Error::other("probe")),
+            }),
             QueryError::Node(SourceError::InvalidBlockHashHex {
                 reason: "probe".to_owned(),
             }),
         ]
     }
 
+    /// A storage failure keeps the `error_class` of the store that failed.
+    ///
+    /// Dashboards and alerts that select `canonical_store` or `wallet_store`
+    /// keep matching, and an outcome the request caused keeps its own class
+    /// from either store.
+    #[test]
+    fn storage_failures_keep_the_error_class_of_the_store_that_failed() {
+        let unavailable = || StorageReadError::Unavailable {
+            source: Box::new(std::io::Error::other("probe")),
+        };
+        let invalidated = || StorageReadError::ReaderInvalidated {
+            source: Box::new(std::io::Error::other("probe")),
+        };
+        for (error, class) in [
+            (QueryError::canonical_read(unavailable()), "canonical_store"),
+            (QueryError::canonical_read(invalidated()), "canonical_store"),
+            (QueryError::wallet_read(unavailable()), "wallet_store"),
+            (QueryError::wallet_read(invalidated()), "wallet_store"),
+            (
+                QueryError::wallet_read(StorageReadError::CanonicalHistoryUnavailable {
+                    first_available_height: BlockHeight::new(3),
+                }),
+                "canonical_history_unavailable",
+            ),
+            (
+                QueryError::canonical_read(StorageReadError::ReadTaskFailed {
+                    reason: "probe".to_owned(),
+                }),
+                "blocking_task_failed",
+            ),
+        ] {
+            assert_eq!(query_error_class(Some(&error)), class, "{error:?}");
+            assert_eq!(
+                error.error_reason() == ErrorReason::StorageUnavailable,
+                matches!(class, "canonical_store" | "wallet_store"),
+                "{error:?}"
+            );
+        }
+    }
+
     #[test]
     fn history_floor_miss_carries_the_first_retained_height_on_the_wire()
     -> Result<(), Box<dyn std::error::Error>> {
-        let error = QueryError::from(
-            zinder_store::CanonicalStoreError::CanonicalHistoryUnavailable {
-                first_available_height: BlockHeight::new(101),
-            },
-        );
+        let error = QueryError::canonical_read(StorageReadError::CanonicalHistoryUnavailable {
+            first_available_height: BlockHeight::new(101),
+        });
         assert!(matches!(
             error,
             QueryError::CanonicalHistoryUnavailable {

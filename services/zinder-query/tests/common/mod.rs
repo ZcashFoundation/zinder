@@ -16,8 +16,8 @@ use std::sync::Arc;
 use zinder_core::Network;
 
 use zinder_query::{
-    AdmittedIngestControl, OrderedBroadcaster, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    AdmittedIngestControl, OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
@@ -39,7 +39,10 @@ pub fn serving_pair_slot(
 ) -> eyre::Result<WalletServingPairSlot> {
     let (canonical, wallet) = store_fixture.take_readers()?;
     Ok(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+        WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?,
     )))
 }
 

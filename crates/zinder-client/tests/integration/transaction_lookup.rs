@@ -30,8 +30,9 @@ use zinder_proto::status_with_reason;
 use zinder_proto::v1::{ops, wallet};
 use zinder_proto::wire::TransactionAbsence;
 use zinder_query::{
-    AdmittedIngestControl, ArtifactKey, QueryError, WalletEndpointMetadata, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair, status_from_query_error,
+    AdmittedIngestControl, ArtifactKey, QueryError, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair, status_from_query_error,
 };
 use zinder_store::ArtifactFamily;
 use zinder_testkit::{
@@ -272,8 +273,8 @@ async fn query_server_proves_pinned_absence_and_flags_an_untyped_mempool_miss() 
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     // The fixture writer answers every mempool miss without the typed
     // absence, the shape of an ingest below contract revision 6.

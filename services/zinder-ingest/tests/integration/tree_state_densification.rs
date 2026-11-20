@@ -25,7 +25,8 @@ use zinder_ingest::{
     TreeStateStrideWriteError, TreeStateStrideWriter, spawn_tree_state_densification_task,
 };
 use zinder_query::{
-    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
 use zinder_store::{
@@ -527,7 +528,10 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
     let mut serving = harness.into_serving_store_fixture()?;
     let (canonical_reader, wallet_reader) = serving.take_readers()?;
     let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(Arc::new(canonical_reader), Arc::new(wallet_reader))?,
+        WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+            Arc::new(RocksDbWalletReader::new(wallet_reader)),
+        )?,
     )));
     for height in [1, 57, 150, 299, 300] {
         let tree_state = query.tree_state_at(BlockHeight::new(height), None).await?;

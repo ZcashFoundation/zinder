@@ -361,11 +361,13 @@ macro_rules! impl_canonical_typed_reads {
             /// answered.
             ///
             /// Replays from the seed the lookup read. When this store shows
-            /// another visible chain than the store that issued `replay`, it
-            /// looks [`TreeStateReplay::height`] up again as
-            /// [`Self::tree_state_lookup`] does, including `Ok(None)`, and
-            /// answers from the checkpoint it stores there or by a replay
-            /// from the seed it reads itself, which the outcome names.
+            /// another visible chain than the store that issued `replay`, or
+            /// `replay` was built with [`TreeStateReplay::new`] rather than
+            /// issued by a lookup, it looks [`TreeStateReplay::height`] up
+            /// again as [`Self::tree_state_lookup`] does, including
+            /// `Ok(None)`, and answers from the checkpoint it stores there or
+            /// by a replay from the seed it reads itself, which the outcome
+            /// names.
             pub fn replay_tree_state(
                 &self,
                 replay: &TreeStateReplay,

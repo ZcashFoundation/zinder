@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use zinder_core::{BlockHeight, BlockHeightRange, Network};
 use zinder_query::{
-    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
@@ -82,8 +82,8 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;

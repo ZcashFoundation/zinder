@@ -26,9 +26,10 @@ pub use digest::{
     WalletProjectionAccumulator, WalletProjectionDigestBuilder, WalletProjectionRowFamily,
 };
 pub use rows::{
-    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletOutpointKey, WalletReorgUndo, WalletSpentOutput,
-    WalletTransactionPosition, WalletUnspentOutput,
+    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionHistoryPage,
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage,
+    WalletOutpointKey, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
+    WalletUnspentOutput,
 };
 pub use serial_oracle::WalletProjectionSerialOracle;
 

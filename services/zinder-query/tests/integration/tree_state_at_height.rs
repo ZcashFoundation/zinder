@@ -37,8 +37,9 @@ use zinder_core::{
 use zinder_proto::capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2;
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_source::{NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError};
 use zinder_testkit::{
@@ -182,8 +183,8 @@ async fn tree_state_without_its_history_predecessor_checkpoint_reports_damaged_s
     let (mut canonical, wallet) = store_fixture.take_readers()?;
     canonical.try_catch_up()?;
     let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?));
     let served = NodelessQuery::over_slot(slot, store_fixture).await?;
 

@@ -41,7 +41,10 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
+use zinder_query::{
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
+};
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
     ChainFixture, FixtureBlock, FixtureTransactionRows, WalletServingStoreFixture,
@@ -187,7 +190,10 @@ fn lightwalletd_scan_store_fixture() -> eyre::Result<ScanStore> {
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+        WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?,
     )));
     Ok(ScanStore {
         query,

@@ -304,7 +304,7 @@ broadcast, so it exports none of those series.
 | `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
 | `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
-| `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild spent reading and replaying compact blocks. |
+| `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild took, from the start of its storage read until it answered: reading and replaying compact blocks, and any wait for a blocking thread. |
 | `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native `CompactBlocksInRange` streams refused because 100 were already open. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
 
@@ -318,7 +318,8 @@ from a stored checkpoint, per band, is
 `operation` names the read, such as `compact_blocks_in_range` or
 `tree_state_at`. `status` is `ok` or `error`. `error_class` is `none` on
 success and otherwise the error's snake-case name, such as
-`chain_epoch_pin_unavailable`. A streaming read records once, when the stream
+`chain_epoch_pin_unavailable`. A storage failure is `canonical_store` or
+`wallet_store`, after the store that failed. A streaming read records once, when the stream
 is established. The native gRPC adapter also records `chain_events` and the
 mempool proxies, with the gRPC code name as `error_class`.
 
@@ -383,7 +384,7 @@ bidirectional calls.
 | `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
 | `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when as many requests already waited as the limit has slots. |
 | `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
-| `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for the client to make room for it (`send`). |
+| `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for the client to make room for it (`send`). In compact-blocks mode `read` is the storage read alone; in wallet mode it is the wallet read, including any wait for a blocking thread. |
 | `zinder_compat_stale_tip_refusals_total` | counter | `method` | `GetLatestBlock` (`get_latest_block`) and `GetLightdInfo` (`get_lightd_info`) calls refused with `UNAVAILABLE` because the served tip was older than `compat.stale_tip_limit_ms` and the writer's node did not vouch for it. |
 | `zinder_compat_block_range_reorg_endings_total` | counter | `cause` | Streams ended early by a reorg: `chain_replaced` or `tip_lowered`. Clients retry. |
 | `zinder_compat_compact_refresh_failures_total` | counter | `cause` | Compact-blocks mode: failed refreshes, by readiness cause. |

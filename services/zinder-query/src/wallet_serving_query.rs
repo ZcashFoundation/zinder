@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
@@ -27,9 +27,9 @@ use zinder_proto::capabilities::{
 };
 use zinder_source::TransactionBroadcaster;
 use zinder_store::{
-    ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplayOutcome,
+    ArtifactFamily, BlockHashLookup, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -42,11 +42,11 @@ use crate::{
     DEFAULT_MAX_FULL_BLOCK_RANGE, FULL_BLOCK_STREAM_CHANNEL_CAPACITY,
     FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError, RawTransaction,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    TreeStateFrontiers, UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader,
-    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
+    SettledTipBlock, SpendStatusReadEnd, StorageReadError, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, TreeStateFrontiers, UpstreamNodeCapabilities,
+    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
     broadcast_byte_budget::BroadcastByteBudget,
     grpc::CompactBlockStreamSlot,
     node_broadcast::EndpointVerifications,
@@ -590,11 +590,13 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         self.capture_pair().canonical().raw_blob_retention()
     }
 
+    /// Returns the epoch `pair` serves when it answers `requested`, the
+    /// epoch a pinned read names.
     fn chain_epoch(
         pair: &WalletServingReadPair,
         requested: Option<ChainEpochId>,
     ) -> Result<ChainEpoch, QueryError> {
-        Self::pinned(pair.canonical().chain_epoch()?, requested)
+        Self::pinned(pair.chain_epoch(), requested)
     }
 
     /// Returns `chain_epoch` when it answers `requested`, the epoch a pinned
@@ -611,26 +613,33 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         Ok(chain_epoch)
     }
 
-    fn block_id_at(
+    async fn block_id_at(
         pair: &WalletServingReadPair,
         height: BlockHeight,
     ) -> Result<BlockId, QueryError> {
         pair.canonical()
-            .block_header_at(height)?
+            .block_header_at(height)
+            .await
+            .map_err(QueryError::canonical_read)?
             .map(|header| BlockId::new(height, header.block_hash))
             .ok_or(QueryError::BlockNotInBestChain)
     }
 
-    fn resolve_block_id_by_selector(
+    async fn resolve_block_id_by_selector(
         pair: &WalletServingReadPair,
         selector: BlockSelector,
         chain_epoch: ChainEpoch,
     ) -> Result<BlockIdAtEpoch, QueryError> {
         let block_id = match selector {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
-                Self::block_id_at(pair, height)?
+                Self::block_id_at(pair, height).await?
             }
-            BlockSelector::Hash(hash) => match pair.canonical().block_hash_lookup(hash)? {
+            BlockSelector::Hash(hash) => match pair
+                .canonical()
+                .block_hash_lookup(hash)
+                .await
+                .map_err(QueryError::canonical_read)?
+            {
                 BlockHashLookup::Resolved(block_id) => block_id,
                 BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
                     return Err(QueryError::BlockNotInBestChain);
@@ -639,11 +648,7 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
             BlockSelector::Height(_) => {
                 return Err(QueryError::BlockNotInBestChain);
             }
-            _ => {
-                return Err(QueryError::UnsupportedBlockSelector {
-                    reason: "selector is not supported by the canonical reader",
-                });
-            }
+            _ => return Err(unsupported_block_selector()),
         };
         Ok(BlockIdAtEpoch {
             chain_epoch,
@@ -700,8 +705,11 @@ where
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SettledTipBlock, QueryError> {
-        serving_read::run("settled_tip_block", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        // The pair read and validated its epoch when it was admitted, so the
+        // settled tip needs no storage read.
+        serving_read::record("settled_tip_block", None, async {
+            let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+            let chain_epoch = Self::pinned(pair.chain_epoch(), at_epoch_id)?;
             Ok(SettledTipBlock {
                 height: chain_epoch.settled_tip_height,
                 block_hash: chain_epoch.settled_tip_hash,
@@ -716,10 +724,14 @@ where
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdAtEpoch, QueryError> {
-        serving_read::run("block_id_by_selector", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
-        })
+        serving_read::run(
+            "block_id_by_selector",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                Self::resolve_block_id_by_selector(&pair, selector, chain_epoch).await
+            },
+        )
         .await
     }
 
@@ -731,14 +743,23 @@ where
         serving_read::run(
             "block_header_by_selector",
             self.pin(at_epoch_id),
-            move |pair| {
+            move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
-                let block_header = pair
-                    .canonical()
-                    .block_header_at(resolved.block_id.height)?
-                    .ok_or(QueryError::BlockNotInBestChain)?
-                    .into_header();
+                // A visible height needs no resolution, because the header
+                // read answers whether the height is in the best chain, and
+                // the reader resolves a hash and reads its header in one
+                // read.
+                let block_header = match selector {
+                    BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
+                        pair.canonical().block_header_at(height).await
+                    }
+                    BlockSelector::Hash(hash) => pair.canonical().block_header_by_hash(hash).await,
+                    BlockSelector::Height(_) => return Err(QueryError::BlockNotInBestChain),
+                    _ => return Err(unsupported_block_selector()),
+                }
+                .map_err(QueryError::canonical_read)?
+                .ok_or(QueryError::BlockNotInBestChain)?
+                .into_header();
                 Ok(BlockHeaderAtEpoch {
                     chain_epoch,
                     block_header,
@@ -753,17 +774,23 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
-        serving_read::run("compact_block_at", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let compact_block = pair
-                .canonical()
-                .compact_block_at(height)?
-                .ok_or_else(|| artifact_unavailable(ArtifactFamily::CompactBlock, height))?;
-            Ok(CompactBlock {
-                chain_epoch,
-                compact_block,
-            })
-        })
+        serving_read::run(
+            "compact_block_at",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let compact_block = pair
+                    .canonical()
+                    .compact_block_at(height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or_else(|| artifact_unavailable(ArtifactFamily::CompactBlock, height))?;
+                Ok(CompactBlock {
+                    chain_epoch,
+                    compact_block,
+                })
+            },
+        )
         .await
     }
 
@@ -775,9 +802,13 @@ where
         let requested_blocks = Some(block_range.into_iter().len());
         serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
+                let compact_blocks = pair
+                    .canonical()
+                    .compact_blocks_in_range(block_range)
+                    .await
+                    .map_err(QueryError::canonical_read)?;
                 Ok(CompactBlockRange {
                     chain_epoch,
                     block_range,
@@ -799,13 +830,13 @@ where
         let requested_blocks = Some(block_range.into_iter().len());
         serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let compact_blocks = pair.canonical().compact_blocks_in_range_up_to(
-                    block_range,
-                    order,
-                    max_bytes,
-                )?;
+                let compact_blocks = pair
+                    .canonical()
+                    .compact_blocks_in_range_up_to(block_range, order, max_bytes)
+                    .await
+                    .map_err(QueryError::canonical_read)?;
                 let block_range = match (compact_blocks.first(), compact_blocks.last()) {
                     (Some(lowest), Some(highest)) => {
                         BlockHeightRange::inclusive(lowest.height(), highest.height())
@@ -830,27 +861,44 @@ where
     ) -> Result<CompactBlockStream, QueryError> {
         let requested_blocks = Some(block_range.into_iter().len());
         let sub_read_bytes = self.compact_block_stream_sub_read_bytes;
-        // A read on the blocking pool outlives a cancelled request or a
-        // dropped stream, so the read and the task issuing the later ones
-        // each keep the adapter's stream slot until they end.
+        // A storage read outlives a cancelled request or a dropped stream, so
+        // the first read and the task issuing the later ones each run in a
+        // task of their own that keeps the adapter's stream slot until they
+        // end.
         let stream_slot = CompactBlockStreamSlot::current();
         serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
             // The first read checks the whole range against retained history,
             // so a range the epoch cannot answer fails here, before any block.
             let first_read_slot = stream_slot.clone();
+            let serving_pair_slot = self.serving_pair_slot.clone();
+            let first_read = tokio::spawn(
+                async move {
+                    let _stream_slot = first_read_slot;
+                    let pin = serving_read::SlotPin::new(&serving_pair_slot, at_epoch_id);
+                    serving_read::read_at(pin, move |pair| async move {
+                        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                        let first_blocks = pair
+                            .canonical()
+                            .compact_blocks_in_range_up_to(
+                                block_range,
+                                HeightOrder::Ascending,
+                                sub_read_bytes,
+                            )
+                            .await
+                            .map_err(QueryError::canonical_read)?;
+                        Ok((pair, chain_epoch, first_blocks))
+                    })
+                    .await
+                }
+                .in_current_span(),
+            );
             let (pair, chain_epoch, first_blocks) =
-                serving_read::read_at(self.pin(at_epoch_id), move |pair| {
-                    let _stream_slot = &first_read_slot;
-                    let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    let first_blocks = pair.canonical().compact_blocks_in_range_up_to(
-                        block_range,
-                        HeightOrder::Ascending,
-                        sub_read_bytes,
-                    )?;
-                    Ok((pair, chain_epoch, first_blocks))
-                })
-                .await?;
+                first_read
+                    .await
+                    .map_err(|join_error| QueryError::BlockingTaskFailed {
+                        reason: join_error.to_string(),
+                    })??;
             let (blocks, receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
             let range_drive = drive_serving_pair_compact_block_range(
                 self.serving_pair_slot.clone(),
@@ -882,20 +930,26 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError> {
-        serving_read::run("full_block_at", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            if !pair.canonical().raw_blob_retention().retains_block_blobs() {
-                return Err(unavailable(WALLET_READ_FULL_BLOCK_AT_V1));
-            }
-            let block_blob = pair
-                .canonical()
-                .block_blob_at(height)?
-                .ok_or_else(|| artifact_unavailable(ArtifactFamily::BlockBlob, height))?;
-            Ok(FullBlock {
-                chain_epoch,
-                block_blob,
-            })
-        })
+        serving_read::run(
+            "full_block_at",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                if !pair.canonical().raw_blob_retention().retains_block_blobs() {
+                    return Err(unavailable(WALLET_READ_FULL_BLOCK_AT_V1));
+                }
+                let block_blob = pair
+                    .canonical()
+                    .block_blob_at(height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or_else(|| artifact_unavailable(ArtifactFamily::BlockBlob, height))?;
+                Ok(FullBlock {
+                    chain_epoch,
+                    block_blob,
+                })
+            },
+        )
         .await
     }
 
@@ -906,14 +960,13 @@ where
     ) -> Result<FullBlockStream, QueryError> {
         serving_read::record("full_blocks_in_range", None, async {
             validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
-            let (pair, chain_epoch) = serving_read::read_at(self.pin(at_epoch_id), move |pair| {
-                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                if !pair.canonical().raw_blob_retention().retains_block_blobs() {
-                    return Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1));
-                }
-                Ok((pair, chain_epoch))
-            })
-            .await?;
+            // The pair validated its epoch and its retention when it was
+            // admitted, so opening the stream reads no storage.
+            let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if !pair.canonical().raw_blob_retention().retains_block_blobs() {
+                return Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1));
+            }
             let (blocks, receiver) = mpsc::channel(FULL_BLOCK_STREAM_CHANNEL_CAPACITY);
             tokio::spawn(
                 drive_serving_pair_full_block_range(
@@ -937,48 +990,49 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
-        serving_read::run("transaction_by_id", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let network_upgrade_activations = pair.network_upgrade_activations();
-            // READY admission requires transaction-location coverage to equal
-            // the authenticated source count for every retention mode. Blob
-            // coverage equals that count only under Transactions/All and is
-            // zero under None; live append and replacement update the retained
-            // families in one canonical batch. Under that admitted contract, a
-            // miss over complete history is a proven absence; the store refuses
-            // a miss below its history floor.
-            let Some(location) = pair
-                .canonical()
-                .transaction_location_or_proven_absence(transaction_id)?
-            else {
-                return Ok(TransactionStatus {
+        serving_read::run(
+            "transaction_by_id",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                // The location, the header of its block, and the transaction's
+                // bytes come back from one read, and a miss is a proven
+                // absence over the reader's complete history.
+                let Some(transaction) = pair
+                    .canonical()
+                    .mined_transaction(transaction_id)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                else {
+                    return Ok(TransactionStatus {
+                        chain_epoch,
+                        status: TxStatus::NotFound,
+                    });
+                };
+                let location = transaction.location;
+                let header = transaction
+                    .block_header
+                    .ok_or(QueryError::BlockNotInBestChain)?;
+                let raw_transaction_bytes = transaction
+                    .transaction_blob
+                    .map(|blob| blob.raw_transaction_bytes);
+                let chain_context = MinedTransactionChainContext::from_response_epoch(
+                    &chain_epoch,
+                    location.block_height,
+                    pair.network_upgrade_activations()
+                        .consensus_branch_id_at(location.block_height),
+                    header.block_time,
+                );
+                Ok(TransactionStatus {
                     chain_epoch,
-                    status: TxStatus::NotFound,
-                });
-            };
-            let header = pair
-                .canonical()
-                .block_header_at(location.block_height)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-            let raw_transaction_bytes = pair
-                .canonical()
-                .transaction_blob(location)?
-                .map(|blob| blob.raw_transaction_bytes);
-            let chain_context = MinedTransactionChainContext::from_response_epoch(
-                &chain_epoch,
-                location.block_height,
-                network_upgrade_activations.consensus_branch_id_at(location.block_height),
-                header.block_time,
-            );
-            Ok(TransactionStatus {
-                chain_epoch,
-                status: TxStatus::Mined(MinedTransaction::new(
-                    location,
-                    chain_context,
-                    raw_transaction_bytes,
-                )),
-            })
-        })
+                    status: TxStatus::Mined(MinedTransaction::new(
+                        location,
+                        chain_context,
+                        raw_transaction_bytes,
+                    )),
+                })
+            },
+        )
         .await
     }
 
@@ -999,27 +1053,22 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
-        serving_read::run("raw_transaction", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let location = pair
-                .canonical()
-                .transaction_location(transaction_id)?
-                .ok_or_else(|| QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::TransactionLocation,
-                    key: ArtifactKey::TransactionId(transaction_id),
-                })?;
-            let transaction = pair
-                .canonical()
-                .transaction_blob(location)?
-                .ok_or_else(|| QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::TransactionBlob,
-                    key: ArtifactKey::TransactionId(transaction_id),
-                })?;
-            Ok(RawTransaction {
-                chain_epoch,
-                transaction,
-            })
-        })
+        serving_read::run(
+            "raw_transaction",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let transaction = pair
+                    .canonical()
+                    .transaction_blob_by_id(transaction_id)
+                    .await
+                    .map_err(QueryError::canonical_read)?;
+                Ok(RawTransaction {
+                    chain_epoch,
+                    transaction,
+                })
+            },
+        )
         .await
     }
 
@@ -1029,11 +1078,8 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         serving_read::record("transparent_address_unspent_outputs", None, async {
-            let (pair, chain_epoch) = serving_read::read_at(self.pin(at_epoch_id), move |pair| {
-                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                Ok((pair, chain_epoch))
-            })
-            .await?;
+            let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Ok(TransparentAddressUnspentOutputs::spawn(
                 self.serving_pair_slot.clone(),
                 pair,
@@ -1058,7 +1104,7 @@ where
             None,
             async {
                 let pair = self.serving_pair_slot.capture_at(at_epoch_id);
-                let chain_epoch = Self::pinned(pair.chain_epoch(), at_epoch_id)?;
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 Ok(TransparentAddressUnspentOutputs::spawn_on_demand(
                     self.serving_pair_slot.clone(),
                     pair,
@@ -1089,7 +1135,7 @@ where
                     .map(TransparentHistoryCursor::chain_epoch_id)
                     .or(at_epoch_id),
             );
-            serving_read::read_at(pin, move |pair| {
+            serving_read::read_at(pin, move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let after = cursor
                     .map(|cursor| cursor.resume_on(pair.wallet_source()))
@@ -1100,12 +1146,16 @@ where
                 let page_size =
                     NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
                         .unwrap_or(NonZeroU16::MAX);
-                let page = pair.wallet().address_transaction_history_range_page(
-                    request.address_script_hash,
-                    BlockHeightRange::inclusive(request.start_height, request.end_height),
-                    after,
-                    page_size,
-                )?;
+                let page = pair
+                    .wallet()
+                    .address_transaction_history_range_page(
+                        request.address_script_hash,
+                        BlockHeightRange::inclusive(request.start_height, request.end_height),
+                        after,
+                        page_size,
+                    )
+                    .await
+                    .map_err(QueryError::wallet_read)?;
                 let artifacts = page
                     .transactions
                     .into_iter()
@@ -1144,15 +1194,27 @@ where
                     maximum: MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
                 });
             }
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 // The pair's wallet reader is frozen at the same source as its
                 // canonical epoch, so both output families answer at that
                 // epoch; a pin naming another epoch fails here instead.
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let history_bounds = pair.canonical().history_bounds();
-                let statuses = outpoints
+                // Checkpointed history cannot prove an outpoint absent, so the
+                // request fails at the first one the projection does not hold
+                // and no outpoint after it is read.
+                let end = if history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+                    SpendStatusReadEnd::FirstNotFound
+                } else {
+                    SpendStatusReadEnd::AllOutpoints
+                };
+                let statuses = pair
+                    .wallet()
+                    .outpoint_spend_statuses(outpoints, end)
+                    .await
+                    .map_err(QueryError::wallet_read)?
                     .into_iter()
-                    .map(|outpoint| outpoint_spend_status(pair.wallet(), history_bounds, outpoint))
+                    .map(|status| proven_spend_status(status, history_bounds))
                     .collect::<Result<_, _>>()?;
                 Ok(TransparentOutpointSpendStatuses {
                     chain_epoch,
@@ -1180,17 +1242,22 @@ where
                     maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
                 });
             }
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+            let addresses = addresses
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let address_count = u32::try_from(addresses.len()).unwrap_or(u32::MAX);
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let addresses: HashSet<_> = addresses.into_iter().collect();
-                let mut confirmed_zat = 0_u64;
-                for address in &addresses {
-                    confirmed_zat =
-                        confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
-                }
+                let confirmed_zat = pair
+                    .wallet()
+                    .total_address_balance(addresses)
+                    .await
+                    .map_err(QueryError::wallet_read)?;
                 Ok(TransparentAddressBalance {
                     confirmed_zat,
-                    address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
+                    address_count,
                     chain_epoch,
                 })
             })
@@ -1206,14 +1273,16 @@ where
     ) -> Result<TreeState, QueryError> {
         serving_read::record("tree_state_at", None, async {
             let (lookup_epoch, lookup) =
-                serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+                serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     if height > chain_epoch.visible_tip_height {
                         return Err(QueryError::BlockNotInBestChain);
                     }
                     let lookup = pair
                         .canonical()
-                        .tree_state_lookup(height, pair.network_upgrade_activations())?
+                        .tree_state_lookup(height)
+                        .await
+                        .map_err(QueryError::canonical_read)?
                         .ok_or(QueryError::BlockNotInBestChain)?;
                     Ok((chain_epoch, lookup))
                 })
@@ -1226,24 +1295,23 @@ where
                 }
                 TreeStateLookup::Replay(replay) => replay,
             };
-            // The slot is taken on the async side, so a request cancelled
+            // The slot is taken before the replay, so a request cancelled
             // while it waits gives up its place, and no pair is held while it
-            // waits. Once taken, the blocking replay holds it, so a cancelled
-            // request frees it only when its replay ends. The replay captures
-            // the pair again; one showing a newer chain can answer from a
-            // checkpoint it stores or from its own seed, so the metrics
-            // record the outcome that read reports.
+            // waits. Once taken, the replay runs on a task of its own that
+            // holds the slot, so a cancelled request frees it only when its
+            // replay ends. The replay captures the pair again; one showing a
+            // newer chain can answer from a checkpoint it stores or from its
+            // own seed, so the metrics record the outcome that read reports.
             let replay_slot = Arc::new(self.tree_state_replays.admit().await?);
             let (chain_epoch, outcome, replay_duration) =
-                serving_read::read_at(self.pin(at_epoch_id), move |pair| {
-                    let _replay_slot = replay_slot;
+                serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    let started_at = Instant::now();
-                    let outcome = pair
-                        .canonical()
-                        .replay_tree_state(&replay, pair.network_upgrade_activations())?
+                    let (outcome, replay_duration) =
+                        replay_holding_slot(pair, replay, replay_slot).await?;
+                    let outcome = outcome
+                        .map_err(QueryError::canonical_read)?
                         .ok_or(QueryError::BlockNotInBestChain)?;
-                    Ok((chain_epoch, outcome, started_at.elapsed()))
+                    Ok((chain_epoch, outcome, replay_duration))
                 })
                 .await?;
             let tree_state = match outcome {
@@ -1275,11 +1343,13 @@ where
         serving_read::run(
             "latest_tree_state_checkpoint",
             self.pin(at_epoch_id),
-            move |pair| {
+            move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let checkpoint = pair
                     .canonical()
-                    .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)?
+                    .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
                     .ok_or_else(|| {
                         artifact_unavailable(
                             ArtifactFamily::TreeState,
@@ -1299,7 +1369,7 @@ where
     ) -> Result<SubtreeRoots, QueryError> {
         serving_read::record("subtree_roots_in_range", None, async {
             validate_subtree_root_range(subtree_root_range)?;
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let completed_subtree_count = chain_epoch
                     .tip_metadata
@@ -1329,7 +1399,11 @@ where
                     subtree_root_range.start_index,
                     available_entries,
                 );
-                let subtree_roots = pair.canonical().subtree_roots(available_range)?;
+                let subtree_roots = pair
+                    .canonical()
+                    .subtree_roots(available_range)
+                    .await
+                    .map_err(QueryError::canonical_read)?;
                 Ok(SubtreeRoots {
                     chain_epoch,
                     protocol: subtree_root_range.protocol,
@@ -1349,15 +1423,16 @@ where
     ) -> Result<ChainEvents, QueryError> {
         // The protocol adapter records the chain-event stream; each page read
         // here is one poll of that stream, so it records nothing itself.
-        serving_read::read_at(self.pin(None), move |pair| {
+        serving_read::read_at(self.pin(None), move |pair| async move {
             let event_envelopes = pair
                 .canonical()
-                .wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
-                    from_cursor.as_ref(),
+                .wallet_chain_event_history(
+                    from_cursor,
                     family,
                     crate::DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
-                ))
-                .map_err(map_canonical_chain_event_error)?;
+                )
+                .await
+                .map_err(QueryError::canonical_read)?;
             Ok(ChainEvents { event_envelopes })
         })
         .await
@@ -1370,10 +1445,11 @@ where
     ) -> Result<ChainEventStreamResume, QueryError> {
         // Resolving the start is part of establishing the adapter-recorded
         // chain-event stream.
-        serving_read::read_at(self.pin(None), move |pair| {
+        serving_read::read_at(self.pin(None), move |pair| async move {
             pair.canonical()
-                .resolve_wallet_chain_event_stream_start(&start, requested_family)
-                .map_err(map_canonical_chain_event_error)
+                .resolve_wallet_chain_event_stream_start(start, requested_family)
+                .await
+                .map_err(QueryError::canonical_read)
         })
         .await
     }
@@ -1450,11 +1526,16 @@ async fn drive_serving_pair_full_block_range(
             BlockHeight::new(sub_read_start),
             BlockHeight::new(sub_read_end),
         );
-        let sub_read = serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| {
-            let block_blobs = pair.canonical().block_blobs_in_range(sub_range)?;
-            Ok((pair, block_blobs))
-        })
-        .await;
+        let sub_read =
+            serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| async move {
+                let block_blobs = pair
+                    .canonical()
+                    .block_blobs_in_range(sub_range)
+                    .await
+                    .map_err(QueryError::canonical_read)?;
+                Ok((pair, block_blobs))
+            })
+            .await;
         let block_blobs = match sub_read {
             Ok((read_pair, block_blobs)) => {
                 pair = read_pair;
@@ -1539,15 +1620,20 @@ async fn drive_serving_pair_compact_block_range(
             return fail_compact_block_range(pair, &block_sender, error).await;
         }
         let remaining = BlockHeightRange::inclusive(next_height, reads.last_height);
-        let sub_read = serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| {
-            let blocks = pair.canonical().compact_blocks_in_range_up_to(
-                remaining,
-                HeightOrder::Ascending,
-                reads.sub_read_bytes,
-            )?;
-            Ok((pair, blocks))
-        })
-        .await;
+        let sub_read =
+            serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| async move {
+                let blocks = pair
+                    .canonical()
+                    .compact_blocks_in_range_up_to(
+                        remaining,
+                        HeightOrder::Ascending,
+                        reads.sub_read_bytes,
+                    )
+                    .await
+                    .map_err(QueryError::canonical_read)?;
+                Ok((pair, blocks))
+            })
+            .await;
         match sub_read {
             Ok((read_pair, read_blocks)) => {
                 pair = read_pair;
@@ -1629,64 +1715,66 @@ async fn forward_serving_pair_full_block_sub_range(
     Ok(true)
 }
 
-/// Classifies one outpoint from the wallet projection's output families.
+/// Returns `status` when it answers the request, which a `NotFound` does
+/// only as a proven absence.
 ///
-/// The projection moves an output from the unspent family to the spent family
-/// in the transition that mines its spend, and back only when a reorg reverts
-/// that spend, so an outpoint is never in both families.
-///
-/// The projection covers exactly the canonical history the pair retains, so a
-/// miss proves absence only when that history starts at height 1.
-fn outpoint_spend_status(
-    wallet: &dyn WalletProjectionReader,
+/// The projection covers exactly the canonical history the pair retains, so
+/// a miss proves absence only when that history starts at height 1.
+fn proven_spend_status(
+    status: TransparentOutpointSpendStatus,
     history_bounds: CanonicalHistoryBounds,
-    outpoint: TransparentOutPoint,
 ) -> Result<TransparentOutpointSpendStatus, QueryError> {
-    if wallet.find_unspent_output(outpoint)?.is_some() {
-        return Ok(TransparentOutpointSpendStatus::Unspent);
-    }
-    if let Some(spent) = wallet.find_spent_output(outpoint)? {
-        return Ok(TransparentOutpointSpendStatus::SpentBy {
-            transaction_id: spent.spent_at.transaction_id,
-            input_index: spent.input_index,
-            block: spent.spent_at.block,
-        });
-    }
-    if history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+    if status == TransparentOutpointSpendStatus::NotFound
+        && history_bounds.intentionally_excludes(BlockHeight::new(1))
+    {
         return Err(QueryError::CanonicalHistoryUnavailable {
             first_available_height: history_bounds.first_available_height(),
         });
     }
-    Ok(TransparentOutpointSpendStatus::NotFound)
+    Ok(status)
+}
+
+/// How a [`crate::CanonicalReader::replay_tree_state`] read answered, and how long
+/// it took.
+type ReplayRead = (
+    Result<Option<TreeStateReplayOutcome>, StorageReadError>,
+    std::time::Duration,
+);
+
+/// Replays `replay` on `pair` in a task of its own that holds `replay_slot`
+/// until the replay ends, even when the request awaiting it is cancelled.
+///
+/// A storage read can outlive the request that started it, such as one on
+/// the blocking pool, so only a slot held by the replay itself bounds the
+/// reconstructions that run at once.
+async fn replay_holding_slot(
+    pair: Arc<WalletServingReadPair>,
+    replay: TreeStateReplay,
+    replay_slot: Arc<OwnedSemaphorePermit>,
+) -> Result<ReplayRead, QueryError> {
+    tokio::spawn(
+        async move {
+            let _replay_slot = replay_slot;
+            let started_at = Instant::now();
+            let outcome = pair.canonical().replay_tree_state(replay).await;
+            (outcome, started_at.elapsed())
+        }
+        .in_current_span(),
+    )
+    .await
+    .map_err(|join_error| QueryError::BlockingTaskFailed {
+        reason: join_error.to_string(),
+    })
+}
+
+const fn unsupported_block_selector() -> QueryError {
+    QueryError::UnsupportedBlockSelector {
+        reason: "selector is not supported by the canonical reader",
+    }
 }
 
 fn unavailable(capability: &'static str) -> QueryError {
     QueryError::EndpointCapabilityUnavailable { capability }
-}
-
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "CanonicalStoreError is non-exhaustive; unrelated store failures retain their typed source"
-)]
-fn map_canonical_chain_event_error(error: zinder_store::CanonicalStoreError) -> QueryError {
-    match error {
-        zinder_store::CanonicalStoreError::CanonicalEventCursorExpired {
-            event_sequence,
-            oldest_retained_sequence,
-        } => QueryError::ChainEventCursorExpired {
-            event_sequence,
-            oldest_retained_sequence,
-        },
-        zinder_store::CanonicalStoreError::CanonicalEventCursorMalformed { reason } => {
-            QueryError::ChainEventCursorInvalid { reason }
-        }
-        zinder_store::CanonicalStoreError::CanonicalEventCursorUnknownVersion { .. } => {
-            QueryError::ChainEventCursorInvalid {
-                reason: "cursor version is unsupported",
-            }
-        }
-        other => QueryError::from(other),
-    }
 }
 
 fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryError {
@@ -1796,8 +1884,9 @@ mod full_block_range_tests {
     };
 
     use crate::{
-        FULL_BLOCK_STREAM_CHANNEL_CAPACITY, QueryError, WalletQueryApi, WalletServingPairSlot,
-        WalletServingQuery, WalletServingReadPair,
+        FULL_BLOCK_STREAM_CHANNEL_CAPACITY, QueryError, RocksDbCanonicalReader,
+        RocksDbWalletReader, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+        WalletServingReadPair,
     };
 
     /// Holders of a test pair while no read holds it: the test and the slot.
@@ -1886,8 +1975,8 @@ mod full_block_range_tests {
             let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
             let (canonical, wallet) = store.take_readers()?;
             let pair = Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical),
-                Arc::new(wallet),
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
             )?);
             let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
                 Arc::clone(&pair),
@@ -1924,9 +2013,68 @@ mod tree_state_replay_limit_tests {
     };
 
     use crate::{
-        QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-        WalletServingReadPair, tree_state_replay_limit::TreeStateReplayLimit,
+        QueryError, RocksDbCanonicalReader, RocksDbWalletReader, WalletQueryApi,
+        WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+        observed_canonical_reader::ObservedCanonicalReader,
+        tree_state_replay_limit::TreeStateReplayLimit,
     };
+
+    /// A request cancelled while its replay runs keeps the replay's slot
+    /// until the replay ends, because the storage read keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_request_keeps_its_replay_slot_until_the_replay_ends()
+    -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let (canonical, replays) =
+            ObservedCanonicalReader::holding_replays(RocksDbCanonicalReader::new(canonical)?);
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+        let reconstructed = BlockHeight::new(2);
+
+        let cancelled = tokio::spawn({
+            let query = query.clone();
+            async move { query.tree_state_at(reconstructed, None).await }
+        });
+        replays.replay_started().await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            query.tree_state_at(reconstructed, None),
+        )
+        .await
+        .map_err(|_| "a rebuild took the slot the cancelled request's replay still holds")?;
+        assert!(
+            matches!(refused, Err(QueryError::TreeStateReplayLimitReached { .. })),
+            "unexpected outcome {refused:?}"
+        );
+
+        replays.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match query.tree_state_at(reconstructed, None).await {
+                Ok(tree_state) => {
+                    assert_eq!(tree_state.height, reconstructed);
+                    return Ok(());
+                }
+                Err(QueryError::TreeStateReplayLimitReached { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 
     /// A saturated limit refuses reconstructions but still serves a stored
     /// checkpoint, and admits reconstructions again once a slot frees.
@@ -1938,8 +2086,8 @@ mod tree_state_replay_limit_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let mut query =
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
@@ -1977,8 +2125,8 @@ mod tree_state_replay_limit_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let mut query =
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
@@ -2020,13 +2168,13 @@ mod tree_state_replay_limit_tests {
             WalletServingStoreFixture::from_chain_after_live_append(&chain, &activations)?;
         let (canonical, wallet) = replaying.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         let (canonical, wallet) = storing.take_readers()?;
         let replacement = Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let replacement_epoch = replacement.canonical_fence().chain_epoch_id();
         let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
@@ -2081,8 +2229,8 @@ mod tree_state_replay_limit_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let mut query =
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
@@ -2128,6 +2276,59 @@ mod tree_state_replay_limit_tests {
 }
 
 #[cfg(test)]
+mod block_selector_read_tests {
+    use std::{error::Error, sync::Arc};
+
+    use zinder_core::{BlockHash, BlockHeight, BlockId, BlockSelector, Network};
+    use zinder_testkit::{
+        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    };
+
+    use crate::{
+        QueryError, RocksDbCanonicalReader, RocksDbWalletReader, WalletQueryApi,
+        WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+        observed_canonical_reader::ObservedCanonicalReader,
+    };
+
+    /// A header selected by hash is resolved and read in one storage read,
+    /// so in one hop to the blocking pool.
+    #[tokio::test]
+    async fn a_header_selected_by_hash_takes_one_storage_read() -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let canonical = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+            canonical,
+        )?));
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::<ObservedCanonicalReader>::clone(&canonical),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+        let block = chain
+            .block_at(BlockHeight::new(2))
+            .ok_or("the fixture has a block at height 2")?;
+
+        let header = query
+            .block_header_by_selector(BlockSelector::Hash(block.hash), None)
+            .await?;
+        assert_eq!(
+            header.block_header.block_id,
+            BlockId::new(block.height, block.hash)
+        );
+        assert_eq!(canonical.reads(), 1);
+
+        let unknown = query
+            .block_header_by_selector(BlockSelector::Hash(BlockHash::from_bytes([0xee; 32])), None)
+            .await;
+        assert!(matches!(unknown, Err(QueryError::BlockNotInBestChain)));
+        assert_eq!(canonical.reads(), 2);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod compact_block_stream_tests {
     use std::{error::Error, num::NonZeroU32, sync::Arc, time::Duration};
 
@@ -2141,8 +2342,9 @@ mod compact_block_stream_tests {
     };
 
     use crate::{
-        AdmittedIngestControl, QueryError, WalletEndpointMetadata, WalletQueryApi,
-        WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+        AdmittedIngestControl, QueryError, RocksDbCanonicalReader, RocksDbWalletReader,
+        WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
+        WalletServingQuery, WalletServingReadPair,
     };
 
     type NativeQuery = WalletServingQuery<(), AdmittedIngestControl>;
@@ -2192,8 +2394,8 @@ mod compact_block_stream_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
         let ingest_control =
@@ -2317,8 +2519,8 @@ mod compact_block_stream_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         Ok((
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair)),
@@ -2430,8 +2632,9 @@ mod broadcast_byte_budget_tests {
     };
 
     use crate::{
-        OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-        WalletServingReadPair, broadcast_byte_budget::BroadcastByteBudget,
+        OrderedBroadcaster, QueryError, RocksDbCanonicalReader, RocksDbWalletReader,
+        WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+        broadcast_byte_budget::BroadcastByteBudget,
     };
 
     /// A broadcast that does not fit the bytes other broadcasts hold is
@@ -2444,8 +2647,8 @@ mod broadcast_byte_budget_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
             .with_node_activations(activations);
@@ -2489,8 +2692,8 @@ mod broadcast_byte_budget_tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         // An unreachable endpoint followed by a duplicate answer makes the
         // broadcast hash the transaction to report it accepted.

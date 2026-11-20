@@ -15,14 +15,14 @@ use zinder_store::{
     open_bounded_rocksdb,
 };
 use zinder_wallet_projection::{
-    WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletProjectionBuildState, WalletProjectionReadyEvidence,
-    WalletReorgUndo, WalletSpentOutput, WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletAddressTransaction, WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage, WalletCanonicalSourceIdentity,
+    WalletProjectionBuildState, WalletProjectionReadyEvidence, WalletReorgUndo, WalletSpentOutput,
+    WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 use crate::{
-    RocksDbWalletError, RocksDbWalletStore, WalletAddressTransactionHistoryPage,
-    WalletAddressUnspentOutputsPage,
+    RocksDbWalletError, RocksDbWalletStore,
     store::{decode_only_control, required_column_family_names, wallet_column_family_descriptors},
 };
 

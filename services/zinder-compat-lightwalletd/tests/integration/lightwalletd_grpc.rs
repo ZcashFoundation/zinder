@@ -45,11 +45,11 @@ use zinder_query::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream,
     MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, OrderedBroadcaster, QueryError, RawTransaction,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    RocksDbCanonicalReader, RocksDbWalletReader, SettledTipBlock, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, VisibleTipBlock, WalletQueryApi,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
     ArtifactFamily, CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
@@ -4810,8 +4810,8 @@ impl AcceptanceStore {
     ) -> eyre::Result<Self> {
         let (canonical, wallet) = store_fixture.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         let mut nodes = nodes.into_iter().map(|broadcaster| {
             broadcaster.with_node_activations(sample_regtest_upgrade_activations())

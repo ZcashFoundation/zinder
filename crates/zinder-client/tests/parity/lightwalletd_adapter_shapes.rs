@@ -12,8 +12,8 @@ use tonic::Request;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{
-    CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    CanonicalReader, RocksDbCanonicalReader, RocksDbWalletReader, WalletProjectionReader,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -34,8 +34,8 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
-        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?) as Arc<dyn CanonicalReader>,
+        Arc::new(RocksDbWalletReader::new(wallet_reader)) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot);

@@ -16,7 +16,10 @@ use eyre::{Result, eyre};
 use zinder_core::NetworkUpgradeActivations;
 use zinder_core::{BlockHeight, BlockId, UnixTimestampMillis};
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
-use zinder_query::{WalletQueryApi, WalletServingPairSlot, WalletServingReadPair};
+use zinder_query::{
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletQueryApi, WalletServingPairSlot,
+    WalletServingReadPair,
+};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
@@ -237,8 +240,8 @@ pub(crate) async fn live_serving_pair(
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?));
     Ok(LiveServingPair {
         slot,

@@ -1,10 +1,10 @@
 //! Execution of release wallet reads against one captured serving pair.
 //!
-//! Every `WalletServingQuery` read runs through this module, so storage work
-//! never occupies the async runtime, a join failure surfaces as
-//! [`QueryError::BlockingTaskFailed`], a read that finds a table file of its
-//! pair deleted runs once more on the pair that replaces it, and each request
-//! records one `zinder_query_request_*` sample through [`record`].
+//! Every `WalletServingQuery` read runs through this module, so a read that
+//! finds the reader of its pair invalidated runs once more on the pair that
+//! replaces it, and each request records one `zinder_query_request_*` sample
+//! through [`record`]. The readers themselves keep storage work off the async
+//! runtime.
 //!
 //! The protocol adapter records the operations it owns, such as the
 //! `chain_events` stream. Reads made on behalf of such a request use
@@ -15,8 +15,7 @@ use std::{future::Future, sync::Arc, time::Instant};
 use zinder_core::ChainEpochId;
 
 use crate::{
-    QueryError, WalletServingPairSlot, WalletServingReadPair, join_blocking,
-    record_wallet_query_outcome,
+    QueryError, WalletServingPairSlot, WalletServingReadPair, record_wallet_query_outcome,
 };
 
 /// The pair one read captures: the one `slot` serves at a pinned epoch, or
@@ -41,19 +40,19 @@ impl<'slot> SlotPin<'slot> {
 
 /// Reads the pair `pin` selects as [`read_at`] does and records the request
 /// under `operation`.
-pub(crate) async fn run<Output, Read>(
+pub(crate) async fn run<Output, Read, Reading>(
     operation: &'static str,
     pin: SlotPin<'_>,
     read: Read,
 ) -> Result<Output, QueryError>
 where
-    Output: Send + 'static,
-    Read: FnOnce(Arc<WalletServingReadPair>) -> Result<Output, QueryError> + Clone + Send + 'static,
+    Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
+    Reading: Future<Output = Result<Output, QueryError>>,
 {
     record(operation, None, read_at(pin, read)).await
 }
 
-/// Times `request`, including validation and any work after its blocking
+/// Times `request`, including validation and any work after its storage
 /// read, and records its typed outcome under `operation`.
 ///
 /// `requested_blocks` is `Some` only for `compact_blocks_in_range`, which
@@ -74,42 +73,41 @@ pub(crate) async fn record<Output>(
 /// Only a read inside a [`record`]ed request, or a read made on behalf of an
 /// adapter-recorded request, may call this alone. Any other caller would
 /// leave its request out of the `zinder_query_request_*` series.
-pub(crate) async fn read_at<Output, Read>(
+pub(crate) async fn read_at<Output, Read, Reading>(
     pin: SlotPin<'_>,
     read: Read,
 ) -> Result<Output, QueryError>
 where
-    Output: Send + 'static,
-    Read: FnOnce(Arc<WalletServingReadPair>) -> Result<Output, QueryError> + Clone + Send + 'static,
+    Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
+    Reading: Future<Output = Result<Output, QueryError>>,
 {
     let pair = pin.slot.capture_at(pin.chain_epoch_id);
     read_pair(pin.slot, pair, pin.chain_epoch_id, read).await
 }
 
-/// Runs one blocking read of `pair` on the blocking pool inside the caller's
-/// tracing span, recovering once from a missing table file.
+/// Runs one read of `pair`, recovering once from an invalidated reader.
 ///
-/// A secondary does not keep the writer's table files alive. When `read`
-/// fails because a table file of `pair` was deleted, the pair is retired and
-/// `read` runs once more on the pair the publisher publishes in its place.
-/// That retry happens only when the replacement answers `chain_epoch_id`:
-/// otherwise the read fails with [`QueryError::ChainEpochPinUnavailable`],
-/// and with its original storage error when no replacement is published in
-/// time. A multi-step read passes its own epoch so it never continues at
-/// another one.
-pub(crate) async fn read_pair<Output, Read>(
+/// A `RocksDB` secondary does not keep the writer's table files alive, so a
+/// read can find a table file of `pair` deleted, which its reader reports as
+/// invalidated. The pair is then retired and `read` runs once more on the
+/// pair the publisher publishes in its place. That retry happens only when
+/// the replacement answers `chain_epoch_id`: otherwise the read fails with
+/// [`QueryError::ChainEpochPinUnavailable`], and with its original storage
+/// error when no replacement is published in time. A multi-step read passes
+/// its own epoch so it never continues at another one.
+pub(crate) async fn read_pair<Output, Read, Reading>(
     slot: &WalletServingPairSlot,
     pair: Arc<WalletServingReadPair>,
     chain_epoch_id: Option<ChainEpochId>,
     read: Read,
 ) -> Result<Output, QueryError>
 where
-    Output: Send + 'static,
-    Read: FnOnce(Arc<WalletServingReadPair>) -> Result<Output, QueryError> + Clone + Send + 'static,
+    Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
+    Reading: Future<Output = Result<Output, QueryError>>,
 {
     let retry = read.clone();
-    let error = match off_reactor(Arc::clone(&pair), read).await {
-        Err(error) if error.is_missing_table_file() => error,
+    let error = match read(Arc::clone(&pair)).await {
+        Err(error) if error.invalidates_reader() => error,
         outcome => return outcome,
     };
     let Some(replacement) = slot
@@ -125,26 +123,11 @@ where
             chain_epoch_id: pinned,
         });
     }
-    let outcome = off_reactor(Arc::clone(&replacement), retry).await;
+    let outcome = retry(Arc::clone(&replacement)).await;
     if let Err(error) = &outcome
-        && error.is_missing_table_file()
+        && error.invalidates_reader()
     {
         slot.report_missing_table_file(&replacement, error);
     }
     outcome
-}
-
-async fn off_reactor<Output, Read>(
-    pair: Arc<WalletServingReadPair>,
-    read: Read,
-) -> Result<Output, QueryError>
-where
-    Output: Send + 'static,
-    Read: FnOnce(Arc<WalletServingReadPair>) -> Result<Output, QueryError> + Send + 'static,
-{
-    let span = tracing::Span::current();
-    join_blocking(tokio::task::spawn_blocking(move || {
-        span.in_scope(|| read(pair))
-    }))
-    .await
 }

@@ -625,8 +625,10 @@ impl ChainFixture {
         self
     }
 
-    /// Returns the commitment trees declared after the block at `height`.
-    pub(crate) fn commitment_tree_frontiers_at(
+    /// Returns the commitment trees declared after the block at `height`
+    /// with [`Self::with_commitment_tree_frontiers_at`].
+    #[must_use]
+    pub fn commitment_tree_frontiers_at(
         &self,
         height: BlockHeight,
     ) -> Option<&CommitmentTreeFrontiers> {
@@ -789,7 +791,7 @@ impl ChainFixture {
     /// Explicit transaction rows are merged with transparent output and spend
     /// facts so replay envelopes and compact blocks share one semantic source.
     #[must_use]
-    pub(crate) fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
+    pub fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
         build_fixture_transaction_rows(
             &self.transaction_rows,
             &self.transparent_outputs_by_outpoint,

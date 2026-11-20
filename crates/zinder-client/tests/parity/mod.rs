@@ -19,8 +19,9 @@ use zinder_client::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd;
 use zinder_query::{
-    AdmittedIngestControl, CanonicalReader, WalletEndpointMetadata, WalletProjectionReader,
-    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, CanonicalReader, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletEndpointMetadata, WalletProjectionReader, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
@@ -110,8 +111,8 @@ fn build_transparent_address_adapter(
 ) -> eyre::Result<TransparentAddressAdapter> {
     let (canonical_reader, wallet_reader) = fixture.store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
-        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?) as Arc<dyn CanonicalReader>,
+        Arc::new(RocksDbWalletReader::new(wallet_reader)) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot);
@@ -142,8 +143,8 @@ async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<R
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
-        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?) as Arc<dyn CanonicalReader>,
+        Arc::new(RocksDbWalletReader::new(wallet_reader)) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;

@@ -37,8 +37,9 @@ use zinder_proto::v1::{
 use zinder_proto::wire::TransactionAbsence;
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_MAX_COMPACT_BLOCK_RANGE, IngestControlAdmissionError,
-    OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
+    WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_store::{
     EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1, event_stream_start_message,
@@ -996,8 +997,8 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
@@ -1310,8 +1311,8 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         crate::common::admitted_ingest_control_fixture().await?;
     let broadcast_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?)),
         ingest_control,
     )
@@ -1835,8 +1836,8 @@ async fn native_serving_adapter_over(
     .await?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),

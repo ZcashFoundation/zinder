@@ -79,6 +79,27 @@ pub struct CanonicalEventFence {
 }
 
 impl CanonicalEventFence {
+    /// Creates the fence of the writer position that committed epoch
+    /// `chain_epoch_id` with chain event `chain_event_sequence`, leaving
+    /// `visible_tip` visible over the fact sequence `sequence_digest` names.
+    ///
+    /// A canonical reader of any storage engine reports the fence it admitted
+    /// this way, from the position its writer recorded.
+    #[must_use]
+    pub const fn new(
+        chain_epoch_id: ChainEpochId,
+        chain_event_sequence: u64,
+        visible_tip: BlockId,
+        sequence_digest: CanonicalBlockFactsSequenceDigest,
+    ) -> Self {
+        Self {
+            chain_epoch_id,
+            chain_event_sequence,
+            visible_tip,
+            sequence_digest,
+        }
+    }
+
     pub(super) const fn from_persisted_event(
         chain_epoch_id: ChainEpochId,
         chain_event_sequence: u64,

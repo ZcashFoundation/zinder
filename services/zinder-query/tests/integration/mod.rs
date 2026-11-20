@@ -7,6 +7,7 @@ mod health;
 mod native_grpc;
 mod node_backed_capabilities;
 mod query_request_metrics;
+mod read_conformance;
 mod reflection;
 mod release_image;
 mod repeated_field_limits;

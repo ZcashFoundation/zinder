@@ -13,7 +13,8 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, ServedTreeState, TreeStateLookup, TreeStateReplayOutcome,
+    RocksDbCanonicalStore, ServedTreeState, TreeStateLookup, TreeStateReplay,
+    TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
     publication::column_family,
@@ -343,6 +344,37 @@ fn a_replay_on_another_visible_chain_reads_its_own_seed() -> Result<(), Box<dyn 
             tree_state: expected_tree_state(&activations, BlockHeight::new(120))?,
         })
     );
+    Ok(())
+}
+
+/// A replay built outside a store lookup proves nothing about its seed, so
+/// even a store showing the visible chain the seed names replays from the
+/// seed it reads itself.
+#[test]
+fn a_replay_built_outside_a_lookup_reads_the_store_seed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let height = BlockHeight::new(137);
+    let Some(TreeStateLookup::Replay(issued)) = store.tree_state_lookup(height, &activations)?
+    else {
+        return Err("height 137 has no stored checkpoint".into());
+    };
+    let unstored = expected_checkpoint(&activations, BlockHeight::new(136))?;
+    let mut unlinked = unstored.clone();
+    unlinked.block_id.hash = BlockHash::from_bytes([0xee; 32]);
+
+    for seed in [unstored, unlinked] {
+        let built = TreeStateReplay::new(seed, height).ok_or("the seed lies below the height")?;
+        assert_eq!(
+            store.replay_tree_state(&built, &activations)?,
+            Some(TreeStateReplayOutcome::Replayed {
+                replay: Box::new(issued.clone()),
+                tree_state: expected_tree_state(&activations, height)?,
+            })
+        );
+    }
     Ok(())
 }
 

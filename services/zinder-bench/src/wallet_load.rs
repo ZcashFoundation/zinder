@@ -794,7 +794,10 @@ mod tests {
         ChainMetadata, GetAddressUtxosReply, PoolType, RawTransaction, ShieldedProtocol,
         SubtreeRoot,
     };
-    use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
+    use zinder_query::{
+        RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
+        WalletServingReadPair,
+    };
     use zinder_store::RawBlobRetention;
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
@@ -836,8 +839,8 @@ mod tests {
                     .into_serving_store_fixture()?;
             let (canonical, wallet) = store.take_readers()?;
             let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical),
-                Arc::new(wallet),
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
             )?));
             let adapter =
                 LightwalletdGrpcAdapter::new(WalletServingQuery::from_serving_pair_slot(slot));

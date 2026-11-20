@@ -15,7 +15,10 @@ use zinder_proto::{
     LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
     compat::lightwalletd::{self, compact_tx_streamer_client::CompactTxStreamerClient},
 };
-use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
+use zinder_query::{
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
+};
 use zinder_runtime::{MAX_DECODING_MESSAGE_BYTES, RepeatedElementEncoding};
 use zinder_testkit::{
     ChainFixture, RepeatedRequestField, WalletServingStoreFixture, repeated_request_fields,
@@ -185,10 +188,12 @@ async fn spawn_compat_server() -> Result<CompactTxStreamerClient<tonic::transpor
         &activations,
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-            WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
-        )));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+        Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?),
+    ));
     let server = LightwalletdGrpcAdapter::new(wallet_query).into_server();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;

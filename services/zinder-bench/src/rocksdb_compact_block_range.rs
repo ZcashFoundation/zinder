@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zinder_bench::{BenchError, fixture::FixtureManifest};
 use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact, NetworkUpgradeActivations};
-use zinder_query::CanonicalReader;
+use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
     RocksDbCanonicalSecondary, RocksDbResourceBudget,
@@ -322,7 +322,10 @@ async fn measure_reader_range(
     range: BlockHeightRange,
     expected_block_count: u32,
 ) -> Result<CanonicalReaderRangeCase, BenchError> {
-    let reader: Arc<dyn CanonicalReader> = Arc::new(secondary);
+    let reader: Arc<dyn CanonicalReader> = Arc::new(
+        RocksDbCanonicalReader::new(secondary)
+            .map_err(|error| BenchError::canonical_read(error.to_string()))?,
+    );
     let cold = measure_reader_read(&reader, range, expected_block_count).await?;
     let warm = measure_reader_read(&reader, range, expected_block_count).await?;
     Ok(CanonicalReaderRangeCase {
@@ -332,22 +335,18 @@ async fn measure_reader_range(
     })
 }
 
-/// Times one read of `range` through `reader` as `zinder-query` makes it:
-/// on the blocking pool, inside the caller's tracing span.
+/// Times one read of `range` through `reader` as `zinder-query` makes it,
+/// including the reader's hop to the blocking pool.
 async fn measure_reader_read(
     reader: &Arc<dyn CanonicalReader>,
     range: BlockHeightRange,
     expected_block_count: u32,
 ) -> Result<CompactBlockRangeMeasurement, BenchError> {
     let started = Instant::now();
-    let reader = Arc::clone(reader);
-    let span = tracing::Span::current();
-    let blocks = tokio::task::spawn_blocking(move || {
-        span.in_scope(|| reader.compact_blocks_in_range(range))
-    })
-    .await
-    .map_err(|error| BenchError::canonical_read(error.to_string()))?
-    .map_err(|error| BenchError::canonical_read(error.to_string()))?;
+    let blocks = reader
+        .compact_blocks_in_range(range)
+        .await
+        .map_err(|error| BenchError::canonical_read(error.to_string()))?;
     let seconds = elapsed_seconds(started.elapsed());
     let output = compact_block_range_output(&blocks, range, expected_block_count)?;
     Ok(CompactBlockRangeMeasurement {
