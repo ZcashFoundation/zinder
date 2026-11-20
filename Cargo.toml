@@ -19,6 +19,7 @@ members = [
     "services/zinder-projector",
     "services/zinder-query",
     "tools/zinder-proto-codegen",
+    "tools/wallet-scan-experiment",
 ]
 resolver = "3"
 

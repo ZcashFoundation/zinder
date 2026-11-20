@@ -1,0 +1,35 @@
+[package]
+name = "wallet-scan-experiment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Reproducible compact-block scan experiments"
+categories = ["development-tools::profiling"]
+keywords = ["zcash", "benchmark"]
+
+[features]
+default = ["archive"]
+archive = ["dep:clap", "dep:prost", "dep:tempfile", "dep:zinder-core", "dep:zinder-store", "dep:zinder-proto"]
+
+[[bin]]
+name = "export-wallet-scan-corpus"
+path = "src/export.rs"
+required-features = ["archive"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"], optional = true }
+eyre.workspace = true
+pasta_curves = "0.6.3"
+prost = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+zinder-core = { workspace = true, optional = true }
+zinder-proto = { workspace = true, optional = true }
+zinder-store = { workspace = true, optional = true }
+
+[lints]
+workspace = true
