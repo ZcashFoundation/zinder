@@ -231,11 +231,12 @@ fn spawn_silent_tls_peer(
     })
 }
 
-/// A TLS server configuration for `127.0.0.1` that offers HTTP/2, and the
-/// roots a client needs to trust it.
-fn loopback_tls() -> Result<(Arc<rustls::ServerConfig>, RootCertStore), Box<dyn std::error::Error>>
-{
-    let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
+/// A TLS server configuration whose certificate names the loopback `address`
+/// and that offers HTTP/2, and the roots a client needs to trust it.
+fn loopback_tls(
+    address: &str,
+) -> Result<(Arc<rustls::ServerConfig>, RootCertStore), Box<dyn std::error::Error>> {
+    let certified = rcgen::generate_simple_self_signed(vec![address.to_owned()])?;
     let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -253,7 +254,7 @@ fn loopback_tls() -> Result<(Arc<rustls::ServerConfig>, RootCertStore), Box<dyn 
 
 #[tokio::test]
 async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> TestResult {
-    let (server_config, roots) = loopback_tls()?;
+    let (server_config, roots) = loopback_tls("127.0.0.1")?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let (handshake_completed, handshake_observed) = mpsc::channel();
@@ -395,7 +396,7 @@ fn spawn_tls_terminating_peer(
 
 #[tokio::test]
 async fn an_https_dial_serves_calls_through_a_tls_terminating_peer() -> TestResult {
-    let (server_config, roots) = loopback_tls()?;
+    let (server_config, roots) = loopback_tls("127.0.0.1")?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (peer, mut served_uris) = spawn_tls_terminating_peer(listener, server_config);
@@ -421,6 +422,31 @@ async fn an_https_dial_serves_calls_through_a_tls_terminating_peer() -> TestResu
     assert_eq!(
         served_uri.authority().map(http::uri::Authority::as_str),
         Some(address.to_string().as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_https_dial_to_an_ipv6_literal_verifies_the_peer_by_its_address() -> TestResult {
+    let (server_config, roots) = loopback_tls("::1")?;
+    let listener = TcpListener::bind("[::1]:0").await?;
+    let address = listener.local_addr()?;
+    let (peer, _served_uris) = spawn_tls_terminating_peer(listener, server_config);
+    let endpoint = ZinderGrpcEndpoint::parse(
+        &format!("https://{address}"),
+        SHORT_CONNECT_TIMEOUT,
+        move || Ok(roots),
+    )?;
+
+    let channel = dial(&endpoint, SHORT_CONNECT_TIMEOUT).await?;
+    let check = HealthClient::new(channel)
+        .check(HealthCheckRequest::default())
+        .await;
+    peer.abort();
+
+    assert!(
+        check.is_ok(),
+        "the call to {address} must succeed over TLS, got {check:?}"
     );
     Ok(())
 }

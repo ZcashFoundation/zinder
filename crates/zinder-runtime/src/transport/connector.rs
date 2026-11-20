@@ -147,6 +147,12 @@ pub(super) struct ZinderGrpcTls {
 impl ZinderGrpcTls {
     /// Trusts `roots` to identify `host`, and offers only HTTP/2.
     pub(super) fn new(host: &str, roots: RootCertStore) -> Result<Self, BearerTokenConnectError> {
+        // A URI host keeps the brackets around an IPv6 literal; a server name
+        // takes the bare address.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|bracketed| bracketed.strip_suffix(']'))
+            .unwrap_or(host);
         let server_name =
             ServerName::try_from(host.to_owned()).map_err(|error| tls_setup_error(&error))?;
         let mut config =
