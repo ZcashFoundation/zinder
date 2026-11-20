@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    io::Read as _,
+    io::{Read as _, Write},
     net::SocketAddr,
     str::FromStr as _,
     sync::{
@@ -20,6 +20,7 @@ use hyper_util::{
     client::legacy::connect::dns::Name,
     rt::{TokioExecutor, TokioIo},
 };
+use parking_lot::Mutex;
 use rustls::RootCertStore;
 use tokio::{
     io::AsyncReadExt as _,
@@ -548,6 +549,69 @@ async fn a_startup_dial_returns_a_refused_connection_at_once() -> TestResult {
     assert!(
         matches!(outcome, Err(BearerTokenConnectError::Transport(_))),
         "a refused connection ends the startup dial, got {outcome:?}"
+    );
+    Ok(())
+}
+
+/// Collects what a tracing subscriber writes.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn startup_dial_warnings_redact_endpoint_credentials() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!(
+        "http://reader:hunter2@{}/?token=s3cret",
+        listener.local_addr()?
+    );
+    let peer = spawn_silent_peer(listener);
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let cancel = CancellationToken::new();
+    let cancel_later = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(SHORT_CONNECT_TIMEOUT * 2).await;
+        cancel_later.cancel();
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_with_startup_retries(&endpoint, None, SHORT_CONNECT_TIMEOUT, &cancel),
+    )
+    .await?;
+    peer.abort();
+    let logged = log.contents();
+
+    assert!(matches!(outcome, Ok(None)), "got {outcome:?}");
+    assert!(
+        logged.contains("zinder_grpc_startup_dial_timed_out"),
+        "the timed-out dial must be logged: {logged}"
+    );
+    assert!(
+        !logged.contains("hunter2") && !logged.contains("s3cret"),
+        "the log must not carry endpoint credentials: {logged}"
     );
     Ok(())
 }

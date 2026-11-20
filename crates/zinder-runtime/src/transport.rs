@@ -28,6 +28,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
+use zinder_source::redact_endpoint_url;
 
 use crate::auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
@@ -146,7 +147,7 @@ async fn connect_with_startup_retries(
                 tracing::warn!(
                     target: "zinder::runtime",
                     event = "zinder_grpc_startup_dial_timed_out",
-                    endpoint,
+                    endpoint = %redact_endpoint_url(endpoint),
                     %error,
                     retry_delay_ms = STARTUP_DIAL_RETRY_DELAY.as_millis(),
                     "Zinder gRPC peer did not answer the startup dial; dialing again"

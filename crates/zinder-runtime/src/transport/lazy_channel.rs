@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
+use zinder_source::redact_endpoint_url;
 
 use super::connect_zinder_grpc;
 use crate::auth::{AuthenticatedChannel, BearerToken, BearerTokenConnectError};
@@ -114,7 +115,7 @@ impl std::fmt::Debug for LazyZinderGrpcChannel {
         };
         formatter
             .debug_struct("LazyZinderGrpcChannel")
-            .field("endpoint", &self.shared.endpoint)
+            .field("endpoint", &redact_endpoint_url(&self.shared.endpoint))
             .field("bearer_token_attached", &self.shared.bearer_token.is_some())
             .field("state", &state)
             .finish()
@@ -181,5 +182,21 @@ mod tests {
         assert!(format!("{lazy:?}").contains("idle"));
         drop(listener);
         Ok(())
+    }
+
+    #[test]
+    fn debug_output_redacts_endpoint_credentials() {
+        let lazy = LazyZinderGrpcChannel::new(
+            "https://reader:hunter2@ingest.internal:9100/?token=s3cret",
+            None,
+        );
+
+        let debug = format!("{lazy:?}");
+
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+        assert!(debug.contains("ingest.internal:9100"), "{debug}");
     }
 }
