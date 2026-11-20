@@ -70,8 +70,9 @@ only indexer here that can also run that validator in its own process. Zingod
 accepts 1 to 64 validators.
 zinder-ingest follows one validator at a time from an ordered list of `[node]`
 and optional `[node_fallbacks.N]` endpoints. zinder-query and
-zinder-compat-lightwalletd use their own node list only to broadcast, and
-zinder-explorer reads only `[node]`.
+zinder-compat-lightwalletd use their own node list only to broadcast and, in
+wallet-mode compatibility, to read the recommended fee. zinder-explorer reads
+only `[node]`.
 
 ## Interfaces
 
@@ -141,14 +142,14 @@ whether compact blocks can carry transparent inputs and outputs.
 | `GetAddressUtxos` | Experimental | Yes | Yes | Yes | Yes |
 | `GetAddressUtxosStream` | Experimental | Yes | Yes | Yes | Yes |
 | `GetLightdInfo` | Experimental | Yes | Yes | Yes | Yes |
-| `GetStandardFee` | No | Yes | Yes | Yes | No[^zinder-standard-fee] |
+| `GetStandardFee` | No | Yes | Yes | Yes | Yes[^zinder-standard-fee] |
 | `Ping` | No | Optional[^ping] | No[^zingod-unimplemented] | Optional[^ping] | Optional[^zinder-ping] |
 | Transparent inputs and outputs in compact blocks | No | Yes[^transparent-pool] | Yes[^transparent-pool] | Yes[^transparent-pool] | Yes[^transparent-pool] |
 
 Zebra labels its whole lightwalletd gRPC listener experimental.[^zebra-lwd-exp]
 ztreamer serves the same methods in both modes. In its default `wallet` serving
-mode, Zinder serves every method except `GetStandardFee` (which returns
-`UNIMPLEMENTED`), and answers `Ping` only with `compat.ping_very_insecure`.
+mode, Zinder serves every method and answers `Ping` only with
+`compat.ping_very_insecure`.
 [Runtime serving selection](lightwalletd-compatibility.md#runtime-serving-selection)
 describes Zinder's narrower `compact-blocks` mode.
 
@@ -356,7 +357,7 @@ Limits:
 - Alpha: its APIs, storage layouts, and deployment topology will change.
 - zinder-ingest needs an archive validator and is the only writer, and the runtimes share one host with no read replicas or snapshot bootstrap.
 - Serving depends on zinder-ingest, which cannot start without a validator: readers stop five minutes after ingest stops, and while every validator is down the served tip stops advancing and broadcasts fail.
-- No built-in TLS, no client authentication on the wallet listeners, and no `GetStandardFee`, while full blocks need a non-default setting and Explorer views need the Explorer image or a non-default setting.
+- No built-in TLS and no client authentication on the wallet listeners, while full blocks need a non-default setting and Explorer views need the Explorer image or a non-default setting.
 
 ## Source revisions
 
@@ -447,7 +448,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-ping]: Needs `compat.ping_very_insecure = true` or `--ping-very-insecure`, which Zinder says to enable only on a server under load testing, and otherwise both serving modes refuse `Ping` with `FAILED_PRECONDITION` ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L162-L175), [main.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-compat-lightwalletd/src/bin/zinder-compat-lightwalletd/main.rs#L101-L103)).
 
-[^zinder-standard-fee]: Zinder vendors `lightwallet-protocol` v0.6.0 and returns `UNIMPLEMENTED` from `GetStandardFee` as specified for backends without a `getstandardfee` estimator ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#methods-served)).
+[^zinder-standard-fee]: In wallet serving, Zinder returns the fee and estimator version that a verified node in its broadcast list reports through `getstandardfee`, as Go lightwalletd returns its node's. It returns `UNIMPLEMENTED` when no configured node implements the RPC, and in `compact-blocks` serving ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#getstandardfee)).
 
 [^transparent-pool]: In `GetBlockRange`, only when the request names the transparent pool type, while Zingod's `GetBlock` always includes it and ztreamer fetches each full block from its validator ([ztreamer](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/service/src/compact/blocks/mod.rs#L92-L137), [Zingod](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/book/src/wallets/methods.md#L25-L26), [Go lightwalletd](https://github.com/zcash/lightwalletd/blob/faaf7aa1f917f41ad41def61d7095330078c8a8d/common/common.go#L617-L668), [Zinder](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L194-L204)).
 
@@ -569,7 +570,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-processes]: zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, and a Zebra or Zakura validator, plus the optional zinder-explorer and any fallback validators ([ADR-0035](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/adrs/0035-canonical-storage-topologies.md#L169-L174), [release-images.json](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/deploy/release-images.json#L1-L7)).
 
-[^zinder-node-targets]: zinder-ingest follows one validator at a time from `[node]` and any `[node_fallbacks.N]` endpoints, numbered from 1 without a gap. zinder-query and wallet-mode zinder-compat-lightwalletd read their own list only to broadcast, and the bundled container gives zinder-query the same endpoints as zinder-ingest. zinder-explorer reads only `[node]`, and zinder-projector and compact-blocks zinder-compat-lightwalletd refuse any node setting ([node-source-boundary.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/architecture/node-source-boundary.md#L105-L143), [wallet-serving-runtime-entrypoint](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/deploy/wallet-serving-runtime-entrypoint#L78-L80)).
+[^zinder-node-targets]: zinder-ingest follows one validator at a time from `[node]` and any `[node_fallbacks.N]` endpoints, numbered from 1 without a gap. zinder-query and wallet-mode zinder-compat-lightwalletd read their own list only to broadcast and, in compatibility, to read the recommended fee, and the bundled container gives zinder-query the same endpoints as zinder-ingest. zinder-explorer reads only `[node]`, and zinder-projector and compact-blocks zinder-compat-lightwalletd refuse any node setting ([node-source-boundary.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/architecture/node-source-boundary.md#L105-L143), [wallet-serving-runtime-entrypoint](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/deploy/wallet-serving-runtime-entrypoint#L78-L80), [lightwalletd-compatibility.md](lightwalletd-compatibility.md#getstandardfee)).
 
 [^zebra-disk]: The Zebra book's figure, and extracting a snapshot needs twice that for a while ([requirements.md](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/book/src/user/requirements.md#L23-L26)).
 

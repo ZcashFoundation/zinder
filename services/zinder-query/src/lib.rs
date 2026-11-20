@@ -2,8 +2,8 @@
 //!
 //! This crate serves indexed artifacts from an admitted wallet-serving pair
 //! through [`WalletServingQuery`] without mutating canonical storage or using
-//! upstream nodes as a fallback for indexed history. Transaction broadcast is
-//! the only operation that contacts an upstream node.
+//! upstream nodes as a fallback for indexed history. Only transaction
+//! broadcast and the recommended-fee read contact an upstream node.
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
@@ -17,7 +17,7 @@ use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
     MAX_SUBTREE_ROOTS_PER_REQUEST, NetworkUpgradeActivations, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    ShieldedProtocol, StandardFee, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
@@ -408,6 +408,17 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, QueryError>;
+
+    /// Reads the fee the verified broadcast node recommends for a
+    /// transaction to be mined in the next block.
+    ///
+    /// Fails with [`QueryError::Node`] holding
+    /// [`SourceError::NodeCapabilityMissing`] when no verified node
+    /// implements `getstandardfee`,
+    /// [`SourceError::TransactionBroadcastDisabled`] when no node is
+    /// configured, and [`SourceError::SourceProtocolMismatch`] when the node
+    /// answers with a zero fee or a reply of another shape.
+    async fn standard_fee(&self) -> Result<StandardFee, QueryError>;
 }
 
 /// Default maximum compact-block count returned by one range call.

@@ -1,6 +1,8 @@
 //! Zebra JSON-RPC source adapter.
 
 use std::collections::HashSet;
+use std::fmt;
+use std::marker::PhantomData;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +17,8 @@ use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use zinder_core::{
@@ -25,7 +28,7 @@ use zinder_core::{
     CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
     CommitmentTreeFrontiersError, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    StandardFee, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
     TransactionId, ValuePoolBalance,
 };
 
@@ -1806,6 +1809,30 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
             )),
         }
     }
+
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        let JsonObject(reply): JsonObject<ZebraStandardFee> = self
+            .call_with_result_shape(
+                "getstandardfee",
+                ArrayParams::new(),
+                |error| {
+                    if error.code == Some(JSON_RPC_METHOD_NOT_FOUND_CODE) {
+                        SourceError::NodeCapabilityMissing {
+                            capability: NodeCapability::StandardFee,
+                        }
+                    } else {
+                        map_node_unavailable(error)
+                    }
+                },
+                "getstandardfee returned a result that is not a fee and estimator version",
+            )
+            .await?;
+        StandardFee::new(reply.standard_fee, reply.version).ok_or(
+            SourceError::SourceProtocolMismatch {
+                reason: "getstandardfee reported a zero standard fee",
+            },
+        )
+    }
 }
 
 fn map_node_unavailable(error: JsonRpcCallError) -> SourceError {
@@ -2299,6 +2326,9 @@ fn parse_openrpc_capabilities(
     if method_names.contains(&"getblockchaininfo") {
         probed_capabilities.push(NodeCapability::ChainValuePools);
     }
+    if method_names.contains(&"getstandardfee") {
+        probed_capabilities.push(NodeCapability::StandardFee);
+    }
     if stores_historical_block_bodies {
         probed_capabilities.push(NodeCapability::HistoricalBlockBodies);
     }
@@ -2655,6 +2685,53 @@ fn classify_rejection_reason(message: &str) -> BroadcastRejectionReason {
         return BroadcastRejectionReason::InvalidSignature;
     }
     BroadcastRejectionReason::Unknown
+}
+
+/// A JSON-RPC result that decodes only from a JSON object.
+///
+/// A derived struct decoder also accepts an array of the members in
+/// declaration order, which is not a reply of named members.
+struct JsonObject<Members>(Members);
+
+impl<'de, Members> Deserialize<'de> for JsonObject<Members>
+where
+    Members: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(JsonObjectVisitor(PhantomData))
+    }
+}
+
+struct JsonObjectVisitor<Members>(PhantomData<Members>);
+
+impl<'de, Members> Visitor<'de> for JsonObjectVisitor<Members>
+where
+    Members: Deserialize<'de>,
+{
+    type Value = JsonObject<Members>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        Members::deserialize(MapAccessDeserializer::new(map)).map(JsonObject)
+    }
+}
+
+/// Reply of the `getstandardfee` RPC.
+#[derive(Deserialize)]
+struct ZebraStandardFee {
+    standard_fee: u64,
+    /// A node that omits the estimator version runs the static ZIP 317 fee.
+    #[serde(default)]
+    version: u32,
 }
 
 /// Domain-shaped JSON-RPC `error` object after we strip jsonrpsee internals.

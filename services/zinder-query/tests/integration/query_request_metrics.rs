@@ -172,6 +172,7 @@ const SERVING_QUERY_OPERATIONS: &[&str] = &[
     "latest_tree_state_checkpoint",
     "subtree_roots_in_range",
     "broadcast_transaction",
+    "standard_fee",
 ];
 
 #[test]
@@ -291,6 +292,7 @@ async fn request_every_transaction_read(query: &WalletServingQuery<()>) {
     let _ = query
         .broadcast_transaction(RawTransactionBytes::new(vec![0x00]))
         .await;
+    let _ = query.standard_fee().await;
 }
 
 async fn request_every_transparent_read(query: &WalletServingQuery<()>) {

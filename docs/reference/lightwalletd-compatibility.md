@@ -2,7 +2,7 @@
 
 This page is the reference for how `zinder-compat-lightwalletd` answers the lightwalletd `CompactTxStreamer` protocol, and where its behavior differs from Go lightwalletd. It is for wallet developers who point an existing lightwalletd client at Zinder, and for operators who run the compatibility runtime.
 
-The runtime serves the same stored data as the native `WalletQuery` service, described in [Wallet data plane](../architecture/wallet-data-plane.md). It uses the node only to broadcast transactions.
+The runtime serves the same stored data as the native `WalletQuery` service, described in [Wallet data plane](../architecture/wallet-data-plane.md). It uses the node only to broadcast transactions and to read the recommended fee.
 
 ## Claim boundary
 
@@ -23,7 +23,7 @@ A named wallet is supported once it passes end-to-end certification against a re
 
 The operator selects one of two serving modes with `[compat].serving`, the `ZINDER_COMPAT__SERVING` environment variable, or `--serving`. The default is `wallet`.
 
-- `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction`, and connects to ingest control for the mempool methods.
+- `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction` and `GetStandardFee`, and connects to ingest control for the mempool methods.
 - `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
 
 In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
@@ -48,7 +48,7 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetLatestTreeState` | Served | `UNIMPLEMENTED` | |
 | `GetSubtreeRoots` | Served | `UNIMPLEMENTED` | `maxEntries = 0` streams every remaining root |
 | `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | At most 100,000 outputs per response |
-| `GetStandardFee` | `UNIMPLEMENTED` | `UNIMPLEMENTED` | Zinder does not expose a backend `getstandardfee` estimator |
+| `GetStandardFee` | Served when a configured node implements `getstandardfee` | `UNIMPLEMENTED` | See [`GetStandardFee`](#getstandardfee) |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
 
 A handler that makes several storage reads pins them to the chain epoch of the tip it reads first, so one response never mixes two branches of a reorg. Block-range streams instead follow the chain, as described below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
@@ -183,6 +183,21 @@ The typed outcome maps to `SendResponse.errorCode`. When the node supplied a cod
 | Unknown | -1 | Node message |
 
 When an earlier endpoint was unreachable, a later duplicate or queued answer returns `errorCode` 0 with the transaction id, because the unreachable endpoint may have accepted the transaction.
+
+### `GetStandardFee`
+
+`GetStandardFee` returns the ZIP 317 marginal fee per logical action and the estimator version, both as the node's `getstandardfee` RPC reports them. An omitted estimator version is `0`. Zinder does not compute a fee itself, and it does not pass on a zero fee, which a node that follows ZIP 317 never reports.
+
+The call uses the same verified endpoints and failover order as `SendTransaction`, and applies the same admission check against the pair being served, so it never asks an endpoint that has not passed first-contact verification or whose network-upgrade table disagrees with the served schedule at the next block. It moves to the next endpoint when one is unreachable or does not implement the RPC, and it does not change the preferred broadcast endpoint.
+
+| Situation | Status |
+| --- | --- |
+| A verified node answers with a fee | The fee and estimator version |
+| A verified node answers with a zero fee, or with a reply that is not a JSON object with a fee and estimator version, such as an array of the two numbers | `INTERNAL` |
+| No endpoint is verified yet, an endpoint is still awaiting verification and none answered, or every verified endpoint is unreachable or answers with an error other than method-not-found | `UNAVAILABLE` |
+| Every endpoint that can still be admitted is verified and lacks `getstandardfee`, or `[node]` is not set | `UNIMPLEMENTED` |
+
+An unreachable endpoint, or one still awaiting verification, takes precedence over one that lacks the method, so an outage is not reported as a permanent absence. A zero fee or a reply of another shape is a node bug, not an outage, so it ends the call with `INTERNAL` without asking the next endpoint, as Go lightwalletd answers it.
 
 ### `GetTaddressTxids` and `GetTaddressTransactions`
 

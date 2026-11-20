@@ -30,10 +30,10 @@ use zinder_core::{
     ChainEpochId, CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata,
     CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
     CompactTransactionData, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId, TransactionLocation,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentSpendFact, TransparentUnspentOutput,
+    SUBTREE_LEAF_COUNT, ShieldedProtocol, StandardFee, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId,
+    TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentSpendFact, TransparentUnspentOutput,
     wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
@@ -576,7 +576,40 @@ async fn lightd_info_protocol_version_satisfies_zingolib_minimum() -> eyre::Resu
 }
 
 #[tokio::test]
-async fn get_standard_fee_returns_unimplemented() -> eyre::Result<()> {
+async fn get_standard_fee_returns_the_node_fee_unchanged() -> eyre::Result<()> {
+    let node = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x11; 32]))
+        .with_standard_fee(
+            StandardFee::new(7_000, 3).ok_or_else(|| eyre!("the node fee must be non-zero"))?,
+        );
+    let (adapter, _store) = broadcasting_acceptance_adapter(node).await?;
+
+    let fee = adapter
+        .get_standard_fee(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert_eq!(fee.fee_zat, 7_000);
+    assert_eq!(fee.estimator_version, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_standard_fee_is_unimplemented_when_the_node_lacks_the_method() -> eyre::Result<()> {
+    let node = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x11; 32]));
+    let (adapter, _store) = broadcasting_acceptance_adapter(node).await?;
+
+    let status = adapter
+        .get_standard_fee(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected GetStandardFee to return UNIMPLEMENTED"))?;
+
+    assert_eq!(status.code(), Code::Unimplemented);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_standard_fee_is_unimplemented_without_a_configured_node() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
     let adapter = acceptance_adapter(&store_fixture);
 
@@ -587,6 +620,45 @@ async fn get_standard_fee_returns_unimplemented() -> eyre::Result<()> {
         .ok_or_else(|| eyre!("expected GetStandardFee to return UNIMPLEMENTED"))?;
 
     assert_eq!(status.code(), Code::Unimplemented);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_standard_fee_is_unavailable_when_the_node_is_unreachable() -> eyre::Result<()> {
+    let node = MockTransactionBroadcaster::node_unavailable("node refuses connections");
+    let (adapter, _store) = broadcasting_acceptance_adapter(node).await?;
+
+    let status = adapter
+        .get_standard_fee(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected GetStandardFee to return UNAVAILABLE"))?;
+
+    assert_eq!(status.code(), Code::Unavailable);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_standard_fee_is_unavailable_while_a_fee_capable_fallback_is_unreachable()
+-> eyre::Result<()> {
+    let fallback = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x12; 32]))
+        .with_standard_fee(
+            StandardFee::new(7_000, 3).ok_or_else(|| eyre!("the node fee must be non-zero"))?,
+        );
+    fallback.report_unreachable();
+    let (adapter, _store) = ordered_broadcasting_acceptance_adapter(vec![
+        MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x11; 32])),
+        fallback,
+    ])
+    .await?;
+
+    let status = adapter
+        .get_standard_fee(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected GetStandardFee to return UNAVAILABLE"))?;
+
+    assert_eq!(status.code(), Code::Unavailable);
     Ok(())
 }
 
@@ -2898,6 +2970,10 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, QueryError> {
         self.inner.broadcast_transaction(raw_transaction).await
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, QueryError> {
+        self.inner.standard_fee().await
     }
 }
 

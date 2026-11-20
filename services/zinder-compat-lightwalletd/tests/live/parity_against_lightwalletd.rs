@@ -24,6 +24,7 @@
 //! transaction round-trip by hash,
 //! block/index-without-txid error parity, future-height status-code parity for
 //! single-block compact block methods, invalid transaction broadcast rejection,
+//! the recommended standard fee,
 //! transparent address history, UTXOs, multi-address reads, and empty-address
 //! behavior for regtest transparent addresses, tree-state identity,
 //! Sapling/Orchard subtree-root availability, mempool compact-transaction
@@ -413,6 +414,27 @@ async fn send_transaction_rejects_invalid_encoding_like_reference() -> Result<()
     assert!(
         !reference_response.error_message.is_empty(),
         "reference invalid transaction rejection must include an error message",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+async fn standard_fee_matches_reference() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+
+    let zinder_fee = zinder.get_standard_fee(Empty {}).await?.into_inner();
+    let reference_fee = reference.get_standard_fee(Empty {}).await?.into_inner();
+
+    assert_eq!(
+        zinder_fee, reference_fee,
+        "GetStandardFee fee and estimator version diverge across shims",
     );
     Ok(())
 }

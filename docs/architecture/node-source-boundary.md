@@ -140,8 +140,8 @@ not from its version. A node that does not answer `rpc.discover` fails the
 check. The capabilities are `best_chain_blocks`,
 `source_chain_segments`, `tip_id`, `tree_state`, `subtree_roots`,
 `settled_tip_height`, `readiness_probe`, `transaction_broadcast`, `json_rpc`,
-`openrpc_discovery`, `chain_value_pools`, `block_value_pool_balances`, and
-`historical_block_bodies`. They are distinct from the client-facing strings in
+`openrpc_discovery`, `chain_value_pools`, `block_value_pool_balances`,
+`historical_block_bodies`, and `standard_fee`. They are distinct from the client-facing strings in
 [Capabilities](../reference/capabilities.md).
 
 `historical_block_bodies` means the node keeps every block. The source grants
@@ -191,6 +191,12 @@ and `HistoricalBlockBodyUnavailable`, classed `capability_missing`, as is
 reports an unrecognized refusal as `protocol_mismatch` and logs
 `tree_state_block_hash_refused`.
 
+`getstandardfee` reports a zero fee, or an answer of another shape, as
+`SourceProtocolMismatch`, as the transparent-address lookups report an answer
+of another shape. The answer must be a JSON object with a fee and an optional
+estimator version, so an array of the two numbers is another shape. A node
+without the method is `NodeCapabilityMissing` for `standard_fee`.
+
 ## Authentication
 
 `node.auth.method` selects one mode:
@@ -231,8 +237,9 @@ the consumer rebuilds its snapshot from the new endpoint.
 
 - Ingest switches its chain reads between endpoints. See
   [Chain ingestion](chain-ingestion.md#node-endpoint-failover).
-- `zinder-query` and wallet-mode compatibility use the list only to broadcast,
-  trying the active endpoint first and moving to the next verified one. They
+- `zinder-query` and wallet-mode compatibility use the list only to broadcast
+  and, in compatibility, to read the recommended fee with `getstandardfee`.
+  They try the active endpoint first and move to the next verified one. They
   read only the JSON-RPC and `[node.health]` fields.
 - `zinder-explorer` validates the list but reads only `[node]`.
 
@@ -276,6 +283,7 @@ stall a caller. Without `[node.health].addr`, readiness comes from JSON-RPC
 observations.
 
 The node's readiness caps ingest's readiness. Readers use their node only to
-broadcast, so they report it as a degraded dependency and keep serving stored
-data. See [Readiness](../reference/readiness.md) and
+broadcast and, in wallet-mode compatibility, to read the recommended fee, so
+they report it as a degraded dependency and keep serving stored data. See
+[Readiness](../reference/readiness.md) and
 [ADR-0016](../adrs/0016-wallet-serving-readiness.md).

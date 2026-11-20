@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockId, BroadcastAccepted, NetworkUpgradeActivations, RawTransactionBytes,
+    BlockId, BroadcastAccepted, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
     TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
@@ -34,6 +34,7 @@ use zinder_source::{
 #[derive(Clone, Debug)]
 pub struct MockTransactionBroadcaster {
     outcome: BroadcastOutcome,
+    standard_fee: Option<StandardFee>,
     captured_calls: Arc<Mutex<Vec<RawTransactionBytes>>>,
     probe: Arc<Mutex<MockNodeProbe>>,
 }
@@ -119,6 +120,14 @@ impl MockTransactionBroadcaster {
         ))
     }
 
+    /// Answers `getstandardfee` with `standard_fee`. Without it the node
+    /// lacks the method, unless the node fails every call.
+    #[must_use]
+    pub fn with_standard_fee(mut self, standard_fee: StandardFee) -> Self {
+        self.standard_fee = Some(standard_fee);
+        self
+    }
+
     /// Reports `activations` as the node's activation table to a reader's
     /// first-contact verification.
     #[must_use]
@@ -186,6 +195,7 @@ impl MockTransactionBroadcaster {
     fn with_outcome(outcome: BroadcastOutcome) -> Self {
         Self {
             outcome,
+            standard_fee: None,
             captured_calls: Arc::new(Mutex::new(Vec::new())),
             probe: Arc::new(Mutex::new(MockNodeProbe::default())),
         }
@@ -251,6 +261,15 @@ impl TransactionBroadcaster for MockTransactionBroadcaster {
                 Err(mock_source_error.as_source_error())
             }
         }
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        if let BroadcastOutcome::SourceError(mock_source_error) = &self.outcome {
+            return Err(mock_source_error.as_source_error());
+        }
+        self.standard_fee.ok_or(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::StandardFee,
+        })
     }
 }
 

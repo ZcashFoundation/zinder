@@ -344,6 +344,7 @@ async fn capability_probe_discovers_zebra_methods() -> Result<()> {
     assert!(probed.supports(NodeCapability::TreeState));
     assert!(probed.supports(NodeCapability::SubtreeRoots));
     assert!(probed.supports(NodeCapability::TransactionBroadcast));
+    assert!(probed.supports(NodeCapability::StandardFee));
     assert!(
         probed.supports(NodeCapability::HistoricalBlockBodies),
         "the live node must report archive storage (`pruned: false`)"
@@ -397,6 +398,19 @@ async fn broadcast_classifies_invalid_transaction() -> Result<()> {
             | TransactionBroadcastOutcome::Rejected(_)
             | TransactionBroadcastOutcome::Unknown(_)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn standard_fee_decodes_the_node_reply() -> Result<()> {
+    let _guard = init();
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
+    let source = zebra_source(&env)?;
+
+    source.standard_fee().await?;
     Ok(())
 }
 

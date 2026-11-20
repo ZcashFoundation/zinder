@@ -81,7 +81,7 @@ struct Cli {
     /// Operational HTTP endpoint listen address for /healthz, /readyz, /metrics.
     #[arg(long = "ops-listen-addr")]
     ops_listen_addr: Option<SocketAddr>,
-    /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
+    /// Node JSON-RPC address used for transaction broadcast and the recommended fee. Omit to disable both.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
     /// Answer the `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does.

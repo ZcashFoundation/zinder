@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-A wallet reader answers almost every request from its published serving pair. Only a few requests call anything else: a transaction broadcast calls the node, and mempool reads and lookups of unmined transactions call ingest control. Compact-blocks compatibility serving calls neither.
+A wallet reader answers almost every request from its published serving pair. Only a few requests call anything else: a transaction broadcast and the lightwalletd `GetStandardFee` call the node, and mempool reads and lookups of unmined transactions call ingest control. Compact-blocks compatibility serving calls neither.
 
 If readiness required the node and ingest control as well as the pair, any node outage or syncing node would refuse every stored read without making any request succeed. Deployment tooling would spread the outage further. A proxy that checks `/readyz` before each request would close the public route. A container supervisor would restart the container, and a restart during a node outage becomes a full outage, because ingest needs the node to start.
 

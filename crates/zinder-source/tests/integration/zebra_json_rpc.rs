@@ -1059,6 +1059,141 @@ async fn broadcast_transaction_without_error_code_returns_unknown() -> eyre::Res
 }
 
 #[tokio::test]
+async fn standard_fee_returns_both_reported_fields() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("getstandardfee").reply(RpcReply::result(
+        json!({"standard_fee": 7_000, "version": 3}),
+    ))])?;
+    let source = regtest_source(&server)?;
+
+    let fee = source.standard_fee().await?;
+    let requests = server.requests_for("getstandardfee")?;
+
+    assert_eq!(fee.fee_zat(), 7_000);
+    assert_eq!(fee.estimator_version(), 3);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].params, Value::Null);
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_fee_reports_a_missing_method_as_a_missing_capability() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([])?;
+    let source = regtest_source(&server)?;
+
+    let error = source
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a node without getstandardfee answered"))?;
+
+    assert!(matches!(
+        error,
+        SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::StandardFee
+        }
+    ));
+    assert_eq!(
+        error.upstream_classification(),
+        SourceFailureClass::CapabilityMissing
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_fee_reports_another_node_error_as_unavailable() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("getstandardfee").reply(RpcReply::error_with_code(-28, "node is warming up"))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let error = source
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a warming node answered with a fee"))?;
+
+    assert!(matches!(error, SourceError::NodeUnavailable { .. }));
+    Ok(())
+}
+
+/// A node that follows ZIP 317 never reports a zero fee, so a zero fee is
+/// not passed on to a wallet.
+#[tokio::test]
+async fn standard_fee_refuses_a_zero_fee() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getstandardfee")
+            .reply(RpcReply::result(json!({"standard_fee": 0, "version": 0})))])?;
+    let source = regtest_source(&server)?;
+
+    let error = source
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a zero fee was accepted"))?;
+
+    assert!(
+        matches!(error, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}
+
+/// A reply that does not decode as a fee and estimator version is a protocol
+/// mismatch, not an unreachable node.
+#[tokio::test]
+async fn standard_fee_reports_a_reply_of_another_shape_as_a_protocol_mismatch() -> eyre::Result<()>
+{
+    for (case, reply) in [
+        ("string instead of a fee object", json!("not json")),
+        ("null", Value::Null),
+        ("array of the fee and version", json!([7_000, 3])),
+        (
+            "fee as a string",
+            json!({"standard_fee": "1000", "version": 0}),
+        ),
+        (
+            "fractional fee",
+            json!({"standard_fee": 1000.5, "version": 0}),
+        ),
+    ] {
+        let server =
+            JsonRpcTestServer::start([method("getstandardfee").reply(RpcReply::result(reply))])?;
+        let source = regtest_source(&server)?;
+
+        let error = source
+            .standard_fee()
+            .await
+            .err()
+            .ok_or_else(|| eyre!("{case}: a malformed reply was accepted"))?;
+
+        assert!(
+            matches!(error, SourceError::SourceProtocolMismatch { .. }),
+            "{case}: unexpected error: {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            SourceFailureClass::ProtocolMismatch,
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_fee_defaults_an_omitted_version_to_zero() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("getstandardfee").reply(RpcReply::result(json!({"standard_fee": 5_000})))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let fee = source.standard_fee().await?;
+
+    assert_eq!(fee.fee_zat(), 5_000);
+    assert_eq!(fee.estimator_version(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
@@ -1071,6 +1206,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
                 {"name": "z_getsubtreesbyindex"},
                 {"name": "sendrawtransaction"},
                 {"name": "getblockchaininfo"},
+                {"name": "getstandardfee"},
                 {"name": "rpc.discover"},
                 {"name": "ping"},
             ],
@@ -1087,6 +1223,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
     assert!(probed.supports(NodeCapability::SubtreeRoots));
     assert!(probed.supports(NodeCapability::TransactionBroadcast));
     assert!(probed.supports(NodeCapability::ChainValuePools));
+    assert!(probed.supports(NodeCapability::StandardFee));
     assert_eq!(source.capabilities(), probed);
 
     Ok(())
