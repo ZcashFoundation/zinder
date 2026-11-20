@@ -17,6 +17,7 @@ mod node_failover;
 mod phase;
 mod runtime_config;
 mod source_recovery;
+mod subtree_verification;
 mod transaction_component_backfill;
 mod tree_state_densification;
 mod tree_state_verification;

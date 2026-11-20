@@ -56,6 +56,32 @@ const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32
 const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
 const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
 
+fn assert_subtree_verification(metrics: &PrometheusHandle, pool: &str, outcome: &str) {
+    let exposition = metrics.render();
+    for (metric, expected) in [
+        ("zinder_ingest_subtree_root_verifications_total", true),
+        (
+            "zinder_ingest_subtree_root_verification_duration_seconds_count",
+            true,
+        ),
+        (
+            "zinder_ingest_subtree_root_recheck_duration_seconds_count",
+            matches!(outcome, "recheck_match" | "mismatch"),
+        ),
+    ] {
+        let sample = exposition.lines().find(|line| {
+            line.starts_with(metric)
+                && line.contains(&format!("pool=\"{pool}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        });
+        assert_eq!(
+            sample.and_then(|line| line.split_whitespace().last()),
+            expected.then_some("1"),
+            "{metric} {pool} {outcome}"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceCall {
     Tip,
@@ -76,6 +102,7 @@ pub(super) struct RecordingParseableSource {
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
+    cancel_after_subtree_read: Arc<Mutex<Option<CancellationToken>>>,
     switch_before_checkpoint: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
     switch_before_subtree_read: Arc<Mutex<Option<PendingChainSwitch>>>,
     switch_back_after_subtree_read: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
@@ -130,6 +157,7 @@ impl RecordingParseableSource {
             tip_call_gate: Arc::new(Mutex::new(None)),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
+            cancel_after_subtree_read: Arc::new(Mutex::new(None)),
             switch_before_checkpoint: Arc::new(Mutex::new(None)),
             switch_before_subtree_read: Arc::new(Mutex::new(None)),
             switch_back_after_subtree_read: Arc::new(Mutex::new(None)),
@@ -212,6 +240,10 @@ impl RecordingParseableSource {
 
     fn cancel_after_checkpoint(&self, height: BlockHeight, cancel: CancellationToken) {
         *self.cancel_after_checkpoint.lock() = Some((height, cancel));
+    }
+
+    fn cancel_after_subtree_read(&self, cancel: CancellationToken) {
+        *self.cancel_after_subtree_read.lock() = Some(cancel);
     }
 
     fn calls(&self) -> Vec<SourceCall> {
@@ -353,6 +385,11 @@ impl NodeSource for RecordingParseableSource {
                 start_index: range.start_index,
                 reason: "parseable follower fixture has no root at this index".to_owned(),
             })?;
+        let cancel_after_subtree_read = self.cancel_after_subtree_read.lock().take();
+        if let Some(cancel) = cancel_after_subtree_read {
+            cancel.cancel();
+            std::future::pending::<()>().await;
+        }
         Ok(SourceSubtreeRoots::new(
             range.protocol,
             range.start_index,
@@ -2463,6 +2500,8 @@ async fn append_against_tree_states(
 #[tokio::test]
 async fn a_block_that_completes_a_subtree_commits_the_root_derived_from_its_commitments()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let siblings = subtree_completing_siblings()?;
     let temporary = tempdir()?;
     let (source, store) =
@@ -2499,6 +2538,7 @@ async fn a_block_that_completes_a_subtree_commits_the_root_derived_from_its_comm
             SourceCall::Subtree(orchard_subtree_zero()),
         ]
     );
+    assert_subtree_verification(&recorder.handle(), "orchard", "first_match");
     Ok(())
 }
 
@@ -2603,6 +2643,8 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
         ),
     ];
     for contradiction in contradictions {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
         let temporary = tempdir()?;
         let store_path = temporary.path().join("canonical");
         let (source, store) = publish_subtree_boundary_store(&siblings, 3, &store_path).await?;
@@ -2657,6 +2699,7 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
         )?;
         assert_eq!(reopened.event_fence(), original_fence);
         assert!(reopened.subtree_roots(orchard_subtree_zero()).is_err());
+        assert_subtree_verification(&recorder.handle(), "orchard", "mismatch");
     }
     Ok(())
 }
@@ -2670,6 +2713,8 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
 #[tokio::test]
 async fn a_switch_away_and_back_around_the_subtree_root_read_appends_the_block_with_its_root()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let siblings = subtree_completing_siblings()?;
     let temporary = tempdir()?;
     let (source, store) =
@@ -2713,6 +2758,44 @@ async fn a_switch_away_and_back_around_the_subtree_root_read_appends_the_block_w
             SourceCall::Subtree(orchard_subtree_zero()),
         ]
     );
+    assert_subtree_verification(&recorder.handle(), "orchard", "recheck_match");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_a_subtree_read_records_an_interrupted_verification()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    let siblings = subtree_completing_siblings()?;
+    let temporary = tempdir()?;
+    let (source, store) =
+        publish_subtree_boundary_store(&siblings, 3, &temporary.path().join("canonical")).await?;
+    siblings.serve_chain_through(&source, &siblings.first, SUBTREE_COMPLETION_HEIGHT)?;
+    let original_fence = store.event_fence();
+    let cancel = CancellationToken::new();
+    source.cancel_after_subtree_read(cancel.clone());
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let follower = follower_to_target(
+        &source,
+        &siblings.activations,
+        SUBTREE_COMPLETION_HEIGHT,
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+
+    assert_eq!(store.event_fence(), original_fence);
+    assert_eq!(
+        source
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, SourceCall::Subtree(_)))
+            .count(),
+        1
+    );
+    assert_subtree_verification(&recorder.handle(), "orchard", "interrupted");
     Ok(())
 }
 
@@ -2764,6 +2847,8 @@ async fn construction_stores_the_subtree_roots_derived_from_the_loaded_blocks()
 #[tokio::test]
 async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let chains = InterleavedSubtreeChains::new()?;
     let first = || chains.chain(&fixture_orchard_source_block()?, 1);
     let second = || chains.chain(&fixture_zakura_orchard_source_block()?, 2);
@@ -2805,6 +2890,7 @@ async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
         subtree_and_checkpoint_calls(&source),
         construction_reread_calls()
     );
+    assert_subtree_verification(&recorder.handle(), "multiple", "mismatch");
     Ok(())
 }
 
@@ -2816,6 +2902,8 @@ async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
 #[tokio::test]
 async fn construction_reads_subtree_roots_again_after_a_switch_away_and_back()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let chains = InterleavedSubtreeChains::new()?;
     let first = chains.chain(&fixture_orchard_source_block()?, 1)?;
     let settled = block_id(&first.blocks, 3)?;
@@ -2836,6 +2924,7 @@ async fn construction_reads_subtree_roots_again_after_a_switch_away_and_back()
         subtree_and_checkpoint_calls(&source),
         construction_reread_calls()
     );
+    assert_subtree_verification(&recorder.handle(), "multiple", "recheck_match");
     assert_eq!(
         InterleavedSubtreeChains::publish_and_read_roots(built, settled)?,
         expected_roots

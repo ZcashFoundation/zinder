@@ -1434,6 +1434,18 @@ fn apply_next_wallet_transition(
             reason: "wallet transition returned a source fence different from the authenticated retained-event result",
         });
     }
+    let position = observed.source_position();
+    tracing::info!(
+        target: "zinder::projector",
+        event = "wallet_projection_following_applied",
+        process_id = std::process::id(),
+        chain_epoch = position.chain_epoch_id.value(),
+        event_sequence = position.event_sequence,
+        visible_height = position.tip.height.value(),
+        visible_tip_hash = ?position.tip.hash,
+        sequence_digest = ?observed.source_sequence_digest().as_bytes(),
+        "applied and verified the following wallet fence"
+    );
     Ok(Some(observed))
 }
 
