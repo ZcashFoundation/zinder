@@ -123,6 +123,57 @@ fn sparse_range_returns_none_for_missing_checkpoints_and_some_for_stored_ones() 
 }
 
 #[test]
+fn stored_roots_stay_aligned_and_reject_damage_across_two_batches() -> TestResult {
+    use zinder_testkit::{CanonicalBaseline, CanonicalWriterFixture, ChainFixture};
+
+    let activations = activations()?;
+    let chain = ChainFixture::new(activations.network()).extend_blocks(1_101);
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let path = writer.canonical_primary_path().to_owned();
+    let window = writer
+        .canonical_primary()?
+        .reorg_policy()
+        .reorg_window_blocks();
+    // Keep the fixture directory while reopening the primary for a damaged-row read.
+    let _readers = writer.into_serving_store_fixture()?;
+    let store = RocksDbCanonicalStore::open_ready(
+        &path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(window)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    // The first batch ends at 1,090. Each batch contains both gaps and stored rows.
+    let range = BlockHeightRange::inclusive(BlockHeight::new(67), BlockHeight::new(1_101));
+    let roots = store.stored_final_note_commitment_roots_in_range(range, &activations)?;
+    assert_eq!(roots.len(), range.into_iter().len());
+    for (height, actual) in range.into_iter().zip(roots) {
+        let expected = if height.value().is_multiple_of(100) || height == range.end {
+            let checkpoint = store
+                .tree_state_checkpoint_at(height, &activations)?
+                .ok_or("fixture checkpoint missing")?;
+            Some(
+                checkpoint
+                    .frontiers
+                    .final_note_commitment_roots(checkpoint.block_id),
+            )
+        } else {
+            None
+        };
+        assert_eq!(actual, expected, "height {}", height.value());
+    }
+
+    replace_checkpoint_row(&store, BlockHeight::new(1_100), &[])?;
+    assert!(matches!(
+        store.stored_final_note_commitment_roots_in_range(range, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn range_bounds_exclude_heights_outside_retained_history_and_visible_tip() -> TestResult {
     let temporary = TempDir::new()?;
     let store = densified_store(&temporary)?;
