@@ -3,22 +3,102 @@
 //!
 //! A listener that trusts [`PROXY_CLIENT_ADDRESS_HEADER`] lets whoever sets
 //! the header choose the client its requests count against. The reference
-//! Caddy template must therefore replace the header, the TLS runbook must
-//! stop the trust before restoring a proxy configuration that passes client
-//! headers on, and it must name every network that reaches the listener
-//! without the proxy.
+//! Caddy template must therefore replace the header on the requests it
+//! forwards to the gRPC listener, the TLS runbook must stop the trust before
+//! restoring a proxy configuration that passes client headers on, and it
+//! must name every network that reaches the listener without the proxy, in
+//! the base Compose file and in every overlay merged with it.
 
 #![allow(
     missing_docs,
     reason = "Integration test names describe the proxy contract under test."
 )]
 
+use std::fs;
+
 use eyre::{Result, ensure, eyre};
 use zinder_runtime::PROXY_CLIENT_ADDRESS_HEADER;
 
 const CADDYFILE: &str = include_str!("../../../../deploy/compat-lightwalletd.Caddyfile");
-const COMPOSE: &str = include_str!("../../../../deploy/docker-compose.yml");
 const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-tls.md");
+const DEPLOY_DIRECTORY: &str = "../../deploy";
+const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
+
+/// The base Compose file and every overlay whose usage merges it, as
+/// `(file name, contents)` pairs.
+fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(DEPLOY_DIRECTORY)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_yaml = path.extension().is_some_and(|extension| extension == "yml");
+        if !(name.starts_with("docker-compose") && is_yaml) {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)?;
+        let merges_base = contents.contains(&format!("-f deploy/{BASE_COMPOSE_FILE}"));
+        if name == BASE_COMPOSE_FILE || merges_base {
+            files.push((name.to_owned(), contents));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// The lines inside the Caddy block that forwards to the plaintext gRPC
+/// listener, without its opening and closing lines.
+fn grpc_upstream_block(caddyfile: &str) -> Result<Vec<&str>> {
+    let mut lines = caddyfile
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| !(line.starts_with("reverse_proxy h2c://") && line.ends_with('{')));
+    lines
+        .next()
+        .ok_or_else(|| eyre!("the Caddy template has no reverse_proxy h2c:// block"))?;
+    let mut depth = 1_usize;
+    let mut block = Vec::new();
+    for line in lines {
+        // Placeholders such as `{http.request.remote}` open and close on one
+        // line, so only block braces change the depth.
+        depth = (depth + line.matches('{').count())
+            .checked_sub(line.matches('}').count())
+            .ok_or_else(|| eyre!("unbalanced braces in the Caddy template at {line:?}"))?;
+        if depth == 0 {
+            return Ok(block);
+        }
+        block.push(line);
+    }
+    Err(eyre!(
+        "the Caddy template's reverse_proxy h2c:// block never closes"
+    ))
+}
+
+/// Checks that the gRPC upstream block replaces the client address header
+/// with the address of the wallet's own connection.
+fn replaces_the_client_address_header_upstream(caddyfile: &str) -> Result<()> {
+    let directives = grpc_upstream_block(caddyfile)?
+        .into_iter()
+        .filter(|line| line.starts_with("header_up"))
+        .collect::<Vec<_>>();
+    let [directive] = directives.as_slice() else {
+        return Err(eyre!(
+            "the gRPC upstream block sets {} upstream headers; expected one: {directives:?}",
+            directives.len()
+        ));
+    };
+    // `header_up <name> <value>` replaces what the client sent. A `+name`
+    // would append to it, and the client's own value would reach Zinder.
+    let fields = directive.split_whitespace().collect::<Vec<_>>();
+    ensure!(
+        matches!(fields.as_slice(), [_, name, "{http.request.remote}"]
+            if name.eq_ignore_ascii_case(PROXY_CLIENT_ADDRESS_HEADER)),
+        "the gRPC upstream block must replace {PROXY_CLIENT_ADDRESS_HEADER} with the client \
+         connection's address: {directive}"
+    );
+    Ok(())
+}
 
 /// The runbook text under `heading`, up to the next `## ` heading.
 fn section<'doc>(document: &'doc str, heading: &str) -> Result<&'doc str> {
@@ -47,27 +127,33 @@ fn ingest_networks(compose: &str) -> Vec<&str> {
 
 #[test]
 fn the_caddy_template_replaces_the_header_the_listener_reads() -> Result<()> {
-    let directives = CADDYFILE
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("header_up"))
-        .collect::<Vec<_>>();
-    let [directive] = directives.as_slice() else {
-        return Err(eyre!(
-            "the Caddy template sets {} upstream headers; expected one: {directives:?}",
-            directives.len()
-        ));
-    };
-    // `header_up <name> <value>` replaces what the client sent. A `+name`
-    // would append to it, and the client's own value would reach Zinder.
-    let fields = directive.split_whitespace().collect::<Vec<_>>();
-    ensure!(
-        matches!(fields.as_slice(), [_, name, "{http.request.remote}"]
-            if name.eq_ignore_ascii_case(PROXY_CLIENT_ADDRESS_HEADER)),
-        "the Caddy template must replace {PROXY_CLIENT_ADDRESS_HEADER} with the client \
-         connection's address: {directive}"
+    replaces_the_client_address_header_upstream(CADDYFILE)
+}
+
+#[test]
+fn a_header_set_outside_the_grpc_upstream_block_does_not_count() {
+    // `forward_auth` takes `header_up` too, but sets it only on the
+    // readiness request, so the wallet's own header reaches Zinder.
+    let caddyfile = "\
+https://example.org:443 {
+\troute {
+\t\tforward_auth 127.0.0.1:9107 {
+\t\t\turi /readyz
+\t\t\theader_up X-Zinder-Client-Address {http.request.remote}
+\t\t}
+
+\t\treverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT} {
+\t\t\tflush_interval -1
+\t\t}
+\t}
+}
+";
+
+    assert_eq!(
+        grpc_upstream_block(caddyfile).ok(),
+        Some(vec!["flush_interval -1"])
     );
-    Ok(())
+    assert!(replaces_the_client_address_header_upstream(caddyfile).is_err());
 }
 
 #[test]
@@ -88,20 +174,49 @@ fn the_runbook_stops_trusting_the_header_before_restoring_an_older_proxy() -> Re
 }
 
 #[test]
-fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<()> {
-    let requirements = section(TLS_RUNBOOK, "## Keep wallets apart in the receive limit")?;
-    let networks = ingest_networks(COMPOSE);
+fn the_runbook_recreates_containers_with_every_compose_file_the_deployment_uses() -> Result<()> {
+    let commands = TLS_RUNBOOK
+        .lines()
+        .filter(|line| line.contains("docker compose"))
+        .collect::<Vec<_>>();
+
     ensure!(
-        !networks.is_empty(),
-        "found no networks for zinder-ingest in deploy/docker-compose.yml"
+        !commands.is_empty(),
+        "the TLS runbook runs no Compose command"
     );
-    for network in networks {
+    for command in commands {
         ensure!(
-            requirements.contains(&format!("Compose `{network}` network")),
-            "the public listeners share zinder-ingest's namespace, which joins the {network} \
-             network, but the runbook's requirements do not name it"
+            command.contains("--env-file \"$env_file\" \"${compose_files[@]}\""),
+            "a Compose command must pass the env file and every -f file the deployment \
+             runs with, or Compose drops what the missing overlays add: {command}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<()> {
+    let requirements = section(TLS_RUNBOOK, "## Keep wallets apart in the receive limit")?;
+    let compose_files = wallet_serving_compose_files()?;
+    ensure!(
+        compose_files.len() > 1,
+        "found no overlay merged with deploy/{BASE_COMPOSE_FILE} in {DEPLOY_DIRECTORY}"
+    );
+    let mut checked = 0;
+    for (file, contents) in &compose_files {
+        for network in ingest_networks(contents) {
+            ensure!(
+                requirements.contains(&format!("Compose `{network}` network")),
+                "the public listeners share zinder-ingest's namespace, which deploy/{file} \
+                 joins to the {network} network, but the runbook's requirements do not name it"
+            );
+            checked += 1;
+        }
+    }
+    ensure!(
+        checked > 0,
+        "found no networks for zinder-ingest in the Compose files"
+    );
     ensure!(
         requirements.contains("docker network inspect"),
         "the runbook must show how to list the containers that reach the listener directly"

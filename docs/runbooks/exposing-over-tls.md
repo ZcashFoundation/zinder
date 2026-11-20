@@ -62,7 +62,8 @@ Zinder trusts it, because until then any wallet can send its own.
    [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit),
    then tell Zinder to trust the client address Caddy forwards. Add this line
    to the env file you pass to Compose, then recreate the compatibility
-   container:
+   container with that env file and every `-f` file the deployment runs
+   with, as in [Roll back the proxy](#roll-back-the-proxy):
 
    ```bash
    ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true
@@ -132,17 +133,23 @@ This guarantee depends on these settings:
   - every process on the host, through the loopback port or the container's
     own addresses;
   - every container on the Compose `node` network, the node's Docker network
-    that `ZINDER_SOURCE_NETWORK_NAME` names, including the node; and
+    that `ZINDER_SOURCE_NETWORK_NAME` names, including the node;
+  - every container on the Compose `node-fallback` network, the fallback
+    node's Docker network that `ZINDER_FALLBACK_SOURCE_NETWORK_NAME` names,
+    including the fallback node, when the deployment merges
+    `deploy/docker-compose.node-fallback.yml`; and
   - every container on the Compose `observability` network, including
     Prometheus and Grafana.
 
   Before you turn the setting on, confirm that the host runs no untrusted
   users or workloads, and that you run and trust every container on those
-  networks. This lists them:
+  networks. This lists them. Set `env_file` and `compose_files` to the env
+  file and the `-f` files the deployment runs with, in the same order:
 
   ```bash
-  env_file=deploy/.env.mainnet # the env file you pass to Compose
-  ingest="$(docker compose --env-file "$env_file" -f deploy/docker-compose.yml ps -q zinder-ingest)"
+  env_file=deploy/.env.mainnet
+  compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
+  ingest="$(docker compose --env-file "$env_file" "${compose_files[@]}" ps -q zinder-ingest)"
   for network in $(docker inspect "$ingest" \
     --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'); do
     docker network inspect "$network" \
@@ -246,11 +253,18 @@ header before Caddy loads such a file.
    the setting off first. In the env file you pass to Compose, set
    `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false`, and also
    `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` if you expose the native
-   endpoint. Then recreate each container whose setting you changed, here
-   with the Mainnet env file:
+   endpoint. Then recreate each container whose setting you changed. Give
+   Compose the same env file and the same `-f` files, in the same order, that
+   the deployment runs with. With fewer files, Compose recreates the
+   container without what the missing overlays add, such as the fallback
+   node's settings and cookie mount from
+   `deploy/docker-compose.node-fallback.yml`. For a Mainnet deployment that
+   merges that overlay:
 
    ```bash
-   docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml \
+   env_file=deploy/.env.mainnet
+   compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
+   docker compose --env-file "$env_file" "${compose_files[@]}" \
      up -d zinder-compat-lightwalletd # and zinder-query, if you changed it
    ```
 
