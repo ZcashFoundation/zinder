@@ -1,0 +1,6 @@
+kind: changed
+body: Explorer replay reuses the final note-commitment roots of checkpointed blocks. It only reads compact blocks and hashes their commitments for gaps in checkpoint coverage.
+time: 2026-11-20T15:02:48.756106446Z
+custom:
+    Bump: patch
+    PR: "427"
