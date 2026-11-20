@@ -864,6 +864,31 @@ async fn transparent_address_answers_of_another_shape_are_protocol_mismatches() 
 }
 
 #[tokio::test]
+async fn transparent_address_utxos_reject_a_positional_row() -> eyre::Result<()> {
+    let row = json!([
+        testnet_address(1).to_string(),
+        display_txid(2),
+        0,
+        p2pkh_script_hex(),
+        1_005,
+        5
+    ]);
+    let server =
+        JsonRpcTestServer::start(
+            [method("getaddressutxos").reply(RpcReply::result(json!([row])))],
+        )?;
+    let outputs = regtest_source(server.url())?
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
+        .await;
+
+    assert!(
+        matches!(outputs, Err(SourceError::SourceProtocolMismatch { .. })),
+        "unexpected outputs {outputs:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre::Result<()> {
     // Consecutive transport-class failures rebuild the client, which reads
     // the cookie file again. A node that answers with another shape is
@@ -872,7 +897,7 @@ async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre:
     const STARTUP_AUTHORIZATION: &str = "Basic X19jb29raWVfXzpiZWZvcmUtcmVzdGFydA==";
 
     let server = JsonRpcTestServer::start([
-        method("getaddressbalance").reply_with(|_| RpcReply::result(json!({ "balance": 7 })))
+        method("getaddressbalance").reply_with(|_| RpcReply::result(json!([5, 10])))
     ])?;
     let cookie_dir = tempfile::tempdir()?;
     let cookie_path = cookie_dir.path().join(".cookie");
@@ -888,7 +913,10 @@ async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre:
 
     for _ in 0..ATTEMPTS {
         let balance = source.fetch_transparent_address_balance(&lookup).await;
-        assert!(balance.is_err(), "unexpected balance {balance:?}");
+        assert!(
+            matches!(balance, Err(SourceError::SourceProtocolMismatch { .. })),
+            "unexpected balance {balance:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 

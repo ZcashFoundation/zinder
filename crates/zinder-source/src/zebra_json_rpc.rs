@@ -973,7 +973,7 @@ impl ZebraJsonRpcSource {
         lookup: &TransparentAddressLookup,
     ) -> Result<SourceTransparentAddressBalance, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
-        let balance: ZebraAddressBalance = self
+        let JsonObject(balance): JsonObject<ZebraAddressBalance> = self
             .call_with_result_shape(
                 "getaddressbalance",
                 positional_params([json!({ "addresses": lookup.rpc_addresses() })])?,
@@ -1137,7 +1137,7 @@ impl ZebraJsonRpcSource {
         bound: UtxoRowBound,
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
-        let rows: Vec<ZebraAddressUtxo> = self
+        let rows: Vec<JsonObject<ZebraAddressUtxo>> = self
             .call_with_result_shape(
                 "getaddressutxos",
                 positional_params([json!({
@@ -1149,6 +1149,7 @@ impl ZebraJsonRpcSource {
                 "getaddressutxos returned a result that is not a list of unspent outputs",
             )
             .await?;
+        let rows: Vec<_> = rows.into_iter().map(|JsonObject(row)| row).collect();
         decode_address_utxos(&rows, lookup, start_height, bound)
     }
 
