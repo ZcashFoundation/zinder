@@ -69,11 +69,30 @@ end, so they do not hold the drain open.
 
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
-streams never end on their own. `zinder-query` and
-`zinder-compat-lightwalletd` each bound their gRPC drain at 10 seconds. Calls
-still open then, such as a block-range stream to a client that reads slowly,
-are abandoned. The single-volume entrypoint allows its processes 20 seconds to
-exit.
+streams never end on their own.
+
+`zinder-query` and `zinder-compat-lightwalletd` stop in this order:
+
+1. They report `shutting_down`, so `/readyz` and new requests see it before
+   anything stops.
+2. They stop their background tasks and start the gRPC server's graceful
+   drain.
+3. They wait up to 10 seconds for the drain.
+4. They end every call still open, such as a block-range stream to a client
+   that reads slowly, with `UNAVAILABLE`, and refuse any later call the same
+   way before its handler runs.
+5. They release their serving generations.
+6. They wait for their background tasks to stop. `zinder-query` stops its
+   operational endpoint with the other tasks in step 2, and
+   `zinder-compat-lightwalletd` closes its endpoint after this step.
+
+When step 4 completes, no call handler or response of the gRPC server
+remains. Work a handler already handed off finishes on its own and holds the
+generation it reads until then: a storage read running on a blocking thread
+completes and its result is discarded, and a block-range reader finishes the
+chunk it is reading and stops when it tries to send it, because the response
+it fed has ended. Connections stay open, without calls, until the process
+exits. The single-volume entrypoint allows its processes 20 seconds to exit.
 
 ### Background task failure
 
@@ -84,12 +103,10 @@ readiness would stop tracking its dependency, and a serving pair published as
 ready would stay ready past `storage.serving_pair_staleness_ceiling_ms`.
 
 Each runtime therefore watches its tasks next to its gRPC server. When one
-exits, or the server stops without a shutdown request, the runtime reports
-`shutting_down`, cancels the other tasks, drains the server, and exits with an
-error that names the task. It leaves the restart to the platform. The server
-drains before the serving generations are released, so a retired generation
-is never torn down under a live reader. A requested shutdown follows the same
-order and exits successfully.
+exits, or the server stops without a shutdown request, the runtime stops in
+the order above and leaves the restart to the platform. A termination signal
+is a shutdown request of its own: the server and tasks see only the runtime
+stopping, so a signal never looks like the server stopping on its own.
 
 | Runtime | Watched tasks |
 | --- | --- |
@@ -99,6 +116,14 @@ order and exits successfully.
 
 The compatibility runtime closes its operational endpoint after the server
 stops, and does not watch it.
+
+The runtime logs every task that fails, with its name, as
+`runtime_task_failed`, or as `runtime_task_stopped` for a task that ended
+without an error. It exits with status 0 only after a requested shutdown in
+which the gRPC server reported no error and every task stopped cleanly. It
+exits with status 1 in every other case, with an error that names the task or
+server that stopped the runtime, or, for a requested shutdown, the first task
+that failed while stopping.
 
 ## Memory allocator
 

@@ -24,7 +24,12 @@
 //! while the runtime refuses wallet calls. Reflection, built with
 //! [`public_grpc_reflection`], applies the same request size bound as every
 //! other public service.
+//!
+//! A listener a [`crate::SupervisedRuntime`] serves also passes through
+//! [`GrpcCallTerminationLayer`], which ends the calls still open once the
+//! runtime's drain deadline passes.
 
+mod call_termination;
 mod message_boundaries;
 mod receive_slots;
 mod send_stall;
@@ -61,6 +66,8 @@ use tower::{
     layer::util::{Identity, Stack},
 };
 
+pub(crate) use self::call_termination::OpenGrpcCalls;
+pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 use self::{

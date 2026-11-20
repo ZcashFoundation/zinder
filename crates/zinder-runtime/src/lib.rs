@@ -29,6 +29,8 @@
 //!   reading them ([`GrpcSendStallLayer`]), and the wallet listener
 //!   assembly ([`public_grpc_router`]) that serves a wallet service behind
 //!   the readiness gate with gRPC reflection and `grpc.health.v1` outside it.
+//! - The supervision that stops a wallet-serving runtime's gRPC listener and
+//!   background tasks together ([`SupervisedRuntime`], [`SupervisedTasks`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -63,6 +65,7 @@ mod public_grpc_server;
 mod readiness;
 mod repeated_field_limits;
 mod rpc_metrics;
+mod runtime_supervision;
 mod sections;
 mod startup_phase;
 mod transport;
@@ -118,9 +121,10 @@ pub use ops_healthcheck::{
 };
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,
-    GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
-    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PublicGrpcRouter, PublicGrpcServer,
-    public_grpc_reflection, public_grpc_router, public_grpc_server, public_grpc_server_with,
+    GrpcCallTermination, GrpcCallTerminationLayer, GrpcReceiveLimit, GrpcReceiveLimitLayer,
+    GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    PublicGrpcRouter, PublicGrpcServer, public_grpc_reflection, public_grpc_router,
+    public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
@@ -131,6 +135,10 @@ pub use repeated_field_limits::{
     MethodFieldLimits, RepeatedElementEncoding, RepeatedFieldGuard, RepeatedFieldLimit,
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
+pub use runtime_supervision::{
+    GRPC_SERVER_DRAIN_TIMEOUT, RuntimeSupervisionError, RuntimeTaskFailure, ShutdownRequest,
+    SupervisedGrpcServer, SupervisedRuntime, SupervisedTasks,
+};
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
     IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,

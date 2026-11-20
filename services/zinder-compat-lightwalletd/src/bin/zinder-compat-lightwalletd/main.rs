@@ -15,8 +15,8 @@ use zinder_compat_lightwalletd::{
     spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
 };
 use zinder_runtime::{
-    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TracingSubscriberError, cancel_on_terminating_signal, install_metrics_recorder_for_service,
+    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
+    TracingSubscriberError, install_metrics_recorder_for_service,
     install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
@@ -25,7 +25,7 @@ mod compact_block_serving;
 mod config;
 mod supervision;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
-use supervision::{CompactBlocksServingTasks, WalletServingTasks, supervise_compat_runtime};
+use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
@@ -269,7 +269,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_node_broadcast(node_broadcast.clone())
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
-    let cancel = CancellationToken::new();
+    let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+    let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
@@ -288,7 +289,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         Arc::from([]),
     )
     .await?;
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
         serving_pair_slot,
@@ -311,9 +312,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.storage.secondary_catchup_interval,
         cancel.clone(),
     );
-    let serving_runtime_drained = CancellationToken::new();
     let serving_pair_publisher_handle =
-        serving_pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        serving_pair_publisher.spawn(cancel.clone(), runtime.serving_drained());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "wallet").set(1.0);
     let mempool_surface = Arc::new({
         let mut surface =
@@ -366,23 +366,22 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 
     let server = router.serve_with_shutdown(
         lightwalletd_config.listen_addr,
-        cancel.clone().cancelled_owned(),
+        runtime.grpc_server_shutdown(),
     );
-    let runtime_outcome = supervise_compat_runtime(
-        server,
-        &cancel,
-        || serving_readiness.publish_shutting_down(),
-        &serving_runtime_drained,
-        WalletServingTasks {
-            serving_pair_publisher: serving_pair_publisher_handle,
-            node_readiness_probe: node_readiness_handle,
-            ingest_control_readiness_probe: ingest_control_readiness_handle,
-            tip_change_publisher: tip_publisher_handle,
-            node_tip_witness: node_tip_witness_handle,
-        }
-        .supervised(),
-    )
-    .await;
+    let runtime_outcome = runtime
+        .supervise(
+            server,
+            WalletServingTasks {
+                serving_pair_publisher: serving_pair_publisher_handle,
+                node_readiness_probe: node_readiness_handle,
+                ingest_control_readiness_probe: ingest_control_readiness_handle,
+                tip_change_publisher: tip_publisher_handle,
+                node_tip_witness: node_tip_witness_handle,
+            }
+            .supervised(),
+            || serving_readiness.publish_shutting_down(),
+        )
+        .await;
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -449,7 +448,8 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
-    let cancel = CancellationToken::new();
+    let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+    let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
@@ -468,9 +468,8 @@ async fn run_compact_blocks(
         Arc::from([]),
     )
     .await?;
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let serving_runtime_drained = CancellationToken::new();
-    let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+    let _signal_handle = runtime.request_shutdown_on_terminating_signal();
+    let publisher_handle = publisher.spawn(cancel.clone(), runtime.serving_drained());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "compact-blocks").set(1.0);
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -498,20 +497,19 @@ async fn run_compact_blocks(
     StartupPhase::Ready.start().complete();
     let server = router.serve_with_shutdown(
         lightwalletd_config.listen_addr,
-        cancel.clone().cancelled_owned(),
+        runtime.grpc_server_shutdown(),
     );
-    let runtime_outcome = supervise_compat_runtime(
-        server,
-        &cancel,
-        || serving_readiness.publish_shutting_down(),
-        &serving_runtime_drained,
-        CompactBlocksServingTasks {
-            compact_block_publisher: publisher_handle,
-            node_tip_witness: node_tip_witness_handle,
-        }
-        .supervised(),
-    )
-    .await;
+    let runtime_outcome = runtime
+        .supervise(
+            server,
+            CompactBlocksServingTasks {
+                compact_block_publisher: publisher_handle,
+                node_tip_witness: node_tip_witness_handle,
+            }
+            .supervised(),
+            || serving_readiness.publish_shutting_down(),
+        )
+        .await;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_stopped",

@@ -94,16 +94,8 @@ pub(super) enum QueryConfigError {
     Reflection(#[from] tonic_reflection::server::Error),
     #[error(transparent)]
     Operations(#[from] zinder_runtime::OpsServerError),
-    #[error("wallet query {task} stopped before runtime shutdown")]
-    RuntimeTaskStopped { task: &'static str },
-    #[error("wallet query {task} task failed: {source}")]
-    RuntimeTaskJoin {
-        task: &'static str,
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("wallet query gRPC server stopped before runtime shutdown")]
-    GrpcServerStopped,
+    #[error("wallet query runtime stopped: {0}")]
+    Supervision(#[from] zinder_runtime::RuntimeSupervisionError),
 }
 
 pub(super) fn load_query_config(

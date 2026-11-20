@@ -156,18 +156,8 @@ pub(crate) enum LightwalletdConfigError {
     #[error(transparent)]
     Operations(#[from] zinder_runtime::OpsServerError),
 
-    #[error("compatibility {task} stopped before runtime shutdown")]
-    RuntimeTaskStopped { task: &'static str },
-
-    #[error("compatibility {task} task failed: {source}")]
-    RuntimeTaskJoin {
-        task: &'static str,
-        #[source]
-        source: tokio::task::JoinError,
-    },
-
-    #[error("compatibility gRPC server stopped before runtime shutdown")]
-    GrpcServerStopped,
+    #[error("compatibility runtime stopped: {0}")]
+    Supervision(#[from] zinder_runtime::RuntimeSupervisionError),
 }
 
 /// Loads and validates lightwalletd compat configuration.
