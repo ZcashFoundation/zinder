@@ -129,8 +129,9 @@ feed:
 - A `ChainReorged` always passes, because a client must invalidate cached data
   after any reorg.
 
-The filter does not change cursors, so a client can resume with a different
-filter. After a hint, the client still reads the address or block data it
+While your subscription is open, the server scans past every examined event,
+including a full page of quiet blocks. Delivered events keep their original
+cursors, so you can reconnect with a different filter. After a hint, the client still reads the address or block data it
 needs.
 
 ## Retention

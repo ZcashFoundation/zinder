@@ -15,6 +15,9 @@
 
 use std::num::NonZeroU32;
 
+use futures_util::{Stream, future::Either, stream::try_unfold};
+use tokio_stream::wrappers::ReceiverStream;
+
 use tokio::sync::mpsc;
 use zinder_core::{BlockHeight, Network, TransparentAddressScriptHash};
 use zinder_proto::v1::wallet;
@@ -65,75 +68,60 @@ pub(super) fn decode_address_filter(
     Ok(out)
 }
 
-/// Spawns the server task that drives one client's chain-events stream and
-/// applies the address-filter semantics from `docs/architecture/chain-events.md`
-/// when the filter is
-/// non-empty.
-///
-/// The cursor and family follow the same shape as the unfiltered stream;
-/// the only behavioral change is post-fetch envelope filtering.
-///
-/// When `traffic_readiness` reports a parked canonical writer, the next page
-/// read ends the stream with the typed halt status instead of polling a
-/// chain that no longer advances.
-pub(super) fn spawn_filtered_stream<Q>(
+/// Reads every event into a bounded channel so the scan cursor advances
+/// across quiet pages. The address filter controls only what the client receives.
+pub(super) fn chain_event_stream<Q>(
     query_api: Q,
     resume: ChainEventStreamResume,
     address_filter: Vec<TransparentAddressScriptHash>,
     traffic_readiness: Option<Readiness>,
-    event_sender: mpsc::Sender<Result<wallet::ChainEventEnvelope, tonic::Status>>,
-) where
+) -> impl Stream<Item = Result<wallet::ChainEventEnvelope, tonic::Status>>
+where
     Q: WalletQueryApi + Clone + 'static,
 {
-    let filter = std::sync::Arc::new(address_filter);
-    let family = resume.family;
+    let reader = query_api.clone();
+    let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(run_event_stream(
         resume.cursor,
         move |cursor| {
-            let query_api = query_api.clone();
-            let filter = filter.clone();
+            let reader = reader.clone();
             let writer_halt = traffic_readiness.as_ref().and_then(writer_halt_status);
             async move {
                 if let Some(status) = writer_halt {
                     return Err(status);
                 }
-                let envelopes = chain_events_response(&query_api, cursor, family)
+                chain_events_response(&reader, cursor, resume.family)
                     .await
-                    .map_err(|error| crate::grpc::status_from_query_error(&error))?;
-                if filter.is_empty() {
-                    return Ok(envelopes);
-                }
-                filter_envelopes(&query_api, &filter, envelopes).await
+                    .map_err(|error| crate::grpc::status_from_query_error(&error))
             }
         },
-        event_sender,
+        sender,
     ));
+
+    if address_filter.is_empty() {
+        return Either::Left(ReceiverStream::new(receiver));
+    }
+    Either::Right(try_unfold(
+        (receiver, query_api, address_filter),
+        |(mut receiver, query, addresses)| async move {
+            while let Some(envelope) = receiver.recv().await {
+                let envelope = envelope?;
+                if envelope_passes_filter(&query, &addresses, &envelope)
+                    .await
+                    .map_err(|error| crate::grpc::status_from_query_error(&error))?
+                {
+                    return Ok(Some((envelope, (receiver, query, addresses))));
+                }
+            }
+            Ok(None)
+        },
+    ))
 }
 
 fn writer_halt_status(readiness: &Readiness) -> Option<tonic::Status> {
     readiness
         .reorg_window_exceeded()
         .map(|halt| not_ready_status(&ReadinessCause::from(halt)))
-}
-
-/// Filters `envelopes` against `filter`, preserving every reorg envelope
-/// and emitting commits only when their committed block range touches at
-/// least one of the filter's addresses.
-async fn filter_envelopes<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    filter: &[TransparentAddressScriptHash],
-    envelopes: Vec<wallet::ChainEventEnvelope>,
-) -> Result<Vec<wallet::ChainEventEnvelope>, tonic::Status> {
-    let mut out = Vec::with_capacity(envelopes.len());
-    for envelope in envelopes {
-        if envelope_passes_filter(query_api, filter, &envelope)
-            .await
-            .map_err(|error| crate::grpc::status_from_query_error(&error))?
-        {
-            out.push(envelope);
-        }
-    }
-    Ok(out)
 }
 
 /// Returns true when `envelope` should be delivered to a client whose
@@ -193,6 +181,9 @@ async fn address_touched_in_range<Q: WalletQueryApi + ?Sized>(
         .await?;
     Ok(!page.artifacts.is_empty())
 }
+
+#[cfg(test)]
+mod filter_progress_tests;
 
 #[cfg(test)]
 mod tests {
