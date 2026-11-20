@@ -1,301 +1,221 @@
-//! Lightwalletd `CompactBlock` and `CompactTx` messages built from stored
-//! compact blocks and mempool entries, and the pool filtering both serving
-//! modes apply to them.
+//! Projection of canonical compact blocks onto the lightwalletd wire format.
 
 use tonic::Status;
 use zinder_core::{
-    CompactBlockArtifact, CompactShieldedAction, CompactTransaction, CompactTransactionData,
-    TransactionId,
+    CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd;
 
-/// The pools a request keeps, parsed from its `poolTypes`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Payload {
+    FullBlock,
+    SelectedPools,
+    Nullifiers,
+    Mempool,
+}
+
+/// The fields and transactions a lightwalletd compact-block method returns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "Each bool is an independent per-pool inclusion gate parsed from a request's poolTypes, not a state machine."
+    reason = "Each pool is independently selected on the wire."
 )]
-pub(crate) struct CompactBlockPoolSelection {
-    pub(crate) sapling: bool,
-    pub(crate) orchard: bool,
-    pub(crate) ironwood: bool,
-    pub(crate) transparent: bool,
+pub(crate) struct CompactBlockShape {
+    sapling: bool,
+    orchard: bool,
+    ironwood: bool,
+    transparent: bool,
+    payload: Payload,
 }
 
-impl CompactBlockPoolSelection {
-    /// Every shielded pool, which a request that names no pool receives.
-    pub(crate) const fn shielded() -> Self {
-        Self {
-            sapling: true,
-            orchard: true,
-            ironwood: true,
-            transparent: false,
-        }
-    }
+impl CompactBlockShape {
+    /// `GetBlock` retains every stored transaction and all of its pools.
+    pub(crate) const FULL_BLOCK: Self = Self {
+        sapling: true,
+        orchard: true,
+        ironwood: true,
+        transparent: true,
+        payload: Payload::FullBlock,
+    };
 
-    /// Parses a request's `poolTypes`, where an empty list selects the
-    /// shielded pools.
-    pub(crate) fn from_request(pool_types: &[i32]) -> Result<Self, Status> {
+    /// Every shielded pool in nullifier-only form.
+    pub(crate) const NULLIFIERS: Self = Self {
+        transparent: false,
+        payload: Payload::Nullifiers,
+        ..Self::FULL_BLOCK
+    };
+
+    /// Selects the pools requested by `GetBlockRange`. An empty request selects
+    /// every shielded pool. Unknown pool values return `INVALID_ARGUMENT`.
+    pub(crate) fn for_range(pool_types: &[i32]) -> Result<Self, Status> {
         if pool_types.is_empty() {
-            return Ok(Self::shielded());
+            return Ok(Self {
+                transparent: false,
+                payload: Payload::SelectedPools,
+                ..Self::FULL_BLOCK
+            });
         }
-
-        let mut pool_selection = Self {
+        let mut selected = Self {
             sapling: false,
             orchard: false,
             ironwood: false,
             transparent: false,
+            payload: Payload::SelectedPools,
         };
-        for pool_type in pool_types {
-            match lightwalletd::PoolType::try_from(*pool_type) {
-                Ok(lightwalletd::PoolType::Sapling) => pool_selection.sapling = true,
-                Ok(lightwalletd::PoolType::Orchard) => pool_selection.orchard = true,
-                Ok(lightwalletd::PoolType::Ironwood) => pool_selection.ironwood = true,
-                Ok(lightwalletd::PoolType::Transparent) => pool_selection.transparent = true,
+        for &pool_type in pool_types {
+            match lightwalletd::PoolType::try_from(pool_type) {
+                Ok(lightwalletd::PoolType::Sapling) => selected.sapling = true,
+                Ok(lightwalletd::PoolType::Orchard) => selected.orchard = true,
+                Ok(lightwalletd::PoolType::Ironwood) => selected.ironwood = true,
+                Ok(lightwalletd::PoolType::Transparent) => selected.transparent = true,
                 Ok(lightwalletd::PoolType::Invalid) | Err(_) => {
                     return Err(Status::invalid_argument("invalid pool type requested"));
                 }
             }
         }
-
-        Ok(pool_selection)
-    }
-}
-
-/// How much of each kept pool a message retains.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompactBlockPayloadMode {
-    /// Every field of the kept pools.
-    Full,
-    /// Nullifiers alone, as the `*Nullifiers` methods send them.
-    NullifiersOnly,
-}
-
-/// How a response shapes each compact block it sends.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CompactBlockShape {
-    /// Pools the sent blocks keep.
-    pub(crate) pool_selection: CompactBlockPoolSelection,
-    /// Payload depth the sent blocks keep.
-    pub(crate) payload_mode: CompactBlockPayloadMode,
-}
-
-impl CompactBlockShape {
-    /// The shielded pools, nullifiers only, as `GetBlockNullifiers` and
-    /// `GetBlockRangeNullifiers` send them whatever `poolTypes` asks.
-    pub(crate) const NULLIFIERS: Self = Self {
-        pool_selection: CompactBlockPoolSelection::shielded(),
-        payload_mode: CompactBlockPayloadMode::NullifiersOnly,
-    };
-
-    /// Every field of `pool_selection`, as `GetBlockRange` sends it.
-    pub(crate) const fn full(pool_selection: CompactBlockPoolSelection) -> Self {
-        Self {
-            pool_selection,
-            payload_mode: CompactBlockPayloadMode::Full,
-        }
+        Ok(selected)
     }
 
-    /// Converts `compact_block` and keeps what this shape selects.
+    pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
+        Ok(Self {
+            payload: Payload::Mempool,
+            ..Self::for_range(pool_types)?
+        })
+    }
+
+    /// Converts a stored block and preserves the original indices of selected transactions.
     pub(crate) fn message(
         self,
-        compact_block: &CompactBlockArtifact,
+        block: CompactBlockArtifact,
     ) -> Result<lightwalletd::CompactBlock, Status> {
-        compact_block_to_lightwalletd(compact_block)
-            .map(|message| prune_compact_block(message, self.pool_selection, self.payload_mode))
-    }
-}
-
-/// Converts a stored compact block to the lightwalletd message, with every
-/// pool and field it holds.
-pub(crate) fn compact_block_to_lightwalletd(
-    compact_block: &CompactBlockArtifact,
-) -> Result<lightwalletd::CompactBlock, Status> {
-    let transactions = compact_block
-        .transactions()
-        .iter()
-        .map(compact_transaction_to_lightwalletd)
-        .collect::<Result<Vec<_>, _>>()?;
-    let metadata = compact_block.chain_metadata();
-    Ok(lightwalletd::CompactBlock {
-        height: u64::from(compact_block.height().value()),
-        hash: encode_internal_block_hash(compact_block.block_hash()).to_vec(),
-        prev_hash: encode_internal_block_hash(compact_block.previous_block_hash()).to_vec(),
-        time: compact_block.time(),
-        header: Vec::new(),
-        vtx: transactions,
-        chain_metadata: Some(lightwalletd::ChainMetadata {
-            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
-            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
-            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
-        }),
-    })
-}
-
-fn compact_transaction_to_lightwalletd(
-    transaction: &CompactTransaction,
-) -> Result<lightwalletd::CompactTx, Status> {
-    compact_transaction_data_to_lightwalletd(
-        transaction.index,
-        transaction.transaction_id,
-        &transaction.data,
-    )
-}
-
-/// Converts one transaction's compact data to the lightwalletd message at
-/// block position `index`.
-pub(crate) fn compact_transaction_data_to_lightwalletd(
-    index: u64,
-    transaction_id: TransactionId,
-    transaction_data: &CompactTransactionData,
-) -> Result<lightwalletd::CompactTx, Status> {
-    let fee = transaction_data
-        .fee_zat
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| Status::data_loss("compact transaction fee exceeds u32"))?
-        .unwrap_or_default();
-    Ok(lightwalletd::CompactTx {
-        index,
-        txid: encode_internal_transaction_id(transaction_id).to_vec(),
-        fee,
-        spends: transaction_data
-            .sapling_spends
-            .iter()
-            .map(|spend| lightwalletd::CompactSaplingSpend {
-                nf: spend.nullifier.to_vec(),
-            })
-            .collect(),
-        outputs: transaction_data
-            .sapling_outputs
-            .iter()
-            .map(|output| lightwalletd::CompactSaplingOutput {
-                cmu: output.commitment.to_vec(),
-                ephemeral_key: output.ephemeral_key.to_vec(),
-                ciphertext: output.ciphertext.to_vec(),
-            })
-            .collect(),
-        actions: transaction_data
-            .orchard_actions
-            .iter()
-            .map(compact_shielded_action_to_lightwalletd)
-            .collect(),
-        vin: transaction_data
-            .transparent_inputs
-            .iter()
-            .map(|input| lightwalletd::CompactTxIn {
-                prevout_txid: encode_internal_transaction_id(input.previous_transaction_id)
-                    .to_vec(),
-                prevout_index: input.previous_output_index,
-            })
-            .collect(),
-        vout: transaction_data
-            .transparent_outputs
-            .iter()
-            .map(|output| lightwalletd::TxOut {
-                value: output.value_zat,
-                script_pub_key: output.script_pub_key.clone(),
-            })
-            .collect(),
-        ironwood_actions: transaction_data
-            .ironwood_actions
-            .iter()
-            .map(compact_shielded_action_to_lightwalletd)
-            .collect(),
-    })
-}
-
-fn compact_shielded_action_to_lightwalletd(
-    action: &CompactShieldedAction,
-) -> lightwalletd::CompactOrchardAction {
-    lightwalletd::CompactOrchardAction {
-        nullifier: action.nullifier.to_vec(),
-        cmx: action.commitment.to_vec(),
-        ephemeral_key: action.ephemeral_key.to_vec(),
-        ciphertext: action.ciphertext.to_vec(),
-    }
-}
-
-fn prune_compact_transaction(
-    mut transaction: lightwalletd::CompactTx,
-    pool_selection: CompactBlockPoolSelection,
-    payload_mode: CompactBlockPayloadMode,
-) -> lightwalletd::CompactTx {
-    if !pool_selection.sapling || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-        transaction.outputs.clear();
-    }
-    if !pool_selection.sapling {
-        transaction.spends.clear();
-    }
-    if !pool_selection.orchard {
-        transaction.actions.clear();
-    } else if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-        for action in &mut transaction.actions {
-            action.cmx.clear();
-            action.ephemeral_key.clear();
-            action.ciphertext.clear();
+        let block = block.into_parts();
+        let mut vtx = if self.payload == Payload::FullBlock {
+            Vec::with_capacity(block.transactions.len())
+        } else {
+            Vec::new()
+        };
+        for transaction in block.transactions {
+            if let Some(selected) = self.encode_transaction(transaction)? {
+                vtx.push(selected);
+            }
         }
+        let metadata = block.chain_metadata;
+        Ok(lightwalletd::CompactBlock {
+            height: u64::from(block.block_id.height.value()),
+            hash: encode_internal_block_hash(block.block_id.hash).to_vec(),
+            prev_hash: encode_internal_block_hash(block.previous_block_hash).to_vec(),
+            time: block.time,
+            header: Vec::new(),
+            vtx,
+            chain_metadata: (self.payload != Payload::Nullifiers).then_some(
+                lightwalletd::ChainMetadata {
+                    sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+                    orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+                    ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+                },
+            ),
+        })
     }
-    if !pool_selection.ironwood {
-        transaction.ironwood_actions.clear();
-    } else if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-        for action in &mut transaction.ironwood_actions {
-            action.cmx.clear();
-            action.ephemeral_key.clear();
-            action.ciphertext.clear();
+
+    pub(crate) fn encode_transaction(
+        self,
+        transaction: CompactTransaction,
+    ) -> Result<Option<lightwalletd::CompactTx>, Status> {
+        let scan = transaction.data;
+        // An unrepresentable fee is storage damage even when a pool filter would omit the transaction.
+        let fee = scan
+            .fee_zat
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| Status::data_loss("compact transaction fee exceeds u32"))?
+            .unwrap_or_default();
+        let nullifiers_only = self.payload == Payload::Nullifiers;
+        let mut message = lightwalletd::CompactTx::default();
+        if self.sapling {
+            message.spends = scan
+                .sapling_spends
+                .into_iter()
+                .map(|spend| lightwalletd::CompactSaplingSpend {
+                    nf: spend.nullifier.to_vec(),
+                })
+                .collect();
+            if !nullifiers_only {
+                message.outputs = scan
+                    .sapling_outputs
+                    .into_iter()
+                    .map(|output| lightwalletd::CompactSaplingOutput {
+                        cmu: output.commitment.to_vec(),
+                        ephemeral_key: output.ephemeral_key.to_vec(),
+                        ciphertext: output.ciphertext.to_vec(),
+                    })
+                    .collect();
+            }
         }
+        if self.orchard {
+            message.actions = encode_actions(scan.orchard_actions, nullifiers_only);
+        }
+        if self.ironwood {
+            message.ironwood_actions = encode_actions(scan.ironwood_actions, nullifiers_only);
+        }
+        if self.transparent {
+            if self.payload != Payload::Mempool {
+                message.vin = scan
+                    .transparent_inputs
+                    .into_iter()
+                    .map(|input| lightwalletd::CompactTxIn {
+                        prevout_txid: encode_internal_transaction_id(input.previous_transaction_id)
+                            .to_vec(),
+                        prevout_index: input.previous_output_index,
+                    })
+                    .collect();
+            }
+            message.vout = scan
+                .transparent_outputs
+                .into_iter()
+                .map(|output| lightwalletd::TxOut {
+                    value: output.value_zat,
+                    script_pub_key: output.script_pub_key,
+                })
+                .collect();
+        }
+        if self.payload != Payload::FullBlock && !compact_transaction_has_payload(&message) {
+            return Ok(None);
+        }
+        message.index = transaction.index;
+        message.txid = encode_internal_transaction_id(transaction.transaction_id).to_vec();
+        message.fee = fee;
+        Ok(Some(message))
     }
-    if !pool_selection.transparent || payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-        transaction.vin.clear();
-        transaction.vout.clear();
-    }
-    transaction
 }
 
-/// Keeps what `pool_selection` and `payload_mode` select of a pending
-/// transaction's message.
-pub(crate) fn prune_mempool_compact_transaction(
-    transaction: lightwalletd::CompactTx,
-    pool_selection: CompactBlockPoolSelection,
-    payload_mode: CompactBlockPayloadMode,
-) -> lightwalletd::CompactTx {
-    let mut transaction = prune_compact_transaction(transaction, pool_selection, payload_mode);
-    // Reference lightwalletd exposes transparent outputs for pending mempool
-    // transactions but omits transparent inputs from GetMempoolTx.
-    transaction.vin.clear();
-    transaction
-}
-
-/// Keeps what `pool_selection` and `payload_mode` select of a block's
-/// message.
-pub(crate) fn prune_compact_block(
-    mut compact_block: lightwalletd::CompactBlock,
-    pool_selection: CompactBlockPoolSelection,
-    payload_mode: CompactBlockPayloadMode,
-) -> lightwalletd::CompactBlock {
-    // The nullifiers-only contract excludes commitment tree sizes: the
-    // GetBlockNullifiers / GetBlockRangeNullifiers responses must not leak the
-    // witness-construction tree sizes carried in chain_metadata.
-    if payload_mode == CompactBlockPayloadMode::NullifiersOnly {
-        compact_block.chain_metadata = None;
-    }
-    compact_block.vtx = compact_block
-        .vtx
+fn encode_actions(
+    actions: Vec<CompactShieldedAction>,
+    nullifiers_only: bool,
+) -> Vec<lightwalletd::CompactOrchardAction> {
+    actions
         .into_iter()
-        .map(|transaction| prune_compact_transaction(transaction, pool_selection, payload_mode))
-        .filter(compact_transaction_has_payload)
-        .collect();
-    compact_block
+        .map(|action| {
+            if nullifiers_only {
+                lightwalletd::CompactOrchardAction {
+                    nullifier: action.nullifier.to_vec(),
+                    ..lightwalletd::CompactOrchardAction::default()
+                }
+            } else {
+                lightwalletd::CompactOrchardAction {
+                    nullifier: action.nullifier.to_vec(),
+                    cmx: action.commitment.to_vec(),
+                    ephemeral_key: action.ephemeral_key.to_vec(),
+                    ciphertext: action.ciphertext.to_vec(),
+                }
+            }
+        })
+        .collect()
 }
 
-/// Returns whether a pruned compact transaction still carries wallet-relevant
-/// data.
-///
-/// Both serving modes drop transactions that this rejects, as lightwalletd
-/// does, and keep the original `CompactTx.index` of the transactions that
-/// remain.
-pub(crate) fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> bool {
+/// Returns whether a projected transaction carries any wallet scan data.
+#[must_use]
+fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> bool {
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
         || !transaction.actions.is_empty()
@@ -306,180 +226,180 @@ pub(crate) fn compact_transaction_has_payload(transaction: &lightwalletd::Compac
 
 #[cfg(test)]
 mod tests {
-    use tonic::Status;
+    use super::*;
     use zinder_core::{
-        CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,
-        CompactTransparentInput, CompactTransparentOutput, TransactionId,
-        wire::encode_internal_transaction_id,
+        BlockHash, BlockHeight, BlockId, CompactChainMetadata, CompactSaplingOutput,
+        CompactSaplingSpend, CompactTransactionData, CompactTransparentInput,
+        CompactTransparentOutput, TransactionId,
     };
-    use zinder_proto::compat::lightwalletd;
 
-    use super::{
-        CompactBlockPayloadMode, CompactBlockPoolSelection,
-        compact_transaction_data_to_lightwalletd, prune_compact_block, prune_compact_transaction,
-    };
+    fn transaction(index: u64, scan: CompactTransactionData) -> CompactTransaction {
+        CompactTransaction {
+            index,
+            transaction_id: TransactionId::from_bytes([1; 32]),
+            data: scan,
+        }
+    }
+
+    fn mixed_block() -> Result<CompactBlockArtifact, zinder_core::CompactBlockArtifactError> {
+        let transparent = CompactTransactionData {
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 20,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTransactionData::default()
+        };
+        let sapling = CompactTransactionData {
+            sapling_spends: vec![CompactSaplingSpend { nullifier: [7; 32] }],
+            ..CompactTransactionData::default()
+        };
+        CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(139), BlockHash::from_bytes([1; 32])),
+            BlockHash::from_bytes([2; 32]),
+            0,
+            vec![
+                transaction(0, transparent.clone()),
+                transaction(1, sapling.clone()),
+                transaction(2, transparent),
+                transaction(3, sapling),
+                transaction(4, CompactTransactionData::default()),
+            ],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 31,
+                orchard_commitment_tree_size: 47,
+                ironwood_commitment_tree_size: 53,
+            },
+        )
+    }
 
     #[test]
-    fn empty_pool_request_is_shielded_only() -> Result<(), Status> {
+    fn pool_selection_retains_original_positions_and_full_blocks_keep_empty_transactions()
+    -> eyre::Result<()> {
+        let block = mixed_block()?;
+        let all = CompactBlockShape::FULL_BLOCK.message(block.clone())?;
+        let shielded = CompactBlockShape::for_range(&[])?.message(block.clone())?;
+        let transparent =
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Transparent as i32])?
+                .message(block)?;
+        let mut shielded_expected = all.clone();
+        shielded_expected.vtx.retain(|tx| matches!(tx.index, 1 | 3));
+        let mut transparent_expected = all.clone();
+        transparent_expected
+            .vtx
+            .retain(|tx| matches!(tx.index, 0 | 2));
         assert_eq!(
-            CompactBlockPoolSelection::from_request(&[])?,
-            CompactBlockPoolSelection::shielded()
+            all.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        let nullifiers = CompactBlockShape::NULLIFIERS.message(mixed_block()?)?;
+        assert!(nullifiers.chain_metadata.is_none());
+        assert_eq!(nullifiers.vtx, shielded_expected.vtx);
+        assert_eq!(shielded, shielded_expected);
+        assert_eq!(transparent, transparent_expected);
+        Ok(())
+    }
+
+    #[test]
+    fn fees_outside_the_wire_range_fail_even_for_an_omitted_transaction() -> eyre::Result<()> {
+        let scan = CompactTransactionData {
+            fee_zat: Some(u64::from(u32::MAX) + 1),
+            ..CompactTransactionData::default()
+        };
+        let projected = CompactBlockShape::for_range(&[])?.encode_transaction(transaction(0, scan));
+        assert!(matches!(projected, Err(status) if status.code() == tonic::Code::DataLoss));
+        Ok(())
+    }
+
+    #[test]
+    fn nullifiers_and_explicit_pools_select_orchard_and_ironwood_independently() -> eyre::Result<()>
+    {
+        let action = |nf| CompactShieldedAction {
+            nullifier: [nf; 32],
+            commitment: [10; 32],
+            ephemeral_key: [11; 32],
+            ciphertext: [12; 52],
+        };
+        let scan = CompactTransactionData {
+            orchard_actions: vec![action(9)],
+            ironwood_actions: vec![action(20)],
+            ..CompactTransactionData::default()
+        };
+        let nullifiers = CompactBlockShape::NULLIFIERS
+            .encode_transaction(transaction(0, scan.clone()))?
+            .ok_or_else(|| eyre::eyre!("missing nullifier transaction"))?;
+        assert_eq!(
+            nullifiers.ironwood_actions,
+            [lightwalletd::CompactOrchardAction {
+                nullifier: vec![20; 32],
+                ..lightwalletd::CompactOrchardAction::default()
+            }]
+        );
+        assert_eq!(
+            nullifiers.actions,
+            [lightwalletd::CompactOrchardAction {
+                nullifier: vec![9; 32],
+                ..lightwalletd::CompactOrchardAction::default()
+            }]
+        );
+        let orchard = CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?
+            .encode_transaction(transaction(0, scan))?
+            .ok_or_else(|| eyre::eyre!("missing Orchard transaction"))?;
+        assert_eq!(
+            orchard.ironwood_actions,
+            [] as [lightwalletd::CompactOrchardAction; 0]
+        );
+        assert_eq!(orchard.actions.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_transparent_selection_exposes_outputs_only() -> eyre::Result<()> {
+        let input_only = CompactTransactionData {
+            transparent_inputs: vec![CompactTransparentInput {
+                previous_transaction_id: TransactionId::from_bytes([5; 32]),
+                previous_output_index: 7,
+            }],
+            ..CompactTransactionData::default()
+        };
+        let selection =
+            CompactBlockShape::for_mempool(&[lightwalletd::PoolType::Transparent as i32])?;
+        assert!(
+            selection
+                .encode_transaction(transaction(0, input_only.clone()))?
+                .is_none()
+        );
+        let scan = CompactTransactionData {
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 11,
+                script_pub_key: vec![0x51],
+            }],
+            ..input_only
+        };
+        let tx = selection
+            .encode_transaction(transaction(0, scan))?
+            .ok_or_else(|| eyre::eyre!("missing mempool output"))?;
+        assert_eq!(tx.vin, [] as [lightwalletd::CompactTxIn; 0]);
+        assert_eq!(
+            tx.vout,
+            [lightwalletd::TxOut {
+                value: 11,
+                script_pub_key: vec![0x51]
+            }]
         );
         Ok(())
     }
 
     #[test]
-    fn invalid_pool_request_fails_before_storage_read() {
-        assert_eq!(
-            CompactBlockPoolSelection::from_request(&[99])
-                .err()
-                .map(|status| status.code()),
-            Some(tonic::Code::InvalidArgument)
-        );
-    }
-
-    fn transparent_only_transaction(index: u64) -> lightwalletd::CompactTx {
-        lightwalletd::CompactTx {
-            index,
-            vin: vec![lightwalletd::CompactTxIn {
-                prevout_txid: vec![0; 32],
-                prevout_index: u32::MAX,
-            }],
-            vout: vec![lightwalletd::TxOut {
-                value: 625_000_000,
-                script_pub_key: vec![0x76, 0xa9],
-            }],
-            ..lightwalletd::CompactTx::default()
-        }
-    }
-
-    fn sapling_transaction(index: u64) -> lightwalletd::CompactTx {
-        lightwalletd::CompactTx {
-            index,
-            spends: vec![lightwalletd::CompactSaplingSpend { nf: vec![7; 32] }],
-            ..lightwalletd::CompactTx::default()
-        }
-    }
-
-    fn block_with_transactions(vtx: Vec<lightwalletd::CompactTx>) -> lightwalletd::CompactBlock {
-        lightwalletd::CompactBlock {
-            height: 139,
-            vtx,
-            ..lightwalletd::CompactBlock::default()
-        }
-    }
-
-    fn transaction_indexes(block: &lightwalletd::CompactBlock) -> Vec<u64> {
-        block
-            .vtx
-            .iter()
-            .map(|transaction| transaction.index)
-            .collect()
-    }
-
-    #[test]
-    fn default_selection_drops_transparent_only_transactions_and_keeps_indexes() {
-        let pruned = prune_compact_block(
-            block_with_transactions(vec![
-                transparent_only_transaction(0),
-                sapling_transaction(1),
-                transparent_only_transaction(2),
-                sapling_transaction(3),
-            ]),
-            CompactBlockPoolSelection::shielded(),
-            CompactBlockPayloadMode::Full,
-        );
-
-        assert_eq!(transaction_indexes(&pruned), vec![1, 3]);
-    }
-
-    #[test]
-    fn transparent_selection_keeps_transparent_only_transactions() {
-        let pruned = prune_compact_block(
-            block_with_transactions(vec![
-                transparent_only_transaction(0),
-                sapling_transaction(1),
-            ]),
-            CompactBlockPoolSelection {
-                sapling: false,
-                orchard: false,
-                ironwood: false,
-                transparent: true,
-            },
-            CompactBlockPayloadMode::Full,
-        );
-
-        assert_eq!(transaction_indexes(&pruned), vec![0]);
-        assert_eq!(
-            pruned.vtx[0].spends,
-            [] as [lightwalletd::CompactSaplingSpend; 0]
-        );
-        assert_ne!(pruned.vtx[0].vout, [] as [lightwalletd::TxOut; 0]);
-    }
-
-    fn compact_tx_with_ironwood() -> lightwalletd::CompactTx {
-        lightwalletd::CompactTx {
-            index: 0,
-            txid: vec![1; 32],
-            fee: 0,
-            spends: Vec::new(),
-            outputs: Vec::new(),
-            actions: vec![lightwalletd::CompactOrchardAction {
-                nullifier: vec![9; 32],
-                cmx: vec![10; 32],
-                ephemeral_key: vec![11; 32],
-                ciphertext: vec![12; 52],
-            }],
-            ironwood_actions: vec![lightwalletd::CompactOrchardAction {
-                nullifier: vec![20; 32],
-                cmx: vec![21; 32],
-                ephemeral_key: vec![22; 32],
-                ciphertext: vec![23; 52],
-            }],
-            vin: Vec::new(),
-            vout: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn nullifiers_only_keeps_the_ironwood_nullifier_and_clears_the_rest() {
-        let pruned = prune_compact_transaction(
-            compact_tx_with_ironwood(),
-            CompactBlockPoolSelection::shielded(),
-            CompactBlockPayloadMode::NullifiersOnly,
-        );
-        assert_eq!(pruned.ironwood_actions.len(), 1);
-        let action = &pruned.ironwood_actions[0];
-        assert_eq!(action.nullifier, vec![20; 32]);
-        assert_eq!(action.cmx, [] as [u8; 0]);
-        assert_eq!(action.ephemeral_key, [] as [u8; 0]);
-        assert_eq!(action.ciphertext, [] as [u8; 0]);
-    }
-
-    #[test]
-    fn deselecting_the_ironwood_pool_drops_ironwood_actions() {
-        let pruned = prune_compact_transaction(
-            compact_tx_with_ironwood(),
-            CompactBlockPoolSelection {
-                sapling: true,
-                orchard: true,
-                ironwood: false,
-                transparent: true,
-            },
-            CompactBlockPayloadMode::Full,
-        );
-        assert_eq!(
-            pruned.ironwood_actions,
-            [] as [lightwalletd::CompactOrchardAction; 0]
-        );
-        assert_eq!(pruned.actions.len(), 1);
+    fn invalid_pool_request_is_refused() {
+        let selection = CompactBlockShape::for_range(&[99]);
+        assert!(matches!(selection, Err(status) if status.code() == tonic::Code::InvalidArgument));
     }
 
     #[test]
     fn structured_scan_data_maps_every_pool_exactly() -> Result<(), Status> {
-        let transaction_id = TransactionId::from_bytes([0x41; 32]);
-        let previous_transaction_id = TransactionId::from_bytes([0x42; 32]);
-        let transaction_data = CompactTransactionData {
+        let transaction_id = zinder_core::TransactionId::from_bytes([0x41; 32]);
+        let previous_transaction_id = zinder_core::TransactionId::from_bytes([0x42; 32]);
+        let data = CompactTransactionData {
             fee_zat: Some(23),
             sapling_spends: vec![CompactSaplingSpend {
                 nullifier: [0x11; 32],
@@ -511,8 +431,13 @@ mod tests {
             }],
         };
 
-        let mapped =
-            compact_transaction_data_to_lightwalletd(5, transaction_id, &transaction_data)?;
+        let mapped = CompactBlockShape::FULL_BLOCK
+            .encode_transaction(CompactTransaction {
+                index: 5,
+                transaction_id,
+                data,
+            })?
+            .ok_or_else(|| Status::internal("full block omitted a transaction"))?;
 
         assert_eq!(mapped.index, 5);
         assert_eq!(mapped.txid, encode_internal_transaction_id(transaction_id));

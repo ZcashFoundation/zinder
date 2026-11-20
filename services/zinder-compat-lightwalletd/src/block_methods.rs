@@ -35,7 +35,7 @@ use crate::block_range::{
     BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
     BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
-use crate::compact_block_messages::{CompactBlockShape, compact_block_to_lightwalletd};
+use crate::compact_block_messages::CompactBlockShape;
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
@@ -379,6 +379,7 @@ impl BlockMethods {
 pub(crate) async fn compact_block<Reads: CompactBlockReads>(
     reads: &Reads,
     block_id: &lightwalletd::BlockId,
+    shape: CompactBlockShape,
 ) -> Result<lightwalletd::CompactBlock, Status> {
     let block = requested_block(block_id)?;
     let view = reads.capture_view().await?;
@@ -386,7 +387,7 @@ pub(crate) async fn compact_block<Reads: CompactBlockReads>(
         reject_future_block_height(height, Reads::view_chain_epoch(&view).visible_tip_height)?;
     }
     let compact_block = reads.read_compact_block(&view, block).await?;
-    let compact_block = compact_block_to_lightwalletd(&compact_block)?;
+    let compact_block = shape.message(compact_block)?;
     if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
         return Err(Status::not_found(
             "requested block hash does not match indexed block",
@@ -551,7 +552,7 @@ impl ChunkConversion {
             blocks.reverse();
         }
         blocks
-            .iter()
+            .into_iter()
             .map(|block| self.shape.message(block).map(Ok))
             .collect()
     }
