@@ -56,32 +56,31 @@ impl LazyZinderGrpcChannel {
     ///
     /// Must be called within a Tokio runtime, which runs the dial.
     pub async fn channel(&self) -> Result<AuthenticatedChannel, Arc<BearerTokenConnectError>> {
-        let mut dial = {
-            let mut state = self.shared.state.lock();
-            match &*state {
-                DialState::Connected(channel) => return Ok(channel.clone()),
-                DialState::Dialing(dial) => dial.clone(),
-                DialState::Idle => {
-                    let (outcome_sender, dial) = watch::channel(None);
-                    *state = DialState::Dialing(dial.clone());
-                    drop(state);
-                    tokio::spawn(Arc::clone(&self.shared).dial(outcome_sender));
-                    dial
+        loop {
+            let mut dial = {
+                let mut state = self.shared.state.lock();
+                match &*state {
+                    DialState::Connected(channel) => return Ok(channel.clone()),
+                    DialState::Dialing(dial) => dial.clone(),
+                    DialState::Idle => {
+                        let (outcome_sender, dial) = watch::channel(None);
+                        *state = DialState::Dialing(dial.clone());
+                        drop(state);
+                        tokio::spawn(Arc::clone(&self.shared).dial(outcome_sender));
+                        dial
+                    }
                 }
+            };
+            if let Ok(outcome) = dial.wait_for(Option::is_some).await
+                && let Some(outcome) = outcome.as_ref()
+            {
+                return outcome.clone();
             }
-        };
-        if let Ok(outcome) = dial.wait_for(Option::is_some).await
-            && let Some(outcome) = outcome.as_ref()
-        {
-            return outcome.clone();
+            // The dial task ended without reporting, which happens only when
+            // its runtime shut down. Forgetting that dial lets this caller
+            // start one on its own runtime that later callers share.
+            self.shared.reset_abandoned_dial(&dial);
         }
-        // The dial task ended without reporting, which happens only when its
-        // runtime shuts down. Dialing here keeps this caller from waiting on
-        // a dial nobody runs.
-        self.shared.reset_abandoned_dial(&dial);
-        connect_zinder_grpc(&self.shared.endpoint, self.shared.bearer_token.as_ref())
-            .await
-            .map_err(Arc::new)
     }
 }
 
@@ -129,23 +128,79 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
-    use std::time::Duration;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
-    use tokio::net::TcpListener;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        task::JoinHandle,
+    };
+    use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+    use tonic::transport::Server;
 
     use super::LazyZinderGrpcChannel;
     use crate::{DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, auth::BearerTokenConnectError};
 
+    /// Accepts every connection and holds it open without answering, sending
+    /// the client address of each one on the returned channel in the order
+    /// the listener accepted them.
+    fn spawn_silent_peer(
+        listener: TcpListener,
+    ) -> (JoinHandle<()>, mpsc::UnboundedReceiver<SocketAddr>) {
+        let (accepted, accepted_addresses) = mpsc::unbounded_channel();
+        let peer = tokio::spawn(async move {
+            while let Ok((mut stream, client_address)) = listener.accept().await {
+                if accepted.send(client_address).is_err() {
+                    break;
+                }
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+                });
+            }
+        });
+        (peer, accepted_addresses)
+    }
+
+    /// Counts the connections the peer accepted before a sentinel connection
+    /// opened now, which the listener accepts after every earlier one.
+    async fn connections_accepted_so_far(
+        address: SocketAddr,
+        accepted_addresses: &mut mpsc::UnboundedReceiver<SocketAddr>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let sentinel = TcpStream::connect(address).await?;
+        let sentinel_address = sentinel.local_addr()?;
+        let mut accepted = 0;
+        while accepted_addresses
+            .recv()
+            .await
+            .ok_or("the peer stopped accepting")?
+            != sentinel_address
+        {
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn concurrent_first_callers_share_one_dial() -> Result<(), Box<dyn std::error::Error>> {
-        // The listener's backlog accepts the TCP connection, but nothing
-        // answers the TLS handshake.
+        // The peer accepts the connection but never sends an HTTP/2 frame.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let lazy = LazyZinderGrpcChannel::new(format!("https://{}", listener.local_addr()?), None);
+        let address = listener.local_addr()?;
+        let (peer, mut accepted_addresses) = spawn_silent_peer(listener);
+        let lazy = LazyZinderGrpcChannel::new(format!("http://{address}"), None);
 
         let started_at = tokio::time::Instant::now();
         let (first, second, third) = tokio::join!(lazy.channel(), lazy.channel(), lazy.channel());
         let elapsed = started_at.elapsed();
+        let dialed = connections_accepted_so_far(address, &mut accepted_addresses).await?;
+        peer.abort();
 
         let outcomes: [_; 3] = (first, second, third).into();
         for outcome in outcomes {
@@ -157,18 +212,18 @@ mod tests {
                 "every caller sees the shared dial's timeout, got {outcome:?}"
             );
         }
+        assert_eq!(dialed, 1, "concurrent callers must open one connection");
         assert!(
             elapsed < DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
             "callers waited {elapsed:?}, longer than one dial"
         );
-        drop(listener);
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_dial_is_not_cached() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let lazy = LazyZinderGrpcChannel::new(format!("https://{}", listener.local_addr()?), None);
+        let lazy = LazyZinderGrpcChannel::new(format!("http://{}", listener.local_addr()?), None);
 
         let first = lazy.channel().await;
         let started_at = tokio::time::Instant::now();
@@ -181,6 +236,57 @@ mod tests {
         );
         assert!(format!("{lazy:?}").contains("idle"));
         drop(listener);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callers_after_an_abandoned_dial_share_one_new_dial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        let incoming = TcpListenerStream::new(listener).map(move |connection| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            connection
+        });
+        let (_reporter, health_service) = tonic_health::server::health_reporter();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(health_service)
+                .serve_with_incoming(incoming),
+        );
+        let lazy = LazyZinderGrpcChannel::new(format!("http://{address}"), None);
+
+        // This test's runtime cannot serve while the thread below blocks it,
+        // so the dial started on that thread's runtime never completes, and
+        // dropping the runtime abandons the dial.
+        let abandoning = lazy.clone();
+        std::thread::spawn(move || -> std::io::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(200), abandoning.channel()).await
+            });
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "the abandoning thread panicked")??;
+
+        let (first, second) = tokio::join!(lazy.channel(), lazy.channel());
+        let accepted = accepted.load(Ordering::SeqCst);
+        server.abort();
+
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "callers dial again after an abandoned dial, got {first:?} and {second:?}"
+        );
+        assert_eq!(
+            accepted, 2,
+            "the abandoned dial and one dial the callers share"
+        );
+        assert!(format!("{lazy:?}").contains("connected"));
         Ok(())
     }
 
