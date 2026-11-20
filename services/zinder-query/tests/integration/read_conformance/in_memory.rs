@@ -90,6 +90,7 @@ struct RecordedEvent {
     event_sequence: u64,
     chain_epoch: ChainEpoch,
     event: ChainEvent,
+    newly_settled: Option<BlockHeightRange>,
 }
 
 impl ReaderHarness for InMemoryReaderHarness {
@@ -163,14 +164,21 @@ impl ReaderHarness for InMemoryReaderHarness {
             chain_epoch: snapshot.chain_epoch,
             block_range: BlockHeightRange::inclusive(first_retained, tip),
         };
-        snapshot.record(ChainEvent::ChainCommitted { committed });
+        snapshot.record(
+            ChainEvent::ChainCommitted { committed },
+            Some(BlockHeightRange::inclusive(first_retained, settled)),
+        );
         Ok(Self {
             current: Arc::new(snapshot),
             trees_after,
         })
     }
 
-    fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<()> {
+    fn append_live_block(
+        &mut self,
+        chain: &ChainFixture,
+        settled_tip: BlockId,
+    ) -> eyre::Result<()> {
         let height = self
             .current
             .tip()?
@@ -180,8 +188,15 @@ impl ReaderHarness for InMemoryReaderHarness {
         let mut next = self.current.as_ref().clone();
         next.add_live_block(chain, height, &mut self.trees_after)?;
         next.index_transactions(chain);
-        let committed = next.advance(BlockHeightRange::inclusive(height, height))?;
-        next.record(ChainEvent::ChainCommitted { committed });
+        let committed = next.advance(BlockHeightRange::inclusive(height, height), settled_tip)?;
+        let newly_settled = self
+            .current
+            .chain_epoch
+            .settled_tip_height
+            .next()
+            .filter(|start| *start <= settled_tip.height)
+            .map(|start| BlockHeightRange::inclusive(start, settled_tip.height));
+        next.record(ChainEvent::ChainCommitted { committed }, newly_settled);
         self.current = Arc::new(next);
         Ok(())
     }
@@ -223,14 +238,20 @@ impl ReaderHarness for InMemoryReaderHarness {
             )?;
         }
         next.index_transactions(replacement_chain);
-        let committed = next.advance(BlockHeightRange::inclusive(
-            first_replaced_height,
-            replacement_tip,
-        ))?;
-        next.record(ChainEvent::ChainReorged {
-            reverted,
-            committed,
-        });
+        let committed = next.advance(
+            BlockHeightRange::inclusive(first_replaced_height, replacement_tip),
+            BlockId::new(
+                reverted.chain_epoch.settled_tip_height,
+                reverted.chain_epoch.settled_tip_hash,
+            ),
+        )?;
+        next.record(
+            ChainEvent::ChainReorged {
+                reverted,
+                committed,
+            },
+            None,
+        );
         self.current = Arc::new(next);
         Ok(())
     }
@@ -305,7 +326,11 @@ impl Snapshot {
     }
 
     /// Commits the next epoch at the current tip and returns its payload.
-    fn advance(&mut self, block_range: BlockHeightRange) -> eyre::Result<ChainEpochCommitted> {
+    fn advance(
+        &mut self,
+        block_range: BlockHeightRange,
+        settled_tip: BlockId,
+    ) -> eyre::Result<ChainEpochCommitted> {
         let next_epoch = self
             .chain_epoch
             .id
@@ -313,11 +338,7 @@ impl Snapshot {
             .checked_add(1)
             .ok_or_else(|| eyre!("the epoch id cannot grow"))?;
         let tip = self.tip()?;
-        let settled = BlockId::new(
-            self.chain_epoch.settled_tip_height,
-            self.chain_epoch.settled_tip_hash,
-        );
-        self.chain_epoch = epoch_at(next_epoch, self.network, &self.blocks, settled)?;
+        self.chain_epoch = epoch_at(next_epoch, self.network, &self.blocks, settled_tip)?;
         self.fence = fence_at(next_epoch, tip, self.blocks.len().try_into()?);
         Ok(ChainEpochCommitted {
             chain_epoch: self.chain_epoch,
@@ -325,11 +346,12 @@ impl Snapshot {
         })
     }
 
-    fn record(&mut self, event: ChainEvent) {
+    fn record(&mut self, event: ChainEvent, newly_settled: Option<BlockHeightRange>) {
         self.events.push(RecordedEvent {
             event_sequence: self.fence.chain_event_sequence(),
             chain_epoch: self.chain_epoch,
             event,
+            newly_settled,
         });
     }
 
@@ -360,19 +382,6 @@ impl Snapshot {
         }
         let seed = self.checkpoint_below(height)?.clone();
         TreeStateReplay::new(seed, height).map(TreeStateLookup::Replay)
-    }
-
-    /// The retained events of `family`. The settled family carries only a
-    /// commit after which the visible tip is at or below the settled tip.
-    fn events_in(&self, family: ChainEventStreamFamily) -> impl Iterator<Item = &RecordedEvent> {
-        self.events.iter().filter(move |recorded| match family {
-            ChainEventStreamFamily::Visible => true,
-            ChainEventStreamFamily::Settled => {
-                recorded.event.is_chain_committed()
-                    && recorded.chain_epoch.visible_tip_height
-                        <= recorded.chain_epoch.settled_tip_height
-            }
-        })
     }
 }
 
@@ -670,16 +679,28 @@ impl CanonicalReader for InMemoryCanonicalReader {
         };
         Ok(self
             .snapshot
-            .events_in(family)
+            .events
+            .iter()
             .filter(|recorded| recorded.event_sequence > after)
-            .take(usize::try_from(max_events.get()).unwrap_or(usize::MAX))
-            .map(|recorded| ChainEventEnvelope {
-                cursor: encode_cursor(family, recorded.event_sequence),
-                event_sequence: recorded.event_sequence,
-                chain_epoch: recorded.chain_epoch,
-                settled_tip_height: recorded.chain_epoch.settled_tip_height,
-                event: recorded.event.clone(),
+            .filter_map(|recorded| {
+                let event = match family {
+                    ChainEventStreamFamily::Visible => recorded.event.clone(),
+                    ChainEventStreamFamily::Settled => ChainEvent::ChainCommitted {
+                        committed: ChainEpochCommitted {
+                            chain_epoch: recorded.chain_epoch,
+                            block_range: recorded.newly_settled?,
+                        },
+                    },
+                };
+                Some(ChainEventEnvelope {
+                    cursor: encode_cursor(family, recorded.event_sequence),
+                    event_sequence: recorded.event_sequence,
+                    chain_epoch: recorded.chain_epoch,
+                    settled_tip_height: recorded.chain_epoch.settled_tip_height,
+                    event,
+                })
             })
+            .take(usize::try_from(max_events.get()).unwrap_or(usize::MAX))
             .collect())
     }
 
@@ -694,11 +715,10 @@ impl CanonicalReader for InMemoryCanonicalReader {
                 family: requested_family,
             },
             EventStreamStartPosition::LiveTail => ChainEventStreamResume {
-                cursor: self
-                    .snapshot
-                    .events_in(requested_family)
-                    .last()
-                    .map(|recorded| encode_cursor(requested_family, recorded.event_sequence)),
+                cursor: Some(encode_cursor(
+                    requested_family,
+                    self.snapshot.fence.chain_event_sequence(),
+                )),
                 family: requested_family,
             },
             EventStreamStartPosition::AfterCursor(cursor) => {

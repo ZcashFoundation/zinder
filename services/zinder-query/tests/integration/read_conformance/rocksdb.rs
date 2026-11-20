@@ -46,8 +46,14 @@ impl ReaderHarness for RocksDbReaderHarness {
         })
     }
 
-    fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<()> {
-        self.writer.append_live_block(chain).map(drop)
+    fn append_live_block(
+        &mut self,
+        chain: &ChainFixture,
+        settled_tip: BlockId,
+    ) -> eyre::Result<()> {
+        self.writer
+            .append_live_block_with_settled_tip(chain, settled_tip)
+            .map(drop)
     }
 
     fn replace_live_blocks(

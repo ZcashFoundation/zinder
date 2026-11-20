@@ -1,5 +1,5 @@
 kind: fixed
-body: Live mempool reads now return `NODE_UNAVAILABLE` after an endpoint switch or when a replacement takes more than 30 seconds to certify. Retained events remain replayable, and a later certification restores live reads. Native wallet queries now receive `STORAGE_UNAVAILABLE` when the ingest store owner stalls during a mempool read or subscription setup. Upgrade the writer and query together for native contract revision 12.
+body: Live mempool reads now return `NODE_UNAVAILABLE` after an endpoint switch or when a replacement takes more than 30 seconds to certify. Retained events remain replayable, and a later certification restores live reads. Native wallet queries now receive `STORAGE_UNAVAILABLE` when the ingest store owner stalls during a mempool read or subscription setup. Upgrade the writer and query together for native contract revision 13.
 time: 2026-11-20T14:49:22.224440953Z
 custom:
     Bump: minor

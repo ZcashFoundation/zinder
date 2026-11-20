@@ -32,7 +32,7 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
-    TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
+    CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
     compact_block_from_message as compact_block_from_wire_message, mempool_entry_from_message,
     outpoint_message, transparent_outpoint_spend_status_entry_from_message,
 };
@@ -985,6 +985,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
         family: ChainEventStreamFamily,
         address_filter: Vec<String>,
     ) -> Result<ChainEventStream, IndexerError> {
+        let address_filtered = !address_filter.is_empty();
         let mut client = self.client();
         let response = client
             .chain_events(Request::new(wallet::ChainEventsRequest {
@@ -996,9 +997,10 @@ impl EndpointBackedIndex for RemoteChainIndex {
             }))
             .await
             .map_err(|status| self.map_status(status))?;
+        let family = resolved_chain_event_family(response.metadata(), family, &start)?;
         let state = (
             response.into_inner(),
-            ChainEventStreamProgression::new(),
+            ChainEventStreamProgression::new(family, address_filtered),
             client,
             self.clone(),
         );
@@ -1012,7 +1014,8 @@ impl EndpointBackedIndex for RemoteChainIndex {
                 else {
                     return Ok(None);
                 };
-                let envelope = chain_event_envelope_from_message(index.network, message)?;
+                let envelope =
+                    chain_event_envelope_from_message(index.network, progression.family, message)?;
                 progression.validate(&envelope)?;
                 index.validate_reorg_cursor(&mut client, &envelope).await?;
                 Ok(Some((envelope, (wire, progression, client, index))))
@@ -1910,8 +1913,36 @@ fn broadcast_rejection_reason_from_message(code: i32) -> zinder_core::BroadcastR
     }
 }
 
+fn resolved_chain_event_family(
+    metadata: &tonic::metadata::MetadataMap,
+    requested: ChainEventStreamFamily,
+    start: &EventStreamStart<ChainEventCursor>,
+) -> Result<ChainEventStreamFamily, IndexerError> {
+    match metadata.get(CHAIN_EVENT_FAMILY_HEADER) {
+        None if requested == ChainEventStreamFamily::Settled => {
+            Err(IndexerError::FailedPrecondition {
+                reason: "settled chain events require wallet contract revision 12 or later"
+                    .to_owned(),
+            })
+        }
+        None => Ok(ChainEventStreamFamily::Visible),
+        Some(header)
+            if header == "settled"
+                && (requested == ChainEventStreamFamily::Settled
+                    || matches!(start, EventStreamStart::AfterCursor(_))) =>
+        {
+            Ok(ChainEventStreamFamily::Settled)
+        }
+        Some(_) => Err(IndexerError::malformed(
+            CHAIN_EVENT_FAMILY_HEADER,
+            "unexpected chain-event stream family",
+        )),
+    }
+}
+
 fn chain_event_envelope_from_message(
     expected_network: Network,
+    family: ChainEventStreamFamily,
     message: wallet::ChainEventEnvelope,
 ) -> Result<ChainEventEnvelope, IndexerError> {
     if message.cursor.is_empty() {
@@ -1942,10 +1973,16 @@ fn chain_event_envelope_from_message(
                     "committed event epoch does not match envelope chain view",
                 ));
             }
-            validate_committed_range(&committed)?;
+            validate_committed_range(&committed, family)?;
             ChainEvent::ChainCommitted { committed }
         }
         wallet::chain_event_envelope::Event::ChainReorged(chain_reorged) => {
+            if family == ChainEventStreamFamily::Settled {
+                return Err(IndexerError::malformed(
+                    "event",
+                    "settled streams cannot deliver a reorg",
+                ));
+            }
             let reverted = chain_range_reverted_from_message(
                 expected_network,
                 chain_reorged.reverted.ok_or_else(|| {
@@ -1981,8 +2018,20 @@ fn chain_event_envelope_from_message(
     })
 }
 
-fn validate_committed_range(committed: &ChainEpochCommitted) -> Result<(), IndexerError> {
+fn validate_committed_range(
+    committed: &ChainEpochCommitted,
+    family: ChainEventStreamFamily,
+) -> Result<(), IndexerError> {
     let range = committed.block_range;
+    if family == ChainEventStreamFamily::Settled {
+        if range.start > range.end || range.end != committed.chain_epoch.settled_tip_height {
+            return Err(IndexerError::malformed(
+                "committed.block_range",
+                "settled range must be non-empty and end at its epoch settled tip",
+            ));
+        }
+        return Ok(());
+    }
     let visible_tip = committed.chain_epoch.visible_tip_height;
     if range.start <= range.end {
         if range.end != visible_tip {
@@ -2004,7 +2053,7 @@ fn validate_reorg_relationship(
     reverted: &ChainRangeReverted,
     committed: &ChainEpochCommitted,
 ) -> Result<(), IndexerError> {
-    validate_committed_range(committed)?;
+    validate_committed_range(committed, ChainEventStreamFamily::Visible)?;
     if reverted.block_range.start > reverted.block_range.end {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.block_range",
@@ -2070,13 +2119,17 @@ fn preserves_settlement(previous: &ChainEpoch, next: &ChainEpoch) -> bool {
 }
 
 struct ChainEventStreamProgression {
+    family: ChainEventStreamFamily,
+    address_filtered: bool,
     events: EventStreamProgression,
     previous_epoch: Option<ChainEpoch>,
 }
 
 impl ChainEventStreamProgression {
-    fn new() -> Self {
+    fn new(family: ChainEventStreamFamily, address_filtered: bool) -> Self {
         Self {
+            family,
+            address_filtered,
             events: EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS),
             previous_epoch: None,
         }
@@ -2095,6 +2148,19 @@ impl ChainEventStreamProgression {
                     "chain_view.chain_epoch.settled_tip",
                     "settlement must preserve or advance the previous settled tip",
                 ));
+            }
+            if self.family == ChainEventStreamFamily::Settled
+                && let ChainEvent::ChainCommitted { committed } = &envelope.event
+            {
+                let start = committed.block_range.start;
+                if start <= previous.settled_tip_height
+                    || (!self.address_filtered && previous.settled_tip_height.next() != Some(start))
+                {
+                    return Err(IndexerError::malformed(
+                        "committed.block_range.start",
+                        "settled ranges must advance without gaps unless address-filtered",
+                    ));
+                }
             }
             // The cursor's own settlement is checked after detecting a legacy locator below it.
             if let ChainEvent::ChainReorged { reverted, .. } = &envelope.event
@@ -3237,23 +3303,27 @@ mod tests {
         Ok(())
     }
 
+    fn decode_visible_event(
+        message: wallet::ChainEventEnvelope,
+    ) -> Result<ChainEventEnvelope, IndexerError> {
+        chain_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            ChainEventStreamFamily::Visible,
+            message,
+        )
+    }
+
     #[test]
     fn chain_event_decoder_rejects_empty_cursor_and_zero_sequence() {
         assert!(matches!(
-            chain_event_envelope_from_message(
-                EXPECTED_NETWORK,
-                committed_event_message(1, Vec::new())
-            ),
+            decode_visible_event(committed_event_message(1, Vec::new())),
             Err(IndexerError::MalformedResponse {
                 field: "cursor",
                 ..
             })
         ));
         assert!(matches!(
-            chain_event_envelope_from_message(
-                EXPECTED_NETWORK,
-                committed_event_message(0, vec![1])
-            ),
+            decode_visible_event(committed_event_message(0, vec![1])),
             Err(IndexerError::MalformedResponse {
                 field: "event_sequence",
                 ..
@@ -3268,7 +3338,7 @@ mod tests {
         if let Some(committed) = committed_payload_mut(&mut wrong_tip) {
             committed.end_height = 41;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, wrong_tip).is_err());
+        assert!(decode_visible_event(wrong_tip).is_err());
 
         let mut malformed_empty = committed_event_message(1, vec![1]);
         assert!(committed_payload_mut(&mut malformed_empty).is_some());
@@ -3276,7 +3346,64 @@ mod tests {
             committed.start_height = 44;
             committed.end_height = 42;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, malformed_empty).is_err());
+        assert!(decode_visible_event(malformed_empty).is_err());
+    }
+
+    #[test]
+    fn settled_streams_reject_reorgs_empty_commits_and_wrong_range_ends() -> Result<(), IndexerError>
+    {
+        let family = ChainEventStreamFamily::Settled;
+        assert!(
+            chain_event_envelope_from_message(EXPECTED_NETWORK, family, reorg_event_message())
+                .is_err()
+        );
+        for (start, end, accepted) in [
+            (39, 40, true),
+            (41, 40, false),
+            (39, 39, false),
+            (40, 42, false),
+        ] {
+            let mut message = committed_event_message(1, vec![1]);
+            let committed = committed_payload_mut(&mut message)
+                .ok_or_else(|| IndexerError::malformed("event", "missing commit in fixture"))?;
+            committed.start_height = start;
+            committed.end_height = end;
+            assert_eq!(
+                chain_event_envelope_from_message(EXPECTED_NETWORK, family, message).is_ok(),
+                accepted
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn settled_ranges_cannot_overlap_and_only_address_filtered_ranges_can_skip_heights()
+    -> Result<(), IndexerError> {
+        let family = ChainEventStreamFamily::Settled;
+        let settled_event = |sequence: u8, start: u32, end: u32| {
+            let mut epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+            epoch.chain_epoch_id = u64::from(sequence);
+            epoch.settled_tip = Some(wallet::BlockTip {
+                height: end,
+                hash: "22".repeat(32),
+            });
+            let mut message = committed_event_at_epoch(epoch, u64::from(sequence), vec![sequence]);
+            let committed = committed_payload_mut(&mut message)
+                .ok_or_else(|| IndexerError::malformed("event", "missing commit in fixture"))?;
+            committed.start_height = start;
+            committed.end_height = end;
+            chain_event_envelope_from_message(EXPECTED_NETWORK, family, message)
+        };
+        for address_filtered in [false, true] {
+            let mut progression = ChainEventStreamProgression::new(family, address_filtered);
+            progression.validate(&settled_event(1, 36, 38)?)?;
+            assert!(progression.validate(&settled_event(2, 38, 39)?).is_err());
+            assert_eq!(
+                progression.validate(&settled_event(3, 40, 41)?).is_ok(),
+                address_filtered
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -3300,32 +3427,18 @@ mod tests {
             committed.end_height = max_height - 1;
         }
 
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, message).is_ok());
+        assert!(decode_visible_event(message).is_ok());
     }
 
     #[test]
     fn chain_event_stream_requires_increasing_sequences_and_unique_cursors_but_allows_gaps()
     -> Result<(), IndexerError> {
-        let first = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(1, vec![1]),
-        )?;
-        let gap = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(3, vec![3]),
-        )?;
-        let duplicate_sequence = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(3, vec![4]),
-        )?;
-        let nonadjacent_repeated_cursor = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(4, vec![1]),
-        )?;
-        let event_after_rejections = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(4, vec![4]),
-        )?;
+        let first = decode_visible_event(committed_event_message(1, vec![1]))?;
+        let gap = decode_visible_event(committed_event_message(3, vec![3]))?;
+        let duplicate_sequence = decode_visible_event(committed_event_message(3, vec![4]))?;
+        let nonadjacent_repeated_cursor =
+            decode_visible_event(committed_event_message(4, vec![1]))?;
+        let event_after_rejections = decode_visible_event(committed_event_message(4, vec![4]))?;
         let mut state = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
         let mut validate = |envelope: &ChainEventEnvelope| {
             state.validate(envelope.event_sequence, envelope.cursor.as_bytes())
@@ -3342,14 +3455,8 @@ mod tests {
     #[test]
     fn chain_event_stream_fails_closed_before_cursor_retention_capacity_is_exceeded()
     -> Result<(), IndexerError> {
-        let first = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(1, vec![1]),
-        )?;
-        let over_capacity = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(2, vec![2]),
-        )?;
+        let first = decode_visible_event(committed_event_message(1, vec![1]))?;
+        let over_capacity = decode_visible_event(committed_event_message(2, vec![2]))?;
         let mut state = EventStreamProgression {
             cursor_count_limit: 1,
             cursor_bytes_limit: usize::MAX,
@@ -3378,7 +3485,7 @@ mod tests {
 
     #[test]
     fn chain_event_decoder_enforces_reorg_range_epoch_and_settlement_relationships() {
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message()).is_ok());
+        assert!(decode_visible_event(reorg_event_message()).is_ok());
 
         let mut misaligned = reorg_event_message();
         if let Some(wallet::chain_event_envelope::Event::ChainReorged(reorg)) =
@@ -3387,7 +3494,7 @@ mod tests {
         {
             committed.start_height = 42;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, misaligned).is_err());
+        assert!(decode_visible_event(misaligned).is_err());
 
         let mut settlement_changed = reorg_event_message();
         if let Some(wallet::chain_event_envelope::Event::ChainReorged(reorg)) =
@@ -3402,7 +3509,7 @@ mod tests {
                 hash: "55".repeat(32),
             });
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, settlement_changed).is_ok());
+        assert!(decode_visible_event(settlement_changed).is_ok());
 
         let mut zero_epoch = committed_event_message(1, vec![1]);
         if let Some(chain_epoch) = zero_epoch
@@ -3412,13 +3519,13 @@ mod tests {
         {
             chain_epoch.chain_epoch_id = 0;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, zero_epoch).is_err());
+        assert!(decode_visible_event(zero_epoch).is_err());
     }
 
     #[test]
     fn reorg_may_settle_replacements_but_must_preserve_previously_settled_blocks()
     -> Result<(), IndexerError> {
-        let envelope = chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
+        let envelope = decode_visible_event(reorg_event_message())?;
         let ChainEvent::ChainReorged {
             reverted,
             mut committed,
@@ -3445,11 +3552,8 @@ mod tests {
     #[test]
     fn chain_event_stream_requires_increasing_epochs_and_monotonic_settlement()
     -> Result<(), IndexerError> {
-        let mut state = ChainEventStreamProgression::new();
-        let mut first = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(1, vec![1]),
-        )?;
+        let mut state = ChainEventStreamProgression::new(ChainEventStreamFamily::Visible, false);
+        let mut first = decode_visible_event(committed_event_message(1, vec![1]))?;
         state.validate(&first)?;
         first.event_sequence = 2;
         first.cursor = ChainEventCursor::from_bytes([2]);
@@ -3477,14 +3581,12 @@ mod tests {
     fn reorg_cannot_undo_settlement_reported_by_a_previous_event() -> Result<(), IndexerError> {
         let mut previous_epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
         previous_epoch.chain_epoch_id = 5;
-        let previous = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_at_epoch(previous_epoch, 5, vec![5]),
-        )?;
-        let mut progression = ChainEventStreamProgression::new();
+        let previous = decode_visible_event(committed_event_at_epoch(previous_epoch, 5, vec![5]))?;
+        let mut progression =
+            ChainEventStreamProgression::new(ChainEventStreamFamily::Visible, false);
         progression.validate(&previous)?;
 
-        let mut reorg = chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message())?;
+        let mut reorg = decode_visible_event(reorg_event_message())?;
         let ChainEvent::ChainReorged {
             reverted,
             committed,

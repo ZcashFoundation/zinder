@@ -1,7 +1,9 @@
 use std::{num::NonZeroU32, path::Path};
 
 use tempfile::TempDir;
-use zinder_core::{BlockHash, BlockHeight, BlockId, Network, UnixTimestampMillis};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, UnixTimestampMillis,
+};
 
 use super::{
     CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
@@ -9,8 +11,8 @@ use super::{
     live_replacement_tests::{published_store, replacement_block},
 };
 use crate::{
-    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, EventStreamStartPosition,
-    RawBlobRetention, RocksDbResourceBudget,
+    ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
+    EventStreamStartPosition, RawBlobRetention, RocksDbResourceBudget,
 };
 
 const REORG_WINDOW: u32 = 2;
@@ -42,30 +44,53 @@ fn wallet_event_history_returns_bounded_pages_that_resume_after_the_last_cursor(
 }
 
 #[test]
-fn settled_family_history_skips_unsettled_commits_and_mints_settled_cursors()
+fn settled_family_delivers_each_height_once_as_the_reorg_window_advances()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
-    let secondary = settled_family_store(temporary.path())?;
-
-    let visible = wallet_history(&secondary, None, ChainEventStreamFamily::Visible, 10)?;
-    assert_eq!(event_sequences(&visible), vec![1, 2, 3]);
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let build_tip = BlockHeight::new(4);
+    let mut store = published_store(&store_path, REORG_WINDOW, build_tip, build_tip)?;
+    let first_height = store.ready_evidence().first_retained_block.height.value();
+    for height in 5_u8..=8 {
+        let settled_height = build_tip.max(BlockHeight::new(u32::from(height) - REORG_WINDOW));
+        store = append_block(
+            store,
+            &activations,
+            height,
+            settled_height,
+            u64::from(height),
+        )?;
+    }
+    let secondary = open_secondary(&store_path, &temporary.path().join("secondary"))?;
     let settled = wallet_history(&secondary, None, ChainEventStreamFamily::Settled, 10)?;
-    assert_eq!(event_sequences(&settled), vec![1, 3]);
-    for envelope in &settled {
+    assert_eq!(event_sequences(&settled), [1, 4, 5]);
+    for (envelope, (start, end)) in settled.iter().zip([(first_height, 4), (5, 5), (6, 6)]) {
+        let ChainEvent::ChainCommitted { committed } = &envelope.event else {
+            return Err("settled history must contain only newly settled commits".into());
+        };
+        assert_eq!(committed.chain_epoch, envelope.chain_epoch);
+        assert_eq!(
+            committed.block_range,
+            BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
+        );
         let payload = envelope
             .cursor
             .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
         assert_eq!(payload.family, ChainEventStreamFamily::Settled);
+        assert_eq!(payload.event_sequence, envelope.event_sequence);
+        assert_eq!(payload.locator.tip().height, BlockHeight::new(end));
         assert_eq!(
-            envelope.chain_epoch.visible_tip_height,
-            envelope.chain_epoch.settled_tip_height
+            payload.locator.tip().hash,
+            envelope.chain_epoch.settled_tip_hash
         );
-    }
-    for envelope in &visible {
-        let payload = envelope
-            .cursor
-            .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
-        assert_eq!(payload.family, ChainEventStreamFamily::Visible);
+        assert!(
+            payload
+                .locator
+                .entries()
+                .iter()
+                .all(|anchor| anchor.height <= BlockHeight::new(end))
+        );
     }
     Ok(())
 }
@@ -185,6 +210,7 @@ fn live_tail_start_mints_a_cursor_in_the_requested_family() -> Result<(), Box<dy
         head_cursor.decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
     assert_eq!(payload.family, ChainEventStreamFamily::Settled);
     assert_eq!(payload.event_sequence, 3);
+    assert_eq!(payload.locator.tip().height, BlockHeight::new(4));
     Ok(())
 }
 
@@ -192,7 +218,7 @@ fn live_tail_start_mints_a_cursor_in_the_requested_family() -> Result<(), Box<dy
 fn after_cursor_start_takes_the_cursor_family_as_authoritative()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
-    let secondary = settled_family_store(temporary.path())?;
+    let (_store, secondary) = store_with_two_live_appends(temporary.path())?;
     let settled_cursor = wallet_history(&secondary, None, ChainEventStreamFamily::Settled, 1)?
         .into_iter()
         .next()
@@ -284,25 +310,6 @@ fn store_with_two_live_appends(
     let store = append_block(store, &activations, 6, BlockHeight::new(4), 2)?;
     let secondary = open_secondary(&store_path, &directory.join("secondary"))?;
     Ok((store, secondary))
-}
-
-/// Publishes a settled baseline at height 4, appends height 5 without
-/// settling it, then appends height 6 and settles it. Events 1 and 3 belong
-/// to the settled family; event 2 does not.
-fn settled_family_store(
-    directory: &Path,
-) -> Result<RocksDbCanonicalSecondary, Box<dyn std::error::Error>> {
-    let store_path = directory.join("canonical");
-    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let store = published_store(
-        &store_path,
-        REORG_WINDOW,
-        BlockHeight::new(4),
-        BlockHeight::new(4),
-    )?;
-    let store = append_block(store, &activations, 5, BlockHeight::new(4), 1)?;
-    let _store = append_block(store, &activations, 6, BlockHeight::new(6), 2)?;
-    open_secondary(&store_path, &directory.join("secondary"))
 }
 
 fn append_block(

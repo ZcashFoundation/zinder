@@ -26,7 +26,8 @@ use zinder_core::{
 pub enum ChainEventStreamFamily {
     /// Every visible chain transition, including reorgs.
     Visible,
-    /// Non-reorg commits that are entirely at or below the settled tip.
+    /// Newly settled ranges, each ending at the settled tip of its full chain epoch.
+    /// The remote endpoint must support wallet contract revision 12 or later.
     Settled,
 }
 
@@ -99,7 +100,7 @@ pub struct ChainEventEnvelope {
 #[non_exhaustive]
 #[cfg(feature = "remote")]
 pub enum ChainEvent {
-    /// A non-reorg commit advanced the canonical tip or settled-tip prefix.
+    /// A visible chain commit or a newly settled range of blocks.
     ChainCommitted {
         /// Committed epoch payload.
         committed: ChainEpochCommitted,
@@ -131,7 +132,8 @@ impl ChainEvent {
 pub struct ChainEpochCommitted {
     /// Chain epoch visible after the commit.
     pub chain_epoch: ChainEpoch,
-    /// Inclusive block range included in the commit.
+    /// Inclusive block range ending at the stream family's tip.
+    /// A visible metadata-only commit can carry an empty range.
     pub block_range: BlockHeightRange,
 }
 
@@ -1388,7 +1390,7 @@ pub trait EndpointBackedIndex: ChainIndex {
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, IndexerError>;
 
-    /// Streams visible-family chain events.
+    /// Opens a visible chain-event stream, or resumes the family of a supplied cursor.
     ///
     /// On server revisions 8 and 9, a synthesized reorg after pruning ends
     /// the stream with [`IndexerError::ChainEventCursorExpired`]. Rebuild from
@@ -1418,6 +1420,12 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Streams chain events for the requested family.
     ///
+    /// A [Settled](ChainEventStreamFamily::Settled) subscription delivers each
+    /// newly settled range as a commit and requires wallet contract revision 12
+    /// or later. When resuming from a cursor, the default
+    /// [Visible](ChainEventStreamFamily::Visible) selection accepts either
+    /// family. Selecting Settled requires a Settled cursor.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1426,7 +1434,7 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # };
     /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
     /// let stream = client
-    ///     .chain_events_for_family(EventStreamStart::LiveTail, ChainEventStreamFamily::Visible)
+    ///     .chain_events_for_family(EventStreamStart::LiveTail, ChainEventStreamFamily::Settled)
     ///     .await?;
     /// # let _ = stream; Ok(()) }
     /// ```
