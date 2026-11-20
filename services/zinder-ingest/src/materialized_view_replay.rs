@@ -1423,15 +1423,18 @@ impl MaterializedViewTailer {
         }
     }
 
-    /// Opens historical work only while replay covers the canonical tip and
-    /// the store volume is above its free-space floor.
-    fn refresh_historical_work_gate(
+    fn refresh_replay_status(
         &self,
-        canonical: &RocksDbCanonicalSecondary,
         historical_work_gate: &HistoricalWorkGate,
-        volume_space_low: bool,
+        limits: EffectiveMaterializedViewReplayLimits,
+        poll_interval: Duration,
     ) {
-        let caught_up = self.replay_caught_up(canonical).unwrap_or_else(|error| {
+        if limits.state.is_paused() {
+            historical_work_gate.set_replay_verification_pending(false);
+        }
+        record_materialized_view_replay_budget(self.config.replay_policy, limits, poll_interval);
+        let canonical = self.canonical.read();
+        let caught_up = self.replay_caught_up(&canonical).unwrap_or_else(|error| {
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "materialized_view_replay_gate_refresh_failed",
@@ -1440,7 +1443,10 @@ impl MaterializedViewTailer {
             );
             false
         });
-        historical_work_gate.set_materialized_views_caught_up(caught_up && !volume_space_low);
+        historical_work_gate
+            .set_materialized_views_caught_up(caught_up && !limits.volume_space_low);
+        self.persist_status(&canonical, limits.state);
+        drop(canonical);
     }
 
     fn replay_caught_up(&self, canonical: &RocksDbCanonicalSecondary) -> Result<bool, IngestError> {
@@ -1629,24 +1635,17 @@ async fn run_materialized_view_tailer(
         );
     loop {
         let effective_limits = budget.evaluate_current();
-        record_materialized_view_replay_budget(
-            tailer.config.replay_policy,
-            effective_limits,
-            poll_interval,
-        );
-        {
-            let canonical = tailer.canonical.read();
-            tailer.refresh_historical_work_gate(
-                &canonical,
-                &historical_work_gate,
-                effective_limits.volume_space_low,
-            );
-            tailer.persist_status(&canonical, effective_limits.state);
-        }
+        tailer.refresh_replay_status(&historical_work_gate, effective_limits, poll_interval);
         if effective_limits.state.is_paused() {
             tailer.prevout_caches.release_replay();
         } else {
-            budget = run_materialized_view_tailer_pass(&tailer, budget, &ranking_build).await;
+            budget = run_materialized_view_tailer_pass(
+                &tailer,
+                budget,
+                &ranking_build,
+                &historical_work_gate,
+            )
+            .await;
         }
         if let Some(cursor_risk) = cursor_risk.as_mut() {
             cursor_risk.observe(&tailer.materialized_view_store);
@@ -1674,6 +1673,7 @@ async fn run_materialized_view_tailer_pass(
     tailer: &Arc<MaterializedViewTailer>,
     budget: MaterializedViewReplayBudget,
     ranking_build: &Arc<RankingBuildProgress>,
+    gate: &HistoricalWorkGate,
 ) -> MaterializedViewReplayBudget {
     let started_at = Instant::now();
     let pass_tailer = Arc::clone(tailer);
@@ -1694,6 +1694,12 @@ async fn run_materialized_view_tailer_pass(
         ),
     };
     record_materialized_view_tailer_tick(started_at, &outcome);
+    gate.set_replay_verification_pending(matches!(
+        &outcome,
+        Err(IngestError::CanonicalStore(_)
+            | IngestError::CommitmentTreeState { .. }
+            | IngestError::CommitmentTreeCheckpointMissing { .. })
+    ));
     if let Err(error) = outcome {
         tracing::warn!(
             target: "zinder::ingest",

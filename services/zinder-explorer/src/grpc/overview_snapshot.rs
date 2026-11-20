@@ -19,12 +19,12 @@ use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
 use tonic_types::StatusExt as _;
 use zinder_core::{
-    BlockHeight, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    BlockHeight,
+    explorer_reasons::{MEMPOOL_EVENT_COUNTS_NOT_INDEXED, WALLET_QUERY_CAPABILITY_NOT_SUPPORTED},
     wire::encode_height_key_ascending,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore,
-    MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
+    BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewStore, TRANSACTION_HISTORY_COLUMN_FAMILY,
 };
 use zinder_proto::ZINDER_ERROR_DOMAIN;
 use zinder_proto::capabilities::{
@@ -32,14 +32,17 @@ use zinder_proto::capabilities::{
     WALLET_SNAPSHOT_MEMPOOL_V3,
 };
 use zinder_proto::v1::explorer::{
-    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField,
-    UnavailableReason,
+    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewSnapshotRequest,
+    OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField, UnavailableReason,
 };
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
     self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
+};
+use zinder_proto::wire::{
+    OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH, OVERVIEW_MEMPOOL_FIELD_PATH,
+    OVERVIEW_VALUE_POOLS_FIELD_PATH,
 };
 use zinder_runtime::AuthenticatedChannel;
 
@@ -47,6 +50,7 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::mempool_event_counts::{clamp_window, read_mempool_event_counts};
 use super::transaction_history::decode_history_entry;
 
 /// Range cap on `recent_blocks_limit`.
@@ -63,13 +67,6 @@ const MAX_RECENT_TRANSACTIONS_LIMIT: u32 = 64;
 /// Server default when `recent_transactions_limit == 0`.
 const DEFAULT_RECENT_TRANSACTIONS_LIMIT: u32 = 32;
 
-/// Lower bound on `mempool_window_seconds` (matches `MempoolEventCounts`).
-const MIN_MEMPOOL_WINDOW_SECONDS: u32 = 60;
-/// Upper bound on `mempool_window_seconds` (matches `MempoolEventCounts`).
-const MAX_MEMPOOL_WINDOW_SECONDS: u32 = 3_600;
-/// Server default when `mempool_window_seconds == 0`.
-const DEFAULT_MEMPOOL_WINDOW_SECONDS: u32 = 300;
-
 /// Range cap on `fee_summary_block_count`.
 const MIN_FEE_SUMMARY_BLOCK_COUNT: u32 = 1;
 /// Server-side ceiling matches the per-request cap of `FeeSummary`.
@@ -81,11 +78,6 @@ const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
 /// wallet `MempoolSnapshot`. Mirrors the cap in the per-feature mempool
 /// handlers.
 const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
-
-/// Field path for an unavailable Overview mempool snapshot.
-const MEMPOOL_FIELD_PATH: &str = "mempool";
-/// Field path for unavailable Overview chain value pools.
-const VALUE_POOLS_FIELD_PATH: &str = "value_pools";
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn query_overview_snapshot(
@@ -120,8 +112,15 @@ pub(crate) async fn query_overview_snapshot(
         freshness
             .unavailable
             .push(build_wallet_capability_unavailable_field(
-                MEMPOOL_FIELD_PATH,
+                OVERVIEW_MEMPOOL_FIELD_PATH,
             ));
+    }
+    if mempool_events.is_none() {
+        freshness.unavailable.push(UnavailableField {
+            field_path: OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH.to_owned(),
+            reason: UnavailableReason::UnavailableNotIndexed as i32,
+            human_reason: MEMPOOL_EVENT_COUNTS_NOT_INDEXED.to_owned(),
+        });
     }
     let value_pools = if let Some(value_pools) = available_value_pools {
         value_pools
@@ -129,7 +128,7 @@ pub(crate) async fn query_overview_snapshot(
         freshness
             .unavailable
             .push(build_wallet_capability_unavailable_field(
-                VALUE_POOLS_FIELD_PATH,
+                OVERVIEW_VALUE_POOLS_FIELD_PATH,
             ));
         Vec::new()
     };
@@ -138,7 +137,7 @@ pub(crate) async fn query_overview_snapshot(
         freshness: Some(freshness),
         tip_block_time_unix_seconds,
         mempool,
-        mempool_events: Some(mempool_events),
+        mempool_events,
         fee_summary: Some(fee_summary),
         value_pools,
         recent_blocks,
@@ -170,12 +169,7 @@ impl RequestLimits {
                 MIN_RECENT_TRANSACTIONS_LIMIT,
                 MAX_RECENT_TRANSACTIONS_LIMIT,
             ),
-            mempool_window_seconds: clamp(
-                request.mempool_window_seconds,
-                DEFAULT_MEMPOOL_WINDOW_SECONDS,
-                MIN_MEMPOOL_WINDOW_SECONDS,
-                MAX_MEMPOOL_WINDOW_SECONDS,
-            ),
+            mempool_window_seconds: clamp_window(request.mempool_window_seconds),
             fee_summary_blocks: clamp(
                 request.fee_summary_block_count,
                 DEFAULT_FEE_SUMMARY_BLOCK_COUNT,
@@ -318,42 +312,6 @@ fn read_recent_transactions(
     Ok(entries)
 }
 
-fn read_mempool_event_counts(
-    materialized_view_store: &MaterializedViewStore,
-    window_seconds: u32,
-) -> Result<OverviewMempoolEvents, Status> {
-    let now_seconds = current_unix_seconds();
-    let window_start = now_seconds.saturating_sub(u64::from(window_seconds));
-    let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
-    let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
-    let cap = usize::try_from(window_seconds).unwrap_or(MAX_MEMPOOL_WINDOW_SECONDS as usize);
-    let entries = materialized_view_store
-        .range_iterate_consumer(
-            MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
-            &start_key,
-            &end_key,
-            cap,
-        )
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let mut added_count: u32 = 0;
-    let mut mined_count: u32 = 0;
-    let mut invalidated_count: u32 = 0;
-    for (_, payload) in entries {
-        if let Some((added, mined, invalidated)) = MempoolEventCountsConsumer::decode_row(&payload)
-        {
-            added_count = added_count.saturating_add(added);
-            mined_count = mined_count.saturating_add(mined);
-            invalidated_count = invalidated_count.saturating_add(invalidated);
-        }
-    }
-    Ok(OverviewMempoolEvents {
-        window_seconds,
-        added_count,
-        mined_count,
-        invalidated_count,
-    })
-}
-
 async fn aggregate_mempool_summary(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<Option<OverviewMempool>, Status> {
@@ -456,12 +414,6 @@ fn build_wallet_capability_unavailable_field(field_path: &str) -> UnavailableFie
         reason: UnavailableReason::UnavailableUpstreamNotSupported as i32,
         human_reason: WALLET_QUERY_CAPABILITY_NOT_SUPPORTED.to_owned(),
     }
-}
-
-fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn current_unix_millis() -> u64 {

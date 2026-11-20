@@ -54,9 +54,7 @@ use zinder_store::{
 
 use crate::{
     background_pass::{BackgroundSecondary, write_progress_record},
-    runtime_config::{
-        HistoricalWorkGate, sleep_or_cancel, wait_until_historical_work_or_cancelled,
-    },
+    runtime_config::{HistoricalWorkGate, sleep_or_cancel, wait_for_work_or_cancelled},
 };
 
 /// Default average ceiling on stored checkpoint rows the pass verifies per
@@ -304,7 +302,7 @@ async fn run_tree_state_verification(
         resource_budget: context.resource_budget,
     }
     .open_when_published(
-        (!rechecks_recorded_damage).then_some(&context.gate),
+        || rechecks_recorded_damage || context.gate.admits_verification(),
         &cancel,
         "tree_state_verification_secondary_unavailable",
     )
@@ -328,7 +326,7 @@ async fn run_tree_state_verification(
         return;
     }
     loop {
-        if wait_until_historical_work_or_cancelled(&context.gate, &cancel).await {
+        if wait_for_work_or_cancelled(|| context.gate.take_verification_step(), &cancel).await {
             return;
         }
         let pause = match pass.step(&cancel).await {

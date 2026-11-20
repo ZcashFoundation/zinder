@@ -257,7 +257,7 @@ pub(super) fn replay_tree_state(
     }))
 }
 
-fn refuse_unadmitted_activations(
+pub(super) fn refuse_unadmitted_activations(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,

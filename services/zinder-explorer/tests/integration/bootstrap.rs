@@ -11,7 +11,7 @@ use std::{net::SocketAddr, num::NonZeroU32, path::Path, sync::Arc, time::Duratio
 use async_trait::async_trait;
 use eyre::{Result, eyre};
 use prost::Message as _;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
@@ -32,17 +32,19 @@ use zinder_materialized_views::{
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_SUMMARY_V1,
-    EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
-    EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_FEES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
+    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1, EXPLORER_VALUE_POOL_SUMMARY_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockSummariesInRangeRequest, BlockSummary,
-    BlockSummaryRecord, ChainReorgHistoryRequest, OverviewSnapshotRequest,
-    OverviewSnapshotResponse, ServerInfoRequest, TransactionDetailRequest,
+    BlockSummaryRecord, ChainReorgHistoryRequest, MempoolEventCountsRequest,
+    OverviewSnapshotRequest, OverviewSnapshotResponse, ServerInfoRequest, TransactionDetailRequest,
     TransparentAddressDeltasRecord, TransparentAddressDeltasRequest, TransparentDeltaKind,
     UnavailableReason, explorer_query_client::ExplorerQueryClient,
 };
+use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 use zinder_query::{
@@ -155,6 +157,12 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
             .any(|advertised| { advertised == EXPLORER_TRANSACTION_DETAIL_V4 }),
         "transaction_detail capability must not advertise without a wallet_query_endpoint",
     );
+    assert_mempool_counts_error(
+        &mut client,
+        tonic::Code::FailedPrecondition,
+        ErrorReason::DependencyNotConfigured,
+    )
+    .await?;
     let detail_outcome = client
         .transaction_detail(TransactionDetailRequest {
             transaction_id: "00".repeat(32),
@@ -324,17 +332,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
             .await?;
 
-    let explorer_info = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
+    assert_overview_discovery(&mut client).await?;
 
     let first = client
         .overview_snapshot(OverviewSnapshotRequest {
@@ -927,9 +925,102 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
     );
 }
 
-/// The production wallet endpoint serves an empty mempool snapshot through
-/// its admitted ingest control but does not serve chain value pools, so only
-/// the value pools are reported unavailable.
+async fn assert_overview_discovery(client: &mut ExplorerQueryClient<Channel>) -> Result<()> {
+    let explorer_info = client
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner()
+        .info
+        .ok_or_else(|| eyre!("server info missing info envelope"))?;
+    let common = explorer_info
+        .common
+        .as_ref()
+        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+    assert_advertises_capability(&common.capabilities, EXPLORER_OVERVIEW_SNAPSHOT_V1);
+    for unsupported in [
+        EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+        EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
+        EXPLORER_VALUE_POOL_SUMMARY_V1,
+    ] {
+        assert!(
+            !common
+                .capabilities
+                .iter()
+                .any(|capability| capability == unsupported),
+            "advertised {unsupported}"
+        );
+    }
+    assert_mempool_counts_error(
+        client,
+        tonic::Code::NotFound,
+        ErrorReason::ArtifactUnavailable,
+    )
+    .await
+}
+
+async fn assert_mempool_counts_error(
+    client: &mut ExplorerQueryClient<Channel>,
+    code: tonic::Code,
+    reason: ErrorReason,
+) -> Result<()> {
+    let status = client
+        .mempool_event_counts(MempoolEventCountsRequest::default())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("MempoolEventCounts unexpectedly returned counts"))?;
+    assert_eq!(status.code(), code);
+    assert_eq!(
+        tonic_types::StatusExt::get_error_details(&status)
+            .error_info()
+            .map(|details| details.reason.as_str()),
+        Some(reason.as_str_name())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_count_windows_report_local_absence_when_the_wallet_is_unreachable() -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zinder_materialized_views::{
+        MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MempoolEventCountsConsumer,
+    };
+
+    let directory = tempfile::tempdir()?;
+    let store = MaterializedViewStore::open_explorer_views(
+        directory.path(),
+        MaterializedViewStoreOptions {
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            ..MaterializedViewStoreOptions::default()
+        },
+    )?;
+    // Reserve a port without listening on it so every wallet dial is refused.
+    let wallet = TcpSocket::new_v4()?;
+    wallet.bind("127.0.0.1:0".parse()?)?;
+    let (mut client, server) =
+        spawn_explorer_query_server(store.clone(), wallet.local_addr()?).await?;
+    assert_mempool_counts_error(
+        &mut client,
+        tonic::Code::NotFound,
+        ErrorReason::ArtifactUnavailable,
+    )
+    .await?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    store.put_consumer(
+        MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+        &MempoolEventCountsConsumer::key_for_second(now),
+        &[0; 12],
+    )?;
+    assert_mempool_counts_error(
+        &mut client,
+        tonic::Code::Unavailable,
+        ErrorReason::UpstreamUnreachable,
+    )
+    .await?;
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}
+
 fn assert_overview_wallet_fields_from_production_endpoint(
     response: &OverviewSnapshotResponse,
 ) -> Result<()> {
@@ -945,7 +1036,12 @@ fn assert_overview_wallet_fields_from_production_endpoint(
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    assert_eq!(freshness.unavailable.len(), 1);
+    assert!(response.mempool_events.is_none());
+    assert!(freshness.unavailable.iter().any(|field| field.field_path
+        == zinder_proto::wire::OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH
+        && field.reason() == UnavailableReason::UnavailableNotIndexed
+        && field.human_reason == zinder_core::explorer_reasons::MEMPOOL_EVENT_COUNTS_NOT_INDEXED));
+    assert_eq!(freshness.unavailable.len(), 2);
     let unavailable_field = freshness
         .unavailable
         .iter()

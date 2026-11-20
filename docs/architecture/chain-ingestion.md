@@ -257,10 +257,15 @@ again, as a writer checks a row it stores:
   height fails this check when its header is missing, does not decode, or
   sits in a table block that fails its checksum when read.
 
-The pass starts when densification does: once ingest follows the tip, and
-Explorer views have caught up when they are enabled. A restart over a store
-it reports as damaged starts it sooner, as described below. It reads through
-its own canonical secondary and writes nothing to the store, so it runs
+Verification normally runs during tip follow once Explorer views catch up.
+When replay fails to read canonical history or rebuild commitment state, it
+requests one verification step. During tip follow, this lets the verifier
+resume its paced scan from its existing position while the views are behind.
+Repeated failures share one pending step. A successful replay pass or a
+resource pause clears an unused request.
+
+On restart, ingest rechecks recorded damage as described below. Verification
+reads through its own canonical secondary and writes nothing to the store, so it runs
 without `ingest_control.listen_addr`; without that listener, no reader
 attests the store, and ingest readiness alone reports the damage.
 

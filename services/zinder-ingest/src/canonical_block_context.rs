@@ -1,14 +1,16 @@
 //! Materialized-view block contexts hydrated from admitted canonical facts.
 //!
 //! Canonical storage retains block-local facts only. Two inputs the
-//! materialized-view consumers require are therefore derived here rather than
-//! read from a dedicated family: final note-commitment roots come from the
-//! persisted tree-state checkpoints plus compact-block commitments, and
-//! transparent spend facts come from the output the spend names. That output
-//! is found in the hydrated range, then in an optional [`PrevoutCache`] of
-//! outputs earlier ranges produced, and last in the producing block's replay
-//! row. Canonical reads for the last step, and for warming an empty cache,
-//! run on several threads so their storage waits overlap.
+//! materialized-view consumers require are therefore assembled here rather than
+//! read from a dedicated family: final note-commitment roots are read directly
+//! from persisted `tree_state_checkpoint` rows when present and replayed from
+//! the nearest checkpoint plus compact-block commitments only across heights
+//! without a stored checkpoint, and transparent spend facts come from the
+//! output the spend names. That output is found in the hydrated range, then in
+//! an optional [`PrevoutCache`] of outputs earlier ranges produced, and last in
+//! the producing block's replay row. Canonical reads for the last step, and for
+//! warming an empty cache, run on several threads so their storage waits
+//! overlap.
 
 mod parallel_reads;
 mod prevout_cache;
@@ -77,10 +79,13 @@ pub fn require_genesis_complete_history(
 
 /// Builds materialized-view block contexts from admitted canonical facts.
 ///
-/// One reader serves a sequence of ranges. Sequential ranges reuse the
-/// commitment-tree state left by the previous call; any other range reseeds
-/// from the newest persisted tree-state checkpoint at or before its start.
-/// A reader built with [`Self::without_final_roots`] derives no roots.
+/// One reader serves a sequence of ranges. Stored `tree_state_checkpoint` rows
+/// supply final note-commitment roots directly without reading compact blocks
+/// or hashing commitments. Across heights without a stored checkpoint,
+/// sequential ranges reuse the commitment-tree state left by the previous call;
+/// any other gap reseeds from the newest persisted tree-state checkpoint at or
+/// before its start. A reader built with [`Self::without_final_roots`] derives
+/// no roots.
 pub struct CanonicalBlockContextReader<'canonical> {
     secondary: &'canonical RocksDbCanonicalSecondary,
     activations: &'canonical NetworkUpgradeActivations,
@@ -125,12 +130,12 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         }
     }
 
-    /// Stops deriving final note-commitment roots, so every hydrated context
+    /// Stops populating final note-commitment roots, so every hydrated context
     /// carries `final_note_commitment_roots: None`.
     ///
-    /// Deriving roots reads every compact block in a range, seeds the
-    /// commitment trees from a tree-state checkpoint, and hashes each block's
-    /// commitments. Use this only for consumers that never read roots; the
+    /// Populating roots reads stored `tree_state_checkpoint` rows and, for any
+    /// height without one, replays compact-block commitments from the nearest
+    /// checkpoint. Use this only for consumers that never read roots; the
     /// commitment-root search index needs them.
     #[must_use]
     pub fn without_final_roots(mut self) -> Self {
@@ -495,14 +500,30 @@ fn read_final_note_commitment_roots(
     cursor: &mut FinalRootsCursor,
     range: BlockHeightRange,
 ) -> Result<HashMap<BlockHeight, BlockFinalNoteCommitmentRoots>, IngestError> {
-    let compact_blocks = secondary.compact_blocks_in_range(range)?;
-    let accumulator = cursor.position_at(secondary, activations, range.start)?;
-    let mut roots = HashMap::with_capacity(compact_blocks.len());
-    for compact_block in &compact_blocks {
-        append_compact_block(accumulator, compact_block)?;
-        let block_roots = accumulator.final_note_commitment_roots(compact_block.block_hash());
-        if has_any_pool_root(&block_roots) {
-            roots.insert(compact_block.height(), block_roots);
+    let stored_roots = secondary.stored_final_note_commitment_roots_in_range(range, activations)?;
+    let mut roots = HashMap::with_capacity(stored_roots.len());
+    let mut heights = range.into_iter().zip(stored_roots).peekable();
+    while let Some((start, stored)) = heights.next() {
+        if let Some(block_roots) = stored {
+            if has_any_pool_root(&block_roots) {
+                roots.insert(start, block_roots);
+            }
+            continue;
+        }
+
+        let mut end = start;
+        while let Some((height, _)) = heights.next_if(|(_, roots)| roots.is_none()) {
+            end = height;
+        }
+        let gap = BlockHeightRange::inclusive(start, end);
+        let compact_blocks = secondary.compact_blocks_in_range(gap)?;
+        let accumulator = cursor.position_at(secondary, activations, start)?;
+        for block in &compact_blocks {
+            append_compact_block(accumulator, block)?;
+            let block_roots = accumulator.final_note_commitment_roots(block.block_hash());
+            if has_any_pool_root(&block_roots) {
+                roots.insert(block.height(), block_roots);
+            }
         }
     }
     Ok(roots)
