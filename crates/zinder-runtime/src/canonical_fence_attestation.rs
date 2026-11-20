@@ -9,10 +9,11 @@
 //! control-plane client or credential: callers read writer status through
 //! their own [`CanonicalFenceProbe`].
 
-use std::{future::Future, num::NonZeroU32, time::Duration};
+use std::{future::Future, num::NonZeroU32, sync::Arc, time::Duration};
 
+use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::time::Instant;
+use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::{
@@ -24,7 +25,7 @@ use zinder_proto::{
 };
 use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
 
-use crate::{ReadinessCause, ReadinessState};
+use crate::{ComposedReadiness, ReadinessCause, ReadinessState};
 
 /// Relation between the writer's attested fence and a local secondary fence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,26 +358,85 @@ where
 /// halt again only once it rediscovers the reorg, and a writer-status outage
 /// must not reopen traffic. Only a following writer with a confirmed tip and
 /// an undamaged store earns the staleness allowance that keeps a lagging
-/// reader admitting traffic.
+/// reader admitting traffic, and the allowance ends at
+/// [`Self::stale_deadline`] whether or not a refresh is still running: a
+/// reader runs each refresh through [`refresh_within_stale_deadline`].
 #[derive(Debug)]
 pub struct WriterAttestation {
     network: Network,
     staleness_ceiling: Duration,
-    attested_at: Option<Instant>,
+    clock: Arc<AttestationClock>,
     remembered_halt: Option<ReadinessState>,
+}
+
+/// When the writer last attested a reader, shared with every
+/// [`StaleDeadline`] the reader's [`WriterAttestation`] hands out.
+#[derive(Debug, Default)]
+struct AttestationClock {
+    attested_at: Mutex<Option<Instant>>,
+    /// Wakes a [`StaleDeadline`] waiting while no allowance runs.
+    attested: Notify,
+}
+
+/// The deadline of a reader's staleness allowance.
+///
+/// It follows every attestation, refusal, and
+/// [`WriterAttestation::end_lapsed_allowance`] the reader makes after taking
+/// it, so a refresh guarded by it ends admission when the allowance in force
+/// runs out, never at the end of one the refresh itself renewed.
+#[derive(Clone, Debug)]
+pub struct StaleDeadline {
+    clock: Arc<AttestationClock>,
+    staleness_ceiling: Duration,
+}
+
+impl StaleDeadline {
+    /// Returns when the allowance in force runs out, which may already have
+    /// passed, or `None` while no allowance runs.
+    #[must_use]
+    pub fn instant(&self) -> Option<Instant> {
+        self.clock
+            .attested_at
+            .lock()
+            .map(|attested_at| attested_at + self.staleness_ceiling)
+    }
+
+    /// Completes once the allowance in force has run out, at once when it
+    /// already has. While no allowance runs, it waits for the next
+    /// attestation.
+    pub async fn passed(self) {
+        loop {
+            let attested = self.clock.attested.notified();
+            let mut attested = std::pin::pin!(attested);
+            attested.as_mut().enable();
+            match self.instant() {
+                Some(deadline) if deadline <= Instant::now() => return,
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => attested.await,
+            }
+        }
+    }
 }
 
 impl WriterAttestation {
     /// Creates the rules for a reader of `network` that may serve a lagging
     /// reader for `staleness_ceiling` after the writer last attested it.
     #[must_use]
-    pub const fn new(network: Network, staleness_ceiling: Duration) -> Self {
+    pub fn new(network: Network, staleness_ceiling: Duration) -> Self {
         Self {
             network,
             staleness_ceiling,
-            attested_at: None,
+            clock: Arc::new(AttestationClock::default()),
             remembered_halt: None,
         }
+    }
+
+    fn attested_at(&self) -> Option<Instant> {
+        *self.clock.attested_at.lock()
+    }
+
+    fn withdraw_allowance(&self) {
+        *self.clock.attested_at.lock() = None;
     }
 
     /// Returns the not-ready state `status` imposes on a reader whose visible
@@ -394,7 +454,7 @@ impl WriterAttestation {
     ) -> Option<ReadinessState> {
         let refusal = self.refusal(status, visible_height);
         if refusal.is_some() {
-            self.attested_at = None;
+            self.withdraw_allowance();
         }
         refusal
     }
@@ -443,7 +503,7 @@ impl WriterAttestation {
         visible_height: Option<u32>,
     ) -> ReadinessState {
         let halt = refusing(ReadinessCause::from(halt), visible_height);
-        self.attested_at = None;
+        self.withdraw_allowance();
         self.remembered_halt = Some(halt.clone());
         halt
     }
@@ -451,7 +511,8 @@ impl WriterAttestation {
     /// Records that a following writer with a confirmed tip attested the
     /// reader now.
     pub fn attest(&mut self) {
-        self.attested_at = Some(Instant::now());
+        *self.clock.attested_at.lock() = Some(Instant::now());
+        self.clock.attested.notify_waiters();
     }
 
     /// Returns the halt or store damage the writer last reported, which a
@@ -466,35 +527,94 @@ impl WriterAttestation {
     /// writer with a confirmed tip has attested the reader.
     #[must_use]
     pub fn stale_allowance(&self) -> Option<Duration> {
-        self.attested_at
+        self.attested_at()
             .map(|attested_at| attested_at.elapsed())
             .filter(|staleness| *staleness < self.staleness_ceiling)
     }
 
-    /// Returns when the staleness allowance runs out, while it still runs.
+    /// Returns the deadline of the staleness allowance. Its instant is when
+    /// the allowance of the last attestation runs out, which may already
+    /// have passed; it names none while no following writer with a confirmed
+    /// tip has attested the reader since the last refusal or
+    /// [`Self::end_lapsed_allowance`].
     ///
-    /// A reader refreshes no later than this instant, so a reader whose
-    /// refresh interval exceeds the ceiling still stops admitting traffic on
-    /// an unattested view once the ceiling passes. `None` once the ceiling
-    /// has passed or while no following writer with a confirmed tip has
-    /// attested the reader, so a lapsed allowance never schedules a refresh.
+    /// A reader refreshes no later than that instant and stops admitting
+    /// traffic at it unless the writer attests the reader again first, so a
+    /// refresh interval longer than the ceiling, or a refresh that stalls,
+    /// cannot keep admitting traffic on an unattested view past it.
     #[must_use]
-    pub fn stale_deadline(&self) -> Option<Instant> {
-        self.stale_allowance()?;
-        self.attested_at
-            .map(|attested_at| attested_at + self.staleness_ceiling)
+    pub fn stale_deadline(&self) -> StaleDeadline {
+        StaleDeadline {
+            clock: Arc::clone(&self.clock),
+            staleness_ceiling: self.staleness_ceiling,
+        }
+    }
+
+    /// Forgets an attestation whose staleness allowance has run out, so its
+    /// passed deadline schedules no further refresh, and returns whether it
+    /// did.
+    pub fn end_lapsed_allowance(&mut self) -> bool {
+        let lapsed = self.attested_at().is_some() && self.stale_allowance().is_none();
+        if lapsed {
+            self.withdraw_allowance();
+        }
+        lapsed
+    }
+
+    /// Returns the state that replaces `admission` once the staleness
+    /// allowance runs out before the writer attests the reader again, or
+    /// `None` when `admission` already refuses traffic.
+    ///
+    /// A reader serving a view that trails the writer reports that lag;
+    /// otherwise the writer has not answered in time, which is
+    /// `writer_status_unavailable`.
+    #[must_use]
+    pub fn lapsed_admission(admission: &ReadinessState) -> Option<ReadinessState> {
+        if !admission.cause.permits_traffic() {
+            return None;
+        }
+        let cause = if let ReadinessCause::ServingPairStale {
+            lag_chain_epochs, ..
+        } = admission.cause
+            && lag_chain_epochs > 0
+        {
+            ReadinessCause::ReplicaLagging { lag_chain_epochs }
+        } else {
+            ReadinessCause::WriterStatusUnavailable
+        };
+        Some(refusing(cause, admission.current_height))
     }
 }
 
-/// Completes at `deadline`, or never when there is none.
+/// Runs `refresh` to completion, and once `deadline` passes before it
+/// completes, replaces an admission state that still admits traffic with
+/// its [`WriterAttestation::lapsed_admission`].
 ///
-/// A reader's refresh loop selects on it beside its refresh interval, with
-/// [`WriterAttestation::stale_deadline`], so the staleness ceiling holds even
-/// when the interval is longer.
-pub async fn sleep_until_stale_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
+/// A reader runs every refresh through it with
+/// [`WriterAttestation::stale_deadline`], so a refresh that stalls past the
+/// staleness ceiling, such as one waiting on a writer that accepted its
+/// status call and never answers, cannot hold admission open past the
+/// ceiling. A deadline that has already passed ends admission before
+/// `refresh` first runs. A refusal `admission` holds is kept, an attestation
+/// the refresh makes moves the deadline, and a state the refresh publishes
+/// afterwards replaces the lapsed one.
+pub async fn refresh_within_stale_deadline<Refresh: Future>(
+    deadline: StaleDeadline,
+    admission: &ComposedReadiness,
+    refresh: Refresh,
+) -> Refresh::Output {
+    let mut refresh = std::pin::pin!(refresh);
+    tokio::select! {
+        biased;
+        () = deadline.passed() => {
+            admission.update_admission(|state| {
+                if let Some(lapsed) = WriterAttestation::lapsed_admission(state) {
+                    *state = lapsed;
+                }
+            });
+            refresh.await
+        }
+        output = &mut refresh => output,
     }
 }
 
@@ -532,10 +652,10 @@ mod tests {
         CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
         CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
         WriterAttestation, classify_canonical_writer_fence, compare_canonical_writer_fences,
-        converge_on_canonical_writer_fence, sleep_until_stale_deadline,
+        converge_on_canonical_writer_fence, refresh_within_stale_deadline,
         writer_attests_network_upgrade_schedule,
     };
-    use crate::{ReadinessCause, ReadinessState};
+    use crate::{ComposedReadiness, ReadinessCause, ReadinessState};
 
     const NETWORK: Network = Network::ZcashRegtest;
 
@@ -1365,7 +1485,7 @@ mod tests {
             Some(damaged.clone())
         );
         assert_eq!(attestation.stale_allowance(), None);
-        assert_eq!(attestation.stale_deadline(), None);
+        assert_eq!(attestation.stale_deadline().instant(), None);
         assert_eq!(attestation.remembered_halt(), Some(damaged.clone()));
 
         // A restarted writer that has not confirmed its tip keeps the
@@ -1403,34 +1523,183 @@ mod tests {
         );
     }
 
-    /// The deadline runs with the allowance, ends with it, and never names an
-    /// instant already past, so a refresh loop that selects on it cannot spin.
-    #[tokio::test]
-    async fn the_stale_deadline_ends_with_the_staleness_allowance()
+    /// The deadline outlasts the allowance until the reader ends it.
+    ///
+    /// It stays once it passes, so a reader that reaches its loop late still
+    /// ends admission at once, and it ends when the reader forgets the lapsed
+    /// attestation, so a refresh loop that selects on it cannot spin.
+    #[tokio::test(start_paused = true)]
+    async fn the_stale_deadline_outlasts_the_allowance_until_it_is_ended()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ceiling = Duration::from_millis(50);
+        let ceiling = Duration::from_secs(60);
         let mut attestation = WriterAttestation::new(NETWORK, ceiling);
-        assert_eq!(attestation.stale_deadline(), None);
+        assert_eq!(attestation.stale_deadline().instant(), None);
+        assert!(!attestation.end_lapsed_allowance());
 
         attestation.attest();
         let deadline = attestation
             .stale_deadline()
+            .instant()
             .ok_or("an attested reader has a deadline")?;
-        assert!(deadline.saturating_duration_since(tokio::time::Instant::now()) <= ceiling);
+        assert_eq!(deadline, tokio::time::Instant::now() + ceiling);
+        assert!(!attestation.end_lapsed_allowance());
 
-        sleep_until_stale_deadline(Some(deadline)).await;
+        tokio::time::advance(ceiling).await;
         assert_eq!(attestation.stale_allowance(), None);
-        assert_eq!(attestation.stale_deadline(), None);
+        assert_eq!(attestation.stale_deadline().instant(), Some(deadline));
+        attestation.stale_deadline().passed().await;
+        assert!(attestation.end_lapsed_allowance());
+        assert_eq!(attestation.stale_deadline().instant(), None);
         assert!(
             tokio::time::timeout(
-                Duration::from_millis(100),
-                sleep_until_stale_deadline(attestation.stale_deadline())
+                Duration::from_secs(3_600),
+                attestation.stale_deadline().passed()
             )
             .await
             .is_err(),
-            "a lapsed allowance must not schedule a refresh"
+            "a forgotten allowance must not schedule a refresh"
         );
         Ok(())
+    }
+
+    /// A refresh that stalls past the deadline cannot hold admission open:
+    /// the admitting state lapses at the deadline while the refresh still
+    /// waits, and the refresh still runs to completion.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_stalls_past_the_deadline_ends_admission_at_the_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = crate::Readiness::default();
+        let admission = ComposedReadiness::new(readiness.clone(), &[]);
+        admission.publish_admission(ReadinessState::serving_pair_stale(0, 30, Some(7)));
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_secs(60));
+        attestation.attest();
+        let refresh = tokio::spawn({
+            let admission = admission.clone();
+            let deadline = attestation.stale_deadline();
+            async move {
+                refresh_within_stale_deadline(
+                    deadline,
+                    &admission,
+                    tokio::time::sleep(Duration::from_secs(3_600)),
+                )
+                .await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        let before = readiness.report();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = readiness.report();
+        let finished_early = refresh.is_finished();
+        refresh.await?;
+
+        assert!(before.is_ready, "{:?}", before.cause);
+        assert!(!after.is_ready);
+        assert_eq!(after.cause, ReadinessCause::WriterStatusUnavailable);
+        assert_eq!(after.current_height, Some(7));
+        assert!(!finished_early, "the refresh still runs after the deadline");
+        Ok(())
+    }
+
+    /// A deadline that has already passed ends admission before the refresh
+    /// first runs.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_passed_deadline_ends_admission_before_the_refresh_runs() {
+        let readiness = crate::Readiness::default();
+        let admission = ComposedReadiness::new(readiness.clone(), &[]);
+        admission.publish_admission(ReadinessState::ready(Some(7)));
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_secs(60));
+        attestation.attest();
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        let admitted_when_refresh_ran =
+            refresh_within_stale_deadline(attestation.stale_deadline(), &admission, async {
+                readiness.report().is_ready
+            })
+            .await;
+
+        assert!(!admitted_when_refresh_ran);
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::WriterStatusUnavailable
+        );
+    }
+
+    /// A refresh that renews the attestation keeps admission open past the
+    /// deadline it started under, and the renewed deadline still holds.
+    #[tokio::test(start_paused = true)]
+    async fn an_attestation_the_refresh_makes_moves_its_deadline() {
+        let readiness = crate::Readiness::default();
+        let admission = ComposedReadiness::new(readiness.clone(), &[]);
+        admission.publish_admission(ReadinessState::ready(Some(7)));
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_secs(60));
+        attestation.attest();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        let started = tokio::time::Instant::now();
+        let deadline = attestation.stale_deadline();
+
+        let admission_seen = refresh_within_stale_deadline(deadline, &admission, async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            attestation.attest();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let past_first_deadline = readiness.report().is_ready;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            (past_first_deadline, readiness.report().is_ready)
+        })
+        .await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(85));
+        assert_eq!(admission_seen, (true, false));
+    }
+
+    /// An allowance that starts during a refresh that began without one
+    /// still ends that refresh's admission when it runs out.
+    #[tokio::test(start_paused = true)]
+    async fn an_allowance_the_refresh_starts_is_guarded_too() {
+        let readiness = crate::Readiness::default();
+        let admission = ComposedReadiness::new(readiness.clone(), &[]);
+        let mut attestation = WriterAttestation::new(NETWORK, Duration::from_secs(60));
+        let deadline = attestation.stale_deadline();
+
+        let admitted_after_ceiling = refresh_within_stale_deadline(deadline, &admission, async {
+            attestation.attest();
+            admission.publish_admission(ReadinessState::ready(Some(7)));
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            readiness.report().is_ready
+        })
+        .await;
+
+        assert!(!admitted_after_ceiling);
+    }
+
+    /// Lapsing keeps a refusal and reports the lag a stale view served.
+    #[test]
+    fn a_lapsed_admission_keeps_refusals_and_reports_lag() {
+        let damaged = ReadinessState::not_ready(ReadinessCause::CanonicalStoreDamaged {
+            height: Some(42),
+            pool: None,
+        });
+        assert_eq!(WriterAttestation::lapsed_admission(&damaged), None);
+        assert_eq!(
+            WriterAttestation::lapsed_admission(&ReadinessState::serving_pair_stale(
+                3,
+                30,
+                Some(7)
+            )),
+            Some(ReadinessState {
+                current_height: Some(7),
+                ..ReadinessState::not_ready(ReadinessCause::ReplicaLagging {
+                    lag_chain_epochs: 3
+                })
+            })
+        );
+        assert_eq!(
+            WriterAttestation::lapsed_admission(&ReadinessState::ready(Some(7))),
+            Some(ReadinessState {
+                current_height: Some(7),
+                ..ReadinessState::not_ready(ReadinessCause::WriterStatusUnavailable)
+            })
+        );
     }
 
     #[test]

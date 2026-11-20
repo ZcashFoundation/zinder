@@ -38,7 +38,7 @@ use zinder_runtime::{
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
     ComposedReadiness, Readiness, ReadinessCause, ReadinessState, WriterAttestation,
     classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
-    expected_writer_fence, sleep_until_stale_deadline,
+    expected_writer_fence, refresh_within_stale_deadline,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
@@ -186,8 +186,9 @@ impl WriterStatus {
         })
     }
 
-    /// Bounded, so a writer that accepts the call and never answers cannot
-    /// hold the publisher's refresh past its staleness ceiling.
+    /// Bounded by the wallet ingest-control request timeout, so a writer that
+    /// accepts the call and never answers cannot hold the publisher's refresh
+    /// open. Admission ends at the staleness ceiling meanwhile.
     async fn fetch(&mut self) -> Result<CanonicalWriterStatusResponse, Status> {
         self.client
             .writer_status(wallet_ingest_control_request(
@@ -293,13 +294,17 @@ impl CompactBlockPublisher {
         tokio::spawn(async move {
             loop {
                 // The staleness deadline holds the ceiling when the catch-up
-                // interval is longer than it.
+                // interval is longer than it, and admission ends at the
+                // deadline even while a refresh still runs.
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {}
-                    () = sleep_until_stale_deadline(self.writer_attestation.stale_deadline()) => {}
+                    () = self.writer_attestation.stale_deadline().passed() => {}
                 }
-                self.refresh().await;
+                let deadline = self.writer_attestation.stale_deadline();
+                let admission = self.readiness.composed.clone();
+                refresh_within_stale_deadline(deadline, &admission, self.refresh()).await;
+                self.writer_attestation.end_lapsed_allowance();
                 self.record_resource_gauges().await;
             }
             serving_drained.cancelled().await;
@@ -2776,6 +2781,108 @@ mod tests {
         drop(primary);
         let _ = shutdown_sender.send(());
         server.await??;
+        Ok(())
+    }
+
+    /// A writer-status read that stalls cannot hold admission past the
+    /// staleness ceiling.
+    ///
+    /// Each read waits until the wallet ingest-control bound ends it, so a
+    /// read is always in flight when the ceiling passes; the reader stops
+    /// admitting traffic at the ceiling instead of when that read ends.
+    #[tokio::test]
+    async fn a_stalled_writer_status_read_ends_admission_at_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_secs(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.stall();
+        tokio::time::pause();
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        let before_ceiling = readiness.report();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after_ceiling = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert!(before_ceiling.is_ready, "{:?}", before_ceiling.cause);
+        assert_eq!(after_ceiling.cause, ReadinessCause::WriterStatusUnavailable);
+        drop(slot);
+        drop(primary);
+        drop(shutdown_sender);
+        server.abort();
+        let _join_outcome = server.await;
+        Ok(())
+    }
+
+    /// A publisher that starts its loop after the ceiling has passed ends
+    /// admission at once instead of after its catch-up interval.
+    #[tokio::test]
+    async fn a_publisher_that_starts_after_the_staleness_ceiling_ends_admission_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+
+        control.stall();
+        tokio::time::pause();
+        tokio::time::advance(staleness_ceiling + Duration::from_secs(1)).await;
+        assert!(readiness.report().is_ready);
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let at_start = readiness.report();
+        cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert_eq!(at_start.cause, ReadinessCause::WriterStatusUnavailable);
+        drop(slot);
+        drop(primary);
+        drop(shutdown_sender);
+        server.abort();
+        let _join_outcome = server.await;
         Ok(())
     }
 

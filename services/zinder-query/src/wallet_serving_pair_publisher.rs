@@ -67,7 +67,7 @@ use zinder_runtime::{
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, ComposedReadiness,
     NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
     UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation, classify_canonical_writer_fence,
-    connect_zinder_grpc, converge_on_canonical_writer_fence, sleep_until_stale_deadline,
+    connect_zinder_grpc, converge_on_canonical_writer_fence, refresh_within_stale_deadline,
     writer_attests_network_upgrade_schedule,
 };
 use zinder_source::{
@@ -1144,11 +1144,13 @@ impl WalletServingPairPublisher {
     ///
     /// A refresh runs every catch-up interval, at once when a read first
     /// finds a pair missing a table file, and when the staleness ceiling
-    /// passes after the writer last attested the pair, so a catch-up interval
-    /// longer than the ceiling cannot keep admitting traffic past it. Every
-    /// refresh failure leaves the current immutable pair untouched and
-    /// updates readiness with its typed cause; it never falls back to a
-    /// primary store.
+    /// passes after the writer last attested the pair. Admission on an
+    /// unattested pair ends at the ceiling even while a refresh is still
+    /// running, and at once when the loop starts after it, so neither a
+    /// catch-up interval longer than the ceiling nor a stalled writer-status
+    /// read keeps admitting traffic past it. Every refresh failure leaves the
+    /// current immutable pair untouched and updates readiness with its typed
+    /// cause; it never falls back to a primary store.
     ///
     /// The task closes the publisher's secondaries on a blocking thread once
     /// `serving_runtime_drained` is cancelled, and fails when that teardown
@@ -1169,13 +1171,22 @@ impl WalletServingPairPublisher {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {}
                     () = missing_table_file_reported(signals.as_deref()) => {}
-                    () = sleep_until_stale_deadline(self.writer_attestation.stale_deadline()) => {}
+                    () = self.writer_attestation.stale_deadline().passed() => {}
                 }
-                self.refresh_and_record().await;
+                self.refresh_within_staleness_ceiling().await;
             }
             serving_runtime_drained.cancelled().await;
             tear_down_on_blocking_thread(self).await
         })
+    }
+
+    /// Refreshes, ending admission on the published pair once the staleness
+    /// ceiling of the last attestation passes before the refresh completes.
+    async fn refresh_within_staleness_ceiling(&mut self) {
+        let deadline = self.writer_attestation.stale_deadline();
+        let admission = self.readiness.composed.clone();
+        refresh_within_stale_deadline(deadline, &admission, self.refresh_and_record()).await;
+        self.writer_attestation.end_lapsed_allowance();
     }
 
     async fn refresh_and_record(&mut self) {
@@ -5408,6 +5419,161 @@ mod tests {
         Ok(())
     }
 
+    /// A writer-status read that stalls cannot hold admission past the
+    /// staleness ceiling.
+    ///
+    /// Each read waits until the wallet ingest-control bound ends it, so a
+    /// read is always in flight when the ceiling passes; the pair stops
+    /// admitting traffic at the ceiling instead of when that read ends.
+    #[tokio::test]
+    async fn a_stalled_writer_status_read_ends_admission_at_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let mut fixture =
+            StalenessFixture::bootstrap(Duration::from_secs(1), staleness_ceiling).await?;
+        fixture.control.stall();
+        tokio::time::pause();
+        let publisher_cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = fixture
+            .publisher
+            .take()
+            .ok_or("the fixture holds its publisher")?
+            .spawn(publisher_cancel.clone(), drained.clone());
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        let before_ceiling = fixture.readiness.report();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after_ceiling = fixture.readiness.report();
+        publisher_cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            crate::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert!(before_ceiling.is_ready, "{:?}", before_ceiling.cause);
+        assert_eq!(
+            after_ceiling.cause,
+            zinder_runtime::ReadinessCause::WriterStatusUnavailable
+        );
+        fixture.shutdown().await
+    }
+
+    /// A publisher that starts its loop after the ceiling has passed ends
+    /// admission at once instead of after its catch-up interval.
+    #[tokio::test]
+    async fn a_publisher_that_starts_after_the_staleness_ceiling_ends_admission_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_mins(1);
+        let mut fixture =
+            StalenessFixture::bootstrap(Duration::from_hours(1), staleness_ceiling).await?;
+        fixture.control.stall();
+        tokio::time::pause();
+        tokio::time::advance(staleness_ceiling + Duration::from_secs(1)).await;
+        assert!(fixture.readiness.report().is_ready);
+        let publisher_cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = fixture
+            .publisher
+            .take()
+            .ok_or("the fixture holds its publisher")?
+            .spawn(publisher_cancel.clone(), drained.clone());
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let at_start = fixture.readiness.report();
+        publisher_cancel.cancel();
+        drained.cancel();
+        tokio::time::timeout(
+            crate::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 4,
+            publisher_task,
+        )
+        .await???;
+        tokio::time::resume();
+
+        assert_eq!(
+            at_start.cause,
+            zinder_runtime::ReadinessCause::WriterStatusUnavailable
+        );
+        fixture.shutdown().await
+    }
+
+    /// A bootstrapped publisher over a writer-status server the test controls.
+    struct StalenessFixture {
+        _temporary: TempDir,
+        _canonical_primary: RocksDbCanonicalStore,
+        control: MutableCanonicalControl,
+        readiness: zinder_runtime::Readiness,
+        publisher: Option<WalletServingPairPublisher>,
+        _slot: WalletServingPairSlot,
+        server_cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl StalenessFixture {
+        async fn bootstrap(
+            catchup_interval: Duration,
+            staleness_ceiling: Duration,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let activations = lifecycle_upgrade_activations()?;
+            let canonical_primary_path = temporary.path().join("canonical-primary");
+            let wallet_primary_path = temporary.path().join("wallet-primary");
+            let canonical_primary =
+                build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+            build_wallet_from_canonical(
+                &canonical_primary,
+                &wallet_primary_path,
+                RocksDbWalletBuildOptions {
+                    supported_reorg_depth: 100,
+                    ..RocksDbWalletBuildOptions::for_local_tests()
+                },
+            )?;
+            let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+            let (endpoint, server_cancel, server_task) =
+                serve_canonical_control(control.clone()).await?;
+            let readiness = zinder_runtime::Readiness::default();
+            let mut config = wallet_serving_pair_config(
+                canonical_primary_path,
+                temporary.path().join("canonical-secondaries"),
+                wallet_primary_path,
+                temporary.path().join("wallet-secondaries"),
+            )?;
+            config.catchup_interval = catchup_interval;
+            config.serving_pair_staleness_ceiling = staleness_ceiling;
+            let (publisher, slot) =
+                WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                    config,
+                    WalletServingReadiness::pair_only(readiness.clone()),
+                    &endpoint,
+                    None,
+                )
+                .await?;
+            if !readiness.report().is_ready {
+                return Err("bootstrap must admit traffic".into());
+            }
+            Ok(Self {
+                _temporary: temporary,
+                _canonical_primary: canonical_primary,
+                control,
+                readiness,
+                publisher: Some(publisher),
+                _slot: slot,
+                server_cancel,
+                server_task,
+            })
+        }
+
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.server_cancel.cancel();
+            self.server_task.abort();
+            let _join_outcome = self.server_task.await;
+            Ok(())
+        }
+    }
+
     /// The serving pair refuses a parked writer with its halt.
     ///
     /// A parked writer keeps attesting its frozen fence, so the publisher
@@ -8606,6 +8772,8 @@ mod tests {
         /// answers with an outage.
         queued: Arc<Mutex<std::collections::VecDeque<Option<CanonicalWriterStatusResponse>>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
+        /// Accepts each writer-status call and never answers it.
+        stalled: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MutableCanonicalControl {
@@ -8614,7 +8782,13 @@ mod tests {
                 writer_status: Arc::new(Mutex::new(writer_status)),
                 queued: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        fn stall(&self) {
+            self.stalled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -8638,6 +8812,9 @@ mod tests {
             &self,
             _request: Request<CanonicalWriterStatusRequest>,
         ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
+            if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Status::unavailable("fixture writer status outage"));
             }
