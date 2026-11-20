@@ -1,10 +1,10 @@
 # Native compact-block scan experiment
 
-A wallet that scans shielded pools can omit transparent inputs and outputs from its downloads. A second option is to send an extra public Pallas point for each Orchard and Ironwood action so a wallet can reduce the work of trial decryption. This experiment measures the two options independently on the native Zinder compact-block format. Both encodings are experimental.
+A wallet that scans shielded pools can omit transparent inputs and outputs from its downloads. A second option is to send an extra public Pallas point for each Orchard and Ironwood action so a wallet can reduce the work of trial decryption. This experiment measures the two options independently on the native Zinder compact-block format. Both encodings are experimental. [Ztreamer’s shifted-key implementation](https://github.com/zcashlabs/ztreamer/pull/382) describes the point and its cost per action.
 
 ## Replaying a range
 
-The exporter opens a read-only secondary of a wallet-serving Testnet canonical store with the default reorg window, retained transactions, and a recorded upgrade schedule. It checks the height and parent hash of each block. To repeat the mixed-range measurement, run:
+The exporter opens a read-only secondary of a wallet-serving Testnet canonical store with the default reorg window, retained transactions, and a recorded upgrade schedule. It checks the height and parent hash of each block. This command repeats the mixed-range measurement.
 
 ```sh
 cargo run --locked --release -p wallet-scan-experiment --bin export-wallet-scan-corpus -- \
@@ -26,7 +26,7 @@ On the 19,990-block range, omitting transparent data saved 16.0%. Including hint
 
 The exporter measures the uncompressed protobuf stream item for each block. The shielded projection preserves block identity, tree sizes, and the original index of each retained transaction. It drops transactions with no shielded fields. For each canonically encoded, nonidentity Orchard or Ironwood EPK, the exporter computes the compressed point `[2^64]EPK` and appends it as a 32-byte length-delimited experimental action field. Field 5 is local to this experiment. The original EPK is retained. Each extended stream item must decode to the same shielded projection with the current native schema.
 
-The counts exclude range headers, gRPC framing, compression, TLS, and wallet processing. The [raw results](evidence/native-payloads.json) include source heights, hashes, corpus digests, and seven timings of point derivation on a single logical CPU of a shared Ryzen 9 9950X. Derivation timing includes point decoding, 64 doublings, and re-encoding inside the exporter. It excludes database reads and stream encoding. These timings do not measure server capacity.
+The counts exclude range headers, gRPC framing, compression, TLS, and wallet processing. The [raw results](evidence/native-payloads.json) include source heights, hashes, corpus digests, and seven timings of point derivation on a single logical CPU of a shared Ryzen 9 9950X. Derivation timing includes point decoding, 64 doublings, and re-encoding inside the exporter. It excludes database reads and stream encoding. Estimating server capacity requires a concurrent serving workload.
 
 ## Corpus format
 
