@@ -86,7 +86,7 @@ jobs:
 
       - name: Test qualification serving
         run: >-
-          cargo nextest run --profile=ci -p zinder-compat-lightwalletd -p zinder-ingest
+          cargo nextest run --profile=ci -p zinder-compat-lightwalletd -p zinder-ingest -p zinder-query
           --features light-wallet-qualification -E 'test(qualification)'
 
       - name: Test (PostgreSQL driver)
