@@ -77,6 +77,19 @@ impl CompactBlockShape {
         Ok(selected)
     }
 
+    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
+        let selected = Self::for_range(pool_types)?;
+        if !selected.sapling && !selected.orchard && !selected.ironwood {
+            // lightwalletd removes transparent first, then defaults an empty list to all shielded pools.
+            return Ok(Self::NULLIFIERS);
+        }
+        Ok(Self {
+            transparent: false,
+            payload: Payload::Nullifiers,
+            ..selected
+        })
+    }
+
     pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
         Ok(Self {
             payload: Payload::Mempool,

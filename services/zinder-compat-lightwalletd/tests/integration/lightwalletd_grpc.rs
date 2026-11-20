@@ -2703,6 +2703,61 @@ async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fi
     Ok(())
 }
 
+#[tokio::test]
+async fn nullifier_range_pool_selection_matches_reference_transactions() -> eyre::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        pool_types: Vec<i32>,
+        transaction_hex: String,
+    }
+
+    // Go lightwalletd v0.6.2 produced these CompactTx bytes from the mixed-pool
+    // transaction in acceptance_store_fixture through its GetBlockRangeNullifiers handler.
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "fixtures/lightwalletd-v0.6.2-nullifier-pools.json"
+    ))?;
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+    for case in cases {
+        let request = lightwalletd::BlockRange {
+            pool_types: case.pool_types.clone(),
+            ..block_range_request(1, 1)
+        };
+        let stream = adapter
+            .get_block_range_nullifiers(Request::new(request))
+            .await?
+            .into_inner();
+        let blocks = collect_stream(stream).await?;
+        let [block] = blocks.as_slice() else {
+            return Err(eyre!("expected one block for {:?}", case.pool_types));
+        };
+        let [transaction] = block.vtx.as_slice() else {
+            return Err(eyre!(
+                "expected one matching transaction for {:?}",
+                case.pool_types
+            ));
+        };
+        assert!(block.chain_metadata.is_none());
+        assert_eq!(
+            hex::encode(prost::Message::encode_to_vec(transaction)),
+            case.transaction_hex,
+            "requested pools {:?}",
+            case.pool_types
+        );
+    }
+    for invalid in [lightwalletd::PoolType::Invalid as i32, 99] {
+        let request = lightwalletd::BlockRange {
+            pool_types: vec![lightwalletd::PoolType::Ironwood as i32, invalid],
+            ..block_range_request(1, 1)
+        };
+        let result = adapter
+            .get_block_range_nullifiers(Request::new(request))
+            .await;
+        assert!(matches!(result, Err(status) if status.code() == Code::InvalidArgument));
+    }
+    Ok(())
+}
+
 /// Asserts one nullifiers-only compact block carries only shielded nullifiers
 /// and has every excluded field cleared.
 fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre::Result<()> {
