@@ -802,9 +802,13 @@ fn resolve_raw_blob_policy(
 ) -> Result<RawBlobPolicy, ConfigError> {
     match (coverage, configured_policy) {
         (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
-        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => Err(ConfigError::invalid(
-            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
-        )),
+        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None))
+            if !cfg!(feature = "light-wallet-qualification") =>
+        {
+            Err(ConfigError::invalid(
+                "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
+            ))
+        }
         (_, Some(raw_blob_policy)) => Ok(raw_blob_policy),
         (_, None) => Ok(DEFAULT_RAW_BLOB_POLICY),
     }

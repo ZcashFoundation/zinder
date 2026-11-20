@@ -20,7 +20,7 @@ use zinder_source::{
     BroadcastNodeProbe, NodeCapability, NodeSet, NodeSetSwitch, NodeTarget, SourceError,
     SourceFailureClass, TransactionBroadcaster, ZebraJsonRpcSource,
 };
-use zinder_store::CanonicalActivationSchedule;
+use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
 
 use crate::{
     UpstreamNodeCapabilities, WalletServingPairSlot, WalletServingReadPair,
@@ -208,7 +208,7 @@ impl<Source> OrderedBroadcaster<Source> {
                 .is_some_and(|verification| {
                     !verification.table_agrees_through(
                         pair.network_upgrade_activations(),
-                        broadcast_height(pair),
+                        broadcast_height(pair.canonical_fence()),
                     )
                 })
     }
@@ -225,6 +225,26 @@ impl<Source> OrderedBroadcaster<Source> {
 }
 
 impl OrderedBroadcaster<ZebraJsonRpcSource> {
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) async fn verify_primary_for_canonical(
+        &self,
+        reader: &dyn crate::CanonicalReader,
+    ) -> Result<(), SourceError> {
+        let schedule =
+            reader
+                .network_upgrade_schedule()
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "canonical reader has no admitted upgrade schedule",
+                })?;
+        let target = Arc::new(VerificationTarget::new(
+            reader.event_fence(),
+            schedule.activations(),
+            Some(schedule.revision()),
+        ));
+        self.inner.verifications.track(&target);
+        self.verify_against(0, &target).await
+    }
+
     /// Builds the JSON-RPC source of `primary`, position 0, and of every
     /// fallback target after it, without contacting any node.
     ///
@@ -1009,22 +1029,31 @@ pub(crate) struct VerificationBasis {
 
 impl VerificationBasis {
     pub(crate) fn of(pair: &WalletServingReadPair) -> Self {
-        Self {
-            schedule_revision: pair
-                .canonical()
+        Self::new(
+            pair.canonical()
                 .network_upgrade_schedule()
                 .map(CanonicalActivationSchedule::revision),
-            broadcast_branch: pair
-                .network_upgrade_activations()
-                .consensus_branch_id_at(broadcast_height(pair)),
+            pair.network_upgrade_activations(),
+            broadcast_height(pair.canonical_fence()),
+        )
+    }
+
+    fn new(
+        schedule_revision: Option<u64>,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> Self {
+        Self {
+            schedule_revision,
+            broadcast_branch: activations.consensus_branch_id_at(height),
         }
     }
 }
 
 /// Returns the height of the block a transaction broadcast now targets, the
 /// one after the pair's visible tip.
-fn broadcast_height(pair: &WalletServingReadPair) -> BlockHeight {
-    let tip_height = pair.canonical_fence().visible_tip().height;
+fn broadcast_height(fence: CanonicalEventFence) -> BlockHeight {
+    let tip_height = fence.visible_tip().height;
     tip_height.next().unwrap_or(tip_height)
 }
 
@@ -1042,12 +1071,27 @@ struct VerificationTarget {
 
 impl VerificationTarget {
     fn of(pair: &WalletServingReadPair) -> Self {
+        Self::new(
+            pair.canonical_fence(),
+            pair.network_upgrade_activations(),
+            pair.canonical()
+                .network_upgrade_schedule()
+                .map(CanonicalActivationSchedule::revision),
+        )
+    }
+
+    fn new(
+        fence: CanonicalEventFence,
+        activations: &NetworkUpgradeActivations,
+        revision: Option<u64>,
+    ) -> Self {
+        let broadcast_height = broadcast_height(fence);
         Self {
-            basis: VerificationBasis::of(pair),
-            admitted_activations: pair.network_upgrade_activations().clone(),
-            broadcast_height: broadcast_height(pair),
-            chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
-            visible_tip: pair.canonical_fence().visible_tip(),
+            basis: VerificationBasis::new(revision, activations, broadcast_height),
+            admitted_activations: activations.clone(),
+            broadcast_height,
+            chain_epoch_id: fence.chain_epoch_id(),
+            visible_tip: fence.visible_tip(),
             captured_at: Instant::now(),
         }
     }

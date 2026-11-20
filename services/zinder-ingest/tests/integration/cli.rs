@@ -823,6 +823,7 @@ fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result
     Ok(())
 }
 
+#[cfg(not(feature = "light-wallet-qualification"))]
 #[test]
 fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
@@ -839,6 +840,30 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
         &[],
         "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"",
     )
+}
+
+#[cfg(feature = "light-wallet-qualification")]
+#[test]
+fn qualification_accepts_wallet_coverage_without_transaction_blobs() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
+        "[storage]\n",
+        "[storage]\nraw_blob_policy = \"none\"\n",
+        1,
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
+
+    Ok(())
 }
 
 #[test]

@@ -164,8 +164,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         requested_serving = lightwalletd_config.serving.as_str(),
         "resolved compatibility serving configuration"
     );
-    if lightwalletd_config.serving == CompatServing::CompactBlocks {
-        return run_compact_blocks(lightwalletd_config).await;
+    if lightwalletd_config.serving != CompatServing::Wallet {
+        return run_canonical(lightwalletd_config).await;
     }
     let Some(wallet_primary_path) = lightwalletd_config.wallet_primary_path.clone() else {
         return Err(LightwalletdConfigError::Config(
@@ -317,22 +317,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let serving_pair_publisher_handle =
         serving_pair_publisher.spawn(cancel.clone(), runtime.serving_drained());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "wallet").set(1.0);
-    let mempool_surface = Arc::new({
-        let mut surface =
-            IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
-        if let Some(token) = lightwalletd_config.ingest_control_bearer_token.clone() {
-            surface = surface.with_bearer_token(token);
-        }
-        surface
-    });
-    let (tip_change_watcher, tip_publisher_handle) = spawn_ingest_control_tip_change_publisher(
-        lightwalletd_config.ingest_control_addr.clone(),
-        lightwalletd_config.ingest_control_bearer_token.clone(),
-        cancel.clone(),
-    );
-    let grpc_adapter = grpc_adapter
-        .with_mempool_surface(mempool_surface)
-        .with_tip_change_watcher(tip_change_watcher);
+    let (grpc_adapter, tip_publisher_handle) =
+        with_ingest_mempool(grpc_adapter, &lightwalletd_config, &cancel);
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -389,23 +375,81 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     Ok(runtime_outcome?)
 }
 
+fn with_ingest_mempool<Query>(
+    grpc_adapter: LightwalletdGrpcAdapter<Query>,
+    lightwalletd_config: &config::LightwalletdConfig,
+    cancel: &CancellationToken,
+) -> (LightwalletdGrpcAdapter<Query>, tokio::task::JoinHandle<()>) {
+    let mempool_surface = Arc::new({
+        let mut surface =
+            IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
+        if let Some(token) = lightwalletd_config.ingest_control_bearer_token.clone() {
+            surface = surface.with_bearer_token(token);
+        }
+        surface
+    });
+    let (tip_change_watcher, tip_publisher_handle) = spawn_ingest_control_tip_change_publisher(
+        lightwalletd_config.ingest_control_addr.clone(),
+        lightwalletd_config.ingest_control_bearer_token.clone(),
+        cancel.clone(),
+    );
+    let grpc_adapter = grpc_adapter
+        .with_mempool_surface(mempool_surface)
+        .with_tip_change_watcher(tip_change_watcher);
+
+    (grpc_adapter, tip_publisher_handle)
+}
+
+enum CanonicalComposition {
+    CompactBlocks,
+    #[cfg(feature = "light-wallet-qualification")]
+    Qualification {
+        source: Box<ZebraJsonRpcSource>,
+        ingest: AdmittedIngestControl,
+        poll_interval: std::time::Duration,
+    },
+}
+
+impl CanonicalComposition {
+    async fn admit(config: &config::LightwalletdConfig) -> Result<Self, LightwalletdConfigError> {
+        match config.serving {
+            #[cfg(feature = "light-wallet-qualification")]
+            CompatServing::LightWalletQualification => {
+                let target = config.broadcaster.as_ref().ok_or_else(|| {
+                    zinder_runtime::ConfigError::invalid(
+                        "light-wallet qualification requires [node]",
+                    )
+                })?;
+                let source = ZebraJsonRpcSource::from_node_target(target)
+                    .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?;
+                let ingest = AdmittedIngestControl::connect(
+                    &config.ingest_control_addr,
+                    config.ingest_control_bearer_token.as_ref(),
+                    config.network,
+                )
+                .await?;
+                let poll_interval = target.health.as_ref().map_or_else(
+                    || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
+                    |health| health.poll_interval,
+                );
+                Ok(Self::Qualification {
+                    source: Box::new(source),
+                    ingest,
+                    poll_interval,
+                })
+            }
+            CompatServing::CompactBlocks | CompatServing::Wallet => Ok(Self::CompactBlocks),
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "The compact serving branch keeps admission, readiness, server startup, and shutdown ordering auditable in one linear composition root."
 )]
-async fn run_compact_blocks(
+async fn run_canonical(
     lightwalletd_config: config::LightwalletdConfig,
 ) -> Result<(), LightwalletdConfigError> {
-    if lightwalletd_config.wallet_primary_path.is_some()
-        || lightwalletd_config.wallet_secondary_root.is_some()
-        || lightwalletd_config.wallet_rocksdb_budget.is_some()
-    {
-        return Err(LightwalletdConfigError::Config(
-            zinder_runtime::ConfigError::invalid(
-                "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb",
-            ),
-        ));
-    }
     if lightwalletd_config.ops_listen_addr.is_some() {
         install_metrics_recorder_for_service(
             RuntimeService::CompatLightwalletd,
@@ -415,7 +459,16 @@ async fn run_compact_blocks(
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
-    let serving_readiness = compact_block_serving::CompactServingReadiness::new(readiness.clone());
+    let composition = CanonicalComposition::admit(&lightwalletd_config).await?;
+    let serving_readiness = match &composition {
+        #[cfg(feature = "light-wallet-qualification")]
+        CanonicalComposition::Qualification { .. } => {
+            compact_block_serving::CompactServingReadiness::for_qualification(readiness.clone())
+        }
+        CanonicalComposition::CompactBlocks => {
+            compact_block_serving::CompactServingReadiness::new(readiness.clone())
+        }
+    };
     let start_api_phase = StartupPhase::StartApi.start();
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let (publisher, slot) = compact_block_serving::CompactBlockPublisher::bootstrap(
@@ -447,13 +500,6 @@ async fn run_compact_blocks(
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
-    let grpc_adapter = zinder_compat_lightwalletd::CompactBlocksGrpcAdapter::new(slot)
-        .with_max_concurrent_block_range_streams(
-            lightwalletd_config.max_concurrent_block_range_streams,
-        )
-        .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
-        .with_node_tip_witness(node_tip_witness)
-        .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -464,12 +510,86 @@ async fn run_compact_blocks(
     )
     .await?;
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
-    let publisher_handle = publisher.spawn(cancel.clone(), runtime.serving_drained());
-    metrics::gauge!("zinder_compat_serving_info", "serving" => "compact-blocks").set(1.0);
+    let tasks = CompactBlocksServingTasks {
+        compact_block_publisher: publisher.spawn(cancel.clone(), runtime.serving_drained()),
+        node_tip_witness: node_tip_witness_handle,
+        operations: ops_handle,
+    }
+    .supervised();
+    let (server, tasks) = match composition {
+        #[cfg(feature = "light-wallet-qualification")]
+        CanonicalComposition::Qualification {
+            source,
+            ingest,
+            poll_interval,
+        } => {
+            let source = *source;
+            let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
+                slot,
+                source.clone(),
+                lightwalletd_config
+                    .tree_state_replay_wait
+                    .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAIT),
+                lightwalletd_config
+                    .tree_state_replay_waiters_per_slot
+                    .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT),
+            )
+            .with_max_concurrent_block_range_streams(
+                lightwalletd_config.max_concurrent_block_range_streams,
+            )
+            .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+            .with_node_tip_witness(node_tip_witness)
+            .with_ping(configured_ping(&lightwalletd_config, &cancel));
+            let (adapter, tip_publisher) =
+                with_ingest_mempool(adapter, &lightwalletd_config, &cancel);
+            let probe = zinder_query::spawn_qualification_dependency_probe(
+                source,
+                ingest,
+                serving_readiness.dependencies(),
+                (
+                    poll_interval,
+                    lightwalletd_config.storage.secondary_catchup_interval,
+                ),
+                cancel.clone(),
+            );
+            (
+                browser_transport::serve(
+                    &runtime,
+                    adapter.into_server(),
+                    incoming,
+                    &lightwalletd_config,
+                    &readiness,
+                )?,
+                tasks
+                    .with("qualification dependency probe", probe)
+                    .with("tip-change publisher", tip_publisher),
+            )
+        }
+        CanonicalComposition::CompactBlocks => {
+            let grpc_adapter = zinder_compat_lightwalletd::CompactBlocksGrpcAdapter::new(slot)
+                .with_max_concurrent_block_range_streams(
+                    lightwalletd_config.max_concurrent_block_range_streams,
+                )
+                .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+                .with_node_tip_witness(node_tip_witness)
+                .with_ping(configured_ping(&lightwalletd_config, &cancel));
+            (
+                browser_transport::serve(
+                    &runtime,
+                    grpc_adapter.into_server(),
+                    incoming,
+                    &lightwalletd_config,
+                    &readiness,
+                )?,
+                tasks,
+            )
+        }
+    };
+    metrics::gauge!("zinder_compat_serving_info", "serving" => lightwalletd_config.serving.as_str()).set(1.0);
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_started",
-        serving = "compact-blocks",
+        serving = lightwalletd_config.serving.as_str(),
         network = encode_zinder_native_chain_name(lightwalletd_config.network),
         %listen_addr,
         visible_height = ?visible_height,
@@ -482,31 +602,15 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let server = browser_transport::serve(
-        &runtime,
-        grpc_adapter.into_server(),
-        incoming,
-        &lightwalletd_config,
-        &serving_readiness.runtime(),
-    )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     let runtime_outcome = runtime
-        .supervise(
-            server,
-            CompactBlocksServingTasks {
-                compact_block_publisher: publisher_handle,
-                node_tip_witness: node_tip_witness_handle,
-                operations: ops_handle,
-            }
-            .supervised(),
-            || serving_readiness.publish_shutting_down(),
-        )
+        .supervise(server, tasks, || serving_readiness.publish_shutting_down())
         .await;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_stopped",
-        serving = "compact-blocks",
+        serving = lightwalletd_config.serving.as_str(),
         "lightwalletd-compatible gRPC server stopped"
     );
     Ok(runtime_outcome?)

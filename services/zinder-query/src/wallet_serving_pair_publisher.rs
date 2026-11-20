@@ -841,22 +841,27 @@ fn publish_wallet_node_observation(
     observation: Result<UpstreamHealthSnapshot, NodeFailure>,
     outage: &mut Option<WalletNodeOutage>,
 ) {
+    readiness.publish_node_source_cause(node_observation_cause(observation, outage));
+}
+
+fn node_observation_cause(
+    observation: Result<UpstreamHealthSnapshot, NodeFailure>,
+    outage: &mut Option<WalletNodeOutage>,
+) -> ReadinessCause {
     match observation {
         Ok(snapshot) if snapshot.ready_for_queries => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::Ready);
+            ReadinessCause::Ready
         }
         Ok(snapshot) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::UpstreamNotReady(
-                upstream_not_ready_detail(snapshot),
-            ));
+            ReadinessCause::UpstreamNotReady(upstream_not_ready_detail(snapshot))
         }
         Err(NodeFailure::CapabilityMissing(capability)) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::NodeCapabilityMissing {
+            ReadinessCause::NodeCapabilityMissing {
                 capability: capability.name(),
-            });
+            }
         }
         Err(NodeFailure::Unavailable {
             failure_class,
@@ -864,12 +869,52 @@ fn publish_wallet_node_observation(
         }) => {
             let continued =
                 WalletNodeOutage::continue_with(outage.as_ref(), failure_class, &reason);
-            readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
-                continued.detail.clone(),
-            ));
+            let cause = ReadinessCause::NodeUnavailable(continued.detail.clone());
             *outage = Some(continued);
+            cause
         }
     }
+}
+
+/// Observes a qualification endpoint's node and ingest control as degraded dependencies.
+#[cfg(feature = "light-wallet-qualification")]
+pub fn spawn_qualification_dependency_probe(
+    source: zinder_source::ZebraJsonRpcSource,
+    ingest: AdmittedIngestControl,
+    readiness: ComposedReadiness,
+    intervals: (Duration, Duration),
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let watch_node = async {
+            let mut outage = None;
+            loop {
+                let observation = probe_wallet_node_readiness(&source)
+                    .await
+                    .map_err(|error| NodeFailure::from(&error));
+                readiness.publish_input(
+                    ReadinessInput::NodeSource,
+                    node_observation_cause(observation, &mut outage),
+                );
+                tokio::time::sleep(intervals.0).await;
+            }
+        };
+        let watch_ingest = async {
+            let mut observer = IngestControlObserver::default();
+            loop {
+                readiness.publish_input(
+                    ReadinessInput::IngestControl,
+                    observer.observe(&ingest).await,
+                );
+                tokio::time::sleep(intervals.1).await;
+            }
+        };
+        tokio::select! {
+            () = cancel.cancelled() => {}
+            () = watch_node => {}
+            () = watch_ingest => {}
+        }
+    })
 }
 
 async fn probe_wallet_node_readiness(

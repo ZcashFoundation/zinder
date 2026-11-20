@@ -1,5 +1,8 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
+#[cfg(feature = "light-wallet-qualification")]
+pub(crate) mod qualification;
+
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -320,6 +323,144 @@ where
     }
 }
 
+impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
+    /// Answers a `GetTransaction` whose canonical read missed from the live
+    /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
+    ///
+    /// A pending transaction is returned at height 0, the protocol's
+    /// "in the mempool" sentinel. A deployment without a mempool surface keeps
+    /// `canonical_miss`, and so does a mempool miss after a canonical read
+    /// that searched the chain of the same epoch. A mempool miss at another
+    /// epoch is `UNAVAILABLE`, because the transaction may have been mined
+    /// into a block this replica has not applied yet. A mempool failure is
+    /// returned instead of `canonical_miss`, because the transaction may be
+    /// pending.
+    async fn pending_transaction(
+        &self,
+        transaction_id: TransactionId,
+        canonical_miss: CanonicalTransactionMiss,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let Some(mempool_surface) = self.mempool_surface.as_ref() else {
+            return Err(canonical_miss.into_status());
+        };
+        let lookup = mempool_surface
+            .mempool_transaction(transaction_id)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        match (lookup, canonical_miss) {
+            (MempoolTransactionLookup::Pending(entry), _) => Ok(mempool_raw_transaction(&entry)),
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) if chain_epoch_id == at_epoch_id => {
+                Err(CanonicalTransactionMiss::NotInChain { at_epoch_id }.into_status())
+            }
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) => Err(Status::unavailable(format!(
+                "the live mempool answered at chain epoch {} but this replica read chain epoch {}; retry",
+                chain_epoch_id.value(),
+                at_epoch_id.value(),
+            ))),
+            (
+                MempoolTransactionLookup::Absent { .. },
+                CanonicalTransactionMiss::BelowHistoryFloor(history_floor),
+            ) => Err(history_floor),
+        }
+    }
+
+    async fn mempool_transactions(
+        &self,
+        request: Request<lightwalletd::GetMempoolTxRequest>,
+    ) -> Result<Response<GrpcStream<lightwalletd::CompactTx>>, Status> {
+        let request = request.into_inner();
+        validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
+        let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
+        let mut exclusions = (!request.exclude_txid_suffixes.is_empty())
+            .then(|| MempoolExclusions::new(request.exclude_txid_suffixes));
+        let mut compact_messages = Vec::new();
+        while let Some(entry_outcome) = entries.next().await {
+            let entry = entry_outcome?.into_parts();
+            if let Some(exclusions) = &mut exclusions {
+                exclusions.observe(entry.transaction_id);
+            }
+            if let Some(message) = shape.encode_transaction(CompactTransaction {
+                index: 0,
+                transaction_id: entry.transaction_id,
+                data: entry.compact_transaction_data,
+            })? {
+                compact_messages.push(message);
+            }
+        }
+        let messages = compact_messages
+            .into_iter()
+            .filter(move |message| {
+                exclusions
+                    .as_ref()
+                    .is_none_or(|exclusions| !exclusions.uniquely_matches(&message.txid))
+            })
+            .map(Ok);
+        Ok(Response::new(Box::pin(stream::iter(messages))))
+    }
+
+    async fn mempool_stream(
+        &self,
+    ) -> Result<Response<GrpcStream<lightwalletd::RawTransaction>>, Status> {
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        // Deliver the current mempool contents from the snapshot walk, then
+        // continue with events strictly after the walk's resume anchor. The
+        // anchor hands off at-least-once: a transaction admitted mid-walk may
+        // appear both in a later page and as an event, and an evicted
+        // transaction may be added again. lightwalletd sends each txid once
+        // per block interval, so the stream drops txids it already sent.
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let snapshot_chain_epoch_id = first_page.chain_epoch_id;
+        let event_stream = mempool_surface
+            .mempool_events(first_page.events_resume_cursor.clone())
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
+            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
+        );
+        let raw_transaction_stream = each_once_up_to(
+            entry_stream,
+            zinder_core::MempoolEntry::transaction_id,
+            MAX_MEMPOOL_STREAM_TRANSACTIONS,
+        )
+        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
+
+        let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
+            if let Some(watcher) = self.tip_change_watcher.clone() {
+                Box::pin(close_mempool_stream_on_tip_change(
+                    raw_transaction_stream,
+                    watcher,
+                    snapshot_chain_epoch_id,
+                ))
+            } else {
+                Box::pin(raw_transaction_stream)
+            };
+        Ok(Response::new(bounded_stream))
+    }
+}
+
 /// Wallet serving reads through its query at the serving pair the query
 /// captures.
 ///
@@ -525,52 +666,6 @@ where
             merge.add_address(address, outputs).await?;
         }
         Ok(merge)
-    }
-
-    /// Answers a `GetTransaction` whose canonical read missed from the live
-    /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
-    ///
-    /// A pending transaction is returned at height 0, the protocol's
-    /// "in the mempool" sentinel. A deployment without a mempool surface keeps
-    /// `canonical_miss`, and so does a mempool miss after a canonical read
-    /// that searched the chain of the same epoch. A mempool miss at another
-    /// epoch is `UNAVAILABLE`, because the transaction may have been mined
-    /// into a block this replica has not applied yet. A mempool failure is
-    /// returned instead of `canonical_miss`, because the transaction may be
-    /// pending.
-    async fn pending_transaction(
-        &self,
-        transaction_id: TransactionId,
-        canonical_miss: CanonicalTransactionMiss,
-    ) -> Result<lightwalletd::RawTransaction, Status> {
-        let Some(mempool_surface) = self.mempool_surface.as_ref() else {
-            return Err(canonical_miss.into_status());
-        };
-        let lookup = mempool_surface
-            .mempool_transaction(transaction_id)
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        match (lookup, canonical_miss) {
-            (MempoolTransactionLookup::Pending(entry), _) => Ok(mempool_raw_transaction(&entry)),
-            (
-                MempoolTransactionLookup::Absent { chain_epoch_id },
-                CanonicalTransactionMiss::NotInChain { at_epoch_id },
-            ) if chain_epoch_id == at_epoch_id => {
-                Err(CanonicalTransactionMiss::NotInChain { at_epoch_id }.into_status())
-            }
-            (
-                MempoolTransactionLookup::Absent { chain_epoch_id },
-                CanonicalTransactionMiss::NotInChain { at_epoch_id },
-            ) => Err(Status::unavailable(format!(
-                "the live mempool answered at chain epoch {} but this replica read chain epoch {}; retry",
-                chain_epoch_id.value(),
-                at_epoch_id.value(),
-            ))),
-            (
-                MempoolTransactionLookup::Absent { .. },
-                CanonicalTransactionMiss::BelowHistoryFloor(history_floor),
-            ) => Err(history_floor),
-        }
     }
 
     /// Starts reading the mined history `filter` selects at the visible
@@ -877,44 +972,7 @@ where
         &self,
         request: Request<lightwalletd::GetMempoolTxRequest>,
     ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-        let request = request.into_inner();
-        validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
-        let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
-        let mempool_surface = self
-            .mempool_surface
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
-            .clone();
-        let first_page = mempool_surface
-            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-        let mut exclusions = (!request.exclude_txid_suffixes.is_empty())
-            .then(|| MempoolExclusions::new(request.exclude_txid_suffixes));
-        let mut compact_messages = Vec::new();
-        while let Some(entry_outcome) = entries.next().await {
-            let entry = entry_outcome?.into_parts();
-            if let Some(exclusions) = &mut exclusions {
-                exclusions.observe(entry.transaction_id);
-            }
-            if let Some(message) = shape.encode_transaction(CompactTransaction {
-                index: 0,
-                transaction_id: entry.transaction_id,
-                data: entry.compact_transaction_data,
-            })? {
-                compact_messages.push(message);
-            }
-        }
-        let messages = compact_messages
-            .into_iter()
-            .filter(move |message| {
-                exclusions
-                    .as_ref()
-                    .is_none_or(|exclusions| !exclusions.uniquely_matches(&message.txid))
-            })
-            .map(Ok);
-        Ok(Response::new(Box::pin(stream::iter(messages))))
+        self.mempool_transactions(request).await
     }
 
     type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -923,47 +981,7 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        let mempool_surface = self
-            .mempool_surface
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
-            .clone();
-        // Deliver the current mempool contents from the snapshot walk, then
-        // continue with events strictly after the walk's resume anchor. The
-        // anchor hands off at-least-once: a transaction admitted mid-walk may
-        // appear both in a later page and as an event, and an evicted
-        // transaction may be added again. lightwalletd sends each txid once
-        // per block interval, so the stream drops txids it already sent.
-        let first_page = mempool_surface
-            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let snapshot_chain_epoch_id = first_page.chain_epoch_id;
-        let event_stream = mempool_surface
-            .mempool_events(first_page.events_resume_cursor.clone())
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
-            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
-        );
-        let raw_transaction_stream = each_once_up_to(
-            entry_stream,
-            zinder_core::MempoolEntry::transaction_id,
-            MAX_MEMPOOL_STREAM_TRANSACTIONS,
-        )
-        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
-
-        let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
-            if let Some(watcher) = self.tip_change_watcher.clone() {
-                Box::pin(close_mempool_stream_on_tip_change(
-                    raw_transaction_stream,
-                    watcher,
-                    snapshot_chain_epoch_id,
-                ))
-            } else {
-                Box::pin(raw_transaction_stream)
-            };
-        Ok(Response::new(bounded_stream))
+        self.mempool_stream().await
     }
 
     async fn get_tree_state(
@@ -1063,26 +1081,7 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::StandardFee>, Status> {
-        match self.query_api.standard_fee().await {
-            Ok(fee) => Ok(Response::new(lightwalletd::StandardFee {
-                fee_zat: fee.fee_zat(),
-                estimator_version: fee.estimator_version(),
-            })),
-            Err(QueryError::Node(
-                SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::StandardFee,
-                }
-                | SourceError::TransactionBroadcastDisabled,
-            )) => Err(Status::unimplemented(
-                "GetStandardFee is not implemented: no configured node implements the getstandardfee RPC",
-            )),
-            Err(QueryError::Node(error @ SourceError::SourceProtocolMismatch { .. })) => {
-                Err(Status::internal(format!(
-                    "GetStandardFee: the node's getstandardfee reply is unusable: {error}"
-                )))
-            }
-            Err(error) => Err(status_from_query_error(&error)),
-        }
+        standard_fee_response(self.query_api.standard_fee().await)
     }
 
     async fn ping(
@@ -1218,6 +1217,24 @@ where
     }
 }
 
+trait SubtreeRootReads: Send + Sync + 'static {
+    fn read_subtree_roots(
+        &self,
+        range: SubtreeRootRange,
+        epoch: ChainEpochId,
+    ) -> impl Future<Output = Result<SubtreeRoots, QueryError>> + Send;
+}
+
+impl<Query: WalletQueryApi> SubtreeRootReads for Query {
+    async fn read_subtree_roots(
+        &self,
+        range: SubtreeRootRange,
+        epoch: ChainEpochId,
+    ) -> Result<SubtreeRoots, QueryError> {
+        self.subtree_roots(range, Some(epoch)).await
+    }
+}
+
 /// One protocol's subtree roots at one chain epoch, read one bounded native
 /// page at a time until `max_entries` is reached or the store runs out.
 ///
@@ -1238,7 +1255,7 @@ struct SubtreeRootsStream<QueryApi> {
 
 impl<QueryApi> SubtreeRootsStream<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: SubtreeRootReads,
 {
     async fn start(
         query_api: QueryApi,
@@ -1274,13 +1291,13 @@ where
         let page_entries = remaining.min(self.page_limit);
         let subtree_roots = self
             .query_api
-            .subtree_roots(
+            .read_subtree_roots(
                 SubtreeRootRange::new(
                     self.protocol,
                     SubtreeRootIndex::new(start_index),
                     page_entries,
                 ),
-                Some(self.at_epoch_id),
+                self.at_epoch_id,
             )
             .await
             .map_err(|error| subtree_roots_status(&error))?;
@@ -1306,7 +1323,7 @@ where
 
 impl<QueryApi> ResponseSource for SubtreeRootsStream<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: SubtreeRootReads,
 {
     type Message = lightwalletd::SubtreeRoot;
 
@@ -1670,6 +1687,31 @@ fn lightwalletd_address_utxo(
             .map_err(|_| Status::data_loss("transparent output value exceeds i64"))?,
         height: u64::from(utxo.block_height.value()),
     })
+}
+
+fn standard_fee_response(
+    fee: Result<zinder_core::StandardFee, QueryError>,
+) -> Result<Response<lightwalletd::StandardFee>, Status> {
+    match fee {
+        Ok(fee) => Ok(Response::new(lightwalletd::StandardFee {
+            fee_zat: fee.fee_zat(),
+            estimator_version: fee.estimator_version(),
+        })),
+        Err(QueryError::Node(
+            SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::StandardFee,
+            }
+            | SourceError::TransactionBroadcastDisabled,
+        )) => Err(Status::unimplemented(
+            "GetStandardFee is not implemented: no configured node implements the getstandardfee RPC",
+        )),
+        Err(QueryError::Node(error @ SourceError::SourceProtocolMismatch { .. })) => {
+            Err(Status::internal(format!(
+                "GetStandardFee: the node's getstandardfee reply is unusable: {error}"
+            )))
+        }
+        Err(error) => Err(status_from_query_error(&error)),
+    }
 }
 
 fn address_utxo_limit_exceeded(response_limit: usize) -> Status {

@@ -98,6 +98,22 @@ impl CompactServingReadiness {
         }
     }
 
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) fn for_qualification(runtime: Readiness) -> Self {
+        use zinder_runtime::ReadinessInput::{IngestControl, NodeSource};
+        Self {
+            composed: ComposedReadiness::with_dependency_inputs(
+                runtime,
+                &[NodeSource, IngestControl],
+            ),
+        }
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    pub(crate) fn dependencies(&self) -> ComposedReadiness {
+        self.composed.clone()
+    }
+
     pub(crate) fn runtime(&self) -> Readiness {
         self.composed.runtime_readiness()
     }

@@ -1371,45 +1371,7 @@ where
             validate_subtree_root_range(subtree_root_range)?;
             serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let completed_subtree_count = chain_epoch
-                    .tip_metadata
-                    .completed_subtree_count(subtree_root_range.protocol);
-                if subtree_root_range.start_index.value() >= completed_subtree_count {
-                    return Ok(SubtreeRoots {
-                        chain_epoch,
-                        protocol: subtree_root_range.protocol,
-                        start_index: subtree_root_range.start_index,
-                        subtree_roots: Vec::new(),
-                    });
-                }
-                let available_entries = completed_subtree_count
-                    .saturating_sub(subtree_root_range.start_index.value())
-                    .min(subtree_root_range.max_entries.get());
-                let available_entries = NonZeroU32::new(available_entries).ok_or_else(|| {
-                    QueryError::ArtifactUnavailable {
-                        family: ArtifactFamily::SubtreeRoot,
-                        key: ArtifactKey::SubtreeRootIndex {
-                            protocol: subtree_root_range.protocol,
-                            index: subtree_root_range.start_index,
-                        },
-                    }
-                })?;
-                let available_range = zinder_core::SubtreeRootRange::new(
-                    subtree_root_range.protocol,
-                    subtree_root_range.start_index,
-                    available_entries,
-                );
-                let subtree_roots = pair
-                    .canonical()
-                    .subtree_roots(available_range)
-                    .await
-                    .map_err(QueryError::canonical_read)?;
-                Ok(SubtreeRoots {
-                    chain_epoch,
-                    protocol: subtree_root_range.protocol,
-                    start_index: subtree_root_range.start_index,
-                    subtree_roots,
-                })
+                canonical_subtree_roots(pair.canonical(), chain_epoch, subtree_root_range).await
             })
             .await
         })
@@ -1784,7 +1746,54 @@ fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryErr
     }
 }
 
-fn tree_state_response(chain_epoch: ChainEpoch, tree_state: ServedTreeState) -> TreeState {
+pub(crate) async fn canonical_subtree_roots(
+    reader: &dyn crate::CanonicalReader,
+    chain_epoch: ChainEpoch,
+    subtree_root_range: zinder_core::SubtreeRootRange,
+) -> Result<SubtreeRoots, QueryError> {
+    let completed_subtree_count = chain_epoch
+        .tip_metadata
+        .completed_subtree_count(subtree_root_range.protocol);
+    if subtree_root_range.start_index.value() >= completed_subtree_count {
+        return Ok(SubtreeRoots {
+            chain_epoch,
+            protocol: subtree_root_range.protocol,
+            start_index: subtree_root_range.start_index,
+            subtree_roots: Vec::new(),
+        });
+    }
+    let available_entries = completed_subtree_count
+        .saturating_sub(subtree_root_range.start_index.value())
+        .min(subtree_root_range.max_entries.get());
+    let available_entries =
+        NonZeroU32::new(available_entries).ok_or_else(|| QueryError::ArtifactUnavailable {
+            family: ArtifactFamily::SubtreeRoot,
+            key: ArtifactKey::SubtreeRootIndex {
+                protocol: subtree_root_range.protocol,
+                index: subtree_root_range.start_index,
+            },
+        })?;
+    let available_range = zinder_core::SubtreeRootRange::new(
+        subtree_root_range.protocol,
+        subtree_root_range.start_index,
+        available_entries,
+    );
+    let subtree_roots = reader
+        .subtree_roots(available_range)
+        .await
+        .map_err(QueryError::canonical_read)?;
+    Ok(SubtreeRoots {
+        chain_epoch,
+        protocol: subtree_root_range.protocol,
+        start_index: subtree_root_range.start_index,
+        subtree_roots,
+    })
+}
+
+pub(crate) fn tree_state_response(
+    chain_epoch: ChainEpoch,
+    tree_state: ServedTreeState,
+) -> TreeState {
     let block_id = tree_state.block_id();
     let block_time_seconds = tree_state.block_time_seconds();
     let (sapling, orchard, ironwood) = tree_state.into_final_state_bytes();

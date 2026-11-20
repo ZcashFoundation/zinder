@@ -464,6 +464,55 @@ stops the proxy, and checks that a broadcast moves to the fallback with cause
 The Zingolib flow cannot run on this chain. Zingolib 5.0.0 supports upgrades
 only through NU6.2, and the test refuses a tip at or past NU6.3.
 
+### Light-wallet serving qualification
+
+Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
+The qualification build serves wallet RPCs with one canonical store and ingest
+control. It uses the node for transparent balances, UTXOs, address history,
+transaction submission, and the recommended fee. Forwarded answers are not
+epoch-pinned. Compare them with wallet serving while the node stays at the
+same block hash and height.
+
+Build the two qualification binaries:
+
+```bash
+cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd \
+  --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
+```
+
+In a shell with the Regtest node authentication from the preceding section,
+start ingest with a fresh store. The example uses the default ingest-control
+listener on port 9100. Set the same storage policy on both processes.
+
+```bash
+unset ZINDER_NETWORK
+export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
+export ZINDER_STORAGE__RAW_BLOB_POLICY=none
+mkdir -p .tmp
+ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving \
+  target/debug/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/qualification-canonical >.tmp/qualification-ingest.log 2>&1 &
+```
+
+Once ingest reaches the mined tip and its `/readyz` on port 9105 returns 200,
+start compatibility from the same shell:
+
+```bash
+target/debug/zinder-compat-lightwalletd --network zcash-regtest \
+  --serving light-wallet-qualification --listen-addr 127.0.0.1:9089 \
+  --canonical-primary-path .tmp/qualification-canonical \
+  --canonical-secondary-root .tmp/qualification-secondary
+```
+
+The canonical reader serves compact blocks, nullifiers, tree states, and subtree
+roots. Both mempool methods use ingest control. Each address-history stream
+hydrates one transaction at a time through the node. Dropping the stream
+cancels the active read. With `none`, `GetTransaction` fetches the bytes from
+the node. To exercise local mined-transaction reads, repeat with fresh store
+paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
+projector or wallet store. The feature is for qualification only. Release
+builds accept `wallet` and `compact-blocks`.
+
 ### Testnet
 
 Testnet uses the same command with a cookie-authenticated node. This example
