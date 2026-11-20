@@ -259,33 +259,7 @@ fn reconstruct(
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
-    let (mut accumulator, tip) = replay_compact_blocks(store, seed, height, activations)?;
-    let header = read_block_header_at(store, height)?.ok_or_else(|| {
-        CanonicalStoreError::publication(format!(
-            "tree-state reconstruction header at height {} is absent",
-            height.value()
-        ))
-    })?;
-    if header.block_hash != tip.hash {
-        return Err(CanonicalStoreError::publication(format!(
-            "replayed compact blocks do not end at the canonical block at height {}",
-            height.value()
-        )));
-    }
-    let block_time_seconds = u32::try_from(header.block_time).map_err(|_| {
-        CanonicalStoreError::publication(format!(
-            "canonical block time at height {} is outside u32",
-            height.value()
-        ))
-    })?;
-    let frontiers = accumulator
-        .cross_checked_frontiers()
-        .map_err(|source| replay_refused(height, &source))?;
-    Ok(CommitmentTreeCheckpoint::new(
-        tip,
-        block_time_seconds,
-        frontiers,
-    ))
+    replay_compact_blocks(store, seed, height, activations, |_| Ok(()))?.checkpoint(store)
 }
 
 /// Returns the lowest checkpoint height a reconstruction of `height` may seed
@@ -305,23 +279,18 @@ fn required_seed_height(height: BlockHeight, history_predecessor: BlockHeight) -
 /// Seeds the trees from `seed` and appends each stored compact block through
 /// `height` in ascending order, reading the blocks in multi-get batches.
 ///
-/// Every block must extend the one before it, starting from `seed`'s block,
-/// and reach the tree sizes its compact block records. Returns the trees and
-/// the identity of the last replayed block.
-fn replay_compact_blocks(
+/// Each block is appended with [`ReplayedTrees::append_block`] and the trees
+/// are then passed to `after_block`. Returns the trees after the block at
+/// `height`.
+pub(super) fn replay_compact_blocks(
     store: &impl CanonicalServingRead,
     seed: &CommitmentTreeCheckpoint,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
-) -> Result<(CommitmentTreeAccumulator, BlockId), CanonicalStoreError> {
-    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-        seed.block_id.height,
-        &seed.frontiers,
-        activations,
-    )
-    .map_err(|source| replay_refused(seed.block_id.height, &source))?;
-    let mut tip = seed.block_id;
-    let Some(first_height) = tip.height.next() else {
+    mut after_block: impl FnMut(&mut ReplayedTrees) -> Result<(), CanonicalStoreError>,
+) -> Result<ReplayedTrees, CanonicalStoreError> {
+    let mut trees = ReplayedTrees::seed(seed, activations)?;
+    let Some(first_height) = trees.tip.height.next() else {
         return Err(CanonicalStoreError::publication(
             "tree-state reconstruction height exceeds u32::MAX",
         ));
@@ -330,33 +299,141 @@ fn replay_compact_blocks(
         store,
         BlockHeightRange::inclusive(first_height, height),
         |compact_block| {
-            let next_height = compact_block.height();
-            if compact_block.previous_block_hash() != tip.hash {
-                return Err(CanonicalStoreError::publication(format!(
-                    "compact block at height {} does not extend the block below it",
-                    next_height.value()
-                )));
-            }
-            append_compact_block_commitments(&mut accumulator, &compact_block)
-                .map_err(|source| replay_refused(next_height, &source))?;
-            let recorded = compact_block.chain_metadata();
-            if accumulator.tip_metadata()
-                != ChainTipMetadata::new(
-                    recorded.sapling_commitment_tree_size,
-                    recorded.orchard_commitment_tree_size,
-                    recorded.ironwood_commitment_tree_size,
-                )
-            {
-                return Err(CanonicalStoreError::publication(format!(
-                    "compact block at height {} records tree sizes its note commitments do not reach",
-                    next_height.value()
-                )));
-            }
-            tip = BlockId::new(next_height, compact_block.block_hash());
-            Ok(())
+            trees.append_block(&compact_block)?;
+            after_block(&mut trees)
         },
     )?;
-    Ok((accumulator, tip))
+    Ok(trees)
+}
+
+/// Commitment trees replayed from a stored checkpoint, and the block they
+/// end at.
+///
+/// Tree-state reads and the densification of settled history both append
+/// stored compact blocks through [`Self::append_block`], so a checkpoint the
+/// densification stores is the one a read would reconstruct.
+pub(super) struct ReplayedTrees {
+    accumulator: CommitmentTreeAccumulator,
+    tip: BlockId,
+    /// Block time of the tip, once its canonical header has been checked.
+    canonical_tip_time: Option<u32>,
+}
+
+impl ReplayedTrees {
+    /// Seeds the trees from a validated stored checkpoint.
+    fn seed(
+        seed: &CommitmentTreeCheckpoint,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, CanonicalStoreError> {
+        let accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            seed.block_id.height,
+            &seed.frontiers,
+            activations,
+        )
+        .map_err(|source| replay_refused(seed.block_id.height, &source))?;
+        Ok(Self {
+            accumulator,
+            tip: seed.block_id,
+            canonical_tip_time: None,
+        })
+    }
+
+    /// Appends the note commitments of the compact block above the tip.
+    ///
+    /// The block must extend the tip and reach the tree sizes it records.
+    fn append_block(
+        &mut self,
+        compact_block: &CompactBlockArtifact,
+    ) -> Result<(), CanonicalStoreError> {
+        let height = compact_block.height();
+        if compact_block.previous_block_hash() != self.tip.hash {
+            return Err(CanonicalStoreError::publication(format!(
+                "compact block at height {} does not extend the block below it",
+                height.value()
+            )));
+        }
+        append_compact_block_commitments(&mut self.accumulator, compact_block)
+            .map_err(|source| replay_refused(height, &source))?;
+        if self.accumulator.tip_metadata() != recorded_tree_sizes(compact_block) {
+            return Err(CanonicalStoreError::publication(format!(
+                "compact block at height {} records tree sizes its note commitments do not reach",
+                height.value()
+            )));
+        }
+        self.tip = BlockId::new(height, compact_block.block_hash());
+        self.canonical_tip_time = None;
+        Ok(())
+    }
+
+    /// Returns the block the trees end at.
+    pub(super) const fn tip(&self) -> BlockId {
+        self.tip
+    }
+
+    /// Returns the tree sizes after the tip.
+    pub(super) fn tree_sizes(&self) -> ChainTipMetadata {
+        self.accumulator.tip_metadata()
+    }
+
+    /// Checks that the tip is the canonical block at its height and returns
+    /// its block time.
+    pub(super) fn canonical_block_time(
+        &mut self,
+        store: &impl CanonicalServingRead,
+    ) -> Result<u32, CanonicalStoreError> {
+        if let Some(block_time_seconds) = self.canonical_tip_time {
+            return Ok(block_time_seconds);
+        }
+        let height = self.tip.height;
+        let header = read_block_header_at(store, height)?.ok_or_else(|| {
+            CanonicalStoreError::publication(format!(
+                "block header at height {} is absent",
+                height.value()
+            ))
+        })?;
+        if header.block_hash != self.tip.hash {
+            return Err(CanonicalStoreError::publication(format!(
+                "replayed compact block at height {} is not the canonical block",
+                height.value()
+            )));
+        }
+        let block_time_seconds = u32::try_from(header.block_time).map_err(|_| {
+            CanonicalStoreError::publication(format!(
+                "canonical block time at height {} is outside u32",
+                height.value()
+            ))
+        })?;
+        self.canonical_tip_time = Some(block_time_seconds);
+        Ok(block_time_seconds)
+    }
+
+    /// Returns the checkpoint at the tip, which must be the canonical block
+    /// at its height.
+    pub(super) fn checkpoint(
+        &mut self,
+        store: &impl CanonicalServingRead,
+    ) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
+        let block_time_seconds = self.canonical_block_time(store)?;
+        let frontiers = self
+            .accumulator
+            .cross_checked_frontiers()
+            .map_err(|source| replay_refused(self.tip.height, &source))?;
+        Ok(CommitmentTreeCheckpoint::new(
+            self.tip,
+            block_time_seconds,
+            frontiers,
+        ))
+    }
+}
+
+/// Returns the tree sizes `compact_block` records after its commitments.
+pub(super) fn recorded_tree_sizes(compact_block: &CompactBlockArtifact) -> ChainTipMetadata {
+    let recorded = compact_block.chain_metadata();
+    ChainTipMetadata::new(
+        recorded.sapling_commitment_tree_size,
+        recorded.orchard_commitment_tree_size,
+        recorded.ironwood_commitment_tree_size,
+    )
 }
 
 /// Appends one compact block's note commitments to `accumulator` in wire

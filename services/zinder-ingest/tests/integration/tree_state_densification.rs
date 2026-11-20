@@ -176,6 +176,54 @@ async fn a_history_predecessor_off_the_cadence_seeds_the_first_stride() -> eyre:
     Ok(())
 }
 
+/// The pass stores the tree state a read reconstructs at every height.
+///
+/// Before the pass, a read between two cadence checkpoints replays from the
+/// one below it; afterwards it reads the row the pass stored for its height.
+#[test]
+fn every_densified_checkpoint_is_the_tree_state_a_read_reconstructs() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+    let read_all = |primary: &RocksDbCanonicalStore| {
+        (1..=DENSIFIED_THROUGH)
+            .map(|height| {
+                Ok(primary
+                    .tree_state_checkpoint_at(BlockHeight::new(height), &harness.activations)?)
+            })
+            .collect::<eyre::Result<Vec<_>>>()
+    };
+    let reconstructed = harness.with_primary(read_all)?;
+
+    let densified = harness.with_primary(|primary| {
+        let mut densified = Vec::new();
+        let mut from = BlockHeight::new(0);
+        while let Some(stride) = primary.next_tree_state_stride(from, EVERY_BLOCK)? {
+            let replayed =
+                primary.densify_tree_state_stride(stride, EVERY_BLOCK, &harness.activations)?;
+            densified.push(primary.commit_tree_state_stride(&replayed)?.rows_written);
+            from = stride.end_height();
+        }
+        Ok(densified)
+    })?;
+
+    eyre::ensure!(
+        densified == vec![99, 99, 99],
+        "every settled stride must gain a row per block: {densified:?}"
+    );
+    harness.with_primary(|primary| {
+        eyre::ensure!(stored_checkpoint_heights(primary, 0, DENSIFIED_THROUGH)?.len() == 301);
+        let stored = read_all(primary)?;
+        for (height, (stored, reconstructed)) in
+            (1..=DENSIFIED_THROUGH).zip(stored.iter().zip(&reconstructed))
+        {
+            eyre::ensure!(
+                stored == reconstructed && stored.is_some(),
+                "the pass stored another tree state than a read reconstructs at height {height}"
+            );
+        }
+        Ok(())
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_completed_pass_records_its_progress_and_a_restart_commits_nothing() -> eyre::Result<()> {
     let harness = Harness::new()?;

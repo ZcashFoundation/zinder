@@ -18,7 +18,10 @@ use super::{
     block_load::{encode_block_position, encode_tree_state_checkpoint},
     live_replacement_tests::{published_fork_store, published_store},
     publication::column_family,
-    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
+    rocksdb::{
+        BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    },
     test_network_upgrade_activations,
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
@@ -441,6 +444,46 @@ fn a_commitment_budget_needs_no_rows_in_strides_without_commitments() -> TestRes
     Ok(())
 }
 
+#[test]
+fn a_budget_stride_refuses_a_damaged_header_at_a_height_it_neither_compares_nor_writes()
+-> TestResult {
+    let damages: [(HeaderDamage, &str); 3] = [
+        (HeaderDamage::Delete, "block header at height 50 is absent"),
+        (
+            HeaderDamage::OtherBlockHash,
+            "block at height 50 is not the canonical block",
+        ),
+        (
+            HeaderDamage::BlockTimeOutsideU32,
+            "block time at height 50 is outside u32",
+        ),
+    ];
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(
+        std::num::NonZeroU32::new(1).ok_or("budget must be nonzero")?,
+    );
+    for (damage, reason) in damages {
+        let temporary = TempDir::new()?;
+        let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+        let activations = activations()?;
+        assert_eq!(
+            store
+                .densify_tree_state_stride(stride(0, 100), budget, &activations)?
+                .row_count(),
+            0,
+            "a stride without commitments selects no height"
+        );
+        damage_header(&store, BlockHeight::new(50), damage)?;
+
+        let error = store
+            .densify_tree_state_stride(stride(0, 100), budget, &activations)
+            .err()
+            .ok_or("a damaged header inside the stride must refuse it")?;
+
+        assert_stride_mismatch(&error, stride(0, 100), reason);
+    }
+    Ok(())
+}
+
 fn densification_store(
     temporary: &TempDir,
     settled_height: BlockHeight,
@@ -555,6 +598,39 @@ fn delete_row(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestResult 
         .bounded_open
         .db
         .delete_cf(&family, encode_block_position(height))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HeaderDamage {
+    Delete,
+    OtherBlockHash,
+    BlockTimeOutsideU32,
+}
+
+fn damage_header(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+    damage: HeaderDamage,
+) -> TestResult {
+    let db = &store.bounded_open.db;
+    let family = column_family(db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let key = encode_block_position(height);
+    let mut header = db.get_cf(&family, key)?.ok_or("block header is absent")?;
+    match damage {
+        HeaderDamage::Delete => {
+            db.delete_cf(&family, key)?;
+            return Ok(());
+        }
+        HeaderDamage::OtherBlockHash => {
+            *header.first_mut().ok_or("block header is empty")? ^= 0x01;
+        }
+        HeaderDamage::BlockTimeOutsideU32 => header
+            .get_mut(128..136)
+            .ok_or("block header is shorter than its block time")?
+            .copy_from_slice(&(i64::from(u32::MAX) + 1).to_le_bytes()),
+    }
+    db.put_cf(&family, key, header)?;
     Ok(())
 }
 
