@@ -3430,11 +3430,11 @@ mod tests {
     }
 
     /// Replaces the compact block at `height` of `chain` with one that holds
-    /// a single transaction of `data`.
+    /// a single transaction of `transaction_data`.
     fn with_one_transaction_at(
         chain: zinder_testkit::ChainFixture,
         height: u32,
-        data: zinder_core::CompactTransactionData,
+        transaction_data: zinder_core::CompactTransactionData,
     ) -> Result<zinder_testkit::ChainFixture, Box<dyn std::error::Error>> {
         let block = chain
             .block_at(BlockHeight::new(height))
@@ -3453,13 +3453,13 @@ mod tests {
             format!("one-transaction-block-{height}").into_bytes(),
         );
         rows.facts.public_facts.counts = zinder_core::TransactionComponentCounts {
-            sapling_spend_count: u32::try_from(data.sapling_spends.len())?,
+            sapling_spend_count: u32::try_from(transaction_data.sapling_spends.len())?,
             ..zinder_core::TransactionComponentCounts::EMPTY
         };
         let transaction = zinder_core::CompactTransaction {
             index: 0,
             transaction_id: range_parity_transaction_id(height, 0),
-            data,
+            data: transaction_data,
         };
         Ok(chain
             .with_transaction_rows(rows)

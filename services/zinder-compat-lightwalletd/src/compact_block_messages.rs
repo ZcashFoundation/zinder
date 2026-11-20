@@ -479,7 +479,7 @@ mod tests {
     fn structured_scan_data_maps_every_pool_exactly() -> Result<(), Status> {
         let transaction_id = TransactionId::from_bytes([0x41; 32]);
         let previous_transaction_id = TransactionId::from_bytes([0x42; 32]);
-        let data = CompactTransactionData {
+        let transaction_data = CompactTransactionData {
             fee_zat: Some(23),
             sapling_spends: vec![CompactSaplingSpend {
                 nullifier: [0x11; 32],
@@ -511,7 +511,8 @@ mod tests {
             }],
         };
 
-        let mapped = compact_transaction_data_to_lightwalletd(5, transaction_id, &data)?;
+        let mapped =
+            compact_transaction_data_to_lightwalletd(5, transaction_id, &transaction_data)?;
 
         assert_eq!(mapped.index, 5);
         assert_eq!(mapped.txid, encode_internal_transaction_id(transaction_id));
