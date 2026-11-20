@@ -1183,6 +1183,7 @@ async fn run_source_generation(
     let generation = open_and_follow_source(source, canonical, owner, mempool_ready_signal, cancel);
     tokio::pin!(generation);
     if let Some(deadline) = deadline {
+        mempool_ready_signal.stage_replacement_until(deadline);
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline) => {}

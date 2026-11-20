@@ -33,7 +33,7 @@
 //! zinder_source::MempoolSourceEvent::InitialSnapshotComplete
 
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -57,6 +57,7 @@ pub(crate) const MEMPOOL_TIP_TRANSITION_GRACE: Duration = Duration::from_secs(30
 struct SourceCertification {
     source_tip: BlockId,
     endpoint: ObservedNodeEndpoint,
+    replacement_deadline: OnceLock<tokio::time::Instant>,
 }
 
 /// The active node endpoint as the mempool owner observed it.
@@ -115,7 +116,13 @@ impl MempoolReadyGate {
         self.certified_source_tip
             .borrow()
             .as_ref()
-            .filter(|certification| certification.endpoint.is_active())
+            .filter(|certification| {
+                certification.endpoint.is_active()
+                    && certification
+                        .replacement_deadline
+                        .get()
+                        .is_none_or(|deadline| tokio::time::Instant::now() < *deadline)
+            })
             .map(|certification| certification.source_tip)
     }
 
@@ -209,7 +216,15 @@ impl MempoolReadySignal {
             .send_replace(Some(SourceCertification {
                 source_tip,
                 endpoint: observed,
+                replacement_deadline: OnceLock::new(),
             }));
+    }
+
+    /// Shares the owner's deadline without waking the follower on ordinary tip changes.
+    pub(super) fn stage_replacement_until(&self, deadline: tokio::time::Instant) {
+        if let Some(certification) = self.certified_source_tip.borrow().as_ref() {
+            let _first_deadline = certification.replacement_deadline.set(deadline);
+        }
     }
 
     /// Withdraws the gate while no source generation can serve.
@@ -278,6 +293,21 @@ mod tests {
             BlockHeight::new(u32::from(tag)),
             BlockHash::from_bytes([tag; 32]),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_expires_even_before_the_owner_publishes_its_withdrawal() {
+        let (signal, gate) = mempool_ready_channel();
+        let tip = source_tip(1);
+        signal.certify_source_tip(tip, signal.observe_node_endpoint());
+        let deadline = tokio::time::Instant::now() + MEMPOOL_TIP_TRANSITION_GRACE;
+        signal.stage_replacement_until(deadline);
+        signal.stage_replacement_until(deadline + MEMPOOL_TIP_TRANSITION_GRACE);
+        assert!(gate.admits_canonical_tip(tip));
+        tokio::time::advance(MEMPOOL_TIP_TRANSITION_GRACE).await;
+        assert!(!gate.admits_canonical_tip(tip));
+        signal.certify_source_tip(tip, signal.observe_node_endpoint());
+        assert!(gate.admits_canonical_tip(tip));
     }
 
     #[test]
