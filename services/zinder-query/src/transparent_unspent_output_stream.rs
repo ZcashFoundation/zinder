@@ -264,11 +264,13 @@ async fn produce_pages(
         if pair.are_reads_revoked() {
             return fail(pair, &pages).await;
         }
-        let page_read = serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| {
-            let page = read_page(&pair, address_script_hash, start_height, after, page_size)?;
-            Ok((pair, page))
-        });
-        // The blocking read cannot be interrupted, but a caller that leaves
+        let page_read =
+            serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| async move {
+                let page =
+                    read_page(&pair, address_script_hash, start_height, after, page_size).await?;
+                Ok((pair, page))
+            });
+        // The storage read cannot be interrupted, but a caller that leaves
         // while it runs should not have to wait for this task to notice.
         let page_read = tokio::select! {
             biased;
@@ -315,7 +317,7 @@ async fn fail(
     let _ = pages.send(Err(error)).await;
 }
 
-fn read_page(
+async fn read_page(
     pair: &WalletServingReadPair,
     address_script_hash: TransparentAddressScriptHash,
     start_height: BlockHeight,
@@ -328,12 +330,16 @@ fn read_page(
     ),
     QueryError,
 > {
-    let page = pair.wallet().address_unspent_outputs_page_from_height(
-        address_script_hash,
-        start_height,
-        after,
-        page_size,
-    )?;
+    let page = pair
+        .wallet()
+        .address_unspent_outputs_page_from_height(
+            address_script_hash,
+            start_height,
+            after,
+            page_size,
+        )
+        .await
+        .map_err(QueryError::wallet_read)?;
     let outputs = page
         .outputs
         .into_iter()
@@ -367,22 +373,22 @@ mod tests {
     use tokio_stream::StreamExt as _;
     use zinder_core::{
         BlockHeight, BlockHeightRange, ChainEpochId, Network, TransactionId,
-        TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
+        TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
+        TransparentUnspentOutput,
     };
     use zinder_testkit::{
         ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
     };
     use zinder_wallet_projection::{
-        WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletProjectionReadyEvidence,
-        WalletSpentOutput, WalletUnspentOutput,
-    };
-    use zinder_wallet_rocksdb::{
-        RocksDbWalletError, WalletAddressTransactionHistoryPage, WalletAddressUnspentOutputsPage,
+        WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
+        WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage,
+        WalletProjectionReadyEvidence,
     };
 
     use super::TransparentAddressUnspentOutputs;
     use crate::{
-        QueryError, TransparentAddressUnspentOutputsRequest, WalletProjectionReader,
+        QueryError, RocksDbCanonicalReader, RocksDbWalletReader, SpendStatusReadEnd,
+        StorageReadError, TransparentAddressUnspentOutputsRequest, WalletProjectionReader,
         WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
     };
 
@@ -401,7 +407,7 @@ mod tests {
     async fn a_stream_delivers_every_page_in_address_index_order() -> Result<(), Box<dyn Error>> {
         let output_count = 2 * page_size() + 7;
         let fixture = CountedPair::with_outputs(output_count)?;
-        let stream = fixture.open_paged()?;
+        let stream = fixture.open_paged();
         assert_eq!(
             stream.chain_epoch.id,
             fixture.pair.canonical_fence().chain_epoch_id()
@@ -445,7 +451,7 @@ mod tests {
     async fn a_stream_reads_storage_only_as_fast_as_its_caller_consumes()
     -> Result<(), Box<dyn Error>> {
         let fixture = CountedPair::with_outputs(4 * page_size())?;
-        let mut stream = fixture.open_paged()?;
+        let mut stream = fixture.open_paged();
 
         stream
             .next()
@@ -468,7 +474,7 @@ mod tests {
     async fn dropping_a_stream_mid_read_stops_its_storage_reads_and_releases_its_pair()
     -> Result<(), Box<dyn Error>> {
         let fixture = CountedPair::with_outputs(4 * page_size())?;
-        let mut stream = fixture.open_paged()?;
+        let mut stream = fixture.open_paged();
         stream
             .next()
             .await
@@ -496,7 +502,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let output_count = 4 * page_size();
         let fixture = CountedPair::with_outputs(output_count)?;
-        let mut stream = fixture.open_paged()?;
+        let mut stream = fixture.open_paged();
         let epoch = stream.chain_epoch.id;
         stream
             .next()
@@ -779,12 +785,12 @@ mod tests {
             let page_reads = Arc::new(AtomicUsize::new(0));
             let page_sizes = Arc::new(Mutex::new(Vec::new()));
             let wallet = CountingWalletReader {
-                inner: Arc::new(wallet),
+                inner: Arc::new(RocksDbWalletReader::new(wallet)),
                 page_reads: Arc::clone(&page_reads),
                 page_sizes: Arc::clone(&page_sizes),
             };
             let pair = Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical),
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
                 Arc::new(wallet),
             )?);
             let slot = WalletServingPairSlot::new(Arc::clone(&pair));
@@ -843,17 +849,17 @@ mod tests {
 
         /// Opens a stream of the fixture address that reads
         /// [`TEST_PAGE_SIZE`] outputs per page.
-        fn open_paged(&self) -> Result<TransparentAddressUnspentOutputs, Box<dyn Error>> {
-            Ok(TransparentAddressUnspentOutputs::spawn_paged(
+        fn open_paged(&self) -> TransparentAddressUnspentOutputs {
+            TransparentAddressUnspentOutputs::spawn_paged(
                 self.slot.clone(),
                 Arc::clone(&self.pair),
                 &TransparentAddressUnspentOutputsRequest {
                     address_script_hash: self.address,
                     start_height: BlockHeight::new(0),
                 },
-                self.pair.canonical().chain_epoch()?,
+                self.pair.canonical().chain_epoch(),
                 TEST_PAGE_SIZE,
-            ))
+            )
         }
 
         fn page_reads(&self) -> usize {
@@ -895,6 +901,7 @@ mod tests {
         page_sizes: Arc<Mutex<Vec<u16>>>,
     }
 
+    #[async_trait::async_trait]
     impl WalletProjectionReader for CountingWalletReader {
         fn network(&self) -> Network {
             self.inner.network()
@@ -904,78 +911,55 @@ mod tests {
             self.inner.ready_evidence()
         }
 
-        fn address_unspent_outputs_page(
-            &self,
-            address_script_hash: TransparentAddressScriptHash,
-            after: Option<WalletAddressUnspentOutputKey>,
-            page_size: NonZeroU16,
-        ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
-            self.page_reads.fetch_add(1, Ordering::AcqRel);
-            self.inner
-                .address_unspent_outputs_page(address_script_hash, after, page_size)
-        }
-
-        fn address_unspent_outputs_page_from_height(
+        async fn address_unspent_outputs_page_from_height(
             &self,
             address_script_hash: TransparentAddressScriptHash,
             start_height: BlockHeight,
             after: Option<WalletAddressUnspentOutputKey>,
             page_size: NonZeroU16,
-        ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
+        ) -> Result<WalletAddressUnspentOutputsPage, StorageReadError> {
             self.page_reads.fetch_add(1, Ordering::AcqRel);
             self.page_sizes.lock().push(page_size.get());
-            self.inner.address_unspent_outputs_page_from_height(
-                address_script_hash,
-                start_height,
-                after,
-                page_size,
-            )
-        }
-
-        fn address_transaction_history_page(
-            &self,
-            address_script_hash: TransparentAddressScriptHash,
-            after: Option<WalletAddressTransactionKey>,
-            page_size: NonZeroU16,
-        ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
             self.inner
-                .address_transaction_history_page(address_script_hash, after, page_size)
+                .address_unspent_outputs_page_from_height(
+                    address_script_hash,
+                    start_height,
+                    after,
+                    page_size,
+                )
+                .await
         }
 
-        fn address_transaction_history_range_page(
+        async fn address_transaction_history_range_page(
             &self,
             address_script_hash: TransparentAddressScriptHash,
             height_range: BlockHeightRange,
             after: Option<WalletAddressTransactionKey>,
             page_size: NonZeroU16,
-        ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
-            self.inner.address_transaction_history_range_page(
-                address_script_hash,
-                height_range,
-                after,
-                page_size,
-            )
+        ) -> Result<WalletAddressTransactionHistoryPage, StorageReadError> {
+            self.inner
+                .address_transaction_history_range_page(
+                    address_script_hash,
+                    height_range,
+                    after,
+                    page_size,
+                )
+                .await
         }
 
-        fn address_balance(
+        async fn total_address_balance(
             &self,
-            address_script_hash: TransparentAddressScriptHash,
-        ) -> Result<u64, RocksDbWalletError> {
-            self.inner.address_balance(address_script_hash)
+            addresses: Vec<TransparentAddressScriptHash>,
+        ) -> Result<u64, StorageReadError> {
+            self.inner.total_address_balance(addresses).await
         }
 
-        fn find_unspent_output(
+        async fn outpoint_spend_statuses(
             &self,
-            outpoint: TransparentOutPoint,
-        ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
-            self.inner.find_unspent_output(outpoint)
-        }
-
-        fn find_spent_output(
-            &self,
-            outpoint: TransparentOutPoint,
-        ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
-            self.inner.find_spent_output(outpoint)
+            outpoints: Vec<TransparentOutPoint>,
+            end: SpendStatusReadEnd,
+        ) -> Result<Vec<TransparentOutpointSpendStatus>, StorageReadError> {
+            self.inner.outpoint_spend_statuses(outpoints, end).await
         }
     }
 }

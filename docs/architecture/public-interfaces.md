@@ -36,8 +36,10 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 
 | Term | Plain meaning | Where it lives |
 | --- | --- | --- |
-| `CanonicalReader` | Read-only canonical data held at one admitted fence. | `zinder-query` |
-| `WalletProjectionReader` | Read-only wallet projection state held at one admitted source identity. | `zinder-query` |
+| `CanonicalReader` | The asynchronous, engine-neutral interface to canonical data held at one admitted fence. | `zinder-query` |
+| `WalletProjectionReader` | The asynchronous, engine-neutral interface to wallet projection state held at one admitted source identity. | `zinder-query` |
+| `StorageReadError` | Why a canonical or wallet read returned no value. `QueryError` converts it without changing the public outcome. | `zinder-query` |
+| `RocksDbCanonicalReader`, `RocksDbWalletReader` | The `RocksDB` implementations of the two readers, over admitted secondaries. | `zinder-query` |
 | `WalletServingReadPair` | A canonical reader and a wallet reader proven to describe the same fence, called a serving pair. A request that reads both captures one pair when it starts. | `zinder-query` |
 | `WalletServingPairPublisher` | The reader-process owner that catches up, admits, and publishes serving pairs. | `zinder-query` |
 | `SupervisedRuntime` | The supervision that stops a wallet-serving runtime's gRPC listener and background tasks together, and ends the calls still open at its drain deadline. | `zinder-runtime` |
@@ -142,6 +144,16 @@ Every other crate is internal: `zinder-store`, `zinder-source`,
   that produced them.
 - Public traits describe what a consumer can do. Concrete RocksDB types stay
   in composition roots and storage adapters.
+- Serving runtimes read stored data only through `CanonicalReader` and
+  `WalletProjectionReader`. Their signatures name no storage engine, they fail
+  with `StorageReadError`, and each implementation keeps blocking storage work
+  off the async runtime. A method answers one serving question, so a request
+  that needs several lookups makes one read. The compact-blocks mode, whose
+  generation lifecycle is `RocksDB` code, reads its range chunks through
+  `CanonicalReader`, driving each read with `read_on_blocking_thread` on the
+  blocking thread that holds the generation.
+  [Storage backend](storage-backend.md#read-interfaces) describes them and
+  their error vocabulary.
 - Library crates expose per-boundary `thiserror` enums. Public domain crates
   never expose `tonic::Status`, `rocksdb` types, or transport client errors.
   Each server boundary error (`QueryError`, `StoreError`, `ExplorerError`)

@@ -302,7 +302,7 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             Ok(())
         }
         Command::RocksDbCompactBlockRange(args) => {
-            let output = run_rocksdb_compact_block_range(args)?;
+            let output = run_rocksdb_compact_block_range(args).await?;
             emit_report(&output.report, output.report_path.as_deref())
         }
         Command::RocksDbTreeStateReplay(args) => {

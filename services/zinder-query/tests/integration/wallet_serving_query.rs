@@ -3,96 +3,62 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::sync::Arc;
+use std::thread::{self, ThreadId};
 
 use parking_lot::Mutex;
 use tracing::Instrument as _;
-use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-};
+use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt as _, registry::LookupSpan};
+use zinder_core::{BlockHeight, BlockHeightRange, Network};
 use zinder_query::{
-    CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
-};
-use zinder_store::{
-    BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
-    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, RawBlobRetention, ServedTreeState,
+    CanonicalReader, QueryError, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletProjectionReader, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
-/// Bounds how long the gated read waits for the reactor to make progress.
-const REACTOR_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[tokio::test]
-async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
-        activations.as_ref(),
-    )?;
-    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    let reactor_gate = Arc::new(ReactorGate::default());
-    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(
-            Arc::new(GatedCanonicalReader {
-                canonical_reader,
-                reactor_gate: Arc::clone(&reactor_gate),
-                read_span_probe: Arc::default(),
-            }) as Arc<dyn CanonicalReader>,
-            Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?,
-    )));
-
-    // The runtime is single-threaded, so this task only runs while the store
-    // read is off the reactor.
-    let (reactor_progressed, gate) = mpsc::channel();
-    reactor_gate.arm(gate);
-    tokio::spawn(async move {
-        let _ = reactor_progressed.send(());
+/// A wallet read runs its storage work on another thread than the runtime
+/// that serves the request, inside the request's span.
+///
+/// The runtime is single-threaded and runs on the test thread, so the
+/// request span entered on any other thread is the reader's storage read.
+#[test]
+fn wallet_serving_reads_run_off_the_reactor_inside_the_request_span() -> eyre::Result<()> {
+    let span_entries = Arc::new(SpanEntries::default());
+    let subscriber = tracing_subscriber::registry().with(SpanEntryLayer {
+        entries: Arc::clone(&span_entries),
     });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let reactor_thread = thread::current().id();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let activations = Arc::new(sample_regtest_upgrade_activations());
+            let mut store_fixture = WalletServingStoreFixture::from_chain(
+                &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+                activations.as_ref(),
+            )?;
+            let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+            let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+                Arc::new(WalletServingReadPair::new(
+                    Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+                    Arc::new(RocksDbWalletReader::new(wallet_reader)),
+                )?),
+            ));
+            let compact_block = query
+                .compact_block_at(BlockHeight::new(2), None)
+                .instrument(tracing::info_span!("wallet_request"))
+                .await?;
+            assert_eq!(compact_block.compact_block.height(), BlockHeight::new(2));
+            Ok::<_, eyre::Report>(())
+        })
+    })?;
 
-    let compact_block = query.compact_block_at(BlockHeight::new(2), None).await?;
-
-    assert_eq!(compact_block.compact_block.height(), BlockHeight::new(2));
     assert!(
-        reactor_gate.observed_reactor_progress(),
-        "the canonical read held the reactor for its whole duration"
+        span_entries.entered_off(reactor_thread, "wallet_request"),
+        "the storage read must run off the reactor inside the request span"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn wallet_serving_reads_run_inside_the_request_span() -> eyre::Result<()> {
-    tracing::subscriber::set_global_default(tracing_subscriber::registry())?;
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
-        activations.as_ref(),
-    )?;
-    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
-    let read_span_probe = Arc::new(ReadSpanProbe::default());
-    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(
-            Arc::new(GatedCanonicalReader {
-                canonical_reader,
-                reactor_gate: Arc::default(),
-                read_span_probe: Arc::clone(&read_span_probe),
-            }) as Arc<dyn CanonicalReader>,
-            Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?,
-    )));
-
-    query
-        .compact_block_at(BlockHeight::new(2), None)
-        .instrument(tracing::info_span!("wallet_request"))
-        .await?;
-
-    assert_eq!(read_span_probe.last_read_span(), Some("wallet_request"));
     Ok(())
 }
 
@@ -106,8 +72,8 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
         WalletServingReadPair::new(
-            Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
-            Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+            Arc::new(RocksDbCanonicalReader::new(canonical_reader)?) as Arc<dyn CanonicalReader>,
+            Arc::new(RocksDbWalletReader::new(wallet_reader)) as Arc<dyn WalletProjectionReader>,
         )?,
     )));
 
@@ -149,220 +115,38 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     Ok(())
 }
 
-/// One-shot rendezvous proving a canonical read released the reactor.
-///
-/// The gate is armed after pair admission so the validation read that
-/// `WalletServingReadPair::new` performs does not consume it.
+/// The threads each span was entered on, by span name.
 #[derive(Default)]
-struct ReactorGate {
-    gate: Mutex<Option<mpsc::Receiver<()>>>,
-    reactor_progressed: AtomicBool,
+struct SpanEntries {
+    entries: Mutex<Vec<(&'static str, ThreadId)>>,
 }
 
-impl ReactorGate {
-    fn arm(&self, gate: mpsc::Receiver<()>) {
-        *self.gate.lock() = Some(gate);
+impl SpanEntries {
+    /// Reports whether a span named `span_name` was entered on a thread other
+    /// than `thread`.
+    fn entered_off(&self, thread: ThreadId, span_name: &str) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .any(|(name, entered_on)| *name == span_name && *entered_on != thread)
     }
+}
 
-    fn wait_for_reactor_progress(&self) {
-        let Some(gate) = self.gate.lock().take() else {
-            return;
-        };
-        if gate.recv_timeout(REACTOR_PROGRESS_TIMEOUT).is_ok() {
-            self.reactor_progressed.store(true, Ordering::Release);
+/// Records the thread every span is entered on.
+struct SpanEntryLayer {
+    entries: Arc<SpanEntries>,
+}
+
+impl<Subscriber> Layer<Subscriber> for SpanEntryLayer
+where
+    Subscriber: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, context: Context<'_, Subscriber>) {
+        if let Some(span) = context.span(id) {
+            self.entries
+                .entries
+                .lock()
+                .push((span.metadata().name(), thread::current().id()));
         }
-    }
-
-    fn observed_reactor_progress(&self) -> bool {
-        self.reactor_progressed.load(Ordering::Acquire)
-    }
-}
-
-/// Span that was current on the thread running the latest canonical epoch read.
-#[derive(Default)]
-struct ReadSpanProbe {
-    last_read_span: Mutex<Option<&'static str>>,
-}
-
-impl ReadSpanProbe {
-    fn observe(&self) {
-        *self.last_read_span.lock() = tracing::Span::current()
-            .metadata()
-            .map(tracing::Metadata::name);
-    }
-
-    fn last_read_span(&self) -> Option<&'static str> {
-        *self.last_read_span.lock()
-    }
-}
-
-/// Canonical reader whose epoch read blocks until the reactor makes progress.
-struct GatedCanonicalReader {
-    canonical_reader: zinder_store::RocksDbCanonicalSecondary,
-    reactor_gate: Arc<ReactorGate>,
-    read_span_probe: Arc<ReadSpanProbe>,
-}
-
-impl CanonicalReader for GatedCanonicalReader {
-    fn network_upgrade_schedule(&self) -> Option<&zinder_store::CanonicalActivationSchedule> {
-        self.canonical_reader.network_upgrade_schedule()
-    }
-
-    fn raw_blob_retention(&self) -> RawBlobRetention {
-        self.canonical_reader.raw_blob_retention()
-    }
-
-    fn network(&self) -> Network {
-        self.canonical_reader.network()
-    }
-
-    fn event_fence(&self) -> CanonicalEventFence {
-        self.canonical_reader.event_fence()
-    }
-
-    fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
-        self.canonical_reader.history_bounds()
-    }
-
-    fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError> {
-        self.reactor_gate.wait_for_reactor_progress();
-        self.read_span_probe.observe();
-        self.canonical_reader.chain_epoch()
-    }
-
-    fn chain_epoch_at(&self, epoch_id: ChainEpochId) -> Result<ChainEpoch, CanonicalStoreError> {
-        self.canonical_reader.chain_epoch_at(epoch_id)
-    }
-
-    fn block_header_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
-        self.canonical_reader.block_header_at(height)
-    }
-
-    fn block_hash_lookup(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<BlockHashLookup, CanonicalStoreError> {
-        self.canonical_reader.block_hash_lookup(block_hash)
-    }
-
-    fn compact_block_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-        self.canonical_reader.compact_block_at(height)
-    }
-
-    fn compact_blocks_in_range(
-        &self,
-        range: BlockHeightRange,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-        self.canonical_reader.compact_blocks_in_range(range)
-    }
-
-    fn compact_blocks_in_range_up_to(
-        &self,
-        range: BlockHeightRange,
-        order: zinder_store::HeightOrder,
-        max_bytes: usize,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-        self.canonical_reader
-            .compact_blocks_in_range_up_to(range, order, max_bytes)
-    }
-
-    fn block_blob_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
-        self.canonical_reader.block_blob_at(height)
-    }
-
-    fn block_blobs_in_range(
-        &self,
-        range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
-        self.canonical_reader.block_blobs_in_range(range)
-    }
-
-    fn transaction_location(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-        self.canonical_reader.transaction_location(transaction_id)
-    }
-
-    fn transaction_location_or_proven_absence(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-        self.canonical_reader
-            .transaction_location_or_proven_absence(transaction_id)
-    }
-
-    fn transaction_blob(
-        &self,
-        location: TransactionLocation,
-    ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
-        self.canonical_reader.transaction_blob(location)
-    }
-
-    fn tree_state_checkpoint_at_or_before(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
-        self.canonical_reader
-            .tree_state_checkpoint_at_or_before(height)
-    }
-
-    fn tree_state_checkpoint_at(
-        &self,
-        height: BlockHeight,
-        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-        self.canonical_reader
-            .tree_state_checkpoint_at(height, network_upgrade_activations)
-    }
-
-    fn tree_state_lookup(
-        &self,
-        height: BlockHeight,
-        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<Option<zinder_store::TreeStateLookup>, CanonicalStoreError> {
-        self.canonical_reader
-            .tree_state_lookup(height, network_upgrade_activations)
-    }
-
-    fn replay_tree_state(
-        &self,
-        replay: &zinder_store::TreeStateReplay,
-        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, CanonicalStoreError> {
-        self.canonical_reader
-            .replay_tree_state(replay, network_upgrade_activations)
-    }
-
-    fn subtree_roots(
-        &self,
-        range: SubtreeRootRange,
-    ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
-        self.canonical_reader.subtree_roots(range)
-    }
-
-    fn wallet_chain_event_history(
-        &self,
-        request: ChainEventHistoryRequest<'_>,
-    ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError> {
-        self.canonical_reader.wallet_chain_event_history(request)
-    }
-
-    fn resolve_wallet_chain_event_stream_start(
-        &self,
-        start: &EventStreamStartPosition,
-        requested_family: ChainEventStreamFamily,
-    ) -> Result<ChainEventStreamResume, CanonicalStoreError> {
-        self.canonical_reader
-            .resolve_wallet_chain_event_stream_start(start, requested_family)
     }
 }

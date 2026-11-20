@@ -15,7 +15,8 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as _,
 };
 use zinder_query::{
-    OrderedBroadcaster, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{
@@ -91,8 +92,8 @@ impl NodeFeeFixture {
         let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
         let (canonical, wallet) = store_fixture.take_readers()?;
         let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?));
         let node = verifiable_node(&schedule, tip_hash, fee_reply)?;
         let nodes = OrderedBroadcaster::new(

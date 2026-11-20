@@ -16,9 +16,9 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-    compact_blocks_in_range_header, compact_blocks_in_range_item,
+    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, RocksDbCanonicalReader,
+    RocksDbWalletReader, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair, compact_blocks_in_range_header, compact_blocks_in_range_item,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
     visible_tip_block_response,
 };
@@ -313,8 +313,8 @@ async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
@@ -558,8 +558,8 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
@@ -611,8 +611,8 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
@@ -717,8 +717,8 @@ async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyr
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;

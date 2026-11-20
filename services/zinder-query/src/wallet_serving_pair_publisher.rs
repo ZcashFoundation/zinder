@@ -36,10 +36,11 @@ use std::{
 };
 
 use crate::{
-    AdmittedIngestControl, CanonicalReader, OrderedBroadcaster, WalletProjectionReader,
+    AdmittedIngestControl, OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader,
     WalletServingAdmissionError, WalletServingReadPair,
     ingest_control::wallet_ingest_control_request,
     node_broadcast::{STALE_VERIFICATION_RETRY, VerificationBasis},
+    wallet_serving_pair::CanonicalAdmission,
 };
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -1466,15 +1467,25 @@ impl WalletServingPairPublisher {
         };
         let state = |generation: usize| &self.generations[generation].state;
         unpublished()
-            .find(|generation| matches!(state(*generation), SecondaryGenerationState::Candidate { .. }))
+            .find(|generation| {
+                matches!(
+                    state(*generation),
+                    SecondaryGenerationState::Candidate { .. }
+                )
+            })
             .or_else(|| {
                 unpublished().find(|generation| {
-                    matches!(state(*generation), SecondaryGenerationState::Published { lease, .. } if lease.is_reusable())
+                    matches!(
+                        state(*generation),
+                        SecondaryGenerationState::Published { lease, readers }
+                            if lease.is_reusable() && !readers.is_shared()
+                    )
                 })
             })
             .or_else(|| {
-                unpublished()
-                    .find(|generation| matches!(state(*generation), SecondaryGenerationState::Vacant))
+                unpublished().find(|generation| {
+                    matches!(state(*generation), SecondaryGenerationState::Vacant)
+                })
             })
     }
 
@@ -1703,13 +1714,7 @@ impl WalletServingPairPublisher {
         let candidate_task_outcome = tokio::task::spawn_blocking(move || {
             candidate.canonical.try_catch_up()?;
             candidate.wallet.try_catch_up()?;
-            let convergence = match WalletServingReadPair::validate_readers(
-                &candidate.canonical,
-                &candidate.wallet,
-            ) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(candidate_admission_outcome(error)?),
-            };
+            let convergence = candidate_convergence(&candidate)?;
             Ok::<_, WalletServingPairError>((candidate, convergence))
         })
         .await;
@@ -1772,15 +1777,17 @@ impl WalletServingPairPublisher {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
-        let (pair, readers, served_epoch) = tokio::task::spawn_blocking(move || {
+        let (pair, readers) = tokio::task::spawn_blocking(move || {
             let readers = PublishedReaders::new(*candidate);
-            let canonical: Arc<dyn CanonicalReader> = readers.canonical.clone();
-            let wallet: Arc<dyn WalletProjectionReader> = readers.wallet.clone();
-            // The commit time only reports how stale the served view is, so a
-            // failed read leaves the previous one in place.
-            let served_epoch = canonical.chain_epoch().ok();
-            WalletServingReadPair::new(canonical, wallet)
-                .map(|pair| (Arc::new(pair), readers, served_epoch))
+            let canonical =
+                RocksDbCanonicalReader::new(Arc::clone(&readers.canonical)).map_err(|error| {
+                    WalletServingPairError::PairPublication(crate::QueryError::canonical_read(
+                        error,
+                    ))
+                })?;
+            let wallet = RocksDbWalletReader::new(Arc::clone(&readers.wallet));
+            WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))
+                .map(|pair| (Arc::new(pair), readers))
                 .map_err(WalletServingPairError::PairPublication)
         })
         .await
@@ -1806,9 +1813,8 @@ impl WalletServingPairPublisher {
         if refusal.is_none() {
             self.writer_attestation.attest();
         }
-        if let Some(served_epoch) = served_epoch {
-            self.readiness.publish_served_epoch(served_epoch.created_at);
-        }
+        self.readiness
+            .publish_served_epoch(pair.chain_epoch().created_at);
         self.readiness
             .publish_pair_state(refusal.unwrap_or_else(|| ReadinessState::ready(visible_height)));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
@@ -2083,9 +2089,10 @@ struct SecondaryPairCandidate {
 
 /// The secondaries behind a published pair.
 ///
-/// The pair reads through unsized clones of these handles. Keeping them here
-/// lets the publisher take back sole ownership once the pair drains, and only
-/// then catch the same open secondaries up for a later candidate.
+/// The pair's readers share these handles, and so does every storage read
+/// in flight through them. Keeping them here lets the publisher take back
+/// sole ownership once the pair and its reads drain, and only then catch the
+/// same open secondaries up for a later candidate.
 struct PublishedReaders {
     canonical: Arc<RocksDbCanonicalSecondary>,
     wallet: Arc<RocksDbWalletSecondary>,
@@ -2097,6 +2104,13 @@ impl PublishedReaders {
             canonical: Arc::new(candidate.canonical),
             wallet: Arc::new(candidate.wallet),
         }
+    }
+
+    /// Reports whether anything else shares either secondary: a pair a
+    /// request still holds, or a storage read still in flight, which can
+    /// outlive the request that started it.
+    fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.canonical) > 1 || Arc::strong_count(&self.wallet) > 1
     }
 
     /// Returns both secondaries as a candidate, or `self` while anything
@@ -2228,26 +2242,44 @@ impl CanonicalWriterStatusClient {
     }
 }
 
-/// Returns how a caught-up candidate that failed pair admission converges.
+/// Returns how a caught-up candidate converges: `Ok(())` when its two
+/// secondaries prove one exact source, and otherwise how far apart they are.
+fn candidate_convergence(
+    candidate: &SecondaryPairCandidate,
+) -> Result<Result<(), WalletServingConvergence>, WalletServingPairError> {
+    let chain_epoch = match candidate.canonical.chain_epoch() {
+        Ok(chain_epoch) => chain_epoch,
+        Err(error) => return candidate_epoch_read_failure(error).map(Err),
+    };
+    let admission = CanonicalAdmission {
+        network: candidate.canonical.network(),
+        network_upgrade_schedule: candidate.canonical.network_upgrade_schedule(),
+        event_fence: candidate.canonical.event_fence(),
+        chain_epoch,
+    };
+    Ok(WalletServingReadPair::validate_admission(
+        admission,
+        candidate.wallet.network(),
+        candidate.wallet.ready_evidence(),
+    )
+    .map(drop)
+    .map_err(|error| classify_pair_admission(&error)))
+}
+
+/// Returns how a caught-up candidate whose canonical epoch read failed with
+/// `error` converges.
 ///
-/// A canonical read that failed only because the writer's compaction deleted
-/// a table file after the catch-up is the candidate's own storage failure,
-/// as it is during the catch-up, so it fails the refresh with its typed
-/// source instead of reading as a schema or fence mismatch.
-fn candidate_admission_outcome(
-    error: WalletServingAdmissionError,
+/// A read that failed only because the writer's compaction deleted a table
+/// file after the catch-up is the candidate's own storage failure, as it is
+/// during the catch-up, so it fails the refresh with its typed source instead
+/// of reading as a schema or fence mismatch.
+fn candidate_epoch_read_failure(
+    error: CanonicalStoreError,
 ) -> Result<WalletServingConvergence, WalletServingPairError> {
-    match error {
-        WalletServingAdmissionError::CanonicalRead { source } if source.is_missing_table_file() => {
-            Err(WalletServingPairError::Canonical(source))
-        }
-        error @ (WalletServingAdmissionError::NetworkMismatch { .. }
-        | WalletServingAdmissionError::CanonicalRead { .. }
-        | WalletServingAdmissionError::CanonicalFenceMismatch
-        | WalletServingAdmissionError::NetworkUpgradeScheduleNotAdmitted
-        | WalletServingAdmissionError::WalletSourceMismatch { .. }) => {
-            Ok(classify_pair_admission(&error))
-        }
+    if error.is_missing_table_file() {
+        Err(WalletServingPairError::Canonical(error))
+    } else {
+        Ok(WalletServingConvergence::SchemaOrFenceMismatch)
     }
 }
 
@@ -2263,7 +2295,6 @@ fn classify_pair_admission(error: &WalletServingAdmissionError) -> WalletServing
             }
         }
         WalletServingAdmissionError::NetworkMismatch { .. }
-        | WalletServingAdmissionError::CanonicalRead { .. }
         | WalletServingAdmissionError::CanonicalFenceMismatch
         | WalletServingAdmissionError::NetworkUpgradeScheduleNotAdmitted => {
             WalletServingConvergence::SchemaOrFenceMismatch
@@ -2580,15 +2611,16 @@ mod tests {
         RETAINED_PAIR_WINDOW, SECONDARY_GENERATION_COUNT, SecondaryGenerationState,
         WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
         WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
-        candidate_admission_outcome, classify_canonical_writer_fence, classify_pair_admission,
+        candidate_epoch_read_failure, classify_canonical_writer_fence, classify_pair_admission,
         error_with_sources, missing_table_file_reported, refresh_failure_is_routine_lag,
         refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
         spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
         wallet_ingest_control_request, wallet_source_writer_fence,
     };
     use crate::{
-        AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
-        WalletQueryApi, WalletQueryGrpcAdapter, WalletServingQuery,
+        AdmittedIngestControl, NativeWalletEndpointCapabilities, RocksDbCanonicalReader,
+        RocksDbWalletReader, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+        WalletServingQuery,
     };
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
@@ -3805,8 +3837,8 @@ mod tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(crate::WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let visible_height = pair.canonical_fence().visible_tip().height.value();
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
@@ -6297,7 +6329,7 @@ mod tests {
 
         assert!(readyz.get("degraded").is_none(), "{readyz}");
         // The fixture writer committed the served epoch at a fixed past time.
-        let committed_at = old_pair.canonical().chain_epoch()?.created_at.value();
+        let committed_at = old_pair.canonical().chain_epoch().created_at.value();
         let served_epoch_age = readyz["served_epoch_age_seconds"]
             .as_u64()
             .ok_or("a published pair must report its served epoch age")?;
@@ -6916,7 +6948,8 @@ mod tests {
         let before_first_read = canonical_cache.usage_bytes();
         let first_blocks = first
             .canonical()
-            .compact_blocks_in_range(split_block_range())?;
+            .compact_blocks_in_range(split_block_range())
+            .await?;
         assert!(canonical_cache.usage_bytes() > before_first_read);
 
         primaries.append_block()?;
@@ -6937,7 +6970,8 @@ mod tests {
         let before_second_read = canonical_cache.usage_bytes();
         let second_blocks = second
             .canonical()
-            .compact_blocks_in_range(split_block_range())?;
+            .compact_blocks_in_range(split_block_range())
+            .await?;
         assert_eq!(second_blocks, first_blocks);
         assert_eq!(
             canonical_cache.usage_bytes(),
@@ -7202,7 +7236,7 @@ mod tests {
             assert_ne!(publisher.published_generation, Some(held_generation));
             assert_eq!(held.canonical().event_fence(), held_fence);
             assert_eq!(
-                held.canonical().chain_epoch()?.id,
+                held.canonical().chain_epoch().id,
                 held_fence.chain_epoch_id()
             );
             assert_eq!(
@@ -7322,9 +7356,11 @@ mod tests {
         primaries.shutdown().await
     }
 
-    /// A drained generation whose secondaries are still shared stays frozen.
+    /// A drained generation whose secondaries are still shared, as by a
+    /// storage read that outlives the request that started it, stays frozen.
     ///
-    /// The refresh fails instead of catching the shared secondaries up or
+    /// The refresh waits for the generation, as it waits for one whose pair a
+    /// request holds, instead of catching the shared secondaries up or
     /// opening a second instance over their metadata paths.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_generation_with_shared_secondaries_is_neither_caught_up_nor_reopened()
@@ -7347,16 +7383,14 @@ mod tests {
         }
         age_out_retained_pairs(&mut publisher, 2);
 
+        let published_fence = slot.capture().canonical_fence();
         let fence = primaries.append_block()?;
-        let failure = publisher
-            .refresh_once()
-            .await
-            .err()
-            .ok_or("a shared generation must not become a candidate")?;
-        assert!(matches!(
-            failure,
-            WalletServingPairError::CandidateUnavailable { generation: 0 }
-        ));
+        publisher.refresh_once().await?;
+        assert_eq!(
+            slot.capture().canonical_fence(),
+            published_fence,
+            "a shared generation must not become a candidate"
+        );
         assert_eq!(shared_canonical.event_fence(), bootstrap_fence);
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
         assert_eq!(
@@ -7518,10 +7552,11 @@ mod tests {
             &slot,
             Arc::clone(&stale_pair),
             Some(stale_epoch),
-            |pair| {
-                Ok(pair
-                    .canonical()
-                    .compact_blocks_in_range(split_block_range())?)
+            |pair| async move {
+                pair.canonical()
+                    .compact_blocks_in_range(split_block_range())
+                    .await
+                    .map_err(crate::QueryError::canonical_read)
             },
         )
         .await;
@@ -7563,7 +7598,7 @@ mod tests {
             .await
             .err()
             .ok_or("a corrupt table file must fail the read")?;
-        assert!(!failure.is_missing_table_file(), "{failure:?}");
+        assert!(!failure.invalidates_reader(), "{failure:?}");
         assert_eq!(
             zinder_proto::BoundaryError::error_reason(&failure),
             ErrorReason::StorageUnavailable
@@ -7597,8 +7632,8 @@ mod tests {
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
         let pair = Arc::new(crate::WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?);
         let slot = WalletServingPairSlot::new(Arc::clone(&pair));
         // The report only logs the read's failure.
@@ -7659,22 +7694,15 @@ mod tests {
             .ok_or("a stale secondary must reopen a compacted-away table file")?;
         assert!(missing.is_missing_table_file(), "{missing:?}");
 
-        let failure =
-            match candidate_admission_outcome(crate::WalletServingAdmissionError::CanonicalRead {
-                source: missing,
-            }) {
-                Err(failure @ WalletServingPairError::Canonical(_)) => failure,
-                other => {
-                    return Err(
-                        format!("the refresh must fail with its source, got {other:?}").into(),
-                    );
-                }
-            };
+        let failure = match candidate_epoch_read_failure(missing) {
+            Err(failure @ WalletServingPairError::Canonical(_)) => failure,
+            other => {
+                return Err(format!("the refresh must fail with its source, got {other:?}").into());
+            }
+        };
         assert_eq!(
-            candidate_admission_outcome(crate::WalletServingAdmissionError::CanonicalRead {
-                source: CanonicalStoreError::StoreNotReady {
-                    path: canonical_primary_path.clone(),
-                },
+            candidate_epoch_read_failure(CanonicalStoreError::StoreNotReady {
+                path: canonical_primary_path.clone(),
             })
             .ok(),
             Some(WalletServingConvergence::SchemaOrFenceMismatch),
@@ -7733,7 +7761,7 @@ mod tests {
         let serving_runtime_drained = CancellationToken::new();
         let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
         let log_capture = LogCapture::install_for_target("zinder::wallet_serving");
-        let mut stream = primaries.open_stream(&slot)?;
+        let mut stream = primaries.open_stream(&slot);
         let first = stream
             .next()
             .await
@@ -7806,7 +7834,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let serving_runtime_drained = CancellationToken::new();
         let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
-        let mut stream = primaries.open_stream(&slot)?;
+        let mut stream = primaries.open_stream(&slot);
         stream
             .next()
             .await
@@ -8037,7 +8065,10 @@ mod tests {
         let mut store =
             WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
         let (canonical, wallet) = store.take_readers()?;
-        let pair = crate::WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?;
+        let pair = crate::WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?;
         Ok((Arc::new(pair), store))
     }
 
@@ -8705,10 +8736,10 @@ mod tests {
         fn open_stream(
             &self,
             slot: &WalletServingPairSlot,
-        ) -> Result<crate::TransparentAddressUnspentOutputs, Box<dyn std::error::Error>> {
+        ) -> crate::TransparentAddressUnspentOutputs {
             let pair = slot.capture();
-            let chain_epoch = pair.canonical().chain_epoch()?;
-            Ok(crate::TransparentAddressUnspentOutputs::spawn_paged(
+            let chain_epoch = pair.canonical().chain_epoch();
+            crate::TransparentAddressUnspentOutputs::spawn_paged(
                 slot.clone(),
                 pair,
                 &crate::TransparentAddressUnspentOutputsRequest {
@@ -8717,7 +8748,7 @@ mod tests {
                 },
                 chain_epoch,
                 SPLIT_PAGE_SIZE,
-            ))
+            )
         }
 
         /// Commits block 3 and serves the writer status that attests it, then
@@ -8944,7 +8975,8 @@ mod retention_tests {
 
     use super::{RETAINED_PAIR_WINDOW, WalletServingPairSlot};
     use crate::{
-        QueryError, TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery,
+        QueryError, RocksDbCanonicalReader, RocksDbWalletReader,
+        TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery,
         WalletServingReadPair,
     };
 
@@ -9263,8 +9295,8 @@ mod retention_tests {
     ) -> Result<Arc<WalletServingReadPair>, Box<dyn Error>> {
         let (canonical, wallet) = writer.serving_store_fixture()?.take_readers()?;
         Ok(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
         )?))
     }
 

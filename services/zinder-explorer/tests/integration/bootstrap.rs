@@ -46,8 +46,8 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
@@ -744,8 +744,8 @@ async fn spawn_wallet_query_server(
     .await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical_reader),
-            Arc::new(wallet_reader),
+            Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+            Arc::new(RocksDbWalletReader::new(wallet_reader)),
         )?)),
         ingest_control,
     );

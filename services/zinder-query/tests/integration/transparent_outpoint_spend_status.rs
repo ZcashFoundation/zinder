@@ -9,13 +9,16 @@
 //! (`ChainView::outpoint_spend_status`) and librustzcash
 //! `TransactionDataRequest::GetSpendingTx`.
 
+use std::{num::NonZeroU16, sync::Arc};
+
 use eyre::eyre;
+use parking_lot::Mutex;
 use tonic::{Code, Request};
 use tonic_types::StatusExt as _;
 use zinder_core::{
-    BlockHeight, BlockId, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, Network, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
-    TransparentSpendFact, TransparentUnspentOutput,
+    BlockHeight, BlockHeightRange, BlockId, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, Network,
+    TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutpointSpendStatus, TransparentSpendFact, TransparentUnspentOutput,
 };
 use zinder_proto::capabilities::WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1;
 use zinder_proto::v1::{
@@ -23,10 +26,18 @@ use zinder_proto::v1::{
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
 use zinder_proto::wire::{outpoint_message, transparent_outpoint_spend_status_entry_from_message};
-use zinder_query::{QueryError, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter};
+use zinder_query::{
+    QueryError, RocksDbCanonicalReader, RocksDbWalletReader, SpendStatusReadEnd, StorageReadError,
+    WalletEndpointMetadata, WalletProjectionReader, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
     sample_regtest_upgrade_activations,
+};
+use zinder_wallet_projection::{
+    WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage, WalletProjectionReadyEvidence,
 };
 
 use crate::common::{native_serving_query_over, serving_query_from, serving_query_over};
@@ -342,6 +353,159 @@ async fn miss_on_checkpointed_history_reports_history_unavailable() -> eyre::Res
         );
     }
     Ok(())
+}
+
+/// A batch on checkpointed history ends at its first missing outpoint.
+///
+/// That miss fails the request, so the outpoints after it are never read
+/// and cannot change its outcome. Complete history reads the whole batch.
+#[tokio::test]
+async fn checkpointed_history_reads_an_outpoint_batch_only_through_its_first_miss()
+-> eyre::Result<()> {
+    let first_retained_height = BlockHeight::new(2);
+    let spend_chain = spend_chain_created_at(first_retained_height)?;
+    let never_created = TransparentOutPoint::new(TransactionId::from_bytes([0x99; 32]), 0);
+    let batch = vec![
+        spend_chain.unspent,
+        never_created,
+        spend_chain.spent_by_input_zero,
+        never_created,
+    ];
+
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&spend_chain.chain).with_history_floor(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (query, wallet_reads, _store) = recording_query(&mut writer)?;
+    let outcome = query
+        .transparent_outpoint_spend_status(batch.clone(), None)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(QueryError::CanonicalHistoryUnavailable {
+                first_available_height
+            }) if first_available_height == first_retained_height
+        ),
+        "a miss on checkpointed history must fail the request, got {outcome:?}"
+    );
+    assert_eq!(
+        *wallet_reads.lock(),
+        vec![(SpendStatusReadEnd::FirstNotFound, 2)],
+        "the read must stop at the first missing outpoint"
+    );
+
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&spend_chain_created_at(BlockHeight::new(1))?.chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (query, wallet_reads, _store) = recording_query(&mut writer)?;
+    let statuses = query
+        .transparent_outpoint_spend_status(batch, None)
+        .await?
+        .statuses;
+    assert_eq!(statuses.len(), 4);
+    assert_eq!(
+        *wallet_reads.lock(),
+        vec![(SpendStatusReadEnd::AllOutpoints, 4)]
+    );
+    Ok(())
+}
+
+/// Each spend-status read a [`RecordingWalletReader`] passed on: where it
+/// ended, and how many statuses it returned.
+type SpendStatusReads = Arc<Mutex<Vec<(SpendStatusReadEnd, usize)>>>;
+
+/// A query over the readers of `writer` whose wallet reader records its
+/// spend-status reads.
+fn recording_query(
+    writer: &mut CanonicalWriterFixture,
+) -> eyre::Result<(
+    WalletServingQuery<()>,
+    SpendStatusReads,
+    zinder_testkit::WalletServingStoreFixture,
+)> {
+    let mut store = writer.serving_store_fixture()?;
+    let (canonical, wallet) = store.take_readers()?;
+    let reads = SpendStatusReads::default();
+    let pair = WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RecordingWalletReader {
+            inner: RocksDbWalletReader::new(wallet),
+            reads: Arc::clone(&reads),
+        }),
+    )?;
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
+    Ok((query, reads, store))
+}
+
+/// Delegates every read and records each spend-status read.
+struct RecordingWalletReader {
+    inner: RocksDbWalletReader,
+    reads: SpendStatusReads,
+}
+
+#[async_trait::async_trait]
+impl WalletProjectionReader for RecordingWalletReader {
+    fn network(&self) -> Network {
+        self.inner.network()
+    }
+
+    fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
+        self.inner.ready_evidence()
+    }
+
+    async fn address_unspent_outputs_page_from_height(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressUnspentOutputsPage, StorageReadError> {
+        self.inner
+            .address_unspent_outputs_page_from_height(
+                address_script_hash,
+                start_height,
+                after,
+                page_size,
+            )
+            .await
+    }
+
+    async fn address_transaction_history_range_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        height_range: BlockHeightRange,
+        after: Option<WalletAddressTransactionKey>,
+        page_size: NonZeroU16,
+    ) -> Result<WalletAddressTransactionHistoryPage, StorageReadError> {
+        self.inner
+            .address_transaction_history_range_page(
+                address_script_hash,
+                height_range,
+                after,
+                page_size,
+            )
+            .await
+    }
+
+    async fn total_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+    ) -> Result<u64, StorageReadError> {
+        self.inner.total_address_balance(addresses).await
+    }
+
+    async fn outpoint_spend_statuses(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        end: SpendStatusReadEnd,
+    ) -> Result<Vec<TransparentOutpointSpendStatus>, StorageReadError> {
+        let statuses = self.inner.outpoint_spend_statuses(outpoints, end).await?;
+        self.reads.lock().push((end, statuses.len()));
+        Ok(statuses)
+    }
 }
 
 #[tokio::test]

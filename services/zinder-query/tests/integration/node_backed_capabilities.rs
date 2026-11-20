@@ -23,8 +23,9 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
-    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
     BroadcastNodeProbe, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
@@ -433,8 +434,8 @@ async fn query_without_a_node_omits_broadcast_and_keeps_tree_state() -> eyre::Re
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
@@ -498,8 +499,8 @@ async fn serving_query_from_chain(
     let mut store_fixture = WalletServingStoreFixture::from_chain(chain, activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;

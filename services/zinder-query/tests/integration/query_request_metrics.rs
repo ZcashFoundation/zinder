@@ -17,10 +17,10 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
-    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, RocksDbCanonicalReader,
+    RocksDbWalletReader, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputsRequest, WalletEndpointMetadata, WalletQueryApi,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition, event_stream_start_message};
 use zinder_testkit::{
@@ -345,7 +345,10 @@ fn shared_serving_query() -> eyre::Result<(WalletServingQuery<()>, WalletServing
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-        WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+        WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?,
     )));
     Ok((query, store_fixture))
 }
@@ -371,8 +374,8 @@ impl ReleaseAdapter {
             crate::common::admitted_ingest_control_fixture().await?;
         let query = WalletServingQuery::from_admitted_native_serving_pair(
             WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical),
-                Arc::new(wallet),
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
             )?)),
             ingest_control,
         );

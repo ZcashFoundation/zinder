@@ -27,7 +27,7 @@ mod supervision;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 use zinder_query::{
-    AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
+    AdmittedIngestControl, CanonicalReader as _, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
     WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
     spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,

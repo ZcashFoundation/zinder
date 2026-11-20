@@ -27,7 +27,8 @@ use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::{
-    OrderedBroadcaster, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventEnvelope, RawBlobRetention};
 use zinder_testkit::{
@@ -118,8 +119,8 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let broadcaster = MockTransactionBroadcaster::accepted(accepted_transaction_id)
         .with_node_activations(activations.as_ref().clone());

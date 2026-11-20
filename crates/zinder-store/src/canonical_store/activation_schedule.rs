@@ -14,7 +14,7 @@ use rust_rocksdb::{DB, WriteBatch};
 use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHeight, ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
 };
 
 use super::{CanonicalStoreError, control::ActivationScheduleBinding};
@@ -81,7 +81,96 @@ pub struct CanonicalActivationSchedule {
     digest: [u8; 32],
 }
 
+/// Why a network-upgrade schedule revision cannot be admitted.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("network-upgrade schedule revision is not admissible: {reason}")]
+pub struct InadmissibleActivationSchedule {
+    reason: String,
+}
+
+impl InadmissibleActivationSchedule {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns why the revision cannot be admitted.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 impl CanonicalActivationSchedule {
+    /// Admits `activations` as the first schedule revision at `admitted_tip`,
+    /// for a store built with the table whose fingerprint is
+    /// `construction_fingerprint`.
+    ///
+    /// This is the revision a canonical writer of any storage engine records
+    /// when it first admits the node's table, so a reader of that engine can
+    /// rebuild the revision from what it stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InadmissibleActivationSchedule`] when `activations` does not
+    /// start with the construction table, adds an activation at or below
+    /// `admitted_tip`, or exceeds the schedule's bounds.
+    pub fn first_revision(
+        activations: NetworkUpgradeActivations,
+        construction_fingerprint: NetworkUpgradeActivationsFingerprint,
+        admitted_tip: zinder_core::BlockId,
+    ) -> Result<Self, InadmissibleActivationSchedule> {
+        let prefix_len = activations
+            .matching_fingerprint_prefix_len(construction_fingerprint)
+            .ok_or_else(|| {
+                InadmissibleActivationSchedule::new(
+                    "the table does not start with the construction table",
+                )
+            })?;
+        let construction = NetworkUpgradeActivations::new(
+            activations.network(),
+            activations.activations()[..prefix_len].to_vec(),
+        )
+        .map_err(|error| InadmissibleActivationSchedule::new(error.to_string()))?;
+        if !activations.preserves_through(&construction, admitted_tip.height) {
+            return Err(InadmissibleActivationSchedule::new(
+                "the table adds an activation at or below the admitted tip",
+            ));
+        }
+        let prefix_len = u32::try_from(prefix_len).map_err(|_| {
+            InadmissibleActivationSchedule::new("the construction table length exceeds u32")
+        })?;
+        Self::initial(
+            activations,
+            construction_fingerprint.as_bytes(),
+            prefix_len,
+            admitted_tip,
+        )
+        .map_err(InadmissibleActivationSchedule::new)
+    }
+
+    /// Admits `activations` at `admitted_tip` as the revision after this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InadmissibleActivationSchedule`] when `activations` changes
+    /// an activation at or below `admitted_tip`, or the revision exceeds the
+    /// schedule's bounds.
+    pub fn next_revision(
+        &self,
+        admitted_tip: zinder_core::BlockId,
+        activations: NetworkUpgradeActivations,
+    ) -> Result<Self, InadmissibleActivationSchedule> {
+        if !activations.preserves_through(&self.activations, admitted_tip.height) {
+            return Err(InadmissibleActivationSchedule::new(
+                "the table changes an activation at or below the admitted tip",
+            ));
+        }
+        Self::successor(self, admitted_tip, activations)
+            .map_err(InadmissibleActivationSchedule::new)
+    }
+
     pub(super) fn initial(
         activations: NetworkUpgradeActivations,
         baseline_fingerprint: [u8; 32],
@@ -605,6 +694,77 @@ mod tests {
         assert_eq!(reopened, second);
         assert_eq!(reopened.revision(), 2);
         assert_eq!(reopened.activations(), &activations(3, 12)?);
+        Ok(())
+    }
+
+    /// The public constructors build the revisions a writer records, so a
+    /// reader of another engine can rebuild the schedule it serves.
+    #[test]
+    fn public_revisions_equal_the_journal_the_writer_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let construction = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(1),
+                activation_height: BlockHeight::new(1),
+                name: "Sapling".to_owned(),
+            }],
+        )?
+        .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        let first =
+            CanonicalActivationSchedule::first_revision(activations(2, 10)?, construction, tip(3))?;
+        let second = first.next_revision(tip(5), activations(3, 12)?)?;
+        assert_eq!(
+            first,
+            CanonicalActivationSchedule::initial(
+                activations(2, 10)?,
+                construction.as_bytes(),
+                1,
+                tip(3)
+            )?
+        );
+        assert_eq!(
+            second,
+            CanonicalActivationSchedule::successor(&first, tip(5), activations(3, 12)?)?
+        );
+        assert_eq!(second.revision(), 2);
+
+        let temporary = TempDir::new()?;
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let db = DB::open(&options, temporary.path())?;
+        let mut batch = WriteBatch::default();
+        first.put_into(&mut batch)?;
+        second.put_into(&mut batch)?;
+        db.write(&batch)?;
+        assert_eq!(
+            CanonicalActivationSchedule::read_bound(
+                &db,
+                temporary.path(),
+                second.binding(),
+                construction.as_bytes(),
+            )?,
+            second
+        );
+
+        // A table that drops the construction table, or moves an activation
+        // the admitted tip has reached, is refused.
+        let unrelated = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(9),
+                activation_height: BlockHeight::new(1),
+                name: "Other".to_owned(),
+            }],
+        )?;
+        assert!(
+            CanonicalActivationSchedule::first_revision(unrelated, construction, tip(3)).is_err()
+        );
+        assert!(
+            CanonicalActivationSchedule::first_revision(activations(2, 3)?, construction, tip(3))
+                .is_err()
+        );
+        assert!(first.next_revision(tip(11), activations(3, 12)?).is_err());
         Ok(())
     }
 

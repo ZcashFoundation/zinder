@@ -32,7 +32,10 @@ use zinder_proto::{
         canonical_control_client::CanonicalControlClient,
     },
 };
-use zinder_query::{QueryError, status_from_query_error, wallet_ingest_control_request};
+use zinder_query::{
+    CanonicalReader, QueryError, RocksDbCanonicalReader, StorageReadError, read_on_blocking_thread,
+    status_from_query_error, wallet_ingest_control_request,
+};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
@@ -41,7 +44,7 @@ use zinder_runtime::{
     expected_writer_fence, refresh_within_stale_deadline,
 };
 use zinder_store::{
-    BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
     RocksDbResourceBudget, SharedBlockCache, StoreRole, record_instance_memory_gauges,
     record_shared_block_cache_gauges,
@@ -59,6 +62,8 @@ const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 pub(crate) enum CompactBlockServingError {
     #[error("compact-block storage failed: {0}")]
     Storage(#[from] CanonicalStoreError),
+    #[error("compact-block generation could not be admitted: {0}")]
+    Admission(#[from] StorageReadError),
     #[error("compact-block writer status failed: {0}")]
     WriterStatus(String),
     #[error("compact-block runtime failed: {0}")]
@@ -122,13 +127,10 @@ impl CompactServingReadiness {
     }
 
     /// Records the writer's commit time of the chain epoch `reader` serves.
-    /// The age only reports staleness, so a failed read keeps the last one.
-    fn publish_served_epoch(&self, reader: &RocksDbCanonicalSecondary) {
-        if let Ok(epoch) = reader.chain_epoch() {
-            self.composed
-                .runtime_readiness()
-                .set_served_epoch_committed_at(epoch.created_at);
-        }
+    fn publish_served_epoch(&self, reader: &RocksDbCanonicalReader) {
+        self.composed
+            .runtime_readiness()
+            .set_served_epoch_committed_at(reader.chain_epoch().created_at);
     }
 
     pub(crate) fn publish_shutting_down(&self) {
@@ -151,23 +153,25 @@ pub(crate) struct CompactBlockServingConfig {
     pub(crate) lag_threshold: u64,
 }
 
+/// The generation that compact-blocks requests read, which only the
+/// publisher replaces.
 #[derive(Clone)]
 pub(crate) struct CompactBlockServingSlot {
-    current: Arc<ArcSwap<RocksDbCanonicalSecondary>>,
+    current: Arc<ArcSwap<RocksDbCanonicalReader>>,
 }
 
 impl CompactBlockServingSlot {
-    fn new(reader: Arc<RocksDbCanonicalSecondary>) -> Self {
+    fn new(reader: Arc<RocksDbCanonicalReader>) -> Self {
         Self {
             current: Arc::new(ArcSwap::from(reader)),
         }
     }
 
-    pub(crate) fn capture(&self) -> Arc<RocksDbCanonicalSecondary> {
+    pub(crate) fn capture(&self) -> Arc<RocksDbCanonicalReader> {
         self.current.load_full()
     }
 
-    fn publish(&self, reader: Arc<RocksDbCanonicalSecondary>) -> Arc<RocksDbCanonicalSecondary> {
+    fn publish(&self, reader: Arc<RocksDbCanonicalReader>) -> Arc<RocksDbCanonicalReader> {
         self.current.swap(reader)
     }
 }
@@ -206,7 +210,7 @@ pub(crate) struct CompactBlockPublisher {
     readiness: CompactServingReadiness,
     slot: CompactBlockServingSlot,
     active_generation: usize,
-    retired: Option<Arc<RocksDbCanonicalSecondary>>,
+    retired: Option<Arc<RocksDbCanonicalReader>>,
     /// The block cache both generations open on, sized by the configured
     /// budget. It outlives each generation, so a cold open on a refresh
     /// starts with the blocks the replaced generation loaded.
@@ -256,7 +260,7 @@ impl CompactBlockPublisher {
                 CompactBlockServingError::Runtime(failure.to_string())
             }
         })?;
-        let reader = Arc::new(candidate);
+        let reader = Arc::new(admit_generation(candidate).await?);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
@@ -390,10 +394,20 @@ impl CompactBlockPublisher {
             );
         }
         if let Some(retired) = self.retired.take() {
-            if Arc::strong_count(&retired) > 1 {
-                self.retired = Some(retired);
-                return;
-            }
+            // A request or a read in flight still holds the retired
+            // generation, whose secondary path the candidate reopens.
+            let retired = match Arc::try_unwrap(retired).map(RocksDbCanonicalReader::into_secondary)
+            {
+                Ok(Ok(secondary)) => secondary,
+                Ok(Err(reader)) => {
+                    self.retired = Some(Arc::new(reader));
+                    return;
+                }
+                Err(retired) => {
+                    self.retired = Some(retired);
+                    return;
+                }
+            };
             if let Err(error) = tokio::task::spawn_blocking(move || drop(retired)).await {
                 tracing::error!(
                     target: "zinder::compat_lightwalletd",
@@ -465,7 +479,14 @@ impl CompactBlockPublisher {
                 return;
             }
         };
-        let reader = Arc::new(candidate);
+        let Ok(reader) = admit_generation(candidate).await else {
+            self.record_failure(
+                ReadinessCause::StorageUnavailable,
+                active.event_fence().visible_tip().height.value(),
+            );
+            return;
+        };
+        let reader = Arc::new(reader);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
         self.readiness.publish_served_epoch(&reader);
@@ -500,7 +521,7 @@ impl CompactBlockPublisher {
         let sampled = tokio::task::spawn_blocking(move || {
             generations
                 .iter()
-                .map(|generation| generation.instance_memory())
+                .map(|generation| generation.secondary().instance_memory())
                 .sum()
         })
         .await;
@@ -586,6 +607,21 @@ async fn open_generation(
     })?
 }
 
+/// Admits a converged candidate as the reader requests read, reading the
+/// chain epoch it serves.
+async fn admit_generation(
+    candidate: RocksDbCanonicalSecondary,
+) -> Result<RocksDbCanonicalReader, CompactBlockServingError> {
+    tokio::task::spawn_blocking(move || RocksDbCanonicalReader::new(candidate))
+        .await
+        .map_err(|error| {
+            CompactBlockServingError::Runtime(format!(
+                "compact-block admission task failed: {error}"
+            ))
+        })?
+        .map_err(CompactBlockServingError::Admission)
+}
+
 async fn catch_up_generation(
     mut candidate: RocksDbCanonicalSecondary,
 ) -> Result<RocksDbCanonicalSecondary, CompactBlockServingError> {
@@ -658,13 +694,16 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
 /// Returns the schedule the canonical writer admitted, which every generation
 /// adopts when it opens.
 fn writer_admitted_activations(
-    reader: &RocksDbCanonicalSecondary,
+    reader: &RocksDbCanonicalReader,
 ) -> Result<&NetworkUpgradeActivations, Status> {
-    reader.network_upgrade_activations().ok_or_else(|| {
-        Status::failed_precondition(
-            "canonical reader carries no writer-admitted network-upgrade schedule",
-        )
-    })
+    reader
+        .network_upgrade_schedule()
+        .map(CanonicalActivationSchedule::activations)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "canonical reader carries no writer-admitted network-upgrade schedule",
+            )
+        })
 }
 
 fn candidate_unavailable() -> ConvergenceFailure {
@@ -754,6 +793,9 @@ async fn converge_candidate<'a>(
     }
 }
 
+/// The Unix time in seconds that tip calls judge a tip's age at.
+type UnixClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct CompactBlockAdapter {
     slot: CompactBlockServingSlot,
@@ -762,6 +804,7 @@ pub(crate) struct CompactBlockAdapter {
     tip_block_times: TipBlockTimeCache,
     node_tip_witness: NodeTipWitness,
     ping: LightwalletdPing,
+    unix_clock: UnixClock,
 }
 
 impl CompactBlockAdapter {
@@ -775,7 +818,15 @@ impl CompactBlockAdapter {
             tip_block_times: TipBlockTimeCache::default(),
             node_tip_witness: NodeTipWitness::default(),
             ping: LightwalletdPing::default(),
+            unix_clock: Arc::new(unix_now_seconds),
         }
+    }
+
+    /// Judges tip ages at the Unix time `unix_clock` reports.
+    #[cfg(test)]
+    fn with_unix_clock(mut self, unix_clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.unix_clock = Arc::new(unix_clock);
+        self
     }
 
     /// Sets how old the served tip may be before `GetLatestBlock` and
@@ -819,34 +870,34 @@ impl CompactBlockAdapter {
         )
     }
 
-    fn reader(&self) -> Arc<RocksDbCanonicalSecondary> {
+    fn reader(&self) -> Arc<RocksDbCanonicalReader> {
         self.slot.capture()
     }
 
     /// Reads the served generation's chain epoch and the times of its tip
     /// for the tip call `method`, and refuses the tip when it is older than
     /// the stale-tip limit.
-    fn served_tip(
+    async fn served_tip(
         &self,
-        reader: &RocksDbCanonicalSecondary,
+        reader: &RocksDbCanonicalReader,
         method: &'static str,
     ) -> Result<(ChainEpoch, TipBlockTime, i64), Status> {
-        let epoch = reader.chain_epoch().map_err(store_status)?;
-        let now = unix_now_seconds();
-        let cached = self
+        let epoch = reader.chain_epoch();
+        let tip_height = epoch.visible_tip_height;
+        let tip = self
             .tip_block_times
-            .cached(epoch.id, epoch.visible_tip_height);
-        let tip = if let Some(cached) = cached {
-            cached
-        } else {
-            let block_time = reader
-                .block_header_at(epoch.visible_tip_height)
-                .map_err(store_status)?
-                .ok_or_else(|| Status::unavailable("the served tip has no stored block header"))?
-                .block_time;
-            self.tip_block_times
-                .store(epoch.id, epoch.visible_tip_height, block_time, now)
-        };
+            .block_time(epoch.id, tip_height, move || async move {
+                reader
+                    .block_header_at(tip_height)
+                    .await
+                    .map_err(store_status)?
+                    .map(|header| header.block_time)
+                    .ok_or_else(|| Status::unavailable("the served tip has no stored block header"))
+            })
+            .await?;
+        // Sampled after the header read, which can wait for a blocking
+        // thread, so the tip's age is the one it has when the call answers.
+        let now = (self.unix_clock)();
         self.stale_tip_limit.check(
             method,
             tip.aged_from_unix_seconds,
@@ -862,32 +913,31 @@ impl CompactBlockAdapter {
         ))
     }
 
-    fn resolve_height(
-        reader: &RocksDbCanonicalSecondary,
-        block: &lightwalletd::BlockId,
-    ) -> Result<BlockHeight, Status> {
+    /// Returns the height or the hash `block` names.
+    fn requested_block(block: &lightwalletd::BlockId) -> Result<RequestedBlock, Status> {
         if block.height != 0 {
             return u32::try_from(block.height)
-                .map(BlockHeight::new)
+                .map(|height| RequestedBlock::Height(BlockHeight::new(height)))
                 .map_err(|_| Status::invalid_argument("block height exceeds u32"));
         }
         if block.hash.len() != 32 {
             return Err(Status::invalid_argument("block identifier is unspecified"));
         }
-        let hash = BlockHash::from_bytes(
+        Ok(RequestedBlock::Hash(BlockHash::from_bytes(
             block
                 .hash
                 .as_slice()
                 .try_into()
                 .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?,
-        );
-        match reader.block_hash_lookup(hash).map_err(store_status)? {
-            BlockHashLookup::Resolved(block_id) => Ok(block_id.height),
-            BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => Err(
-                Status::not_found("block is not in the canonical best chain"),
-            ),
-        }
+        )))
     }
+}
+
+/// The block a `GetBlock` request names.
+#[derive(Clone, Copy)]
+enum RequestedBlock {
+    Height(BlockHeight),
+    Hash(BlockHash),
 }
 
 #[tonic::async_trait]
@@ -906,7 +956,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let reader = self.reader();
-        let (epoch, tip, now) = self.served_tip(&reader, "get_lightd_info")?;
+        let (epoch, tip, now) = self.served_tip(&reader, "get_lightd_info").await?;
         let activations = writer_admitted_activations(&reader)?;
         let estimated_height = estimated_network_height(
             activations,
@@ -927,7 +977,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         _request: Request<lightwalletd::ChainSpec>,
     ) -> Result<Response<lightwalletd::BlockId>, Status> {
         let reader = self.reader();
-        let (epoch, _, _) = self.served_tip(&reader, "get_latest_block")?;
+        let (epoch, _, _) = self.served_tip(&reader, "get_latest_block").await?;
         Ok(Response::new(lightwalletd::BlockId {
             height: u64::from(epoch.visible_tip_height.value()),
             hash: encode_internal_block_hash(epoch.visible_tip_hash).to_vec(),
@@ -940,17 +990,26 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
         let reader = self.reader();
         let request = request.into_inner();
-        let height = Self::resolve_height(reader.as_ref(), &request)?;
-        let epoch = reader.chain_epoch().map_err(store_status)?;
-        if height > epoch.visible_tip_height {
-            return Err(Status::out_of_range(
-                "requested block is newer than latest block",
-            ));
-        }
-        let block = reader
-            .compact_block_at(height)
-            .map_err(store_status)?
-            .ok_or_else(|| Status::not_found("block is not indexed"))?;
+        // The reader resolves a hash and reads its block in one read.
+        let block = match Self::requested_block(&request)? {
+            RequestedBlock::Height(height) => {
+                if height > reader.chain_epoch().visible_tip_height {
+                    return Err(Status::out_of_range(
+                        "requested block is newer than latest block",
+                    ));
+                }
+                reader
+                    .compact_block_at(height)
+                    .await
+                    .map_err(store_status)?
+                    .ok_or_else(|| Status::not_found("block is not indexed"))?
+            }
+            RequestedBlock::Hash(hash) => reader
+                .compact_block_by_hash(hash)
+                .await
+                .map_err(store_status)?
+                .ok_or_else(|| Status::not_found("block is not in the canonical best chain"))?,
+        };
         let response = compact_block_to_lightwalletd(&block)?;
         if !request.hash.is_empty() && request.hash != response.hash {
             return Err(Status::not_found(
@@ -988,7 +1047,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         let pool_selection = pool_selection_from_request(&request.pool_types)?;
         let stream_slot = self.block_range_streams.open().await?;
         let reader = self.reader();
-        let epoch = reader.chain_epoch().map_err(store_status)?;
+        let epoch = reader.chain_epoch();
         if range.end > epoch.visible_tip_height {
             return Err(Status::out_of_range(
                 "requested range is newer than latest block",
@@ -1124,8 +1183,8 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     }
 }
 
-fn store_status(error: CanonicalStoreError) -> Status {
-    status_from_query_error(&QueryError::from(error))
+fn store_status(error: StorageReadError) -> Status {
+    status_from_query_error(&QueryError::canonical_read(error))
 }
 
 #[allow(
@@ -1218,7 +1277,7 @@ fn timed<Output>(stage_work: impl FnOnce() -> Output) -> (Output, Duration) {
 /// the blocking read and encoding finish even when the client cancels the
 /// request.
 async fn read_first_chunk(
-    reader: Arc<RocksDbCanonicalSecondary>,
+    reader: Arc<RocksDbCanonicalReader>,
     chunks: BlockRangeChunks,
     chain_epoch_id: ChainEpochId,
     encoding: ChunkEncoding,
@@ -1241,7 +1300,7 @@ type FirstChunk = (
 );
 
 fn read_and_encode_first_chunk(
-    reader: Arc<RocksDbCanonicalSecondary>,
+    reader: Arc<RocksDbCanonicalReader>,
     mut chunks: BlockRangeChunks,
     chain_epoch_id: ChainEpochId,
     encoding: ChunkEncoding,
@@ -1250,7 +1309,7 @@ fn read_and_encode_first_chunk(
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
     };
-    let (blocks, read) = timed(|| read_chunk_blocks(&reader, chunk, &chunks));
+    let (blocks, read) = timed(|| read_chunk_blocks(reader.as_ref(), chunk, &chunks));
     timings.read = Some(read);
     let blocks = blocks?;
     drop(reader);
@@ -1270,8 +1329,11 @@ fn read_and_encode_first_chunk(
 /// Streams every chunk after the first, each read at the generation current
 /// when it is read.
 ///
-/// The task holds a generation only inside one chunk read, never while it
-/// waits for the client, so a slow client cannot keep the publisher from
+/// Each chunk captures the current generation on the blocking thread that
+/// reads it and releases it before encoding, so the task holds a generation
+/// only inside one storage read: never while the read waits for a blocking
+/// thread, while its blocks are encoded, or while the client makes room, and
+/// a slow client or a busy blocking pool cannot keep the publisher from
 /// recycling the retired generation.
 async fn stream_later_chunks(
     slot: CompactBlockServingSlot,
@@ -1337,9 +1399,9 @@ fn read_later_chunk(
         return Ok(Vec::new());
     };
     let reader = slot.capture();
-    let epoch = reader.chain_epoch().map_err(store_status)?;
+    let epoch = reader.chain_epoch();
     continuity.check_view_reaches(chunk, &epoch)?;
-    let (blocks, read) = timed(|| read_chunk_blocks(&reader, chunk, chunks));
+    let (blocks, read) = timed(|| read_chunk_blocks(reader.as_ref(), chunk, chunks));
     timings.read = Some(read);
     let blocks = blocks?;
     drop(reader);
@@ -1351,15 +1413,22 @@ fn read_later_chunk(
 }
 
 /// Reads the blocks of `chunk` that fit one chunk's byte budget, from the
-/// end the stream sends first.
+/// end the stream sends first, through the canonical read interface on the
+/// calling blocking thread.
+///
+/// The read stage is timed here rather than around the blocking task, so it
+/// leaves out the time the task waited for a blocking thread.
 fn read_chunk_blocks(
-    reader: &RocksDbCanonicalSecondary,
+    reader: &impl CanonicalReader,
     chunk: BlockHeightRange,
     chunks: &BlockRangeChunks,
 ) -> Result<Vec<CompactBlockArtifact>, Status> {
-    reader
-        .compact_blocks_in_range_up_to(chunk, chunks.order(), BLOCK_RANGE_CHUNK_MAX_BYTES)
-        .map_err(store_status)
+    read_on_blocking_thread(reader.compact_blocks_in_range_up_to(
+        chunk,
+        chunks.order(),
+        BLOCK_RANGE_CHUNK_MAX_BYTES,
+    ))
+    .map_err(store_status)
 }
 
 fn range_worker_failed(error: &tokio::task::JoinError) -> Status {
@@ -1595,6 +1664,7 @@ mod tests {
         ReleaseCanonicalProjectionBuildLeaseResponse, RenewCanonicalProjectionBuildLeaseRequest,
         canonical_control_server::{CanonicalControl, CanonicalControlServer},
     };
+    use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
     use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
@@ -2171,7 +2241,10 @@ mod tests {
         let (_publisher, slot) = bootstrap.await??;
 
         let reader = slot.capture();
-        assert_eq!(reader.network_upgrade_activations(), Some(&activations));
+        assert_eq!(
+            reader.secondary().network_upgrade_activations(),
+            Some(&activations)
+        );
         let info = CompactBlockAdapter::new(slot.clone())
             .get_lightd_info(Request::new(lightwalletd::Empty {}))
             .await?
@@ -2369,7 +2442,7 @@ mod tests {
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
         let block_cache = publisher.block_cache.clone();
         let initial = slot.capture();
-        let first_block = initial.compact_block_at(BlockHeight::new(1))?;
+        let first_block = initial.compact_block_at(BlockHeight::new(1)).await?;
         let loaded = block_cache.usage_bytes();
         assert!(
             loaded > 0,
@@ -2400,7 +2473,10 @@ mod tests {
             before_read >= loaded,
             "a cold open on refresh keeps the blocks already loaded"
         );
-        assert_eq!(replaced.compact_block_at(BlockHeight::new(1))?, first_block);
+        assert_eq!(
+            replaced.compact_block_at(BlockHeight::new(1)).await?,
+            first_block
+        );
         assert_eq!(
             block_cache.usage_bytes(),
             before_read,
@@ -3415,7 +3491,7 @@ mod tests {
             let published_reader = slot.capture();
             assert_eq!(published_reader.event_fence(), primary.event_fence());
             assert_eq!(
-                published_reader.network_upgrade_activations(),
+                published_reader.secondary().network_upgrade_activations(),
                 Some(&upgraded)
             );
             drop(published_reader);
@@ -3752,7 +3828,7 @@ mod tests {
                 .with_settled_tip(BlockHeight::new(TIP_HEIGHT - 90)),
         )
         .await?;
-        let sent_epoch = harness.slot.capture().chain_epoch()?.id;
+        let sent_epoch = harness.slot.capture().chain_epoch().id;
 
         let mut stream = harness
             .adapter
@@ -3767,7 +3843,7 @@ mod tests {
             .writer
             .replace_live_blocks(&replacement_chain, BlockHeight::new(fork_height))?;
         harness.refresh_at_writer_fence().await?;
-        assert_ne!(harness.slot.capture().chain_epoch()?.id, sent_epoch);
+        assert_ne!(harness.slot.capture().chain_epoch().id, sent_epoch);
 
         let ending = read_blocks(&mut stream, &mut blocks, usize::MAX)
             .await
@@ -4016,9 +4092,10 @@ mod tests {
         drop(first_wallet);
         drop(second_wallet);
 
-        let slot = CompactBlockServingSlot::new(Arc::new(first_reader));
+        let slot =
+            CompactBlockServingSlot::new(Arc::new(RocksDbCanonicalReader::new(first_reader)?));
         let pinned = slot.capture();
-        let retired = slot.publish(Arc::new(second_reader));
+        let retired = slot.publish(Arc::new(RocksDbCanonicalReader::new(second_reader)?));
         assert_eq!(
             retired.event_fence().visible_tip(),
             pinned.event_fence().visible_tip()
@@ -4042,7 +4119,9 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
 
         let cases = [
             ("start above visible tip", 4_u64, 5_u64, Code::OutOfRange),
@@ -4224,7 +4303,7 @@ mod tests {
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
         Ok(CompactBlockAdapter::new(CompactBlockServingSlot::new(
-            Arc::new(canonical),
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
         )))
     }
 
@@ -4337,7 +4416,7 @@ mod tests {
         chain: &zinder_testkit::ChainFixture,
     ) -> Result<
         (
-            Arc<zinder_store::RocksDbCanonicalSecondary>,
+            Arc<RocksDbCanonicalReader>,
             zinder_testkit::WalletServingStoreFixture,
         ),
         Box<dyn std::error::Error>,
@@ -4347,21 +4426,19 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(chain, &activations)?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        Ok((Arc::new(canonical), fixture))
+        Ok((Arc::new(RocksDbCanonicalReader::new(canonical)?), fixture))
     }
 
-    fn adapter_serving(
-        reader: &Arc<zinder_store::RocksDbCanonicalSecondary>,
-    ) -> CompactBlockAdapter {
+    fn adapter_serving(reader: &Arc<RocksDbCanonicalReader>) -> CompactBlockAdapter {
         CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::clone(reader)))
     }
 
     /// Returns how many blocks of `1..=LARGE_BLOCK_TIP` one byte-capped chunk
     /// read of `reader` keeps.
     fn first_chunk_blocks(
-        reader: &zinder_store::RocksDbCanonicalSecondary,
+        reader: &RocksDbCanonicalReader,
     ) -> Result<u32, Box<dyn std::error::Error>> {
-        let first_chunk = reader.compact_blocks_in_range_up_to(
+        let first_chunk = reader.secondary().compact_blocks_in_range_up_to(
             zinder_core::BlockHeightRange::inclusive(
                 BlockHeight::new(1),
                 BlockHeight::new(LARGE_BLOCK_TIP),
@@ -4382,6 +4459,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (reader, _fixture) = large_block_reader(&large_block_chain(None)?)?;
         let stored_bytes: usize = reader
+            .secondary()
             .compact_blocks_in_range(zinder_core::BlockHeightRange::inclusive(
                 BlockHeight::new(1),
                 BlockHeight::new(LARGE_BLOCK_TIP),
@@ -4424,6 +4502,185 @@ mod tests {
         rendered
             .lines()
             .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
+    }
+
+    /// Returns the seconds `rendered` records for the block-range `stage`.
+    fn block_range_stage_seconds(rendered: &str, stage: &str) -> Option<f64> {
+        let series =
+            format!("zinder_compat_block_range_stage_duration_seconds_sum{{stage=\"{stage}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str())?.parse::<f64>().ok())
+    }
+
+    fn one_blocking_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+    }
+
+    /// A blocking task that keeps the blocking thread running it until it is
+    /// released.
+    struct BlockingGate {
+        release: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl BlockingGate {
+        /// Queues a gate behind every blocking task already queued.
+        fn queue() -> (Self, oneshot::Receiver<()>) {
+            let (running, running_receiver) = oneshot::channel();
+            let (release, released) = oneshot::channel::<()>();
+            let task = tokio::task::spawn_blocking(move || {
+                let _ = running.send(());
+                let _ = released.blocking_recv();
+            });
+            (Self { release, task }, running_receiver)
+        }
+
+        /// Takes the only blocking thread of the runtime.
+        async fn hold() -> Result<Self, Box<dyn std::error::Error>> {
+            let (gate, running) = Self::queue();
+            running.await?;
+            Ok(gate)
+        }
+
+        async fn release(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.release
+                .send(())
+                .map_err(|()| "the blocking gate stopped waiting")?;
+            self.task.await?;
+            Ok(())
+        }
+    }
+
+    /// A block requested by hash is resolved and read in one storage read,
+    /// so in one hop to the blocking pool.
+    ///
+    /// The runtime has one blocking thread. A gate queued behind the
+    /// request's read keeps it, so a second read would wait behind the gate.
+    #[test]
+    fn a_block_requested_by_hash_takes_one_blocking_hop() -> Result<(), Box<dyn std::error::Error>>
+    {
+        one_blocking_thread_runtime()?.block_on(request_a_block_by_hash_ahead_of_a_gate())
+    }
+
+    async fn request_a_block_by_hash_ahead_of_a_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(3);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
+        let by_height = adapter
+            .get_block(Request::new(lightwalletd::BlockId {
+                height: 2,
+                hash: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+
+        let held = BlockingGate::hold().await?;
+        let mut by_hash = adapter.get_block(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: by_height.hash.clone(),
+        }));
+        assert!(
+            poll_once(&mut by_hash).is_pending(),
+            "the request's read must wait for the held blocking thread"
+        );
+        let (queued, _running) = BlockingGate::queue();
+        held.release().await?;
+        let block = tokio::time::timeout(Duration::from_secs(5), by_hash)
+            .await
+            .map_err(|_| "the request made a second read, which waits behind the gate")??
+            .into_inner();
+        assert_eq!(block.encode_to_vec(), by_height.encode_to_vec());
+        queued.release().await
+    }
+
+    /// Streams blocks `1..=2_100`, more than one chunk, while the test holds
+    /// the only blocking thread from before the second chunk's read is queued
+    /// until `hold` has passed.
+    ///
+    /// Returns how many holders the generation the stream started at had
+    /// while that read waited.
+    async fn stream_with_a_queued_later_chunk(
+        hold: Duration,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 2_100;
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT);
+        let harness =
+            LongRangeHarness::start(&zinder_testkit::CanonicalBaseline::new(&chain)).await?;
+        let entry_generation = Arc::downgrade(&harness.slot.capture());
+
+        let mut stream = harness
+            .adapter
+            .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
+            .await?
+            .into_inner();
+        // Taken before the stream's task runs, so its second chunk's read
+        // queues behind the gate.
+        let gate = BlockingGate::hold().await?;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let generation_holders = entry_generation.strong_count();
+        tokio::time::sleep(hold).await;
+        gate.release().await?;
+
+        let mut blocks = Vec::new();
+        read_blocks(&mut stream, &mut blocks, usize::MAX).await?;
+        assert_linked_from_genesis(&blocks, TIP_HEIGHT);
+        drop(stream);
+        harness.stop().await?;
+        Ok(generation_holders)
+    }
+
+    /// A later chunk whose read waits for a blocking thread holds no
+    /// generation, so the publisher can recycle the retired one meanwhile:
+    /// the chunk captures its generation on the thread that reads it.
+    #[test]
+    fn a_later_chunk_waiting_for_a_blocking_thread_holds_no_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let holders = one_blocking_thread_runtime()?
+            .block_on(stream_with_a_queued_later_chunk(Duration::ZERO))?;
+        assert_eq!(
+            holders, 1,
+            "only the serving slot may hold the generation while a chunk read waits"
+        );
+        Ok(())
+    }
+
+    /// A chunk's read stage is the storage read alone, without the time the
+    /// read waited for a blocking thread.
+    #[test]
+    fn a_chunk_read_stage_leaves_out_its_wait_for_a_blocking_thread()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+        let hold = Duration::from_secs(1);
+
+        one_blocking_thread_runtime()?.block_on(stream_with_a_queued_later_chunk(hold))?;
+
+        let rendered = metrics_handle.render();
+        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
+        let read_seconds =
+            block_range_stage_seconds(&rendered, "read").ok_or("no read stage was recorded")?;
+        assert!(
+            read_seconds < hold.as_secs_f64(),
+            "the read stage counted the {hold:?} its read waited for a blocking thread: {read_seconds}s"
+        );
+        Ok(())
     }
 
     /// Each chunk records how long it took to read and to convert, although
@@ -4686,7 +4943,9 @@ mod tests {
             .block_header_at(tip.height)?
             .ok_or("the fixture tip must have a header")?
             .block_time;
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
 
         let info = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
@@ -4841,6 +5100,60 @@ mod tests {
         Ok(())
     }
 
+    /// A tip call judges the tip's age when its header read ends, not when
+    /// the call starts.
+    ///
+    /// The runtime has one blocking thread, which the test holds while the
+    /// call waits to read the tip's header. A paused clock shows the tip one
+    /// minute old when the call starts and advances past the stale-tip limit
+    /// before the read is let through.
+    #[test]
+    fn a_tip_call_judges_the_tip_age_after_its_header_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        one_blocking_thread_runtime()?.block_on(judge_the_tip_age_across_a_held_read())
+    }
+
+    async fn judge_the_tip_age_across_a_held_read() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(4);
+        let (reader, _fixture) = large_block_reader(&chain)?;
+        let tip_block_time = reader
+            .secondary()
+            .block_header_at(reader.chain_epoch().visible_tip_height)?
+            .ok_or("the fixture tip must have a header")?
+            .block_time;
+        let paused_clock = Arc::new(AtomicI64::new(tip_block_time + 60));
+        let adapter = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_unix_clock({
+                let paused_clock = Arc::clone(&paused_clock);
+                move || paused_clock.load(Ordering::SeqCst)
+            });
+
+        let held = BlockingGate::hold().await?;
+        let mut call = adapter.get_latest_block(Request::new(lightwalletd::ChainSpec::default()));
+        assert!(
+            poll_once(&mut call).is_pending(),
+            "the tip header read must wait for the held blocking thread"
+        );
+        paused_clock.store(tip_block_time + 30 * 60, Ordering::SeqCst);
+        held.release().await?;
+        let refused = tokio::time::timeout(Duration::from_secs(5), call)
+            .await?
+            .err()
+            .map(|status| status.code());
+        assert_eq!(
+            refused,
+            Some(Code::Unavailable),
+            "the tip is 30 minutes old when its header read ends"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
@@ -4860,7 +5173,9 @@ mod tests {
             .compact_block_at(BlockHeight::new(2))?
             .ok_or("fixture block missing")?;
         let expected_wire = compact_block_to_lightwalletd(&expected_block)?;
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
 
         let info = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
@@ -5021,7 +5336,9 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -5058,7 +5375,9 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+            RocksDbCanonicalReader::new(canonical)?,
+        )));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -5139,8 +5458,10 @@ mod tests {
             zinder_runtime::RuntimeService::CompatLightwalletd,
         );
         let router = runtime.public_grpc_router(
-            CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)))
-                .into_server(),
+            CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(
+                RocksDbCanonicalReader::new(canonical)?,
+            )))
+            .into_server(),
             zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
             zinder_runtime::ClientAddressSource::Connection,
             &serving_readiness.runtime(),

@@ -25,8 +25,8 @@ use zinder_core::{
 };
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -175,8 +175,8 @@ async fn build_live_serving_pair(
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?));
     Ok((store_fixture, slot, tip_height))
 }

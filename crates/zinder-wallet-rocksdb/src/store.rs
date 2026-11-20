@@ -29,12 +29,13 @@ use zinder_store::{
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY,
-    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
-    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
-    WalletProjectionBuildPlan, WalletProjectionBuildState, WalletProjectionDigestBuilder,
-    WalletProjectionReadyEvidence, WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput,
-    WalletStoreControlRecord, WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionHistoryPage,
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage,
+    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionBuildPlan,
+    WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord,
+    WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -101,24 +102,6 @@ pub struct WalletRecoveryAdmissionConfig<'staging> {
     pub max_temporary_file_bytes_per_sorter: u64,
     /// Accounted memory ceiling for reconstructing retained reorg-undo effects.
     pub max_accounted_reorg_undo_bytes: u64,
-}
-
-/// One bounded page of current outputs ordered by creation position and outpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletAddressUnspentOutputsPage {
-    /// Current outputs in durable version-1 address-index order.
-    pub outputs: Vec<WalletUnspentOutput>,
-    /// Exclusive continuation key to pass as `after` for the next page.
-    pub next_page_after: Option<WalletAddressUnspentOutputKey>,
-}
-
-/// One bounded page of address history ordered by block height and transaction index.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WalletAddressTransactionHistoryPage {
-    /// Address-touching transactions in durable version-1 history order.
-    pub transactions: Vec<WalletAddressTransaction>,
-    /// Exclusive continuation key to pass as `after` for the next page.
-    pub next_page_after: Option<WalletAddressTransactionKey>,
 }
 
 /// Durable BUILDING wallet store and its lease-management boundary.

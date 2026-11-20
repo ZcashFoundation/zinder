@@ -16,7 +16,8 @@ use zinder_proto::compat::lightwalletd::{
     ChainSpec, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::{
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair, WalletServingReadiness,
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair, WalletServingReadiness,
 };
 use zinder_runtime::{
     OpsEndpointHandle, OpsServer, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
@@ -43,10 +44,12 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
         &activations,
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-            WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
-        )));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+        Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?),
+    ));
     let readiness = Readiness::default();
     let serving_readiness = WalletServingReadiness::pair_only(readiness.clone());
     let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);

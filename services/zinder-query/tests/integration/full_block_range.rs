@@ -16,8 +16,9 @@ use zinder_proto::{
     v1::wallet,
 };
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQueryApi,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, RocksDbCanonicalReader,
+    RocksDbWalletReader, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_store::{ArtifactFamily, RawBlobRetention};
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
@@ -238,8 +239,8 @@ async fn serving_pair_with_all_retention_advertises_and_serves_full_blocks() -> 
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
@@ -342,8 +343,8 @@ async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() ->
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
     )?);
     let (ingest_control, _ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;

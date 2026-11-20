@@ -2,7 +2,6 @@
 
 use std::{
     fmt, io,
-    num::NonZeroU16,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,272 +10,13 @@ use std::{
 
 use thiserror::Error;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
-use zinder_core::{
-    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
-    CanonicalHistoryBounds, ChainEpoch, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
-    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
-};
-use zinder_store::{
-    BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
-    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
-    ServedTreeState, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
-};
+use zinder_core::{BlockId, ChainEpoch, Network, NetworkUpgradeActivations};
+use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
 use zinder_wallet_projection::{
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletProjectionReadyEvidence, WalletProjectionSourcePosition, WalletSpentOutput,
-    WalletUnspentOutput,
-};
-use zinder_wallet_rocksdb::{
-    RocksDbWalletError, RocksDbWalletSecondary, WalletAddressTransactionHistoryPage,
-    WalletAddressUnspentOutputsPage,
+    WalletCanonicalSourceIdentity, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
 };
 
-use crate::QueryError;
-
-/// Read-only canonical data held at one immutable admitted fence.
-///
-/// Implementations must never catch up or otherwise mutate their observed
-/// fence while a caller holds the same instance in a [`WalletServingReadPair`].
-pub trait CanonicalReader: Send + Sync + 'static {
-    /// Returns the writer-admitted network-upgrade schedule observed with
-    /// this fence, or `None` before the writer's first admission.
-    fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule>;
-
-    /// Returns the persisted raw-blob retention authenticated at admission.
-    fn raw_blob_retention(&self) -> RawBlobRetention;
-
-    /// Returns the immutable network admitted by this canonical reader.
-    fn network(&self) -> Network;
-
-    /// Returns the exact admitted canonical event fence.
-    fn event_fence(&self) -> CanonicalEventFence;
-
-    /// Returns the intentionally retained canonical history range.
-    fn history_bounds(&self) -> CanonicalHistoryBounds;
-
-    /// Reads the visible chain epoch at the admitted fence.
-    fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError>;
-
-    /// Reads one retained canonical epoch by its exact identifier.
-    fn chain_epoch_at(
-        &self,
-        epoch_id: zinder_core::ChainEpochId,
-    ) -> Result<ChainEpoch, CanonicalStoreError>;
-
-    /// Reads one canonical header by height.
-    fn block_header_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError>;
-
-    /// Resolves a block hash through the admitted canonical best-chain index.
-    fn block_hash_lookup(
-        &self,
-        block_hash: zinder_core::BlockHash,
-    ) -> Result<BlockHashLookup, CanonicalStoreError>;
-
-    /// Reads one compact block by height.
-    fn compact_block_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError>;
-
-    /// Reads an inclusive compact-block range.
-    fn compact_blocks_in_range(
-        &self,
-        range: BlockHeightRange,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>;
-
-    /// Reads compact blocks from the end of `range` that `order` visits
-    /// first, until the next block would take their stored bytes past
-    /// `max_bytes`, as
-    /// [`RocksDbCanonicalSecondary::compact_blocks_in_range_up_to`] does.
-    fn compact_blocks_in_range_up_to(
-        &self,
-        range: BlockHeightRange,
-        order: HeightOrder,
-        max_bytes: usize,
-    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>;
-
-    /// Reads one retained full block blob by height.
-    fn block_blob_at(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError>;
-
-    /// Reads retained full block blobs for an inclusive height range.
-    fn block_blobs_in_range(
-        &self,
-        range: BlockHeightRange,
-    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError>;
-
-    /// Reads the canonical location of a transaction.
-    fn transaction_location(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError>;
-
-    /// Reads the canonical location of a transaction, answering `None` only
-    /// for a proven absence from height 1 through the visible tip.
-    ///
-    /// A store whose history starts after a checkpoint answers a miss with
-    /// [`CanonicalStoreError::CanonicalHistoryUnavailable`].
-    fn transaction_location_or_proven_absence(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<TransactionLocation>, CanonicalStoreError>;
-
-    /// Reads a raw transaction at an authenticated canonical location.
-    fn transaction_blob(
-        &self,
-        location: TransactionLocation,
-    ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError>;
-
-    /// Reads the newest commitment-tree checkpoint stored at or below a
-    /// height, as
-    /// [`RocksDbCanonicalSecondary::tree_state_checkpoint_at_or_before`]
-    /// does.
-    fn tree_state_checkpoint_at_or_before(
-        &self,
-        height: BlockHeight,
-    ) -> Result<Option<ServedTreeState>, CanonicalStoreError>;
-
-    /// Reads the commitment-tree checkpoint at exactly `height`,
-    /// reconstructing it from stored compact blocks when no checkpoint is
-    /// stored there, as
-    /// [`RocksDbCanonicalSecondary::tree_state_checkpoint_at`] does.
-    fn tree_state_checkpoint_at(
-        &self,
-        height: BlockHeight,
-        network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
-
-    /// Finds how the tree state at `height` is answered, as
-    /// [`RocksDbCanonicalSecondary::tree_state_lookup`] does.
-    ///
-    /// The default answers every height through
-    /// [`Self::tree_state_checkpoint_at`] as stored, so a reader that keeps it
-    /// rebuilds inline, outside the query's replay-slot limit.
-    fn tree_state_lookup(
-        &self,
-        height: BlockHeight,
-        network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
-        self.tree_state_checkpoint_at(height, network_upgrade_activations)
-            .map(|checkpoint| {
-                checkpoint
-                    .map(|checkpoint| TreeStateLookup::Stored(ServedTreeState::from(checkpoint)))
-            })
-    }
-
-    /// Reconstructs the tree state a [`Self::tree_state_lookup`] found no
-    /// checkpoint for, and reports how it was answered, as
-    /// [`RocksDbCanonicalSecondary::replay_tree_state`] does.
-    ///
-    /// The default reads the height through
-    /// [`Self::tree_state_checkpoint_at`] and reports it replayed from the
-    /// seed `replay` names.
-    fn replay_tree_state(
-        &self,
-        replay: &TreeStateReplay,
-        network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
-        self.tree_state_checkpoint_at(replay.height(), network_upgrade_activations)
-            .map(|checkpoint| {
-                checkpoint.map(|checkpoint| TreeStateReplayOutcome::Replayed {
-                    replay: Box::new(replay.clone()),
-                    tree_state: ServedTreeState::from(checkpoint),
-                })
-            })
-    }
-
-    /// Reads a contiguous range of subtree roots.
-    fn subtree_roots(
-        &self,
-        range: SubtreeRootRange,
-    ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError>;
-
-    /// Projects retained canonical transitions into authenticated wallet events.
-    fn wallet_chain_event_history(
-        &self,
-        request: ChainEventHistoryRequest<'_>,
-    ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError>;
-
-    /// Resolves an authenticated wallet chain-event subscription start.
-    fn resolve_wallet_chain_event_stream_start(
-        &self,
-        start: &EventStreamStartPosition,
-        requested_family: ChainEventStreamFamily,
-    ) -> Result<ChainEventStreamResume, CanonicalStoreError>;
-}
-
-/// Read-only wallet projection state held at one immutable READY source identity.
-///
-/// Implementations must never follow a primary or mutate their observed READY
-/// evidence while a caller holds the instance in a [`WalletServingReadPair`].
-pub trait WalletProjectionReader: Send + Sync + 'static {
-    /// Returns the immutable wallet network admitted from store control.
-    fn network(&self) -> Network;
-
-    /// Returns the complete READY evidence bound to this reader.
-    fn ready_evidence(&self) -> &WalletProjectionReadyEvidence;
-
-    /// Reads one bounded page of unspent outputs for an address.
-    fn address_unspent_outputs_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError>;
-
-    /// Reads one bounded page of unspent outputs at or above a creation-height
-    /// lower bound.
-    fn address_unspent_outputs_page_from_height(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        start_height: BlockHeight,
-        after: Option<WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError>;
-
-    /// Reads one bounded page of address-touching transaction history.
-    fn address_transaction_history_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError>;
-
-    /// Reads one bounded page of address-touching transactions within an
-    /// inclusive height range.
-    fn address_transaction_history_range_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        height_range: BlockHeightRange,
-        after: Option<WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError>;
-
-    /// Reads one address balance, treating an absent row as zero.
-    fn address_balance(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> Result<u64, RocksDbWalletError>;
-
-    /// Reads the current unspent output at one exact outpoint.
-    fn find_unspent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError>;
-
-    /// Reads the spent output at one exact outpoint, with its spending input.
-    fn find_spent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError>;
-}
+use crate::{CanonicalReader, QueryError, WalletProjectionReader};
 
 /// Typed reason why canonical and wallet readers cannot form one serving pair.
 ///
@@ -293,13 +33,6 @@ pub enum WalletServingAdmissionError {
         canonical: Network,
         /// Network committed by the wallet reader.
         wallet: Network,
-    },
-    /// The canonical reader could not decode its visible epoch.
-    #[error("canonical reader failed while validating a wallet-serving read pair")]
-    CanonicalRead {
-        /// Exact canonical storage failure.
-        #[source]
-        source: CanonicalStoreError,
     },
     /// The visible canonical epoch disagreed with the canonical READY fence.
     #[error("canonical READY epoch does not match its admitted event fence")]
@@ -318,246 +51,29 @@ pub enum WalletServingAdmissionError {
     },
 }
 
-macro_rules! impl_canonical_read {
-    ($store:ty) => {
-        impl CanonicalReader for $store {
-            fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
-                self.network_upgrade_schedule()
-            }
-
-            fn raw_blob_retention(&self) -> RawBlobRetention {
-                self.raw_blob_retention()
-            }
-
-            fn network(&self) -> Network {
-                self.network()
-            }
-
-            fn event_fence(&self) -> CanonicalEventFence {
-                self.event_fence()
-            }
-
-            fn history_bounds(&self) -> CanonicalHistoryBounds {
-                self.history_bounds()
-            }
-
-            fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError> {
-                self.chain_epoch()
-            }
-
-            fn chain_epoch_at(
-                &self,
-                epoch_id: zinder_core::ChainEpochId,
-            ) -> Result<ChainEpoch, CanonicalStoreError> {
-                self.chain_epoch_at(epoch_id)
-            }
-
-            fn block_header_at(
-                &self,
-                height: BlockHeight,
-            ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
-                self.block_header_at(height)
-            }
-
-            fn block_hash_lookup(
-                &self,
-                block_hash: zinder_core::BlockHash,
-            ) -> Result<BlockHashLookup, CanonicalStoreError> {
-                self.block_hash_lookup(block_hash)
-            }
-
-            fn compact_block_at(
-                &self,
-                height: BlockHeight,
-            ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-                self.compact_block_at(height)
-            }
-
-            fn compact_blocks_in_range(
-                &self,
-                range: BlockHeightRange,
-            ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-                self.compact_blocks_in_range(range)
-            }
-
-            fn compact_blocks_in_range_up_to(
-                &self,
-                range: BlockHeightRange,
-                order: HeightOrder,
-                max_bytes: usize,
-            ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-                self.compact_blocks_in_range_up_to(range, order, max_bytes)
-            }
-
-            fn block_blob_at(
-                &self,
-                height: BlockHeight,
-            ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
-                self.block_blob_at(height)
-            }
-
-            fn block_blobs_in_range(
-                &self,
-                range: BlockHeightRange,
-            ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
-                self.block_blobs_in_range(range)
-            }
-
-            fn transaction_location(
-                &self,
-                transaction_id: TransactionId,
-            ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-                self.transaction_location(transaction_id)
-            }
-
-            fn transaction_location_or_proven_absence(
-                &self,
-                transaction_id: TransactionId,
-            ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-                self.transaction_location_or_proven_absence(transaction_id)
-            }
-
-            fn transaction_blob(
-                &self,
-                location: TransactionLocation,
-            ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
-                self.transaction_blob(location)
-            }
-
-            fn tree_state_checkpoint_at_or_before(
-                &self,
-                height: BlockHeight,
-            ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
-                self.tree_state_checkpoint_at_or_before(height)
-            }
-
-            fn tree_state_checkpoint_at(
-                &self,
-                height: BlockHeight,
-                network_upgrade_activations: &NetworkUpgradeActivations,
-            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-                self.tree_state_checkpoint_at(height, network_upgrade_activations)
-            }
-
-            fn tree_state_lookup(
-                &self,
-                height: BlockHeight,
-                network_upgrade_activations: &NetworkUpgradeActivations,
-            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
-                self.tree_state_lookup(height, network_upgrade_activations)
-            }
-
-            fn replay_tree_state(
-                &self,
-                replay: &TreeStateReplay,
-                network_upgrade_activations: &NetworkUpgradeActivations,
-            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
-                self.replay_tree_state(replay, network_upgrade_activations)
-            }
-
-            fn subtree_roots(
-                &self,
-                range: SubtreeRootRange,
-            ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
-                self.subtree_roots(range)
-            }
-
-            fn wallet_chain_event_history(
-                &self,
-                request: ChainEventHistoryRequest<'_>,
-            ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError> {
-                self.wallet_chain_event_history(request)
-            }
-
-            fn resolve_wallet_chain_event_stream_start(
-                &self,
-                start: &EventStreamStartPosition,
-                requested_family: ChainEventStreamFamily,
-            ) -> Result<ChainEventStreamResume, CanonicalStoreError> {
-                self.resolve_wallet_chain_event_stream_start(start, requested_family)
-            }
-        }
-    };
+/// What a canonical reader admitted with its fence, as pair admission
+/// compares it with wallet READY evidence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CanonicalAdmission<'reader> {
+    /// Network the reader admitted.
+    pub(crate) network: Network,
+    /// Network-upgrade schedule the canonical writer admitted with the fence.
+    pub(crate) network_upgrade_schedule: Option<&'reader CanonicalActivationSchedule>,
+    /// Exact admitted canonical event fence.
+    pub(crate) event_fence: CanonicalEventFence,
+    /// Chain epoch visible at the fence.
+    pub(crate) chain_epoch: ChainEpoch,
 }
 
-impl_canonical_read!(RocksDbCanonicalSecondary);
-
-impl WalletProjectionReader for RocksDbWalletSecondary {
-    fn network(&self) -> Network {
-        self.network()
-    }
-
-    fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
-        self.ready_evidence()
-    }
-
-    fn address_unspent_outputs_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
-        self.address_unspent_outputs_page(address_script_hash, after, page_size)
-    }
-
-    fn address_unspent_outputs_page_from_height(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        start_height: BlockHeight,
-        after: Option<WalletAddressUnspentOutputKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressUnspentOutputsPage, RocksDbWalletError> {
-        self.address_unspent_outputs_page_from_height(
-            address_script_hash,
-            start_height,
-            after,
-            page_size,
-        )
-    }
-
-    fn address_transaction_history_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        after: Option<WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
-        self.address_transaction_history_page(address_script_hash, after, page_size)
-    }
-
-    fn address_transaction_history_range_page(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        height_range: BlockHeightRange,
-        after: Option<WalletAddressTransactionKey>,
-        page_size: NonZeroU16,
-    ) -> Result<WalletAddressTransactionHistoryPage, RocksDbWalletError> {
-        self.address_transaction_history_range_page(
-            address_script_hash,
-            height_range,
-            after,
-            page_size,
-        )
-    }
-
-    fn address_balance(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> Result<u64, RocksDbWalletError> {
-        self.address_balance(address_script_hash)
-    }
-
-    fn find_unspent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
-        self.find_unspent_output(outpoint)
-    }
-
-    fn find_spent_output(
-        &self,
-        outpoint: TransparentOutPoint,
-    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
-        self.find_spent_output(outpoint)
+impl<'reader> CanonicalAdmission<'reader> {
+    /// Returns what `reader` admitted with its fence.
+    fn of(reader: &'reader dyn CanonicalReader) -> Self {
+        Self {
+            network: reader.network(),
+            network_upgrade_schedule: reader.network_upgrade_schedule(),
+            event_fence: reader.event_fence(),
+            chain_epoch: reader.chain_epoch(),
+        }
     }
 }
 
@@ -594,8 +110,12 @@ impl WalletServingReadPair {
         canonical: Arc<dyn CanonicalReader>,
         wallet: Arc<dyn WalletProjectionReader>,
     ) -> Result<Self, QueryError> {
-        let chain_epoch = Self::validated_chain_epoch(canonical.as_ref(), wallet.as_ref())
-            .map_err(|error| pair_admission_query_error(&error))?;
+        let chain_epoch = Self::validate_admission(
+            CanonicalAdmission::of(canonical.as_ref()),
+            wallet.network(),
+            wallet.ready_evidence(),
+        )
+        .map_err(|error| pair_admission_query_error(&error))?;
         let network_upgrade_activations = canonical
             .network_upgrade_schedule()
             .map(|schedule| schedule.activations().clone())
@@ -618,42 +138,34 @@ impl WalletServingReadPair {
         })
     }
 
-    /// Validates whether two immutable readers represent one exact source.
+    /// Validates whether a canonical reader admitted as `canonical` and a
+    /// wallet reader of `wallet_network` with `wallet_evidence` represent one
+    /// exact source, and returns the canonical epoch they agree on.
     ///
     /// Candidate-pair publishers use this before publication. It compares the
     /// admitted network, epoch, event cursor, visible tip, sequence digest,
     /// and settlement boundary without retaining either reader.
-    pub fn validate_readers(
-        canonical: &(dyn CanonicalReader + 'static),
-        wallet: &(dyn WalletProjectionReader + 'static),
-    ) -> Result<(), WalletServingAdmissionError> {
-        Self::validated_chain_epoch(canonical, wallet).map(drop)
-    }
-
-    /// Validates the readers as [`Self::validate_readers`] does and returns
-    /// the canonical epoch they agree on.
-    fn validated_chain_epoch(
-        canonical: &(dyn CanonicalReader + 'static),
-        wallet: &(dyn WalletProjectionReader + 'static),
+    pub(crate) fn validate_admission(
+        canonical: CanonicalAdmission<'_>,
+        wallet_network: Network,
+        wallet_evidence: &WalletProjectionReadyEvidence,
     ) -> Result<ChainEpoch, WalletServingAdmissionError> {
-        if canonical.network() != wallet.network() {
+        if canonical.network != wallet_network {
             return Err(WalletServingAdmissionError::NetworkMismatch {
-                canonical: canonical.network(),
-                wallet: wallet.network(),
+                canonical: canonical.network,
+                wallet: wallet_network,
             });
         }
-        if canonical.network_upgrade_schedule().is_none() {
+        if canonical.network_upgrade_schedule.is_none() {
             return Err(WalletServingAdmissionError::NetworkUpgradeScheduleNotAdmitted);
         }
-        let canonical_fence = canonical.event_fence();
-        let canonical_epoch = canonical
-            .chain_epoch()
-            .map_err(|source| WalletServingAdmissionError::CanonicalRead { source })?;
+        let canonical_fence = canonical.event_fence;
+        let canonical_epoch = canonical.chain_epoch;
         let canonical_visible_tip = BlockId::new(
             canonical_epoch.visible_tip_height,
             canonical_epoch.visible_tip_hash,
         );
-        if canonical_epoch.network != canonical.network()
+        if canonical_epoch.network != canonical.network
             || canonical_epoch.id != canonical_fence.chain_epoch_id()
             || canonical_visible_tip != canonical_fence.visible_tip()
         {
@@ -671,8 +183,7 @@ impl WalletServingReadPair {
                 canonical_epoch.settled_tip_hash,
             ),
         );
-        let wallet_source =
-            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet_evidence);
         if wallet_source != canonical_source {
             return Err(WalletServingAdmissionError::WalletSourceMismatch {
                 canonical: Box::new(canonical_source),

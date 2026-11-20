@@ -533,6 +533,24 @@ impl WalletAddressTransaction {
     }
 }
 
+/// One bounded page of current outputs ordered by creation position and outpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletAddressUnspentOutputsPage {
+    /// Current outputs in durable version-1 address-index order.
+    pub outputs: Vec<WalletUnspentOutput>,
+    /// Exclusive continuation key to pass as `after` for the next page.
+    pub next_page_after: Option<WalletAddressUnspentOutputKey>,
+}
+
+/// One bounded page of address history ordered by block height and transaction index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletAddressTransactionHistoryPage {
+    /// Address-touching transactions in durable version-1 history order.
+    pub transactions: Vec<WalletAddressTransaction>,
+    /// Exclusive continuation key to pass as `after` for the next page.
+    pub next_page_after: Option<WalletAddressTransactionKey>,
+}
+
 /// Current transparent balance for one address script hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalletAddressBalance {

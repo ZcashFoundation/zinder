@@ -1,8 +1,10 @@
-//! Compact-block range measurements through the admitted canonical secondary API.
+//! Compact-block range measurements through the admitted canonical secondary
+//! API and through the canonical reader `zinder-query` serves from.
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,7 +12,8 @@ use clap::Args;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zinder_bench::{BenchError, fixture::FixtureManifest};
-use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact};
+use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact, NetworkUpgradeActivations};
+use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
     RocksDbCanonicalSecondary, RocksDbResourceBudget,
@@ -81,6 +84,17 @@ struct CompactBlockRangeCase {
     fresh_secondary_open_seconds: f64,
     cold: CompactBlockRangeMeasurement,
     warm: CompactBlockRangeMeasurement,
+    canonical_reader: CanonicalReaderRangeCase,
+}
+
+/// The same range read through `zinder_query::CanonicalReader` on a second
+/// fresh secondary, including the hop to the blocking pool that
+/// `zinder-query` makes for every read.
+#[derive(Serialize)]
+struct CanonicalReaderRangeCase {
+    fresh_secondary_open_seconds: f64,
+    cold: CompactBlockRangeMeasurement,
+    warm: CompactBlockRangeMeasurement,
 }
 
 #[derive(Serialize)]
@@ -98,7 +112,7 @@ struct CompactBlockRangeOutputEvidence {
 }
 
 /// Measures nested ranges ending at one immutable admitted READY tip.
-pub(crate) fn run_rocksdb_compact_block_range(
+pub(crate) async fn run_rocksdb_compact_block_range(
     args: RocksDbCompactBlockRangeArgs,
 ) -> Result<RocksDbCompactBlockRangeOutput, BenchError> {
     if args.software_revision.trim().is_empty() {
@@ -116,18 +130,12 @@ pub(crate) fn run_rocksdb_compact_block_range(
     let mut admitted_ready = None;
     let mut cases = Vec::with_capacity(RANGE_BLOCK_COUNTS.len());
     for block_count in RANGE_BLOCK_COUNTS {
-        let secondary_path = args.secondary_root.join(format!("range-{block_count}"));
-        let open_started = Instant::now();
-        let secondary = RocksDbCanonicalSecondary::open_ready(
+        let (secondary, open_elapsed) = open_secondary(
             &canonical_store,
-            &secondary_path,
+            &args.secondary_root.join(format!("range-{block_count}")),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
             reorg_policy,
-            RocksDbResourceBudget::canonical_reader_defaults(),
         )?;
-        let open_elapsed = open_started.elapsed();
         let ready = secondary.ready_evidence();
         require_same_ready_fence(admitted_ready.as_ref(), &ready)?;
         admitted_ready = Some(ready);
@@ -140,6 +148,26 @@ pub(crate) fn run_rocksdb_compact_block_range(
                 "cold and warm compact-block outputs differ for {block_count} blocks"
             )));
         }
+        drop(secondary);
+        let reader_path = args
+            .secondary_root
+            .join(format!("range-{block_count}-canonical-reader"));
+        let (reader_secondary, reader_open_elapsed) = open_at_fence(
+            &canonical_store,
+            &reader_path,
+            &activations,
+            reorg_policy,
+            &ready,
+        )?;
+        let canonical_reader =
+            measure_reader_range(reader_secondary, reader_open_elapsed, range, block_count).await?;
+        if canonical_reader.cold.output != cold.output
+            || canonical_reader.warm.output != cold.output
+        {
+            return Err(BenchError::report_format(format!(
+                "canonical-reader compact-block outputs differ for {block_count} blocks"
+            )));
+        }
         cases.push(CompactBlockRangeCase {
             requested_block_count: block_count,
             range_start_height: range.start.value(),
@@ -147,6 +175,7 @@ pub(crate) fn run_rocksdb_compact_block_range(
             fresh_secondary_open_seconds: elapsed_seconds(open_elapsed),
             cold,
             warm,
+            canonical_reader,
         });
     }
 
@@ -155,7 +184,7 @@ pub(crate) fn run_rocksdb_compact_block_range(
     })?;
     let report = RocksDbCompactBlockRangeReport {
         contract_identity: "rocksdb-compact-block-range",
-        report_format_version: 2,
+        report_format_version: 3,
         software_revision: args.software_revision,
         fixture_manifest_digest_sha256: manifest.digest_sha256()?,
         canonical_store: canonical_store.to_string_lossy().into_owned(),
@@ -166,6 +195,48 @@ pub(crate) fn run_rocksdb_compact_block_range(
         report,
         report_path: args.report,
     })
+}
+
+/// Opens a fresh READY secondary and returns it with how long the open took.
+fn open_secondary(
+    canonical_store: &Path,
+    secondary_path: &Path,
+    activations: &NetworkUpgradeActivations,
+    reorg_policy: CanonicalReorgPolicy,
+) -> Result<(RocksDbCanonicalSecondary, Duration), BenchError> {
+    let open_started = Instant::now();
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        canonical_store,
+        secondary_path,
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        reorg_policy,
+        RocksDbResourceBudget::canonical_reader_defaults(),
+    )?;
+    Ok((secondary, open_started.elapsed()))
+}
+
+/// Opens a secondary as [`open_secondary`] does, but only at the `expected`
+/// READY fence.
+///
+/// A case's canonical-reader measurement opens its secondary this way at the
+/// fence its direct measurement read, so both time the same chain.
+fn open_at_fence(
+    canonical_store: &Path,
+    secondary_path: &Path,
+    activations: &NetworkUpgradeActivations,
+    reorg_policy: CanonicalReorgPolicy,
+    expected: &CanonicalStoreReadyEvidence,
+) -> Result<(RocksDbCanonicalSecondary, Duration), BenchError> {
+    let (secondary, open_elapsed) =
+        open_secondary(canonical_store, secondary_path, activations, reorg_policy)?;
+    if secondary.ready_evidence() != *expected {
+        return Err(BenchError::report_format(
+            "canonical READY fence changed between the direct and canonical-reader measurements",
+        ));
+    }
+    Ok((secondary, open_elapsed))
 }
 
 fn prepare_secondary_root(
@@ -235,6 +306,47 @@ fn measure_range(
 ) -> Result<CompactBlockRangeMeasurement, BenchError> {
     let started = Instant::now();
     let blocks = secondary.compact_blocks_in_range(range)?;
+    let seconds = elapsed_seconds(started.elapsed());
+    let output = compact_block_range_output(&blocks, range, expected_block_count)?;
+    Ok(CompactBlockRangeMeasurement {
+        seconds,
+        blocks_per_second: f64::from(expected_block_count) / seconds,
+        output,
+    })
+}
+
+/// Reads `range` cold and then warm through the canonical reader.
+async fn measure_reader_range(
+    secondary: RocksDbCanonicalSecondary,
+    open_elapsed: Duration,
+    range: BlockHeightRange,
+    expected_block_count: u32,
+) -> Result<CanonicalReaderRangeCase, BenchError> {
+    let reader: Arc<dyn CanonicalReader> = Arc::new(
+        RocksDbCanonicalReader::new(secondary)
+            .map_err(|error| BenchError::canonical_read(error.to_string()))?,
+    );
+    let cold = measure_reader_read(&reader, range, expected_block_count).await?;
+    let warm = measure_reader_read(&reader, range, expected_block_count).await?;
+    Ok(CanonicalReaderRangeCase {
+        fresh_secondary_open_seconds: elapsed_seconds(open_elapsed),
+        cold,
+        warm,
+    })
+}
+
+/// Times one read of `range` through `reader` as `zinder-query` makes it,
+/// including the reader's hop to the blocking pool.
+async fn measure_reader_read(
+    reader: &Arc<dyn CanonicalReader>,
+    range: BlockHeightRange,
+    expected_block_count: u32,
+) -> Result<CompactBlockRangeMeasurement, BenchError> {
+    let started = Instant::now();
+    let blocks = reader
+        .compact_blocks_in_range(range)
+        .await
+        .map_err(|error| BenchError::canonical_read(error.to_string()))?;
     let seconds = elapsed_seconds(started.elapsed());
     let output = compact_block_range_output(&blocks, range, expected_block_count)?;
     Ok(CompactBlockRangeMeasurement {
@@ -400,7 +512,10 @@ mod tests {
         CompactTransparentInput, CompactTransparentOutput, TransactionId,
     };
 
-    use super::{BlockHeight, BlockHeightRange, compact_block_range_output};
+    use super::{
+        BenchError, BlockHeight, BlockHeightRange, compact_block_range_output, open_at_fence,
+        open_secondary,
+    };
 
     fn empty_block(height: u32, hash_byte: u8, parent_byte: u8, time: u32) -> CompactBlockArtifact {
         CompactBlockArtifact::empty(
@@ -416,6 +531,53 @@ mod tests {
                 ironwood_commitment_tree_size: 0,
             },
         )
+    }
+
+    /// The canonical-reader measurement reads only a secondary at the READY
+    /// fence the direct measurement read, so a writer that moved between the
+    /// two opens fails the case instead of timing another chain.
+    #[test]
+    fn the_reader_measurement_refuses_a_secondary_at_another_ready_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .extend_blocks(4);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let mut writer = zinder_testkit::CanonicalWriterFixture::publish(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(3)),
+            &activations,
+        )?;
+        let canonical_store = writer.canonical_primary_path().to_path_buf();
+        let reorg_policy = writer.canonical_primary()?.reorg_policy();
+        let secondaries = tempfile::TempDir::new()?;
+        let (direct, _) = open_secondary(
+            &canonical_store,
+            &secondaries.path().join("direct"),
+            &activations,
+            reorg_policy,
+        )?;
+        let ready = direct.ready_evidence();
+
+        open_at_fence(
+            &canonical_store,
+            &secondaries.path().join("same-fence"),
+            &activations,
+            reorg_policy,
+            &ready,
+        )?;
+        writer.append_live_block(&chain)?;
+        let moved = open_at_fence(
+            &canonical_store,
+            &secondaries.path().join("moved-fence"),
+            &activations,
+            reorg_policy,
+            &ready,
+        );
+        assert!(
+            matches!(moved, Err(BenchError::ReportFormat { .. })),
+            "a secondary at a moved fence must fail the case"
+        );
+        Ok(())
     }
 
     #[test]

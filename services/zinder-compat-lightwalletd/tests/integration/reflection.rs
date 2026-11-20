@@ -16,7 +16,10 @@ use tonic_reflection::pb::v1::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::Network;
 use zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET;
-use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
+use zinder_query::{
+    RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
+};
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 const EXPECTED_SERVICE: &str = "cash.z.wallet.sdk.rpc.CompactTxStreamer";
@@ -29,10 +32,12 @@ async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
         &activations,
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
-            WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
-        )));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+        Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?),
+    ));
     let adapter = LightwalletdGrpcAdapter::new(wallet_query).into_server();
     let reflection_service =
         zinder_runtime::public_grpc_reflection(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)?;

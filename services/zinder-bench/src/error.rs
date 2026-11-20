@@ -167,6 +167,13 @@ pub enum BenchError {
         /// Status label and message of the failed probe call.
         reason: String,
     },
+    /// A read through the canonical reader that `zinder-query` serves from
+    /// failed.
+    #[error("canonical reader read failed: {reason}")]
+    CanonicalRead {
+        /// Human-readable read failure.
+        reason: String,
+    },
 }
 
 impl From<serde_json::Error> for BenchError {
@@ -332,6 +339,14 @@ impl BenchError {
     #[must_use]
     pub fn wallet_load_endpoint(reason: impl Into<String>) -> Self {
         Self::WalletLoadEndpoint {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a canonical-reader error from the failed read.
+    #[must_use]
+    pub fn canonical_read(reason: impl Into<String>) -> Self {
+        Self::CanonicalRead {
             reason: reason.into(),
         }
     }

@@ -33,8 +33,9 @@ use zinder_client::{
 use zinder_core::TransparentSpendFact;
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
+    WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, WalletServingStoreFixture,
@@ -49,8 +50,8 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
     let admitted_ingest_control = AdmittedIngestControl::connect(
@@ -119,8 +120,8 @@ async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
     let admitted_ingest_control = AdmittedIngestControl::connect(
@@ -193,8 +194,8 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
@@ -271,8 +272,8 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
     let admitted_ingest_control = AdmittedIngestControl::connect(
@@ -444,8 +445,8 @@ async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> e
         WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical_reader),
-        Arc::new(wallet_reader),
+        Arc::new(RocksDbCanonicalReader::new(canonical_reader)?),
+        Arc::new(RocksDbWalletReader::new(wallet_reader)),
     )?);
     let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
     let admitted_ingest_control = AdmittedIngestControl::connect(
