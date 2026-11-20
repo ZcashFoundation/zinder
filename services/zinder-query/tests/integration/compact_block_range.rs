@@ -694,9 +694,11 @@ fn fixture_block_identities(chain: &ChainFixture) -> Vec<(BlockHeight, BlockHash
         .collect()
 }
 
-/// An adapter refuses a `CompactBlocksInRange` stream past its limit with
-/// `RESOURCE_EXHAUSTED` until an open stream ends, and a finished stream
-/// sends its header and every block.
+/// An adapter refuses a `CompactBlocksInRange` stream past its limit.
+///
+/// The refusal is `RESOURCE_EXHAUSTED` with the typed
+/// `COMPACT_BLOCK_STREAM_LIMIT_REACHED` reason until an open stream ends, and
+/// a finished stream sends its header and every block.
 #[tokio::test]
 async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyre::Result<()> {
     use tokio_stream::StreamExt as _;
@@ -730,10 +732,14 @@ async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyr
 
     let open = WalletQueryService::compact_blocks_in_range(&adapter, request()).await?;
     let refused = WalletQueryService::compact_blocks_in_range(&adapter, request()).await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(tonic::Code::ResourceExhausted)
-    );
+    let refusal = refused
+        .err()
+        .ok_or_else(|| eyre::eyre!("the second stream was not refused"))?;
+    assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+    let error_info = tonic_types::StatusExt::get_details_error_info(&refusal)
+        .ok_or_else(|| eyre::eyre!("the refusal carries no google.rpc.ErrorInfo"))?;
+    assert_eq!(error_info.domain, "zinder.dev");
+    assert_eq!(error_info.reason, "COMPACT_BLOCK_STREAM_LIMIT_REACHED");
 
     let chunks = open.into_inner().collect::<Vec<_>>().await;
     assert_eq!(chunks.len(), 4, "one header and three blocks");

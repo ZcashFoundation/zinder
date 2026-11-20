@@ -146,4 +146,10 @@ enum ErrorReason {
   // broadcasting its budget of transaction bytes at once. Retry with
   // backoff; the budget always fits one maximum-size transaction.
   BROADCAST_BUDGET_EXHAUSTED = 55;
+
+  // RESOURCE_EXHAUSTED family.
+  // `WalletQuery.CompactBlocksInRange` was refused because the server already
+  // serves its limit of open block-range streams. Retry with backoff; a slot
+  // frees when an open stream ends.
+  COMPACT_BLOCK_STREAM_LIMIT_REACHED = 56;
 }

@@ -518,6 +518,11 @@ pub enum ErrorReason {
     /// broadcasting its budget of transaction bytes at once. Retry with
     /// backoff; the budget always fits one maximum-size transaction.
     BroadcastBudgetExhausted = 55,
+    /// RESOURCE_EXHAUSTED family.
+    /// `WalletQuery.CompactBlocksInRange` was refused because the server already
+    /// serves its limit of open block-range streams. Retry with backoff; a slot
+    /// frees when an open stream ends.
+    CompactBlockStreamLimitReached = 56,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -583,6 +588,7 @@ impl ErrorReason {
             }
             Self::TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
             Self::BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
+            Self::CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -651,6 +657,9 @@ impl ErrorReason {
             }
             "TREE_STATE_REPLAY_LIMIT_REACHED" => Some(Self::TreeStateReplayLimitReached),
             "BROADCAST_BUDGET_EXHAUSTED" => Some(Self::BroadcastBudgetExhausted),
+            "COMPACT_BLOCK_STREAM_LIMIT_REACHED" => {
+                Some(Self::CompactBlockStreamLimitReached)
+            }
             _ => None,
         }
     }

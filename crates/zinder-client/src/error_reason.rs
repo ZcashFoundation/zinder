@@ -93,6 +93,7 @@ define_error_reasons! {
     TransparentOutpointCountOutOfRange => "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
     TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
     BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
+    CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -157,6 +158,7 @@ mod tests {
             WireErrorReason::TransparentOutpointCountOutOfRange,
             WireErrorReason::TreeStateReplayLimitReached,
             WireErrorReason::BroadcastBudgetExhausted,
+            WireErrorReason::CompactBlockStreamLimitReached,
         ];
 
         for generated in generated_reasons {
