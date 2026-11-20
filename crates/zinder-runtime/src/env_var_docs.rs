@@ -796,10 +796,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Longest a wallet-serving pair keeps admitting traffic, in milliseconds, \
-                      after the last writer attestation. Traffic stops when it passes, even \
-                      while a refresh is still waiting for the writer, and the reader \
-                      refreshes then, even if `storage.secondary_catchup_interval_ms` is \
-                      longer. Defaults to 300000. Must be greater than zero.",
+                      after the last writer attestation. The reader refreshes at least every \
+                      half ceiling, even if `storage.secondary_catchup_interval_ms` is longer, \
+                      so a writer that answers attests it again before the ceiling passes. \
+                      Traffic stops when the ceiling passes, even while a refresh is still \
+                      waiting for the writer. Defaults to 300000. Must be greater than zero.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL_PATH",

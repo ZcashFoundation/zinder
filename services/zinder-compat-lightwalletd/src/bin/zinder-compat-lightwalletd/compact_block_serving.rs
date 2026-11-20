@@ -292,13 +292,17 @@ impl CompactBlockPublisher {
         serving_drained: CancellationToken,
     ) -> JoinHandle<Result<(), CompactBlockServingError>> {
         tokio::spawn(async move {
+            // Refreshing at least every half ceiling lets a writer that
+            // answers attest the reader before the ceiling passes. The
+            // deadline ends admission only for a refresh left unanswered,
+            // even while it still runs, or for a loop that starts late.
+            let refresh_interval = self
+                .writer_attestation
+                .refresh_interval(self.config.catchup_interval);
             loop {
-                // The staleness deadline holds the ceiling when the catch-up
-                // interval is longer than it, and admission ends at the
-                // deadline even while a refresh still runs.
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(self.config.catchup_interval) => {}
+                    () = tokio::time::sleep(refresh_interval) => {}
                     () = self.writer_attestation.stale_deadline().passed() => {}
                 }
                 let deadline = self.writer_attestation.stale_deadline();
@@ -1617,6 +1621,8 @@ mod tests {
         available: Arc<std::sync::atomic::AtomicBool>,
         /// Accepts each writer-status call and never answers it.
         stalled: Arc<std::sync::atomic::AtomicBool>,
+        /// How long each writer-status call waits before it answers.
+        answer_delay: Arc<Mutex<Duration>>,
     }
 
     impl MutableCanonicalControl {
@@ -1626,12 +1632,17 @@ mod tests {
                 queued_statuses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                answer_delay: Arc::new(Mutex::new(Duration::ZERO)),
             }
         }
 
         fn stall(&self) {
             self.stalled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn delay_answers(&self, delay: Duration) {
+            *self.answer_delay.lock() = delay;
         }
 
         fn queue_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -1660,6 +1671,10 @@ mod tests {
         ) -> Result<tonic::Response<CanonicalWriterStatusResponse>, tonic::Status> {
             if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
                 std::future::pending::<()>().await;
+            }
+            let answer_delay = *self.answer_delay.lock();
+            if !answer_delay.is_zero() {
+                tokio::time::sleep(answer_delay).await;
             }
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(tonic::Status::unavailable("fixture writer status outage"));
@@ -2883,6 +2898,61 @@ mod tests {
         drop(shutdown_sender);
         server.abort();
         let _join_outcome = server.await;
+        Ok(())
+    }
+
+    /// A writer that answers keeps a reader admitting traffic when the
+    /// catch-up interval is longer than the staleness ceiling.
+    ///
+    /// Each answer takes 100 ms, so a refresh that started only once the
+    /// ceiling passed would refuse traffic until the writer answered it. The
+    /// test runs on the real clock because the paused clock can advance past
+    /// a pending socket read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answering_writer_keeps_admission_past_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_secs(1);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let (endpoint, shutdown_sender, server) = serve_control(&control).await?;
+        let readiness = Readiness::default();
+        let (publisher, slot) = CompactBlockPublisher::bootstrap(
+            compact_serving_config(&temporary, Duration::from_hours(1), staleness_ceiling)?,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.delay_answers(Duration::from_millis(100));
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+        let mut refusals = Vec::new();
+        let sampled_until = tokio::time::Instant::now() + staleness_ceiling * 3;
+        while tokio::time::Instant::now() < sampled_until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let report = readiness.report();
+            if !report.is_ready {
+                refusals.push(report.cause);
+            }
+        }
+        cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            refusals.is_empty(),
+            "an answering writer must keep the reader admitted: {refusals:?}"
+        );
+        drop(slot);
+        drop(primary);
+        let _ = shutdown_sender.send(());
+        server.await??;
         Ok(())
     }
 

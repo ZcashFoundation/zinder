@@ -360,7 +360,9 @@ where
 /// an undamaged store earns the staleness allowance that keeps a lagging
 /// reader admitting traffic, and the allowance ends at
 /// [`Self::stale_deadline`] whether or not a refresh is still running: a
-/// reader runs each refresh through [`refresh_within_stale_deadline`].
+/// reader runs each refresh through [`refresh_within_stale_deadline`], and
+/// refreshes at least every [`Self::refresh_interval`] so a writer that
+/// answers renews the allowance before it ends.
 #[derive(Debug)]
 pub struct WriterAttestation {
     network: Network,
@@ -540,7 +542,7 @@ impl WriterAttestation {
     ///
     /// A reader refreshes no later than that instant and stops admitting
     /// traffic at it unless the writer attests the reader again first, so a
-    /// refresh interval longer than the ceiling, or a refresh that stalls,
+    /// refresh that stalls, or a refresh loop that starts after the instant,
     /// cannot keep admitting traffic on an unattested view past it.
     #[must_use]
     pub fn stale_deadline(&self) -> StaleDeadline {
@@ -548,6 +550,19 @@ impl WriterAttestation {
             clock: Arc::clone(&self.clock),
             staleness_ceiling: self.staleness_ceiling,
         }
+    }
+
+    /// Returns how long a reader waits between scheduled refreshes:
+    /// `catchup_interval`, but at most half the staleness ceiling.
+    ///
+    /// A refresh that the writer answers attests the reader again before the
+    /// allowance runs out, so a catch-up interval as long as the ceiling, or
+    /// longer, cannot end admission on a reader whose writer answers.
+    /// Admission ends at [`Self::stale_deadline`] only when a refresh goes
+    /// unanswered for the rest of the allowance.
+    #[must_use]
+    pub fn refresh_interval(&self, catchup_interval: Duration) -> Duration {
+        catchup_interval.min(self.staleness_ceiling / 2)
     }
 
     /// Forgets an attestation whose staleness allowance has run out, so its
@@ -1520,6 +1535,30 @@ mod tests {
                 Some(1_000),
                 Some(7)
             ))
+        );
+    }
+
+    /// A reader refreshes at its catch-up interval, but at least every half
+    /// ceiling, so a writer that answers attests it before the ceiling passes.
+    #[test]
+    fn the_refresh_interval_is_at_most_half_the_staleness_ceiling() {
+        let attestation = WriterAttestation::new(NETWORK, Duration::from_mins(1));
+
+        assert_eq!(
+            attestation.refresh_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            attestation.refresh_interval(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            attestation.refresh_interval(Duration::from_mins(1)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            attestation.refresh_interval(Duration::from_hours(1)),
+            Duration::from_secs(30)
         );
     }
 

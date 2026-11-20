@@ -1142,15 +1142,17 @@ impl WalletServingPairPublisher {
     /// Runs bounded refreshes until shutdown, then retains reader ownership
     /// until the serving runtime confirms its request paths have drained.
     ///
-    /// A refresh runs every catch-up interval, at once when a read first
-    /// finds a pair missing a table file, and when the staleness ceiling
-    /// passes after the writer last attested the pair. Admission on an
-    /// unattested pair ends at the ceiling even while a refresh is still
-    /// running, and at once when the loop starts after it, so neither a
-    /// catch-up interval longer than the ceiling nor a stalled writer-status
-    /// read keeps admitting traffic past it. Every refresh failure leaves the
-    /// current immutable pair untouched and updates readiness with its typed
-    /// cause; it never falls back to a primary store.
+    /// A refresh runs every catch-up interval, but at least every half
+    /// staleness ceiling, at once when a read first finds a pair missing a
+    /// table file, and when the staleness ceiling passes after the writer
+    /// last attested the pair. A writer that answers therefore attests the
+    /// pair again before the ceiling passes, whatever the catch-up interval.
+    /// Admission on an unattested pair ends at the ceiling even while a
+    /// refresh is still running, and at once when the loop starts after it,
+    /// so a stalled writer-status read cannot keep admitting traffic past
+    /// it. Every refresh failure leaves the current immutable pair untouched
+    /// and updates readiness with its typed cause; it never falls back to a
+    /// primary store.
     ///
     /// The task closes the publisher's secondaries on a blocking thread once
     /// `serving_runtime_drained` is cancelled, and fails when that teardown
@@ -1166,10 +1168,13 @@ impl WalletServingPairPublisher {
                 .serving_pair_slot
                 .as_ref()
                 .map(|slot| Arc::clone(&slot.signals));
+            let refresh_interval = self
+                .writer_attestation
+                .refresh_interval(self.config.catchup_interval);
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(self.config.catchup_interval) => {}
+                    () = tokio::time::sleep(refresh_interval) => {}
                     () = missing_table_file_reported(signals.as_deref()) => {}
                     () = self.writer_attestation.stale_deadline().passed() => {}
                 }
@@ -5500,6 +5505,48 @@ mod tests {
         fixture.shutdown().await
     }
 
+    /// A writer that answers keeps a pair admitting traffic when the
+    /// catch-up interval is longer than the staleness ceiling.
+    ///
+    /// Each answer takes 100 ms, so a refresh that started only once the
+    /// ceiling passed would refuse traffic until the writer answered it. The
+    /// test runs on the real clock because the paused clock can advance past
+    /// a pending socket read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answering_writer_keeps_admission_past_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_secs(1);
+        let mut fixture =
+            StalenessFixture::bootstrap(Duration::from_hours(1), staleness_ceiling).await?;
+        fixture.control.delay_answers(Duration::from_millis(100));
+        let publisher_cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_task = fixture
+            .publisher
+            .take()
+            .ok_or("the fixture holds its publisher")?
+            .spawn(publisher_cancel.clone(), drained.clone());
+
+        let mut refusals = Vec::new();
+        let sampled_until = tokio::time::Instant::now() + staleness_ceiling * 3;
+        while tokio::time::Instant::now() < sampled_until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let report = fixture.readiness.report();
+            if !report.is_ready {
+                refusals.push(report.cause);
+            }
+        }
+        publisher_cancel.cancel();
+        drained.cancel();
+        publisher_task.await??;
+
+        assert!(
+            refusals.is_empty(),
+            "an answering writer must keep the pair admitted: {refusals:?}"
+        );
+        fixture.shutdown().await
+    }
+
     /// A bootstrapped publisher over a writer-status server the test controls.
     struct StalenessFixture {
         _temporary: TempDir,
@@ -8774,6 +8821,8 @@ mod tests {
         available: Arc<std::sync::atomic::AtomicBool>,
         /// Accepts each writer-status call and never answers it.
         stalled: Arc<std::sync::atomic::AtomicBool>,
+        /// How long each writer-status call waits before it answers.
+        answer_delay: Arc<Mutex<Duration>>,
     }
 
     impl MutableCanonicalControl {
@@ -8783,12 +8832,17 @@ mod tests {
                 queued: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                answer_delay: Arc::new(Mutex::new(Duration::ZERO)),
             }
         }
 
         fn stall(&self) {
             self.stalled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn delay_answers(&self, delay: Duration) {
+            *self.answer_delay.lock() = delay;
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -8814,6 +8868,10 @@ mod tests {
         ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
             if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
                 std::future::pending::<()>().await;
+            }
+            let answer_delay = *self.answer_delay.lock();
+            if !answer_delay.is_zero() {
+                tokio::time::sleep(answer_delay).await;
             }
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Status::unavailable("fixture writer status outage"));
