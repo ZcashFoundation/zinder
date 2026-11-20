@@ -59,7 +59,11 @@ newest blocks one at a time, as in
 [Continuous following](#continuous-following), before ingest reports ready.
 
 Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
-them in order. It rebuilds the note commitment trees from the blocks and stores
+them in order. For a JSON-RPC `getblock` batch, each requested ID must appear
+once in the reply. A short reply or a repeated ID causes ingest to report
+`SourceProtocolMismatch` for the batch before assigning any reply to a height.
+
+Ingest rebuilds the note commitment trees from the blocks and stores
 a tree-state checkpoint every 100 blocks and at the build tip. The loader
 refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
