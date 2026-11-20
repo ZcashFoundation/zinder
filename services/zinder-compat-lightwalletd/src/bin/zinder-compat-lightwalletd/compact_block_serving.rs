@@ -2778,18 +2778,32 @@ mod tests {
     /// What a stream over heights 1 through 2,050 sent across a reorg.
     ///
     /// The reorg is a live replacement from `fork_height` through
-    /// `replacement_tip_height`, published while the stream waits on its
-    /// client.
+    /// `replacement_tip_height`, published after the stream has read its
+    /// second chunk, heights 1,001 through 2,000, and before it reads its
+    /// third.
     struct ReorgedStream {
         blocks: Vec<lightwalletd::CompactBlock>,
         ending: Option<tonic::Status>,
+        /// The block-range metrics the stream recorded, rendered once it
+        /// ended.
+        rendered_metrics: String,
     }
 
+    #[allow(
+        clippy::future_not_send,
+        reason = "The helper counts the stream's reads with a thread-local metrics recorder, which sees them because the current-thread test runtime polls every task on this thread."
+    )]
     async fn stream_across_reorg(
         fork_height: u32,
         replacement_tip_height: u32,
     ) -> Result<ReorgedStream, Box<dyn std::error::Error>> {
         const TIP_HEIGHT: u32 = 2_050;
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+        let chunk_reads =
+            || block_range_stage_samples(&metrics_handle.render(), "read").unwrap_or(0);
         let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(TIP_HEIGHT);
@@ -2823,22 +2837,32 @@ mod tests {
             .await?
             .into_inner();
         let mut blocks = Vec::new();
-        // Block 1,000 ends the first chunk, so the second is read before the
-        // replacement, and the third waits for this client to ask past the
-        // first and is read after it.
+        // Block 1,000 ends the first chunk. Once the second chunk's read has
+        // finished, that chunk waits in the response until this client asks
+        // past the first, so the third is read only after the replacement.
         read_blocks(&mut stream, &mut blocks, 1_000).await?;
+        wait_until(|| chunk_reads() >= 2).await?;
         harness
             .writer
             .replace_live_blocks(&replacement_chain, BlockHeight::new(fork_height))?;
         harness.refresh_at_writer_fence().await?;
         assert_ne!(harness.slot.capture().chain_epoch().id, sent_epoch);
+        assert_eq!(
+            chunk_reads(),
+            2,
+            "the third chunk must be read after the replacement"
+        );
 
         let ending = read_blocks(&mut stream, &mut blocks, usize::MAX)
             .await
             .err();
         drop(stream);
         harness.stop().await?;
-        Ok(ReorgedStream { blocks, ending })
+        Ok(ReorgedStream {
+            blocks,
+            ending,
+            rendered_metrics: metrics_handle.render(),
+        })
     }
 
     /// A reorg that replaces a block the stream already sent ends the stream
@@ -2863,11 +2887,6 @@ mod tests {
     #[tokio::test]
     async fn a_later_chunk_that_ends_the_stream_records_its_read()
     -> Result<(), Box<dyn std::error::Error>> {
-        let metrics_recorder =
-            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let metrics_handle = metrics_recorder.handle();
-        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
-
         let reorged = stream_across_reorg(1_990, 2_050).await?;
         assert_eq!(
             reorged.ending.as_ref().map(tonic::Status::code),
@@ -2876,10 +2895,10 @@ mod tests {
 
         // Chunks 1 and 2 are sent; chunk 3 waits for room, is read, and fails
         // the hash link.
-        let rendered = metrics_handle.render();
-        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
-        assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(2));
-        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(2));
+        let rendered = &reorged.rendered_metrics;
+        assert_eq!(block_range_stage_samples(rendered, "read"), Some(3));
+        assert_eq!(block_range_stage_samples(rendered, "convert"), Some(2));
+        assert_eq!(block_range_stage_samples(rendered, "send"), Some(2));
         Ok(())
     }
 
