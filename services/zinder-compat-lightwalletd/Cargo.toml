@@ -50,6 +50,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
+prost-types.workspace = true
 reqwest.workspace = true
 rust-rocksdb.workspace = true
 secrecy.workspace = true

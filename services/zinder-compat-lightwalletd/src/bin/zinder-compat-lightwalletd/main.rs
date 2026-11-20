@@ -353,9 +353,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         "lightwalletd-compatible gRPC server started"
     );
 
-    // The listener exposes `grpc.reflection.v1.ServerReflection` so legacy
-    // lightwalletd wallets and `grpcurl` can discover the served
-    // `CompactTxStreamer` surface without an out-of-band proto.
     let server = browser_transport::serve(
         &runtime,
         grpc_adapter.into_server(),

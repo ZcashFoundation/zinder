@@ -35,7 +35,7 @@ On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECON
 
 ## Lightwalletd clients
 
-Point the client's server address at the compatibility endpoint. The client keeps the `CompactTxStreamer` protocol; nothing else changes on the client side. Check the endpoint with `grpcurl`, which works without proto files because the server exposes gRPC reflection:
+Point the client's server address at the compatibility endpoint. Both wallet and compact-blocks modes support native gRPC reflection v1 and v1alpha. Clients using either version can discover `CompactTxStreamer` and its message types without local proto files. For example, use `grpcurl` to request server information.
 
 ```bash
 grpcurl -plaintext -d '{}' 127.0.0.1:9067 \

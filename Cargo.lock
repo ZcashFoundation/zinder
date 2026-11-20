@@ -6107,6 +6107,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "parking_lot 0.13.0",
  "prost",
+ "prost-types",
  "reqwest",
  "rust-rocksdb",
  "secrecy",

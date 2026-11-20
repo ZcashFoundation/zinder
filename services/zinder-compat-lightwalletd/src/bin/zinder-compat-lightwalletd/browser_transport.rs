@@ -259,12 +259,15 @@ mod tests {
             (Version::HTTP_11, "application/grpc", false),
             (Version::HTTP_2, "application/grpc-web+proto", false),
         ] {
-            let mut request =
-                Request::post("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo")
-                    .version(version)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(Body::empty())?;
-            assert_eq!(policy.validate(&mut request).is_ok(), admitted);
+            for version_name in ["v1", "v1alpha"] {
+                let mut request = Request::post(format!(
+                    "/grpc.reflection.{version_name}.ServerReflection/ServerReflectionInfo"
+                ))
+                .version(version)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::empty())?;
+                assert_eq!(policy.validate(&mut request).is_ok(), admitted);
+            }
         }
         Ok(())
     }

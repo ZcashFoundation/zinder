@@ -29,9 +29,8 @@
 //! assembles, serves the wallet service behind the
 //! [`TrafficReadinessInterceptor`], and gRPC reflection and
 //! `grpc.health.v1.Health` outside it, so both keep answering while the
-//! runtime refuses wallet calls. Reflection, built with
-//! [`public_grpc_reflection`], applies the same request size bound as every
-//! other public service. Every call on the listener also passes through
+//! runtime refuses wallet calls. Both reflection versions apply the public
+//! request size bound. Every call on the listener also passes through
 //! [`GrpcCallTerminationLayer`], outside every other layer, which ends the
 //! calls still open once the runtime's drain deadline passes.
 
@@ -66,11 +65,15 @@ use tonic::{
         server::{Router, TcpConnectInfo, TlsConnectInfo},
     },
 };
-use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
+use tonic_reflection::server::{
+    Builder as ReflectionBuilder,
+    v1::{ServerReflection, ServerReflectionServer},
+};
 use tower::{
     Layer, Service, ServiceBuilder,
     layer::util::{Identity, Stack},
 };
+use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 
 pub(crate) use self::call_termination::OpenGrpcCalls;
 pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
@@ -231,17 +234,29 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let reflection =
-        reflection_describing(&[wallet_descriptor_set, tonic_health::pb::FILE_DESCRIPTOR_SET])?;
     let health = public_grpc_health(readiness, drain, S::NAME);
     let gated_wallet_service = InterceptedService::new(
         wallet_service,
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
-    Ok(server
-        .add_service(gated_wallet_service)
-        .add_service(reflection)
-        .add_service(health))
+    let mut router = server.add_service(gated_wallet_service).add_service(health);
+    let descriptors = || {
+        ReflectionBuilder::configure()
+            .register_encoded_file_descriptor_set(wallet_descriptor_set)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+    };
+    let mut v1 = descriptors();
+    if S::NAME == compact_tx_streamer_server::SERVICE_NAME {
+        let alpha = descriptors()
+            .register_encoded_file_descriptor_set(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)
+            .build_v1alpha()?
+            .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES);
+        router = router.add_service(alpha);
+        v1 = v1.register_encoded_file_descriptor_set(
+            tonic_reflection::pb::v1alpha::FILE_DESCRIPTOR_SET,
+        );
+    }
+    Ok(router.add_service(reflection_v1(v1)?))
 }
 
 /// Where a public listener learns which client sent a request, so that the
@@ -293,17 +308,15 @@ impl ClientAddressSource {
 pub fn public_grpc_reflection(
     encoded_file_descriptor_set: &'static [u8],
 ) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
-    reflection_describing(&[encoded_file_descriptor_set])
+    reflection_v1(
+        ReflectionBuilder::configure()
+            .register_encoded_file_descriptor_set(encoded_file_descriptor_set),
+    )
 }
 
-fn reflection_describing(
-    encoded_file_descriptor_sets: &[&'static [u8]],
-) -> Result<ServerReflectionServer<impl ServerReflection + use<>>, tonic_reflection::server::Error>
-{
-    let builder = encoded_file_descriptor_sets.iter().copied().fold(
-        tonic_reflection::server::Builder::configure(),
-        tonic_reflection::server::Builder::register_encoded_file_descriptor_set,
-    );
+fn reflection_v1(
+    builder: ReflectionBuilder<'static>,
+) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
     Ok(builder
         .build_v1()?
         .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES))
