@@ -22,8 +22,10 @@ For example, `wallet.read.compact_block_range_v2` gates
   `_v2` is a different capability from `_v1`, not an upgrade of it.
 - A server advertises a capability only when the endpoint it composed can
   serve it: the method, the stored data it needs, and the providers behind
-  it. Readiness and temporary dependency outages do not remove a capability.
-  They affect individual requests instead.
+  it. Wallet capabilities describe the admitted runtime. A temporary outage
+  can cause a wallet request to fail while its capability remains advertised.
+  The Explorer also checks view coverage and the wallet descriptor for methods
+  that require them.
 - A method can exist in the protobuf schema without its capability being
   advertised. On `WalletQuery`, calling such a method fails with
   `ENDPOINT_CAPABILITY_UNAVAILABLE`.
@@ -40,7 +42,7 @@ For example, `wallet.read.compact_block_range_v2` gates
 | Native wallet client | `WalletQuery.ServerInfo`, in `info.common.capabilities` |
 | Rust SDK (`zinder-client`) | `EndpointBackedIndex::server_info()`, in `ServerInfo.capabilities` |
 | Explorer client | `ExplorerQuery.ServerInfo`, in `info.common.capabilities` |
-| Operator or dashboard | The `capabilities` field of `/healthz` on the operational endpoint |
+| Operator or dashboard | The `capabilities` field of `/healthz` on the operational endpoint. The Explorer reports its startup snapshot here; use `ExplorerQuery.ServerInfo` for current capabilities |
 | Lightwalletd client | None. `CompactTxStreamer` has no capability strings; see [Lightwalletd compatibility](lightwalletd-compatibility.md). |
 
 The same `ServerInfo` also carries `contract_revision`, which increases when
@@ -191,7 +193,10 @@ for verification.
 ## Explorer capabilities
 
 `zinder-explorer` computes its set from what it has open, each time it
-answers `ServerInfo`. In the table, "wallet query" means
+answers `ServerInfo`. For `ValuePoolSummary`, it also checks the wallet
+endpoint's advertised capabilities. It caches a successful probe for 60
+seconds. A probe has two seconds to connect and read the descriptor. When a
+probe fails, the Explorer omits the capability and can retry after five seconds. In the table, "wallet query" means
 `explorer.wallet_query_endpoint` is set, and "views" means the Explorer
 materialized-view store is open, which requires `ingest.explorer_views = true`
 on the writer. The explorer does not read the canonical store, so it never
@@ -204,7 +209,7 @@ advertises a capability that needs it.
 | `explorer.mempool.summary_v1` | `MempoolSummary` | Wallet query |
 | `explorer.mempool.snapshot_v1` | `MempoolSnapshot` | Wallet query |
 | `explorer.mempool.activity_v1` | `MempoolActivity` | Wallet query |
-| `explorer.value_pool.summary_v1` | `ValuePoolSummary` | Wallet query. Calls still fail with `ENDPOINT_CAPABILITY_UNAVAILABLE`, because `zinder-query` does not serve `ChainValuePoolsAtTip` |
+| `explorer.value_pool.summary_v1` | `ValuePoolSummary` | Wallet query advertises `wallet.read.chain_value_pools_at_tip_v1` |
 | `explorer.network_upgrade.status_v1` | `NetworkUpgradeStatus` | Wallet query |
 | `explorer.chain.reorg_history_v1` | `ChainReorgHistory` | Views |
 | `explorer.transaction.detail_v4` | `TransactionDetail` | Views and wallet query |
@@ -225,8 +230,8 @@ advertises a capability that needs it.
 | `explorer.value_pool.flow_summary_v1` | `ValuePoolFlowSummary` | Views and wallet query |
 | `explorer.value_pool.flow_amount_threshold_summary_v1` | `ValuePoolFlowAmountThresholdSummary` | Views and wallet query |
 | `explorer.value_pool.flow_rounded_amount_summary_v1` | `ValuePoolFlowRoundedAmountSummary` | Views and wallet query |
-| `explorer.value_pool.balance_history_v1` | `ValuePoolBalanceHistory` | Views and wallet query |
-| `explorer.mempool.event_counts_v1` | `MempoolEventCounts` | Views and wallet query |
+| `explorer.value_pool.balance_history_v1` | `ValuePoolBalanceHistory` | Unadvertised. No runtime writes balance history |
+| `explorer.mempool.event_counts_v1` | `MempoolEventCounts` | Unadvertised. No runtime indexes mempool events |
 | `explorer.overview.snapshot_v1` | `OverviewSnapshot` | Views and wallet query |
 | `explorer.migration.overview_v1` | `MigrationOverview` | Views and wallet query |
 | `explorer.migration.cohorts_v1` | `MigrationCohorts` | Views and wallet query |

@@ -481,6 +481,8 @@ pub enum CapabilitySurface {
 pub enum AdvertisePolicy {
     /// No additional deployment requirement.
     AlwaysOn,
+    /// No runtime produces the data for this capability.
+    Unserved,
     /// Wallet: requires a configured transaction broadcaster.
     RequiresBroadcaster,
     /// Wallet: requires a served chain-event stream.
@@ -489,7 +491,8 @@ pub enum AdvertisePolicy {
     ///
     /// Ingest resolves this against the source handle's
     /// `NodeCapability::ChainValuePools`; wallet compositions require the
-    /// corresponding admitted upstream read path.
+    /// corresponding admitted upstream read path. Explorer requires the wallet
+    /// endpoint to advertise [`Capability::ChainValuePools`].
     RequiresChainValuePools,
     /// Explorer: advertised when a `WalletQuery` endpoint is wired.
     RequiresWalletQuery,
@@ -535,9 +538,25 @@ impl AdvertisePolicy {
     /// `WalletQuery`-endpoint precondition.
     #[must_use]
     pub fn explorer_satisfied(self, readiness: ExplorerReadiness) -> bool {
+        self.explorer_satisfied_with_wallet(readiness, None)
+    }
+
+    /// Resolves an Explorer capability using the connected wallet's advertised
+    /// methods. An absent descriptor leaves wallet capability claims unconfirmed.
+    #[must_use]
+    pub fn explorer_satisfied_with_wallet(
+        self,
+        readiness: ExplorerReadiness,
+        wallet: Option<&WalletServerInfo>,
+    ) -> bool {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresWalletQuery => readiness.wallet_query_online,
+            Self::RequiresChainValuePools => {
+                readiness.wallet_query_online
+                    && wallet
+                        .is_some_and(|descriptor| descriptor.supports(Capability::ChainValuePools))
+            }
             Self::RequiresCanonicalStore => readiness.canonical_store_online,
             Self::RequiresMaterializedViewStore => readiness.materialized_view_store_online,
             Self::RequiresWalletQueryAndCanonicalStore => {
@@ -563,7 +582,7 @@ impl AdvertisePolicy {
             }
             Self::RequiresBroadcaster
             | Self::RequiresChainEvents
-            | Self::RequiresChainValuePools
+            | Self::Unserved
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
             | Self::RequiresTransparentAddressHistory => false,
@@ -579,7 +598,8 @@ impl AdvertisePolicy {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresChainValuePools => chain_value_pools_supported,
-            Self::RequiresBroadcaster
+            Self::Unserved
+            | Self::RequiresBroadcaster
             | Self::RequiresChainEvents
             | Self::RequiresCanonicalStore
             | Self::RequiresMaterializedViewStore
@@ -958,7 +978,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
+        AdvertisePolicy::RequiresChainValuePools,
     ),
     CapabilitySpec::new(
         EXPLORER_NETWORK_UPGRADE_STATUS_V1,
@@ -1000,7 +1020,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolBalanceHistory"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_CHAIN_REORG_HISTORY_V1,
@@ -1024,7 +1044,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolEventCounts"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_FEES_V1,

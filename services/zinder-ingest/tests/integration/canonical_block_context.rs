@@ -25,8 +25,9 @@ use zebra_chain::{
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
     CanonicalBlockFacts, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
-    ShieldedProtocol, TransactionId, TransparentOutPoint, UnixTimestampMillis,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, ShieldedProtocol, TransactionId,
+    TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_ingest::{
     CanonicalBlockContextReader, CanonicalConstructionConfig, CanonicalFollowConfig,
@@ -594,6 +595,205 @@ async fn materialized_view_hydration_requires_genesis_complete_history()
     Ok(())
 }
 
+#[tokio::test]
+async fn stored_sparse_and_mixed_checkpoints_hydrate_byte_identical_roots()
+-> Result<(), Box<dyn Error>> {
+    const MIXED_TIP: u32 = 6;
+    let activations = sample_regtest_upgrade_activations();
+    let blocks = shielded_chain_through(MIXED_TIP)?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(MIXED_TIP));
+
+    // (a) Sparse construction store: only heights 0 and MIXED_TIP have checkpoints.
+    let sparse = CanonicalHarness::publish_chain(blocks.clone(), &activations).await?;
+    assert_roots_match_expected(sparse.secondary(), &activations, full_range, &expected)?;
+
+    // (b) Dense store: every height 1..=MIXED_TIP has a stored checkpoint via live following.
+    let dense = CanonicalHarness::dense_chain(blocks.clone(), &activations).await?;
+    assert_roots_match_expected(dense.secondary(), &activations, full_range, &expected)?;
+
+    // (c) Mixed dense + sparse store: delete checkpoints at heights 3 and 5 so
+    // the range alternates stored (1..=2) -> gap (3..=3) -> stored (4..=4) -> gap (5..=5) -> stored (6..=6).
+    let mut mixed = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    mixed.delete_rows("tree_state_checkpoint", &[3, 5])?;
+    assert_roots_match_expected(mixed.secondary(), &activations, full_range, &expected)?;
+
+    // Multi-page sequential reads across dense/sparse boundaries must match byte-for-byte.
+    for page_bounds in [
+        vec![(1, 2), (3, 4), (5, 6)],
+        vec![(1, 3), (4, 6)],
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)],
+    ] {
+        let mut reader = CanonicalBlockContextReader::new(mixed.secondary(), &activations);
+        let mut collected = HashMap::new();
+        for (start, end) in page_bounds {
+            let page = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+            collected.extend(reader.read_block_commit_contexts(page)?);
+        }
+        for height in full_range {
+            let context = collected
+                .get(&height)
+                .ok_or_else(|| format!("paged hydration must cover height {}", height.value()))?;
+            assert_eq!(
+                context.final_note_commitment_roots.as_ref(),
+                expected.get(&height)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pre_sapling_activation_boundaries_omit_roots_identically_for_sparse_and_dense_stores()
+-> Result<(), Box<dyn Error>> {
+    let activations = staged_pool_activations()?;
+    let blocks = chain_through(CHAIN_TIP_HEIGHT, 0, &|_| Ok(Vec::new()))?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    assert_eq!(
+        expected.get(&BlockHeight::new(1)),
+        Some(&BlockFinalNoteCommitmentRoots::unavailable(
+            BlockHeight::new(1),
+            blocks
+                .get(&BlockHeight::new(1))
+                .ok_or("height 1 must exist")?
+                .hash,
+        ))
+    );
+
+    let sparse = CanonicalHarness::publish_chain(blocks.clone(), &activations).await?;
+    let dense = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    for secondary in [sparse.secondary(), dense.secondary()] {
+        let contexts = CanonicalBlockContextReader::new(secondary, &activations)
+            .read_ordered_block_commit_contexts(chain_range())?;
+        assert_eq!(contexts.len(), usize::try_from(CHAIN_TIP_HEIGHT)?);
+        assert_eq!(
+            contexts[0].final_note_commitment_roots, None,
+            "pre-Sapling height 1 must omit final roots"
+        );
+        for context in &contexts[1..] {
+            assert_eq!(
+                context.final_note_commitment_roots.as_ref(),
+                expected.get(&context.height),
+                "post-Sapling height {} must carry exact roots",
+                context.height.value()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_checkpoints_hydrate_final_roots_without_reading_compact_blocks()
+-> Result<(), Box<dyn Error>> {
+    const DENSE_TIP: u32 = 6;
+    let activations = sample_regtest_upgrade_activations();
+    let blocks = shielded_chain_through(DENSE_TIP)?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(DENSE_TIP));
+
+    // Delete compact_block rows for heights 1..=5 while keeping every stored
+    // tree_state_checkpoint row (and tip height 6's compact block for admission).
+    let mut dense = CanonicalHarness::dense_chain(blocks.clone(), &activations).await?;
+    dense.delete_rows("compact_block", &[1, 2, 3, 4, 5])?;
+    assert_eq!(
+        dense.secondary().compact_block_at(BlockHeight::new(2))?,
+        None
+    );
+    assert!(matches!(
+        dense
+            .secondary()
+            .compact_blocks_in_range(BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(5)
+            )),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    assert_roots_match_expected(dense.secondary(), &activations, full_range, &expected)?;
+
+    // Mixed case: remove compact_block only at checkpointed heights (1, 2, 4)
+    // and remove checkpoints at uncheckpointed heights (3, 5). Hydration must
+    // skip compact blocks for 1, 2, 4, 6 and replay only gaps 3..=3 and 5..=5.
+    let mut mixed = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    mixed.delete_rows("compact_block", &[1, 2, 4])?;
+    mixed.delete_rows("tree_state_checkpoint", &[3, 5])?;
+    assert_roots_match_expected(mixed.secondary(), &activations, full_range, &expected)?;
+    Ok(())
+}
+
+fn assert_roots_match_expected(
+    secondary: &RocksDbCanonicalSecondary,
+    activations: &NetworkUpgradeActivations,
+    range: BlockHeightRange,
+    expected: &BTreeMap<BlockHeight, BlockFinalNoteCommitmentRoots>,
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = CanonicalBlockContextReader::new(secondary, activations);
+    let contexts = reader.read_block_commit_contexts(range)?;
+    for height in range {
+        let context = contexts
+            .get(&height)
+            .ok_or_else(|| format!("hydration must cover height {}", height.value()))?;
+        assert_eq!(
+            context.final_note_commitment_roots.as_ref(),
+            expected.get(&height),
+            "roots mismatch at height {}",
+            height.value()
+        );
+    }
+    Ok(())
+}
+
+fn shielded_chain_through(
+    tip_height: u32,
+) -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn Error>> {
+    chain_through(tip_height, 0, &|height| {
+        if height == 5 {
+            return shielded_transactions(&fixture_sapling_source_block()?);
+        }
+        if height == 4 {
+            return shielded_transactions(&fixture_orchard_source_block()?);
+        }
+        Ok(Vec::new())
+    })
+}
+
+fn staged_pool_activations() -> Result<NetworkUpgradeActivations, Box<dyn Error>> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
+                activation_height: BlockHeight::new(1),
+                name: "Overwinter".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(2),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x2bb4_0e60),
+                activation_height: BlockHeight::new(2),
+                name: "Blossom".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xf5b9_230b),
+                activation_height: BlockHeight::new(2),
+                name: "Heartwood".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xe9ff_75a6),
+                activation_height: BlockHeight::new(2),
+                name: "Canopy".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xc2d6_d0b4),
+                activation_height: BlockHeight::new(4),
+                name: "NU5".to_owned(),
+            },
+        ],
+    )?)
+}
+
 /// Two chains that mine the same transparent spend at [`SPENDING_BLOCK_HEIGHT`]
 /// in different blocks; only the replacement extends to a block spending it.
 struct ForkedSpendChains {
@@ -941,13 +1141,76 @@ impl CanonicalHarness {
         build_plan: CanonicalStoreBuildPlan,
         settled_height: u32,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::publish_settled_with_activations(
+            blocks,
+            build_plan,
+            settled_height,
+            &sample_regtest_upgrade_activations(),
+        )
+        .await
+    }
+
+    async fn publish_chain(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
+        let first_block = blocks
+            .values()
+            .next()
+            .ok_or("the chain must not be empty")?
+            .clone();
+        let tip_height = blocks
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or("the chain must not be empty")?
+            .value();
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            activations,
+            first_block.block_time_seconds.saturating_sub(1),
+            block_id(&blocks, tip_height)?,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+        )?;
+        Self::publish_settled_with_activations(blocks, build_plan, tip_height, activations).await
+    }
+
+    /// Publishes block 1 and live-follows every subsequent block so every
+    /// height `1..=tip` carries a persisted `tree_state_checkpoint` row.
+    async fn dense_chain(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
+        let first = blocks
+            .get(&BlockHeight::new(1))
+            .ok_or("the chain must start at height 1")?
+            .clone();
+        let initial = BTreeMap::from([(BlockHeight::new(1), first)]);
+        let mut harness = Self::publish_chain(initial, activations).await?;
+        harness.follow_to(blocks, activations).await?;
+        Ok(harness)
+    }
+
+    async fn publish_settled_with_activations(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        build_plan: CanonicalStoreBuildPlan,
+        settled_height: u32,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let store = build_canonical_store(&store_path, &blocks, build_plan, settled_height).await?;
+        let store = build_canonical_store_with_activations(
+            &store_path,
+            &blocks,
+            build_plan,
+            settled_height,
+            activations,
+        )
+        .await?;
         let secondary = RocksDbCanonicalSecondary::open_ready(
             &store_path,
             temporary.path().join("canonical-secondary"),
-            &sample_regtest_upgrade_activations(),
+            activations,
             CanonicalStoreWorkload::Wallet,
             zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
@@ -961,20 +1224,54 @@ impl CanonicalHarness {
         })
     }
 
-    /// Follows the canonical writer onto `blocks`, replacing every height
-    /// where they differ from the published chain, and catches the secondary up.
-    async fn reorg_to(
+    /// Closes the primary, deletes `heights` from `family` directly on disk,
+    /// and reopens the secondary so reads observe the modified column family.
+    fn delete_rows(&mut self, family: &str, heights: &[u32]) -> Result<(), Box<dyn Error>> {
+        let primary_path = self.temporary.path().join("canonical");
+        let activations = self
+            .secondary
+            .network_upgrade_activations()
+            .cloned()
+            .unwrap_or_else(sample_regtest_upgrade_activations);
+        self.store = None;
+        {
+            let options = rust_rocksdb::Options::default();
+            let column_families = rust_rocksdb::DB::list_cf(&options, &primary_path)?;
+            let db = rust_rocksdb::DB::open_cf(&options, &primary_path, &column_families)?;
+            let handle = db
+                .cf_handle(family)
+                .ok_or_else(|| format!("missing column family {family}"))?;
+            for height in heights {
+                db.delete_cf(&handle, height.to_be_bytes())?;
+            }
+            db.flush_cf(&handle)?;
+        }
+        self.secondary = RocksDbCanonicalSecondary::open_ready(
+            &primary_path,
+            self.temporary
+                .path()
+                .join(format!("canonical-secondary-after-{family}")),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        Ok(())
+    }
+
+    async fn follow_to(
         &mut self,
         blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
     ) -> Result<(), Box<dyn Error>> {
-        let activations = Arc::new(sample_regtest_upgrade_activations());
         let tip_height = blocks
             .keys()
             .next_back()
             .copied()
-            .ok_or("the replacement chain must not be empty")?;
+            .ok_or("the chain must not be empty")?;
         let source = StaticChainSource {
-            checkpoints: chain_checkpoints(&blocks, &activations)?,
+            checkpoints: chain_checkpoints(&blocks, activations)?,
             blocks: blocks.clone(),
         };
         let store = self
@@ -985,7 +1282,7 @@ impl CanonicalHarness {
         let cancel = CancellationToken::new();
         let follower = CanonicalFollower::new(
             &source,
-            activations,
+            Arc::new(activations.clone()),
             CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(5),
                 poll_interval: Duration::ZERO,
@@ -1004,6 +1301,16 @@ impl CanonicalHarness {
         self.secondary.try_catch_up()?;
         self.blocks = blocks;
         Ok(())
+    }
+
+    /// Follows the canonical writer onto `blocks`, replacing every height
+    /// where they differ from the published chain, and catches the secondary up.
+    async fn reorg_to(
+        &mut self,
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.follow_to(blocks, &sample_regtest_upgrade_activations())
+            .await
     }
 
     const fn secondary(&self) -> &RocksDbCanonicalSecondary {
@@ -1053,13 +1360,14 @@ impl CanonicalHarness {
     }
 }
 
-async fn build_canonical_store(
+async fn build_canonical_store_with_activations(
     store_path: &Path,
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     build_plan: CanonicalStoreBuildPlan,
     settled_height: u32,
+    activations: &NetworkUpgradeActivations,
 ) -> Result<RocksDbCanonicalStore, Box<dyn Error>> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let activations = Arc::new(activations.clone());
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
         CanonicalStoreWorkload::Wallet,
