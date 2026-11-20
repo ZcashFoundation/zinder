@@ -418,7 +418,7 @@ pub struct BoundedRocksDbOpen {
     pub statistics: Arc<Options>,
     resource_budget: RocksDbResourceBudget,
     resource_gauge_throttle: ResourceGaugeThrottle,
-    cache_entry_throttle: ResourceGaugeThrottle,
+    wal_size_throttle: ResourceGaugeThrottle,
 }
 
 impl BoundedRocksDbOpen {
@@ -437,15 +437,12 @@ impl BoundedRocksDbOpen {
             io_mode: self.io_mode,
             resource_budget: self.resource_budget,
         };
-        let sample_cache = self.cache_entry_throttle.should_sample();
-        record_single_instance_resource_gauges(&inputs, sample_cache);
-        if sample_cache {
-            inputs.record_block_cache_entry_gauges();
-        }
+        record_single_instance_resource_gauges(&inputs, self.wal_size_throttle.should_sample());
     }
 
-    /// Samples cache entry counts and charges through this database. A publisher
-    /// calls this on one generation per shared cache per instance-memory interval.
+    /// Scans the cache for entry counts and charges.
+    /// Serving publishers call this on the blocking pool, once per shared cache
+    /// at the instance-memory cadence.
     pub fn record_block_cache_entry_gauges(&self, role: StoreRole) {
         record_cache_entries(&self.db, role);
     }
@@ -529,7 +526,7 @@ pub fn open_bounded_rocksdb(
         statistics: Arc::new(statistics),
         resource_budget: rocksdb_resource_budget,
         resource_gauge_throttle: ResourceGaugeThrottle::default(),
-        cache_entry_throttle: ResourceGaugeThrottle::for_instance_memory(),
+        wal_size_throttle: ResourceGaugeThrottle::for_instance_memory(),
     })
 }
 
@@ -1670,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_reports_level_counts_and_cache_entries_without_per_file_properties()
+    fn primary_reports_level_counts_without_expensive_properties()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let mut primary = open_rows_primary(root.path())?;
@@ -1692,23 +1689,9 @@ mod tests {
         }
         assert!(!first.contains("compression-ratio-at-level"));
         assert!(!first.contains("zinder_store_table_metadata_bytes"));
-        // RocksDB can return its cached startup snapshot on the first collection.
-        assert!(
-            primary_gauge(
-                &first,
-                "zinder_store_block_cache_entries{",
-                "entry_role=\"Misc\""
-            )
-            .is_some_and(|count| count > 0.0)
-        );
-        assert!(
-            primary_gauge(
-                &first,
-                "zinder_store_block_cache_entry_bytes{",
-                "entry_role=\"DataBlock\""
-            )
-            .is_some()
-        );
+        assert!(first.contains("zinder_store_block_cache_usage_bytes"));
+        assert!(!first.contains("zinder_store_block_cache_entries"));
+        assert!(!first.contains("zinder_store_block_cache_entry_bytes"));
         let rows = primary.db.cf_handle("rows").ok_or("rows must open")?;
         primary
             .db
@@ -1731,6 +1714,34 @@ mod tests {
         reopened.record_resource_gauges(StoreRole::CanonicalPrimary, &["rows"]);
         let after_reopen = recorder.handle().render();
         assert_eq!(property(&after_reopen, &occupied_property), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_exports_cache_composition_on_explicit_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary_dir = tempfile::tempdir()?;
+        let secondary_dir = tempfile::tempdir()?;
+        let primary = open_rows_primary(primary_dir.path())?;
+        write_row(&primary, 7)?;
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let cache = SharedBlockCache::new(budget.block_cache_bytes);
+        let secondary = open_rows_secondary(primary_dir.path(), secondary_dir.path(), &cache)?;
+        assert!(read_row(&secondary)??.is_some());
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        secondary.record_block_cache_entry_gauges(StoreRole::CanonicalSecondary);
+        let exposition = recorder.handle().render();
+        assert!(exposition.lines().any(|line| {
+            line.starts_with("zinder_store_block_cache_entries{")
+                && line.contains("entry_role=\"Misc\"")
+                && line.contains("store_role=\"canonical_secondary\"")
+                && line
+                    .rsplit_once(' ')
+                    .is_some_and(|(_, count)| count.parse::<f64>().is_ok_and(|count| count > 0.0))
+        }));
+        assert!(exposition.contains("zinder_store_block_cache_entry_bytes"));
         Ok(())
     }
 

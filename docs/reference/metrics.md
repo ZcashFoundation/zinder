@@ -434,8 +434,8 @@ within each process.
 | `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. |
 | `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
-| `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
-| `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
+| `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
+| `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
 | `zinder_store_memtable_budget_bytes` | gauge | `store_role` | Memtable budget. Readers sum it over open pair slots. |
 | `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
 | `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
@@ -449,8 +449,7 @@ within each process.
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the
 wallet primary during following. Commit bursts refresh the writer gauges at
-most once per second. The writers sample WAL size and cache entry statistics
-at most once every 15 seconds.
+most once per second. Writers sample WAL size at most once every 15 seconds.
 
 For each data column family, `rocksdb.num-files-at-level0` includes zero.
 Levels 1 through 6 acquire a file-count series when they hold SSTs.
@@ -468,8 +467,8 @@ Serving publishers report the cache footprint, cache entries, tickers, and
 summed instance memory. Compact-block mode serves only the canonical store.
 Cache usage includes pinned bytes. Each store shares one cache and one set of tickers
 across generations. Recycling a generation preserves its reads in the
-cumulative totals. Cache entry statistics sample one handle per cache at the
-15-second instance-memory cadence.
+cumulative totals. Serving publishers sample cache composition on the blocking
+pool, using one handle per cache at the 15-second instance-memory cadence.
 
 `zinder_store_rocksdb_ticker` uses upstream names for its `ticker` label.
 The store's `statistics_level` must be `tickers` or `full`.

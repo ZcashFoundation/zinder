@@ -529,7 +529,6 @@ pub struct MaterializedViewStore {
     statistics: Arc<Options>,
     io_mode: RocksDbIoMode,
     resource_gauge_throttle: Arc<ResourceGaugeThrottle>,
-    cache_entry_throttle: Arc<ResourceGaugeThrottle>,
     logical_write_bytes: Arc<AtomicU64>,
 }
 
@@ -1120,7 +1119,6 @@ impl MaterializedViewStore {
             statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
-            cache_entry_throttle: Arc::new(ResourceGaugeThrottle::for_instance_memory()),
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         if is_fresh_store {
@@ -1229,7 +1227,6 @@ impl MaterializedViewStore {
             statistics: bounded_open.statistics,
             io_mode: bounded_open.io_mode,
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
-            cache_entry_throttle: Arc::new(ResourceGaugeThrottle::for_instance_memory()),
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         store.admit_open_secondary_store(manifest_admission)?;
@@ -2744,9 +2741,6 @@ impl MaterializedViewStore {
             resource_budget: self.rocksdb_resource_budget,
         };
         record_rocksdb_resource_gauges(&inputs);
-        if self.cache_entry_throttle.should_sample() {
-            inputs.record_block_cache_entry_gauges();
-        }
         self.record_materialized_view_rocksdb_properties(store_role);
     }
 

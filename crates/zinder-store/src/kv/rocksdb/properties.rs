@@ -5,13 +5,6 @@ use rust_rocksdb::{AsColumnFamilyRef, DB, properties};
 
 use super::{RocksDbResourceGaugeInputs, StoreRole, u64_to_f64};
 
-impl RocksDbResourceGaugeInputs<'_> {
-    /// Samples the cache's entry counts and charges once per instance-memory interval.
-    pub fn record_block_cache_entry_gauges(&self) {
-        record_cache_entries(self.db, self.store_role);
-    }
-}
-
 pub(super) fn record_cache_entries(db: &DB, role: StoreRole) {
     let Ok(Some(property)) = db.property_value("rocksdb.block-cache-entry-stats") else {
         return;
