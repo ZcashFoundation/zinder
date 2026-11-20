@@ -1040,8 +1040,8 @@ pool's roots from index zero, then confirms the end of the Sapling roots
 with an empty reply from index one. It requests a 10-block range, resumes
 from the fifth block after the fixture interrupts the first stream with
 `DEADLINE_EXCEEDED`, and requests the remaining 54 blocks. Every range
-selects Sapling, Orchard, and Ironwood, and the wallet completes with an
-empty balance.
+selects Sapling, Orchard, and Ironwood. The CLI reports all 64 blocks
+scanned.
 
 The fixture measures the pinned client's direct gRPC path through sync
 completion over a span with no new note commitments. On a populated chain,

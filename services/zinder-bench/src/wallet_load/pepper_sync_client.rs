@@ -2,6 +2,7 @@
 
 use std::{
     error::Error,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -21,6 +22,7 @@ const PUBLIC_TEST_VECTOR_SEED: &str = "abandon abandon abandon abandon abandon a
 #[ignore = "requires the pinned Zingo CLI build described in the zinder-bench README"]
 async fn pepper_sync_fresh_restore_requests() -> Result<(), Box<dyn Error>> {
     let binary = std::env::var_os("ZINDER_TEST_PEPPER_SYNC_BIN")
+        .map(PathBuf::from)
         .ok_or("set ZINDER_TEST_PEPPER_SYNC_BIN to the pinned Zingo CLI executable")?;
     let mut fixture = MockStreamer::new(RangeEnding::Clean);
     fixture.first_range_deadline_after = Some(4);
@@ -37,27 +39,7 @@ async fn pepper_sync_fresh_restore_requests() -> Result<(), Box<dyn Error>> {
     );
     let requests = Arc::clone(&fixture.requests);
     let server = mock_streamer::serve(fixture).await?;
-    let wallet = tempfile::tempdir()?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(45),
-        Command::new(binary)
-            .kill_on_drop(true)
-            .env("ZINGO_SEED", PUBLIC_TEST_VECTOR_SEED)
-            .args(["--chain", "mainnet", "--server", &server.url, "--data-dir"])
-            .arg(wallet.path())
-            .args(["--birthday", &BIRTHDAY.to_string(), "--waitsync", "balance"])
-            .output(),
-    )
-    .await??;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        output.status.success(),
-        "Zingo CLI exited with {}",
-        output.status
-    );
-    assert!(stdout.contains("confirmed_orchard_balance: 0"));
-    assert!(stderr.contains("Zingo CLI quit successfully."));
+    restore_wallet(&binary, &server.url).await?;
 
     assert_eq!(requests.connections.lock().len(), 1);
     assert_eq!(requests.mempool_streams.load(Ordering::Relaxed), 1);
@@ -96,5 +78,37 @@ async fn pepper_sync_fresh_restore_requests() -> Result<(), Box<dyn Error>> {
         PoolType::Ironwood as i32,
     ];
     assert_eq!(*requests.block_range_pool_types.lock(), [shielded; 3]);
+    Ok(())
+}
+
+async fn restore_wallet(binary: &Path, endpoint: &str) -> Result<(), Box<dyn Error>> {
+    let wallet = tempfile::tempdir()?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(45),
+        Command::new(binary)
+            .kill_on_drop(true)
+            .env("ZINGO_SEED", PUBLIC_TEST_VECTOR_SEED)
+            .args(["--chain", "mainnet", "--server", endpoint, "--data-dir"])
+            .arg(wallet.path())
+            .args([
+                "--birthday",
+                &BIRTHDAY.to_string(),
+                "--waitsync",
+                "sync",
+                "status",
+            ])
+            .output(),
+    )
+    .await??;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        output.status.success(),
+        "Zingo CLI exited with {}",
+        output.status
+    );
+    assert!(!stderr.to_ascii_lowercase().contains("error:"));
+    assert!(stderr.contains("Zingo CLI quit successfully."));
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(status["session_blocks_scanned"], TIP - BIRTHDAY + 1);
     Ok(())
 }
