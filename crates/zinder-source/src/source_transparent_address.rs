@@ -5,12 +5,17 @@
 //! validated request and the decoded rows, so the request bounds and the
 //! row order are the same whichever certified node answers.
 
-use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use serde::Deserialize;
-use zebra_chain::transparent::Address as ZebraTransparentAddress;
-use zinder_core::{BlockHeight, Network, TransparentOutPoint};
+use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
+use zebra_chain::amount::Amount;
+use zebra_chain::transparent::{
+    Address as ZebraTransparentAddress, Output as ZebraTransparentOutput, Script as ZebraScript,
+};
+use zinder_core::{BlockHeight, Network, TransactionId, TransparentOutPoint};
 
 use crate::source_block::wire_error_to_transaction_id_error;
 use crate::{SourceError, parse_transparent_address, transparent_address_matches_network};
@@ -174,7 +179,8 @@ pub struct SourceTransparentUnspentOutput {
     pub address: ZebraTransparentAddress,
     /// Output identity.
     pub outpoint: TransparentOutPoint,
-    /// Raw `scriptPubKey` bytes.
+    /// Raw `scriptPubKey` bytes, a P2PKH or P2SH script that pays
+    /// [`Self::address`].
     pub script_pub_key: Vec<u8>,
     /// Output value in zatoshis.
     pub value_zat: u64,
@@ -246,13 +252,16 @@ impl UtxoRowBound {
 /// Zebra applies `startHeight` and `maxEntries` itself. Zakura ignores both
 /// and returns every unspent output in chain order, so the rows below
 /// `start_height` are dropped and the rest bounded here. Both nodes return
-/// rows in chain order, which keeps the two results identical.
+/// rows in chain order, which keeps the two results identical. Every row is
+/// validated before any is dropped, so a row the answer leaves out cannot
+/// hide a node that breaks the contract.
 ///
 /// # Errors
 ///
 /// A complete lookup with more than [`TransparentAddressRowLimit::MAX`]
 /// matching rows returns [`SourceError::TransparentAddressRowLimitExceeded`].
-/// Rows out of chain order, or for an address outside `lookup`, return
+/// A row for an address outside `lookup`, a script that does not pay the
+/// row's address, rows out of chain order, or a repeated outpoint return
 /// [`SourceError::SourceProtocolMismatch`].
 pub(crate) fn decode_address_utxos(
     rows: &[ZebraAddressUtxo],
@@ -260,35 +269,46 @@ pub(crate) fn decode_address_utxos(
     start_height: BlockHeight,
     bound: UtxoRowBound,
 ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
-    if rows
-        .windows(2)
-        .any(|pair| matches!(pair, [earlier, later] if later.height < earlier.height))
-    {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "getaddressutxos rows are not in chain order",
-        });
+    // The rows of one address repeat its text and script, so each distinct
+    // pair is checked once.
+    let mut checked_payees: HashMap<(&str, &str), ZebraTransparentAddress> = HashMap::new();
+    let mut outputs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let script_pub_key =
+            hex::decode(&row.script).map_err(|_| SourceError::SourceProtocolMismatch {
+                reason: "getaddressutxos returned a script that is not hex",
+            })?;
+        let address = match checked_payees.entry((row.address.as_str(), row.script.as_str())) {
+            Entry::Occupied(checked) => *checked.get(),
+            Entry::Vacant(unchecked) => {
+                *unchecked.insert(checked_payee(&row.address, &script_pub_key, lookup)?)
+            }
+        };
+        outputs.push(decode_address_utxo(row, address, script_pub_key)?);
     }
-    let first_matching_row = rows.partition_point(|row| row.height < start_height.value());
-    let matching_rows = rows.get(first_matching_row..).unwrap_or_default();
+    check_utxo_chain_order(&outputs)?;
+    let first_matching_output =
+        outputs.partition_point(|output| output.block_height < start_height);
+    outputs.drain(..first_matching_output);
     let max_rows = bound.max_rows();
-    if matches!(bound, UtxoRowBound::Complete) && matching_rows.len() > max_rows.row_count() {
+    if matches!(bound, UtxoRowBound::Complete) && outputs.len() > max_rows.row_count() {
         return Err(SourceError::TransparentAddressRowLimitExceeded {
             operation: "getaddressutxos",
             max_rows: max_rows.get(),
         });
     }
-    matching_rows
-        .iter()
-        .take(max_rows.row_count())
-        .map(|row| decode_address_utxo(row, lookup))
-        .collect()
+    outputs.truncate(max_rows.row_count());
+    Ok(outputs)
 }
 
-fn decode_address_utxo(
-    row: &ZebraAddressUtxo,
+/// Returns the address a row names after checking that `lookup` holds it
+/// and that the row's script pays it.
+fn checked_payee(
+    address_text: &str,
+    script_pub_key: &[u8],
     lookup: &TransparentAddressLookup,
-) -> Result<SourceTransparentUnspentOutput, SourceError> {
-    let address = parse_transparent_address(&row.address).map_err(|_| {
+) -> Result<ZebraTransparentAddress, SourceError> {
+    let address = parse_transparent_address(address_text).map_err(|_| {
         SourceError::SourceProtocolMismatch {
             reason: "getaddressutxos returned an invalid transparent address",
         }
@@ -298,12 +318,23 @@ fn decode_address_utxo(
             reason: "getaddressutxos returned an output of an address the lookup does not hold",
         });
     }
+    let pays_address = script_recipient(script_pub_key)
+        .is_some_and(|recipient| TransparentAddress::try_from(address) == Ok(recipient));
+    if !pays_address {
+        return Err(SourceError::SourceProtocolMismatch {
+            reason: "getaddressutxos returned a script that does not pay the row's address",
+        });
+    }
+    Ok(address)
+}
+
+fn decode_address_utxo(
+    row: &ZebraAddressUtxo,
+    address: ZebraTransparentAddress,
+    script_pub_key: Vec<u8>,
+) -> Result<SourceTransparentUnspentOutput, SourceError> {
     let transaction_id = zinder_core::wire::decode_rpc_transaction_id_hex(&row.txid)
         .map_err(wire_error_to_transaction_id_error)?;
-    let script_pub_key =
-        hex::decode(&row.script).map_err(|_| SourceError::SourceProtocolMismatch {
-            reason: "getaddressutxos returned a script that is not hex",
-        })?;
     Ok(SourceTransparentUnspentOutput {
         address,
         outpoint: TransparentOutPoint::new(transaction_id, row.output_index),
@@ -311,6 +342,45 @@ fn decode_address_utxo(
         value_zat: row.satoshis,
         block_height: BlockHeight::new(row.height),
     })
+}
+
+/// Returns the P2PKH or P2SH address `script_pub_key` pays, or `None` for any
+/// other script.
+///
+/// Both nodes index an output under the address `zcash_transparent` derives
+/// from its script, so a row whose script pays no address, or another one,
+/// cannot come from their indexes.
+fn script_recipient(script_pub_key: &[u8]) -> Option<TransparentAddress> {
+    let output = ZebraTransparentOutput::new(Amount::zero(), ZebraScript::new(script_pub_key));
+    TxOut::try_from(&output).ok()?.recipient_address()
+}
+
+/// Checks that `outputs` are in the order both nodes return them: by height,
+/// with each transaction's outputs together and in increasing index order.
+///
+/// That order holds each outpoint once, so the check also refuses a repeated
+/// outpoint, which would otherwise count one output twice.
+fn check_utxo_chain_order(outputs: &[SourceTransparentUnspentOutput]) -> Result<(), SourceError> {
+    let mut finished_transactions: HashSet<TransactionId> = HashSet::new();
+    for pair in outputs.windows(2) {
+        let [earlier, later] = pair else {
+            continue;
+        };
+        let in_order = if later.outpoint.transaction_id == earlier.outpoint.transaction_id {
+            later.block_height == earlier.block_height
+                && later.outpoint.output_index > earlier.outpoint.output_index
+        } else {
+            finished_transactions.insert(earlier.outpoint.transaction_id);
+            later.block_height >= earlier.block_height
+                && !finished_transactions.contains(&later.outpoint.transaction_id)
+        };
+        if !in_order {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "getaddressutxos rows are not in chain order or repeat an outpoint",
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -323,16 +393,50 @@ mod tests {
         ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Testnet, [hash_byte; 20])
     }
 
+    /// Txid hex of the transaction a test block at `height` holds.
+    fn block_transaction_hex(height: u32) -> String {
+        let mut transaction_id = [0_u8; 32];
+        transaction_id[..4].copy_from_slice(&height.to_le_bytes());
+        hex::encode(transaction_id)
+    }
+
+    fn script_hex(address: ZebraTransparentAddress) -> String {
+        hex::encode(address.script().as_raw_bytes())
+    }
+
+    /// Row for output `output_index` of the transaction at `height`, paying
+    /// address 1.
     fn utxo_row(height: u32, output_index: u32) -> ZebraAddressUtxo {
         ZebraAddressUtxo {
             address: testnet_address(1).to_string(),
-            txid: "11".repeat(32),
+            txid: block_transaction_hex(height),
             output_index,
-            script: "76a914".to_owned(),
+            script: script_hex(testnet_address(1)),
             satoshis: 5,
             height,
         }
     }
+
+    fn decode_complete(
+        rows: &[ZebraAddressUtxo],
+        lookup: &TransparentAddressLookup,
+    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+        decode_address_utxos(rows, lookup, BlockHeight::new(0), UtxoRowBound::Complete)
+    }
+
+    fn mismatch_reason(
+        outcome: &Result<Vec<SourceTransparentUnspentOutput>, SourceError>,
+    ) -> Option<&'static str> {
+        match outcome {
+            Err(SourceError::SourceProtocolMismatch { reason }) => Some(*reason),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    const SCRIPT_MISMATCH: Option<&str> =
+        Some("getaddressutxos returned a script that does not pay the row's address");
+    const ORDER_MISMATCH: Option<&str> =
+        Some("getaddressutxos rows are not in chain order or repeat an outpoint");
 
     #[test]
     fn lookup_merges_duplicates_and_keeps_network() -> Result<(), TransparentAddressLookupError> {
@@ -534,6 +638,109 @@ mod tests {
             ),
             Err(SourceError::SourceProtocolMismatch { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_refuse_a_script_that_does_not_pay_the_row_address()
+    -> Result<(), TransparentAddressLookupError> {
+        // Address 2 is in the lookup, so only the script check refuses a row
+        // that names address 1 but pays address 2.
+        let lookup = TransparentAddressLookup::new(
+            Network::ZcashTestnet,
+            [testnet_address(1), testnet_address(2)],
+        )?;
+        let script_hash_address =
+            ZebraTransparentAddress::from_script_hash(ZebraNetworkKind::Testnet, [1; 20]);
+        for script in [
+            "6a".to_owned(),
+            script_hex(testnet_address(2)),
+            script_hex(script_hash_address),
+        ] {
+            let mut row = utxo_row(5, 0);
+            row.script = script;
+            assert_eq!(
+                mismatch_reason(&decode_complete(&[row], &lookup)),
+                SCRIPT_MISMATCH
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_accept_a_script_hash_row_whose_script_pays_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let script_hash_address =
+            ZebraTransparentAddress::from_script_hash(ZebraNetworkKind::Testnet, [7; 20]);
+        let lookup = TransparentAddressLookup::new(Network::ZcashTestnet, [script_hash_address])?;
+        let mut row = utxo_row(5, 0);
+        row.address = script_hash_address.to_string();
+        row.script = script_hex(script_hash_address);
+
+        let outputs = decode_complete(&[row], &lookup)?;
+
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.address)
+                .collect::<Vec<_>>(),
+            [script_hash_address]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_validate_rows_below_the_start_height_and_past_the_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lookup = lookup_of_address_one()?;
+        let mut unpaid_row_below_start = utxo_row(3, 0);
+        unpaid_row_below_start.script = "6a".to_owned();
+        let mut foreign_row_past_prefix = utxo_row(9, 0);
+        foreign_row_past_prefix.address = testnet_address(9).to_string();
+        let max_rows = TransparentAddressRowLimit::new(1).ok_or("row limit")?;
+
+        let below_start = decode_address_utxos(
+            &[unpaid_row_below_start, utxo_row(5, 0)],
+            &lookup,
+            BlockHeight::new(5),
+            UtxoRowBound::Complete,
+        );
+        let past_prefix = decode_address_utxos(
+            &[utxo_row(5, 0), foreign_row_past_prefix],
+            &lookup,
+            BlockHeight::new(0),
+            UtxoRowBound::Prefix(max_rows),
+        );
+
+        assert_eq!(mismatch_reason(&below_start), SCRIPT_MISMATCH);
+        assert_eq!(
+            mismatch_reason(&past_prefix),
+            Some("getaddressutxos returned an output of an address the lookup does not hold")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn utxos_refuse_repeated_outpoints_and_reversed_output_indexes()
+    -> Result<(), TransparentAddressLookupError> {
+        let lookup = lookup_of_address_one()?;
+        let mut other_transaction = utxo_row(5, 0);
+        other_transaction.txid = block_transaction_hex(1_000);
+        let mut transaction_at_two_heights = utxo_row(6, 1);
+        transaction_at_two_heights.txid = block_transaction_hex(5);
+        let invalid_answers = [
+            vec![utxo_row(5, 0), utxo_row(5, 0)],
+            vec![utxo_row(5, 1), utxo_row(5, 0)],
+            vec![utxo_row(5, 0), other_transaction, utxo_row(5, 1)],
+            vec![utxo_row(5, 0), transaction_at_two_heights],
+        ];
+
+        for rows in invalid_answers {
+            assert_eq!(
+                mismatch_reason(&decode_complete(&rows, &lookup)),
+                ORDER_MISMATCH
+            );
+        }
         Ok(())
     }
 }

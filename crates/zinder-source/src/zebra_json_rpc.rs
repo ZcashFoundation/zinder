@@ -16,6 +16,7 @@ use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BlockValuePoolBalances, BroadcastAccepted, BroadcastDuplicate,
@@ -583,10 +584,57 @@ impl ZebraJsonRpcSource {
     where
         Response: for<'de> Deserialize<'de>,
     {
+        self.call_decoding(method, params, map_call_error, Ok).await
+    }
+
+    /// Calls `method` and decodes its result apart from the JSON-RPC
+    /// envelope.
+    ///
+    /// A result that does not decode as `Response` is reported as
+    /// [`SourceError::SourceProtocolMismatch`] with `shape_mismatch_reason`.
+    /// It does not count toward the client rebuild, because the node
+    /// answered and a fresh connection gets the same answer.
+    /// [`Self::call_typed`] reports such a result as
+    /// [`SourceError::NodeUnavailable`] instead.
+    async fn call_with_result_shape<Response>(
+        &self,
+        method: &'static str,
+        params: ArrayParams,
+        map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
+        shape_mismatch_reason: &'static str,
+    ) -> Result<Response, SourceError>
+    where
+        Response: for<'de> Deserialize<'de>,
+    {
+        self.call_decoding(
+            method,
+            params,
+            map_call_error,
+            |raw_result: Box<RawValue>| {
+                serde_json::from_str(raw_result.get()).map_err(|_| {
+                    SourceError::SourceProtocolMismatch {
+                        reason: shape_mismatch_reason,
+                    }
+                })
+            },
+        )
+        .await
+    }
+
+    async fn call_decoding<WireResponse, Response>(
+        &self,
+        method: &'static str,
+        params: ArrayParams,
+        map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
+        decode: impl FnOnce(WireResponse) -> Result<Response, SourceError>,
+    ) -> Result<Response, SourceError>
+    where
+        WireResponse: for<'de> Deserialize<'de>,
+    {
         let started_at = Instant::now();
         let client_result = self
             .request_client()?
-            .request::<Response, _>(method, params)
+            .request::<WireResponse, _>(method, params)
             .await;
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &client_result,
@@ -594,7 +642,7 @@ impl ZebraJsonRpcSource {
             self.max_response_bytes,
         ));
         let rpc_outcome = match client_result {
-            Ok(response) => Ok(response),
+            Ok(response) => decode(response),
             Err(ClientError::Call(error)) => Err(map_call_error(JsonRpcCallError::from(error))),
             Err(error) => Err(map_transport_error(&error, method, self.max_response_bytes)),
         };
@@ -912,18 +960,22 @@ impl ZebraJsonRpcSource {
     /// node does not maintain its transparent address indexes,
     /// [`SourceError::TransparentAddressLookupNetworkMismatch`] when `lookup`
     /// targets another network, [`SourceError::NodeResponseTooLarge`] when
-    /// the answer exceeds the node's own response limit, and
-    /// [`SourceError::NodeUnavailable`] when the node cannot be reached.
+    /// the answer exceeds the node's own response limit,
+    /// [`SourceError::BlockCommittedDuringRead`] when the node committed a
+    /// block while it read its index, [`SourceError::SourceProtocolMismatch`]
+    /// when the answer has another shape, and [`SourceError::NodeUnavailable`]
+    /// when the node cannot be reached.
     pub async fn fetch_transparent_address_balance(
         &self,
         lookup: &TransparentAddressLookup,
     ) -> Result<SourceTransparentAddressBalance, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         let balance: ZebraAddressBalance = self
-            .call_typed(
+            .call_with_result_shape(
                 "getaddressbalance",
                 positional_params([json!({ "addresses": lookup.rpc_addresses() })])?,
                 |error| transparent_address_call_error("getaddressbalance", error),
+                "getaddressbalance returned a result without a numeric balance and received",
             )
             .await?;
         Ok(balance.into())
@@ -940,7 +992,9 @@ impl ZebraJsonRpcSource {
     /// it. It reads the tip again after the request and keeps the answer only
     /// when both reads name the same block. Otherwise the tip may have fallen
     /// below the range while the node answered, so the source repeats the
-    /// request against the new tip, up to three attempts in all. Neither
+    /// request against the new tip, up to three attempts in all. It treats a
+    /// refusal of the answer's size the same way, because that refusal may
+    /// be for the new tip's range rather than the requested one. Neither
     /// node indexes the genesis block, and both read an end height of zero
     /// as the tip, so an empty range or one ending at genesis is answered
     /// without a node request.
@@ -968,12 +1022,17 @@ impl ZebraJsonRpcSource {
             if start_height > indexed_end_height || indexed_end_height == BlockHeight::new(0) {
                 return Ok(Vec::new());
             }
-            let txid_hex_list = self
+            let txid_hex_list = match self
                 .request_address_transaction_ids(lookup, start_height, indexed_end_height)
-                .await?;
+                .await
+            {
+                Ok(txid_hex_list) => Ok(txid_hex_list),
+                Err(error) if is_answer_size_refusal(&error) => Err(error),
+                Err(error) => return Err(error),
+            };
             let tip_after_request = self.tip_id().await?;
             if tip_after_request == tip {
-                return txid_hex_list
+                return txid_hex_list?
                     .iter()
                     .map(|txid_hex| decode_display_transaction_id(txid_hex))
                     .collect();
@@ -993,7 +1052,7 @@ impl ZebraJsonRpcSource {
         end_height: BlockHeight,
     ) -> Result<Vec<String>, SourceError> {
         let txid_hex_list: Vec<String> = self
-            .call_typed(
+            .call_with_result_shape(
                 "getaddresstxids",
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
@@ -1001,6 +1060,7 @@ impl ZebraJsonRpcSource {
                     "end": end_height.value(),
                 })])?,
                 |error| transparent_address_call_error("getaddresstxids", error),
+                "getaddresstxids returned a result that is not a list of transaction ids",
             )
             .await?;
         if txid_hex_list.len() > TransparentAddressRowLimit::MAX.row_count() {
@@ -1027,8 +1087,10 @@ impl ZebraJsonRpcSource {
     /// than [`TransparentAddressRowLimit::MAX`] outputs match,
     /// [`SourceError::SourceResponseTooLarge`] when the answer exceeds
     /// `node.max_response_bytes`, [`SourceError::SourceProtocolMismatch`]
-    /// when a row is out of chain order or pays an address outside `lookup`,
-    /// and the errors of [`Self::fetch_transparent_address_balance`].
+    /// when any returned row names an address outside `lookup`, has a script
+    /// that does not pay its address, is out of chain order, or repeats an
+    /// outpoint, and the errors of
+    /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_utxos(
         &self,
         lookup: &TransparentAddressLookup,
@@ -1073,7 +1135,7 @@ impl ZebraJsonRpcSource {
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         let rows: Vec<ZebraAddressUtxo> = self
-            .call_typed(
+            .call_with_result_shape(
                 "getaddressutxos",
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
@@ -1081,6 +1143,7 @@ impl ZebraJsonRpcSource {
                     "maxEntries": bound.rpc_max_entries(),
                 })])?,
                 |error| transparent_address_call_error("getaddressutxos", error),
+                "getaddressutxos returned a result that is not a list of unspent outputs",
             )
             .await?;
         decode_address_utxos(&rows, lookup, start_height, bound)
@@ -1861,6 +1924,17 @@ fn subtree_roots_call_error(
 const TRANSPARENT_INDEXES_UNAVAILABLE_REFUSAL: &str =
     "transparent address and spender indexes are unavailable";
 
+/// Phrase in each address-lookup refusal of a node that committed a block
+/// while it read its index.
+///
+/// Zebra's and Zakura's balance refusal is `unable to get balance: state was
+/// committing a block` (`read::address` in their state crates). Their
+/// transaction-id and unspent-output refusals continue the same phrase.
+const BLOCK_COMMITTED_DURING_READ_REFUSAL: &str = "state was committing a block";
+
+/// JSON-RPC code both nodes answer for a failed state read (`LegacyCode::Misc`).
+const JSON_RPC_MISC_ERROR_CODE: i64 = -1;
+
 /// Zebra's refusals of an address lookup that matched more rows than
 /// `MAX_ADDRESS_QUERY_RESULTS` (Zebra 7.1.0 and later).
 const ADDRESS_ROW_LIMIT_REFUSALS: [&str; 3] = [
@@ -1893,9 +1967,26 @@ fn transparent_address_call_error(operation: &'static str, error: JsonRpcCallErr
             operation,
             reason: error.message,
         }
+    } else if error.code == Some(JSON_RPC_MISC_ERROR_CODE)
+        && error.message.contains(BLOCK_COMMITTED_DURING_READ_REFUSAL)
+    {
+        SourceError::BlockCommittedDuringRead {
+            operation,
+            reason: error.message,
+        }
     } else {
         map_node_unavailable(error)
     }
+}
+
+/// Returns whether `error` refuses an address lookup's answer for its size.
+fn is_answer_size_refusal(error: &SourceError) -> bool {
+    matches!(
+        error,
+        SourceError::TransparentAddressRowLimitExceeded { .. }
+            | SourceError::NodeResponseTooLarge { .. }
+            | SourceError::SourceResponseTooLarge { .. }
+    )
 }
 
 struct BatchedSourceBlocks {
@@ -2103,6 +2194,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::ChainTipChangedDuringFetch { .. }) => "chain_tip_changed_during_fetch",
+        Some(SourceError::BlockCommittedDuringRead { .. }) => "block_committed_during_read",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::HistoricalTreeStateUnavailable { .. }) => {
             "historical_tree_state_unavailable"

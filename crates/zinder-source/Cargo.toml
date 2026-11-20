@@ -28,7 +28,7 @@ prost.workspace = true
 rustls-pki-types.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tokio-stream.workspace = true
@@ -37,6 +37,7 @@ tracing.workspace = true
 zebra-chain.workspace = true
 zcash_primitives = { workspace = true, features = ["std"] }
 zcash_protocol = { workspace = true, features = ["std"] }
+zcash_transparent.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 
@@ -50,7 +51,6 @@ sapling.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
-zcash_transparent.workspace = true
 zinder-testkit = { path = "../zinder-testkit" }
 
 [lints]

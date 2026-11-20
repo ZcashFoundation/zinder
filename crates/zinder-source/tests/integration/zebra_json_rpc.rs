@@ -257,6 +257,27 @@ async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()>
 }
 
 #[tokio::test]
+async fn tip_result_of_another_shape_stays_node_unavailable() -> eyre::Result<()> {
+    // Only the transparent-address lookups report a result of another shape
+    // as a protocol mismatch.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(RpcReply::result(json!({ "height": "ten" })))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let error = match source.tip_id().await {
+        Ok(tip_id) => return Err(eyre!("expected tip error, got {tip_id:?}")),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(error, SourceError::NodeUnavailable { .. }),
+        "unexpected error {error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_rpc_response_size_limit_is_configurable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("getbestblockheightandhash").reply(
         RpcReply::result(json!({

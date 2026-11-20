@@ -11,7 +11,7 @@ use zebra_chain::parameters::NetworkKind as ZebraNetworkKind;
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{BlockHeight, Network, TransactionId, TransparentOutPoint};
 use zinder_source::{
-    NodeAuth, SourceError, SourceFailureClass, SourceTransparentAddressBalance,
+    CookieSource, NodeAuth, SourceError, SourceFailureClass, SourceTransparentAddressBalance,
     TransparentAddressLookup, TransparentAddressRowLimit, ZebraJsonRpcSource,
 };
 use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
@@ -80,6 +80,11 @@ fn display_txid(byte: u8) -> String {
 fn p2pkh_script_hex() -> String {
     format!("76a914{}88ac", "01".repeat(20))
 }
+
+/// JSON-RPC code both nodes answer for a failed state read.
+const NODE_MISC_ERROR_CODE: i64 = -1;
+
+const NODE_RESPONSE_TOO_LARGE_CODE: i64 = -32_008;
 
 fn utxo_row(height: u32, txid_byte: u8, output_index: u32) -> Value {
     json!({
@@ -292,7 +297,7 @@ async fn transparent_address_transaction_ids_for_genesis_or_empty_ranges_send_no
 async fn transparent_address_row_cap_refusal_is_typed() -> eyre::Result<()> {
     // Zebra 7.1.0 refuses a lookup matching more than 100,000 rows with -8.
     let server = JsonRpcTestServer::start([
-        method("getbestblockheightandhash").reply(tip_reply(10)),
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids").reply(RpcReply::error(
             "more than 100000 transactions match; narrow the height range",
         )),
@@ -344,7 +349,7 @@ async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Res
     // Zakura 1.8.6 answers getaddresstxids without a row cap.
     let over_cap: Vec<String> = std::iter::repeat_n(display_txid(5), 100_001).collect();
     let server = JsonRpcTestServer::start([
-        method("getbestblockheightandhash").reply(tip_reply(10)),
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids").reply(RpcReply::result(json!(over_cap))),
     ])?;
     let source = regtest_source(server.url())?;
@@ -540,9 +545,9 @@ async fn transparent_address_utxos_refuse_an_output_of_an_address_outside_the_lo
 async fn transparent_address_answer_over_the_node_response_limit_is_typed() -> eyre::Result<()> {
     // Zakura and Zebra answer -32008 instead of a response larger than their
     // rpc.max_response_body_size.
-    let server =
-        JsonRpcTestServer::start([method("getaddressutxos")
-            .reply(RpcReply::error_with_code(-32_008, "Response is too big"))])?;
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(
+        RpcReply::error_with_code(NODE_RESPONSE_TOO_LARGE_CODE, "Response is too big"),
+    )])?;
     let source = regtest_source(server.url())?;
 
     let error = source
@@ -663,5 +668,310 @@ async fn transparent_address_lookup_for_another_network_sends_nothing() -> eyre:
         }
     ));
     assert!(server.requests()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_transaction_ids_drop_a_size_refusal_for_a_tip_that_fell_below_the_range()
+-> eyre::Result<()> {
+    // The tip rolls back from 10 to 8 before the node answers, so the node
+    // clamps the range 10..=10 to block 8 and refuses that block's answer.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(8, 2)),
+        method("getaddresstxids").reply(RpcReply::error_with_code(
+            NODE_RESPONSE_TOO_LARGE_CODE,
+            "Response is too big",
+        )),
+    ])?;
+    let source = regtest_source(server.url())?;
+
+    let transaction_ids = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(10),
+            BlockHeight::new(10),
+        )
+        .await?;
+
+    assert_eq!(transaction_ids, Vec::<TransactionId>::new());
+    assert_eq!(server.requests_for("getaddresstxids")?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_transaction_ids_report_a_size_refusal_only_for_a_steady_tip()
+-> eyre::Result<()> {
+    let steady_server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
+        method("getaddresstxids").reply_with(|_| {
+            RpcReply::error_with_code(NODE_RESPONSE_TOO_LARGE_CODE, "Response is too big")
+        }),
+    ])?;
+    let moving_server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(11, 2)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(12, 3)),
+        method("getbestblockheightandhash").reply(tip_reply_with_hash(13, 4)),
+        method("getaddresstxids").reply_with(|_| {
+            RpcReply::error("more than 100000 transactions match; narrow the height range")
+        }),
+    ])?;
+    let lookup = regtest_lookup()?;
+
+    let mut errors = Vec::new();
+    for server in [&steady_server, &moving_server] {
+        errors.push(
+            regtest_source(server.url())?
+                .fetch_transparent_address_transaction_ids(
+                    &lookup,
+                    BlockHeight::new(1),
+                    BlockHeight::new(10),
+                )
+                .await
+                .err()
+                .ok_or_else(|| eyre!("expected a refusal"))?,
+        );
+    }
+
+    assert!(
+        matches!(
+            errors.first(),
+            Some(SourceError::NodeResponseTooLarge {
+                operation: "getaddresstxids",
+                ..
+            })
+        ),
+        "unexpected error {errors:?}"
+    );
+    assert!(
+        matches!(
+            errors.get(1),
+            Some(SourceError::ChainTipChangedDuringFetch {
+                operation: "getaddresstxids",
+                attempts: 3,
+            })
+        ),
+        "unexpected error {errors:?}"
+    );
+    assert_eq!(steady_server.requests_for("getaddresstxids")?.len(), 1);
+    assert_eq!(moving_server.requests_for("getaddresstxids")?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_utxos_refuse_a_script_that_does_not_pay_the_row_address()
+-> eyre::Result<()> {
+    // Address 2 is in the lookup, so the row that names address 1 but pays
+    // address 2 passes the address check.
+    let mut op_return_row = utxo_row(5, 2, 0);
+    op_return_row["script"] = json!("6a");
+    let mut other_recipient_row = utxo_row(5, 2, 0);
+    other_recipient_row["script"] = json!(format!("76a914{}88ac", "02".repeat(20)));
+
+    for row in [op_return_row, other_recipient_row] {
+        let server = JsonRpcTestServer::start([
+            method("getaddressutxos").reply(RpcReply::result(json!([row])))
+        ])?;
+        let error = regtest_source(server.url())?
+            .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected a protocol mismatch"))?;
+
+        assert!(
+            matches!(
+                error,
+                SourceError::SourceProtocolMismatch {
+                    reason: "getaddressutxos returned a script that does not pay the row's address"
+                }
+            ),
+            "unexpected error {error:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_utxos_refuse_a_repeated_outpoint() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
+            utxo_row(5, 2, 0),
+            utxo_row(5, 2, 0)
+        ])))])?;
+    let source = regtest_source(server.url())?;
+
+    let error = source
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected a protocol mismatch"))?;
+
+    assert!(
+        matches!(error, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected error {error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_answers_of_another_shape_are_protocol_mismatches() -> eyre::Result<()>
+{
+    let mut row_without_script = utxo_row(5, 2, 0);
+    row_without_script
+        .as_object_mut()
+        .and_then(|row| row.remove("script"));
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
+        method("getaddressbalance").reply(RpcReply::result(json!({ "balance": 7 }))),
+        method("getaddresstxids").reply(RpcReply::result(json!({ "txids": [] }))),
+        method("getaddressutxos").reply(RpcReply::result(json!([row_without_script]))),
+    ])?;
+    let source = regtest_source(server.url())?;
+    let lookup = regtest_lookup()?;
+
+    let errors = [
+        source
+            .fetch_transparent_address_balance(&lookup)
+            .await
+            .err(),
+        source
+            .fetch_transparent_address_transaction_ids(
+                &lookup,
+                BlockHeight::new(1),
+                BlockHeight::new(10),
+            )
+            .await
+            .err(),
+        source
+            .fetch_transparent_address_utxos(&lookup, BlockHeight::new(0))
+            .await
+            .err(),
+    ];
+
+    for error in errors {
+        let error = error.ok_or_else(|| eyre!("expected a protocol mismatch"))?;
+        assert!(
+            matches!(error, SourceError::SourceProtocolMismatch { .. }),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            SourceFailureClass::ProtocolMismatch
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre::Result<()> {
+    // Consecutive transport-class failures rebuild the client, which reads
+    // the cookie file again. A node that answers with another shape is
+    // reachable, so the client keeps its startup credentials.
+    const ATTEMPTS: usize = 8;
+    const STARTUP_AUTHORIZATION: &str = "Basic X19jb29raWVfXzpiZWZvcmUtcmVzdGFydA==";
+
+    let server = JsonRpcTestServer::start([
+        method("getaddressbalance").reply_with(|_| RpcReply::result(json!({ "balance": 7 })))
+    ])?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    std::fs::write(&cookie_path, "__cookie__:before-restart")?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::Cookie(CookieSource::File(cookie_path.clone())),
+        Duration::from_secs(5),
+    )?;
+    let lookup = regtest_lookup()?;
+    std::fs::write(&cookie_path, "__cookie__:after-restart")?;
+
+    for _ in 0..ATTEMPTS {
+        let balance = source.fetch_transparent_address_balance(&lookup).await;
+        assert!(balance.is_err(), "unexpected balance {balance:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let authorizations: Vec<Option<String>> = server
+        .requests()?
+        .into_iter()
+        .map(|request| request.authorization)
+        .collect();
+    assert_eq!(authorizations.len(), ATTEMPTS);
+    assert!(
+        authorizations
+            .iter()
+            .all(|authorization| authorization.as_deref() == Some(STARTUP_AUTHORIZATION)),
+        "an answer of another shape must not rebuild the client: {authorizations:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transparent_address_lookups_during_a_block_commit_are_view_changes() -> eyre::Result<()> {
+    // Zebra 7.1.0 and Zakura 1.8.6 answer -1 with these messages when their
+    // finalized state commits a block during the address index read.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
+        method("getaddressbalance").reply(RpcReply::error_with_code(
+            NODE_MISC_ERROR_CODE,
+            "unable to get balance: state was committing a block",
+        )),
+        method("getaddresstxids").reply(RpcReply::error_with_code(
+            NODE_MISC_ERROR_CODE,
+            "unable to get tx IDs: state was committing a block, that is missing from the \
+             non-finalized chain, and the query has multiple addresses",
+        )),
+        method("getaddressutxos").reply(RpcReply::error_with_code(
+            NODE_MISC_ERROR_CODE,
+            "unable to get UTXOs: state was committing a block, and non-finalized chain is empty",
+        )),
+    ])?;
+    let source = regtest_source(server.url())?;
+    let lookup = regtest_lookup()?;
+
+    let errors = [
+        (
+            "getaddressbalance",
+            source
+                .fetch_transparent_address_balance(&lookup)
+                .await
+                .err(),
+        ),
+        (
+            "getaddresstxids",
+            source
+                .fetch_transparent_address_transaction_ids(
+                    &lookup,
+                    BlockHeight::new(1),
+                    BlockHeight::new(10),
+                )
+                .await
+                .err(),
+        ),
+        (
+            "getaddressutxos",
+            source
+                .fetch_transparent_address_utxos(&lookup, BlockHeight::new(0))
+                .await
+                .err(),
+        ),
+    ];
+
+    for (expected_operation, error) in errors {
+        let error = error.ok_or_else(|| eyre!("expected a block-commit refusal"))?;
+        assert!(
+            matches!(
+                &error,
+                SourceError::BlockCommittedDuringRead { operation, .. }
+                    if *operation == expected_operation
+            ),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            SourceFailureClass::UpstreamViewChanged
+        );
+    }
     Ok(())
 }

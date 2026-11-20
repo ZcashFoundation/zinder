@@ -89,9 +89,10 @@ differently, and the source gives both the same result:
   request for a range that ends at genesis, which neither node indexes. It
   reads the tip again after the request and keeps the answer only when both
   reads name the same block, because a tip that fell below the range in
-  between makes the node answer with its new tip's transactions. After three
-  attempts whose tip changed, it reports `ChainTipChangedDuringFetch`, classed
-  `upstream_view_changed`.
+  between makes the node answer with its new tip's transactions. It treats a
+  refusal of the answer's size the same way, because that refusal may be for
+  the new tip's range. After three attempts whose tip changed, it reports
+  `ChainTipChangedDuringFetch`, classed `upstream_view_changed`.
 - **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
   `maxEntries` zero, the only value for which Zebra refuses a lookup over the
   row limit. With a positive `maxEntries`, Zebra returns that many outputs and
@@ -111,8 +112,21 @@ differently, and the source gives both the same result:
   `configuration`, because the same request to the same node fails the same
   way.
 
-Each unspent-output row must be in chain order and pay an address of the
-lookup. Any other row is reported as `SourceProtocolMismatch`.
+The source checks every unspent-output row the node returns, including the
+rows it drops below the start height or past a prefix. A row must name an
+address of the lookup and carry a P2PKH or P2SH script that pays that
+address, the address both nodes' indexes derive from the script. Rows must
+be in chain order: by height, with each transaction's outputs together and
+in increasing index order, so no outpoint repeats. Any other row is reported
+as `SourceProtocolMismatch`, as is an answer of another shape, such as a
+balance without `received`. That class is `protocol_mismatch`, not
+`node_unreachable`, so such an answer does not count toward the client
+rebuild described under [Authentication](#authentication).
+
+Both nodes refuse an address lookup with code -1 and a message containing
+`state was committing a block` when they commit a block while reading their
+index. The source reports that refusal as `BlockCommittedDuringRead`,
+classed `upstream_view_changed`, and the caller retries the same node.
 
 A Zakura node in pruned storage mode with checkpoint sync stops maintaining its
 transparent indexes and refuses `getaddressbalance`, `getaddresstxids`, and

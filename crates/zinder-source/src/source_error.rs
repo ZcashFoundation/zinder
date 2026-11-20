@@ -285,17 +285,33 @@ pub enum SourceError {
     ///
     /// The node bounds a `getaddresstxids` height range by the tip it sees
     /// when it answers. The source reads the tip before and after the
-    /// request and accepts the answer only when both reads name the same
-    /// block, because a tip that fell below the range in between makes the
-    /// node answer for its new tip instead. It is classed
-    /// [`SourceFailureClass::UpstreamViewChanged`], so the caller retries
-    /// against the node's fresh tip.
+    /// request and accepts the answer, or a refusal of its size, only when
+    /// both reads name the same block, because a tip that fell below the
+    /// range in between makes the node answer for its new tip instead. It is
+    /// classed [`SourceFailureClass::UpstreamViewChanged`], so the caller
+    /// retries against the node's fresh tip.
     #[error("chain tip changed during each of {attempts} {operation} attempts")]
     ChainTipChangedDuringFetch {
         /// Node method whose answer depends on the tip.
         operation: &'static str,
         /// Number of attempts made.
         attempts: u32,
+    },
+
+    /// The node committed a block while it read its address index, and
+    /// refused to answer from a mix of the old and new state.
+    ///
+    /// Zebra and Zakura refuse `getaddressbalance`, and some
+    /// `getaddresstxids` and `getaddressutxos` lookups, with an error that
+    /// says `state was committing a block`. The node is healthy, so it is
+    /// classed [`SourceFailureClass::UpstreamViewChanged`] and the caller
+    /// retries the same node.
+    #[error("node committed a block while answering {operation}: {reason}")]
+    BlockCommittedDuringRead {
+        /// Node method the node refused.
+        operation: &'static str,
+        /// Node error message.
+        reason: String,
     },
 
     /// The node responded but the requested block could not be returned.
@@ -623,6 +639,7 @@ impl SourceError {
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::ChainTipChangedDuringFetch { .. }
+            | Self::BlockCommittedDuringRead { .. }
             | Self::SubtreeRootsUnavailable { .. }
             | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
             Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {
