@@ -203,12 +203,11 @@ const TICKERS: [Ticker; 17] = [
     Ticker::ReadaheadTrimmed,
 ];
 
-const HISTOGRAMS: [Histogram; 6] = [
+const HISTOGRAMS: [Histogram; 5] = [
     Histogram::DbMultiget,
     Histogram::DbGet,
     Histogram::ReadBlockGetMicros,
     Histogram::SstReadMicros,
-    Histogram::FileReadGetMicros,
     Histogram::TableOpenIoMicros,
 ];
 

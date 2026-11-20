@@ -29,7 +29,7 @@ pub(crate) struct SubtreeArgs {
     #[arg(long)]
     start_index: Option<u32>,
     /// Maximum roots in the page, capped at the visible tree size.
-    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_SUBTREE_ROOTS_PER_REQUEST)))]
+    #[arg(long, default_value_t = MAX_SUBTREE_ROOTS_PER_REQUEST, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_SUBTREE_ROOTS_PER_REQUEST)))]
     max_entries: u32,
 }
 

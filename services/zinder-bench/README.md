@@ -689,7 +689,7 @@ mkdir -p .tmp/reads
 "$bench" rocksdb-compact-block-range "${store[@]}" \
   --secondary-root .tmp/reads/ranges --rocksdb-statistics-level full \
   --report .tmp/reads/ranges.json
-"$bench" rocksdb-subtree-roots "${store[@]}" --protocol orchard --max-entries 1000 \
+"$bench" rocksdb-subtree-roots "${store[@]}" --protocol orchard --max-entries 1024 \
   --secondary-root .tmp/reads/roots --report .tmp/reads/roots.json
 "$bench" rocksdb-store-properties "${store[@]}" \
   --secondary-root .tmp/reads/properties --report .tmp/reads/properties.json
