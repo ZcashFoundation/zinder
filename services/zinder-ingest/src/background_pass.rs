@@ -88,7 +88,7 @@ impl BackgroundSecondary<'_> {
     /// failed attempt logs `unavailable_event`.
     pub(crate) async fn open_when_published<Handle: BackgroundSecondaryHandle>(
         &self,
-        has_work: impl Fn() -> bool,
+        has_work: impl Fn() -> bool + Send + Sync,
         cancel: &CancellationToken,
         unavailable_event: &'static str,
     ) -> Option<Handle> {

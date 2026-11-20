@@ -339,7 +339,7 @@ pub(crate) async fn wait_until_historical_work_or_cancelled(
 }
 
 pub(crate) async fn wait_for_work_or_cancelled(
-    has_work: impl Fn() -> bool,
+    has_work: impl Fn() -> bool + Send,
     cancel: &CancellationToken,
 ) -> bool {
     loop {
