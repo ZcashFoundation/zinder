@@ -2,8 +2,8 @@ use eyre::{Result, ensure};
 use zinder_proto::compat::lightwalletd;
 
 pub(crate) fn assert_nullifier_range_matches(
-    zinder_blocks: Vec<lightwalletd::CompactBlock>,
-    reference_blocks: Vec<lightwalletd::CompactBlock>,
+    zinder_blocks: &[lightwalletd::CompactBlock],
+    reference_blocks: &[lightwalletd::CompactBlock],
 ) -> Result<()> {
     ensure!(
         zinder_blocks.len() == reference_blocks.len(),
@@ -11,21 +11,18 @@ pub(crate) fn assert_nullifier_range_matches(
         zinder_blocks.len(),
         reference_blocks.len()
     );
-    for (zinder, reference) in zinder_blocks.into_iter().zip(reference_blocks) {
+    for (zinder, reference) in zinder_blocks.iter().zip(reference_blocks) {
         assert_nullifier_compact_block_matches(zinder, reference)?;
     }
     Ok(())
 }
 
 pub(crate) fn assert_nullifier_compact_block_matches(
-    mut zinder: lightwalletd::CompactBlock,
-    mut reference: lightwalletd::CompactBlock,
+    zinder: &lightwalletd::CompactBlock,
+    reference: &lightwalletd::CompactBlock,
 ) -> Result<()> {
-    assert_nullifier_response_redacts_non_nullifier_payloads(&zinder)?;
-    assert_nullifier_response_redacts_non_nullifier_payloads(&reference)?;
-    // Go sends an empty chainMetadata message and Zinder omits it.
-    zinder.chain_metadata = None;
-    reference.chain_metadata = None;
+    assert_nullifier_response_redacts_non_nullifier_payloads(zinder)?;
+    assert_nullifier_response_redacts_non_nullifier_payloads(reference)?;
     ensure!(
         zinder == reference,
         "nullifier block differs at reference height {}",
@@ -38,8 +35,8 @@ fn assert_nullifier_response_redacts_non_nullifier_payloads(
     block: &lightwalletd::CompactBlock,
 ) -> Result<()> {
     ensure!(
-        block.chain_metadata.unwrap_or_default() == lightwalletd::ChainMetadata::default(),
-        "nullifier block includes tree sizes at height {}",
+        block.chain_metadata == Some(lightwalletd::ChainMetadata::default()),
+        "nullifier block requires present, zero-sized tree metadata at height {}",
         block.height
     );
     for tx in &block.vtx {
@@ -83,13 +80,19 @@ mod tests {
     }
 
     #[test]
-    fn accepts_omitted_and_zero_tree_sizes() -> eyre::Result<()> {
+    fn accepts_present_metadata_with_zero_tree_sizes() -> eyre::Result<()> {
+        assert_nullifier_compact_block_matches(&reference_block(), &reference_block())
+    }
+
+    #[test]
+    fn rejects_missing_metadata_even_when_both_blocks_omit_it() {
         let reference = reference_block();
         let zinder = lightwalletd::CompactBlock {
             chain_metadata: None,
             ..reference.clone()
         };
-        assert_nullifier_compact_block_matches(zinder, reference)
+        assert!(assert_nullifier_compact_block_matches(&zinder, &zinder).is_err());
+        assert!(assert_nullifier_compact_block_matches(&zinder, &reference).is_err());
     }
 
     #[test]
@@ -99,7 +102,7 @@ mod tests {
             vtx: Vec::new(),
             ..reference.clone()
         };
-        assert!(assert_nullifier_compact_block_matches(zinder, reference).is_err());
+        assert!(assert_nullifier_compact_block_matches(&zinder, &reference).is_err());
     }
 
     #[test]
@@ -107,12 +110,12 @@ mod tests {
         let reference = reference_block();
         let mut zinder = reference.clone();
         zinder.vtx[0].fee += 1;
-        assert!(assert_nullifier_compact_block_matches(zinder, reference).is_err());
+        assert!(assert_nullifier_compact_block_matches(&zinder, &reference).is_err());
     }
 
     #[test]
     fn rejects_missing_block() {
-        assert!(assert_nullifier_range_matches(Vec::new(), vec![reference_block()]).is_err());
+        assert!(assert_nullifier_range_matches(&[], &[reference_block()]).is_err());
     }
 
     #[test]
@@ -125,7 +128,7 @@ mod tests {
             }),
             ..reference.clone()
         };
-        assert!(assert_nullifier_compact_block_matches(zinder.clone(), reference.clone()).is_err());
-        assert!(assert_nullifier_compact_block_matches(reference, zinder).is_err());
+        assert!(assert_nullifier_compact_block_matches(&zinder, &zinder).is_err());
+        assert!(assert_nullifier_compact_block_matches(&reference, &zinder).is_err());
     }
 }

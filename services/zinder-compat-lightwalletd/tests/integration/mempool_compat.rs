@@ -257,6 +257,33 @@ async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_t
     Ok(())
 }
 
+#[tokio::test]
+async fn mempool_unknown_pool_values_select_only_recognized_components() -> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry(0xC1, synthetic_chain_epoch())?,
+        transparent_only_entry(0xC2, synthetic_chain_epoch())?,
+    ]);
+    let adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface));
+    let transparent = lightwalletd::PoolType::Transparent as i32;
+    for (pool_types, expected_ids) in [
+        (vec![], vec![vec![0xC1; 32]]),
+        (vec![-1, 99], vec![]),
+        (vec![99, transparent, transparent], vec![vec![0xC2; 32]]),
+    ] {
+        let stream = adapter
+            .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+                pool_types,
+                exclude_txid_suffixes: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(collect_compact_txids(stream).await?, expected_ids);
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_tx_drops_ironwood_entries_outside_requested_pool_types()
 -> eyre::Result<()> {

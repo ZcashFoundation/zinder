@@ -341,9 +341,8 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::for_range(&request.pool_types)?;
         self.block_methods
-            .block_range(&self.slot, &request, shape)
+            .block_range(&self.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
