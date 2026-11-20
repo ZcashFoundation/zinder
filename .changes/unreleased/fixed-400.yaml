@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallets can use RPC-order block hash bytes to look up a tree state. Unary nullifier responses retain transparent-only transaction IDs, and mempool suffix exclusions preserve transactions whose IDs also match in another pool.
+time: 2026-11-20T11:49:54.427988226Z
+custom:
+    Bump: patch
+    PR: "400"
