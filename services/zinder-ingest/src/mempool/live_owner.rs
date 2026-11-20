@@ -65,8 +65,8 @@ pub const DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES: u64 = 16_00
 /// One source generation buffered until its snapshot-complete marker.
 ///
 /// Staging keeps a reconnect's partial observations out of the durable event
-/// log. Until completion, a previously certified generation keeps answering
-/// reads at its own tip. At completion, the owner reconciles the staged set
+/// log. A previous certification can serve its own tip during the staging
+/// grace. At completion, the owner reconciles the staged set
 /// against the last durable/live set under the mutation gate, so no read
 /// observes a partially reconciled index.
 #[derive(Debug)]
@@ -508,8 +508,8 @@ impl LiveMempoolOwner {
     /// the transaction then could leave it in neither the canonical chain at
     /// the tip nor the mempool, so such a transition starts a replacement
     /// generation instead, exactly as a tip change does. The serving
-    /// generation keeps answering at its own tip until the replacement is
-    /// certified. Only a `Mined` transition for the tip block itself removes
+    /// generation can answer at its own tip during the staging grace.
+    /// Only a `Mined` transition for the tip block itself removes
     /// the entry.
     pub(crate) async fn apply_event(
         &self,
@@ -518,12 +518,11 @@ impl LiveMempoolOwner {
         observed_at: UnixTimestampMillis,
     ) -> Result<Option<GenerationOutran>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        let state = self.status.read().clone();
-        if state.follows_source() && self.staged_generation.lock().is_some() {
+        if self.status.read().follows_source() && self.staged_generation.lock().is_some() {
             self.stage_event_locked(event, observed_at)?;
             return Ok(None);
         }
-        let (source_tip, _) = state.serving_anchor()?;
+        let (source_tip, _) = self.status.read().serving_anchor()?;
         if let Some(observed_source_tip) =
             mined_block(&event).filter(|mined_block| *mined_block != source_tip)
         {
@@ -785,8 +784,7 @@ impl LiveMempoolOwner {
 
     /// Reconciles a complete source snapshot once its tip matches canonical
     /// ingest, or keeps the snapshot private while canonical ingest catches up.
-    /// A snapshot a staged `Mined` transition outran ends without certifying,
-    /// and a serving generation keeps answering throughout.
+    /// A snapshot a staged `Mined` transition outran ends without certifying.
     pub(crate) async fn try_complete_hydration(
         &self,
         canonical: &CanonicalControlHandle,
@@ -1399,8 +1397,7 @@ fn rebuild_after_source_closed() -> MempoolOwnerLoopOutcome {
 }
 
 /// Records a normal tip boundary. The next source generation stages behind
-/// the serving one, which keeps its certification until the replacement is
-/// certified.
+/// the serving one for the remainder of its staging grace.
 fn record_source_tip_change(
     generation_source_tip: zinder_core::BlockId,
     observed_source_tip: zinder_core::BlockId,
@@ -2513,7 +2510,7 @@ mod tests {
                     &zinder_store::EventStreamStartPosition::LiveTail,
                 )),
             });
-            request.set_timeout(Duration::from_secs(4));
+            request.set_timeout(Duration::from_secs(10));
             let open = adapter.mempool_events(request);
             tokio::pin!(open);
             assert!(futures_util::poll!(&mut open).is_pending());
@@ -2526,7 +2523,7 @@ mod tests {
             };
             assert!(futures_util::poll!(&mut open).is_pending());
             assert_eq!(commands.len(), usize::from(!hold_gate));
-            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::advance(Duration::from_secs(7)).await;
             let status = open.await.err().ok_or("stalled stream opened")?;
             assert_eq!(status.code(), Code::Unavailable);
             assert_eq!(

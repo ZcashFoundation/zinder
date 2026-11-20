@@ -87,15 +87,14 @@ impl CanonicalReadDeadline {
 
     fn from_timeouts(grpc: Option<Duration>, open: Option<Duration>) -> Self {
         // Reserve time for encoding, transport, and scheduling at the caller.
-        const REPLY_MARGIN: Duration = Duration::from_secs(1);
+        const MAX_REPLY_MARGIN: Duration = Duration::from_secs(1);
         let budget =
             grpc.into_iter()
                 .chain(open)
                 .min()
                 .map_or(CANONICAL_CONTROL_REPLY_TIMEOUT, |timeout| {
-                    timeout
-                        .saturating_sub(REPLY_MARGIN)
-                        .min(CANONICAL_CONTROL_REPLY_TIMEOUT)
+                    let margin = MAX_REPLY_MARGIN.min(timeout / 10);
+                    (timeout - margin).min(CANONICAL_CONTROL_REPLY_TIMEOUT)
                 });
         Self(tokio::time::Instant::now() + budget)
     }
@@ -1946,6 +1945,17 @@ pub(crate) mod test_support {
             );
         }
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_rpc_deadlines_leave_time_for_the_owner() {
+        let mut request = Request::new(());
+        request.set_timeout(Duration::from_millis(100));
+        let deadline = CanonicalReadDeadline::from_request(&request);
+        assert_eq!(
+            deadline.0 - tokio::time::Instant::now(),
+            Duration::from_millis(90)
+        );
     }
 
     #[test]
