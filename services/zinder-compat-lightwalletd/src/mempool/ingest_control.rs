@@ -8,8 +8,8 @@
 //! ## Connection lifecycle and fan-out
 //!
 //! Each [`IngestControlMempoolSurface`] instance dials a single HTTP/2 channel
-//! to the writer the first time a method is invoked, caches it in an
-//! [`Arc<OnceCell<_>>`], and reuses it for every subsequent
+//! to the writer the first time a method is invoked, caches it in a
+//! [`LazyZinderGrpcChannel`], and reuses it for every subsequent
 //! [`IngestControlMempoolSurface::mempool_snapshot_page`] /
 //! [`IngestControlMempoolSurface::mempool_events`] call. Tonic's `Channel`
 //! handles transparent HTTP/2 reconnect, so a transient writer outage does
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{OnceCell, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
@@ -50,7 +50,9 @@ use zinder_proto::{
     wire::TransactionAbsence,
 };
 use zinder_query::{WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, wallet_ingest_control_request};
-use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
+use zinder_runtime::{
+    AuthenticatedChannel, BearerToken, LazyZinderGrpcChannel, connect_zinder_grpc,
+};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
     mempool_entry_from_message, mempool_event_envelope_from_message,
@@ -72,12 +74,23 @@ type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel
 const TIP_PUBLISHER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Mempool read surface backed by an `IngestControl` gRPC endpoint.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IngestControlMempoolSurface {
     endpoint: String,
-    bearer_token: Option<BearerToken>,
-    channel: Arc<OnceCell<AuthenticatedChannel>>,
+    channel: LazyZinderGrpcChannel,
     request_timeout: Duration,
+}
+
+impl std::fmt::Debug for IngestControlMempoolSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The channel shows the endpoint with its credentials redacted, so the
+        // raw `endpoint` stays out.
+        formatter
+            .debug_struct("IngestControlMempoolSurface")
+            .field("channel", &self.channel)
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IngestControlMempoolSurface {
@@ -87,9 +100,8 @@ impl IngestControlMempoolSurface {
     #[must_use]
     pub fn new(endpoint: String) -> Self {
         Self {
+            channel: LazyZinderGrpcChannel::new(endpoint.clone(), None),
             endpoint,
-            bearer_token: None,
-            channel: Arc::new(OnceCell::new()),
             request_timeout: WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
         }
     }
@@ -99,39 +111,35 @@ impl IngestControlMempoolSurface {
     /// header by the underlying gRPC interceptor.
     #[must_use]
     pub fn with_bearer_token(mut self, bearer_token: BearerToken) -> Self {
-        self.bearer_token = Some(bearer_token);
+        self.channel = LazyZinderGrpcChannel::new(self.endpoint.clone(), Some(bearer_token));
         self
     }
 
     /// Returns an `IngestControl` client backed by the surface's cached
     /// HTTP/2 channel.
     ///
-    /// The first call dials the writer; subsequent calls reuse the cached
-    /// [`AuthenticatedChannel`] (cheap clone, transparent HTTP/2 reconnect).
+    /// The first calls share one dial to the writer; subsequent calls reuse
+    /// the cached [`AuthenticatedChannel`] (cheap clone, transparent HTTP/2
+    /// reconnect).
     async fn ingest_control_client(
         &self,
     ) -> Result<AuthenticatedIngestControlClient, MempoolSurfaceError> {
-        let endpoint = self.endpoint.clone();
-        let bearer_token = self.bearer_token.clone();
-        let channel = self
-            .channel
-            .get_or_try_init(|| async move {
-                connect_zinder_grpc(&endpoint, bearer_token.as_ref())
-                    .await
-                    .map_err(|error| MempoolSurfaceError::Unavailable {
-                        reason: error.to_string(),
-                    })
-            })
-            .await?;
-        Ok(IngestControlClient::new(channel.clone()))
+        let channel =
+            self.channel
+                .channel()
+                .await
+                .map_err(|error| MempoolSurfaceError::Unavailable {
+                    reason: error.to_string(),
+                })?;
+        Ok(IngestControlClient::new(channel))
     }
 
     /// Runs `operation` under the surface's request timeout.
     ///
-    /// The bound must cover [`Self::ingest_control_client`] as well as the
-    /// RPC: the first dial has no deadline of its own, and concurrent callers
-    /// wait on the same cell. A cancelled dial leaves the cell empty, so the
-    /// next call dials again.
+    /// The bound covers [`Self::ingest_control_client`] as well as the RPC.
+    /// Concurrent callers share one dial, which the transport's connect
+    /// timeout bounds, so whichever bound is shorter ends a caller's wait. A
+    /// failed dial leaves nothing cached, so the next call dials again.
     async fn bounded<T>(
         &self,
         operation_name: &str,
@@ -500,8 +508,28 @@ mod tests {
     use std::time::Instant;
 
     use tokio::net::TcpListener;
+    use zinder_runtime::DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT;
 
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_endpoint_credentials() -> Result<(), Box<dyn std::error::Error>> {
+        let surface = IngestControlMempoolSurface::new(
+            "https://reader:hunter2@ingest.internal:9100/?token=s3cret".to_owned(),
+        )
+        .with_bearer_token(<BearerToken as std::str::FromStr>::from_str(
+            "bearer-s3cret",
+        )?);
+
+        let debug = format!("{surface:?}");
+
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+        assert!(debug.contains("ingest.internal:9100"), "{debug}");
+        Ok(())
+    }
 
     /// A writer that accepts TCP but never answers HTTP/2 must not hold a
     /// mempool lookup past the request bound.
@@ -529,6 +557,67 @@ mod tests {
         assert!(
             elapsed >= request_timeout && elapsed < Duration::from_secs(2),
             "lookup took {elapsed:?}"
+        );
+        drop(listener);
+        Ok(())
+    }
+
+    /// A writer that accepts TCP but never completes the TLS handshake must
+    /// fail the first dial within the transport's connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn mempool_transaction_is_unavailable_when_the_dial_stalls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let surface =
+            IngestControlMempoolSurface::new(format!("https://{}", listener.local_addr()?));
+
+        let lookup = tokio::time::timeout(
+            DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
+            surface.mempool_transaction(TransactionId::from_bytes([7; 32])),
+        )
+        .await?;
+
+        let Err(MempoolSurfaceError::Unavailable { reason }) = lookup else {
+            return Err(format!("stalled dial must be unavailable, got {lookup:?}").into());
+        };
+        assert!(
+            reason.contains("dial did not complete"),
+            "unexpected reason: {reason}"
+        );
+        drop(listener);
+        Ok(())
+    }
+
+    /// Concurrent first lookups share one dial, so a stalled writer fails all
+    /// of them within one connect timeout instead of one timeout per caller.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_first_lookups_share_one_dial() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let surface =
+            IngestControlMempoolSurface::new(format!("https://{}", listener.local_addr()?));
+        let transaction_id = TransactionId::from_bytes([7; 32]);
+
+        let started_at = tokio::time::Instant::now();
+        let (first, second, third) = tokio::join!(
+            surface.mempool_transaction(transaction_id),
+            surface.mempool_transaction(transaction_id),
+            surface.mempool_transaction(transaction_id),
+        );
+        let elapsed = started_at.elapsed();
+
+        let lookups: [_; 3] = (first, second, third).into();
+        for lookup in lookups {
+            let Err(MempoolSurfaceError::Unavailable { reason }) = lookup else {
+                return Err(format!("stalled dial must be unavailable, got {lookup:?}").into());
+            };
+            assert!(
+                reason.contains("dial did not complete"),
+                "unexpected reason: {reason}"
+            );
+        }
+        assert!(
+            elapsed < DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
+            "lookups waited {elapsed:?}, longer than one dial"
         );
         drop(listener);
         Ok(())

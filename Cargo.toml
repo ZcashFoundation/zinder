@@ -65,6 +65,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] 
 rust-rocksdb = { version = "0.54.1", features = ["multi-threaded-cf"] }
 rustix = { version = "1.1.6", default-features = false, features = ["fs", "std"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.5"
 rustls-pki-types = { version = "1.16.0", default-features = false, features = ["alloc"] }
 secrecy = "0.10.3"
 secp256k1 = { version = "0.33.1", default-features = false }
@@ -82,6 +83,7 @@ tikv-jemallocator = { version = "0.7.0", features = ["unprefixed_malloc_on_suppo
 time = { version = "0.3.55", features = ["formatting"] }
 tokio = { version = "1.54.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 toml = "1.2.1"

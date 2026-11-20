@@ -263,12 +263,16 @@ async fn run_owned_projector(
     let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
         return Ok(());
     };
-    let mut canonical_control = CanonicalWriterControlClient::connect(
+    let Some(mut canonical_control) = CanonicalWriterControlClient::connect_at_startup(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
         config.projector_control.bearer_token.as_ref(),
+        &cancel,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
     let resumable_wallet = open_resumable_wallet(config, canonical.reorg_policy())?;
     let resumable_source = resumable_wallet
         .as_ref()

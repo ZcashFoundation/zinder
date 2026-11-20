@@ -421,3 +421,26 @@ and the Cipherscan adapter use one hardened HTTP/1 listener.
 
 The operational endpoint must stay private. `ops.listen_addr` sets its
 address, and an empty value disables it.
+
+### Dials between Zinder runtimes
+
+A runtime that calls another Zinder runtime, such as a reader dialing
+`ingest_control.addr` or the Cipherscan adapter dialing
+`cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must
+finish the name lookup, the TCP connect, and the TLS handshake and receive the
+peer's whole initial HTTP/2 `SETTINGS` frame within that time. A peer that
+opens with any other frame fails the dial at once. The dial sends no request,
+so a TLS-terminating proxy in front of the peer needs no route or credential
+for it. A reconnect that the open channel makes on its own gets the same 5
+seconds, from the name lookup until the peer's `SETTINGS` frame is complete, so
+a call that waits on it fails within that time when the peer stalls.
+
+| Caller | When a dial runs out of time |
+| --- | --- |
+| `zinder-projector` and `zinder-compat-cipherscan` at startup | The runtime logs `zinder_grpc_startup_dial_timed_out`, waits 1 second, and dials again until the peer answers or the runtime is stopped. A refused connection, a failed TLS handshake, or a peer that does not open with an HTTP/2 `SETTINGS` frame still ends startup. |
+| `zinder-query` and `zinder-compat-lightwalletd` dialing `ingest_control.addr` at startup | Startup fails with the connect timeout. |
+| Mempool reads in `zinder-compat-lightwalletd` and wallet reads in `zinder-explorer` | The request fails as unavailable, and the next request dials again. Requests that arrive during a dial wait for that dial. |
+
+The bound is not configurable.
+[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
+records this policy.

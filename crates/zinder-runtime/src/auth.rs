@@ -243,8 +243,10 @@ pub fn bearer_metadata(
 /// client type.
 pub type AuthenticatedChannel = InterceptedService<Channel, BearerTokenClientInterceptor>;
 
-/// Errors returned by [`crate::transport::connect_zinder_grpc`].
+/// Errors returned by [`crate::transport::connect_zinder_grpc`] and
+/// [`crate::transport::LazyZinderGrpcChannel::channel`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BearerTokenConnectError {
     /// The endpoint URL could not be parsed.
     #[error("zinder gRPC endpoint URL is invalid: {0}")]
@@ -252,6 +254,29 @@ pub enum BearerTokenConnectError {
     /// The transport could not connect to the endpoint.
     #[error("zinder gRPC transport connect failed: {0}")]
     Transport(#[source] tonic::transport::Error),
+    /// The dial did not complete within its connect timeout.
+    #[error("zinder gRPC dial did not complete within {connect_timeout:?}")]
+    ConnectTimeout {
+        /// Bound the dial was given.
+        connect_timeout: std::time::Duration,
+    },
+    /// A [`crate::transport::LazyZinderGrpcChannel`] dial ended without an
+    /// outcome, because the runtime running it shut down or the dial panicked.
+    #[error("zinder gRPC dial ended without an outcome")]
+    DialAbandoned,
+    /// The peer did not open the connection with an HTTP/2 `SETTINGS` frame,
+    /// so it does not serve HTTP/2.
+    #[error("zinder gRPC peer does not speak HTTP/2: {reason}")]
+    PeerNotHttp2 {
+        /// What the peer sent instead.
+        reason: String,
+    },
+    /// TLS for an `https` endpoint could not be set up.
+    #[error("zinder gRPC TLS setup failed: {reason}")]
+    TlsSetup {
+        /// Why the setup failed.
+        reason: String,
+    },
     /// The bearer token could not be encoded as gRPC metadata.
     #[error(transparent)]
     Token(#[from] BearerTokenError),

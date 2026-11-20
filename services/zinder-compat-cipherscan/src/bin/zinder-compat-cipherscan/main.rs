@@ -8,14 +8,15 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    HttpListenerLimits, Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
-    TracingSubscriberError, cancel_on_terminating_signal, connect_zinder_grpc,
-    install_tracing_subscriber, serve_http, spawn_ops_endpoint_for,
+    HttpListenerLimits, OpsEndpointHandle, Readiness, ReadinessCause, ReadinessState,
+    RuntimeService, StartupPhase, TracingSubscriberError, cancel_on_terminating_signal,
+    connect_zinder_grpc_at_startup, install_tracing_subscriber, serve_http, spawn_ops_endpoint_for,
 };
+use zinder_source::redact_endpoint_url;
 
 mod config;
 
-use config::{CipherscanConfigError, CipherscanConfigOverrides};
+use config::{CipherscanConfig, CipherscanConfigError, CipherscanConfigOverrides};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -127,16 +128,26 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     )
     .await?;
 
-    let explorer_channel = connect_zinder_grpc(
+    let cancel = CancellationToken::new();
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let Some(explorer_channel) = connect_zinder_grpc_at_startup(
         &cipherscan_config.explorer_query_endpoint,
         cipherscan_config.bearer_token.as_ref(),
+        &cancel,
     )
-    .await?;
-    let wallet_channel = connect_zinder_grpc(
+    .await?
+    else {
+        return shut_down_ops_endpoint(ops_handle).await;
+    };
+    let Some(wallet_channel) = connect_zinder_grpc_at_startup(
         &cipherscan_config.wallet_query_endpoint,
         cipherscan_config.bearer_token.as_ref(),
+        &cancel,
     )
-    .await?;
+    .await?
+    else {
+        return shut_down_ops_endpoint(ops_handle).await;
+    };
     let listener = TcpListener::bind(cipherscan_config.listen_addr)
         .await
         .map_err(|source| CipherscanConfigError::Bind {
@@ -144,8 +155,6 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
             source,
         })?;
 
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let adapter = CipherscanRestAdapter::new(
         cipherscan_config.network,
         explorer_channel,
@@ -159,17 +168,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::ready(None));
 
-    tracing::info!(
-        target: "zinder::compat::cipherscan",
-        event = "cipherscan_adapter_started",
-        network = encode_zinder_native_chain_name(cipherscan_config.network),
-        listen_addr = %cipherscan_config.listen_addr,
-        explorer_query_endpoint = %cipherscan_config.explorer_query_endpoint,
-        wallet_query_endpoint = %cipherscan_config.wallet_query_endpoint,
-        current_price_endpoint = %cipherscan_config.market_price_endpoints.current,
-        historical_price_endpoint_template = %cipherscan_config.market_price_endpoints.historical_template,
-        "Cipherscan-compatible REST adapter started"
-    );
+    log_adapter_started(&cipherscan_config);
 
     let serve_result = serve_http(
         listener,
@@ -186,10 +185,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         "Cipherscan-compatible REST adapter stopped"
     );
 
-    let ops_shutdown_result = match ops_handle {
-        Some(handle) => handle.shutdown().await,
-        None => Ok(()),
-    };
+    let ops_shutdown_result = shut_down_ops_endpoint(ops_handle).await;
 
     match serve_result {
         Err(error) => {
@@ -203,7 +199,33 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
             }
             Err(CipherscanConfigError::Serve(error))
         }
-        Ok(()) => ops_shutdown_result.map_err(CipherscanConfigError::from),
+        Ok(()) => ops_shutdown_result,
+    }
+}
+
+/// Logs the adapter's start. Endpoint URLs are redacted, because their user
+/// information or query may carry a credential.
+fn log_adapter_started(cipherscan_config: &CipherscanConfig) {
+    let market_price_endpoints = &cipherscan_config.market_price_endpoints;
+    tracing::info!(
+        target: "zinder::compat::cipherscan",
+        event = "cipherscan_adapter_started",
+        network = encode_zinder_native_chain_name(cipherscan_config.network),
+        listen_addr = %cipherscan_config.listen_addr,
+        explorer_query_endpoint = %redact_endpoint_url(&cipherscan_config.explorer_query_endpoint),
+        wallet_query_endpoint = %redact_endpoint_url(&cipherscan_config.wallet_query_endpoint),
+        current_price_endpoint = %redact_endpoint_url(market_price_endpoints.current.as_str()),
+        historical_price_endpoint_template = %redact_endpoint_url(&market_price_endpoints.historical_template),
+        "Cipherscan-compatible REST adapter started"
+    );
+}
+
+async fn shut_down_ops_endpoint(
+    ops_handle: Option<OpsEndpointHandle>,
+) -> Result<(), CipherscanConfigError> {
+    match ops_handle {
+        Some(handle) => handle.shutdown().await.map_err(CipherscanConfigError::from),
+        None => Ok(()),
     }
 }
 
@@ -249,9 +271,53 @@ impl From<Cli> for CipherscanConfigOverrides {
 #[cfg(test)]
 mod tests {
     use tokio_util::sync::CancellationToken;
+    use zinder_compat_cipherscan::CipherscanMarketPriceEndpoints;
+    use zinder_core::Network;
     use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
+    use zinder_testkit::log_capture::LogCapture;
 
-    use super::drain_readiness_on_cancel;
+    use super::{CipherscanConfig, drain_readiness_on_cancel, log_adapter_started};
+
+    #[test]
+    fn the_started_event_redacts_endpoint_credentials() -> Result<(), Box<dyn std::error::Error>> {
+        let cipherscan_config = CipherscanConfig {
+            network: Network::ZcashRegtest,
+            listen_addr: "127.0.0.1:9070".parse()?,
+            ops_listen_addr: None,
+            allow_public_bind: false,
+            explorer_query_endpoint: "http://reader:hunter2@127.0.0.1:9068/?token=s3cret"
+                .to_owned(),
+            wallet_query_endpoint: "http://reader:hunter2@127.0.0.1:9102/?token=s3cret".to_owned(),
+            market_price_endpoints: CipherscanMarketPriceEndpoints::new(
+                reqwest::Url::parse("https://prices.test/simple?api_key=s3cret")?,
+                "https://prices.test/history?date={date}&api_key=s3cret".to_owned(),
+            )?,
+            bearer_token_path: None,
+            bearer_token: None,
+        };
+        let capture = LogCapture::install_for_target("zinder::compat::cipherscan");
+
+        log_adapter_started(&cipherscan_config);
+
+        let events = capture.events();
+        let started = events
+            .iter()
+            .find(|event| event.field("event") == Some("cipherscan_adapter_started"))
+            .ok_or("the started event must be logged")?;
+        for (field, logged) in &started.fields {
+            assert!(
+                !logged.contains("hunter2") && !logged.contains("s3cret"),
+                "{field} carries a credential: {logged}"
+            );
+        }
+        assert!(
+            started
+                .field("explorer_query_endpoint")
+                .is_some_and(|endpoint| endpoint.contains("127.0.0.1:9068")),
+            "{started:?}"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cancellation_drains_readiness_before_server_shutdown() {

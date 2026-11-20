@@ -6,16 +6,14 @@
 //! activity, value pools) compose them through a `WalletQuery` channel.
 //!
 //! The adapter holds a single cached `WalletQuery` channel and reuses it
-//! across requests. The first request that needs the channel pays the
-//! handshake cost; later requests just clone the cached
-//! [`AuthenticatedChannel`] (a `tonic` `Channel` is internally pooled and
-//! clone-cheap) so the explorer never opens one HTTP/2 connection per
-//! request.
+//! across requests. The first requests that need the channel share one dial;
+//! later requests just clone the cached [`AuthenticatedChannel`] (a `tonic`
+//! `Channel` is internally pooled and clone-cheap) so the explorer never
+//! opens one HTTP/2 connection per request.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
@@ -63,7 +61,7 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, BearerTokenServerInterceptor,
-    RepeatedFieldGuard, RpcMetricNames, RpcOutcome, connect_zinder_grpc, describe_rpc_metrics,
+    LazyZinderGrpcChannel, RepeatedFieldGuard, RpcMetricNames, RpcOutcome, describe_rpc_metrics,
     record_rpc_request,
 };
 use zinder_source::NodeSource;
@@ -146,7 +144,7 @@ pub struct ExplorerQueryGrpcAdapter {
     transaction_history_materialized_view_reader:
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: NetworkUpgradeActivationsCache,
-    wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
+    wallet_channel: Option<LazyZinderGrpcChannel>,
     prevout_resolution_online: bool,
     upstream_observation_cache: UpstreamObservationCache,
 }
@@ -163,7 +161,7 @@ impl ExplorerQueryGrpcAdapter {
             materialized_view_store: None,
             transaction_history_materialized_view_reader: None,
             network_upgrade_activations: NetworkUpgradeActivationsCache::new(settings.network),
-            wallet_channel: Arc::new(OnceCell::new()),
+            wallet_channel: None,
             prevout_resolution_online: false,
             upstream_observation_cache: UpstreamObservationCache::empty(),
         }
@@ -187,6 +185,7 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn with_wallet_query_endpoint(mut self, endpoint: String) -> Self {
         self.wallet_query_endpoint = Some(endpoint);
+        self.reset_wallet_channel();
         self
     }
 
@@ -194,7 +193,14 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn with_wallet_query_bearer_token(mut self, bearer_token: BearerToken) -> Self {
         self.wallet_query_bearer_token = Some(bearer_token);
+        self.reset_wallet_channel();
         self
+    }
+
+    fn reset_wallet_channel(&mut self) {
+        self.wallet_channel = self.wallet_query_endpoint.clone().map(|endpoint| {
+            LazyZinderGrpcChannel::new(endpoint, self.wallet_query_bearer_token.clone())
+        });
     }
 
     /// Wires a shared-secret bearer token into the explorer-query adapter.
@@ -1380,8 +1386,11 @@ impl ExplorerQueryGrpcAdapter {
         Ok(materialized_view_store)
     }
 
-    fn require_wallet_endpoint(&self, method: &'static str) -> Result<&str, Status> {
-        self.wallet_query_endpoint.as_deref().ok_or_else(|| {
+    fn require_wallet_channel(
+        &self,
+        method: &'static str,
+    ) -> Result<&LazyZinderGrpcChannel, Status> {
+        self.wallet_channel.as_ref().ok_or_else(|| {
             ExplorerError::dependency_not_configured(format!(
                 "{method} requires a wallet_query_endpoint; configure \
                  --wallet-query-endpoint"
@@ -1393,24 +1402,19 @@ impl ExplorerQueryGrpcAdapter {
     /// Returns a `WalletQueryClient` that shares one cached HTTP/2 channel
     /// across every request handled by this adapter.
     ///
-    /// The first call pays the dial cost; subsequent calls clone the cached
+    /// The first calls share one dial; subsequent calls clone the cached
     /// channel, which is `tonic::transport::Channel` internally (cheap clone,
     /// transparent HTTP/2 reconnect).
     async fn wallet_client(
         &self,
         method: &'static str,
     ) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
-        let endpoint = self.require_wallet_endpoint(method)?;
-        let token = self.wallet_query_bearer_token.clone();
         let channel = self
-            .wallet_channel
-            .get_or_try_init(|| async {
-                connect_zinder_grpc(endpoint, token.as_ref())
-                    .await
-                    .map_err(connect_error_to_status)
-            })
-            .await?;
-        Ok(WalletQueryClient::new(channel.clone()))
+            .require_wallet_channel(method)?
+            .channel()
+            .await
+            .map_err(|error| connect_error_to_status(&error))?;
+        Ok(WalletQueryClient::new(channel))
     }
 }
 
@@ -1425,11 +1429,7 @@ fn canonical_store_unavailable(method: &'static str) -> Status {
     .into()
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "BearerTokenConnectError is moved out of the Result by the caller; the helper takes ownership"
-)]
-fn connect_error_to_status(error: BearerTokenConnectError) -> Status {
+fn connect_error_to_status(error: &BearerTokenConnectError) -> Status {
     ExplorerError::upstream_unreachable(format!("WalletQuery endpoint unreachable: {error}")).into()
 }
 
@@ -1510,6 +1510,38 @@ mod tests {
     use zinder_store::RocksDbResourceBudget;
 
     use super::*;
+
+    /// Concurrent first requests share one `WalletQuery` dial, so a stalled
+    /// peer fails all of them within one connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_first_wallet_requests_share_one_dial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The listener's backlog accepts the TCP connection, but nothing
+        // answers the TLS handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_wallet_query_endpoint(format!("https://{}", listener.local_addr()?));
+
+        let started_at = tokio::time::Instant::now();
+        let (first, second, third) = tokio::join!(
+            adapter.wallet_client("TransactionDetail"),
+            adapter.wallet_client("TransactionDetail"),
+            adapter.wallet_client("TransactionDetail"),
+        );
+        let elapsed = started_at.elapsed();
+
+        let outcomes: [_; 3] = (first, second, third).into();
+        for outcome in outcomes {
+            let status = outcome.err().ok_or("a stalled dial must fail")?;
+            assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        }
+        assert!(
+            elapsed < zinder_runtime::DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT + Duration::from_secs(1),
+            "requests waited {elapsed:?}, longer than one dial"
+        );
+        drop(listener);
+        Ok(())
+    }
 
     /// Methods that read canonical-store facts the explorer runtime does not serve.
     async fn canonical_fact_method_outcomes(

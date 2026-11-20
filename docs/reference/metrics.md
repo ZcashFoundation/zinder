@@ -434,8 +434,9 @@ configuration, with `RUST_LOG="<value>" is not a valid log filter`.
 Each log event carries an `event` field and a tracing target such as
 `zinder::ingest`. Automate on those fields, not on message text. Events carry
 bounded values only: heights, epochs, sequence numbers, durations, and labels.
-Events that name a node endpoint use its `position`, and events that carry a
-node URL redact its credentials.
+Events that name a node endpoint use its `position`, and events that carry an
+endpoint URL, such as a node's or another Zinder runtime's, redact its user
+information and query.
 
 | Event | Runtime | Meaning |
 | --- | --- | --- |
