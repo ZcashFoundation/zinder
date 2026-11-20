@@ -70,13 +70,13 @@ pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The tonic router type that [`SupervisedRuntime::public_grpc_router`]
 /// returns.
-pub type SupervisedGrpcRouter = tonic::transport::server::Router<
+pub type SupervisedGrpcRouter<L = Identity> = tonic::transport::server::Router<
     Stack<
         Stack<
             GrpcSendStallLayer,
             Stack<GrpcReceiveLimitLayer, Stack<GrpcCallTerminationLayer, Identity>>,
         >,
-        Identity,
+        L,
     >,
 >;
 
@@ -196,15 +196,51 @@ impl SupervisedRuntime {
             + 'static,
         S::Future: Send + 'static,
     {
-        supervised_wallet_router(
+        self.public_grpc_router_with_transport(
+            (wallet_service, wallet_descriptor_set),
+            client_address,
+            readiness,
+            std::convert::identity,
+        )
+    }
+
+    /// Builds the same supervised wallet router with an outer transport adapter.
+    /// Pass the wallet service with its reflection descriptor set.
+    /// The adapter translates incoming requests before the supervisor and receive
+    /// limits inspect native gRPC frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reflection cannot describe the wallet service.
+    pub fn public_grpc_router_with_transport<S, L>(
+        &self,
+        (wallet_service, descriptor_set): (S, &'static [u8]),
+        client_address: ClientAddressSource,
+        readiness: &Readiness,
+        transport: impl FnOnce(tonic::transport::Server) -> tonic::transport::Server<L>,
+    ) -> Result<SupervisedGrpcRouter<L>, tonic_reflection::server::Error>
+    where
+        L: Clone,
+        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
+            + NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let server = transport(crate::public_grpc_server::public_grpc_transport()).layer(
             supervised_grpc_layers(
                 Arc::clone(&self.open_calls),
                 GrpcReceiveLimits::default(),
                 DEFAULT_GRPC_SEND_STALL_TIMEOUT,
                 client_address,
             ),
+        );
+        supervised_wallet_router(
+            server,
             wallet_service,
-            wallet_descriptor_set,
+            descriptor_set,
             readiness,
             &self.stopping,
         )

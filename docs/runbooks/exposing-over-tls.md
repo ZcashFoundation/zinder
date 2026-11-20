@@ -222,6 +222,23 @@ connections apart, not addresses, so only a per-client connection limit at
 the proxy stops one client from spreading its requests over many
 connections.
 
+## Enable browser wallets
+
+On the compatibility runtime, set the origins of the wallet sites you serve. To get the exact value, open the wallet page and read `location.origin` in the browser console. For example:
+
+```toml
+[compat]
+browser_origins = ["https://wallet.example.org"]
+```
+
+Restart compatibility and give the wallet developer your public lightwalletd URL. Use the default `wallet` serving mode for a wallet that syncs. The stock Caddy configuration forwards gRPC-Web to the same port as native gRPC. A local development wallet can use the loopback endpoint directly, with its exact development origin in the list, such as `http://localhost:5173`.
+
+To verify, open the wallet at an allowed origin, select your endpoint, and start a sync. In the browser network panel, check that cross-origin preflight succeeds and the wallet sends `GetBlockRange` to your hostname. Confirm that its scanned height advances.
+
+If preflight fails, check the private compatibility `/readyz` first. Caddy checks readiness even for `OPTIONS`, and a browser can report the proxy's refusal as a CORS error. Once the reader is ready, compare the request's `Origin` with the configured value, including its port. If only block reads work, check the serving mode.
+
+The origin list controls browser access. Keep authentication and per-client limits at the public proxy. See [Configuration](../reference/configuration.md) for the environment setting and the explicit wildcard for public wallet endpoints.
+
 ## Expose the native endpoint too
 
 To expose the native `WalletQuery` endpoint as well, add a second site block

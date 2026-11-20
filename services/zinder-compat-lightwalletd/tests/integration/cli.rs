@@ -44,6 +44,7 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     assert!(stdout.contains("name = \"zcash-regtest\""), "{stdout}");
     assert!(stdout.contains("[compat]"), "{stdout}");
     assert!(stdout.contains("serving = \"wallet\""), "{stdout}");
+    assert!(stdout.contains("browser_origins = []"), "{stdout}");
     assert!(stdout.contains("reorg_window_blocks = 100"), "{stdout}");
     assert!(
         stdout.contains("pair_convergence_attempts = 12"),
@@ -109,6 +110,90 @@ fn compact_blocks_print_config_omits_wallet_configuration() -> eyre::Result<()> 
     assert!(stdout.contains("serving = \"compact-blocks\""), "{stdout}");
     assert!(!stdout.contains("[wallet]"), "{stdout}");
     assert!(!stdout.contains("wallet.path"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn browser_origins_read_the_file_and_honor_environment_overrides() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compat.toml");
+    let config = compact_blocks_config_toml(
+        &temporary.path().join("store"),
+        &temporary.path().join("secondary"),
+    )?;
+    fs::write(
+        &config_path,
+        format!(
+            "{config}browser_origins = [\"https://wallet.example\", \"http://localhost:5173\"]\n"
+        ),
+    )?;
+    let expected_file: &[&str] = &["https://wallet.example", "http://localhost:5173"];
+    for (environment, expected) in [
+        (None, expected_file),
+        (
+            Some("HTTPS://Wallet.Example:443/"),
+            &["https://wallet.example"],
+        ),
+        (
+            Some("http://[::1]:5173, https://wallet.example"),
+            &["http://[::1]:5173", "https://wallet.example"],
+        ),
+        (Some("*"), &["*"][..]),
+        (Some(""), &[][..]),
+    ] {
+        let mut command = zinder_compat_command();
+        command
+            .args(["--print-config", "--config"])
+            .arg(&config_path);
+        if let Some(environment) = environment {
+            command.env("ZINDER_COMPAT__BROWSER_ORIGINS", environment);
+        }
+        let output = command.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let printed: toml::Table = toml::from_str(&String::from_utf8(output.stdout)?)?;
+        assert_eq!(
+            printed["compat"]["browser_origins"],
+            toml::Value::try_from(expected)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn browser_origins_reject_invalid_or_ambiguous_configuration_without_echoing_credentials()
+-> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compat.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(
+            &temporary.path().join("store"),
+            &temporary.path().join("secondary"),
+        )?,
+    )?;
+    for invalid in [
+        "null",
+        "file:///wallet",
+        "https://wallet.example/path",
+        "https://wallet.example/path/..",
+        "https://wallet.example?query",
+        "https://wallet.example#fragment",
+        "https://*.example",
+        "https://%2a.example",
+        "https://wallet.example,*",
+        "https://user:private-password@wallet.example",
+        "https://wallet.example,",
+    ] {
+        let output = zinder_compat_command()
+            .args(["--print-config", "--config"])
+            .arg(&config_path)
+            .env("ZINDER_COMPAT__BROWSER_ORIGINS", invalid)
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("compat.browser_origins"), "{stderr}");
+        assert!(!stderr.contains("private-password"), "{stderr}");
+    }
     Ok(())
 }
 

@@ -4813,6 +4813,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-web"
+version = "0.14.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c7492987fadf7b27005a4597c977ffa51907a146621273bda37e231aff406"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "http-body",
+ "pin-project",
+ "tokio-stream",
+ "tonic",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4842,6 +4860,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "mime",
  "pin-project-lite",
  "tower",
  "tower-layer",
@@ -6076,14 +6095,17 @@ version = "0.19.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "clap",
  "config",
  "eyre",
  "hex",
+ "http",
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot 0.13.0",
  "prost",
+ "reqwest",
  "rust-rocksdb",
  "secrecy",
  "serde",
@@ -6099,7 +6121,11 @@ dependencies = [
  "tonic-health",
  "tonic-reflection",
  "tonic-types",
+ "tonic-web",
+ "tower",
+ "tower-http",
  "tracing",
+ "url",
  "zcash_address",
  "zcash_protocol",
  "zebra-chain",

@@ -203,7 +203,7 @@ pub(crate) fn supervised_grpc_layers(
 }
 
 /// The HTTP/2 transport policy every public listener shares.
-fn public_grpc_transport() -> Server {
+pub(crate) fn public_grpc_transport() -> Server {
     Server::builder()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
@@ -213,17 +213,16 @@ fn public_grpc_transport() -> Server {
 /// Assembles a supervised wallet listener that serves `wallet_service`
 /// behind the traffic gate, and reflection and health outside it.
 ///
-/// `layers`, from [`supervised_grpc_layers`], apply to every call the
-/// listener serves, and open health `Watch` streams end once `drain` is
-/// cancelled.
-pub(crate) fn supervised_wallet_router<S>(
-    layers: SupervisedGrpcLayers,
+/// Open health `Watch` streams end once `drain` is cancelled.
+pub(crate) fn supervised_wallet_router<S, L>(
+    mut server: Server<L>,
     wallet_service: S,
     wallet_descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
-) -> Result<Router<Stack<SupervisedGrpcLayers, Identity>>, tonic_reflection::server::Error>
+) -> Result<Router<L>, tonic_reflection::server::Error>
 where
+    L: Clone,
     S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
         + NamedService
         + Clone
@@ -239,8 +238,7 @@ where
         wallet_service,
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
-    Ok(public_grpc_transport()
-        .layer(layers)
+    Ok(server
         .add_service(gated_wallet_service)
         .add_service(reflection)
         .add_service(health))
