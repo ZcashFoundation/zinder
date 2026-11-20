@@ -1054,6 +1054,9 @@ identity, the workload's constants, and, over all wallets:
   state reads are also split by `height_band`, the first height of the
   250,000-block band that holds the requested height, in
   `tree_state_stored_reads_by_band` and `tree_state_replayed_reads_by_band`.
+  `tree_state_reconstructions` counts replayed reads on servers that report
+  reads by source. Older servers record the replayed-blocks histogram only
+  for rebuilds, so the report uses its observation count on those servers.
   `receive_evictions` counts requests that lost their receive slot to a
   client holding fewer, and `receive_pools` describes each receive pool of
   the server's public gRPC listener: the requests it admitted, refused, and
