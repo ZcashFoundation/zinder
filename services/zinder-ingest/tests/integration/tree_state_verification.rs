@@ -233,7 +233,7 @@ async fn damage_is_reported_before_its_record_is_written() -> eyre::Result<()> {
     let drained = tokio::task::spawn_blocking(move || std::fs::read(&staged_path)).await??;
     // A FIFO cannot be synced, so that write fails; the next one writes a
     // file once the FIFO is gone.
-    std::fs::remove_file(&staged)?;
+    let _retired = retire_fifo(&staged)?;
     tokio::time::timeout(PASS_DEADLINE, task)
         .await
         .map_err(|_| eyre::eyre!("the pass must end once its record is written"))??;
@@ -270,7 +270,7 @@ async fn a_failed_damage_record_is_written_again_until_it_succeeds() -> eyre::Re
     let retrying = !task.is_finished();
     let reported_while_unwritten =
         store_damage.current() == Some(damaged_row()) && !store.watermark_path().exists();
-    std::fs::remove_file(&staged)?;
+    let _retired = retire_fifo(&staged)?;
     tokio::time::timeout(PASS_DEADLINE, task)
         .await
         .map_err(|_| eyre::eyre!("the pass must end once its record is written"))??;
@@ -375,6 +375,23 @@ async fn an_unreadable_record_over_a_damaged_row_reports_that_row() -> eyre::Res
     eyre::ensure!(closed_gate.readiness().admission_state().cause == damaged_cause());
     eyre::ensure!(store.watermark()? == damaged_row_record(&store));
     Ok(())
+}
+
+/// Removes the FIFO at `staged`, so the next write of the record creates a
+/// file, and returns a handle that keeps a write already waiting on the FIFO
+/// from waiting forever.
+///
+/// A write that opened the FIFO before it was removed waits for a reader, so
+/// the handle opens it for reading and writing, which never blocks, before
+/// removing it. That write then fails to sync, and the retry after it writes
+/// the file.
+fn retire_fifo(staged: &Path) -> eyre::Result<std::fs::File> {
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged)?;
+    std::fs::remove_file(staged)?;
+    Ok(reader)
 }
 
 /// A gate whose historical work never opens.
