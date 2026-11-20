@@ -193,9 +193,8 @@ impl RunObservation {
     /// A failed read keeps the run's results, because the wallets' work is
     /// already done and would otherwise be lost.
     pub(super) async fn finish(self) -> (Option<ServerObserved>, Option<String>) {
-        match scrape(&self.url).await {
-            Ok(after) => {
-                let held_slots = self.held_slots.finish(&after).await;
+        match self.held_slots.finish(&self.url).await {
+            Ok((after, held_slots)) => {
                 match ServerObserved::between(&self.before, &after, &held_slots) {
                     Ok(observed) => (Some(observed), None),
                     Err(reason) => (None, Some(reason)),
@@ -237,23 +236,22 @@ impl HeldSlotsTimeline {
 
     /// The slots `pool` held on average from the first read to the last.
     ///
-    /// Between two reads, the pool counts as holding the mean of both, so
-    /// the result never exceeds the most slots any read found.
+    /// Between two reads, the pool counts as holding the mean of both. The
+    /// result weighs each span by the time it covers, so it never exceeds
+    /// the most slots any read found.
     fn mean(&self, pool: &str) -> f64 {
         let held = |reading: &HeldSlotsReading| reading.by_pool.get(pool).copied().unwrap_or(0.0);
-        let slot_seconds = self
+        let (slot_seconds, observed) = self
             .readings
             .iter()
             .zip(self.readings.iter().skip(1))
             .map(|(earlier, later)| {
-                later.at.saturating_sub(earlier.at).as_secs_f64()
-                    * f64::midpoint(held(earlier), held(later))
+                let span = later.at.saturating_sub(earlier.at).as_secs_f64();
+                (span * f64::midpoint(held(earlier), held(later)), span)
             })
-            .sum::<f64>();
-        let observed = match (self.readings.first(), self.readings.last()) {
-            (Some(first), Some(last)) => last.at.saturating_sub(first.at).as_secs_f64(),
-            _ => 0.0,
-        };
+            .fold((0.0, 0.0), |(slot_seconds, observed), (held_for, span)| {
+                (slot_seconds + held_for, observed + span)
+            });
         if observed > 0.0 {
             slot_seconds / observed
         } else {
@@ -291,16 +289,18 @@ impl HeldSlotsSampler {
         }
     }
 
-    /// Stops reading and returns the reads, with `after`, the scrape just
-    /// taken, as the last.
-    async fn finish(self, after: &[MetricSample]) -> HeldSlotsTimeline {
-        let at = self.started.elapsed();
+    /// Stops reading, then scrapes `url` once more and returns that scrape
+    /// with the reads, the scrape as the last.
+    ///
+    /// The reader stops before the closing scrape starts, so no read shows
+    /// the server after that scrape or lands later in the timeline.
+    async fn finish(self, url: &str) -> Result<(Vec<MetricSample>, HeldSlotsTimeline), String> {
         self.reader.abort();
-        // Once the reader has stopped, no read can land after `after`.
         let _ = self.reader.await;
+        let after = scrape(url).await?;
         let mut timeline = std::mem::take(&mut *self.timeline.lock());
-        timeline.record(at, after);
-        timeline
+        timeline.record(self.started.elapsed(), &after);
+        Ok((after, timeline))
     }
 }
 
@@ -687,9 +687,16 @@ mod tests {
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpListener,
     };
-    use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples};
+    use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name};
 
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use super::{
         HeldSlotsSampler, HeldSlotsTimeline, RunObservation, ServerObserved, scrape, scrape_within,
@@ -923,6 +930,74 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mean_slots_held_never_exceeds_the_most_slots_any_read_found() {
+        // A read that lands just after the closing one leaves the timeline
+        // out of order. The pool is full at every read.
+        let mut held_slots = HeldSlotsTimeline::default();
+        held_slots.record(Duration::ZERO, &held_in_request_pool(32));
+        held_slots.record(RUN + Duration::from_millis(1), &held_in_request_pool(32));
+        held_slots.record(RUN, &held_in_request_pool(32));
+
+        let mean = held_slots.mean("request");
+
+        assert!((mean - 32.0).abs() < 1e-9, "{mean}");
+    }
+
+    #[tokio::test]
+    async fn the_sampler_stops_reading_before_its_closing_scrape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\n\r\n\
+            zinder_grpc_request_receive_slots_held{pool=\"request\"} 8\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/metrics", listener.local_addr()?);
+        let (first_read_answered, answered) = tokio::sync::oneshot::channel();
+        let later_requests = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let later_requests = Arc::clone(&later_requests);
+            async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0_u8; 512];
+                let _ = socket.read(&mut request).await?;
+                socket.write_all(RESPONSE).await?;
+                drop(socket);
+                let _ = first_read_answered.send(());
+                // Every later answer takes longer than a read interval, so
+                // a reader still running during the closing scrape reads too.
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    later_requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut request = [0_u8; 512];
+                        let _ = socket.read(&mut request).await;
+                        tokio::time::sleep(super::HELD_SLOTS_READ_INTERVAL * 2).await;
+                        let _ = socket.write_all(RESPONSE).await;
+                    });
+                }
+                Ok::<_, std::io::Error>(())
+            }
+        });
+
+        let sampler = HeldSlotsSampler::start(&url, &held_in_request_pool(0));
+        answered.await?;
+        let (after, held_slots) = sampler.finish(&url).await?;
+        server.abort();
+
+        assert_eq!(
+            later_requests.load(Ordering::SeqCst),
+            1,
+            "only the closing scrape reaches the server once it starts"
+        );
+        assert!((sum_by_name(&after, super::RECEIVE_SLOTS_HELD) - 8.0).abs() < 1e-9);
+        assert!(
+            held_slots
+                .readings
+                .windows(2)
+                .all(|pair| pair[0].at <= pair[1].at),
+            "{held_slots:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_sampler_reads_held_slots_until_the_run_ends()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -943,7 +1018,7 @@ mod tests {
 
         let sampler = HeldSlotsSampler::start(&url, &held_in_request_pool(0));
         tokio::time::sleep(super::HELD_SLOTS_READ_INTERVAL * 2 + Duration::from_millis(500)).await;
-        let held_slots = sampler.finish(&held_in_request_pool(0)).await;
+        let (_, held_slots) = sampler.finish(&url).await?;
         server.abort();
 
         // The reads at both ends, and at least one between them.
