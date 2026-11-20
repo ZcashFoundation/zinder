@@ -21,8 +21,8 @@ The operational endpoint serves without authentication. Keep it private, as
 [Service operations](../architecture/service-operations.md#security-boundary)
 describes.
 
-`zinder-query` and `zinder-compat-lightwalletd` also answer the same question
-on their gRPC listeners, as [gRPC health](#grpc-health) describes.
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` also report
+readiness on their gRPC listeners, as [gRPC health](#grpc-health) describes.
 
 ## Response bodies
 
@@ -116,15 +116,12 @@ run their own healthcheck script, described in
 
 ## gRPC health
 
-`zinder-query` and `zinder-compat-lightwalletd`, in both of its serving modes,
-serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
-(`Check` and `Watch`) on their wallet gRPC listener. gRPC-aware load
+`zinder-query`, `zinder-explorer`, and both serving modes of
+`zinder-compat-lightwalletd` serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
+(`Check` and `Watch`) on their public gRPC listeners. gRPC-aware load
 balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
-directly, without an HTTP probe on the ops port. `zinder-ingest`,
-`zinder-projector`, and `zinder-explorer` do not serve it.
-
-Both listeners read the same readiness state. Each response reflects the
-state at the time of its request.
+directly. Each gRPC listener reads the same readiness state as its own
+`/readyz` endpoint.
 
 | Status | When |
 | --- | --- |
@@ -132,21 +129,22 @@ state at the time of its request.
 | `NOT_SERVING` | `/readyz` answers 503, including `shutting_down` once shutdown starts. |
 
 An empty service name asks about the whole listener. The name of the service
-the listener serves (`zinder.v1.wallet.WalletQuery` or
-`cash.z.wallet.sdk.rpc.CompactTxStreamer`) returns the same status. Any other
-name fails `Check` with `NOT_FOUND`, and `Watch` reports `SERVICE_UNKNOWN`.
+the listener serves (`zinder.v1.wallet.WalletQuery`,
+`cash.z.wallet.sdk.rpc.CompactTxStreamer`, or `zinder.v1.explorer.ExplorerQuery`)
+returns the same status. Any other name fails `Check` with `NOT_FOUND`, and
+`Watch` reports `SERVICE_UNKNOWN`.
 There is no per-method or per-capability status.
 
-Use `zinder-query grpc-healthcheck <ADDR>` to check either reader's local
-plaintext gRPC socket. For example, `zinder-query grpc-healthcheck '[::1]:9067'`
+Use `zinder-query grpc-healthcheck <ADDR>` to probe any of these plaintext gRPC
+listeners. For example, `zinder-query grpc-healthcheck '[::1]:9067'`
 checks the single-volume lightwalletd listener. The command exits 0 for
 `SERVING`, 3 for a non-serving health response, and 1 if the call fails.
 Connecting and receiving the reply share a three-second deadline.
 
 The health service and gRPC reflection stay reachable while the runtime
-refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
-`grpc.health.v1.Health` beside the wallet service, so `grpcurl` needs no proto
-files to call it.
+refuses wallet or Explorer calls with `SERVICE_NOT_READY`. Both accept calls
+without an Explorer bearer token. Reflection describes `grpc.health.v1.Health`,
+so `grpcurl` needs no proto files to call it.
 
 `Watch` sends the current status at once and again on every change, as soon
 as readiness publishes it. Changes that land before the stream can send them
@@ -169,8 +167,8 @@ listener while it closes. A `SERVING` the stream was already sending as the
 drain began can still arrive just before that final `NOT_SERVING`. A stream that reported `SERVICE_UNKNOWN` ends
 without another message.
 
-A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
-the runtime, not its ops port:
+A Kubernetes `grpc` probe needs no `service` field. This example probes the
+lightwalletd port directly.
 
 ```yaml
 readinessProbe:
@@ -255,7 +253,7 @@ snapshot for up to 30 seconds while it loads the next one.
 | Cause | When |
 | --- | --- |
 | `starting` | Until startup finishes. With `node.health.addr` set, also until the first successful health probe. |
-| `syncing` | During fresh construction, while trailing the node, or while the mempool snapshot trails the tip for more than 30 seconds. |
+| `syncing` | During fresh construction, while trailing the node, when the certified mempool snapshot trails the tip for 30 seconds, or when a replacement has waited 30 seconds for certification. |
 | `node_unavailable` | The active node fails. Ingest keeps its state and retries. |
 | `upstream_not_ready` | The `[node.health]` probe reports the node not synchronized. |
 | `reorg_window_exceeded` | A reorg was deeper than the window. Only shutdown replaces it. |
@@ -343,9 +341,10 @@ once per second.
 | `schema_mismatch` | The view store's format or consumer schemas no longer match the binary. |
 | `storage_unavailable` | Any other catch-up failure. |
 
-Explorer keeps answering gRPC in both failure cases; only `/readyz` refuses.
-How far the views trail the chain is reported per response in
-`ExplorerFreshness`, not through readiness.
+On a catch-up failure, `/readyz` returns 503, gRPC health reports
+`NOT_SERVING`, and new `ExplorerQuery` calls fail with `UNAVAILABLE` and
+the readiness cause. The next successful catch-up reopens the gate.
+`ExplorerFreshness` reports how far the views trail the chain in each response.
 
 ### Cipherscan adapter
 

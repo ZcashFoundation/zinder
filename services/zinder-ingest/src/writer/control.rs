@@ -65,6 +65,73 @@ const CANONICAL_CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// projectors reopen the primary during a transient follower busy period.
 const CANONICAL_CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Absolute bound shared by all owner and mutation-gate waits for one RPC.
+#[derive(Clone, Copy)]
+pub(super) struct CanonicalReadDeadline(tokio::time::Instant);
+
+impl CanonicalReadDeadline {
+    pub(super) fn from_request<T>(request: &Request<T>) -> Self {
+        Self::from_timeouts(grpc_timeout(request), None)
+    }
+
+    pub(super) fn for_mempool_events(
+        request: &Request<zinder_proto::v1::wallet::MempoolEventsRequest>,
+    ) -> Self {
+        let open_timeout = request
+            .metadata()
+            .get(zinder_proto::MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER)
+            .and_then(|header| header.to_str().ok()?.parse().ok())
+            .map(Duration::from_millis);
+        Self::from_timeouts(grpc_timeout(request), open_timeout)
+    }
+
+    fn from_timeouts(grpc: Option<Duration>, open: Option<Duration>) -> Self {
+        // Reserve time for encoding, transport, and scheduling at the caller.
+        const MAX_REPLY_MARGIN: Duration = Duration::from_secs(1);
+        let budget =
+            grpc.into_iter()
+                .chain(open)
+                .min()
+                .map_or(CANONICAL_CONTROL_REPLY_TIMEOUT, |timeout| {
+                    let margin = MAX_REPLY_MARGIN.min(timeout / 10);
+                    timeout
+                        .saturating_sub(margin)
+                        .min(CANONICAL_CONTROL_REPLY_TIMEOUT)
+                });
+        Self(tokio::time::Instant::now() + budget)
+    }
+
+    pub(super) async fn wait<T>(
+        self,
+        read: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        tokio::time::timeout_at(self.0, read).await.map_err(|_| {
+            canonical_owner_unavailable(
+                "canonical writer did not service the request before the read deadline",
+            )
+        })?
+    }
+}
+
+// Tonic exposes Request::set_timeout but keeps its HTTP/2 timeout parser private.
+fn grpc_timeout<T>(request: &Request<T>) -> Option<Duration> {
+    let header = request.metadata().get("grpc-timeout")?.as_encoded_bytes();
+    let (unit, digits) = header.split_last()?;
+    if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let count: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    match unit {
+        b'H' => Some(Duration::from_hours(count)),
+        b'M' => Some(Duration::from_mins(count)),
+        b'S' => Some(Duration::from_secs(count)),
+        b'm' => Some(Duration::from_millis(count)),
+        b'u' => Some(Duration::from_micros(count)),
+        b'n' => Some(Duration::from_nanos(count)),
+        _ => None,
+    }
+}
+
 /// One configured directory below which the canonical owner may stage
 /// checkpoint candidates.
 ///
@@ -1146,9 +1213,11 @@ impl CanonicalControlGrpcAdapter {
 impl CanonicalControl for CanonicalControlGrpcAdapter {
     async fn writer_status(
         &self,
-        _request: Request<CanonicalWriterStatusRequest>,
+        request: Request<CanonicalWriterStatusRequest>,
     ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
-        let mut status = self.handle.writer_status().await?;
+        let mut status = CanonicalReadDeadline::from_request(&request)
+            .wait(self.handle.writer_status())
+            .await?;
         // Read after the writer answers, so damage reported before the answer
         // is never left out of it.
         status.canonical_store_damaged = self
@@ -1162,8 +1231,8 @@ impl CanonicalControl for CanonicalControlGrpcAdapter {
         &self,
         request: Request<CanonicalEventPageRequest>,
     ) -> Result<Response<CanonicalEventPageResponse>, Status> {
-        self.handle
-            .event_page(request.into_inner())
+        CanonicalReadDeadline::from_request(&request)
+            .wait(self.handle.event_page(request.into_inner()))
             .await
             .map(Response::new)
     }
@@ -1843,6 +1912,76 @@ pub(crate) mod test_support {
         });
         assert_eq!(storage_unavailable(stalled.chain_epoch().await), expected);
         stalled_owner.abort();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_reads_and_owner_writes_keep_the_full_reply_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handle, _commands) = canonical_control_channel();
+        let adapter = CanonicalControlGrpcAdapter::new(
+            handle,
+            CanonicalCheckpointStagingRoot::new(PathBuf::new()),
+            RocksDbResourceBudget::for_local_tests(),
+            CanonicalStoreDamageSignal::default(),
+        );
+        let mut write = Request::new(AcquireCanonicalProjectionBuildLeaseRequest {
+            lease: Some(CanonicalProjectionBuildLease::default()),
+        });
+        write.set_timeout(Duration::from_secs(15));
+        let start = tokio::time::Instant::now();
+        let read = adapter.writer_status(Request::new(CanonicalWriterStatusRequest {}));
+        let write = adapter.acquire_projection_build_lease(write);
+        tokio::pin!(read, write);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(futures_util::poll!(&mut write).is_pending());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(futures_util::poll!(&mut write).is_pending());
+        let (read, write) = tokio::join!(read, write);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        for status in [read.err(), write.err()] {
+            assert_eq!(
+                status.ok_or("stalled owner answered")?.code(),
+                tonic::Code::Unavailable
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_rpc_deadlines_leave_time_for_the_owner() {
+        let mut request = Request::new(());
+        request.set_timeout(Duration::from_millis(100));
+        let deadline = CanonicalReadDeadline::from_request(&request);
+        assert_eq!(
+            deadline.0 - tokio::time::Instant::now(),
+            Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn grpc_read_timeout_accepts_all_six_wire_units_and_ignores_malformed_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (header, expected) in [
+            ("2H", Some(Duration::from_hours(2))),
+            ("3M", Some(Duration::from_mins(3))),
+            ("15S", Some(Duration::from_secs(15))),
+            ("15000m", Some(Duration::from_secs(15))),
+            ("15000000u", Some(Duration::from_secs(15))),
+            ("0n", Some(Duration::ZERO)),
+            ("150000000n", None),
+            ("+1S", None),
+            ("1s", None),
+            ("S", None),
+            ("", None),
+        ] {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("grpc-timeout", header.parse()?);
+            assert_eq!(grpc_timeout(&request), expected, "{header}");
+        }
         Ok(())
     }
 

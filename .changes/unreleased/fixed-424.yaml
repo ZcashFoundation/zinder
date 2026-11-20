@@ -1,0 +1,6 @@
+kind: fixed
+body: Ingest reports a protocol mismatch when a node repeats a reply ID in a batched `getblock` response. A missing reply no longer causes ingest to retry that height as unavailable.
+time: 2026-11-20T14:51:54.348441698Z
+custom:
+    Bump: patch
+    PR: "424"

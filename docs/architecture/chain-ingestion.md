@@ -59,7 +59,11 @@ newest blocks one at a time, as in
 [Continuous following](#continuous-following), before ingest reports ready.
 
 Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
-them in order. It rebuilds the note commitment trees from the blocks and stores
+them in order. For a JSON-RPC `getblock` batch, each requested ID must appear
+once in the reply. A short reply or a repeated ID causes ingest to report
+`SourceProtocolMismatch` for the batch before assigning any reply to a height.
+
+Ingest rebuilds the note commitment trees from the blocks and stores
 a tree-state checkpoint every 100 blocks and at the build tip. The loader
 refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
@@ -251,9 +255,7 @@ again, as a writer checks a row it stores:
   height. The history predecessor has no stored header, so its row carries
   the block time recorded for it when the store was built. A row at any other
   height fails this check when its header is missing, does not decode, or
-  sits in a table block that fails its checksum when read. Unlike checkpoint
-  rows, headers are read through the block cache, so a header block already
-  cached on the verification secondary is checked from memory.
+  sits in a table block that fails its checksum when read.
 
 The pass starts when densification does: once ingest follows the tip, and
 Explorer views have caught up when they are enabled. A restart over a store
@@ -285,13 +287,12 @@ per cycle at the default rate. A real cycle takes longer: checking adds up to
 4.3 ms per row, the pass waits while historical work is closed, a store error
 costs a 30-second retry, and a restart can check up to a minute of rows again.
 
-The checkpoint family of the pass's secondary has no RocksDB block cache, so
-every read takes the checkpoint blocks from their table files and checks
-their checksums, whatever another read of the secondary loaded before. A
-block that fails its checksum is damage, reported like a row that fails a
-check, at the first height it may hold. A table file that the writer's
-compaction deleted under the pass's secondary is not damage: the step stops,
-and the pass retries it after catching up.
+The verification secondary bypasses the RocksDB block cache for checkpoint
+and header rows. For rows stored in table files, each read checks the
+checksum of the data block again. A block that fails its checksum is damage,
+reported like a row that fails a check, at the first height it may hold. A
+table file that the writer's compaction deleted under the pass's secondary is
+not damage: the step stops, and the pass retries it after catching up.
 
 The pass records the height its current cycle continues from in
 `tree-state-verification-watermark.json` inside the canonical store
@@ -462,6 +463,24 @@ loads a full snapshot before ingest reports ready, then applies added, mined,
 and invalidated events. Mempool state is not part of block commits. Readers get it
 through the private control API. See
 [ADR-0012](../adrs/0012-mempool-topology-and-retention.md).
+
+After a tip change, the certified mempool can serve at its own tip for up to
+30 seconds while ingest stages a replacement. Further tip changes do not
+restart the clock. At expiry, ingest withdraws mempool readiness and live
+reads return `NODE_UNAVAILABLE`. The owner keeps following the source and
+resumes serving when a complete snapshot matches the canonical tip.
+
+Live mempool reads and ingest readiness use the same endpoint certification.
+After a switch, snapshot and transaction reads and the caught-up event stream
+refuse with `NODE_UNAVAILABLE` until the new active endpoint certifies.
+Retained events remain available for replay.
+
+Ingest control bounds a read, including time waiting for the owner, by the
+caller’s `grpc-timeout`. It reserves 10% of that budget, up to one second,
+to return a typed refusal.
+Wallet clients send `x-zinder-mempool-events-open-timeout-ms` on
+`MempoolEvents` so the 15-second opening budget ends when the stream opens.
+When both budgets are present, the shorter applies.
 
 ## Supported networks
 

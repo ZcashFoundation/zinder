@@ -17,6 +17,8 @@
 //! See [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md)
 //! for the boundary and policy decisions this module enforces.
 
+mod batch_ids;
+
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::future::BoxFuture;
-use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder};
+use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder, RpcServiceBuilder};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -115,13 +117,38 @@ pub fn build_zebra_json_rpc_client(
     max_response_bytes: NonZeroU64,
     headers: HeaderMap,
 ) -> Result<HttpClient, ZebraTransportError> {
+    zebra_json_rpc_client_builder(request_timeout, max_response_bytes, headers)
+        .build(json_rpc_addr)
+        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
+}
+
+pub(crate) type ZebraSourceClient = HttpClient<batch_ids::CheckBatchIds>;
+
+pub(crate) fn build_zebra_source_client(
+    json_rpc_addr: &str,
+    request_timeout: Duration,
+    max_response_bytes: NonZeroU64,
+    headers: HeaderMap,
+) -> Result<ZebraSourceClient, ZebraTransportError> {
+    let middleware = RpcServiceBuilder::new()
+        .layer_fn(batch_ids::CheckBatchIds)
+        .rpc_logger(1024);
+    zebra_json_rpc_client_builder(request_timeout, max_response_bytes, headers)
+        .set_rpc_middleware(middleware)
+        .build(json_rpc_addr)
+        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
+}
+
+fn zebra_json_rpc_client_builder(
+    request_timeout: Duration,
+    max_response_bytes: NonZeroU64,
+    headers: HeaderMap,
+) -> HttpClientBuilder {
     let max_response_size = u32::try_from(max_response_bytes.get()).unwrap_or(u32::MAX);
     HttpClientBuilder::default()
         .request_timeout(request_timeout)
         .max_response_size(max_response_size)
         .set_headers(headers)
-        .build(json_rpc_addr)
-        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
 }
 
 /// Runtime options for [`connect_zebra_indexer_channel`].

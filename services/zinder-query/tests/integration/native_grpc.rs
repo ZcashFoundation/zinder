@@ -269,24 +269,28 @@ async fn ingest_control_admission_rejects_a_different_network() -> eyre::Result<
 
 #[tokio::test]
 async fn ingest_control_admission_rejects_a_different_contract_revision() -> eyre::Result<()> {
-    let ingest_control =
-        StaticIngestControl::new().with_contract_revision(zinder_proto::CONTRACT_REVISION + 1);
-    let (ingest_control_addr, cancel, server_handle) =
-        spawn_ingest_control_server(ingest_control).await?;
+    for revision in [12, zinder_proto::CONTRACT_REVISION + 1] {
+        let ingest_control = StaticIngestControl::new().with_contract_revision(revision);
+        let (ingest_control_addr, cancel, server_handle) =
+            spawn_ingest_control_server(ingest_control).await?;
 
-    let outcome = AdmittedIngestControl::connect(
-        &format!("http://{ingest_control_addr}"),
-        None,
-        Network::ZcashRegtest,
-    )
-    .await;
+        let outcome = AdmittedIngestControl::connect(
+            &format!("http://{ingest_control_addr}"),
+            None,
+            Network::ZcashRegtest,
+        )
+        .await;
 
-    assert!(matches!(
-        outcome,
-        Err(IngestControlAdmissionError::ContractRevisionMismatch { .. })
-    ));
-    cancel.cancel();
-    server_handle.await??;
+        assert!(matches!(
+            outcome,
+            Err(IngestControlAdmissionError::ContractRevisionMismatch {
+                expected: zinder_proto::CONTRACT_REVISION,
+                actual,
+            }) if actual == revision
+        ));
+        cancel.cancel();
+        server_handle.await??;
+    }
     Ok(())
 }
 
