@@ -20,7 +20,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 1. **One bounded open path.** Every RocksDB store, canonical, wallet, and materialized-view, primary or secondary, opens through one path in the storage layer. A typed resource budget sets the block cache, the WAL ceiling, open files, write buffers, and a total memtable budget. Configuration validates each value against a minimum. Operators tune the budget, not raw RocksDB options.
 2. **Direct I/O first.** Every production open tries direct reads, and primaries also use direct I/O for flush and compaction. When the filesystem refuses, the open logs the refusal and retries with buffered I/O. There is no operator toggle.
 3. **Total memtable memory is bounded** across all column families of a store by one write-buffer manager.
-4. **Metadata is charged to the cache.** Every column family, including each store's default family, reads through the bounded block cache, and index and filter blocks count against it.
+4. **Metadata is charged to the cache.** Every column family, including each store's default family, reads through the bounded block cache, and index and filter blocks count against it. The one exception is the tree-state checkpoint family of the canonical secondary that ingest opens to verify stored checkpoints. It reads through no block cache, so every verification read takes its blocks from the table file and checks their checksums.
 5. **One cache per store per process.** A process that keeps several secondaries of one store open shares one block cache of the configured size among them. The canonical and wallet stores keep separate caches. The cache stays non-strict, so one generation's pinned blocks cannot fail another generation's catch-up.
 6. **Pressure means non-reclaimable memory.** Throttling of rebuildable work, such as materialized-view replay, uses anonymous memory against the cgroup limit, not working set.
 7. **Startup catch-up is bounded, and later lag is not a failure.** A wallet-serving reader waits up to `storage.initial_catchup_timeout_ms` to admit its first serving pair. If it cannot, it exits before it opens its public or ops listeners, so `/readyz` does not exist yet and the supervisor restarts it. After the first pair is published, a reader that falls behind keeps running, and readiness reports the lag.
@@ -32,6 +32,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 
 - Store reads cannot fill the cgroup through the page cache on filesystems that support direct I/O. Elsewhere, the same bounded RocksDB caches apply with buffered I/O.
 - A serving process's block-cache memory is the configured canonical plus wallet cache size, not that sum times the number of generations. Memtables and table readers remain per generation.
+- Ingest's verification secondary keeps the index blocks of its open checkpoint table files in table-reader memory, outside `block_cache_bytes`. The open-file limit bounds that memory.
 - With jemalloc and the arena cap still set, the local reproduction advanced 44,333 blocks per minute instead of 1,816, and its peak resident memory was 8 to 11 percent higher than glibc's with the cap.
 - Glibc malloc variables such as `MALLOC_ARENA_MAX` have no effect on a Linux service binary, and glibc's memory reports no longer describe it.
 - Building a service binary needs a C compiler and `make`. AArch64 builds use 64 KiB jemalloc pages, which can raise resident memory on 4 KiB-page hosts.
@@ -44,6 +45,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 - **Waiting without a deadline for the first pair.** A reader that can never converge would stay silent, with no listener to report why.
 - **Dividing a reader budget among generations.** Each generation would cache its own copy of the same blocks, and the current pair would get a fraction of the configured cache.
 - **One cache for the canonical and wallet stores.** One store's scans would evict the other's index and filter blocks, and the two budgets would lose their meaning.
+- **Verifying checkpoints through the shared cache with `fill_cache` off.** That flag only stops a read from inserting blocks. RocksDB still returns a block another read cached, so a verification read could pass a block whose table file has been damaged since.
 - **Removing the arena cap from deployments.** Replay recovers, but throughput would still depend on a variable that operators set for unrelated reasons.
 - **Fewer read threads.** It gives up the overlap of storage waits on network-attached volumes.
 - **mimalloc.** It also avoids shared arena locks, but it was not measured. `tikv-jemallocator` is maintained by a project that runs RocksDB on it.
