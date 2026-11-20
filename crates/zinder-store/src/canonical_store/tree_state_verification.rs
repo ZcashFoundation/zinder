@@ -33,10 +33,10 @@ use super::{
     block_load::{decode_tree_state_checkpoint, encode_block_position},
     frontier_presence_mismatch,
     publication::column_family,
-    reader::{CanonicalServingRead, read_block_header_at},
+    reader::{CanonicalServingRead, decode_block_header},
     rocksdb::{
-        CanonicalStoreAdmissionExpectation, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-        canonical_verification_column_family_descriptors,
+        BLOCK_HEADER_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, canonical_verification_column_family_descriptors,
     },
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
@@ -87,8 +87,9 @@ pub struct TreeStateCheckpointMismatch {
     /// What `height` names.
     pub kind: TreeStateCheckpointMismatchKind,
     /// Pool whose frontier failed, or `None` when the row failed outside any
-    /// one frontier, such as a value that ends inside its block time or a
-    /// block time that differs from the canonical block's.
+    /// one frontier, such as a value that ends inside its block time, a
+    /// block time that differs from the canonical block's, or a canonical
+    /// header that cannot be read to check it against.
     pub pool: Option<ShieldedProtocol>,
     /// The check that failed.
     pub reason: String,
@@ -97,7 +98,8 @@ pub struct TreeStateCheckpointMismatch {
 /// What the height of a [`TreeStateCheckpointMismatch`] names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeStateCheckpointMismatchKind {
-    /// The row stored at the height failed a check, or its block failed its
+    /// The row stored at the height failed a check, or a table block that
+    /// holds the row or the canonical header at its height failed its
     /// checksum.
     Row,
     /// A scan could not read an entry as a row: a key that is not a height,
@@ -182,8 +184,10 @@ impl RocksDbTreeStateVerifier {
     /// `network_upgrade_activations` activates at or below its height, and the
     /// block time of the canonical header at its height, or of the history
     /// predecessor, which has no retained header. The first row that fails is
-    /// reported in [`TreeStateCheckpointVerification::mismatch`], as is a key
-    /// that is not a height and a table block that fails its checksum.
+    /// reported in [`TreeStateCheckpointVerification::mismatch`], as is a row
+    /// whose header is missing, does not decode, or sits in a block that
+    /// fails its checksum, a key that is not a height, and a table block that
+    /// fails its checksum.
     /// Entries above the settled tip are never read, so damage there waits
     /// for the tip to pass it. An error means the store could not be read or
     /// does not admit the activation table.
@@ -199,7 +203,8 @@ impl RocksDbTreeStateVerifier {
     /// Verifies the checkpoint stored at exactly `height` with the checks
     /// [`Self::verify_tree_state_checkpoints`] applies.
     ///
-    /// A block that fails its checksum is a mismatch of that row. An error
+    /// A block that fails its checksum, whether it holds the row or the
+    /// canonical header at its height, is a mismatch of that row. An error
     /// means the store could not be read or does not admit the activation
     /// table.
     pub fn verify_tree_state_checkpoint_at(
@@ -209,33 +214,26 @@ impl RocksDbTreeStateVerifier {
     ) -> Result<TreeStateCheckpointRowVerification, CanonicalStoreError> {
         let store = &self.secondary;
         require_admitted_activations(store, network_upgrade_activations)?;
-        let db = &store.serving_open().db;
-        let family = column_family(db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
-        let mut read_options = ReadOptions::default();
-        read_options.set_verify_checksums(true);
-        match db.get_cf_opt(&family, encode_block_position(height), &read_options) {
-            Ok(None) => Ok(TreeStateCheckpointRowVerification::Absent),
-            Ok(Some(encoded)) => verify_row(store, network_upgrade_activations, height, &encoded)
-                .map(|mismatch| {
+        match read_checksummed(store, TREE_STATE_CHECKPOINT_COLUMN_FAMILY, height)? {
+            ChecksummedRead::Absent => Ok(TreeStateCheckpointRowVerification::Absent),
+            ChecksummedRead::Stored(encoded) => {
+                verify_row(store, network_upgrade_activations, height, &encoded).map(|mismatch| {
                     mismatch.map_or(
                         TreeStateCheckpointRowVerification::Intact,
                         TreeStateCheckpointRowVerification::Mismatch,
                     )
-                }),
-            Err(source) if source.kind() == ErrorKind::Corruption => Ok(
-                TreeStateCheckpointRowVerification::Mismatch(TreeStateCheckpointMismatch {
+                })
+            }
+            ChecksummedRead::Corrupt(source) => Ok(TreeStateCheckpointRowVerification::Mismatch(
+                TreeStateCheckpointMismatch {
                     height,
                     kind: TreeStateCheckpointMismatchKind::Row,
                     pool: None,
                     reason: format!(
                         "the stored tree_state_checkpoint block holding this height is corrupt: {source}"
                     ),
-                }),
-            ),
-            Err(source) => Err(CanonicalStoreError::RocksDbOperation {
-                operation: "tree-state verification read",
-                source,
-            }),
+                },
+            )),
         }
     }
 }
@@ -402,31 +400,86 @@ fn verify_row(
             format!("the checkpoint {}", presence.describe()),
         )));
     }
-    Ok(match canonical_block_time(store, height)? {
-        Some(block_time) if block_time == i64::from(block_time_seconds) => None,
-        Some(block_time) => Some(mismatch(
-            None,
-            format!(
-                "the checkpoint block time {block_time_seconds} differs from the canonical block time {block_time}"
-            ),
-        )),
-        None => Some(mismatch(
-            None,
-            "no canonical block header is stored at the checkpoint's height".to_owned(),
-        )),
-    })
+    Ok(block_time_failure(store, height, block_time_seconds)?.map(|reason| mismatch(None, reason)))
 }
 
-/// Returns the block time a checkpoint stored at `height` carries: the
-/// history predecessor's, which has no retained header, or the canonical
-/// header's. `None` means no header is stored at `height`.
-fn canonical_block_time(
+/// Returns why `block_time_seconds`, the block time of the row at `height`,
+/// fails to be the canonical block time there: the history predecessor's,
+/// which has no retained header, or the canonical header's.
+///
+/// Every other settled height has a header, so a header that is missing,
+/// sits in a block that fails its checksum, or does not decode fails the
+/// row as well, instead of stopping verification at it.
+fn block_time_failure(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
-) -> Result<Option<i64>, CanonicalStoreError> {
+    block_time_seconds: u32,
+) -> Result<Option<String>, CanonicalStoreError> {
     let history_predecessor = store.serving_build_plan().history_predecessor();
-    if height == history_predecessor.block_id.height {
-        return Ok(Some(i64::from(history_predecessor.block_time_seconds)));
+    let canonical_block_time = if height == history_predecessor.block_id.height {
+        i64::from(history_predecessor.block_time_seconds)
+    } else {
+        let encoded = match read_checksummed(store, BLOCK_HEADER_COLUMN_FAMILY, height)? {
+            ChecksummedRead::Stored(encoded) => encoded,
+            ChecksummedRead::Absent => {
+                return Ok(Some(
+                    "no canonical block header is stored at the checkpoint's height".to_owned(),
+                ));
+            }
+            ChecksummedRead::Corrupt(source) => {
+                return Ok(Some(format!(
+                    "the stored block_header block holding the checkpoint's height is corrupt: {source}"
+                )));
+            }
+        };
+        match decode_block_header(height, &encoded) {
+            Ok(header) => header.block_time,
+            Err(error) => {
+                return Ok(Some(format!(
+                    "the canonical block header at the checkpoint's height does not decode: {error}"
+                )));
+            }
+        }
+    };
+    Ok((canonical_block_time != i64::from(block_time_seconds)).then(|| {
+        format!(
+            "the checkpoint block time {block_time_seconds} differs from the canonical block time {canonical_block_time}"
+        )
+    }))
+}
+
+/// What a read of the value stored at one height found, with the checksum of
+/// every block it read verified.
+enum ChecksummedRead {
+    /// No value is stored at the height.
+    Absent,
+    /// The stored value.
+    Stored(Vec<u8>),
+    /// The table block holding the height fails its checksum.
+    Corrupt(rust_rocksdb::Error),
+}
+
+/// Reads the value `family_name` stores at `height`, keeping a block that
+/// fails its checksum apart from every other store failure, such as a table
+/// file compacted away under the secondary.
+fn read_checksummed(
+    store: &impl CanonicalServingRead,
+    family_name: &'static str,
+    height: BlockHeight,
+) -> Result<ChecksummedRead, CanonicalStoreError> {
+    let db = &store.serving_open().db;
+    let family = column_family(db, family_name)?;
+    let mut read_options = ReadOptions::default();
+    read_options.set_verify_checksums(true);
+    match db.get_cf_opt(&family, encode_block_position(height), &read_options) {
+        Ok(None) => Ok(ChecksummedRead::Absent),
+        Ok(Some(encoded)) => Ok(ChecksummedRead::Stored(encoded)),
+        Err(source) if source.kind() == ErrorKind::Corruption => {
+            Ok(ChecksummedRead::Corrupt(source))
+        }
+        Err(source) => Err(CanonicalStoreError::RocksDbOperation {
+            operation: "tree-state verification read",
+            source,
+        }),
     }
-    Ok(read_block_header_at(store, height)?.map(|header| header.block_time))
 }

@@ -266,6 +266,36 @@ fn a_row_whose_block_has_no_header_is_a_mismatch_without_a_pool() -> TestResult 
     Ok(())
 }
 
+/// A header that does not decode is damage at the row whose block time it
+/// checks, so verification reports it instead of stopping there on every
+/// retry and never verifying a row above it.
+#[test]
+fn a_row_whose_header_does_not_decode_is_a_mismatch_without_a_pool() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    let height = BlockHeight::new(30);
+    let family = column_family(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    store
+        .bounded_open
+        .db
+        .put_cf(&family, encode_block_position(height), [0xff; 3])?;
+
+    assert_header_damage_at(&temporary, height, "does not decode")
+}
+
+/// A header in a table block that fails its checksum is damage at the row
+/// whose block time it checks, as a corrupt checkpoint block is.
+#[test]
+fn a_row_whose_header_block_is_corrupt_is_a_mismatch_without_a_pool() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let height = BlockHeight::new(30);
+    corrupt_table_file_holding(&store, BLOCK_HEADER_COLUMN_FAMILY, height)?;
+
+    assert_header_damage_at(&temporary, height, "block_header block")
+}
+
 /// One row is verified by its exact height, which is how a restart checks a
 /// row it recorded as damaged.
 ///
@@ -360,7 +390,11 @@ fn a_corrupt_table_block_is_a_mismatch_even_after_an_intact_pass() -> TestResult
     assert_eq!(intact.mismatch, None);
 
     let corrupted_height = BlockHeight::new(50);
-    corrupt_table_file_holding(&store, corrupted_height)?;
+    corrupt_table_file_holding(
+        &store,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        corrupted_height,
+    )?;
     let verification =
         verifier.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
 
@@ -404,7 +438,11 @@ fn a_block_a_normal_read_loaded_does_not_mask_corruption_on_disk() -> TestResult
             .is_some()
     );
 
-    corrupt_table_file_holding(&store, corrupted_height)?;
+    corrupt_table_file_holding(
+        &store,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        corrupted_height,
+    )?;
 
     let verification =
         verifier.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
@@ -644,6 +682,46 @@ fn block_time_mismatch(height: BlockHeight) -> TreeStateCheckpointMismatch {
     }
 }
 
+/// Asserts that the row at `height` is a mismatch without a pool.
+///
+/// Both a scan from height 0 and a verification at `height` must report it,
+/// with a reason that names `reason_fragment`, and the scan must verify every
+/// row below it.
+fn assert_header_damage_at(
+    temporary: &TempDir,
+    height: BlockHeight,
+    reason_fragment: &str,
+) -> TestResult {
+    let verifier = open_verifier(temporary)?;
+    let activations = activations()?;
+
+    let verification =
+        verifier.verify_tree_state_checkpoints(BlockHeight::new(0), rows(1_000)?, &activations)?;
+    let at_height = verifier.verify_tree_state_checkpoint_at(height, &activations)?;
+
+    let mismatch = verification
+        .mismatch
+        .ok_or("a row whose header cannot be read must fail")?;
+    assert_eq!(
+        (mismatch.height, mismatch.kind, mismatch.pool),
+        (height, TreeStateCheckpointMismatchKind::Row, None)
+    );
+    assert!(
+        mismatch.reason.contains(reason_fragment),
+        "{}",
+        mismatch.reason
+    );
+    assert_eq!(
+        (verification.verified_rows, verification.next_from),
+        (height.value(), height)
+    );
+    assert_eq!(
+        at_height,
+        TreeStateCheckpointRowVerification::Mismatch(mismatch)
+    );
+    Ok(())
+}
+
 /// Stores a row under the key of `height` extended by one byte, a key no
 /// writer stores, which sorts after that height's key and before the next.
 fn put_extended_key(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestResult {
@@ -657,10 +735,14 @@ fn put_extended_key(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestR
     Ok(())
 }
 
-/// Flips the first byte of the table file that holds only the row at
-/// `height`, which breaks its first data block's checksum without touching
-/// the footer or index.
-fn corrupt_table_file_holding(store: &RocksDbCanonicalStore, height: BlockHeight) -> TestResult {
+/// Flips the first byte of the table file of `family` that holds only the
+/// row at `height`, which breaks its first data block's checksum without
+/// touching the footer or index.
+fn corrupt_table_file_holding(
+    store: &RocksDbCanonicalStore,
+    family: &str,
+    height: BlockHeight,
+) -> TestResult {
     let key = encode_block_position(height);
     let file = store
         .bounded_open
@@ -668,7 +750,7 @@ fn corrupt_table_file_holding(store: &RocksDbCanonicalStore, height: BlockHeight
         .live_files()?
         .into_iter()
         .find(|file| {
-            file.column_family_name == TREE_STATE_CHECKPOINT_COLUMN_FAMILY
+            file.column_family_name == family
                 && file.start_key.as_deref() == Some(key.as_slice())
                 && file.end_key.as_deref() == Some(key.as_slice())
         })

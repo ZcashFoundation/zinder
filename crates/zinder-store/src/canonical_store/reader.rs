@@ -1113,7 +1113,7 @@ fn decode_chain_epoch(
     })
 }
 
-fn decode_block_header(
+pub(super) fn decode_block_header(
     height: BlockHeight,
     encoded: &[u8],
 ) -> Result<BlockHeaderArtifact, CanonicalStoreError> {

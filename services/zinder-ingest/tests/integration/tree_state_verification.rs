@@ -57,17 +57,17 @@ fn damaged_cause() -> ReadinessCause {
     damaged_row().readiness_cause()
 }
 
-/// Damage at the damaged row when only its block time changed, which fails
-/// outside any pool.
-fn damaged_block_time() -> CanonicalStoreDamage {
+/// Damage at the damaged row that fails outside any pool, such as a block
+/// time that differs from its block's.
+fn damaged_without_a_pool() -> CanonicalStoreDamage {
     CanonicalStoreDamage {
         site: CanonicalStoreDamageSite::Row(BlockHeight::new(DAMAGED_HEIGHT)),
         pool: None,
     }
 }
 
-/// The record a pass that found [`damaged_block_time`] leaves.
-fn damaged_block_time_record(store: &PublishedStore) -> serde_json::Value {
+/// The record a pass that found [`damaged_without_a_pool`] leaves.
+fn damaged_without_a_pool_record(store: &PublishedStore) -> serde_json::Value {
     serde_json::json!({
         "version": 1,
         "construction_manifest_sha256": store.manifest_sha256,
@@ -227,15 +227,15 @@ async fn a_row_whose_block_time_differs_from_its_block_is_reported_without_a_poo
     store.run_until_the_pass_ends(&gate, &store_damage).await?;
 
     eyre::ensure!(
-        store_damage.current() == Some(damaged_block_time()),
+        store_damage.current() == Some(damaged_without_a_pool()),
         "the pass must report the row with another block time, got {:?}",
         store_damage.current()
     );
     eyre::ensure!(
         gate.readiness().runtime_readiness().report().cause
-            == damaged_block_time().readiness_cause()
+            == damaged_without_a_pool().readiness_cause()
     );
-    eyre::ensure!(store.watermark()? == damaged_block_time_record(&store));
+    eyre::ensure!(store.watermark()? == damaged_without_a_pool_record(&store));
     Ok(())
 }
 
@@ -246,7 +246,7 @@ async fn recorded_damage_at_a_row_whose_block_time_still_differs_stays_reported(
 {
     let store = PublishedStore::new()?;
     store.flip_block_time_bit(DAMAGED_HEIGHT)?;
-    store.write_watermark(&damaged_block_time_record(&store))?;
+    store.write_watermark(&damaged_without_a_pool_record(&store))?;
     let store_damage = CanonicalStoreDamageSignal::recorded_in(&store.primary_path);
     let closed_gate = closed_gate();
 
@@ -255,14 +255,44 @@ async fn recorded_damage_at_a_row_whose_block_time_still_differs_stays_reported(
         .await?;
 
     eyre::ensure!(
-        store_damage.current() == Some(damaged_block_time()),
+        store_damage.current() == Some(damaged_without_a_pool()),
         "a row that still carries another block time must stay reported, got {:?}",
         store_damage.current()
     );
     eyre::ensure!(
-        closed_gate.readiness().admission_state().cause == damaged_block_time().readiness_cause()
+        closed_gate.readiness().admission_state().cause
+            == damaged_without_a_pool().readiness_cause()
     );
-    eyre::ensure!(store.watermark()? == damaged_block_time_record(&store));
+    eyre::ensure!(store.watermark()? == damaged_without_a_pool_record(&store));
+    Ok(())
+}
+
+/// A canonical header that does not decode is damage at the row whose block
+/// time it checks, so the pass reports it instead of retrying that row
+/// forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_block_header_does_not_decode_is_reported_without_a_pool() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    rewrite_row(
+        &store.primary_path,
+        "block_header",
+        DAMAGED_HEIGHT,
+        |header| {
+            *header = vec![0xff; 3];
+            Ok(())
+        },
+    )?;
+    let gate = following_tip_gate();
+    let store_damage = CanonicalStoreDamageSignal::default();
+
+    store.run_until_the_pass_ends(&gate, &store_damage).await?;
+
+    eyre::ensure!(
+        store_damage.current() == Some(damaged_without_a_pool()),
+        "the pass must report the row whose header does not decode, got {:?}",
+        store_damage.current()
+    );
+    eyre::ensure!(store.watermark()? == damaged_without_a_pool_record(&store));
     Ok(())
 }
 
@@ -613,7 +643,7 @@ impl PublishedStore {
     /// Flips a byte of the first stored root of the row at `height`, which
     /// follows the block time and the presence bitmap.
     fn flip_first_root_byte(&self, height: u32) -> eyre::Result<()> {
-        rewrite_checkpoint_row(&self.primary_path, height, |row| {
+        rewrite_row(&self.primary_path, "tree_state_checkpoint", height, |row| {
             let root_byte = row
                 .get_mut(5)
                 .ok_or_else(|| eyre::eyre!("checkpoint row holds no root"))?;
@@ -625,7 +655,7 @@ impl PublishedStore {
     /// Flips the low bit of the block time that leads the row at `height`,
     /// which keeps a row that decodes to the same trees.
     fn flip_block_time_bit(&self, height: u32) -> eyre::Result<()> {
-        rewrite_checkpoint_row(&self.primary_path, height, |row| {
+        rewrite_row(&self.primary_path, "tree_state_checkpoint", height, |row| {
             let block_time_byte = row
                 .first_mut()
                 .ok_or_else(|| eyre::eyre!("checkpoint row is empty"))?;
@@ -650,8 +680,10 @@ fn delete_checkpoint_row(primary_path: &Path, height: u32) -> eyre::Result<()> {
     Ok(())
 }
 
-fn rewrite_checkpoint_row(
+/// Rewrites the row the canonical family `family_name` stores at `height`.
+fn rewrite_row(
     primary_path: &Path,
+    family_name: &str,
     height: u32,
     rewrite: impl FnOnce(&mut Vec<u8>) -> eyre::Result<()>,
 ) -> eyre::Result<()> {
@@ -659,12 +691,12 @@ fn rewrite_checkpoint_row(
     let column_families = rust_rocksdb::DB::list_cf(&options, primary_path)?;
     let db = rust_rocksdb::DB::open_cf(&options, primary_path, &column_families)?;
     let family = db
-        .cf_handle("tree_state_checkpoint")
-        .ok_or_else(|| eyre::eyre!("a canonical store owns the tree-state checkpoint family"))?;
+        .cf_handle(family_name)
+        .ok_or_else(|| eyre::eyre!("a canonical store owns the {family_name} family"))?;
     let key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(height));
     let mut row = db
         .get_cf(&family, key)?
-        .ok_or_else(|| eyre::eyre!("height {height} holds no checkpoint"))?;
+        .ok_or_else(|| eyre::eyre!("height {height} holds no row"))?;
     rewrite(&mut row)?;
     db.put_cf(&family, key, &row)?;
     db.flush_cf(&family)?;
