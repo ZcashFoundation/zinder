@@ -28,7 +28,7 @@ other runtime opens it read-only as a RocksDB secondary.
 | `zinder-ingest` | Follows the node, builds the canonical index, handles reorgs, tracks the mempool, and serves a private control API to the other runtimes | Canonical store; materialized-view store when `ingest.explorer_views = true` | Node JSON-RPC, and the node's indexer gRPC for the mempool when configured | Yes |
 | `zinder-projector` | Builds and follows the wallet store from canonical chain events | Wallet store | Canonical store, ingest control | Yes, for wallet serving |
 | `zinder-query` | Serves the native `WalletQuery` gRPC protocol and broadcasts transactions | Nothing | Canonical and wallet stores, ingest control, node for broadcast | For native and Rust SDK clients |
-| `zinder-compat-lightwalletd` | Serves lightwalletd's `CompactTxStreamer` protocol | Nothing | Canonical and wallet stores, ingest control, node for broadcast; with `compat.serving = "compact-blocks"`, only the canonical store and ingest control | For lightwalletd clients |
+| `zinder-compat-lightwalletd` | Serves lightwalletd's `CompactTxStreamer` protocol | Nothing | Canonical and wallet stores, ingest control, node for broadcast and `GetStandardFee`; with `compat.serving = "compact-blocks"`, only the canonical store and ingest control | For lightwalletd clients |
 | `zinder-explorer` | Serves `ExplorerQuery` for block explorers | Nothing | Materialized-view store, `WalletQuery` over gRPC, optional `[node]` for tip observation | No |
 
 The three stores hold different things:

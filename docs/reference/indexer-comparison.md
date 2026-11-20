@@ -142,14 +142,14 @@ whether compact blocks can carry transparent inputs and outputs.
 | `GetAddressUtxos` | Experimental | Yes | Yes | Yes | Yes |
 | `GetAddressUtxosStream` | Experimental | Yes | Yes | Yes | Yes |
 | `GetLightdInfo` | Experimental | Yes | Yes | Yes | Yes |
-| `GetStandardFee` | No | Yes | Yes | Yes | Optional[^zinder-standard-fee] |
+| `GetStandardFee` | No | Yes | Yes | Yes | Yes[^zinder-standard-fee] |
 | `Ping` | No | Optional[^ping] | No[^zingod-unimplemented] | Optional[^ping] | Optional[^zinder-ping] |
 | Transparent inputs and outputs in compact blocks | No | Yes[^transparent-pool] | Yes[^transparent-pool] | Yes[^transparent-pool] | Yes[^transparent-pool] |
 
 Zebra labels its whole lightwalletd gRPC listener experimental.[^zebra-lwd-exp]
 ztreamer serves the same methods in both modes. In its default `wallet` serving
-mode, Zinder serves every method, with `GetStandardFee` depending on the node[^zinder-standard-fee],
-and answers `Ping` only with `compat.ping_very_insecure`.
+mode, Zinder serves every method and answers `Ping` only with
+`compat.ping_very_insecure`.
 [Runtime serving selection](lightwalletd-compatibility.md#runtime-serving-selection)
 describes Zinder's narrower `compact-blocks` mode.
 
@@ -448,7 +448,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^zinder-ping]: Needs `compat.ping_very_insecure = true` or `--ping-very-insecure`, which Zinder says to enable only on a server under load testing, and otherwise both serving modes refuse `Ping` with `FAILED_PRECONDITION` ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L162-L175), [main.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-compat-lightwalletd/src/bin/zinder-compat-lightwalletd/main.rs#L101-L103)).
 
-[^zinder-standard-fee]: The reviewed Zinder revision predates this behavior, which comes from the change that resolves [issue #301](https://github.com/ZcashFoundation/zinder/issues/301). In wallet serving, Zinder forwards the fee its verified node reports through `getstandardfee`, using the node list it also uses to broadcast, and returns `UNIMPLEMENTED` when no configured node implements the RPC and in `compact-blocks` serving ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#getstandardfee)).
+[^zinder-standard-fee]: In wallet serving, Zinder returns the fee and estimator version that a verified node in its broadcast list reports through `getstandardfee`, as Go lightwalletd returns its node's. It returns `UNIMPLEMENTED` when no configured node implements the RPC, and in `compact-blocks` serving ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#getstandardfee)).
 
 [^transparent-pool]: In `GetBlockRange`, only when the request names the transparent pool type, while Zingod's `GetBlock` always includes it and ztreamer fetches each full block from its validator ([ztreamer](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/service/src/compact/blocks/mod.rs#L92-L137), [Zingod](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/book/src/wallets/methods.md#L25-L26), [Go lightwalletd](https://github.com/zcash/lightwalletd/blob/faaf7aa1f917f41ad41def61d7095330078c8a8d/common/common.go#L617-L668), [Zinder](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L194-L204)).
 

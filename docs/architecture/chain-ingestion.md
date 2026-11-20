@@ -243,7 +243,7 @@ the rules.
 | Situation | Failover |
 | --- | --- |
 | Continuous following | Ingest switches between follow iterations. |
-| Broadcast from `zinder-query` or wallet-mode compatibility | Moves to the next verified endpoint within the request. |
+| Broadcast from `zinder-query` or wallet-mode compatibility, and `GetStandardFee` in wallet-mode compatibility | Moves to the next verified endpoint within the request. |
 | Fresh construction | None. A node failure exits, and the restart begins again. |
 | Explorer | None. It reads only `[node]`. |
 

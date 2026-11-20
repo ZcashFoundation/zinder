@@ -390,9 +390,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 \
                       with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` \
                       counterpart. `zinder-ingest` switches to a fallback when its active endpoint \
-                      fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast \
-                      through the next verified endpoint when one is unreachable. `zinder-explorer` \
-                      validates the list and reads only `[node]`.",
+                      fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast, \
+                      and compatibility reads the recommended fee, through the next verified \
+                      endpoint when one is unreachable. `zinder-explorer` validates the list and \
+                      reads only `[node]`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR",
