@@ -28,7 +28,7 @@ Generate a manifest and run the shared gate from the Zinder checkout.
 python3 scripts/wallet-clients/vizor-manifest.py \
   --engine .tmp/vizor-build/vizor-regtest \
   --engine-provenance .tmp/vizor-build/engine-source.json \
-  --fixture "$fixture/ready.json" \
+  --fixture "$fixture/ready.initial.json" \
   --trace-tool scripts/trace-wallet-endpoint.py \
   --evidence .tmp/vizor-release-traces --output .tmp/vizor-release.json
 python3 scripts/run-wallet-lifecycle.py \

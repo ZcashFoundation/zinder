@@ -20,7 +20,7 @@ cargo +1.100.0 build --locked --jobs 2 \
 Start a disposable Regtest fixture with all upgrades through NU6.2 at height 1, NU6.3 at 250, NU7 disabled, and a tip above 250. The command below reads the endpoint and mining RPC from its readiness receipt. The fixture advances the chain by 104 blocks. Give each run exclusive control of mining.
 
 ```bash
-fixture=/absolute/path/to/ready.json
+fixture=/absolute/path/to/ready.initial.json
 python3 -O scripts/wallet-clients/cake-regtest.py \
   --engine "$case_dir/engine/target/debug/zkool_graphql" \
   --trace scripts/trace-wallet-endpoint.py \

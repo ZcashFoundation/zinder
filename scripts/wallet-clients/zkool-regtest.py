@@ -6,11 +6,15 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import sqlite3
 import subprocess
 import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from wallet_fixture import binding, verify_node
+
 
 def main():
     if not __debug__:
@@ -23,7 +27,17 @@ def main():
     p.add_argument('--variant', choices=['internal-enabled','external-only'], required=True)
     p.add_argument('--fence-python', required=True)
     p.add_argument('--proto-dir', required=True)
+    p.add_argument('--ready', required=True, type=Path)
+    p.add_argument('--candidate', type=Path)
     a = p.parse_args()
+    endpoint, control, anchor_height, anchor_hash = binding(a.ready, a.candidate, a.endpoint, a.node)
+    verify_node(control, anchor_height, anchor_hash, "zkool")
+    if a.step == 'bootstrap':
+        a.evidence_dir.mkdir(mode=0o700, parents=True)
+        subprocess.run([a.fence_python, str(Path(__file__).with_name('wait-serving-fence.py')),
+                        '--endpoint', endpoint, '--height', str(anchor_height), '--expected-hash', anchor_hash,
+                        '--proto-dir', a.proto_dir, '--output', str(a.evidence_dir/'fixture-anchor.json')],
+                       check=True, timeout=190)
     for endpoint in [a.endpoint, a.node]:
         if urlsplit(endpoint).scheme != 'http' or urlsplit(endpoint).hostname != '127.0.0.1':
             p.error('explicit isolated loopback HTTP endpoints required')
@@ -41,7 +55,7 @@ def main():
         command = [a.binary, op, *args]
         trace = logs / f'trace-{time.time_ns()}'
         if online:
-            command = ['python3', a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace), '--', *command]
+            command = [sys.executable, a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace), '--', *command]
         env = dict(os.environ, ZINDER_ZKOOL_USE_INTERNAL='true' if a.variant == 'internal-enabled' else 'false')
         process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
@@ -109,12 +123,14 @@ def main():
             raise RuntimeError('wallet evidence check failed')
         state['addresses'] = addresses
         domain['database_created'] = (created / 'zkool.db').is_file()
-        rpc('generatetoaddress', [1, addresses['unified']])
+        block_hash, = rpc('generatetoaddress', [1, addresses['unified']])
+        created_txid = rpc('getblock', [block_hash, 1])['tx'][0]
         rpc('generate', [100])
         wait_published(rpc('getblockcount', []))
         cli('resume', [a.endpoint, str(created)], True)
         with sqlite3.connect(created/'zkool.db') as con:
-            activity = con.execute('SELECT hex(txid) FROM transactions WHERE height>0 ORDER BY height LIMIT 1').fetchone()
+            activity = con.execute('SELECT hex(txid) FROM transactions WHERE height>0 AND txid=?',
+                                   (bytes.fromhex(created_txid)[::-1],)).fetchone()
         if activity is None:
             raise RuntimeError('known source activity required')
         state['activity_sql_txid'] = activity[0]

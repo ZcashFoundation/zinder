@@ -13,6 +13,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--endpoint', required=True)
     p.add_argument('--height', required=True, type=int)
+    p.add_argument('--expected-hash', help='canonical RPC display hash for an immutable fixture anchor')
     p.add_argument('--proto-dir', required=True)
     p.add_argument('--output', required=True, type=Path)
     a = p.parse_args()
@@ -33,6 +34,8 @@ def main():
             rows = list(client.GetBlockRange(pb.BlockRange(start=pb.BlockID(height=a.height), end=pb.BlockID(height=a.height)), timeout=5))
             tree = client.GetTreeState(pb.BlockID(height=a.height), timeout=5)
             ready = tip >= a.height and block.height == a.height and len(rows) == 1 and rows[0].height == a.height and rows[0].hash == block.hash and tree.height == a.height
+            if a.expected_hash and block.height == a.height and bytes(block.hash)[::-1].hex() != a.expected_hash:
+                raise ValueError('wallet endpoint differs from the immutable fixture block hash')
             samples.append({'elapsed_seconds':time.monotonic()-started,'tip':tip,'complete':ready})
             if ready:
                 a.output.write_text(json.dumps({'endpoint':a.endpoint,'height':a.height,'publication_wait_seconds':time.monotonic()-started,'samples':samples,'block_sha256':hashlib.sha256(block.SerializeToString(deterministic=True)).hexdigest()}))

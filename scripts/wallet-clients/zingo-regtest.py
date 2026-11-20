@@ -7,10 +7,14 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import subprocess
 import time
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
+
+from wallet_fixture import binding, verify_node
+
 
 def main():
     if not __debug__:
@@ -22,12 +26,22 @@ def main():
     p.add_argument('--trace-tool', required=True)
     p.add_argument('--scratch', required=True, type=Path)
     p.add_argument('--report', required=True, type=Path)
-    p.add_argument('--evidence-dir', type=Path)
+    p.add_argument('--evidence-dir', required=True, type=Path)
     p.add_argument('--step', required=True)
     p.add_argument('--birthday', type=int, default=2)
     p.add_argument('--fence-python', required=True)
     p.add_argument('--proto-dir', required=True)
+    p.add_argument('--ready', required=True, type=Path)
+    p.add_argument('--candidate', type=Path)
     a = p.parse_args()
+    endpoint, control, anchor_height, anchor_hash = binding(a.ready, a.candidate, a.endpoint, a.node)
+    verify_node(control, anchor_height, anchor_hash, "zingo")
+    if a.step == 'bootstrap':
+        a.evidence_dir.mkdir(mode=0o700, parents=True)
+        subprocess.run([a.fence_python, str(Path(__file__).with_name('wait-serving-fence.py')),
+                        '--endpoint', endpoint, '--height', str(anchor_height), '--expected-hash', anchor_hash,
+                        '--proto-dir', a.proto_dir, '--output', str(a.evidence_dir/'fixture-anchor.json')],
+                       check=True, timeout=190)
     for endpoint in (a.endpoint, a.node):
         url = urlsplit(endpoint)
         if url.scheme != 'http' or url.hostname != '127.0.0.1':
@@ -53,7 +67,7 @@ def main():
         full_command = argv + command
         trace_dir = logdir / f'trace-{time.time_ns()}'
         if online:
-            full_command = ['python3', a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace_dir), '--', *full_command]
+            full_command = [sys.executable, a.trace_tool, '--endpoint-port', str(urlsplit(a.endpoint).port), '--output', str(trace_dir), '--', *full_command]
         process = subprocess.Popen(full_command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=90)
