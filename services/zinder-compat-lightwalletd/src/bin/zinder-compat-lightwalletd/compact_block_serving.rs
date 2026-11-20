@@ -30,9 +30,9 @@ use zinder_runtime::{
     refresh_within_stale_deadline, writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-    ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
-    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
+    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
+    RocksDbResourceBudget, SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 
 const GENERATION_COUNT: usize = 2;
@@ -98,17 +98,18 @@ enum ConvergenceFailure {
     Storage(CompactBlockServingError),
 }
 
-/// Readiness of compact-blocks serving, which follows the published canonical
-/// generation alone: no compact-blocks method calls the node.
+/// Readiness inputs and reader admission policy for the selected canonical serving mode.
 #[derive(Clone)]
 pub(crate) struct CompactServingReadiness {
     inputs: zinder_query::WalletServingReadiness,
+    requires_writer_schedule: bool,
 }
 
 impl CompactServingReadiness {
     pub(crate) fn new(runtime: Readiness) -> Self {
         Self {
             inputs: zinder_query::WalletServingReadiness::pair_only(runtime),
+            requires_writer_schedule: false,
         }
     }
 
@@ -116,6 +117,7 @@ impl CompactServingReadiness {
     pub(crate) fn for_qualification(runtime: Readiness) -> Self {
         Self {
             inputs: zinder_query::WalletServingReadiness::with_node_and_ingest_control(runtime),
+            requires_writer_schedule: true,
         }
     }
 
@@ -132,13 +134,21 @@ impl CompactServingReadiness {
         self.inputs.canonical_admission().publish_admission(storage);
     }
 
+    fn accepts_reader_schedule(
+        &self,
+        status: &CanonicalWriterStatusResponse,
+        schedule: Option<&CanonicalActivationSchedule>,
+    ) -> bool {
+        !self.requires_writer_schedule || writer_attests_network_upgrade_schedule(status, schedule)
+    }
+
     fn observe_reader_schedule(
         &self,
         attestation: &WriterAttestation,
         status: &CanonicalWriterStatusResponse,
         reader: &RocksDbCanonicalReader,
     ) -> bool {
-        if writer_attests_network_upgrade_schedule(status, reader.network_upgrade_schedule()) {
+        if self.accepts_reader_schedule(status, reader.network_upgrade_schedule()) {
             return true;
         }
         attestation.withdraw_allowance();
@@ -719,7 +729,9 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
 
     fn attests_writer_schedule(&self, status: &CanonicalWriterStatusResponse) -> bool {
         self.candidate.as_ref().is_some_and(|candidate| {
-            writer_attests_network_upgrade_schedule(status, candidate.network_upgrade_schedule())
+            self.served
+                .readiness
+                .accepts_reader_schedule(status, candidate.network_upgrade_schedule())
         })
     }
 
@@ -1223,7 +1235,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_requires_the_writer_to_attest_the_candidate_schedule()
+    async fn compact_blocks_admit_a_matching_fence_without_qualification_schedule_attestation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let config =
+            compact_serving_config(&temporary, Duration::from_millis(1), Duration::from_secs(5))?;
+        let (primary, _) =
+            lifecycle_store(&config.canonical_primary_path, &lifecycle_activations())?;
+        let control = MutableCanonicalControl::new(CanonicalWriterStatusResponse {
+            network_upgrade_schedule: None,
+            ..lifecycle_writer_status(&primary)
+        });
+        let (endpoint, shutdown, server) = serve_control(&control).await?;
+        let readiness = CompactServingReadiness::new(Readiness::default());
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, readiness.clone(), &endpoint, None).await?;
+        assert!(readiness.runtime().report().is_ready);
+        let active = slot.capture();
+        let mut status = lifecycle_writer_status(&primary);
+        status
+            .network_upgrade_schedule
+            .as_mut()
+            .ok_or("missing writer schedule")?
+            .revision += 1;
+        control.set_writer_status(status);
+        publisher.refresh().await;
+        assert!(readiness.runtime().report().is_ready);
+        assert!(Arc::ptr_eq(&active, &slot.capture()));
+        let _ = shutdown.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[cfg(feature = "light-wallet-qualification")]
+    #[tokio::test]
+    async fn qualification_bootstrap_requires_writer_schedule_attestation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let config =
@@ -1238,7 +1284,7 @@ mod tests {
             .revision += 1;
         let control = MutableCanonicalControl::new(status);
         let (endpoint, shutdown, server) = serve_control(&control).await?;
-        let readiness = CompactServingReadiness::new(Readiness::default());
+        let readiness = CompactServingReadiness::for_qualification(Readiness::default());
         let first =
             CompactBlockPublisher::bootstrap(config.clone(), readiness.clone(), &endpoint, None)
                 .await;
@@ -2869,6 +2915,7 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(feature = "light-wallet-qualification")]
         async fn lightd_info(&self) -> Result<lightwalletd::LightdInfo, tonic::Status> {
             self.adapter
                 .get_lightd_info(Request::new(lightwalletd::Empty {}))
@@ -3025,14 +3072,16 @@ mod tests {
         harness.stop().await
     }
 
+    #[cfg(feature = "light-wallet-qualification")]
     #[tokio::test]
-    async fn a_fixed_fence_schedule_revision_closes_admission_until_the_reader_is_replaced()
+    async fn qualification_replaces_the_reader_after_a_fixed_fence_schedule_change()
     -> Result<(), Box<dyn std::error::Error>> {
         let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(3);
-        let mut harness = LongRangeHarness::start(
+        let mut harness = LongRangeHarness::start_with_readiness(
             &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
+            CompactServingReadiness::for_qualification(Readiness::default()),
         )
         .await?;
         let leased = harness.slot.capture();
