@@ -48,8 +48,9 @@ Status is what each route family does against the current Explorer runtime. Any 
 | Root WebSocket | `mempool_tx` and `mempool_removed` frames work. At the next block, `new_block` hydration fails and subscribers are closed with code 1013 | `WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents`, `BlockProductionSeries` |
 | `/api/address/:address`, `/api/rich-list`, `/api/supply/transparent-breakdown` | Works | `TransparentAddressActivity`, `TransparentAddressRanking` |
 | `/api/labels`, `/api/label/:address` | Degraded: needs a label sidecar | None |
-| `/api/supply`, `/api/circulating-supply`, `/api/network/halving` | Works | `ValuePoolSummary` plus local consensus rules |
-| `/api/network/emission`, `/api/pools/overview`, `/api/network/pool-history` | Current values work. History and deltas are degraded because `ValuePoolBalanceHistory` has no rows | `ValuePoolSummary`, `ValuePoolBalanceHistory` |
+| `/api/supply` | Requires a wallet endpoint that serves chain value pools | `ValuePoolSummary` |
+| `/api/circulating-supply`, `/api/network/halving` | Works | Visible tip height and local consensus rules |
+| `/api/network/emission`, `/api/pools/overview`, `/api/network/pool-history` | 503 while the Explorer omits `explorer.value_pool.balance_history_v1` | `ValuePoolSummary`, `ValuePoolBalanceHistory` |
 | `/api/network/stats` | 502: needs `BlockProductionSeries` | Explorer |
 | `/api/network/fees` | Works | `FeeSummary` |
 | `/api/network/fee-distribution` | Degraded to conventional fees, because `PaidFeeDistribution` is never advertised | `ConventionalFeeDistribution` |
