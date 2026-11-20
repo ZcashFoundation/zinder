@@ -1,0 +1,6 @@
+kind: changed
+body: Native ChainEvents contract revision 10 resumes a pruned reorg with one replacement through the current tip. Apply the replacement before discarding undo state through its settled tip, then save its cursor to receive later events. On server revisions 8 and 9, the Rust SDK reports a synthesized reorg as an expired cursor. Rebuild from the earliest retained event.
+time: 2026-11-20T11:17:00.302220131Z
+custom:
+    Bump: minor
+    PR: "395"

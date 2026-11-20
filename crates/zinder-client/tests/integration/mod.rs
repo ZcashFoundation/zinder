@@ -1,4 +1,5 @@
 mod capability_coverage;
+mod chain_event_resume;
 mod error_reason_roundtrip;
 mod public_vocabulary;
 mod remote_chain_index;

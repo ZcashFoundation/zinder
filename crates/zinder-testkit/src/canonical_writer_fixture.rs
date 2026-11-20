@@ -280,6 +280,21 @@ impl CanonicalWriterFixture {
     /// compact block does not advance the persisted commitment trees to its
     /// declared sizes, or the store rejects the append.
     pub fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<CanonicalEventFence> {
+        let settled_tip = self.canonical_primary()?.sequence_checkpoint().through();
+        self.append_live_block_with_settled_tip(chain, settled_tip)
+    }
+
+    /// Appends the next block and publishes the supplied settled tip in the same epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the next block cannot be built or the writer rejects
+    /// the block or settlement transition.
+    pub fn append_live_block_with_settled_tip(
+        &mut self,
+        chain: &ChainFixture,
+        settled_tip: BlockId,
+    ) -> eyre::Result<CanonicalEventFence> {
         let canonical_primary = self.take_canonical_primary()?;
         let anchor = canonical_primary.append_anchor()?;
         let height = anchor
@@ -301,7 +316,7 @@ impl CanonicalWriterFixture {
                 anchor.event_fence(),
                 block,
                 Vec::new(),
-                anchor.settled_tip(),
+                settled_tip,
                 created_at,
             ),
             &self.network_upgrade_activations,

@@ -12,5 +12,5 @@ pub use stream_cursor::{
     StreamCursorError, StreamCursorTokenV1,
 };
 pub(crate) use stream_cursor::{
-    CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventLocator,
+    CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventCursorPayload, ChainEventLocator,
 };
