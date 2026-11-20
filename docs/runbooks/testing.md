@@ -1225,6 +1225,25 @@ Zallet and Zally supply native WalletQuery adapters from their own repositories.
 For Zallet, retain canonical full blocks during ingest and configure the query
 service with the same retention policy before starting the wallet.
 
+To run the pinned zcash-devtool case, start the all-at-one Regtest fixture and
+set `fixture_ready` to its `ready.initial.json`. From the Zinder checkout, build
+the wallet in a private directory and pass its lockfile and binary digest to
+the runner. The runner creates fresh wallet and evidence directories.
+
+```bash
+case_dir=$(mktemp -d)
+git clone https://github.com/zcash/zcash-devtool.git "$case_dir/client"
+git -C "$case_dir/client" checkout --detach c8322f7e71ae46ab24801a721523ba83b27d911b
+CARGO_TARGET_DIR="$case_dir/target" cargo +1.100.0 build --locked \
+  --manifest-path "$case_dir/client/Cargo.toml" --features regtest_support
+client="$case_dir/target/debug/zcash-devtool"
+python3 scripts/wallet-clients/run-devtool-regtest.py \
+  --client "$client" --client-sha256 "$(sha256sum "$client" | cut -d' ' -f1)" \
+  --client-revision "$(git -C "$case_dir/client" rev-parse HEAD)" \
+  --input "$case_dir/client/Cargo.lock" --ready "$fixture_ready" \
+  --output "$case_dir/evidence"
+```
+
 Run a pinned wallet adapter against an isolated, funded fixture:
 
 ```sh
