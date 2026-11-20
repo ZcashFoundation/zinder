@@ -720,6 +720,73 @@ after the others finish.
 | How does a wallet endpoint hold up while many wallets sync? | `zinder-bench lightwalletd-wallet-load` | Follow [section 7 of the zinder-bench README](../../services/zinder-bench/README.md#7-drive-wallet-shaped-load-at-an-endpoint). |
 | How long, and how much memory and disk, does a full build take? | `scripts/run-rocksdb-storage-lifecycle.sh` | Follow [RocksDB storage lifecycle](../../deploy/rocksdb-storage-lifecycle.md). |
 
+#### Run a paired benchmark campaign
+
+Use `scripts/run-benchmark-campaign.py` to run the same cases against two
+prepared targets. It runs the existing benchmark commands in alternating
+before/after order and saves their raw reports. Build the clients first, and
+start the targets with equivalent data, resource limits, and cache preparation.
+Pin the workload to the same network, dataset, and height window. Record each
+server's revision or image digest, serving settings, and cache preparation in
+the campaign. The runner records client affinity and executable hashes.
+
+For example, save this campaign as `wallet-campaign.json`. Set the binary
+paths, endpoint addresses, revisions, and height window for your targets. This
+example assumes both Testnet endpoints serve the same history through height
+4,600,000. The two cases measure closed-loop block streaming and a classic SDK
+sync. Both use four clients.
+
+```json
+{
+  "environment": {"network": "zcash-testnet", "transport": "loopback h2c"},
+  "arms": {
+    "before": {"endpoint": "http://127.0.0.1:9067", "cbb_endpoint": "before=http://127.0.0.1:9067", "revision": "BASELINE_SHA"},
+    "after": {"endpoint": "http://127.0.0.1:9167", "cbb_endpoint": "after=http://127.0.0.1:9167", "revision": "CANDIDATE_SHA"}
+  },
+  "cases": {
+    "cbb-range": {
+      "command": ["cbb", "--endpoint", "{cbb_endpoint}", "--concurrency", "4", "--steps", "10", "--chunk", "100", "--start-height", "4598000", "--tree-every", "0", "--warmup", "0", "--json"],
+      "expect": {"/0/total_requests": 40, "/0/errors": 0}
+    },
+    "classic-sdk": {
+      "command": ["zinder-bench", "lightwalletd-wallet-load", "--endpoint", "{endpoint}", "--workload", "classic-sdk", "--wallets", "4", "--from-height", "4580011", "--to-height", "4600000", "--report", "{report}"],
+      "expect": {"/wallets_completed": 4, "/wallets_failed": 0, "/incomplete_streams": 0},
+      "match": ["/server/chain_name", "/from_height", "/to_height", "/blocks_received", "/bytes_received"]
+    }
+  }
+}
+```
+
+```sh
+python3 scripts/run-benchmark-campaign.py wallet-campaign.json \
+  --output .tmp/wallet-campaign
+```
+
+Each command runs in your current directory. A whole argument such as
+`{endpoint}` takes its value from the current arm. Use `{report}` for tools
+that write their own JSON file. Otherwise the runner reads JSON from standard
+output. Pass `{scratch}` when the tool needs an unused path where it can
+create a scratch or secondary directory for each run. `expect` checks values
+against a known workload contract. `match` checks that values agree across
+the two reports in each pair. Both use JSON pointers. For a store case, check
+the fixture digest, read range, and output digest. For wallet comparisons
+where the expected payload differs, use block counts and the window for
+matching and compare payload sizes in the raw reports.
+
+Add fixture manifests or an explicit CBB tree-height list to the optional
+`inputs` array to record their hashes. Each case defaults to four repetitions
+in `AB`, `BA`, `BA`, `AB` order. Set `repeats` or `timeout_seconds` at the top
+level to override the defaults of four repetitions and 600 seconds per command.
+Use credentials configured outside the campaign because its arguments and
+reports are saved verbatim.
+
+Read `summary.json` for failed commands, missing reports, and mismatched
+fields. Failures preserve their logs and do not stop later pairs. Compare
+per-method latency, errors, and work completed from the raw reports. Interpret
+RPC, storage, and wallet scanner results in their own units. Use the
+dedicated [storage campaign validator](../../deploy/storage-benchmark.md)
+for the PostgreSQL qualification contract.
+
 ### Canonical runtime tracer
 
 This runs the real `zinder-ingest` image beside an existing Zebra Testnet
