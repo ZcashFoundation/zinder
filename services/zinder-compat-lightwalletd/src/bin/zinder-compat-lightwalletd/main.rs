@@ -21,6 +21,7 @@ use zinder_runtime::{
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
+mod browser_transport;
 mod compact_block_serving;
 mod config;
 mod supervision;
@@ -258,6 +259,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             .value(),
     );
     open_storage_phase.complete();
+    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
 
     let tree_state_replay_wait = lightwalletd_config
         .tree_state_replay_wait
@@ -337,7 +339,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         event = "compat_started",
         serving = "wallet",
         network = encode_zinder_native_chain_name(lightwalletd_config.network),
-        listen_addr = %lightwalletd_config.listen_addr,
+        %listen_addr,
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
@@ -354,20 +356,17 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     // The listener exposes `grpc.reflection.v1.ServerReflection` so legacy
     // lightwalletd wallets and `grpcurl` can discover the served
     // `CompactTxStreamer` surface without an out-of-band proto.
-    let router = runtime.public_grpc_router(
+    let server = browser_transport::serve(
+        &runtime,
         grpc_adapter.into_server(),
-        zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
-        lightwalletd_config.client_address_source,
+        incoming,
+        &lightwalletd_config,
         &readiness,
     )?;
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
-    let server = router.serve_with_shutdown(
-        lightwalletd_config.listen_addr,
-        runtime.grpc_server_shutdown(),
-    );
     let runtime_outcome = runtime
         .supervise(
             server,
@@ -446,6 +445,7 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
+    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
     let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
@@ -474,7 +474,7 @@ async fn run_compact_blocks(
         event = "compat_started",
         serving = "compact-blocks",
         network = encode_zinder_native_chain_name(lightwalletd_config.network),
-        listen_addr = %lightwalletd_config.listen_addr,
+        %listen_addr,
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
@@ -485,18 +485,15 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let router = runtime.public_grpc_router(
+    let server = browser_transport::serve(
+        &runtime,
         grpc_adapter.into_server(),
-        zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
-        lightwalletd_config.client_address_source,
+        incoming,
+        &lightwalletd_config,
         &serving_readiness.runtime(),
     )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = router.serve_with_shutdown(
-        lightwalletd_config.listen_addr,
-        runtime.grpc_server_shutdown(),
-    );
     let runtime_outcome = runtime
         .supervise(
             server,

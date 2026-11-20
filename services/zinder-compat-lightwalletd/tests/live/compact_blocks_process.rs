@@ -22,7 +22,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, process::Command, time::sleep};
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
-use tonic::{Code, Request, Response, Status, transport::Server};
+use tonic::{Code, transport::Server};
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
     CommitmentTreeFrontiers, CompactBlockArtifact, CompactTransaction, CompactTransactionData,
@@ -35,15 +35,7 @@ use zinder_core::{
 };
 use zinder_proto::{
     compat::lightwalletd::{self, compact_tx_streamer_client::CompactTxStreamerClient},
-    v1::ingest::{
-        AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
-        CanonicalEventPageResponse, CanonicalProjectionBuildLeaseResponse, CanonicalWriterFence,
-        CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
-        CreateCanonicalOwnerCheckpointRequest, CreateCanonicalOwnerCheckpointResponse,
-        ReadmitCanonicalOwnerCheckpointRequest, ReleaseCanonicalProjectionBuildLeaseRequest,
-        ReleaseCanonicalProjectionBuildLeaseResponse, RenewCanonicalProjectionBuildLeaseRequest,
-        canonical_control_server::{CanonicalControl, CanonicalControlServer},
-    },
+    v1::ingest::{CanonicalWriterStatusResponse, canonical_control_server::CanonicalControlServer},
 };
 use zinder_source::{NodeSource as _, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -59,6 +51,8 @@ use zinder_testkit::{
     synthetic_transaction_public_facts,
 };
 
+use crate::common::{MutableCanonicalControl, writer_status_for_fence};
+
 const BINARY_PATH_ENV: &str = "ZINDER_TEST_COMPACT_BINARY_PATH";
 const CANONICAL_PATH_ENV: &str = "ZINDER_TEST_COMPACT_CANONICAL_PATH";
 const EVIDENCE_ROOT_ENV: &str = "ZINDER_TEST_COMPACT_EVIDENCE_ROOT";
@@ -68,75 +62,6 @@ const EXPECTED_HEIGHT_ENV: &str = "ZINDER_TEST_COMPACT_EXPECTED_HEIGHT";
 const EXPECTED_RPC_HASH_ENV: &str = "ZINDER_TEST_COMPACT_EXPECTED_RPC_HASH";
 const READY_TIMEOUT: Duration = Duration::from_mins(1);
 const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
-
-#[derive(Clone)]
-struct MutableCanonicalControl {
-    status: std::sync::Arc<Mutex<CanonicalWriterStatusResponse>>,
-}
-
-#[tonic::async_trait]
-impl CanonicalControl for MutableCanonicalControl {
-    async fn writer_status(
-        &self,
-        _request: Request<CanonicalWriterStatusRequest>,
-    ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
-        Ok(Response::new(self.status.lock().clone()))
-    }
-
-    async fn event_page(
-        &self,
-        _request: Request<CanonicalEventPageRequest>,
-    ) -> Result<Response<CanonicalEventPageResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-
-    async fn create_owner_checkpoint(
-        &self,
-        _request: Request<CreateCanonicalOwnerCheckpointRequest>,
-    ) -> Result<Response<CreateCanonicalOwnerCheckpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-
-    async fn readmit_owner_checkpoint(
-        &self,
-        _request: Request<ReadmitCanonicalOwnerCheckpointRequest>,
-    ) -> Result<Response<CreateCanonicalOwnerCheckpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-
-    async fn acquire_projection_build_lease(
-        &self,
-        _request: Request<AcquireCanonicalProjectionBuildLeaseRequest>,
-    ) -> Result<Response<CanonicalProjectionBuildLeaseResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-
-    async fn renew_projection_build_lease(
-        &self,
-        _request: Request<RenewCanonicalProjectionBuildLeaseRequest>,
-    ) -> Result<Response<CanonicalProjectionBuildLeaseResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-
-    async fn release_projection_build_lease(
-        &self,
-        _request: Request<ReleaseCanonicalProjectionBuildLeaseRequest>,
-    ) -> Result<Response<ReleaseCanonicalProjectionBuildLeaseResponse>, Status> {
-        Err(Status::unimplemented(
-            "bounded process fixture only serves writer status",
-        ))
-    }
-}
 
 #[derive(Serialize)]
 struct InventoryEntry {
@@ -1072,34 +997,6 @@ fn process_config(
 
 fn toml_string(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn writer_status_for_fence(
-    fence: CanonicalEventFence,
-    network: Network,
-    schedule: Option<&zinder_store::CanonicalActivationSchedule>,
-) -> CanonicalWriterStatusResponse {
-    CanonicalWriterStatusResponse {
-        network_name: zinder_core::wire::encode_zinder_native_chain_name(network).to_owned(),
-        fence: Some(CanonicalWriterFence {
-            chain_epoch_id: fence.chain_epoch_id().value(),
-            event_sequence: fence.chain_event_sequence(),
-            visible_tip_height: fence.visible_tip().height.value(),
-            visible_tip_hash: fence.visible_tip().hash.as_bytes().to_vec(),
-            visible_block_count: fence.sequence_digest().block_count(),
-            canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
-        }),
-        oldest_retained_event_sequence: 1,
-        network_upgrade_schedule: schedule.map(|schedule| {
-            zinder_proto::wire::encode_canonical_network_upgrade_schedule(
-                schedule.activations(),
-                schedule.revision(),
-            )
-        }),
-        reorg_window_exceeded: None,
-        tip_unconfirmed: false,
-        canonical_store_damaged: None,
-    }
 }
 
 fn expected_compact_block(block: &CompactBlockArtifact) -> lightwalletd::CompactBlock {

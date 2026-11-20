@@ -29,7 +29,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
    - Readers query the primary only. Replica reads come later, if the primary's read capacity limits serving.
    - One ingest and one projector run, each with a durable ownership row and writer term. Standby writers come later.
    - The live mempool stays in the active ingest's memory, and readers call that ingest. The mempool event log is stored in PostgreSQL, so `MempoolEvents` cursors survive an ingest restart.
-   - TLS, rate limits, and gRPC-web live in a reference proxy, not inside Zinder.
+   - The proxy terminates TLS, limits clients, and routes traffic to ready readers. The lightwalletd compatibility reader serves gRPC-Web on its existing port when the operator enables browser origins. This gives native and browser wallets one endpoint and lets local developers use the same transport without installing a translating proxy.
    - One set of binaries carries both engines, and configuration selects the topology.
 7. **A benchmark gate precedes PostgreSQL build work.** On Mainnet-shaped data, all four must hold: a block commits in under 2 seconds while readers run; long block-range streaming reaches at least half of RocksDB's rate per reader; a from-scratch Mainnet build of canonical and wallet data finishes in under 48 hours; and the PostgreSQL canonical and wallet data are less than twice the size of the RocksDB stores built from the same data. A missed threshold sends that part of the design back for rework.
 8. **Reads become engine-neutral first.** Read interfaces with RocksDB behind them and a conformance suite for both engines ship before any PostgreSQL reader. Writers keep engine-specific code. Slice 1 then adds a PostgreSQL canonical writer behind stateless lightwalletd-compatible servers, and slice 2 adds wallet projection and native queries. `postgres-horizontal` becomes certified and advertised at the end of slice 2. Writer standby and the Explorer follow.
@@ -56,3 +56,7 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 - **Read followers fed by the chain-event stream.** That needs a new replication protocol with exact reorg replay and a wallet projection per follower, and the writer still has no failover.
 - **RocksDB secondaries over a network filesystem.** Secondary mode is not cross-host replication. A secondary reads the primary's live files and fails when compaction deletes one it still uses.
 - **Persisting the live mempool in PostgreSQL in the first release.** Deferred, not rejected. It ships later only if the benchmark or production shows a need.
+
+## Revision history
+
+- 2026-11-20. Decision 6 assigns optional gRPC-Web translation to the compatibility reader across storage topologies. TLS, client limits, and balancing remain at the deployment edge.

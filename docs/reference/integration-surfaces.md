@@ -7,7 +7,8 @@ This page tells you how to connect a client to Zinder: which endpoint to use, th
 | You have | Use | Service | Compose port |
 | --- | --- | --- | --- |
 | An existing lightwalletd client or SDK | `CompactTxStreamer` | `zinder-compat-lightwalletd` | 9067 |
-| A new client in any language | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
+| A browser wallet using lightwalletd | gRPC-Web on the same `CompactTxStreamer` endpoint | `zinder-compat-lightwalletd` | 9067 |
+| A new native application or backend | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
 | A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
 | An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` | 9068 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
@@ -16,7 +17,7 @@ The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-com
 
 ## What every client must handle
 
-**Transport.** Zinder listeners speak plaintext HTTP/2 (h2c). TLS termination and client authentication belong in the operator's proxy, which the [security boundary](../architecture/service-operations.md#security-boundary) requires and [Exposing over TLS](../runbooks/exposing-over-tls.md) sets up. Connect to the proxy's `https://` address. `zinder-explorer` can also require a shared bearer token (`explorer.bearer_token_path`), which clients send as `authorization: Bearer <token>`; the other listeners rely on the proxy for authentication.
+**Transport.** Native gRPC uses plaintext HTTP/2 (h2c) behind the operator's proxy. TLS termination and client authentication belong in the operator's proxy, which the [security boundary](../architecture/service-operations.md#security-boundary) requires and [Exposing over TLS](../runbooks/exposing-over-tls.md) sets up. Connect to the proxy's `https://` address. `zinder-explorer` can also require a shared bearer token (`explorer.bearer_token_path`), which clients send as `authorization: Bearer <token>`; the other listeners rely on the proxy for authentication.
 
 **Readiness.** A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`. Retry with backoff. A request that fails with `REORG_WINDOW_EXCEEDED` cannot succeed until an operator repairs the indexer; stop creating spends against it. [Readiness](readiness.md) lists the causes.
 
@@ -42,6 +43,19 @@ grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
 ```
 
 A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode answers `false` and serves block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
+
+### Browser wallets
+
+Give your browser wallet the same HTTPS lightwalletd URL as a native wallet. The operator [enables your wallet site's origin](../runbooks/exposing-over-tls.md#enable-browser-wallets) on that endpoint. For example, once your application has initialized WebZjs, read the Testnet tip using your operator's Testnet URL:
+
+```javascript
+const wallet = new WebWallet("test", "https://lightwalletd.example.org", 1, 1);
+const tip = await wallet.get_latest_block();
+```
+
+Use a wallet-serving endpoint for sync. A compact-blocks endpoint can stream blocks, but wallet sync also needs subtree roots and tree state. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
+
+WebZjs requests binary gRPC-Web by default. If your SDK supports binary server streaming, use `application/grpc-web+proto` for block ranges. Text mode base64-encodes the same frames, adding about a third to the response body before HTTP compression.
 
 ## Native gRPC clients
 

@@ -41,7 +41,7 @@ In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightw
 | `GetTransaction` | Served | `UNIMPLEMENTED` | Pending transactions at height 0 |
 | `SendTransaction` | Served when `[node]` is set | `UNIMPLEMENTED` | |
 | `GetTaddressTxids`, `GetTaddressTransactions` | Served | `UNIMPLEMENTED` | Same behavior for both |
-| `GetTaddressBalance`, `GetTaddressBalanceStream` | Served | `UNIMPLEMENTED` | At most 256 distinct addresses |
+| `GetTaddressBalance`, `GetTaddressBalanceStream` | Served | `UNIMPLEMENTED` | At most 256 distinct addresses. [Browser wallets](integration-surfaces.md#browser-wallets) use the unary `GetTaddressBalance`. |
 | `GetMempoolTx` | Served | `UNIMPLEMENTED` | |
 | `GetMempoolStream` | Served | `UNIMPLEMENTED` | |
 | `GetTreeState` | Served | `UNIMPLEMENTED` | Every height from Zinder's store |

@@ -93,9 +93,12 @@ tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"
 tonic-reflection = "0.14.9"
 tonic-types = "0.14.9"
+tonic-web = "0.14.9"
 tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
+url = "2.5.8"
 # These protocol crates share concrete types with Zebra. Keep them on the
 # release line selected by `zebra-chain`, and advance the entire stack
 # together so Cargo cannot resolve incompatible duplicate type families.

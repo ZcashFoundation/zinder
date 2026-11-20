@@ -1,4 +1,5 @@
 mod android_sdk_rpc_contract;
+mod browser_transport;
 mod cli;
 mod env_var_contract;
 mod health;

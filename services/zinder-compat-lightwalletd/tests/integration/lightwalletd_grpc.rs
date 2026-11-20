@@ -3,6 +3,8 @@
     reason = "Integration test names describe the compatibility behavior under test."
 )]
 
+mod browser_streams;
+
 use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;

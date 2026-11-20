@@ -1146,6 +1146,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `127.0.0.1:9067`.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__BROWSER_ORIGINS",
+        toml_path: "compat.browser_origins",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP \
+                      or HTTPS origins in the environment, or an array in TOML. An empty list \
+                      disables browser access (the default). Use `*` alone to allow every origin.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__SERVING",
         toml_path: "compat.serving",
         used_by: &["zinder-compat-lightwalletd"],
@@ -2056,7 +2066,10 @@ mod tests {
                     && env_var.used_by.contains(&"zinder-compat-lightwalletd")
             }));
         }
+    }
 
+    #[test]
+    fn wallet_serving_protocols_document_their_own_settings() {
         let query_specific = ENVIRONMENT_VARIABLES
             .iter()
             .filter(|env_var| env_var.name.starts_with("ZINDER_QUERY__"))
@@ -2082,6 +2095,7 @@ mod tests {
             compat_specific,
             [
                 "ZINDER_COMPAT__LISTEN_ADDR",
+                "ZINDER_COMPAT__BROWSER_ORIGINS",
                 "ZINDER_COMPAT__SERVING",
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
