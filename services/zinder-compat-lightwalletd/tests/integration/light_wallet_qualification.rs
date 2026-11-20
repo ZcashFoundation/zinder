@@ -180,6 +180,75 @@ fn verbose_reply(txid: &Value, height: u32, bytes: &str) -> RpcReply {
 }
 
 #[tokio::test]
+async fn history_aliases_share_admission_until_the_stream_drains_or_is_dropped() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01")),
+        method("getaddressutxos").reply_with(|_| RpcReply::result(json!([]))),
+    ])?;
+    let concurrent = fixture.adapter.clone();
+    for drain in [true, false] {
+        let mut history = fixture
+            .adapter
+            .get_taddress_transactions(history_request(1, 1))
+            .await?
+            .into_inner();
+        assert!(history.next().await.transpose()?.is_some());
+        let before = fixture.node.requests()?.len();
+        let refused = concurrent
+            .get_taddress_txids(history_request(1, 1))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("a second request bypassed history admission"))?;
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        assert_eq!(fixture.node.requests()?.len(), before);
+        concurrent.get_address_utxos(utxo_request(0)).await?;
+
+        if drain {
+            assert!(history.next().await.transpose()?.is_some());
+            assert!(history.next().await.is_none());
+        } else {
+            drop(history);
+        }
+        concurrent.get_taddress_txids(history_request(1, 1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
+    let page_requested = Arc::new(tokio::sync::Notify::new());
+    let received = Arc::clone(&page_requested);
+    let (resume_node, paused_node) = std::sync::mpsc::channel::<()>();
+    let paused_node = parking_lot::Mutex::new(paused_node);
+    let (fixture, _) = history_fixture([method("getaddresstxids").reply_with(move |_| {
+        received.notify_one();
+        let _ = paused_node.lock().recv();
+        RpcReply::result(json!([]))
+    })])?;
+    let mut pending = fixture.adapter.get_taddress_txids(history_request(1, 1));
+    tokio::select! {
+        _ = &mut pending => return Err(eyre!("first history request completed before cancellation")),
+        () = page_requested.notified() => {}
+    }
+    let before = fixture.node.requests()?.len();
+    let refused = fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("history stream bypassed a pending page fetch"))?;
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    assert_eq!(fixture.node.requests()?.len(), before);
+    drop(pending);
+    drop(resume_node);
+    fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn oversized_history_splits_into_disjoint_ranges_in_chain_order() -> Result<()> {
     let (fixture, _) = history_fixture([method("getrawtransaction").reply_with(|params| {
         let bytes = params[0]
@@ -272,6 +341,10 @@ async fn a_transaction_mined_outside_its_history_page_ends_the_stream() -> Resul
     );
     assert!(history.next().await.is_none());
     assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 1);
+    fixture
+        .adapter
+        .get_taddress_txids(history_request(2, 2))
+        .await?;
     Ok(())
 }
 
@@ -304,6 +377,7 @@ async fn one_oversized_history_height_preserves_the_node_refusal() -> Result<()>
         method("getaddresstxids").reply(RpcReply::error(
             "more than 100000 transactions match; narrow the height range",
         )),
+        method("getaddresstxids").reply_with(|_| RpcReply::result(json!([]))),
     ])?;
     let status = fixture
         .adapter
@@ -313,6 +387,16 @@ async fn one_oversized_history_height_preserves_the_node_refusal() -> Result<()>
         .ok_or_else(|| eyre!("served an incomplete history height"))?;
     assert_eq!(status.code(), Code::ResourceExhausted);
     assert!(fixture.node.requests_for("getrawtransaction")?.is_empty());
+    let mut empty = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?
+        .into_inner();
+    fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await?;
+    assert!(empty.next().await.is_none());
     Ok(())
 }
 

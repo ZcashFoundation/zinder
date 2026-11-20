@@ -487,9 +487,11 @@ qualification returns `RESOURCE_EXHAUSTED` when it cannot establish wallet
 order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
 32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
 
-Qualification admits one nonempty UTXO request at a time. A stream holds
-the slot while the client drains its rows. A concurrent UTXO request receives
-`RESOURCE_EXHAUSTED` and can retry with backoff.
+Each qualification instance admits one nonempty UTXO request and one
+address-history request at a time. `GetTaddressTxids` and
+`GetTaddressTransactions` share the history slot. Each request holds its slot
+while it reads from the node and while the client drains the stream. A request
+for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
 
 Build the two qualification binaries:
 

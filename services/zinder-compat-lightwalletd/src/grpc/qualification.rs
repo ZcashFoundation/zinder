@@ -3,7 +3,7 @@
 use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter};
 
 use futures_util::{TryStreamExt as _, stream::try_unfold};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{self as stream, Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address;
@@ -44,6 +44,7 @@ pub struct QualificationWallet {
     slot: CanonicalReaderSlot,
     query: QualificationWalletQuery,
     utxo_slots: Arc<Semaphore>,
+    history_slots: Arc<Semaphore>,
 }
 
 impl LightwalletdGrpcAdapter<QualificationWallet> {
@@ -66,6 +67,7 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             slot,
             query,
             utxo_slots: Arc::new(Semaphore::new(1)),
+            history_slots: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -231,17 +233,24 @@ impl QualificationWallet {
             [indexed_address(&filter.address, epoch.network)?],
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let node = self.node().await?;
-        let mut history = NodeAddressHistory {
-            node: node.clone(),
+        let permit = Arc::clone(&self.history_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "a node address history response is in progress; retry with backoff",
+                )
+            })?;
+        NodeAddressHistory {
+            node: self.node().await?.clone(),
             lookup,
             pending: vec![(range.start_height, range.end_height)],
             anchor: None,
             page: IntoIter::default(),
             page_range: (range.start_height, range.end_height),
-        };
-        history.read_page().await?;
-        Ok(Box::pin(try_unfold(history, NodeAddressHistory::next)))
+            _permit: permit,
+        }
+        .into_stream()
+        .await
     }
 }
 
@@ -362,9 +371,18 @@ struct NodeAddressHistory {
     anchor: Option<BlockId>,
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
+    _permit: OwnedSemaphorePermit,
 }
 
 impl NodeAddressHistory {
+    async fn into_stream(mut self) -> Result<GrpcStream<lightwalletd::RawTransaction>, Status> {
+        self.read_page().await?;
+        if self.page.as_slice().is_empty() && self.pending.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+        Ok(Box::pin(try_unfold(self, Self::next)))
+    }
+
     async fn read_page(&mut self) -> Result<(), Status> {
         self.page = IntoIter::default();
         while let Some((start, end)) = self.pending.pop() {
