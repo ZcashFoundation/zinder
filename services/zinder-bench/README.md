@@ -716,7 +716,7 @@ checks that all four reads of a case agree.
 The subtree command measures one page in `--protocol` (`sapling` by default,
 `orchard`, or `ironwood`). Its default start is the first root completed in
 retained history. Use `--start-index` to select another page.
-`--max-entries` accepts 1 through 1,024 and defaults to 1,000. The visible
+`--max-entries` accepts 1 through 1,024 and defaults to 1,024. The visible
 tree bounds the page. The command requires at least one available root and
 checks the returned indices, root hashes, and completing blocks across reads.
 

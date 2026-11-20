@@ -552,6 +552,74 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn bounded_chunks_keep_two_blocks_with_an_exact_budget_or_room_left()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_store::{HeightOrder, encode_compact_block_artifact};
+
+        let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .extend_blocks(3);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let writer = zinder_testkit::CanonicalWriterFixture::publish(
+            &zinder_testkit::CanonicalBaseline::new(&chain),
+            &activations,
+        )?;
+        let scratch = tempfile::TempDir::new()?;
+        let store = ReadStore {
+            primary: writer.canonical_primary_path().to_path_buf(),
+            secondary_root: scratch.path().into(),
+            activations,
+            reorg_policy: writer.canonical_primary()?.reorg_policy(),
+            workload: zinder_store::CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+        };
+
+        let blocks = chain.compact_block_artifacts();
+        let [first, middle, last] = blocks.as_slice() else {
+            return Err("the fixture must contain three compact blocks".into());
+        };
+        for (order, pair, excluded) in [
+            (HeightOrder::Ascending, [first, middle], last),
+            (HeightOrder::Descending, [middle, last], first),
+        ] {
+            let stored_bytes = pair
+                .iter()
+                .map(|block| encode_compact_block_artifact(block).len())
+                .sum::<usize>();
+            let one_byte_short_of_three =
+                stored_bytes + encode_compact_block_artifact(excluded).len() - 1;
+            for budget in [stored_bytes, one_byte_short_of_three] {
+                let request = super::RangeRead {
+                    block_count: 3,
+                    order,
+                    max_bytes: Some(budget),
+                };
+                let case = super::measure_case(&store, &mut None, request).await?;
+                assert_eq!(
+                    (
+                        case.cold.output.block_count,
+                        case.cold.output.first_height,
+                        case.cold.output.last_height,
+                        case.cold.output.stored_bytes,
+                    ),
+                    (
+                        2,
+                        pair[0].height().value(),
+                        pair[1].height().value(),
+                        u64::try_from(stored_bytes)?
+                    ),
+                    "{order:?} with a {budget}-byte budget"
+                );
+                assert_eq!(case.cold.output, case.warm.output);
+                assert_eq!(case.cold.output, case.canonical_reader.cold.output);
+                assert_eq!(case.cold.output, case.canonical_reader.warm.output);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn output_digest_binds_order_identity_time_and_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
