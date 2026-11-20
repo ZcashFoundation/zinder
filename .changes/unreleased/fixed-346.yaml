@@ -1,5 +1,5 @@
 kind: fixed
-body: "In compact-blocks serving, `GetBlock` by hash now answers a best-chain block whose compact block is missing with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`, as wallet serving does, instead of `BLOCK_NOT_IN_BEST_CHAIN`. In both modes, a `GetBlockRange` chunk holding a block that a lightwalletd message cannot carry now fails whole with `DATA_LOSS`: before the stream opens when it is the first chunk, and before any of its blocks are sent otherwise. Compact-blocks streams now queue 16 blocks ahead, as wallet streams do."
+body: "In compact-blocks serving, `GetBlock` by hash now answers a best-chain block whose compact block is missing with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`, as wallet serving does, instead of `BLOCK_NOT_IN_BEST_CHAIN`. In both modes, a `GetBlockRange` chunk holding a block that a lightwalletd message cannot carry now fails whole with `DATA_LOSS`: before the stream opens when it is the first chunk, and before any of its blocks are sent otherwise."
 time: 2026-11-20T08:00:00.000000000Z
 custom:
     Bump: patch
