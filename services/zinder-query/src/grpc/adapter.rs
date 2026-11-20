@@ -2,7 +2,6 @@
 
 use std::{num::NonZeroU32, pin::Pin, time::Instant};
 
-use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};
@@ -42,7 +41,7 @@ use crate::{
     },
 };
 
-use super::chain_events::{decode_address_filter, spawn_filtered_stream};
+use super::chain_events::{chain_event_stream, decode_address_filter};
 use super::compact_block_stream_limit::{
     CompactBlockStreamLimit, DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS,
 };
@@ -604,17 +603,13 @@ where
                 .resolve_chain_events_start(start, requested_family)
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            let query_api = self.query_api.clone();
-            let (event_sender, event_receiver) = mpsc::channel(16);
-            spawn_filtered_stream(
-                query_api,
+            let stream = chain_event_stream(
+                self.query_api.clone(),
                 resume,
                 address_filter,
                 self.traffic_readiness.clone(),
-                event_sender,
             );
-
-            Ok(self.server_stream(Box::pin(ReceiverStream::new(event_receiver))))
+            Ok(self.server_stream(Box::pin(stream)))
         }
         .await;
         record_proxy_outcome("chain_events", started_at, &outcome);

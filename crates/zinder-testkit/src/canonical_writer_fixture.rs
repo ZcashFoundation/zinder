@@ -295,6 +295,33 @@ impl CanonicalWriterFixture {
         chain: &ChainFixture,
         settled_tip: BlockId,
     ) -> eyre::Result<CanonicalEventFence> {
+        self.append_fixture_block(&FixtureChainArtifacts::new(chain), settled_tip)
+    }
+
+    /// Appends each remaining block as a separate event, settling it at commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer rejects an append or a block cannot be built.
+    pub fn append_settled_blocks(&mut self, chain: &ChainFixture) -> eyre::Result<()> {
+        let artifacts = FixtureChainArtifacts::new(chain);
+        let tip = self.canonical_primary()?.event_fence().visible_tip();
+        for block in artifacts
+            .chain
+            .blocks()
+            .iter()
+            .filter(|block| block.height > tip.height)
+        {
+            self.append_fixture_block(&artifacts, BlockId::new(block.height, block.hash))?;
+        }
+        Ok(())
+    }
+
+    fn append_fixture_block(
+        &mut self,
+        artifacts: &FixtureChainArtifacts,
+        settled_tip: BlockId,
+    ) -> eyre::Result<CanonicalEventFence> {
         let canonical_primary = self.take_canonical_primary()?;
         let anchor = canonical_primary.append_anchor()?;
         let height = anchor
@@ -303,7 +330,6 @@ impl CanonicalWriterFixture {
             .height
             .next()
             .ok_or_else(|| eyre!("the visible tip height cannot advance"))?;
-        let artifacts = FixtureChainArtifacts::new(chain);
         let mut trees = FixtureCommitmentTrees::after(
             anchor.tip_checkpoint().block_id.height,
             &anchor.tip_checkpoint().frontiers,

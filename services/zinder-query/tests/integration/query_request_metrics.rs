@@ -209,6 +209,37 @@ fn every_serving_query_request_records_exactly_one_sample() -> eyre::Result<()> 
 }
 
 #[test]
+fn an_idle_filtered_subscription_probes_each_quiet_commit_once() -> eyre::Result<()> {
+    let exposition = render_metrics_of(async {
+        let release = ReleaseAdapter::open().await?;
+        let mut events = WalletQueryService::chain_events(
+            &release.adapter,
+            Request::new(wallet::ChainEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+                family: wallet::ChainEventStreamFamily::Visible as i32,
+                address_filter: vec!["tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd".to_owned()],
+            }),
+        )
+        .await?
+        .into_inner();
+        // Observe several idle polls after the one quiet baseline commit.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_err()
+        );
+        Ok(())
+    })?;
+    assert_eq!(
+        operation_count(&exposition, "transparent_address_tx_ids_in_range"),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn transparent_address_balance_records_its_own_rejection() -> eyre::Result<()> {
     let exposition = render_metrics_of(async {
         let release = ReleaseAdapter::open().await?;
