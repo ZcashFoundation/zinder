@@ -253,7 +253,7 @@ snapshot for up to 30 seconds while it loads the next one.
 | Cause | When |
 | --- | --- |
 | `starting` | Until startup finishes. With `node.health.addr` set, also until the first successful health probe. |
-| `syncing` | During fresh construction, while trailing the node, or while the mempool snapshot trails the tip for more than 30 seconds. |
+| `syncing` | During fresh construction, while trailing the node, when the certified mempool snapshot trails the tip for 30 seconds, or when a replacement has waited 30 seconds for certification. |
 | `node_unavailable` | The active node fails. Ingest keeps its state and retries. |
 | `upstream_not_ready` | The `[node.health]` probe reports the node not synchronized. |
 | `reorg_window_exceeded` | A reorg was deeper than the window. Only shutdown replaces it. |
