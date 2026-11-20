@@ -82,6 +82,12 @@ async fn native_listener_health_follows_readyz_through_readiness_and_shutdown() 
         "reflection did not describe the wallet and health services: {reflected:?}"
     );
 
+    assert!(
+        !reflected
+            .iter()
+            .any(|name| name == "grpc.reflection.v1alpha.ServerReflection")
+    );
+
     readiness.set(ReadinessState::ready(Some(1)));
     assert_eq!(probe.agreed_status().await?, ServingStatus::Serving);
     assert_eq!(probe.check(WALLET_SERVICE).await?, ServingStatus::Serving);

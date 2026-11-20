@@ -161,8 +161,8 @@ impl SupervisedRuntime {
     ///
     /// - `wallet_service`, behind a [`crate::TrafficReadinessInterceptor`]
     ///   over `readiness`;
-    /// - gRPC reflection v1, describing `wallet_descriptor_set` and
-    ///   `grpc.health.v1`; and
+    /// - gRPC reflection v1, plus v1alpha for `CompactTxStreamer`, describing
+    ///   the wallet, health, and reflection services; and
     /// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
     ///   traffic, as `/readyz` reports it.
     ///

@@ -5,14 +5,17 @@
 
 use std::sync::Arc;
 
-use eyre::{Result, eyre};
-use tokio::net::TcpListener;
-use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
-use tonic::{Request, transport::Server};
+use eyre::{OptionExt as _, Result, eyre};
+use prost::Message as _;
+use prost_types::{FileDescriptorProto, FileDescriptorSet};
+use tokio::{net::TcpListener, sync::mpsc};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::Channel;
 use tonic_reflection::pb::v1::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
 };
+use tonic_reflection::pb::v1alpha;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::Network;
 use zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET;
@@ -24,8 +27,7 @@ use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upg
 
 const EXPECTED_SERVICE: &str = "cash.z.wallet.sdk.rpc.CompactTxStreamer";
 
-#[tokio::test]
-async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
+async fn compat_listener() -> Result<Channel> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
@@ -39,48 +41,159 @@ async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
         )?),
     ));
     let adapter = LightwalletdGrpcAdapter::new(wallet_query).into_server();
-    let reflection_service =
-        zinder_runtime::public_grpc_reflection(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)?;
-
+    let runtime =
+        zinder_runtime::SupervisedRuntime::new(zinder_runtime::RuntimeService::CompatLightwalletd);
+    let router = runtime.public_grpc_router(
+        adapter,
+        LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+        zinder_runtime::ClientAddressSource::Connection,
+        &zinder_runtime::Readiness::default(),
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let _server_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(adapter)
-            .add_service(reflection_service)
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _store_fixture = store_fixture;
+        router
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
     });
-
-    let endpoint = tonic::transport::Endpoint::new(format!("http://{server_addr}"))?
+    Ok(Channel::from_shared(format!("http://{addr}"))?
         .connect()
-        .await?;
-    let mut client = ServerReflectionClient::new(endpoint);
-    let request = Request::new(tokio_stream::once(ServerReflectionRequest {
-        host: String::new(),
-        message_request: Some(MessageRequest::ListServices(String::new())),
-    }));
-    let mut response_stream = client.server_reflection_info(request).await?.into_inner();
-    let response_message = response_stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("reflection stream closed without a response"))??
-        .message_response
-        .ok_or_else(|| eyre!("reflection response carried no MessageResponse"))?;
+        .await?)
+}
 
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "MessageResponse is non_exhaustive; future variants legitimately surface here as test failures."
-    )]
-    let advertised_services = match response_message {
-        MessageResponse::ListServicesResponse(list) => list.service,
-        other => return Err(eyre!("unexpected reflection response: {other:?}")),
+const SERVICES: [&str; 4] = [
+    EXPECTED_SERVICE,
+    "grpc.health.v1.Health",
+    "grpc.reflection.v1.ServerReflection",
+    "grpc.reflection.v1alpha.ServerReflection",
+];
+
+#[tokio::test]
+async fn v1_lists_the_services_on_the_compat_listener() -> Result<()> {
+    let mut client = ServerReflectionClient::new(compat_listener().await?);
+    let mut replies = client
+        .server_reflection_info(tokio_stream::once(ServerReflectionRequest {
+            message_request: Some(MessageRequest::ListServices(String::new())),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    let reply = replies
+        .message()
+        .await?
+        .ok_or_eyre("missing v1 service list")?;
+    let Some(MessageResponse::ListServicesResponse(mut list)) = reply.message_response else {
+        return Err(eyre!("expected a v1 service list"));
     };
-    assert!(
-        advertised_services
+    list.service.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        list.service
             .iter()
-            .any(|service| service.name == EXPECTED_SERVICE),
-        "reflection did not advertise {EXPECTED_SERVICE}: {advertised_services:?}",
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        SERVICES
     );
+    Ok(())
+}
+
+fn alpha_request(
+    message: v1alpha::server_reflection_request::MessageRequest,
+) -> v1alpha::ServerReflectionRequest {
+    v1alpha::ServerReflectionRequest {
+        message_request: Some(message),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn v1alpha_discovers_wallet_descriptors_and_holds_a_stream_slot_until_half_close()
+-> Result<()> {
+    use v1alpha::{
+        server_reflection_client::ServerReflectionClient,
+        server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mut client = ServerReflectionClient::new(compat_listener().await?);
+    let (send, recv) = mpsc::channel(1);
+    let mut replies = client
+        .server_reflection_info(ReceiverStream::new(recv))
+        .await?
+        .into_inner();
+    send.send(alpha_request(MessageRequest::ListServices(String::new())))
+        .await?;
+    let reply = replies
+        .message()
+        .await?
+        .ok_or_eyre("missing v1alpha service list")?;
+    let Some(MessageResponse::ListServicesResponse(mut list)) = reply.message_response else {
+        return Err(eyre!("expected a v1alpha service list"));
+    };
+    list.service.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        list.service
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        SERVICES
+    );
+    let holds_slots = |count: u8| {
+        let gauge =
+            format!(r#"zinder_grpc_request_receive_slots_held{{pool="client_stream"}} {count}"#);
+        recorder.handle().render().lines().any(|line| line == gauge)
+    };
+    assert!(holds_slots(1));
+
+    let descriptors = FileDescriptorSet::decode(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)?;
+    for (query, name) in [
+        (
+            MessageRequest::FileContainingSymbol(EXPECTED_SERVICE.into()),
+            "service.proto",
+        ),
+        (
+            MessageRequest::FileByFilename("compact_formats.proto".into()),
+            "compact_formats.proto",
+        ),
+    ] {
+        send.send(alpha_request(query)).await?;
+        let reply = replies
+            .message()
+            .await?
+            .ok_or_eyre("missing descriptor response")?;
+        let Some(MessageResponse::FileDescriptorResponse(files)) = reply.message_response else {
+            return Err(eyre!("expected descriptor for {name}"));
+        };
+        let expected = descriptors
+            .file
+            .iter()
+            .find(|file| file.name() == name)
+            .ok_or_eyre("missing vendored descriptor")?;
+        let decoded = files
+            .file_descriptor_proto
+            .iter()
+            .map(|file| FileDescriptorProto::decode(file.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(decoded.contains(expected), "missing vendored {name}");
+    }
+    drop(send);
+    assert!(replies.message().await?.is_none());
+    assert!(holds_slots(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn v1alpha_applies_the_public_message_size_limit() -> Result<()> {
+    use v1alpha::{
+        server_reflection_client::ServerReflectionClient, server_reflection_request::MessageRequest,
+    };
+    let mut client = ServerReflectionClient::new(compat_listener().await?);
+    let mut request = alpha_request(MessageRequest::ListServices(String::new()));
+    request.host = "a".repeat(zinder_runtime::MAX_DECODING_MESSAGE_BYTES);
+    let mut replies = client
+        .server_reflection_info(tokio_stream::once(request))
+        .await?
+        .into_inner();
+    assert!(replies.message().await?.is_none());
     Ok(())
 }
