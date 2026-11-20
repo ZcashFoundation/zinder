@@ -21,20 +21,22 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use http::{HeaderValue, Method, Uri, header};
+use http::uri::Scheme;
+use hyper_util::client::legacy::connect::dns::GaiResolver;
+use rustls::RootCertStore;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tower::ServiceExt as _;
+use tonic::transport::{Channel, Endpoint};
 
 use crate::auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
 };
 
+mod connector;
 mod lazy_channel;
 
+use connector::{ZinderGrpcConnector, ZinderGrpcTls, platform_tls_roots, tcp_connector};
 pub use lazy_channel::LazyZinderGrpcChannel;
 
 /// HTTP/2 ping interval that keeps idle intra-Zinder channels honest.
@@ -55,8 +57,8 @@ const ZINDER_GRPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// keep-alive alone cannot detect this on every platform.
 const ZINDER_GRPC_TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
-/// Default time a dial to another Zinder service may take, from the TCP
-/// connect until the peer answers its first HTTP/2 request.
+/// Default time a dial to another Zinder service may take, from the name
+/// lookup until the peer sends its first HTTP/2 frame.
 ///
 /// Intra-Zinder peers share a host or a network, so a healthy dial completes
 /// in milliseconds; five seconds leaves room for a loaded peer while keeping
@@ -66,14 +68,6 @@ pub const DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5)
 
 /// Pause between startup dials that timed out.
 const STARTUP_DIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-/// Path of the standard gRPC health check, which a dial calls to confirm the
-/// peer speaks HTTP/2. Any HTTP response counts, including `UNIMPLEMENTED`
-/// from a server that does not serve the health service.
-const DIAL_READINESS_PROBE_PATH: &str = "/grpc.health.v1.Health/Check";
-
-/// One uncompressed, zero-length gRPC message: an empty `HealthCheckRequest`.
-const EMPTY_GRPC_MESSAGE: [u8; 5] = [0; 5];
 
 /// Opens a long-lived gRPC channel to another Zinder service, giving up after
 /// [`DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT`].
@@ -94,19 +88,20 @@ pub async fn connect_zinder_grpc(
 /// Opens a long-lived gRPC channel like [`connect_zinder_grpc`], giving up
 /// after `connect_timeout` with [`BearerTokenConnectError::ConnectTimeout`].
 ///
-/// The bound covers the whole dial: the TCP connect, the TLS handshake, and
-/// a first HTTP/2 request the peer must answer. A peer that accepts the TCP
+/// The bound covers the whole dial: the name lookup, the TCP connect, the TLS
+/// handshake, and the peer's first HTTP/2 frame. A peer that accepts the TCP
 /// connection or completes TLS but never speaks HTTP/2 therefore fails within
-/// it. When the channel later reconnects on its own, the TCP connect and the
-/// TLS handshake each stay bounded by `connect_timeout`.
+/// it. The dial sends no request, so a proxy in front of the peer needs no
+/// route or credential for it. When the channel later reconnects on its own,
+/// the name lookup, the TCP connect, and the TLS handshake together stay
+/// within `connect_timeout`.
 pub async fn connect_zinder_grpc_with_timeout(
     endpoint: &str,
     bearer_token: Option<&BearerToken>,
     connect_timeout: Duration,
 ) -> Result<AuthenticatedChannel, BearerTokenConnectError> {
     let interceptor = BearerTokenClientInterceptor::new(bearer_token)?;
-    let endpoint = zinder_grpc_endpoint(endpoint, connect_timeout, zinder_grpc_tls_config())
-        .map_err(BearerTokenConnectError::InvalidEndpoint)?;
+    let endpoint = ZinderGrpcEndpoint::parse(endpoint, connect_timeout, platform_tls_roots)?;
     let channel = dial(&endpoint, connect_timeout).await?;
     Ok(InterceptedService::new(channel, interceptor))
 }
@@ -167,76 +162,86 @@ async fn connect_with_startup_retries(
     }
 }
 
-/// Connects `endpoint` and waits for the peer to answer one HTTP/2 request,
-/// all within `connect_timeout`.
+/// An intra-Zinder endpoint ready to dial: the channel's settings and the
+/// connector that opens its connections.
+struct ZinderGrpcEndpoint {
+    channel: Endpoint,
+    connector: ZinderGrpcConnector,
+}
+
+impl ZinderGrpcEndpoint {
+    /// Parses `endpoint` and applies the intra-Zinder transport policy. An
+    /// `https` endpoint runs TLS, trusting the certificates `tls_roots`
+    /// returns, and an `http` endpoint stays plaintext HTTP/2.
+    ///
+    /// `connect_timeout` bounds the name lookup, the TCP connect, and the TLS
+    /// handshake of every connection the channel opens, including the
+    /// reconnects tonic makes after the first dial.
+    fn parse(
+        endpoint: &str,
+        connect_timeout: Duration,
+        tls_roots: impl FnOnce() -> Result<RootCertStore, BearerTokenConnectError>,
+    ) -> Result<Self, BearerTokenConnectError> {
+        let parsed = Endpoint::from_shared(endpoint.to_owned())
+            .map_err(BearerTokenConnectError::InvalidEndpoint)?;
+        let target = parsed.uri().clone();
+        let (channel, tls) = if target.scheme() == Some(&Scheme::HTTPS) {
+            let tls = ZinderGrpcTls::new(target.host().unwrap_or_default(), tls_roots()?)?;
+            // tonic accepts an `https` URI only when it runs the TLS handshake
+            // itself, so the channel carries the endpoint's `http` form, and
+            // `origin` keeps `https` and the authority on every request.
+            let authority = target
+                .authority()
+                .map_or("", |authority| authority.as_str());
+            let plaintext_form = Endpoint::from_shared(format!("http://{authority}"))
+                .map_err(BearerTokenConnectError::InvalidEndpoint)?;
+            (plaintext_form.origin(target.clone()), Some(tls))
+        } else {
+            (parsed, None)
+        };
+        let channel = channel
+            .connect_timeout(connect_timeout)
+            .http2_keep_alive_interval(ZINDER_GRPC_HTTP2_KEEPALIVE_INTERVAL)
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(ZINDER_GRPC_HTTP2_KEEPALIVE_TIMEOUT);
+        let tcp = tcp_connector(GaiResolver::new(), connect_timeout);
+        Ok(Self {
+            channel,
+            connector: ZinderGrpcConnector::new(target, tcp, tls),
+        })
+    }
+}
+
+/// Connects `endpoint` and waits for the peer's first HTTP/2 frame, all
+/// within `connect_timeout`.
 ///
 /// The HTTP/2 client handshake completes once the client has sent its
 /// preface, so a connected channel alone does not prove the peer is serving.
+/// A compliant peer, including a proxy, starts its side of the connection
+/// with a `SETTINGS` frame whatever it routes or authenticates.
 async fn dial(
-    endpoint: &Endpoint,
+    endpoint: &ZinderGrpcEndpoint,
     connect_timeout: Duration,
 ) -> Result<Channel, BearerTokenConnectError> {
-    let connect_and_probe = async {
-        let channel = endpoint.connect().await?;
-        await_http2_response(channel.clone()).await?;
+    let (connector, first_peer_bytes) = endpoint.connector.reporting_first_peer_bytes();
+    let connect_and_wait = async {
+        let channel = endpoint.channel.connect_with_connector(connector).await?;
+        // The wait also ends when the peer closes the connection without a
+        // frame. The dial is not hung then, and the channel reconnects on its
+        // next call.
+        let _ = first_peer_bytes.await;
         Ok(channel)
     };
     tokio::select! {
-        // Polled first: the endpoint's own TCP and TLS bounds equal this one
-        // and start no earlier, so when one fires in the same tick, the dial
+        // Polled first: the endpoint's own connect bound equals this one and
+        // starts no earlier, so when both fire in the same tick, the dial
         // still reports `ConnectTimeout`.
         biased;
         () = tokio::time::sleep(connect_timeout) => {
             Err(BearerTokenConnectError::ConnectTimeout { connect_timeout })
         }
-        outcome = connect_and_probe => outcome.map_err(BearerTokenConnectError::Transport),
+        outcome = connect_and_wait => outcome.map_err(BearerTokenConnectError::Transport),
     }
-}
-
-/// Sends the readiness probe on `channel` and returns once the peer answers
-/// with any HTTP response.
-async fn await_http2_response(channel: Channel) -> Result<(), tonic::transport::Error> {
-    let mut request = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
-        Bytes::from_static(&EMPTY_GRPC_MESSAGE),
-    )));
-    *request.method_mut() = Method::POST;
-    *request.uri_mut() = Uri::from_static(DIAL_READINESS_PROBE_PATH);
-    let headers = request.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
-    headers.insert(header::TE, HeaderValue::from_static("trailers"));
-    channel.oneshot(request).await.map(drop)
-}
-
-/// TLS settings for an `https` Zinder endpoint: the platform's trusted roots.
-fn zinder_grpc_tls_config() -> ClientTlsConfig {
-    ClientTlsConfig::new().with_enabled_roots()
-}
-
-/// Parses `endpoint` and applies the intra-Zinder transport policy, with TLS
-/// under `tls` when its scheme is `https`. An `http` endpoint stays plaintext
-/// HTTP/2.
-///
-/// `connect_timeout` bounds the TCP connect and the TLS handshake of every
-/// connection the channel opens, including the reconnects tonic makes after
-/// the first dial.
-fn zinder_grpc_endpoint(
-    endpoint: &str,
-    connect_timeout: Duration,
-    tls: ClientTlsConfig,
-) -> Result<Endpoint, tonic::transport::Error> {
-    let parsed = Endpoint::from_shared(endpoint.to_owned())?
-        .connect_timeout(connect_timeout)
-        .http2_keep_alive_interval(ZINDER_GRPC_HTTP2_KEEPALIVE_INTERVAL)
-        .keep_alive_while_idle(true)
-        .keep_alive_timeout(ZINDER_GRPC_HTTP2_KEEPALIVE_TIMEOUT)
-        .tcp_keepalive(Some(ZINDER_GRPC_TCP_KEEPALIVE));
-    if parsed.uri().scheme_str() == Some("https") {
-        return parsed.tls_config(tls.timeout(connect_timeout));
-    }
-    Ok(parsed)
 }
 
 /// The single failure mode [`validate_zinder_grpc_endpoint`] can raise.

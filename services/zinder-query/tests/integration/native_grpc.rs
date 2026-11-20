@@ -355,8 +355,8 @@ async fn ingest_control_admission_gives_up_on_a_dial_that_never_completes() -> e
 
 #[tokio::test(start_paused = true)]
 async fn ingest_control_admission_gives_up_on_a_peer_that_never_speaks_http2() -> eyre::Result<()> {
-    // The peer accepts the connection but never sends a frame, so only a
-    // deadline on the first request ends the dial.
+    // The peer accepts the connection but never sends a frame, so only the
+    // wait for its first frame ends the dial.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
     let peer = tokio::spawn(async move {

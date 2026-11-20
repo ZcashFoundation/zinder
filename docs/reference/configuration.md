@@ -427,9 +427,11 @@ address, and an empty value disables it.
 A runtime that calls another Zinder runtime, such as a reader dialing
 `ingest_control.addr` or the Cipherscan adapter dialing
 `cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must
-finish the TCP connect and the TLS handshake and get an answer to one HTTP/2
-request within that time. A reconnect that the open channel makes on its own
-gets the same 5 seconds for its TCP connect and TLS handshake.
+finish the name lookup, the TCP connect, and the TLS handshake and receive the
+peer's first HTTP/2 frame within that time. The dial sends no request, so a
+TLS-terminating proxy in front of the peer needs no route or credential for it.
+A reconnect that the open channel makes on its own gets the same 5 seconds for
+its name lookup, TCP connect, and TLS handshake together.
 
 | Caller | When a dial runs out of time |
 | --- | --- |

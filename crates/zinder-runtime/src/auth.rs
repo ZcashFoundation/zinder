@@ -259,6 +259,12 @@ pub enum BearerTokenConnectError {
         /// Bound the dial was given.
         connect_timeout: std::time::Duration,
     },
+    /// TLS for an `https` endpoint could not be set up.
+    #[error("zinder gRPC TLS setup failed: {reason}")]
+    TlsSetup {
+        /// Why the setup failed.
+        reason: String,
+    },
     /// The bearer token could not be encoded as gRPC metadata.
     #[error(transparent)]
     Token(#[from] BearerTokenError),

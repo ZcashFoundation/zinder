@@ -6,10 +6,21 @@
 use std::{
     io::Read as _,
     net::SocketAddr,
-    sync::{Arc, mpsc},
+    str::FromStr as _,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
+use http::{HeaderValue, header::AUTHORIZATION};
+use hyper_util::{
+    client::legacy::connect::dns::Name,
+    rt::{TokioExecutor, TokioIo},
+};
+use rustls::RootCertStore;
 use tokio::{
     io::AsyncReadExt as _,
     net::{TcpListener, TcpSocket, TcpStream},
@@ -18,14 +29,15 @@ use tokio::{
 };
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Certificate, Server};
+use tonic::transport::Server;
 use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
+use tower::ServiceExt as _;
 
 use super::{
-    DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, connect_with_startup_retries, connect_zinder_grpc,
-    connect_zinder_grpc_with_timeout, dial, zinder_grpc_endpoint, zinder_grpc_tls_config,
+    DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, ZinderGrpcEndpoint, connect_with_startup_retries,
+    connect_zinder_grpc, connect_zinder_grpc_with_timeout, connector::tcp_connector, dial,
 };
-use crate::auth::BearerTokenConnectError;
+use crate::auth::{BearerToken, BearerTokenConnectError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -38,15 +50,27 @@ const SHORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Ceiling on how long a dial with [`SHORT_CONNECT_TIMEOUT`] may take to fail.
 const SHORT_DIAL_CEILING: Duration = Duration::from_secs(2);
 
+/// Path of the gRPC health check.
+const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
+
+/// Trusts no certificate, for dials that never finish a TLS handshake.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Matches the trust-root loader that ZinderGrpcEndpoint::parse takes."
+)]
+fn no_tls_roots() -> Result<RootCertStore, BearerTokenConnectError> {
+    Ok(RootCertStore::empty())
+}
+
 /// Connects to a listener that records the first byte the client sends.
 async fn first_byte_sent(scheme: &str) -> Result<u8, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = zinder_grpc_endpoint(
+    let endpoint = ZinderGrpcEndpoint::parse(
         &format!("{scheme}://{}", listener.local_addr()?),
         Duration::from_secs(5),
-        zinder_grpc_tls_config(),
+        no_tls_roots,
     )?;
-    let client = tokio::spawn(async move { endpoint.connect().await });
+    let client = tokio::spawn(async move { dial(&endpoint, Duration::from_secs(5)).await });
     let (mut socket, _) = listener.accept().await?;
     let mut first = [0_u8; 1];
     socket.read_exact(&mut first).await?;
@@ -223,10 +247,12 @@ async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> Te
     let address = listener.local_addr()?;
     let (handshake_completed, handshake_observed) = mpsc::channel();
     let _peer = spawn_silent_tls_peer(listener, Arc::new(server_config), handshake_completed);
-    let endpoint = zinder_grpc_endpoint(
+    let mut roots = RootCertStore::empty();
+    roots.add(certified.cert.der().clone())?;
+    let endpoint = ZinderGrpcEndpoint::parse(
         &format!("https://{address}"),
         SHORT_CONNECT_TIMEOUT,
-        zinder_grpc_tls_config().ca_certificate(Certificate::from_pem(certified.cert.pem())),
+        move || Ok(roots),
     )?;
 
     let started_at = Instant::now();
@@ -249,23 +275,78 @@ async fn a_peer_that_completes_tls_but_never_speaks_http2_fails_the_dial() -> Te
     Ok(())
 }
 
+/// Token the proxy-like peer accepts.
+const PROXY_TOKEN: &str = "proxy-token";
+
+/// Serves the health check only to requests that carry [`PROXY_TOKEN`], the
+/// way an authenticating proxy in front of a Zinder runtime does, and resets
+/// every other stream without sending headers.
+fn spawn_proxy_like_peer(listener: TcpListener) -> Result<JoinHandle<()>, http::Error> {
+    let authorization = HeaderValue::from_str(&format!("Bearer {PROXY_TOKEN}"))?;
+    let (_reporter, health_service) = tonic_health::server::health_reporter();
+    Ok(tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let authorization = authorization.clone();
+            let health_service = health_service.clone();
+            let route =
+                hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+                    let authorized = request.uri().path() == HEALTH_CHECK_PATH
+                        && request.headers().get(AUTHORIZATION) == Some(&authorization);
+                    let health_service = health_service.clone();
+                    async move {
+                        if !authorized {
+                            // hyper answers a failed request with RST_STREAM.
+                            return Err(std::io::Error::other("refused without a response"));
+                        }
+                        health_service
+                            .oneshot(request)
+                            .await
+                            .map_err(std::io::Error::other)
+                    }
+                });
+            tokio::spawn(
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), route),
+            );
+        }
+    }))
+}
+
 #[tokio::test]
-async fn a_dial_to_a_server_without_the_health_service_succeeds() -> TestResult {
+async fn a_dial_needs_no_route_or_credential_from_a_proxy() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
-    let reflection = crate::public_grpc_reflection(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)?;
-    let server = tokio::spawn(
-        Server::builder()
-            .add_service(reflection)
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
+    let peer = spawn_proxy_like_peer(listener)?;
+    let token = BearerToken::from_str(PROXY_TOKEN)?;
 
-    let outcome = connect_zinder_grpc_with_timeout(&endpoint, None, SHORT_CONNECT_TIMEOUT).await;
-    server.abort();
+    let anonymous = connect_zinder_grpc_with_timeout(&endpoint, None, SHORT_CONNECT_TIMEOUT).await;
+    let anonymous_check = match anonymous {
+        Ok(channel) => Some(
+            HealthClient::new(channel)
+                .check(HealthCheckRequest::default())
+                .await,
+        ),
+        Err(_) => None,
+    };
+    let authenticated =
+        connect_zinder_grpc_with_timeout(&endpoint, Some(&token), SHORT_CONNECT_TIMEOUT).await;
+    let authenticated_check = match authenticated {
+        Ok(channel) => Some(
+            HealthClient::new(channel)
+                .check(HealthCheckRequest::default())
+                .await,
+        ),
+        Err(error) => return Err(format!("the dial must succeed, got {error:?}").into()),
+    };
+    peer.abort();
 
     assert!(
-        outcome.is_ok(),
-        "an UNIMPLEMENTED answer proves the peer serves HTTP/2, got {outcome:?}"
+        matches!(anonymous_check, Some(Err(_))),
+        "the peer must refuse an unauthenticated call, got {anonymous_check:?}"
+    );
+    assert!(
+        matches!(authenticated_check, Some(Ok(_))),
+        "the authenticated call must succeed, got {authenticated_check:?}"
     );
     Ok(())
 }
@@ -319,6 +400,56 @@ async fn a_reconnect_after_the_first_dial_stays_within_the_connect_timeout() -> 
     assert!(
         matches!(reconnecting_call, Ok(Err(_))),
         "a call that must reconnect fails within the connect timeout, got {reconnecting_call:?}"
+    );
+    assert!(elapsed < SHORT_DIAL_CEILING, "reconnect took {elapsed:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reconnect_bounds_a_name_lookup_that_never_answers() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop_server, server_stopped) = oneshot::channel();
+    let server = spawn_health_server(listener, server_stopped);
+    // Answers the first lookup and never answers another.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let counted_lookups = Arc::clone(&lookups);
+    let resolver = tower::service_fn(move |_name: Name| {
+        let first_lookup = counted_lookups.fetch_add(1, Ordering::SeqCst) == 0;
+        async move {
+            if !first_lookup {
+                std::future::pending::<()>().await;
+            }
+            Ok::<_, std::io::Error>(std::iter::once(address))
+        }
+    });
+    let mut endpoint = ZinderGrpcEndpoint::parse(
+        &format!("http://zinder-peer.test:{}", address.port()),
+        SHORT_CONNECT_TIMEOUT,
+        no_tls_roots,
+    )?;
+    endpoint.connector.tcp = tcp_connector(resolver, SHORT_CONNECT_TIMEOUT);
+    let mut client = HealthClient::new(dial(&endpoint, SHORT_CONNECT_TIMEOUT).await?);
+    client.check(HealthCheckRequest::default()).await?;
+
+    // The peer goes away. The pause lets the channel see its connection
+    // close, so the next call reconnects and looks the name up again.
+    let _ = stop_server.send(());
+    server.await??;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started_at = Instant::now();
+    let reconnecting_call = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.check(HealthCheckRequest::default()),
+    )
+    .await;
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(lookups.load(Ordering::SeqCst), 2, "the call must reconnect");
+    assert!(
+        matches!(reconnecting_call, Ok(Err(_))),
+        "a reconnect whose lookup stalls fails within the connect timeout, got {reconnecting_call:?}"
     );
     assert!(elapsed < SHORT_DIAL_CEILING, "reconnect took {elapsed:?}");
     Ok(())
