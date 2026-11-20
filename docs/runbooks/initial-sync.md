@@ -56,12 +56,9 @@ does not mean the process is ready for traffic.
 | Serving admission | query, compat | Opens matching canonical and wallet secondaries and checks that they describe the same chain | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | Compose allows each reader five minutes to become `ready` |
 
 `<canonical>` is ingest's `storage.path`, which the projector reads as
-`storage.canonical_path`. `<wallet>` is the projector's `wallet.path`. The
-reference configs under `deploy/config/` set them to
-`/var/lib/zinder/canonical` and `/var/lib/zinder/wallet`. Outside those
-configs, set `storage.path` explicitly. The ingest binary's own default is
-`/var/lib/zinder/store`, which differs from the projector's default
-`storage.canonical_path`.
+`storage.canonical_path`. Both default to `/var/lib/zinder/canonical`.
+`<wallet>` is the projector's `wallet.path`, which defaults to
+`/var/lib/zinder/wallet`.
 
 ## When each runtime becomes ready
 

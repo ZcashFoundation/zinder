@@ -1,12 +1,9 @@
-//! Default ports and addresses used by every shared section helper.
-//!
-//! Centralizing defaults here keeps the per-service port table in one
-//! place. Operators reviewing port assignments read this module; service
-//! binaries look up their defaults through the shared
-//! `ConfigLoader::with_*_section` helpers rather than re-declaring
-//! constants.
+//! Shared configuration defaults for Zinder runtimes.
 
 use crate::sections::RuntimeService;
+
+/// Default canonical store directory for ingest, Explorer, and the projector.
+pub const DEFAULT_CANONICAL_PATH: &str = "/var/lib/zinder/canonical";
 
 /// Default operational endpoint listen address per service.
 ///

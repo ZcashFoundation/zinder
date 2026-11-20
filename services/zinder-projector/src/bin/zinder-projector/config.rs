@@ -17,11 +17,10 @@ use zinder_runtime::{
     SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
     resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
-    resolve_wallet_projection_writer_rocksdb_budget,
+    resolve_wallet_projection_writer_rocksdb_budget, section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 
-const DEFAULT_CANONICAL_PATH: &str = "/var/lib/zinder/canonical";
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
 const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
 const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
