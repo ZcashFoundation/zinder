@@ -1,0 +1,6 @@
+kind: fixed
+body: "Zinder-to-Zinder gRPC dials and their automatic reconnects now give up after 5 seconds, covering name lookup, TCP, TLS, and the peer's first HTTP/2 frame, so an unresponsive ingest, query, or explorer peer no longer stalls a client for minutes. `zinder-projector` and `zinder-compat-cipherscan` keep retrying a timed-out startup dial until the peer answers; a refused connection still exits. Dials no longer send an unauthenticated health request, so a proxy that drops unauthenticated streams no longer blocks startup. Endpoint URLs in dial logs are redacted."
+time: 2026-11-20T06:00:00.000000000Z
+custom:
+    Bump: patch
+    PR: "342"
