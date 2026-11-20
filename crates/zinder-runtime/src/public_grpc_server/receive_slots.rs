@@ -9,8 +9,8 @@
 //! refused, so when clients hold equal shares, a further request from any of
 //! them is refused.
 //!
-//! Each pool records how many slots it held once it admitted a request and
-//! how long each request held its slot, so its occupancy can be measured.
+//! Each pool reports how many slots it holds, how many it held once it
+//! admitted a request, and how long each request held its slot.
 
 use std::{
     net::SocketAddr,
@@ -23,7 +23,8 @@ use parking_lot::Mutex;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::{
-    RECEIVE_SLOT_HOLD_DURATION_METRIC, RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, ReceivePool,
+    RECEIVE_SLOT_HOLD_DURATION_METRIC, RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC,
+    RECEIVE_SLOTS_HELD_METRIC, ReceivePool,
 };
 
 /// The slots of one receive pool, shared by every connection.
@@ -115,7 +116,11 @@ impl ReceiveSlots {
         metrics::histogram!(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, "pool" => self.pool.label())
             .record(f64::from(u32::try_from(held).unwrap_or(u32::MAX)));
         if let Some(hold) = evicted_hold {
+            // The evicted request's slot passed to this one, so the pool
+            // holds as many slots as before.
             self.record_hold(hold);
+        } else {
+            metrics::gauge!(RECEIVE_SLOTS_HELD_METRIC, "pool" => self.pool.label()).increment(1.0);
         }
         Some(Admission {
             slot: ReceiveSlot {
@@ -137,6 +142,7 @@ impl ReceiveSlots {
             .map(|index| table.held.remove(index));
         drop(table);
         if let Some(released) = released {
+            metrics::gauge!(RECEIVE_SLOTS_HELD_METRIC, "pool" => self.pool.label()).decrement(1.0);
             self.record_hold(released.claimed_at.elapsed());
         }
     }
@@ -317,6 +323,37 @@ mod tests {
             assert!(exposition.contains(expected), "{expected}\n{exposition}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_pool_reports_the_slots_it_holds_through_evictions_and_releases() -> Result<(), &'static str>
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let held_now = || {
+            handle.render().lines().find_map(|line| {
+                line.strip_prefix("zinder_grpc_request_receive_slots_held{pool=\"request\"} ")
+                    .map(str::to_owned)
+            })
+        };
+
+        metrics::with_local_recorder(&recorder, || -> Result<(), &'static str> {
+            let slots = pool(2)?;
+            let first = admitted(slots.claim(Some(connection(1))))?;
+            let second = admitted(slots.claim(Some(connection(1))))?;
+            assert_eq!(held_now().as_deref(), Some("2"));
+            // The newcomer takes the first request's slot, which then frees
+            // nothing when that request drops it.
+            let newcomer = admitted(slots.claim(Some(connection(2))))?;
+            drop(first);
+            assert!(slots.claim(Some(connection(1))).is_none());
+            assert_eq!(held_now().as_deref(), Some("2"));
+            drop(second);
+            assert_eq!(held_now().as_deref(), Some("1"));
+            drop(newcomer);
+            assert_eq!(held_now().as_deref(), Some("0"));
+            Ok(())
+        })
     }
 
     #[test]

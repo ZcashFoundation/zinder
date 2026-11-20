@@ -129,6 +129,7 @@ pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
 const RECEIVE_REFUSALS_METRIC: &str = "zinder_grpc_request_receive_refusals_total";
 const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_total";
 const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
+const RECEIVE_SLOTS_HELD_METRIC: &str = "zinder_grpc_request_receive_slots_held";
 pub(crate) const RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC: &str =
     "zinder_grpc_request_receive_slots_held_at_admission";
 const RECEIVE_SLOT_HOLD_DURATION_METRIC: &str =
@@ -328,6 +329,11 @@ fn describe_limit_metrics() {
         metrics::Unit::Count,
         "gRPC requests cancelled with UNAVAILABLE because a full pool gave their slot to a \
          request from a client holding fewer slots. Label: pool (request|client_stream)."
+    );
+    metrics::describe_gauge!(
+        RECEIVE_SLOTS_HELD_METRIC,
+        metrics::Unit::Count,
+        "Receive slots a pool holds now. Label: pool (request|client_stream)."
     );
     metrics::describe_histogram!(
         RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC,

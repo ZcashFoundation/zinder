@@ -142,7 +142,8 @@ pub(crate) struct LightwalletdWalletLoadArgs {
     include_address_utxos_unary: bool,
     /// Prometheus endpoint of the Zinder server under test, such as
     /// `http://127.0.0.1:9107/metrics`. When set, the report counts the tree
-    /// states the server rebuilt and the requests it refused during the run.
+    /// states the server rebuilt and the requests it refused during the run,
+    /// from reads before and after the run and every second during it.
     #[arg(long = "server-metrics-url")]
     server_metrics_url: Option<String>,
     /// Free-form label for the server under test, such as its name and version.
@@ -449,9 +450,9 @@ pub(crate) async fn run_lightwalletd_wallet_load(
         setup.pending_txids,
     ));
     let parameters = settings.parameters(args.workload, &plan);
-    let metrics_before = match &args.server_metrics_url {
+    let observation = match &args.server_metrics_url {
         Some(url) => Some(
-            server_metrics::scrape(url)
+            server_metrics::RunObservation::start(url)
                 .await
                 .map_err(BenchError::wallet_load_endpoint)?,
         ),
@@ -480,9 +481,9 @@ pub(crate) async fn run_lightwalletd_wallet_load(
         );
     }
     let wall = started.elapsed();
-    let (server_observed, server_metrics_error) = match (&args.server_metrics_url, metrics_before) {
-        (Some(url), Some(before)) => observe_after_run(url, &before, wall).await,
-        _ => (None, None),
+    let (server_observed, server_metrics_error) = match observation {
+        Some(observation) => observation.finish().await,
+        None => (None, None),
     };
     Ok(LightwalletdWalletLoadOutput {
         report: LightwalletdWalletLoadReport::new(
@@ -696,23 +697,6 @@ impl RecordedTotals {
                 .incomplete_streams
                 .saturating_sub(earlier.incomplete_streams),
         }
-    }
-}
-
-/// Reads the server's metrics after the run. A failed read keeps the run's
-/// results and reports why the server's counts are missing, because the
-/// wallets' work is already done and would otherwise be lost.
-async fn observe_after_run(
-    url: &str,
-    before: &[zinder_bench::metrics_scrape::MetricSample],
-    run: Duration,
-) -> (Option<server_metrics::ServerObserved>, Option<String>) {
-    match server_metrics::scrape(url).await {
-        Ok(after) => match server_metrics::ServerObserved::between(before, &after, run) {
-            Ok(observed) => (Some(observed), None),
-            Err(reason) => (None, Some(reason)),
-        },
-        Err(error) => (None, Some(error)),
     }
 }
 
@@ -1124,23 +1108,6 @@ mod tests {
         assert!(
             (1 + 1 + 1 + 3..=1 + 1 + 2 + 3).contains(&connects),
             "{report}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_failed_scrape_after_the_run_keeps_the_report() -> Result<(), Box<dyn Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let url = format!("http://{}/metrics", listener.local_addr()?);
-        drop(listener);
-
-        let (observed, error) =
-            super::observe_after_run(&url, &[], std::time::Duration::from_secs(1)).await;
-
-        assert!(observed.is_none());
-        assert!(
-            error.is_some_and(|error| error.contains(&url)),
-            "the error names the metrics URL"
         );
         Ok(())
     }

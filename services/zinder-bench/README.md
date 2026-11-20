@@ -974,7 +974,11 @@ identity, the workload's constants, and, over all wallets:
   evicted, the slots it held on average when it admitted a request,
   `peak_slots_held_at_most`, the smallest histogram bucket that holds every
   admission, the mean time a request held its slot, and `mean_slots_held`,
-  the slot time held over the run's wall time. Behind a proxy,
+  the mean number of slots held at once. The run reads the server's
+  `zinder_grpc_request_receive_slots_held` gauge when it starts, when it ends,
+  and every second between, leaving out reads that fail, and averages the
+  reads over time, so `mean_slots_held` counts slots held across either end of
+  the run and never exceeds the pool's size. Behind a proxy,
   `proxy_client_address_fallbacks` counts, by reason, the requests that
   counted against the proxy's own connection because they lacked one valid
   client address header.
