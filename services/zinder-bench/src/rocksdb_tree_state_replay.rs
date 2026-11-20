@@ -4,11 +4,14 @@
 //! construction checkpoint, at `k * 100 - 1`. A tree state there has no stored
 //! checkpoint, so the reader replays the 99 compact blocks above the
 //! checkpoint below it, the most any reconstruction replays. This command
-//! measures that case through the admitted canonical secondary API, over the
-//! whole retained range or a chosen window such as a dense spending range.
+//! measures that case through the admitted canonical secondary API. An explicit
+//! height file instead measures every selected read, including stored states.
+
+use std::{fs, path::PathBuf};
 
 use clap::Args;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use zinder_bench::BenchError;
 use zinder_core::{BlockHeight, ChainTipMetadata, NetworkUpgradeActivations};
 use zinder_store::{
@@ -33,6 +36,9 @@ pub(crate) struct RocksDbTreeStateReplayArgs {
     /// Most anchors measured, spread evenly over the window.
     #[arg(long = "max-anchors", default_value_t = DEFAULT_MAX_ANCHORS)]
     max_anchors: u32,
+    /// Measure every listed height in file order, including stored checkpoints.
+    #[arg(long, conflicts_with_all = ["from_height", "to_height", "max_anchors"])]
+    heights_file: Option<PathBuf>,
 }
 
 /// Reconstruction latency at every measured anchor of one READY store.
@@ -43,6 +49,7 @@ pub(crate) struct RocksDbTreeStateReplayReport {
     #[serde(flatten)]
     environment: ReadEnvironment,
     visible_tip_height: u32,
+    heights_file_sha256: Option<String>,
     #[serde(flatten)]
     measurement: TreeStateReplayMeasurement,
 }
@@ -72,6 +79,7 @@ struct LatencySeconds {
 #[derive(Debug, Serialize)]
 struct AnchorMeasurement {
     height: u32,
+    source: TreeStateSource,
     seed_checkpoint_height: u32,
     replayed_blocks: u32,
     replayed_note_commitments: u64,
@@ -81,10 +89,28 @@ struct AnchorMeasurement {
     warm_counters: ReadCounters,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TreeStateSource {
+    Stored,
+    Replayed,
+}
+
 /// Measures reconstructions at the anchors of one admitted READY store.
 pub(crate) fn run_rocksdb_tree_state_replay(
     args: &RocksDbTreeStateReplayArgs,
 ) -> Result<RocksDbTreeStateReplayReport, BenchError> {
+    let explicit = args
+        .heights_file
+        .as_ref()
+        .map(|path| {
+            let text = fs::read_to_string(path).map_err(|source| BenchError::io(path, source))?;
+            Ok::<_, BenchError>((
+                parse_heights(&text)?,
+                hex::encode(Sha256::digest(text.as_bytes())),
+            ))
+        })
+        .transpose()?;
     let (store, environment) = args.store.prepare()?;
     let (secondary, _) = store.open("tree-state", None)?;
     let ready = secondary.ready_evidence();
@@ -97,12 +123,14 @@ pub(crate) fn run_rocksdb_tree_state_replay(
             to_height: args.to_height,
             max_anchors: args.max_anchors,
         },
+        explicit.as_ref().map(|(heights, _)| heights.as_slice()),
     )?;
     Ok(RocksDbTreeStateReplayReport {
         contract_identity: "rocksdb-tree-state-replay",
-        report_format_version: 2,
+        report_format_version: 3,
         environment,
         visible_tip_height: ready.visible_tip.height.value(),
+        heights_file_sha256: explicit.map(|(_, digest)| digest),
         measurement,
     })
 }
@@ -115,10 +143,10 @@ pub(crate) struct ReplayWindow {
     pub(crate) max_anchors: u32,
 }
 
-/// Reconstructs the tree state at each anchor of `window` twice in a row.
+/// Reads the tree state at sampled or explicit heights twice in a row.
 ///
-/// The first reconstruction reads the anchor's compact blocks cold, and the
-/// second, run at once, reads them from the cache the first one filled.
+/// The first read uses the secondary's current cache state. The second read,
+/// run at once, can reuse the cache the first one filled.
 /// Measuring the warm replay before the next anchor keeps later replays from
 /// evicting the blocks of an earlier one when the sampled ranges exceed the
 /// secondary's block cache.
@@ -127,6 +155,7 @@ pub(crate) fn measure_tree_state_replays(
     activations: &NetworkUpgradeActivations,
     level: RocksDbStatisticsLevel,
     window: ReplayWindow,
+    explicit: Option<&[u32]>,
 ) -> Result<TreeStateReplayMeasurement, BenchError> {
     let ready = secondary.ready_evidence();
     let window_start = window
@@ -137,22 +166,13 @@ pub(crate) fn measure_tree_state_replays(
         .to_height
         .unwrap_or(u32::MAX)
         .min(ready.visible_tip.height.value());
-    let mut replays = Vec::new();
-    let mut stored_checkpoint_anchors_skipped = 0_u32;
-    for height in anchor_heights(window_start, window_end) {
-        let seed = secondary
-            .tree_state_checkpoint_at_or_before(BlockHeight::new(height))?
-            .ok_or_else(|| {
-                BenchError::report_format(format!("anchor {height} has no checkpoint below it"))
-            })?;
-        let seed_height = seed.block_id().height.value();
-        if seed_height == height {
-            stored_checkpoint_anchors_skipped = stored_checkpoint_anchors_skipped.saturating_add(1);
-        } else {
-            replays.push((height, seed_height, seed.tip_metadata()));
-        }
-    }
-    let replays = spread_evenly(replays, window.max_anchors);
+    let (replays, stored_checkpoint_anchors_skipped) = select_anchors(
+        secondary,
+        window_start,
+        window_end,
+        window.max_anchors,
+        explicit,
+    )?;
     if replays.is_empty() {
         return Err(BenchError::invalid_argument(
             "the window holds no anchor that needs a tree-state reconstruction",
@@ -164,6 +184,11 @@ pub(crate) fn measure_tree_state_replays(
         let warm = time_reconstruction(secondary, activations, *height, level)?;
         anchors.push(AnchorMeasurement {
             height: *height,
+            source: if height == seed_checkpoint_height {
+                TreeStateSource::Stored
+            } else {
+                TreeStateSource::Replayed
+            },
             seed_checkpoint_height: *seed_checkpoint_height,
             replayed_blocks: height.saturating_sub(*seed_checkpoint_height),
             replayed_note_commitments: commitments_between(*seed_sizes, cold.rows),
@@ -181,6 +206,65 @@ pub(crate) fn measure_tree_state_replays(
         warm_seconds: LatencySeconds::of(anchors.iter().map(|anchor| anchor.warm_seconds)),
         anchors,
     })
+}
+
+fn parse_heights(text: &str) -> Result<Vec<u32>, BenchError> {
+    let heights = text
+        .lines()
+        .map(|line| {
+            line.trim().parse::<u32>().map_err(|_| {
+                BenchError::invalid_argument("--heights-file requires one u32 height per line")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if heights.is_empty() {
+        return Err(BenchError::invalid_argument(
+            "--heights-file must not be empty",
+        ));
+    }
+    Ok(heights)
+}
+
+type SelectedAnchor = (u32, u32, ChainTipMetadata);
+
+fn select_anchors(
+    secondary: &RocksDbCanonicalSecondary,
+    start: u32,
+    end: u32,
+    max: u32,
+    explicit: Option<&[u32]>,
+) -> Result<(Vec<SelectedAnchor>, u32), BenchError> {
+    let heights = explicit.map_or_else(|| anchor_heights(start, end).collect(), <[u32]>::to_vec);
+    if (explicit.is_some() && heights.is_empty())
+        || heights.iter().any(|height| !(start..=end).contains(height))
+    {
+        return Err(BenchError::invalid_argument(
+            "selected heights must be nonempty and within the retained window",
+        ));
+    }
+    let mut selected = Vec::new();
+    let mut skipped = 0_u32;
+    for height in heights {
+        let seed = secondary
+            .tree_state_checkpoint_at_or_before(BlockHeight::new(height))?
+            .ok_or_else(|| {
+                BenchError::report_format(format!("anchor {height} has no checkpoint below it"))
+            })?;
+        let seed_height = seed.block_id().height.value();
+        if explicit.is_none() && seed_height == height {
+            skipped = skipped.saturating_add(1);
+        } else {
+            selected.push((height, seed_height, seed.tip_metadata()));
+        }
+    }
+    Ok((
+        if explicit.is_some() {
+            selected
+        } else {
+            spread_evenly(selected, max)
+        },
+        skipped,
+    ))
 }
 
 fn time_reconstruction(
@@ -268,13 +352,121 @@ impl LatencySeconds {
 
 #[cfg(test)]
 mod tests {
-    use zinder_core::Network;
+    use rust_rocksdb::{PerfMetric, statistics::Ticker};
+    use zinder_core::{BlockHeight, Network};
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture,
         sample_regtest_upgrade_activations, with_note_commitments,
     };
 
-    use super::{ReplayWindow, anchor_heights, measure_tree_state_replays, spread_evenly};
+    use super::{
+        ReplayWindow, TreeStateSource, anchor_heights, measure_tree_state_replays, parse_heights,
+        spread_evenly,
+    };
+
+    #[test]
+    fn explicit_height_file_preserves_order_and_rejects_invalid_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(parse_heights("199\n100\n199\n")?, [199, 100, 199]);
+        for invalid in ["", "\n", "1\n\n2", "-1", "4294967296", "99 100"] {
+            assert!(parse_heights(invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_sparse_dense_and_mixed_reads_retain_attribution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = with_note_commitments(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(250),
+            &activations,
+        )?;
+        for live_dense in [false, true] {
+            let baseline = CanonicalBaseline::new(&chain)
+                .through(BlockHeight::new(if live_dense { 1 } else { 250 }));
+            let mut writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
+            if live_dense {
+                writer.append_settled_blocks(&chain)?;
+            }
+            let mut store = writer.into_serving_store_fixture()?;
+            let (canonical, _wallet) = store.take_readers()?;
+            for heights in [
+                &[99, 199][..],
+                &[100, 200][..],
+                &[199, 100, 99, 250, 100][..],
+            ] {
+                let measurement = measure_tree_state_replays(
+                    &canonical,
+                    &activations,
+                    zinder_store::RocksDbStatisticsLevel::Tickers,
+                    ReplayWindow {
+                        from_height: None,
+                        to_height: None,
+                        max_anchors: 1,
+                    },
+                    Some(heights),
+                )?;
+                assert_explicit_reads(&measurement, heights, live_dense)?;
+            }
+            assert!(
+                measure_tree_state_replays(
+                    &canonical,
+                    &activations,
+                    zinder_store::RocksDbStatisticsLevel::Tickers,
+                    ReplayWindow {
+                        from_height: None,
+                        to_height: None,
+                        max_anchors: 64
+                    },
+                    Some(&[251]),
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_explicit_reads(
+        measurement: &super::TreeStateReplayMeasurement,
+        heights: &[u32],
+        live_dense: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(measurement.stored_checkpoint_anchors_skipped, 0);
+        assert_eq!(
+            measurement
+                .anchors
+                .iter()
+                .map(|a| a.height)
+                .collect::<Vec<_>>(),
+            heights
+        );
+        for anchor in &measurement.anchors {
+            let stored = live_dense || anchor.height % 100 == 0 || anchor.height == 250;
+            assert_eq!(
+                anchor.source,
+                if stored {
+                    TreeStateSource::Stored
+                } else {
+                    TreeStateSource::Replayed
+                }
+            );
+            assert_eq!(anchor.replayed_blocks == 0, stored);
+            assert_eq!(anchor.replayed_note_commitments == 0, stored);
+            let encoded = serde_json::to_value(anchor)?;
+            assert!(
+                encoded["cold_counters"]["ticker_deltas"][Ticker::NumberKeysRead.name()].is_u64()
+            );
+            assert!(
+                encoded["cold_counters"]["perf_context"][PerfMetric::BlockReadCount.name()]
+                    .is_u64()
+            );
+            assert!(
+                encoded["warm_counters"]["perf_context"][PerfMetric::BlockReadByte.name()].is_u64()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn anchors_sit_one_block_below_each_checkpoint_stride() {
@@ -314,6 +506,7 @@ mod tests {
                 to_height: None,
                 max_anchors: 64,
             },
+            None,
         )?;
 
         assert_eq!(measurement.stored_checkpoint_anchors_skipped, 0);
