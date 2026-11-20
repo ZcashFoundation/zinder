@@ -1,6 +1,0 @@
-kind: changed
-body: Lightwalletd block-range responses spend less time converting compact transactions when a wallet requests only shielded pools or nullifiers.
-time: 2026-11-20T08:55:27.933056771Z
-custom:
-    Bump: patch
-    PR: "358"

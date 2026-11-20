@@ -1,6 +1,0 @@
-kind: fixed
-body: Wallets can send up to 20,000 transaction ID suffixes in one GetMempoolTx request, matching Go lightwalletd v0.6.2.
-time: 2026-11-20T11:57:39.86222763Z
-custom:
-    Bump: patch
-    PR: "402"

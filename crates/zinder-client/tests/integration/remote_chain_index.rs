@@ -605,6 +605,47 @@ async fn chain_events_at_revision(
 }
 
 #[tokio::test]
+async fn an_unmarked_stream_rejects_settled_subscriptions_and_enforces_visible_resume_ranges()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut epoch = chain
+        .chain_epoch(zinder_client::ChainEpochId::new(2))
+        .ok_or_else(|| eyre!("missing chain epoch"))?;
+    let settled = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("missing settled block"))?;
+    epoch.settled_tip_height = settled.height;
+    epoch.settled_tip_hash = settled.hash;
+    let message = chain_event_message(epoch, 2, vec![2]);
+    let endpoint = spawn_malformed_chain_event_service(vec![message]).await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    assert!(matches!(
+        index
+            .chain_events_for_family(
+                EventStreamStart::LiveTail,
+                zinder_client::ChainEventStreamFamily::Settled
+            )
+            .await,
+        Err(IndexerError::FailedPrecondition { .. })
+    ));
+    let cursor = zinder_client::ChainEventCursor::from_bytes([1]);
+    let mut visible = index
+        .chain_events(EventStreamStart::AfterCursor(cursor))
+        .await?;
+    assert!(matches!(
+        visible.next().await,
+        Some(Err(IndexerError::MalformedResponse {
+            field: "committed.block_range",
+            ..
+        }))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_pruned_reorg_requires_rebuild_before_delivering_its_cursor() -> eyre::Result<()> {
     for revision in [8, 9] {
         let cursor = zinder_client::ChainEventCursor::from_bytes([1]);

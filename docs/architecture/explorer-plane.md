@@ -183,7 +183,7 @@ The Explorer serves `/healthz`, `/readyz`, and `/metrics` on its ops listener, `
 | Method or field | Behavior |
 | --- | --- |
 | The seven [unadvertised methods](#unadvertised-methods) | Fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. |
-| `MempoolEventCounts` | No runtime indexes mempool events. From native contract revision 12, a direct call for a window with no indexed counts fails with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`. |
+| `MempoolEventCounts` | No runtime indexes mempool events. From native contract revision 13, a direct call for a window with no indexed counts fails with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`. |
 | `OverviewSnapshot.mempool_events` | Absent for a window with no indexed counts. `freshness.unavailable` lists `mempool_events` with `UNAVAILABLE_NOT_INDEXED`. |
 | `ValuePoolBalanceHistory` | No runtime writes balance history. A direct call returns no points and reports incomplete coverage. |
 | `TransactionDetail.intrinsic_value_balances` | Never returned. |

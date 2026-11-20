@@ -11,6 +11,9 @@
 //! twin: it owns the translations whose return type is one of the
 //! generated `zinder_proto::v1::*` enums.
 
+/// Initial gRPC metadata on a settled wallet chain-event subscription. Its value is `"settled"`.
+pub const CHAIN_EVENT_FAMILY_HEADER: &str = "zinder-chain-event-family";
+
 mod activation_schedule;
 mod canonical_store_damaged;
 mod canonical_writer_fence;

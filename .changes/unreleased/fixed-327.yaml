@@ -1,6 +1,0 @@
-kind: fixed
-body: "The lightwalletd-compatible `GetSubtreeRoots` now streams every remaining subtree root when `maxEntries` is 0, instead of stopping at 1,000 roots with an `OK` status. Mainnet has more than 1,100 Sapling subtrees, so wallets that requested every root received a truncated list. If the chain view a stream started on is retired mid-stream, the stream ends with a retryable `UNAVAILABLE`; retry from the original `startIndex`."
-time: 2026-11-19T20:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "327"

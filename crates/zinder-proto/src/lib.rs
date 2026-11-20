@@ -21,7 +21,7 @@ pub use error_policy::{
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
 /// advertised capabilities satisfy their requirements.
-pub const CONTRACT_REVISION: u32 = 12;
+pub const CONTRACT_REVISION: u32 = 13;
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///

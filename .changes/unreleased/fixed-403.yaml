@@ -1,6 +1,0 @@
-kind: fixed
-body: Both lightwalletd nullifier RPCs return chain metadata with zero tree sizes. Unrecognized numeric pool filters select no transaction components, so range requests still return every block and mixed filters return the recognized pools.
-time: 2026-11-20T12:00:04.222769305Z
-custom:
-    Bump: patch
-    PR: "403"

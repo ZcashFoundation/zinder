@@ -5,9 +5,9 @@ use std::{sync::Arc, time::Duration};
 use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, BlockId, ChainEpochId, ChainEvent, ChainEventCursor, ChainEventEnvelope,
-    EndpointBackedIndex, EventStreamStart, Network, RemoteChainIndex, RemoteOpenOptions,
-    TransactionId,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpochId, ChainEvent, ChainEventCursor,
+    ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
+    EventStreamStart, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
 };
 use zinder_query::{
     AdmittedIngestControl, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
@@ -15,17 +15,15 @@ use zinder_query::{
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
-    IngestControlFixture, sample_regtest_upgrade_activations,
+    IngestControlFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 use super::remote_chain_index::spawn_wallet_query;
 
-async fn first_event(
-    writer: &mut CanonicalWriterFixture,
+async fn connect_to_fixture(
+    fixture: &mut WalletServingStoreFixture,
     control: &IngestControlFixture,
-    start: EventStreamStart<ChainEventCursor>,
-) -> eyre::Result<ChainEventEnvelope> {
-    let mut fixture = writer.serving_store_fixture()?;
+) -> eyre::Result<RemoteChainIndex> {
     let (canonical, wallet) = fixture.take_readers()?;
     let pair = WalletServingReadPair::new(
         Arc::new(RocksDbCanonicalReader::new(canonical)?),
@@ -42,8 +40,23 @@ async fn first_event(
         WalletEndpointMetadata::default(),
     ))
     .await?;
-    let index = RemoteChainIndex::connect(RemoteOpenOptions { endpoint, network })?;
-    let mut stream = index.chain_events(start).await?;
+    Ok(RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network,
+    })?)
+}
+
+async fn first_event(
+    writer: &mut CanonicalWriterFixture,
+    control: &IngestControlFixture,
+    start: EventStreamStart<ChainEventCursor>,
+) -> eyre::Result<ChainEventEnvelope> {
+    let mut fixture = writer.serving_store_fixture()?;
+    let index = connect_to_fixture(&mut fixture, control).await?;
+    next_event(&mut index.chain_events(start).await?).await
+}
+
+async fn next_event(stream: &mut ChainEventStream) -> eyre::Result<ChainEventEnvelope> {
     Ok(tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await?
         .ok_or_else(|| eyre!("chain stream ended before the next event"))??)
@@ -120,6 +133,53 @@ async fn visible_cursor_recovers_after_pruned_reorgs_and_resumes_the_next_live_a
         if reverted.chain_epoch == baseline.chain_epoch
         && reverted.block_range.start == fork
         && committed.block_range.end == BlockHeight::new(7))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn settled_cursor_resumes_newly_settled_ranges_with_the_original_visible_epoch()
+-> eyre::Result<()> {
+    let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let chain = with_tip_coinbase(ChainFixture::new(Network::ZcashRegtest).extend_blocks(4), 1)?;
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(2)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let extended = chain.extend_blocks(1);
+    let settled = extended
+        .block_at(BlockHeight::new(3))
+        .ok_or_else(|| eyre!("missing settled block"))?;
+    writer.append_live_block_with_settled_tip(
+        &extended,
+        BlockId::new(settled.height, settled.hash),
+    )?;
+    let mut fixture = writer.serving_store_fixture()?;
+    let index = connect_to_fixture(&mut fixture, &control).await?;
+    let mut stream = index
+        .chain_events_for_family(
+            EventStreamStart::EarliestRetained,
+            ChainEventStreamFamily::Settled,
+        )
+        .await?;
+    let baseline = next_event(&mut stream).await?;
+    assert!(
+        matches!(baseline.event, ChainEvent::ChainCommitted { committed }
+        if committed.block_range == BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2))
+        && committed.chain_epoch == baseline.chain_epoch)
+    );
+    assert_eq!(baseline.chain_epoch.visible_tip_height, BlockHeight::new(4));
+    let cursor = ChainEventCursor::from_bytes(baseline.cursor.as_bytes());
+    let mut resumed = index
+        .chain_events(EventStreamStart::AfterCursor(cursor))
+        .await?;
+    let appended = next_event(&mut resumed).await?;
+    assert_eq!(appended, next_event(&mut stream).await?);
+    assert_eq!(appended.chain_epoch, index.current_epoch().await?);
+    assert!(
+        matches!(appended.event, ChainEvent::ChainCommitted { committed }
+        if committed.block_range == BlockHeightRange::inclusive(settled.height, settled.height)
+        && committed.chain_epoch == appended.chain_epoch)
     );
     Ok(())
 }
