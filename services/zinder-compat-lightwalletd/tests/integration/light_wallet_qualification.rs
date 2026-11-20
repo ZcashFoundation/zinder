@@ -36,6 +36,7 @@ use zinder_testkit::{
 
 mod address_validation;
 mod canonical;
+mod utxo_transport;
 
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 
