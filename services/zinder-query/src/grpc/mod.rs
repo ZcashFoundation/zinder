@@ -9,7 +9,6 @@ mod shutdown_stream;
 
 use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
-use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_proto::wire::canonical_history_unavailable_status;
 use zinder_proto::{BoundaryError, status_with_reason};
 use zinder_store::status_from_store_error;
@@ -79,8 +78,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::UnsupportedShieldedProtocol { .. }
         | QueryError::TransparentOutpointCountOutOfRange { .. }
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
-        QueryError::TransactionBroadcastDisabled
-        | QueryError::MaterializedViewUnavailable { .. }
+        QueryError::MaterializedViewUnavailable { .. }
         | QueryError::EndpointCapabilityUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
@@ -168,13 +166,6 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
 )]
 fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
     match error {
-        QueryError::TransactionBroadcastDisabled => {
-            ErrorDetails::with_precondition_failure_violation(
-                "TRANSACTION_BROADCAST_DISABLED",
-                WALLET_BROADCAST_TRANSACTION_V1,
-                "transaction broadcast is not configured for this deployment",
-            )
-        }
         QueryError::MaterializedViewUnavailable { capability } => {
             ErrorDetails::with_precondition_failure_violation(
                 "MATERIALIZED_VIEW_UNAVAILABLE",

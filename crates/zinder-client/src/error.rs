@@ -58,6 +58,9 @@ pub enum RetryPolicy {
     /// Restart the chain-event stream from the earliest retained event and
     /// rebuild derived state from that replay boundary.
     RestartFromEarliestRetained,
+    /// Discard the expired cursor and any partial mempool snapshot. Read a new
+    /// snapshot from its first page, then subscribe from its events resume cursor.
+    RefreshMempoolSnapshot,
     /// Retry with exponential backoff. The remote service or upstream node
     /// is transiently unavailable; the request shape is correct.
     RetryWithBackoff,
@@ -451,10 +454,10 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::TransparentOutpointCountOutOfRange
         | ErrorReason::SnapshotPageCursorInvalid
         | ErrorReason::BroadcastTransactionTooLarge => RetryPolicy::ClientError,
-        ErrorReason::BroadcastDisabled
-        | ErrorReason::MempoolEventCursorExpired
-        | ErrorReason::SnapshotPageCursorExpired
-        | ErrorReason::SchemaMismatch
+        ErrorReason::MempoolEventCursorExpired | ErrorReason::SnapshotPageCursorExpired => {
+            RetryPolicy::RefreshMempoolSnapshot
+        }
+        ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
         | ErrorReason::ChainEpochConflict
@@ -687,6 +690,21 @@ mod tests {
         assert_eq!(error.reason(), Some(ErrorReason::SubtreeRootRangeTooLarge));
         assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn retired_broadcast_reason_from_older_servers_preserves_its_name() {
+        let status = tonic::Status::with_error_details(
+            Code::FailedPrecondition,
+            "broadcast disabled",
+            ErrorDetails::with_error_info("BROADCAST_DISABLED", ZINDER_ERROR_DOMAIN, []),
+        );
+        let error = IndexerError::from_status(status);
+        assert_eq!(
+            error.reason(),
+            Some(ErrorReason::Unknown("BROADCAST_DISABLED".to_owned()))
+        );
+        assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
     }
 
     #[test]

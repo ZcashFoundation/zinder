@@ -1982,7 +1982,7 @@ async fn writer_status_answers_during_the_source_recovery_backoff()
 }
 
 /// A canonical store published through height 4, the tip of its source.
-async fn follower_fixture_at_its_node_tip() -> Result<
+pub(super) async fn follower_fixture_at_its_node_tip() -> Result<
     (
         RecordingParseableSource,
         Arc<NetworkUpgradeActivations>,
@@ -2013,7 +2013,7 @@ async fn follower_fixture_at_its_node_tip() -> Result<
 
 /// A follower that bounds each node request by the default
 /// `node.request_timeout_secs`.
-fn follower_with_default_request_timeout<'a>(
+pub(super) fn follower_with_default_request_timeout<'a>(
     source: &'a RecordingParseableSource,
     activations: &Arc<NetworkUpgradeActivations>,
     readiness: &'a ComposedReadiness,

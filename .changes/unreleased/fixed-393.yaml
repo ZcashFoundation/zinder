@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallets can recover from an expired mempool event or snapshot page cursor. The Rust SDK reports `RefreshMempoolSnapshot`. Discard partial pages, take a fresh snapshot, and subscribe from its events resume cursor. Native contract revision 11 reserves the retired `BROADCAST_DISABLED` reason. Match `ENDPOINT_CAPABILITY_UNAVAILABLE` when broadcast is unavailable. Upgrade ingest and native query together because query requires a writer at its own revision.
+time: 2026-11-20T11:11:20.553142021Z
+custom:
+    Bump: minor
+    PR: "393"

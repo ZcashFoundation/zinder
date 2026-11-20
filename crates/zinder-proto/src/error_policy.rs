@@ -89,8 +89,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
             ReasonPolicy::new(Code::InvalidArgument, NonRetryable)
         }
 
-        ErrorReason::BroadcastDisabled
-        | ErrorReason::ChainEventCursorExpired
+        ErrorReason::ChainEventCursorExpired
         | ErrorReason::MempoolEventCursorExpired
         | ErrorReason::SnapshotPageCursorExpired
         | ErrorReason::ChainEpochPinUnavailable

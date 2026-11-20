@@ -19,6 +19,7 @@ use zinder_core::{
     BlockHeightRange, ChainEpoch, ShieldedProtocol, UnixTimestampMillis,
     wire::encode_zinder_native_chain_name,
 };
+use zinder_proto::status_for_reason;
 use zinder_proto::v1::ingest::{
     AcquireCanonicalProjectionBuildLeaseRequest, CanonicalCheckpointBlockId,
     CanonicalCheckpointFrontier, CanonicalCheckpointHistoryPredecessor,
@@ -1697,18 +1698,21 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
         CanonicalStoreError::CanonicalEpochNotRetained { .. } => {
             Status::failed_precondition("canonical retained event epoch is unavailable")
         }
-        CanonicalStoreError::MempoolEventCursorExpired { .. } => {
-            Status::failed_precondition("mempool event cursor has expired")
-        }
-        CanonicalStoreError::MempoolSnapshotCursorExpired { .. } => {
-            Status::failed_precondition("mempool snapshot page cursor has expired")
-        }
+        CanonicalStoreError::MempoolEventCursorExpired { .. } => status_for_reason(
+            ops::ErrorReason::MempoolEventCursorExpired,
+            "mempool event cursor has expired",
+        ),
+        CanonicalStoreError::MempoolSnapshotCursorExpired { .. } => status_for_reason(
+            ops::ErrorReason::SnapshotPageCursorExpired,
+            "mempool snapshot page cursor has expired",
+        ),
         CanonicalStoreError::MempoolEventCursorInvalid { .. } => {
             Status::invalid_argument("mempool event cursor is invalid")
         }
-        CanonicalStoreError::MempoolSnapshotCursorInvalid { .. } => {
-            Status::invalid_argument("mempool snapshot page cursor is invalid")
-        }
+        CanonicalStoreError::MempoolSnapshotCursorInvalid { .. } => status_for_reason(
+            ops::ErrorReason::SnapshotPageCursorInvalid,
+            "mempool snapshot page cursor is invalid",
+        ),
         CanonicalStoreError::MempoolEventSequenceOverflow => {
             Status::resource_exhausted("mempool event sequence is exhausted")
         }
@@ -1770,6 +1774,26 @@ pub(crate) mod test_support {
     };
 
     use super::*;
+
+    #[test]
+    fn malformed_snapshot_cursor_carries_the_invalid_page_reason() {
+        use tonic_types::StatusExt as _;
+
+        let status = map_store_error(&CanonicalStoreError::MempoolSnapshotCursorInvalid {
+            reason: "cursor authentication failed",
+        });
+        let details = status.get_error_details();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            details
+                .error_info()
+                .map(|detail| (detail.domain.as_str(), detail.reason.as_str())),
+            Some((
+                zinder_proto::ZINDER_ERROR_DOMAIN,
+                ops::ErrorReason::SnapshotPageCursorInvalid.as_str_name()
+            )),
+        );
+    }
 
     /// A request the owner of the canonical primary never services fails with
     /// the writer's typed `STORAGE_UNAVAILABLE`, whether the owner is gone,

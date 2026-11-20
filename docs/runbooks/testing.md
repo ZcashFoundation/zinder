@@ -44,6 +44,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+scripts/test-nextest-selectors.sh
 cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
@@ -55,6 +56,11 @@ scripts/runbook-lint.sh docs/runbooks/testing.md
 scripts/test-install-ci-tool.sh
 git diff --check
 ```
+
+`scripts/test-nextest-selectors.sh` checks that every test-name predicate in
+the nextest profiles and live workflow selects a compiled test, including
+ignored tests. It checks exclusions individually and reuses the workspace
+test binaries.
 
 The `dependency hygiene` CI job also runs script tests for release, deployment,
 storage-benchmark, and entrypoint policy. When you change one of those areas,
@@ -254,7 +260,7 @@ are set:
 | `ZINDER_TEST_PARITY_ZINDER_ADDR`, `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR` | The `live::parity_against_lightwalletd` tests |
 | `ZINDER_TEST_ZINGOLIB_BIN`, `ZINDER_TEST_ZINGOLIB_SERVER` | The Zingolib real-client flow |
 | `ZINDER_TEST_COMPACT_*` | The two `live::compact_blocks_process` tests |
-| `ZINDER_TEST_CANONICAL_BLOCK_COUNT` | The block count of the Testnet canonical tracer (default 1,000) |
+| `ZINDER_TEST_CANONICAL_BLOCK_COUNT` | The block count of the Testnet or Mainnet checkpoint tracer (default 1,000) |
 
 When you record evidence, count only the tests that exercised the node.
 
@@ -422,7 +428,7 @@ export ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest
 # export ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest
 
 cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-  -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+  -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 sleep 6
 cargo nextest run --workspace --profile=ci-live --run-ignored=all \
   -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
@@ -489,7 +495,9 @@ Two tests matter mostly on Testnet and Mainnet:
 - `canonical_blocks_load_requested_range_from_fixed_checkpoint` loads a fixed
   range (1,000 blocks by default) into a canonical store and verifies the
   written files. It leaves the store in its building state, so it does not
-  prove readiness.
+  prove readiness. The live profile allows five minutes. The weekly Testnet
+  lane skips this tracer, and the manually dispatched Mainnet lane includes
+  it. You can also run it locally on Testnet.
 
 To run that tracer in Docker beside a Z3 Testnet node, without touching the
 node's chain volume:

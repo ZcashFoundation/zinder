@@ -551,7 +551,6 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::UnsupportedWalletEncoding { .. }) => "unsupported_wallet_encoding",
-        Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::BroadcastBudgetExhausted { .. }) => "broadcast_budget_exhausted",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
@@ -1101,10 +1100,6 @@ pub enum QueryError {
         value_kind: &'static str,
     },
 
-    /// Transaction broadcast is disabled for this query handle.
-    #[error("transaction broadcast is disabled")]
-    TransactionBroadcastDisabled,
-
     /// Raw transaction exceeds the maximum serialized size accepted for broadcast.
     #[error("raw transaction is too large: {actual} bytes exceeds maximum {maximum}")]
     BroadcastTransactionTooLarge {
@@ -1277,7 +1272,6 @@ impl zinder_proto::BoundaryError for QueryError {
             }
             Self::InvalidAddress { .. } => ErrorReason::InvalidAddress,
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
-            Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
             Self::BroadcastBudgetExhausted { .. } => ErrorReason::BroadcastBudgetExhausted,
             Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
@@ -1424,7 +1418,6 @@ mod error_reason_tests {
             QueryError::UnsupportedWalletEncoding {
                 value_kind: "probe",
             },
-            QueryError::TransactionBroadcastDisabled,
             QueryError::BroadcastTransactionTooLarge {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,
                 maximum: MAX_RAW_TRANSACTION_BYTES,

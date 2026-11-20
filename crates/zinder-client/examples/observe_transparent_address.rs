@@ -97,7 +97,9 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
                 RetryPolicy::RefreshChainEpoch | RetryPolicy::RestartFromEarliestRetained => {}
-                RetryPolicy::OperatorActionRequired | RetryPolicy::ClientError => {
+                RetryPolicy::OperatorActionRequired
+                | RetryPolicy::ClientError
+                | RetryPolicy::RefreshMempoolSnapshot => {
                     return Err(error);
                 }
                 // RetryPolicy is non-exhaustive; fail closed on unknown
