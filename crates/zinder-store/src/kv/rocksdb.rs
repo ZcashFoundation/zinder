@@ -1719,10 +1719,18 @@ mod tests {
             property(&compacted, "rocksdb.num-files-at-level0"),
             Some(0.0)
         );
-        assert!((1..=6).any(|level| property(
-            &compacted,
-            &format!("rocksdb.num-files-at-level{level}")
-        ) == Some(1.0)));
+        let occupied_property = (1..=6)
+            .map(|level| format!("rocksdb.num-files-at-level{level}"))
+            .find(|name| property(&compacted, name) == Some(1.0))
+            .ok_or("compaction must move the SST above level 0")?;
+        drop(rows);
+        drop(primary);
+
+        let empty = tempfile::tempdir()?;
+        let reopened = open_rows_primary(empty.path())?;
+        reopened.record_resource_gauges(StoreRole::CanonicalPrimary, &["rows"]);
+        let after_reopen = recorder.handle().render();
+        assert_eq!(property(&after_reopen, &occupied_property), Some(0.0));
         Ok(())
     }
 
