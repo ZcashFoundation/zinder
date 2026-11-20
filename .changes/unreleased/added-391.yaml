@@ -1,0 +1,6 @@
+kind: added
+body: Run paired benchmark campaigns with matched work checks, input digests, and raw reports. Wallet-load reports distinguish checkpoint reads from tree-state rebuilds.
+time: 2026-11-20T10:47:00.519393053Z
+custom:
+    Bump: patch
+    PR: "391"
