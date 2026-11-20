@@ -1,6 +1,0 @@
-kind: fixed
-body: Clients using gRPC reflection v1alpha can now discover `CompactTxStreamer` and retrieve its message definitions from the lightwalletd endpoint in wallet and compact-blocks modes.
-time: 2026-11-20T11:55:14.614603339Z
-custom:
-    Bump: patch
-    PR: "401"
