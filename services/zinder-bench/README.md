@@ -1043,7 +1043,7 @@ from the fifth block after the fixture interrupts the first stream with
 selects Sapling, Orchard, and Ironwood. The CLI reports all 64 blocks
 scanned.
 
-The fixture measures the pinned client's direct gRPC path through sync
+The fixture exercises the pinned client's direct gRPC path through sync
 completion over a span with no new note commitments. On a populated chain,
 subtree boundaries and discovered transactions change which ranges
 PepperSync prioritizes. Wallets with history can trigger additional lookups.
