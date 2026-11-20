@@ -1,0 +1,6 @@
+kind: added
+body: The rocksdb-tree-state-replay benchmark accepts an explicit height file to compare stored and replayed WalletQuery storage reads at identical heights, preserving their order and duplicates and recording the input digest and per-height read counters.
+time: 2026-11-20T21:02:01.260574681Z
+custom:
+    Bump: minor
+    PR: "438"
