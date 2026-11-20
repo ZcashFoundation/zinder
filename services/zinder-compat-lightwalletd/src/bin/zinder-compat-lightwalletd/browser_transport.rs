@@ -3,7 +3,7 @@ use std::{convert::Infallible, future::Future, net::SocketAddr, time::Duration};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use tonic::{Status, body::Body, server::NamedService, transport::server::TcpIncoming};
 use tonic_web::GrpcWebLayer;
-use tower::{Service, ServiceBuilder};
+use tower::{Layer, Service, ServiceBuilder};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     validate_request::{ValidateRequest, ValidateRequestHeaderLayer},
@@ -43,14 +43,7 @@ where
 {
     let browser_origins = &config.browser_origins;
     let enabled = !browser_origins.is_empty();
-    let transport = ServiceBuilder::new()
-        .layer(ValidateRequestHeaderLayer::custom(CompatRequest {
-            browser_enabled: enabled,
-        }))
-        .option_layer(enabled.then(|| browser_cors(browser_origins)))
-        .option_layer(enabled.then(GrpcWebLayer::new))
-        .option_layer(enabled.then(|| ValidateRequestHeaderLayer::custom(UnsupportedBrowserCall)))
-        .into_inner();
+    let transport = transport_layers(browser_origins);
     let router = runtime.public_grpc_router_with_transport(
         (
             wallet_service,
@@ -64,6 +57,35 @@ where
         incoming,
         runtime.grpc_server_shutdown(),
     )))
+}
+
+fn transport_layers<S>(
+    browser_origins: &[HeaderValue],
+) -> impl Layer<
+    S,
+    Service: Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = S::Error,
+        Future: Send + 'static,
+    > + Clone
+                 + Send
+                 + 'static,
+> + Clone
++ use<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    let enabled = !browser_origins.is_empty();
+    ServiceBuilder::new()
+        .layer(ValidateRequestHeaderLayer::custom(CompatRequest {
+            browser_enabled: enabled,
+        }))
+        .option_layer(enabled.then(|| browser_cors(browser_origins)))
+        .option_layer(enabled.then(GrpcWebLayer::new))
+        .option_layer(enabled.then(|| ValidateRequestHeaderLayer::custom(UnsupportedBrowserCall)))
+        .into_inner()
 }
 
 fn browser_cors(origins: &[HeaderValue]) -> CorsLayer {
@@ -175,6 +197,9 @@ impl ValidateRequest<Body> for UnsupportedBrowserCall {
         }
     }
 }
+
+#[cfg(test)]
+mod receive_tests;
 
 #[cfg(test)]
 mod tests {

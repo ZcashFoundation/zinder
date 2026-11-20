@@ -6101,6 +6101,8 @@ dependencies = [
  "eyre",
  "hex",
  "http",
+ "http-body",
+ "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot 0.13.0",
