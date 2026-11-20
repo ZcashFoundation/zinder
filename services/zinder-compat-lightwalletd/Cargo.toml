@@ -12,13 +12,14 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-light-wallet-qualification = ["zinder-query/light-wallet-qualification"]
+light-wallet-qualification = ["dep:futures-util", "zinder-query/light-wallet-qualification"]
 
 [dependencies]
 async-trait.workspace = true
 arc-swap.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
+futures-util = { workspace = true, optional = true }
 hex.workspace = true
 http.workspace = true
 prost.workspace = true

@@ -39,8 +39,9 @@ use crate::{
     NodeTarget, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
     SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
-    SourceTransparentUnspentOutput, TransactionBroadcaster, TransparentAddressLookup,
-    TransparentAddressRowLimit, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    SourceTransparentUnspentOutput, SourceTransparentUtxoPage, TransactionBroadcaster,
+    TransparentAddressLookup, TransparentAddressRowLimit,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
@@ -851,6 +852,69 @@ impl ZebraJsonRpcSource {
         &self,
         transaction_id: TransactionId,
     ) -> Result<UpstreamTransactionLookup, SourceError> {
+        let Some(reply) = self.verbose_transaction::<Value>(transaction_id).await? else {
+            return Ok(UpstreamTransactionLookup::NotFound);
+        };
+        let Some(height) = reply["height"].as_u64() else {
+            return Ok(UpstreamTransactionLookup::InMempool);
+        };
+        let block = mined_transaction_block(height, reply["blockhash"].as_str())?;
+        Ok(UpstreamTransactionLookup::Mined {
+            mined_height: block.height,
+            block_hash: block.hash,
+        })
+    }
+
+    /// Fetches a best-chain transaction's block and serialized bytes together
+    /// with one verbose `getrawtransaction`. Returns `None` if the node no
+    /// longer reports the transaction as mined on its best chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source error if the node is unavailable or its reply has
+    /// invalid bytes, an invalid mined location, or a different transaction ID.
+    pub async fn fetch_mined_transaction_bytes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<(BlockId, Vec<u8>)>, SourceError> {
+        let Some(raw) = self
+            .verbose_transaction::<Box<RawValue>>(transaction_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let JsonObject(reply): JsonObject<MinedTransactionReply<'_>> =
+            serde_json::from_str(raw.get()).map_err(|_| SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned an invalid transaction object",
+            })?;
+        let height = match reply.height {
+            Some(-1) | None => return Ok(None),
+            Some(height) => {
+                u64::try_from(height).map_err(|_| SourceError::SourceProtocolMismatch {
+                    reason: "verbose getrawtransaction returned an invalid mined height",
+                })?
+            }
+        };
+        let block = mined_transaction_block(height, reply.blockhash)?;
+        if decode_display_transaction_id(reply.txid)? != transaction_id {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned another transaction ID",
+            });
+        }
+        if reply.hex.is_empty() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned empty transaction bytes",
+            });
+        }
+        let bytes = hex::decode(reply.hex)
+            .map_err(|source| SourceError::InvalidRawTransactionHex { source })?;
+        Ok(Some((block, bytes)))
+    }
+
+    async fn verbose_transaction<Reply: for<'de> Deserialize<'de>>(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<Reply>, SourceError> {
         let params = positional_params([
             Value::from(display_order_transaction_id_hex(transaction_id)),
             Value::from(1),
@@ -859,7 +923,7 @@ impl ZebraJsonRpcSource {
         let started_at = Instant::now();
         let response = self
             .request_client()?
-            .request::<Value, _>("getrawtransaction", params)
+            .request::<Reply, _>("getrawtransaction", params)
             .await;
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
@@ -869,32 +933,11 @@ impl ZebraJsonRpcSource {
         ));
 
         match response {
-            Ok(verbose_response) => {
-                let height_value = verbose_response.get("height").and_then(Value::as_u64);
-                let Some(height_value) = height_value else {
-                    return Ok(UpstreamTransactionLookup::InMempool);
-                };
-                let mined_height = BlockHeight::new(u32::try_from(height_value).map_err(|_| {
-                    SourceError::SourceProtocolMismatch {
-                        reason: "verbose getrawtransaction height does not fit u32",
-                    }
-                })?);
-                let block_hash_hex = verbose_response
-                    .get("blockhash")
-                    .and_then(Value::as_str)
-                    .ok_or(SourceError::SourceProtocolMismatch {
-                        reason: "verbose getrawtransaction reports a height without a blockhash",
-                    })?;
-                let block_hash = decode_rpc_block_hash(block_hash_hex)?;
-                Ok(UpstreamTransactionLookup::Mined {
-                    mined_height,
-                    block_hash,
-                })
-            }
+            Ok(verbose_response) => Ok(Some(verbose_response)),
             Err(ClientError::Call(error)) => {
                 let call_error = JsonRpcCallError::from(error);
                 if call_error.is_not_found() {
-                    Ok(UpstreamTransactionLookup::NotFound)
+                    Ok(None)
                 } else {
                     Err(SourceError::NodeUnavailable {
                         reason: call_error.message,
@@ -1110,6 +1153,7 @@ impl ZebraJsonRpcSource {
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
         self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Complete)
             .await
+            .map(|page| page.outputs)
     }
 
     /// Fetches the first `max_rows` unspent outputs of `lookup`'s addresses
@@ -1135,7 +1179,28 @@ impl ZebraJsonRpcSource {
         start_height: BlockHeight,
         max_rows: TransparentAddressRowLimit,
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
-        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Prefix(max_rows))
+        let mut page = self
+            .fetch_transparent_address_utxo_page(lookup, start_height, max_rows)
+            .await?;
+        page.outputs.truncate(max_rows.row_count());
+        page.outputs.shrink_to_fit();
+        Ok(page.outputs)
+    }
+
+    /// Requests `requested_rows` outputs in chain order and keeps any additional matching rows
+    /// the node supplies, up to [`TransparentAddressRowLimit::MAX`]. The page
+    /// reports whether it contains the complete set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::fetch_transparent_address_utxo_prefix`].
+    pub async fn fetch_transparent_address_utxo_page(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        requested_rows: TransparentAddressRowLimit,
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
+        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Prefix(requested_rows))
             .await
     }
 
@@ -1144,7 +1209,7 @@ impl ZebraJsonRpcSource {
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
         bound: UtxoRowBound,
-    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         let rows: Vec<JsonObject<ZebraAddressUtxo>> = self
             .call_with_result_shape(
@@ -2552,6 +2617,30 @@ fn decode_final_note_commitment_root_hex(
         }
     })?;
     Ok(FinalNoteCommitmentRoot::from_bytes(root_bytes))
+}
+
+#[derive(Deserialize)]
+struct MinedTransactionReply<'a> {
+    txid: &'a str,
+    hex: &'a str,
+    height: Option<i64>,
+    blockhash: Option<&'a str>,
+}
+
+fn mined_transaction_block(
+    height_value: u64,
+    block_hash_hex: Option<&str>,
+) -> Result<BlockId, SourceError> {
+    let mined_height = BlockHeight::new(u32::try_from(height_value).map_err(|_| {
+        SourceError::SourceProtocolMismatch {
+            reason: "verbose getrawtransaction height does not fit u32",
+        }
+    })?);
+    let block_hash_hex = block_hash_hex.ok_or(SourceError::SourceProtocolMismatch {
+        reason: "verbose getrawtransaction reports a height without a blockhash",
+    })?;
+    let block_hash = decode_rpc_block_hash(block_hash_hex)?;
+    Ok(BlockId::new(mined_height, block_hash))
 }
 
 fn decode_display_transaction_id(

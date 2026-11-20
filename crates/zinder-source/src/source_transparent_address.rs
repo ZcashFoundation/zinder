@@ -238,13 +238,16 @@ impl UtxoRowBound {
             Self::Prefix(max_rows) => max_rows.get(),
         }
     }
+}
 
-    const fn max_rows(self) -> TransparentAddressRowLimit {
-        match self {
-            Self::Complete => TransparentAddressRowLimit::MAX,
-            Self::Prefix(max_rows) => max_rows,
-        }
-    }
+/// A chain-ordered response to a bounded unspent-output lookup.
+#[derive(Debug)]
+pub struct SourceTransparentUtxoPage {
+    /// Matching outputs the node supplied, up to [`TransparentAddressRowLimit::MAX`].
+    pub outputs: Vec<SourceTransparentUnspentOutput>,
+    /// True when the reply proves these are all matches at or above the requested height.
+    /// A prefix that fills the node's requested limit can leave completeness unknown.
+    pub complete: bool,
 }
 
 /// Decodes the `getaddressutxos` rows of `lookup` at or above `start_height`.
@@ -268,11 +271,14 @@ pub(crate) fn decode_address_utxos(
     lookup: &TransparentAddressLookup,
     start_height: BlockHeight,
     bound: UtxoRowBound,
-) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+) -> Result<SourceTransparentUtxoPage, SourceError> {
     // The rows of one address repeat its text and script, so each distinct
     // pair is checked once.
     let mut checked_payees: HashMap<(&str, &str), ZebraTransparentAddress> = HashMap::new();
-    let mut outputs = Vec::with_capacity(rows.len());
+    let max_rows = TransparentAddressRowLimit::MAX;
+    let mut outputs = Vec::with_capacity(rows.len().min(max_rows.row_count()));
+    let mut matching = 0;
+    let mut order = UtxoChainOrder::default();
     for row in rows {
         let script_pub_key =
             hex::decode(&row.script).map_err(|_| SourceError::SourceProtocolMismatch {
@@ -284,24 +290,30 @@ pub(crate) fn decode_address_utxos(
                 *unchecked.insert(checked_payee(&row.address, &script_pub_key, lookup)?)
             }
         };
-        outputs.push(decode_address_utxo(row, address, script_pub_key)?);
+        let output = decode_address_utxo(row, address, script_pub_key)?;
+        order.check(&output)?;
+        if output.block_height >= start_height {
+            matching += 1;
+            if matching <= max_rows.row_count() {
+                outputs.push(output);
+            }
+        }
     }
-    check_utxo_chain_order(&outputs)?;
-    let first_matching_output =
-        outputs.partition_point(|output| output.block_height < start_height);
-    outputs.drain(..first_matching_output);
-    let max_rows = bound.max_rows();
-    if matches!(bound, UtxoRowBound::Complete) && outputs.len() > max_rows.row_count() {
+    // Zebra stops at maxEntries. Zakura returns the full set even when the
+    // requested limit is smaller. Only matching rows count toward our cap.
+    let complete = matching <= max_rows.row_count()
+        && match bound {
+            UtxoRowBound::Complete => true,
+            UtxoRowBound::Prefix(limit) => rows.len() != limit.row_count() || matching < rows.len(),
+        };
+    if matches!(bound, UtxoRowBound::Complete) && !complete {
         return Err(SourceError::TransparentAddressRowLimitExceeded {
             operation: "getaddressutxos",
             max_rows: max_rows.get(),
         });
     }
-    outputs.truncate(max_rows.row_count());
-    // Zakura ignores the bounds, so the buffer was sized for every row it
-    // returned; keep only what the caller receives.
     outputs.shrink_to_fit();
-    Ok(outputs)
+    Ok(SourceTransparentUtxoPage { outputs, complete })
 }
 
 /// Returns the address a row names after checking that `lookup` holds it
@@ -358,32 +370,36 @@ fn script_recipient(script_pub_key: &[u8]) -> Option<TransparentAddress> {
     TxOut::try_from(&output).ok()?.recipient_address()
 }
 
-/// Checks that `outputs` are in the order both nodes return them: by height,
-/// with each transaction's outputs together and in increasing index order.
-///
-/// That order holds each outpoint once, so the check also refuses a repeated
-/// outpoint, which would otherwise count one output twice.
-fn check_utxo_chain_order(outputs: &[SourceTransparentUnspentOutput]) -> Result<(), SourceError> {
-    let mut finished_transactions: HashSet<TransactionId> = HashSet::new();
-    for pair in outputs.windows(2) {
-        let [earlier, later] = pair else {
-            continue;
+#[derive(Default)]
+struct UtxoChainOrder {
+    previous: Option<(BlockHeight, TransparentOutPoint)>,
+    finished_transactions: HashSet<TransactionId>,
+}
+
+impl UtxoChainOrder {
+    fn check(&mut self, output: &SourceTransparentUnspentOutput) -> Result<(), SourceError> {
+        let Some((height, outpoint)) = self
+            .previous
+            .replace((output.block_height, output.outpoint))
+        else {
+            return Ok(());
         };
-        let in_order = if later.outpoint.transaction_id == earlier.outpoint.transaction_id {
-            later.block_height == earlier.block_height
-                && later.outpoint.output_index > earlier.outpoint.output_index
+        let in_order = if output.outpoint.transaction_id == outpoint.transaction_id {
+            output.block_height == height && output.outpoint.output_index > outpoint.output_index
         } else {
-            finished_transactions.insert(earlier.outpoint.transaction_id);
-            later.block_height >= earlier.block_height
-                && !finished_transactions.contains(&later.outpoint.transaction_id)
+            self.finished_transactions.insert(outpoint.transaction_id);
+            output.block_height >= height
+                && !self
+                    .finished_transactions
+                    .contains(&output.outpoint.transaction_id)
         };
         if !in_order {
             return Err(SourceError::SourceProtocolMismatch {
                 reason: "getaddressutxos rows are not in chain order or repeat an outpoint",
             });
         }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -425,11 +441,10 @@ mod tests {
         lookup: &TransparentAddressLookup,
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
         decode_address_utxos(rows, lookup, BlockHeight::new(0), UtxoRowBound::Complete)
+            .map(|page| page.outputs)
     }
 
-    fn mismatch_reason(
-        outcome: &Result<Vec<SourceTransparentUnspentOutput>, SourceError>,
-    ) -> Option<&'static str> {
+    fn mismatch_reason<T>(outcome: &Result<T, SourceError>) -> Option<&'static str> {
         match outcome {
             Err(SourceError::SourceProtocolMismatch { reason }) => Some(*reason),
             Ok(_) | Err(_) => None,
@@ -523,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn utxo_prefix_applies_start_height_and_row_limit_a_node_ignored()
+    fn utxo_page_keeps_matching_rows_when_the_node_ignores_its_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let rows = [
             utxo_row(3, 0),
@@ -540,7 +555,11 @@ mod tests {
             UtxoRowBound::Prefix(max_rows),
         )?;
 
-        assert_eq!(heights_and_indexes(&prefix), [(5, 0), (5, 1)]);
+        assert!(prefix.complete);
+        assert_eq!(
+            heights_and_indexes(&prefix.outputs),
+            [(5, 0), (5, 1), (9, 0)]
+        );
         Ok(())
     }
 
@@ -561,7 +580,10 @@ mod tests {
             UtxoRowBound::Complete,
         )?;
 
-        assert_eq!(heights_and_indexes(&outputs), [(5, 0), (5, 1), (9, 0)]);
+        assert_eq!(
+            heights_and_indexes(&outputs.outputs),
+            [(5, 0), (5, 1), (9, 0)]
+        );
         Ok(())
     }
 
@@ -588,7 +610,11 @@ mod tests {
                 max_rows: 100_000,
             })
         ));
-        assert_eq!(prefix.len(), TransparentAddressRowLimit::MAX.row_count());
+        assert!(!prefix.complete);
+        assert_eq!(
+            prefix.outputs.len(),
+            TransparentAddressRowLimit::MAX.row_count()
+        );
         Ok(())
     }
 
@@ -606,7 +632,11 @@ mod tests {
             UtxoRowBound::Complete,
         )?;
 
-        assert_eq!(outputs.len(), TransparentAddressRowLimit::MAX.row_count());
+        assert!(outputs.complete);
+        assert_eq!(
+            outputs.outputs.len(),
+            TransparentAddressRowLimit::MAX.row_count()
+        );
         Ok(())
     }
 

@@ -112,6 +112,7 @@ async fn retained_mined_and_ingest_pending_transactions_survive_a_stopped_node()
         &chain.with_transaction_rows(rows),
         &super::one_upgrade_per_height()?,
         [],
+        Duration::from_secs(2),
     )?;
     let epoch = fixture.slot.capture().chain_epoch();
     let pending = MempoolEntry::new(
@@ -167,6 +168,7 @@ async fn forwarding_rechecks_the_captured_tip_and_recovers_after_a_fork() -> Res
             )))),
             method("sendrawtransaction").reply_with(|_| RpcReply::result(json!("01".repeat(32)))),
         ],
+        Duration::from_secs(2),
     )?;
     fixture.adapter.send_transaction(send()).await?;
     let mut store = zinder_testkit::WalletServingStoreFixture::from_chain_after_live_append(
@@ -311,7 +313,7 @@ async fn stored_replayed_and_latest_tree_states_return_the_canonical_frontiers()
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(12),
         &activations,
     )?;
-    let fixture = Fixture::from_chain(&chain, &activations, [])?;
+    let fixture = Fixture::from_chain(&chain, &activations, [], Duration::from_secs(2))?;
     let expected = commitment_tree_checkpoints(
         &chain,
         &activations,
@@ -460,7 +462,12 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
     // tasks wait for Runtime::block_on, keeping every admitted permit occupied.
     runtime.handle().block_on(async {
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(24);
-        let fixture = Fixture::from_chain(&chain, &sample_regtest_upgrade_activations(), [])?;
+        let fixture = Fixture::from_chain(
+            &chain,
+            &sample_regtest_upgrade_activations(),
+            [],
+            Duration::from_secs(2),
+        )?;
         let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
             fixture.slot,
             ZebraJsonRpcSource::new(

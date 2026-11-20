@@ -475,6 +475,22 @@ writer's activation schedule through the next block, and holds the served tip
 on its best chain. The node can advance while answering. Compare forwarded
 answers with wallet serving while the node stays at the same hash and height.
 
+The node orders UTXOs within a block by position. Qualification needs every
+matching output in the last block of a wallet's request to sort them by wallet
+transaction ID. A request can match more than 100,000 outputs across multiple
+blocks. Qualification uses bounded prefixes to finish the last requested
+height. A tip change between successful reads returns `UNAVAILABLE`.
+
+In the synthetic cutoff fixture, one height supplies 100,000 outputs and a
+later height supplies one more. The node has no ending-height filter, so
+qualification returns `RESOURCE_EXHAUSTED` when it cannot establish wallet
+order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
+32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
+
+Qualification admits one nonempty UTXO request at a time. A stream holds
+the slot while the client drains its rows. A concurrent UTXO request receives
+`RESOURCE_EXHAUSTED` and can retry with backoff.
+
 Build the two qualification binaries:
 
 ```bash
@@ -512,9 +528,14 @@ It can continue across an append and returns `UNAVAILABLE` if a later page
 finds that tip has left the best chain. A writer halt observed by ingest control
 closes admission until the publisher verifies the recovered writer's fence.
 
-Both mempool methods use ingest control. Each address-history stream
-hydrates one transaction at a time through the node. Dropping the stream
-cancels the active read. With `none`, `GetTransaction` fetches the bytes from
+Both mempool methods use ingest control. If an address-history lookup
+exceeds a row or byte limit, qualification splits it into disjoint height ranges.
+Each stream reads one page at a time and fetches each transaction's bytes and
+height in one verbose node call. Dropping the stream cancels the local read
+and prevents further calls.
+If one height alone exceeds the limit, the stream ends with
+`RESOURCE_EXHAUSTED`. A change to the ending block's hash between pages
+requires a retry. With `none`, `GetTransaction` fetches the bytes from
 the node. To exercise local mined-transaction reads, repeat with fresh store
 paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
 projector or wallet store. The feature is for qualification only. Release

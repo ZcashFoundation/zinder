@@ -61,7 +61,7 @@ half. It logs `source_chain_segment_split`.
 ## Transparent address lookups
 
 `ZebraJsonRpcSource` can forward transparent-address lookups to the node's
-own address index. No runtime calls these methods.
+own address index. The light-wallet qualification build uses these lookups.
 
 | Method | Node RPC | Returns |
 | --- | --- | --- |
@@ -69,6 +69,7 @@ own address index. No runtime calls these methods.
 | `fetch_transparent_address_transaction_ids` | `getaddresstxids` | Transaction ids in a height range, in chain order |
 | `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order |
 | `fetch_transparent_address_utxo_prefix` | `getaddressutxos` | The first `max_rows` unspent outputs at or above a height, in chain order |
+| `fetch_transparent_address_utxo_page` | `getaddressutxos` | A chain-ordered prefix, including extra rows the node supplied, and whether it covers every match |
 
 Every method takes a `TransparentAddressLookup`: 1 to 10,000 distinct
 addresses of the source's network. TEX addresses are refused, because the
@@ -103,7 +104,9 @@ differently, and the source gives both the same result:
   the rows below the start height and truncates the rest. A full prefix may
   have more outputs after it, and no later lookup resumes losslessly: the node
   pages only by height, and one block can hold more matching outputs than one
-  prefix.
+  prefix. The page method retains extra matching rows up to the same
+  100,000-row cap, so callers can use rows Zakura has already sent. A page
+  that reaches the local cap with more matching rows is incomplete.
 - **Response size.** An answer above `node.max_response_bytes` is reported as
   `SourceResponseTooLarge`. Zakura's unspent-output answer counts in full,
   even for a prefix or a high start height. Either node answers JSON-RPC error
@@ -132,6 +135,11 @@ A Zakura node in pruned storage mode with checkpoint sync stops maintaining its
 transparent indexes and refuses `getaddressbalance`, `getaddresstxids`, and
 `getaddressutxos`. The source reports that refusal, and a node without the
 methods, as `TransparentAddressIndexesUnavailable`.
+
+For address history, `fetch_mined_transaction_bytes` reads the serialized bytes
+and mined block from one verbose `getrawtransaction` reply. It checks the
+returned transaction ID against the request. A missing, mempool, or side-chain
+transaction has no best-chain location.
 
 ## Capabilities
 
