@@ -1,6 +1,0 @@
-kind: fixed
-body: Wallet ChainEvents subscribers on the Settled family receive each newly settled block range and can resume from a cursor anchored at its last settled block. Settled subscriptions with the Rust client require a server advertising contract revision 12 or later.
-time: 2026-11-20T14:49:10.471708153Z
-custom:
-    Bump: minor
-    PR: "421"

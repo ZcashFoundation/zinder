@@ -1,6 +1,0 @@
-kind: fixed
-body: Background tree-state verification detects damage to a canonical block header's table file even after an earlier pass read the header successfully.
-time: 2026-11-20T14:57:20.7390972Z
-custom:
-    Bump: patch
-    PR: "425"

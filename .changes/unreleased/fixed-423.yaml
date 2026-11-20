@@ -1,6 +1,0 @@
-kind: fixed
-body: The Explorer gRPC listener now serves health and reflection while unready, and refuses new Explorer queries until readiness recovers. A failed background task or operational endpoint stops Explorer with exit 1 and names the task. At the shutdown drain deadline, open calls receive `UNAVAILABLE` with the `shutting_down` cause.
-time: 2026-11-20T14:51:09.732977438Z
-custom:
-    Bump: minor
-    PR: "423"

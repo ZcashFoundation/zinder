@@ -1,6 +1,0 @@
-kind: fixed
-body: Ingest and Explorer now default to the projector's canonical store directory, `/var/lib/zinder/canonical`. If your store is at the old default, set `ZINDER_STORAGE__PATH=/var/lib/zinder/store` for ingest and Explorer before upgrading. Set `ZINDER_STORAGE__CANONICAL_PATH=/var/lib/zinder/store` for a projector that reads that store.
-time: 2026-11-20T16:24:35.762359599Z
-custom:
-    Bump: patch
-    PR: "432"
