@@ -187,7 +187,7 @@ async fn newly_settled_blocks_are_streamed_with_visible_tip_ahead() -> eyre::Res
         .ok_or_else(|| eyre!("settled commit omitted its chain epoch"))?;
     assert_eq!(chain_epoch.settled_tip.map(|tip| tip.height), Some(2));
     assert_eq!(chain_epoch.visible_tip.map(|tip| tip.height), Some(3));
-    assert!(!event.cursor.is_empty());
+    assert_ne!(event.cursor, [] as [u8; 0]);
 
     Ok(())
 }
