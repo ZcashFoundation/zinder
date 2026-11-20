@@ -1,8 +1,20 @@
-use std::{net::TcpListener as PortReservation, time::Duration};
+use std::{
+    convert::Infallible,
+    net::TcpListener as PortReservation,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use eyre::{Result, eyre};
-use tokio::{net::TcpListener, time::timeout};
-use tonic::Code;
+use tokio::{net::TcpListener, sync::Notify, time::timeout};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{
+    Code, Status,
+    body::Body,
+    codegen::{BoxFuture, Service, http},
+    server::NamedService,
+};
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_types::StatusExt as _;
 use zinder_proto::v1::explorer::{
@@ -119,6 +131,49 @@ async fn check_health_and_traffic(
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct PendingWalletSnapshot {
+    requested: Arc<Notify>,
+}
+
+impl PendingWalletSnapshot {
+    fn serve(&self, listener: TcpListener) -> JoinHandle<Result<(), tonic::transport::Error>> {
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(self.clone())
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        )
+    }
+}
+
+impl NamedService for PendingWalletSnapshot {
+    const NAME: &'static str = zinder_proto::v1::wallet::wallet_query_server::SERVICE_NAME;
+}
+
+impl Service<http::Request<Body>> for PendingWalletSnapshot {
+    type Response = http::Response<Body>;
+    type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+        if request.uri().path() == "/zinder.v1.wallet.WalletQuery/MempoolSnapshot" {
+            self.requested.notify_one();
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(async {
+                Ok(
+                    Status::unimplemented("wallet fixture serves only mempool snapshots")
+                        .into_http(),
+                )
+            })
+        }
+    }
+}
+
 #[tokio::test]
 async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the_drain_deadline()
 -> Result<()> {
@@ -143,6 +198,8 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
             wallet_query_endpoint: Some(format!("http://{}", wallet.local_addr()?)),
         },
     )?;
+    let pending_wallet = PendingWalletSnapshot::default();
+    let wallet_server = pending_wallet.serve(wallet);
     let runtime =
         SupervisedRuntime::new(RuntimeService::Explorer).with_grpc_drain_timeout(DRAIN_TIMEOUT);
     let shutdown = runtime.shutdown_request();
@@ -171,8 +228,7 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
             .mempool_summary(MempoolSummaryRequest::default())
             .await
     });
-    // Accept the federated dial but withhold a reply so this Explorer call spans the drain.
-    let (_connection, _) = timeout(PROBE_WAIT_LIMIT, wallet.accept()).await??;
+    timeout(PROBE_WAIT_LIMIT, pending_wallet.requested.notified()).await?;
     let started = tokio::time::Instant::now();
     shutdown.request();
     assert_eq!(
@@ -196,6 +252,7 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
         Some("shutting_down")
     );
     timeout(PROBE_WAIT_LIMIT, server).await???;
+    wallet_server.abort();
     assert_eq!(readiness.report().cause, ReadinessCause::ShuttingDown);
     Ok(())
 }
