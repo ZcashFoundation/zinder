@@ -5,7 +5,10 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{Json, Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    task::{AbortHandle, JoinHandle},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -107,6 +110,25 @@ impl OpsEndpointHandle {
     pub async fn shutdown(mut self) -> Result<(), OpsServerError> {
         self.cancel.cancel();
         self.wait().await
+    }
+
+    /// A handle that tells whether the operational server's task has ended,
+    /// or `None` once [`Self::wait`] has observed it end.
+    pub(crate) fn server_task(&self) -> Option<AbortHandle> {
+        self.join.as_ref().map(JoinHandle::abort_handle)
+    }
+
+    /// A handle for `join`, a task that stands in for the operational server
+    /// and stops once `cancel` is cancelled.
+    #[cfg(test)]
+    pub(crate) const fn for_task(
+        cancel: CancellationToken,
+        join: JoinHandle<Result<(), OpsServerError>>,
+    ) -> Self {
+        Self {
+            cancel,
+            join: Some(join),
+        }
     }
 }
 

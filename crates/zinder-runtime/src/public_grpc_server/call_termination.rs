@@ -3,23 +3,36 @@
 //! A graceful drain lets open calls finish, but the transport keeps a call's
 //! handler running for as long as its client keeps the stream open, and its
 //! connection tasks outlive the server future. [`OpenGrpcCalls::terminate`]
-//! therefore drops each call's handler future or response body itself, under
-//! the lock that every poll of that handler takes. When it returns, no
-//! handler future or response body of the listener exists, and every later
-//! call is refused before its handler runs.
+//! therefore drops each call's handler future or response body itself.
+//!
+//! A handler is created, polled, and dropped only under its call's lock, and
+//! a call is admitted, before its handler exists, only while the listener
+//! still serves. When [`OpenGrpcCalls::terminate`] returns, no handler future
+//! or response body of the listener exists, a drop that another thread had
+//! started has finished, and every later call is refused before its service
+//! is called. The next frame each terminated response yields is its status.
+//!
+//! A handler can hand its client's request stream to work of its own, as
+//! gRPC reflection does. That work could keep the HTTP/2 stream, and so the
+//! connection, open after the handler is gone, so termination also ends a
+//! client-streaming call's request stream: its next poll fails with the
+//! call's status.
 //!
 //! hyper polls a response body only while its client grants flow-control
 //! window, so a body cannot be relied on to observe the termination itself;
 //! dropping it from [`OpenGrpcCalls::terminate`] works for parked bodies too.
+//!
+//! Calls register in one of [`REGISTRY_SHARDS`] shards, picked by the thread
+//! that admits them, so concurrent calls on different threads rarely share a
+//! lock.
 
 use std::{
-    collections::HashMap,
     future::Future,
     mem,
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -28,30 +41,57 @@ use bytes::Bytes;
 use futures_util::future::{BoxFuture, ready};
 use http_body::{Body as _, Frame, SizeHint};
 use parking_lot::Mutex;
+use slab::Slab;
 use tonic::{Status, body::Body};
 use tower::{Layer, Service};
 
+use super::CLIENT_STREAMING_METHOD_PATHS;
+use crate::{ReadinessCause, not_ready_status};
+
+/// How many shards a listener's calls register in.
+const REGISTRY_SHARDS: usize = 16;
+
+/// The shard the next thread to admit a call registers its calls in.
+static NEXT_HOME_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The shard this thread registers the calls it admits in.
+    static HOME_SHARD: usize = NEXT_HOME_SHARD.fetch_add(1, Ordering::Relaxed) % REGISTRY_SHARDS;
+}
+
 /// Calls the runtime is serving, and whether it has stopped serving them.
-#[derive(Debug, Default)]
 pub(crate) struct OpenGrpcCalls {
-    next_call_id: AtomicU64,
-    registry: Mutex<CallRegistry>,
+    shards: [Arc<CallShard>; REGISTRY_SHARDS],
+}
+
+impl Default for OpenGrpcCalls {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Arc::default()),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenGrpcCalls {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenGrpcCalls")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The calls one shard tracks. Aligned so that two shards never share a
+/// cache line.
+#[derive(Default)]
+#[repr(align(128))]
+struct CallShard {
+    calls: Mutex<ShardCalls>,
 }
 
 #[derive(Default)]
-struct CallRegistry {
+struct ShardCalls {
     terminated: bool,
-    calls: HashMap<u64, Weak<dyn TerminateCall>>,
-}
-
-impl std::fmt::Debug for CallRegistry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CallRegistry")
-            .field("terminated", &self.terminated)
-            .field("open_calls", &self.calls.len())
-            .finish_non_exhaustive()
-    }
+    calls: Slab<Weak<dyn TerminateCall>>,
 }
 
 impl OpenGrpcCalls {
@@ -59,60 +99,64 @@ impl OpenGrpcCalls {
     ///
     /// Returns how many calls still had a running handler.
     pub(crate) fn terminate(&self) -> usize {
+        self.shards.iter().map(|shard| shard.terminate()).sum()
+    }
+
+    /// Admits a call before its handler is created, or returns `None` once
+    /// the calls are terminated.
+    fn admit<F>(&self) -> Option<Arc<OpenCall<F>>>
+    where
+        F: Send + 'static,
+    {
+        let shard = &self.shards[HOME_SHARD.with(|home_shard| *home_shard)];
+        let mut shard_calls = shard.calls.lock();
+        if shard_calls.terminated {
+            return None;
+        }
+        let entry = shard_calls.calls.vacant_entry();
+        let call = Arc::new(OpenCall {
+            state: Mutex::new(CallState::Admitted),
+            request: Mutex::new(RequestState::Untracked),
+            _registration: CallRegistration {
+                shard: Arc::clone(shard),
+                key: entry.key(),
+            },
+        });
+        let tracked: Weak<OpenCall<F>> = Arc::downgrade(&call);
+        entry.insert(tracked);
+        drop(shard_calls);
+        Some(call)
+    }
+}
+
+impl CallShard {
+    fn terminate(&self) -> usize {
         let open_calls = {
-            let mut registry = self.registry.lock();
-            registry.terminated = true;
-            mem::take(&mut registry.calls)
+            let mut shard_calls = self.calls.lock();
+            shard_calls.terminated = true;
+            mem::take(&mut shard_calls.calls)
         };
         open_calls
-            .into_values()
-            .filter_map(|call| call.upgrade())
+            .into_iter()
+            .filter_map(|(_, call)| call.upgrade())
             .filter(|call| call.terminate())
             .count()
     }
 
-    /// Tracks the call whose handler is `future`, or returns `None` once the
-    /// calls are terminated.
-    fn track<F>(self: &Arc<Self>, future: F) -> Option<Arc<OpenCall<F>>>
-    where
-        F: Send + 'static,
-    {
-        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-        let call = Arc::new(OpenCall {
-            state: Mutex::new(CallState::Responding {
-                future: Box::pin(future),
-                waker: None,
-            }),
-            _registration: CallRegistration {
-                calls: Arc::clone(self),
-                call_id,
-            },
-        });
-        let tracked: Weak<OpenCall<F>> = Arc::downgrade(&call);
-        let tracked: Weak<dyn TerminateCall> = tracked;
-        let admitted = {
-            let mut registry = self.registry.lock();
-            let admitted = !registry.terminated;
-            if admitted {
-                registry.calls.insert(call_id, tracked);
-            }
-            admitted
-        };
-        admitted.then_some(call)
-    }
-
-    fn forget(&self, call_id: u64) {
-        self.registry.lock().calls.remove(&call_id);
+    fn forget(&self, key: usize) {
+        let forgotten = self.calls.lock().calls.try_remove(key);
+        drop(forgotten);
     }
 }
 
 /// Tower layer that lets a supervised runtime end every call its gRPC
 /// listener serves.
 ///
-/// [`crate::SupervisedRuntime::public_grpc_server`] adds it. Once the runtime
-/// stops serving, each open call's handler is dropped and the call ends with
-/// `UNAVAILABLE`; a call that arrives later is refused the same way before
-/// its handler runs.
+/// [`crate::SupervisedRuntime::public_grpc_server`] adds it outside every
+/// other layer. Once the runtime stops serving, each open call's handler is
+/// dropped and the call ends with `UNAVAILABLE` and `SERVICE_NOT_READY`; a
+/// call that arrives later is refused the same way before the service it
+/// wraps is called.
 #[derive(Clone, Debug)]
 pub struct GrpcCallTerminationLayer {
     calls: Arc<OpenGrpcCalls>,
@@ -157,15 +201,30 @@ where
     }
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        match self.calls.track(self.inner.call(request)) {
-            Some(call) => Box::pin(TerminableCall { call }),
-            None => Box::pin(ready(Ok(server_stopped().into_http()))),
+        let Some(call) = self.calls.admit::<S::Future>() else {
+            return refused();
+        };
+        let request = if CLIENT_STREAMING_METHOD_PATHS.contains(&request.uri().path()) {
+            call.track_request(request)
+        } else {
+            request
+        };
+        if !call.start(|| self.inner.call(request)) {
+            return refused();
         }
+        Box::pin(TerminableCall {
+            call,
+            responded: false,
+        })
     }
 }
 
+fn refused<E: Send + 'static>() -> BoxFuture<'static, Result<http::Response<Body>, E>> {
+    Box::pin(ready(Ok(server_stopped().into_http())))
+}
+
 fn server_stopped() -> Status {
-    Status::unavailable("server is shutting down; retry against another instance")
+    not_ready_status(&ReadinessCause::ShuttingDown)
 }
 
 trait TerminateCall: Send + Sync {
@@ -175,10 +234,25 @@ trait TerminateCall: Send + Sync {
 
 struct OpenCall<F> {
     state: Mutex<CallState<F>>,
+    /// A client stream's request body, which can outlive the handler.
+    request: Mutex<RequestState>,
     _registration: CallRegistration,
 }
 
+enum RequestState {
+    /// The handler owns the request body directly.
+    Untracked,
+    /// The client is still sending its stream.
+    Receiving(Body),
+    /// The runtime ended the call; the stream has not reported it yet.
+    Terminated,
+    /// The stream has ended, and its body is gone.
+    Ended,
+}
+
 enum CallState<F> {
+    /// The call was admitted and its handler is not created yet.
+    Admitted,
     /// The handler is producing its response head.
     Responding {
         future: Pin<Box<F>>,
@@ -188,42 +262,139 @@ enum CallState<F> {
     Streaming { body: Body, waker: Option<Waker> },
     /// The runtime ended the call; its status has not been reported yet.
     Terminated,
-    /// The call has ended and reported how.
+    /// The call has ended, and its handler is gone.
     Finished,
 }
 
-/// Removes a call from the registry once nothing refers to it.
+impl<F: Send + 'static> OpenCall<F> {
+    /// Moves the client's request stream into the call, so termination can
+    /// end it wherever the handler hands it.
+    fn track_request(self: &Arc<Self>, request: http::Request<Body>) -> http::Request<Body> {
+        request.map(|body| {
+            *self.request.lock() = RequestState::Receiving(body);
+            Body::new(TerminableRequest {
+                call: Arc::clone(self),
+            })
+        })
+    }
+}
+
+impl<F> OpenCall<F> {
+    /// Creates the call's handler with `handler`, unless the call was
+    /// terminated after it was admitted.
+    fn start(&self, handler: impl FnOnce() -> F) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            CallState::Admitted => {
+                *state = CallState::Responding {
+                    future: Box::pin(handler()),
+                    waker: None,
+                };
+                true
+            }
+            CallState::Responding { .. }
+            | CallState::Streaming { .. }
+            | CallState::Terminated
+            | CallState::Finished => false,
+        }
+    }
+}
+
+/// Removes a call from its shard once nothing refers to it.
 struct CallRegistration {
-    calls: Arc<OpenGrpcCalls>,
-    call_id: u64,
+    shard: Arc<CallShard>,
+    key: usize,
 }
 
 impl Drop for CallRegistration {
     fn drop(&mut self) {
-        self.calls.forget(self.call_id);
+        self.shard.forget(self.key);
     }
 }
 
 impl<F: Send> TerminateCall for OpenCall<F> {
     fn terminate(&self) -> bool {
         let mut state = self.state.lock();
-        let mut handler = mem::replace(&mut *state, CallState::Terminated);
-        let waker = match &mut handler {
+        let (was_running, waker) = match &mut *state {
+            CallState::Admitted => (false, None),
             CallState::Responding { waker, .. } | CallState::Streaming { waker, .. } => {
-                waker.take()
+                (true, waker.take())
             }
-            CallState::Terminated | CallState::Finished => {
-                *state = handler;
-                return false;
-            }
+            CallState::Terminated | CallState::Finished => return false,
         };
+        // Replacing the state drops the handler under the lock, so neither a
+        // poll nor another drop of it is still running when this returns.
+        *state = CallState::Terminated;
         drop(state);
-        // The handler is dropped unlocked, before its poller is woken.
-        drop(handler);
+        let mut request = self.request.lock();
+        if matches!(*request, RequestState::Receiving(_)) {
+            *request = RequestState::Terminated;
+        }
+        drop(request);
         if let Some(waker) = waker {
             waker.wake();
         }
-        true
+        was_running
+    }
+}
+
+/// The request body of a client-streaming call.
+struct TerminableRequest<F> {
+    call: Arc<OpenCall<F>>,
+}
+
+impl<F: Send + 'static> http_body::Body for TerminableRequest<F> {
+    type Data = Bytes;
+    type Error = Status;
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the request body is polled under its lock, so termination never drops it mid-poll"
+    )]
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut request = self.call.request.lock();
+        match &mut *request {
+            RequestState::Receiving(body) => {
+                let polled = Pin::new(body).poll_frame(cx);
+                if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+                    *request = RequestState::Ended;
+                }
+                polled
+            }
+            RequestState::Terminated => {
+                *request = RequestState::Ended;
+                Poll::Ready(Some(Err(server_stopped())))
+            }
+            RequestState::Untracked | RequestState::Ended => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &*self.call.request.lock() {
+            RequestState::Receiving(body) => body.is_end_stream(),
+            RequestState::Terminated => false,
+            RequestState::Untracked | RequestState::Ended => true,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &*self.call.request.lock() {
+            RequestState::Receiving(body) => body.size_hint(),
+            RequestState::Untracked | RequestState::Terminated | RequestState::Ended => {
+                SizeHint::default()
+            }
+        }
+    }
+}
+
+impl<F> Drop for TerminableRequest<F> {
+    /// Drops the request stream with the handler's last hold on it, as the
+    /// transport expects.
+    fn drop(&mut self) {
+        *self.call.request.lock() = RequestState::Ended;
     }
 }
 
@@ -237,6 +408,9 @@ fn remember_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
 /// The response future of a tracked call.
 struct TerminableCall<F> {
     call: Arc<OpenCall<F>>,
+    /// Whether the call has produced its response, which leaves the future
+    /// nothing to drop.
+    responded: bool,
 }
 
 impl<F, E> Future for TerminableCall<F>
@@ -262,23 +436,41 @@ where
                     let (parts, body) = response.into_parts();
                     *state = CallState::Streaming { body, waker: None };
                     drop(state);
+                    this.responded = true;
                     let body = Body::new(TerminableBody {
                         call: Arc::clone(&this.call) as Arc<dyn CallBody>,
+                        ended: false,
                     });
                     Poll::Ready(Ok(http::Response::from_parts(parts, body)))
                 }
                 Poll::Ready(Err(error)) => {
                     *state = CallState::Finished;
+                    this.responded = true;
                     Poll::Ready(Err(error))
                 }
             },
             CallState::Terminated => {
                 *state = CallState::Finished;
+                this.responded = true;
                 Poll::Ready(Ok(server_stopped().into_http()))
             }
-            CallState::Streaming { .. } | CallState::Finished => {
+            CallState::Admitted | CallState::Streaming { .. } | CallState::Finished => {
+                this.responded = true;
                 Poll::Ready(Ok(server_stopped().into_http()))
             }
+        }
+    }
+}
+
+impl<F> Drop for TerminableCall<F> {
+    /// Drops a handler whose response was abandoned, under its call's lock.
+    fn drop(&mut self) {
+        if self.responded {
+            return;
+        }
+        let mut state = self.call.state.lock();
+        if matches!(*state, CallState::Responding { .. }) {
+            *state = CallState::Finished;
         }
     }
 }
@@ -288,6 +480,8 @@ trait CallBody: Send + Sync {
     fn poll_frame(&self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Status>>>;
     fn is_end_stream(&self) -> bool;
     fn size_hint(&self) -> SizeHint;
+    /// Drops the handler's response body, under the call's lock.
+    fn release(&self);
 }
 
 impl<F: Send> CallBody for OpenCall<F> {
@@ -318,14 +512,16 @@ impl<F: Send> CallBody for OpenCall<F> {
                 *state = CallState::Finished;
                 Poll::Ready(Some(trailers_reporting(&server_stopped())))
             }
-            CallState::Responding { .. } | CallState::Finished => Poll::Ready(None),
+            CallState::Admitted | CallState::Responding { .. } | CallState::Finished => {
+                Poll::Ready(None)
+            }
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match &*self.state.lock() {
             CallState::Streaming { body, .. } => body.is_end_stream(),
-            CallState::Responding { .. } | CallState::Finished => true,
+            CallState::Admitted | CallState::Responding { .. } | CallState::Finished => true,
             CallState::Terminated => false,
         }
     }
@@ -333,9 +529,17 @@ impl<F: Send> CallBody for OpenCall<F> {
     fn size_hint(&self) -> SizeHint {
         match &*self.state.lock() {
             CallState::Streaming { body, .. } => body.size_hint(),
-            CallState::Responding { .. } | CallState::Terminated | CallState::Finished => {
-                SizeHint::default()
-            }
+            CallState::Admitted
+            | CallState::Responding { .. }
+            | CallState::Terminated
+            | CallState::Finished => SizeHint::default(),
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock();
+        if matches!(*state, CallState::Streaming { .. }) {
+            *state = CallState::Finished;
         }
     }
 }
@@ -349,6 +553,8 @@ fn trailers_reporting(status: &Status) -> Result<Frame<Bytes>, Status> {
 /// The response body of a tracked call.
 struct TerminableBody {
     call: Arc<dyn CallBody>,
+    /// Whether the body has reported its end, which leaves nothing to drop.
+    ended: bool,
 }
 
 impl http_body::Body for TerminableBody {
@@ -359,7 +565,14 @@ impl http_body::Body for TerminableBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.call.poll_frame(cx)
+        let this = self.get_mut();
+        let polled = this.call.poll_frame(cx);
+        this.ended = match &polled {
+            Poll::Ready(Some(Ok(frame))) => frame.is_trailers(),
+            Poll::Ready(Some(Err(_)) | None) => true,
+            Poll::Pending => false,
+        };
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -371,17 +584,39 @@ impl http_body::Body for TerminableBody {
     }
 }
 
+impl Drop for TerminableBody {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.call.release();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, future, sync::Arc};
+    use std::{
+        convert::Infallible,
+        future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
 
+    use futures_util::FutureExt as _;
     use http_body_util::{BodyExt as _, StreamBody};
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt as _;
     use tonic::{Code, Status, body::Body};
+    use tonic_types::StatusExt as _;
     use tower::{Layer as _, Service as _, ServiceExt as _, service_fn};
 
     use super::{GrpcCallTerminationLayer, OpenGrpcCalls};
+    use crate::{GrpcReceiveLimits, public_grpc_server::supervised_grpc_layers};
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Reports when the handler state it belongs to is dropped.
     struct DropSignal(Option<oneshot::Sender<()>>);
@@ -394,18 +629,37 @@ mod tests {
         }
     }
 
-    fn status_of(response: &http::Response<Body>) -> Option<Code> {
-        response
-            .headers()
-            .get("grpc-status")
-            .and_then(|status| status.to_str().ok())
-            .and_then(|status| status.parse::<i32>().ok())
-            .map(Code::from)
+    impl OpenGrpcCalls {
+        fn registered_calls(&self) -> usize {
+            self.shards
+                .iter()
+                .map(|shard| shard.calls.lock().calls.len())
+                .sum()
+        }
+    }
+
+    /// Asserts that `headers` carry the status of a call the stopping
+    /// runtime ended or refused.
+    fn assert_shutting_down(headers: &http::HeaderMap) -> TestResult {
+        let status = Status::from_header_map(headers).ok_or("the response carries no status")?;
+        assert_eq!(status.code(), Code::Unavailable);
+        let details = status.get_error_details();
+        let error_info = details
+            .error_info()
+            .ok_or("the status carries no ErrorInfo")?;
+        assert_eq!(error_info.reason, "SERVICE_NOT_READY");
+        assert_eq!(
+            error_info
+                .metadata
+                .get("readiness_cause")
+                .map(String::as_str),
+            Some("shutting_down")
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn terminating_drops_a_pending_handler_and_refuses_later_calls()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn terminating_drops_a_pending_handler_and_ends_the_call() -> TestResult {
         let calls = Arc::new(OpenGrpcCalls::default());
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let dropped_tx = parking_lot::Mutex::new(Some(dropped_tx));
@@ -429,20 +683,45 @@ mod tests {
         assert_eq!(calls.terminate(), 1);
         dropped_rx.await?;
         let response = call.await??;
-        assert_eq!(status_of(&response), Some(Code::Unavailable));
+        assert_shutting_down(response.headers())
+    }
 
+    #[tokio::test]
+    async fn a_call_after_termination_never_reaches_its_service() -> TestResult {
+        let calls = Arc::new(OpenGrpcCalls::default());
+        let service_calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcCallTerminationLayer::new(Arc::clone(&calls)).layer(service_fn({
+            let service_calls = Arc::clone(&service_calls);
+            move |_request: http::Request<Body>| {
+                service_calls.fetch_add(1, Ordering::SeqCst);
+                future::ready(Ok::<_, Infallible>(http::Response::new(Body::empty())))
+            }
+        }));
+        let served = service
+            .ready()
+            .await?
+            .call(http::Request::new(Body::empty()))
+            .await?;
+        served.into_body().collect().await?;
+        assert_eq!(service_calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(calls.terminate(), 0);
         let refused = service
             .ready()
             .await?
             .call(http::Request::new(Body::empty()))
             .await?;
-        assert_eq!(status_of(&refused), Some(Code::Unavailable));
-        Ok(())
+
+        assert_eq!(
+            service_calls.load(Ordering::SeqCst),
+            1,
+            "a call after termination reached the service"
+        );
+        assert_shutting_down(refused.headers())
     }
 
     #[tokio::test]
-    async fn terminating_drops_an_unpolled_response_body() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn terminating_drops_an_unpolled_response_body() -> TestResult {
         let calls = Arc::new(OpenGrpcCalls::default());
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let dropped_tx = parking_lot::Mutex::new(Some(dropped_tx));
@@ -477,16 +756,168 @@ mod tests {
             .trailers()
             .cloned()
             .unwrap_or_default();
-        assert_eq!(
-            Status::from_header_map(&trailers).map(|status| status.code()),
-            Some(Code::Unavailable)
-        );
+        assert_shutting_down(&trailers)
+    }
+
+    /// gRPC reflection hands its client's request stream to a task of its
+    /// own. Terminating the call must end that stream too, or the task
+    /// keeps the HTTP/2 stream, and so the connection, open.
+    #[tokio::test]
+    async fn terminating_a_client_stream_ends_the_request_stream_its_handler_handed_off()
+    -> TestResult {
+        let calls = Arc::new(OpenGrpcCalls::default());
+        let handed_off = Arc::new(parking_lot::Mutex::new(None::<Body>));
+        let mut service = GrpcCallTerminationLayer::new(Arc::clone(&calls)).layer(service_fn({
+            let handed_off = Arc::clone(&handed_off);
+            move |request: http::Request<Body>| {
+                *handed_off.lock() = Some(request.into_body());
+                future::ready(Ok::<_, Infallible>(http::Response::new(Body::new(
+                    StreamBody::new(tokio_stream::pending::<
+                        Result<http_body::Frame<bytes::Bytes>, Status>,
+                    >()),
+                ))))
+            }
+        }));
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        let client_stream =
+            tokio_stream::pending::<Result<http_body::Frame<bytes::Bytes>, Status>>().map(
+                move |frame| {
+                    let _held = &signal;
+                    frame
+                },
+            );
+        let request = http::Request::builder()
+            .uri("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo")
+            .body(Body::new(StreamBody::new(client_stream)))?;
+        let _response = service.ready().await?.call(request).await?;
+
+        assert_eq!(calls.terminate(), 1);
+        dropped_rx.await?;
+        let mut request_stream = handed_off
+            .lock()
+            .take()
+            .ok_or("the handler kept no request stream")?;
+        let ended_with = request_stream
+            .frame()
+            .await
+            .ok_or("the request stream ended without its status")?;
+        let status = ended_with
+            .err()
+            .ok_or("the request stream yielded a frame after termination")?;
+        let mut headers = http::HeaderMap::new();
+        status.add_header(&mut headers)?;
+        assert_shutting_down(&headers)
+    }
+
+    /// The send stall bound hands the transport a large chunk in pieces. A
+    /// terminated response must not send the pieces it still holds.
+    #[tokio::test]
+    async fn a_terminated_response_sends_its_status_before_any_more_data() -> TestResult {
+        let calls = Arc::new(OpenGrpcCalls::default());
+        let chunk = bytes::Bytes::from(vec![0_u8; 1024 * 1024]);
+        let mut service = supervised_grpc_layers(
+            Arc::clone(&calls),
+            GrpcReceiveLimits::default(),
+            Duration::from_hours(1),
+        )
+        .layer(service_fn(move |_request: http::Request<Body>| {
+            let frames = tokio_stream::once(Ok::<_, Status>(http_body::Frame::data(chunk.clone())))
+                .chain(tokio_stream::pending());
+            future::ready(Ok::<_, Infallible>(http::Response::new(Body::new(
+                StreamBody::new(frames),
+            ))))
+        }));
+        let response = service
+            .ready()
+            .await?
+            .call(http::Request::new(Body::empty()))
+            .await?;
+        let mut body = response.into_body();
+        let first = body.frame().await.ok_or("the response ended at once")??;
+        assert!(first.is_data());
+
+        assert_eq!(calls.terminate(), 1);
+        let next = body
+            .frame()
+            .await
+            .ok_or("the response ended without a status")??;
+
+        let trailers = next
+            .into_trailers()
+            .map_err(|_| "the terminated response sent more data")?;
+        assert_shutting_down(&trailers)
+    }
+
+    /// A handler that another thread is dropping, such as one whose client
+    /// went away, is still being torn down when termination reaches it.
+    /// Termination must not return before that drop has finished.
+    #[test]
+    fn terminate_returns_only_after_a_handler_another_thread_drops() -> TestResult {
+        struct BlockingDrop {
+            dropping: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            log: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        }
+
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                let _ = self.dropping.send(());
+                let _ = self.release.recv();
+                self.log.lock().push("handler dropped");
+            }
+        }
+
+        let calls = Arc::new(OpenGrpcCalls::default());
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (dropping_tx, dropping_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handler_state = parking_lot::Mutex::new(Some(BlockingDrop {
+            dropping: dropping_tx,
+            release: release_rx,
+            log: Arc::clone(&log),
+        }));
+        let mut service = GrpcCallTerminationLayer::new(Arc::clone(&calls)).layer(service_fn(
+            move |_request: http::Request<Body>| {
+                let held = handler_state.lock().take();
+                async move {
+                    let _held = held;
+                    future::pending::<Result<http::Response<Body>, Infallible>>().await
+                }
+            },
+        ));
+        service
+            .ready()
+            .now_or_never()
+            .ok_or("the service was not ready")??;
+        let call = service.call(http::Request::new(Body::empty()));
+
+        let dropper = std::thread::spawn(move || drop(call));
+        dropping_rx.recv()?;
+        let (terminating_tx, terminating_rx) = mpsc::channel();
+        let terminator = std::thread::spawn({
+            let calls = Arc::clone(&calls);
+            let log = Arc::clone(&log);
+            move || {
+                let _ = terminating_tx.send(());
+                calls.terminate();
+                log.lock().push("terminate returned");
+            }
+        });
+        terminating_rx.recv()?;
+        std::thread::sleep(Duration::from_millis(100));
+        release_tx.send(())?;
+        dropper.join().map_err(|_| "the dropping thread panicked")?;
+        terminator
+            .join()
+            .map_err(|_| "the terminating thread panicked")?;
+
+        assert_eq!(*log.lock(), ["handler dropped", "terminate returned"]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_finished_call_leaves_nothing_to_terminate() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn a_finished_call_leaves_nothing_to_terminate() -> TestResult {
         let calls = Arc::new(OpenGrpcCalls::default());
         let mut service = GrpcCallTerminationLayer::new(Arc::clone(&calls)).layer(service_fn(
             |_request: http::Request<Body>| {
@@ -500,8 +931,8 @@ mod tests {
             .await?;
         response.into_body().collect().await?;
 
+        assert_eq!(calls.registered_calls(), 0);
         assert_eq!(calls.terminate(), 0);
-        assert!(calls.registry.lock().calls.is_empty());
         Ok(())
     }
 }

@@ -60,6 +60,8 @@ mod memory_budget;
 mod metrics;
 mod ops_endpoint;
 mod ops_healthcheck;
+#[cfg(test)]
+mod perf;
 mod public_grpc_health;
 mod public_grpc_server;
 mod readiness;
@@ -136,8 +138,8 @@ pub use repeated_field_limits::{
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use runtime_supervision::{
-    GRPC_SERVER_DRAIN_TIMEOUT, RuntimeSupervisionError, RuntimeTaskFailure, ShutdownRequest,
-    SupervisedGrpcServer, SupervisedRuntime, SupervisedTasks,
+    GRPC_SERVER_CLOSE_TIMEOUT, GRPC_SERVER_DRAIN_TIMEOUT, RuntimeSupervisionError,
+    RuntimeTaskFailure, ShutdownRequest, SupervisedGrpcServer, SupervisedRuntime, SupervisedTasks,
 };
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,

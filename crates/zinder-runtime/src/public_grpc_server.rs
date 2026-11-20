@@ -26,8 +26,8 @@
 //! other public service.
 //!
 //! A listener a [`crate::SupervisedRuntime`] serves also passes through
-//! [`GrpcCallTerminationLayer`], which ends the calls still open once the
-//! runtime's drain deadline passes.
+//! [`GrpcCallTerminationLayer`], outside every other layer, which ends the
+//! calls still open once the runtime's drain deadline passes.
 
 mod call_termination;
 mod message_boundaries;
@@ -62,7 +62,7 @@ use tonic::{
 };
 use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
 use tower::{
-    Layer, Service,
+    Layer, Service, ServiceBuilder,
     layer::util::{Identity, Stack},
 };
 
@@ -128,6 +128,13 @@ pub type PublicGrpcServer = Server<PublicGrpcLayers>;
 /// The tonic router type that [`public_grpc_router`] returns.
 pub type PublicGrpcRouter = Router<PublicGrpcLayers>;
 
+/// The layers of a supervised public listener, outermost first: call
+/// termination, the receive limit, and the send stall bound.
+pub(crate) type SupervisedGrpcLayers = Stack<
+    GrpcSendStallLayer,
+    Stack<GrpcReceiveLimitLayer, Stack<GrpcCallTerminationLayer, Identity>>,
+>;
+
 /// Returns the gRPC server builder for a public Zinder listener, with the
 /// default receive limits and send stall timeout.
 ///
@@ -151,12 +158,47 @@ pub fn public_grpc_server_with(
     send_stall_timeout: Duration,
 ) -> PublicGrpcServer {
     describe_limit_metrics();
+    public_grpc_transport()
+        .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcSendStallLayer::new(send_stall_timeout))
+}
+
+/// Returns the gRPC server builder for a supervised public listener, whose
+/// calls `calls` can end.
+pub(crate) fn supervised_grpc_server(
+    calls: Arc<OpenGrpcCalls>,
+) -> Server<Stack<SupervisedGrpcLayers, Identity>> {
+    public_grpc_transport().layer(supervised_grpc_layers(
+        calls,
+        GrpcReceiveLimits::default(),
+        DEFAULT_GRPC_SEND_STALL_TIMEOUT,
+    ))
+}
+
+/// The layers of a supervised listener.
+///
+/// Call termination wraps the others, so a terminated call drops what the
+/// send stall bound still holds of its response, and a refused call never
+/// takes a receive slot.
+pub(crate) fn supervised_grpc_layers(
+    calls: Arc<OpenGrpcCalls>,
+    limits: GrpcReceiveLimits,
+    send_stall_timeout: Duration,
+) -> SupervisedGrpcLayers {
+    describe_limit_metrics();
+    ServiceBuilder::new()
+        .layer(GrpcCallTerminationLayer::new(calls))
+        .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcSendStallLayer::new(send_stall_timeout))
+        .into_inner()
+}
+
+/// The HTTP/2 transport policy every public listener shares.
+fn public_grpc_transport() -> Server {
     Server::builder()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
-        .layer(GrpcReceiveLimitLayer::new(limits))
-        .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
 
 /// Assembles a public Zinder wallet listener that serves `wallet_service`.

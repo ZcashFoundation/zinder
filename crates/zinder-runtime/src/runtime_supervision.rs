@@ -2,19 +2,27 @@
 //! it serves from.
 //!
 //! Every supervised task loops until the runtime stops, so a task that ends
-//! earlier has failed. A supervised runtime stops when shutdown is requested,
-//! when its gRPC server stops, or when one of its tasks ends, and always in
-//! the same order:
+//! earlier has failed, even when the supervisor first sees it end while the
+//! runtime stops. A supervised runtime stops when shutdown is requested, when
+//! its gRPC server stops, or when one of its tasks ends, and always in the
+//! same order:
 //!
 //! 1. It reports `shutting_down` through the runtime's readiness hook.
 //! 2. It cancels [`SupervisedRuntime::stopping`], which stops the background
-//!    tasks and starts the gRPC server's graceful drain.
+//!    tasks, the operational endpoint among them, and starts the gRPC
+//!    server's graceful drain at the same time.
 //! 3. It waits up to the drain timeout for the server to drain.
-//! 4. It ends every call the listener still serves, so no handler future or
-//!    response body remains.
-//! 5. It cancels [`SupervisedRuntime::serving_drained`], which lets the
+//! 4. It ends every call the listener still serves. Once it has, no handler
+//!    future or response body of the listener remains, and each ended
+//!    response sends its status before any more data.
+//! 5. If the drain timed out, it waits up to [`GRPC_SERVER_CLOSE_TIMEOUT`]
+//!    for the server to send those statuses and close its connections.
+//! 6. It cancels [`SupervisedRuntime::serving_drained`], which lets the
 //!    serving publishers release their generations.
-//! 6. It waits for every task and reports each task that failed.
+//! 7. It waits for every task and reports each task that failed.
+//!
+//! The supervisor watches the tasks through every step, so they stop, and
+//! their failures are logged, while the server drains.
 //!
 //! A shutdown request is a signal of its own. The server and the tasks never
 //! observe it, so a request can never look like a server or task stopping on
@@ -24,15 +32,14 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use thiserror::Error;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tower::layer::util::{Identity, Stack};
 
 use crate::{
-    GrpcReceiveLimitLayer, GrpcSendStallLayer, OpsEndpointHandle, OpsServerError, RuntimeService,
-    cancel_on_terminating_signal,
-    public_grpc_server::{GrpcCallTerminationLayer, OpenGrpcCalls},
-    public_grpc_server_with,
+    GrpcCallTerminationLayer, GrpcReceiveLimitLayer, GrpcSendStallLayer, OpsEndpointHandle,
+    OpsServerError, RuntimeService, cancel_on_terminating_signal,
+    public_grpc_server::{OpenGrpcCalls, supervised_grpc_server},
 };
 
 /// Longest a supervised gRPC server may drain after the runtime starts
@@ -44,12 +51,25 @@ use crate::{
 /// 20-second grace window, with room left for secondary teardown.
 pub const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest a supervised gRPC server may take, once the calls it still served
+/// at the drain deadline have ended, to send them their status and close its
+/// connections.
+///
+/// A client that reads its stream needs only milliseconds. The bound is for a
+/// client that has stopped reading, whose status cannot be delivered. With
+/// [`GRPC_SERVER_DRAIN_TIMEOUT`], it stays within the single-volume
+/// entrypoint's 20-second grace window.
+pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The tonic server type that [`SupervisedRuntime::public_grpc_server`]
 /// returns.
 pub type SupervisedGrpcServer = tonic::transport::Server<
     Stack<
-        GrpcCallTerminationLayer,
-        Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>,
+        Stack<
+            GrpcSendStallLayer,
+            Stack<GrpcReceiveLimitLayer, Stack<GrpcCallTerminationLayer, Identity>>,
+        >,
+        Identity,
     >,
 >;
 
@@ -132,11 +152,7 @@ impl SupervisedRuntime {
     /// supervisor end every call still open once the drain deadline passes.
     #[must_use]
     pub fn public_grpc_server(&self) -> SupervisedGrpcServer {
-        public_grpc_server_with(
-            crate::GrpcReceiveLimits::default(),
-            crate::DEFAULT_GRPC_SEND_STALL_TIMEOUT,
-        )
-        .layer(GrpcCallTerminationLayer::new(Arc::clone(&self.open_calls)))
+        supervised_grpc_server(Arc::clone(&self.open_calls))
     }
 
     /// The shutdown signal to serve the gRPC listener with, which resolves
@@ -155,11 +171,12 @@ impl SupervisedRuntime {
     /// # Exit status
     ///
     /// A requested shutdown returns `Ok` only when the gRPC server reported no
-    /// error and every task stopped cleanly. Otherwise, and whenever the
-    /// server or a task stopped first, it returns an error. Every task that
-    /// failed is logged by name; the error names the task or server that
-    /// stopped the runtime, or, for a requested shutdown, the first task that
-    /// failed while stopping.
+    /// error and every task stopped cleanly once the runtime started
+    /// stopping. Otherwise, and whenever the server or a task stopped first,
+    /// it returns an error. Every task that failed, or that had ended before
+    /// the runtime started stopping, is logged by name. The error names the
+    /// task or server that stopped the runtime, or, for a requested shutdown,
+    /// the first such task.
     ///
     /// # Errors
     ///
@@ -180,43 +197,21 @@ impl SupervisedRuntime {
             biased;
             () = self.shutdown_requested.cancelled() => RuntimeExit::ShutdownRequested,
             server_outcome = &mut server => RuntimeExit::GrpcServer(server_outcome),
-            Some(task_exit) = running.next() => RuntimeExit::Task(task_exit),
+            Some(task_exit) = running.exits.next() => RuntimeExit::Task(task_exit),
         };
 
+        running.record_tasks_already_ended();
         publish_shutting_down();
         self.stopping.cancel();
-        if let RuntimeExit::Task((task, outcome)) = &exit {
-            log_task_exit(service, task, outcome.as_ref().err());
+        if let RuntimeExit::Task(task_exit) = &exit {
+            log_task_exit(service, task_exit.task, task_exit.outcome.as_ref().err());
         }
 
-        let server_outcome = match exit {
-            RuntimeExit::GrpcServer(_) => Ok(()),
-            RuntimeExit::ShutdownRequested | RuntimeExit::Task(_) => {
-                self.drain_grpc_server(server.as_mut()).await
-            }
-        };
-        let ended_calls = self.open_calls.terminate();
-        if ended_calls > 0 {
-            tracing::warn!(
-                target: "zinder::runtime",
-                event = "runtime_grpc_calls_ended",
-                service,
-                ended_calls,
-                "ended gRPC calls still open after the drain deadline"
-            );
-        }
-        self.serving_drained.cancel();
-
-        let mut first_stop_failure = None;
-        while let Some((task, outcome)) = running.next().await {
-            if let Err(failure) = outcome {
-                log_task_exit(service, task, Some(&failure));
-                first_stop_failure.get_or_insert(RuntimeSupervisionError::TaskFailed {
-                    task,
-                    source: failure,
-                });
-            }
-        }
+        let server_stopped = matches!(exit, RuntimeExit::GrpcServer(_));
+        let (server_outcome, first_stop_failure) = tokio::join!(
+            self.stop_serving(server.as_mut(), server_stopped),
+            running.wait_for_stop(service),
+        );
 
         match exit {
             RuntimeExit::ShutdownRequested => {
@@ -232,7 +227,7 @@ impl SupervisedRuntime {
             RuntimeExit::GrpcServer(Err(source)) => {
                 Err(RuntimeSupervisionError::GrpcServer { source })
             }
-            RuntimeExit::Task((task, outcome)) => {
+            RuntimeExit::Task(TaskExit { task, outcome, .. }) => {
                 if let Err(source) = &server_outcome {
                     log_server_drain_failure(service, source);
                 }
@@ -244,17 +239,52 @@ impl SupervisedRuntime {
         }
     }
 
-    /// Waits for the gRPC server's graceful drain, giving up on it after the
-    /// drain timeout.
-    async fn drain_grpc_server<Server>(
+    /// Drains the gRPC server, ends every call it still serves, and then
+    /// releases the serving generations.
+    ///
+    /// A server that has already stopped is not polled again.
+    async fn stop_serving<Server>(
         &self,
-        server: Pin<&mut Server>,
+        mut server: Pin<&mut Server>,
+        server_stopped: bool,
     ) -> Result<(), tonic::transport::Error>
     where
         Server: Future<Output = Result<(), tonic::transport::Error>>,
     {
+        let drained = if server_stopped {
+            Some(Ok(()))
+        } else {
+            self.drain_grpc_server(server.as_mut()).await
+        };
+        let ended_calls = self.open_calls.terminate();
+        if ended_calls > 0 {
+            tracing::warn!(
+                target: "zinder::runtime",
+                event = "runtime_grpc_calls_ended",
+                service = self.service.binary_name(),
+                ended_calls,
+                "ended gRPC calls still open after the drain deadline"
+            );
+        }
+        let server_outcome = match drained {
+            Some(server_outcome) => server_outcome,
+            None => self.close_grpc_server(server).await,
+        };
+        self.serving_drained.cancel();
+        server_outcome
+    }
+
+    /// Waits for the gRPC server's graceful drain, or returns `None` once
+    /// the drain timeout passes.
+    async fn drain_grpc_server<Server>(
+        &self,
+        server: Pin<&mut Server>,
+    ) -> Option<Result<(), tonic::transport::Error>>
+    where
+        Server: Future<Output = Result<(), tonic::transport::Error>>,
+    {
         if let Ok(server_outcome) = tokio::time::timeout(self.grpc_drain_timeout, server).await {
-            return server_outcome;
+            return Some(server_outcome);
         }
         tracing::warn!(
             target: "zinder::runtime",
@@ -262,6 +292,28 @@ impl SupervisedRuntime {
             service = self.service.binary_name(),
             timeout_seconds = self.grpc_drain_timeout.as_secs_f64(),
             "gRPC server did not drain before its shutdown deadline; ending its open calls"
+        );
+        None
+    }
+
+    /// Waits for the gRPC server to send the calls it ended their status and
+    /// close its connections, giving up after [`GRPC_SERVER_CLOSE_TIMEOUT`].
+    async fn close_grpc_server<Server>(
+        &self,
+        server: Pin<&mut Server>,
+    ) -> Result<(), tonic::transport::Error>
+    where
+        Server: Future<Output = Result<(), tonic::transport::Error>>,
+    {
+        if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_CLOSE_TIMEOUT, server).await {
+            return server_outcome;
+        }
+        tracing::warn!(
+            target: "zinder::runtime",
+            event = "runtime_grpc_close_timed_out",
+            service = self.service.binary_name(),
+            timeout_seconds = GRPC_SERVER_CLOSE_TIMEOUT.as_secs_f64(),
+            "gRPC server did not close its connections after its open calls ended; their clients may not receive the calls' status"
         );
         Ok(())
     }
@@ -278,7 +330,13 @@ impl ShutdownRequest {
     }
 }
 
-type TaskExit = (&'static str, Result<(), RuntimeTaskFailure>);
+/// How a supervised task ended.
+struct TaskExit {
+    /// The task's position in its [`SupervisedTasks`].
+    index: usize,
+    task: &'static str,
+    outcome: Result<(), RuntimeTaskFailure>,
+}
 
 enum RuntimeExit {
     ShutdownRequested,
@@ -321,20 +379,27 @@ fn log_server_drain_failure(service: &'static str, error: &tonic::transport::Err
 /// its failure reports.
 #[derive(Default)]
 pub struct SupervisedTasks {
-    tasks: Vec<(&'static str, SupervisedTask)>,
+    tasks: Vec<SupervisedTask>,
 }
 
 impl std::fmt::Debug for SupervisedTasks {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_list()
-            .entries(self.tasks.iter().map(|(task, _)| task))
+            .entries(self.tasks.iter().map(|task| task.name))
             .finish()
     }
 }
 
-enum SupervisedTask {
-    Spawned(JoinHandle<()>),
+struct SupervisedTask {
+    name: &'static str,
+    /// Tells whether the task has ended, without waiting for it.
+    ended: Option<AbortHandle>,
+    run: TaskRun,
+}
+
+enum TaskRun {
+    Spawned(BoxFuture<'static, Result<(), RuntimeTaskFailure>>),
     Operations(OpsEndpointHandle),
 }
 
@@ -348,57 +413,142 @@ impl SupervisedTasks {
     /// Adds a spawned task that runs until [`SupervisedRuntime::stopping`]
     /// is cancelled.
     #[must_use]
-    pub fn with(mut self, task: &'static str, handle: JoinHandle<()>) -> Self {
-        self.tasks.push((task, SupervisedTask::Spawned(handle)));
-        self
+    pub fn with(self, task: &'static str, handle: JoinHandle<()>) -> Self {
+        let ended = handle.abort_handle();
+        self.push(
+            task,
+            Some(ended),
+            TaskRun::Spawned(Box::pin(async move {
+                handle.await.map_err(RuntimeTaskFailure::Join)
+            })),
+        )
+    }
+
+    /// Adds a spawned task that runs until [`SupervisedRuntime::stopping`]
+    /// is cancelled and returns an error when it fails, such as a serving
+    /// publisher whose teardown can fail after the runtime starts stopping.
+    #[must_use]
+    pub fn with_fallible<E>(self, task: &'static str, handle: JoinHandle<Result<(), E>>) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let ended = handle.abort_handle();
+        self.push(
+            task,
+            Some(ended),
+            TaskRun::Spawned(Box::pin(async move {
+                match handle.await {
+                    Ok(outcome) => {
+                        outcome.map_err(|error| RuntimeTaskFailure::Failed(Box::new(error)))
+                    }
+                    Err(join_error) => Err(RuntimeTaskFailure::Join(join_error)),
+                }
+            })),
+        )
     }
 
     /// Adds the operational endpoint, which the runtime closes once it
     /// starts stopping.
     #[must_use]
-    pub fn with_operations_endpoint(mut self, operations: Option<OpsEndpointHandle>) -> Self {
-        if let Some(handle) = operations {
-            self.tasks
-                .push(("operations endpoint", SupervisedTask::Operations(handle)));
+    pub fn with_operations_endpoint(self, operations: Option<OpsEndpointHandle>) -> Self {
+        match operations {
+            Some(handle) => {
+                let ended = handle.server_task();
+                self.push("operations endpoint", ended, TaskRun::Operations(handle))
+            }
+            None => self,
         }
+    }
+
+    fn push(mut self, name: &'static str, ended: Option<AbortHandle>, run: TaskRun) -> Self {
+        self.tasks.push(SupervisedTask { name, ended, run });
         self
     }
 
-    fn start(self, stopping: &CancellationToken) -> FuturesUnordered<BoxFuture<'static, TaskExit>> {
-        self.tasks
-            .into_iter()
-            .map(|(task, supervised)| -> BoxFuture<'static, TaskExit> {
-                match supervised {
-                    SupervisedTask::Spawned(handle) => {
-                        Box::pin(
-                            async move { (task, handle.await.map_err(RuntimeTaskFailure::Join)) },
-                        )
-                    }
-                    SupervisedTask::Operations(handle) => {
-                        let stopping = stopping.clone();
-                        Box::pin(async move {
-                            (
-                                task,
-                                watch_operations_endpoint(handle, stopping)
-                                    .await
-                                    .map_err(RuntimeTaskFailure::Operations),
-                            )
-                        })
-                    }
+    fn start(self, stopping: &CancellationToken) -> RunningTasks {
+        let mut running = RunningTasks {
+            exits: FuturesUnordered::new(),
+            ended: Vec::with_capacity(self.tasks.len()),
+            ended_before_stopping: Vec::new(),
+        };
+        for (index, SupervisedTask { name, ended, run }) in self.tasks.into_iter().enumerate() {
+            let outcome = match run {
+                TaskRun::Spawned(outcome) => outcome,
+                TaskRun::Operations(handle) => {
+                    Box::pin(watch_operations_endpoint(handle, stopping.clone()))
                 }
-            })
-            .collect()
+            };
+            running.ended.push(ended);
+            running.exits.push(Box::pin(async move {
+                TaskExit {
+                    index,
+                    task: name,
+                    outcome: outcome.await,
+                }
+            }));
+        }
+        running
+    }
+}
+
+/// The supervised tasks of a running runtime.
+struct RunningTasks {
+    exits: FuturesUnordered<BoxFuture<'static, TaskExit>>,
+    /// Tells, for each task by position, whether it has ended.
+    ended: Vec<Option<AbortHandle>>,
+    /// Whether each task, by position, had ended before the runtime started
+    /// stopping.
+    ended_before_stopping: Vec<bool>,
+}
+
+impl RunningTasks {
+    /// Records which tasks have already ended, before the runtime starts
+    /// stopping. Each of them stopped on its own, however late its exit is
+    /// observed.
+    fn record_tasks_already_ended(&mut self) {
+        self.ended_before_stopping = self
+            .ended
+            .iter()
+            .map(|ended| ended.as_ref().is_some_and(AbortHandle::is_finished))
+            .collect();
+    }
+
+    /// Waits for every task still running, logging each one that failed or
+    /// had ended before the runtime started stopping, and returns the first.
+    async fn wait_for_stop(&mut self, service: &'static str) -> Option<RuntimeSupervisionError> {
+        let mut first_failure = None;
+        while let Some(TaskExit {
+            index,
+            task,
+            outcome,
+        }) = self.exits.next().await
+        {
+            let failure = match outcome {
+                Err(source) => {
+                    log_task_exit(service, task, Some(&source));
+                    RuntimeSupervisionError::TaskFailed { task, source }
+                }
+                Ok(()) if self.ended_before_stopping.get(index) == Some(&true) => {
+                    log_task_exit(service, task, None);
+                    RuntimeSupervisionError::TaskStopped { task }
+                }
+                Ok(()) => continue,
+            };
+            first_failure.get_or_insert(failure);
+        }
+        first_failure
     }
 }
 
 async fn watch_operations_endpoint(
     mut handle: OpsEndpointHandle,
     stopping: CancellationToken,
-) -> Result<(), OpsServerError> {
+) -> Result<(), RuntimeTaskFailure> {
     tokio::select! {
         exited = handle.wait() => exited,
         () = stopping.cancelled() => handle.shutdown().await,
     }
+    .map_err(RuntimeTaskFailure::Operations)
 }
 
 /// Why a supervised task failed.
@@ -412,6 +562,10 @@ pub enum RuntimeTaskFailure {
     /// The operational endpoint failed.
     #[error(transparent)]
     Operations(OpsServerError),
+
+    /// The task returned an error.
+    #[error(transparent)]
+    Failed(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Why a supervised runtime stopped with an error.
@@ -463,9 +617,10 @@ mod tests {
     use zinder_testkit::LogCapture;
 
     use super::{
-        GRPC_SERVER_DRAIN_TIMEOUT, RuntimeSupervisionError, SupervisedRuntime, SupervisedTasks,
+        GRPC_SERVER_CLOSE_TIMEOUT, GRPC_SERVER_DRAIN_TIMEOUT, RuntimeSupervisionError,
+        RuntimeTaskFailure, SupervisedRuntime, SupervisedTasks,
     };
-    use crate::RuntimeService;
+    use crate::{OpsEndpointHandle, OpsServerError, RuntimeService};
 
     fn until_stopping(runtime: &SupervisedRuntime) -> JoinHandle<()> {
         let stopping = runtime.stopping();
@@ -477,6 +632,34 @@ mod tests {
         handle.abort();
         handle
     }
+
+    /// Spawns a task that ends at once, and returns it once it has ended.
+    async fn ended_task() -> JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        handle
+    }
+
+    /// An operational endpoint that serves until `cancel` is cancelled, and
+    /// then reports through `closed` that it has closed.
+    fn operations_endpoint(closed: CancellationToken) -> OpsEndpointHandle {
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                cancel.cancelled().await;
+                closed.cancel();
+                Ok(())
+            }
+        });
+        OpsEndpointHandle::for_task(cancel, server)
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("teardown failed")]
+    struct TeardownFailed;
 
     /// What a supervised run observed once the supervisor returned.
     struct RuntimeRun {
@@ -581,6 +764,36 @@ mod tests {
         Ok(())
     }
 
+    /// A task that ended cleanly just before a shutdown request is seen
+    /// first while the runtime stops. It still stopped on its own.
+    #[tokio::test]
+    async fn a_task_that_ended_before_a_requested_shutdown_is_reported_by_name() {
+        let capture = LogCapture::install_for_target("zinder::runtime");
+        let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
+        let ended = ended_task().await;
+        runtime.shutdown_request().request();
+
+        let run = run_supervised(runtime, |runtime| {
+            SupervisedTasks::new()
+                .with("running task", until_stopping(runtime))
+                .with("ended task", ended)
+        })
+        .await;
+
+        assert!(
+            matches!(
+                run.outcome,
+                Err(RuntimeSupervisionError::TaskStopped { task: "ended task" })
+            ),
+            "expected the runtime to fail naming the ended task, got {:?}",
+            run.outcome
+        );
+        assert!(capture.events().iter().any(|event| {
+            event.field("event") == Some("runtime_task_stopped")
+                && event.field("task") == Some("ended task")
+        }));
+    }
+
     /// A shutdown request that lands after the supervisor checked for one,
     /// while the server is being polled, used to stop an idle server first
     /// and so look like the server stopping on its own.
@@ -657,8 +870,100 @@ mod tests {
         );
     }
 
+    /// A publisher's teardown runs after the runtime starts stopping, so its
+    /// failure must still fail a requested shutdown.
+    #[tokio::test]
+    async fn a_fallible_task_that_fails_while_stopping_fails_a_requested_shutdown() {
+        let runtime = SupervisedRuntime::new(RuntimeService::Query);
+        runtime.shutdown_request().request();
+
+        let run = run_supervised(runtime, |runtime| {
+            let serving_drained = runtime.serving_drained();
+            SupervisedTasks::new().with_fallible(
+                "serving-pair publisher",
+                tokio::spawn(async move {
+                    serving_drained.cancelled().await;
+                    Err::<(), _>(TeardownFailed)
+                }),
+            )
+        })
+        .await;
+
+        assert!(
+            matches!(
+                &run.outcome,
+                Err(RuntimeSupervisionError::TaskFailed {
+                    task: "serving-pair publisher",
+                    source: RuntimeTaskFailure::Failed(_),
+                })
+            ),
+            "expected the publisher's teardown failure, got {:?}",
+            run.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operations_endpoint_that_fails_stops_the_runtime_and_is_named() {
+        let run = run_supervised(SupervisedRuntime::new(RuntimeService::Query), |runtime| {
+            let failed = tokio::spawn(async {
+                Err(OpsServerError::Transport {
+                    source: std::io::Error::other("listener failed"),
+                })
+            });
+            SupervisedTasks::new()
+                .with("first task", until_stopping(runtime))
+                .with_operations_endpoint(Some(OpsEndpointHandle::for_task(
+                    CancellationToken::new(),
+                    failed,
+                )))
+        })
+        .await;
+
+        assert!(
+            matches!(
+                &run.outcome,
+                Err(RuntimeSupervisionError::TaskFailed {
+                    task: "operations endpoint",
+                    source: RuntimeTaskFailure::Operations(_),
+                })
+            ),
+            "expected the operations endpoint to be named, got {:?}",
+            run.outcome
+        );
+        assert!(run.published_shutting_down);
+        assert!(run.server_stopped);
+    }
+
+    /// The operational endpoint closes while the gRPC server drains, not
+    /// after. The server here drains only once the endpoint has closed.
+    #[tokio::test(start_paused = true)]
+    async fn the_operations_endpoint_closes_while_the_grpc_server_drains() {
+        let runtime = SupervisedRuntime::new(RuntimeService::Query);
+        let operations_closed = CancellationToken::new();
+        let tasks = SupervisedTasks::new()
+            .with_operations_endpoint(Some(operations_endpoint(operations_closed.clone())));
+        let shutdown = runtime.grpc_server_shutdown();
+        let server = async move {
+            shutdown.await;
+            operations_closed.cancelled().await;
+            Ok(())
+        };
+        runtime.shutdown_request().request();
+        let started_at = tokio::time::Instant::now();
+
+        let outcome = runtime.supervise(server, tasks, || {}).await;
+
+        assert!(outcome.is_ok(), "expected a clean exit, got {outcome:?}");
+        assert!(
+            started_at.elapsed() < GRPC_SERVER_DRAIN_TIMEOUT,
+            "the server drained only at its deadline, after {:?}",
+            started_at.elapsed()
+        );
+    }
+
     /// A server whose open calls never finish stops holding the process once
-    /// the drain bound passes, and the serving generations are released.
+    /// the drain and close bounds pass, and the serving generations are
+    /// released.
     #[tokio::test(start_paused = true)]
     async fn requested_shutdown_gives_up_on_a_server_that_does_not_drain() {
         let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
@@ -671,7 +976,10 @@ mod tests {
             .await;
 
         assert!(outcome.is_ok());
-        assert_eq!(started_at.elapsed(), GRPC_SERVER_DRAIN_TIMEOUT);
+        assert_eq!(
+            started_at.elapsed(),
+            GRPC_SERVER_DRAIN_TIMEOUT + GRPC_SERVER_CLOSE_TIMEOUT
+        );
         assert!(serving_drained.is_cancelled());
     }
 }
