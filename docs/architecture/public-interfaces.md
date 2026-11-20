@@ -256,8 +256,9 @@ These rules apply at every protocol boundary.
 - Native hash strings use RPC byte order as 64 lowercase hex characters.
 - Inside Zinder, hashes are typed values in internal byte order. Each protocol
   adapter converts at its boundary. Lightwalletd-compatible `bytes` hash
-  fields carry internal byte order, except `SubtreeRoot.completingBlockHash`,
-  which reference lightwalletd fills in RPC byte order.
+  fields carry internal byte order except for the hash in a
+  `GetTreeState(BlockID { height: 0, hash })` request and the
+  `SubtreeRoot.completingBlockHash` response field. Both use RPC byte order.
 - Protobuf bytes are checked for exact length before they become typed hashes,
   outpoints, or commitments.
 - Wire translations of an identifier live in one place:

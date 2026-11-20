@@ -25,7 +25,10 @@ use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     NetworkUpgradeActivations,
-    wire::{encode_bip70_chain_name, encode_branch_id_hex, encode_internal_block_hash},
+    wire::{
+        WireDecodeError, decode_internal_block_hash, encode_bip70_chain_name, encode_branch_id_hex,
+        encode_internal_block_hash,
+    },
 };
 use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
 use zinder_store::HeightOrder;
@@ -374,14 +377,14 @@ impl BlockMethods {
     }
 }
 
-/// Answers `GetBlock` with the stored block `block_id` names, every pool
-/// kept, read at one captured view.
+/// Answers `GetBlock` or `GetBlockNullifiers` with the stored block `block_id`
+/// names, shaped by `shape`, read at one captured view.
 pub(crate) async fn compact_block<Reads: CompactBlockReads>(
     reads: &Reads,
     block_id: &lightwalletd::BlockId,
     shape: CompactBlockShape,
 ) -> Result<lightwalletd::CompactBlock, Status> {
-    let block = requested_block(block_id)?;
+    let block = requested_block(block_id, decode_internal_block_hash)?;
     let view = reads.capture_view().await?;
     if let RequestedBlock::Height(height) = block {
         reject_future_block_height(height, Reads::view_chain_epoch(&view).visible_tip_height)?;
@@ -400,22 +403,26 @@ pub(crate) async fn compact_block<Reads: CompactBlockReads>(
 ///
 /// `BlockId { height, hash }` takes three shapes: height-only (`hash` empty),
 /// hash-only (`height = 0` with a 32-byte `hash`), and height-with-hash, whose
-/// hash the caller checks after its read. Height 0 with an empty hash is an
-/// unspecified identifier and returns `INVALID_ARGUMENT`, as reference
-/// lightwalletd does for unary block lookups.
-pub(crate) fn requested_block(block_id: &lightwalletd::BlockId) -> Result<RequestedBlock, Status> {
+/// hash the caller checks after its read when its contract requires that.
+/// Height 0 with an empty hash is an unspecified identifier and returns
+/// `INVALID_ARGUMENT`, as reference lightwalletd does for unary block lookups.
+///
+/// Callers pass the hash decoder matching their wire dialect:
+/// [`decode_internal_block_hash`] for `GetBlock` / `GetBlockNullifiers` and
+/// [`zinder_core::wire::decode_rpc_block_hash_bytes`] for `GetTreeState`.
+pub(crate) fn requested_block(
+    block_id: &lightwalletd::BlockId,
+    decode_hash: fn(&[u8]) -> Result<BlockHash, WireDecodeError>,
+) -> Result<RequestedBlock, Status> {
     if block_id.height != 0 {
         return block_range_height_from_id(block_id).map(RequestedBlock::Height);
     }
     if block_id.hash.is_empty() {
         return Err(Status::invalid_argument("block identifier is unspecified"));
     }
-    let hash_bytes: [u8; 32] = block_id
-        .hash
-        .as_slice()
-        .try_into()
-        .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
-    Ok(RequestedBlock::Hash(BlockHash::from_bytes(hash_bytes)))
+    decode_hash(&block_id.hash)
+        .map(RequestedBlock::Hash)
+        .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))
 }
 
 /// Refuses a height above the visible tip with lightwalletd's
@@ -979,5 +986,57 @@ mod tests {
             lightd_info_response.git_commit,
             zinder_runtime::BUILD_GIT_COMMIT
         );
+    }
+
+    #[test]
+    fn requested_block_decodes_each_hash_dialect_and_validates_selectors() {
+        use super::{lightwalletd, requested_block};
+        use zinder_core::wire::{decode_internal_block_hash, decode_rpc_block_hash_bytes};
+
+        // Testnet block 4031230 (non-palindromic): internal vs RPC byte order.
+        let internal_bytes: [u8; 32] = [
+            0xee, 0xce, 0xfc, 0x22, 0xf4, 0xa0, 0x9f, 0xe4, 0x30, 0x6f, 0x40, 0xaf, 0xa3, 0xa6,
+            0xf3, 0xdb, 0x17, 0x3f, 0x1a, 0x5e, 0x3a, 0x0c, 0xcc, 0x3d, 0x8f, 0xeb, 0x22, 0xc6,
+            0xba, 0xf1, 0x33, 0x00,
+        ];
+        let mut rpc_bytes = internal_bytes;
+        rpc_bytes.reverse();
+        let expected_hash = BlockHash::from_bytes(internal_bytes);
+
+        let by_hash = |hash| lightwalletd::BlockId { height: 0, hash };
+        assert_eq!(
+            requested_block(
+                &by_hash(internal_bytes.to_vec()),
+                decode_internal_block_hash
+            )
+            .ok(),
+            Some(RequestedBlock::Hash(expected_hash))
+        );
+        assert_eq!(
+            requested_block(&by_hash(rpc_bytes.to_vec()), decode_rpc_block_hash_bytes).ok(),
+            Some(RequestedBlock::Hash(expected_hash))
+        );
+
+        // Positive height takes precedence over hash length in requested_block.
+        let height_with_short_hash = requested_block(
+            &lightwalletd::BlockId {
+                height: 42,
+                hash: vec![0xaa],
+            },
+            decode_rpc_block_hash_bytes,
+        );
+        assert_eq!(
+            height_with_short_hash.ok(),
+            Some(RequestedBlock::Height(BlockHeight::new(42)))
+        );
+
+        for length in [0, 31, 33] {
+            let outcome =
+                requested_block(&by_hash(vec![0xaa; length]), decode_rpc_block_hash_bytes);
+            assert_eq!(
+                outcome.err().map(|status| status.code()),
+                Some(Code::InvalidArgument)
+            );
+        }
     }
 }

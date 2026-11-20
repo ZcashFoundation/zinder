@@ -103,7 +103,11 @@ How each engine uses the tip calls:
 
 ### `GetBlock` and `GetBlockNullifiers`
 
-A `BlockID` with a height reads that height. Height 0 with a 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`. Both serving modes answer this way, whether the request names the block by height or by hash. `GetBlock` in compact-blocks serving returns the stored block without pool filtering.
+A `BlockID` with a height reads that height. Zinder also accepts a 32-byte hash in internal byte order for these two methods. Height 0 with a hash selects the block by hash. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`.
+
+`GetBlock` supports these lookups in both serving modes. In compact-blocks serving it returns the stored block without pool filtering. `GetBlockNullifiers` is available only in wallet serving and returns `UNIMPLEMENTED` in compact-blocks serving.
+
+Like Go lightwalletd v0.6.2, `GetBlockNullifiers` retains every stored transaction after clearing non-nullifier payloads. Transparent-only transactions, including a transparent-only coinbase, retain just `index`, `txid`, and `fee`. `GetBlockRangeNullifiers` selects transactions by shielded pool before clearing non-nullifier payloads. Both methods omit commitment-tree sizes. Zinder omits `chainMetadata`, while Go sends the submessage with all sizes set to zero.
 
 ### `GetBlockRange` and `GetBlockRangeNullifiers`
 
@@ -157,7 +161,7 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 ### `GetTreeState` and `GetLatestTreeState`
 
-`GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns, and a refused rebuild is `UNAVAILABLE`.
+`GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. A positive `height` takes precedence and ignores `hash`. With `height = 0`, send the 32 bytes obtained by hex-decoding `TreeState.hash` in RPC byte order. A wallet starting from `CompactBlock.prevHash` reverses those bytes once to request the predecessor’s tree state. A hash outside the best chain and a height above the visible tip both return `INVALID_ARGUMENT`, matching lightwalletd's status for a failed `z_gettreestate` lookup. A refused rebuild returns `UNAVAILABLE`. Other height lookup statuses follow [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots).
 
 Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `UNAVAILABLE`, the code a full block-range limit returns, so a wallet retries both limits the same way. It fails at once when every waiting place is taken. `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` refuses the same rebuild with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
 
@@ -255,7 +259,9 @@ The protocol has no lossless way to page past the cap. A single block with more 
 
 ### `GetMempoolTx`
 
-`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. `exclude_txid_suffixes` accepts at most 1,024 suffixes of at most 32 bytes each. A suffix excludes a transaction only when it matches exactly one mempool transaction. Suffixes are compared against transaction ids in internal byte order.
+`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. Zinder accepts up to 1,024 entries in `exclude_txid_suffixes`, compared with 20,000 in Go lightwalletd v0.6.2. Both accept up to 32 bytes per suffix. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
+
+When suffixes overlap, the shortest matching suffix takes precedence, as in Go lightwalletd v0.6.2. A list containing an empty suffix therefore excludes the only transaction in a singleton snapshot. An empty list excludes nothing. [Go mempool filter](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L1019-L1058)
 
 ### `GetMempoolStream`
 

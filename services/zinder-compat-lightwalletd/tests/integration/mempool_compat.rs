@@ -188,29 +188,36 @@ async fn lightwalletd_get_mempool_tx_preserves_transactions_when_excluded_suffix
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lightwalletd_get_mempool_tx_uniquely_excludes_match_with_other_match_outside_requested_pools()
+async fn lightwalletd_get_mempool_tx_treats_suffix_colliding_outside_requested_pools_as_ambiguous()
 -> eyre::Result<()> {
     let (wallet_query, _store_fixture) = single_block_serving_query()?;
     let mut streamable_transaction_id = [0x11; 32];
     streamable_transaction_id[31] = 0xAA;
     let mut pruned_transaction_id = [0x22; 32];
     pruned_transaction_id[31] = 0xAA;
+    let mut unique_streamable_id = [0x33; 32];
+    unique_streamable_id[31] = 0xBB;
     let surface = ScriptedMempoolSurface::with_entries(vec![
         synthetic_entry_with_transaction_id(streamable_transaction_id, synthetic_chain_epoch())?,
         ironwood_only_entry_with_transaction_id(pruned_transaction_id, synthetic_chain_epoch())?,
-    ]);
+        synthetic_entry_with_transaction_id(unique_streamable_id, synthetic_chain_epoch())?,
+    ])
+    .with_snapshot_page_size(1);
     let adapter =
         LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface));
 
     let response = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
-            exclude_txid_suffixes: vec![vec![0xAA]],
+            // `0xAA` matches both the Sapling tx and the Ironwood-only tx in the
+            // mempool, so it is ambiguous and excludes neither. `0xBB` uniquely
+            // matches `unique_streamable_id` and excludes it.
+            exclude_txid_suffixes: vec![vec![0xAA], vec![0x11, 0xAA], vec![0xBB]],
             pool_types: vec![lightwalletd::PoolType::Sapling as i32],
         }))
         .await?
         .into_inner();
     let collected = collect_compact_txids(response).await?;
-    assert_eq!(collected, [] as [std::vec::Vec<u8>; 0]);
+    assert_eq!(collected, vec![streamable_transaction_id.to_vec()]);
     Ok(())
 }
 

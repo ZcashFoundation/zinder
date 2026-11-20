@@ -11,8 +11,23 @@ use zinder_proto::compat::lightwalletd;
 enum Payload {
     FullBlock,
     SelectedPools,
+    /// Unary `GetBlockNullifiers`: retains every stored transaction (including
+    /// transparent-only shells) with only shielded nullifiers kept.
+    BlockNullifiers,
+    /// Range `GetBlockRangeNullifiers`: filters transactions by selected
+    /// shielded pools before redacting them to nullifiers only.
     Nullifiers,
     Mempool,
+}
+
+impl Payload {
+    const fn is_nullifiers_only(self) -> bool {
+        matches!(self, Self::BlockNullifiers | Self::Nullifiers)
+    }
+
+    const fn retains_all_transactions(self) -> bool {
+        matches!(self, Self::FullBlock | Self::BlockNullifiers)
+    }
 }
 
 /// The fields and transactions a lightwalletd compact-block method returns.
@@ -39,7 +54,16 @@ impl CompactBlockShape {
         payload: Payload::FullBlock,
     };
 
-    /// Every shielded pool in nullifier-only form.
+    /// `GetBlockNullifiers` retains every stored transaction in nullifier-only
+    /// form across every shielded pool, keeping transparent-only transactions
+    /// as `{index, txid, fee}` shells.
+    pub(crate) const BLOCK_NULLIFIERS: Self = Self {
+        transparent: false,
+        payload: Payload::BlockNullifiers,
+        ..Self::FULL_BLOCK
+    };
+
+    /// Every shielded pool in nullifier-only form for `GetBlockRangeNullifiers`.
     pub(crate) const NULLIFIERS: Self = Self {
         transparent: false,
         payload: Payload::Nullifiers,
@@ -103,7 +127,7 @@ impl CompactBlockShape {
         block: CompactBlockArtifact,
     ) -> Result<lightwalletd::CompactBlock, Status> {
         let block = block.into_parts();
-        let mut vtx = if self.payload == Payload::FullBlock {
+        let mut vtx = if self.payload.retains_all_transactions() {
             Vec::with_capacity(block.transactions.len())
         } else {
             Vec::new()
@@ -121,7 +145,7 @@ impl CompactBlockShape {
             time: block.time,
             header: Vec::new(),
             vtx,
-            chain_metadata: (self.payload != Payload::Nullifiers).then_some(
+            chain_metadata: (!self.payload.is_nullifiers_only()).then_some(
                 lightwalletd::ChainMetadata {
                     sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
                     orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
@@ -146,7 +170,7 @@ impl CompactBlockShape {
         if !self.includes_transaction(&scan) {
             return Ok(None);
         }
-        let nullifiers_only = self.payload == Payload::Nullifiers;
+        let nullifiers_only = self.payload.is_nullifiers_only();
         let mut message = lightwalletd::CompactTx {
             index: transaction.index,
             txid: encode_internal_transaction_id(transaction.transaction_id).to_vec(),
@@ -205,7 +229,7 @@ impl CompactBlockShape {
 
     fn includes_transaction(self, scan: &CompactTransactionData) -> bool {
         // A Sapling output selects the transaction even when the nullifier RPC omits the output.
-        self.payload == Payload::FullBlock
+        self.payload.retains_all_transactions()
             || (self.sapling
                 && (!scan.sapling_spends.is_empty() || !scan.sapling_outputs.is_empty()))
             || (self.orchard && !scan.orchard_actions.is_empty())
@@ -310,6 +334,30 @@ mod tests {
         let nullifiers = CompactBlockShape::NULLIFIERS.message(mixed_block()?)?;
         assert!(nullifiers.chain_metadata.is_none());
         assert_eq!(nullifiers.vtx, shielded_expected.vtx);
+        let block_nullifiers = CompactBlockShape::BLOCK_NULLIFIERS.message(mixed_block()?)?;
+        assert!(block_nullifiers.chain_metadata.is_none());
+        assert_eq!(
+            block_nullifiers
+                .vtx
+                .iter()
+                .map(|tx| tx.index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        for index in [0_usize, 2, 4] {
+            let expected_index = u64::try_from(index)?;
+            assert_eq!(
+                block_nullifiers.vtx[index],
+                lightwalletd::CompactTx {
+                    index: expected_index,
+                    txid: vec![1; 32],
+                    fee: 0,
+                    ..lightwalletd::CompactTx::default()
+                }
+            );
+        }
+        assert_eq!(block_nullifiers.vtx[1], nullifiers.vtx[0]);
+        assert_eq!(block_nullifiers.vtx[3], nullifiers.vtx[1]);
         assert_eq!(shielded, shielded_expected);
         assert_eq!(transparent, transparent_expected);
         Ok(())

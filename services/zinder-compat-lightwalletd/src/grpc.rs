@@ -21,8 +21,9 @@ use zinder_core::{
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
-        decode_internal_transaction_id, encode_bip70_chain_name, encode_internal_transaction_id,
-        encode_rpc_block_hash_bytes, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
+        decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_bip70_chain_name,
+        encode_internal_transaction_id, encode_rpc_block_hash_bytes, encode_rpc_block_hash_hex,
+        encode_rpc_transaction_id_hex,
     },
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
@@ -44,8 +45,8 @@ use crate::block_methods::{
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
-    MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
-    SharedTipChangeWatcher, TipChangeWatcherError,
+    MempoolExclusions, MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup,
+    SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcherError,
 };
 use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
@@ -366,7 +367,9 @@ where
         view: &ChainEpoch,
         block: RequestedBlock,
     ) -> Result<CompactBlockArtifact, Status> {
-        let height = resolve_block_height(self, view, block).await?;
+        let height = resolve_block_height(self, view, block)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
         self.compact_block_at(height, Some(view.id))
             .await
             .map(|compact_block| compact_block.compact_block)
@@ -444,7 +447,7 @@ async fn resolve_block_height<QueryApi>(
     query_api: &QueryApi,
     view: &ChainEpoch,
     block: RequestedBlock,
-) -> Result<BlockHeight, Status>
+) -> Result<BlockHeight, QueryError>
 where
     QueryApi: WalletQueryApi + Sync,
 {
@@ -453,9 +456,15 @@ where
         RequestedBlock::Hash(block_hash) => query_api
             .block_id_by_selector(BlockSelector::Hash(block_hash), Some(view.id))
             .await
-            .map(|resolved| resolved.block_id.height)
-            .map_err(|error| status_from_query_error(&error)),
+            .map(|resolved| resolved.block_id.height),
     }
+}
+
+fn tree_state_block_lookup_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::BlockNotInBestChain) {
+        return Status::invalid_argument("block hash is not in the best chain");
+    }
+    status_from_query_error(error)
 }
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
@@ -714,7 +723,7 @@ where
         block_methods::compact_block(
             &self.query_api,
             &request.into_inner(),
-            CompactBlockShape::NULLIFIERS,
+            CompactBlockShape::BLOCK_NULLIFIERS,
         )
         .await
         .map(Response::new)
@@ -869,7 +878,6 @@ where
         let request = request.into_inner();
         validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
         let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
-        let exclude_txid_suffixes = request.exclude_txid_suffixes;
         let mempool_surface = self
             .mempool_surface
             .as_ref()
@@ -880,39 +888,31 @@ where
             .await
             .map_err(status_from_mempool_surface_error)?;
         let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-        let mut exclude_suffix_match_counts = vec![0_usize; exclude_txid_suffixes.len()];
+        let mut exclusions = (!request.exclude_txid_suffixes.is_empty())
+            .then(|| MempoolExclusions::new(request.exclude_txid_suffixes));
         let mut compact_messages = Vec::new();
         while let Some(entry_outcome) = entries.next().await {
             let entry = entry_outcome?.into_parts();
-            let Some(compact_message) = shape.encode_transaction(CompactTransaction {
+            if let Some(exclusions) = &mut exclusions {
+                exclusions.observe(entry.transaction_id);
+            }
+            if let Some(message) = shape.encode_transaction(CompactTransaction {
                 index: 0,
                 transaction_id: entry.transaction_id,
                 data: entry.compact_transaction_data,
-            })?
-            else {
-                continue;
-            };
-            for (exclude_suffix, match_count) in exclude_txid_suffixes
-                .iter()
-                .zip(&mut exclude_suffix_match_counts)
-            {
-                if !exclude_suffix.is_empty() && compact_message.txid.ends_with(exclude_suffix) {
-                    *match_count = match_count.saturating_add(1);
-                }
+            })? {
+                compact_messages.push(message);
             }
-            compact_messages.push(compact_message);
         }
-        let filtered_messages = compact_messages
+        let messages = compact_messages
             .into_iter()
-            .filter_map(move |compact_message| {
-                (!transaction_id_is_uniquely_excluded(
-                    &compact_message.txid,
-                    &exclude_txid_suffixes,
-                    &exclude_suffix_match_counts,
-                ))
-                .then_some(Ok(compact_message))
-            });
-        Ok(Response::new(Box::pin(stream::iter(filtered_messages))))
+            .filter(move |message| {
+                exclusions
+                    .as_ref()
+                    .is_none_or(|exclusions| !exclusions.uniquely_matches(&message.txid))
+            })
+            .map(Ok);
+        Ok(Response::new(Box::pin(stream::iter(messages))))
     }
 
     type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -968,9 +968,11 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        let block = requested_block(&request.into_inner())?;
+        let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
         let view = self.query_api.capture_view().await?;
-        let height = resolve_block_height(&self.query_api, &view, block).await?;
+        let height = resolve_block_height(&self.query_api, &view, block)
+            .await
+            .map_err(|error| tree_state_block_lookup_status(&error))?;
         reject_future_tree_state_height(height, view.visible_tip_height)?;
         let tree_state = self
             .query_api
@@ -2031,19 +2033,6 @@ fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), S
         }
     }
     Ok(())
-}
-
-fn transaction_id_is_uniquely_excluded(
-    transaction_id: &[u8],
-    exclude_suffixes: &[Vec<u8>],
-    exclude_suffix_match_counts: &[usize],
-) -> bool {
-    exclude_suffixes
-        .iter()
-        .zip(exclude_suffix_match_counts)
-        .any(|(suffix, match_count)| {
-            *match_count == 1 && !suffix.is_empty() && transaction_id.ends_with(suffix)
-        })
 }
 
 #[allow(
