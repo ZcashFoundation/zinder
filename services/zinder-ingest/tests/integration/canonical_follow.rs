@@ -31,7 +31,10 @@ use zinder_ingest::{
     load_fresh_canonical, prepare_canonical_block,
 };
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
-use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
+use zinder_runtime::{
+    ComposedReadiness, FollowWaitReason, NodeUnavailableDetail, Readiness, ReadinessCause,
+    ReadinessReport,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
@@ -100,6 +103,7 @@ pub(super) struct RecordingParseableSource {
     calls: Arc<Mutex<Vec<SourceCall>>>,
     tip_call_count: Arc<Mutex<u32>>,
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
+    stall_block_read: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
     cancel_after_subtree_read: Arc<Mutex<Option<CancellationToken>>>,
@@ -155,6 +159,7 @@ impl RecordingParseableSource {
             calls: Arc::new(Mutex::new(Vec::new())),
             tip_call_count: Arc::new(Mutex::new(0)),
             tip_call_gate: Arc::new(Mutex::new(None)),
+            stall_block_read: Arc::default(),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
             cancel_after_subtree_read: Arc::new(Mutex::new(None)),
@@ -281,6 +286,11 @@ impl NodeSource for RecordingParseableSource {
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.calls.lock().push(SourceCall::Block(height));
+        let stall = self.stall_block_read.lock().take();
+        if let Some(entered) = stall {
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        }
         self.block_at(height)
     }
 
@@ -1887,6 +1897,101 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
         ReadinessCause::NodeUnavailable(_)
     ));
     Ok(())
+}
+
+#[tokio::test]
+async fn stalled_block_preparation_replaces_the_at_tip_mempool_wait()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (at_tip, preparing) = reports_around_stalled_block_read(4).await?;
+    for (report, reason) in [
+        (at_tip, FollowWaitReason::MempoolHydrationAtTip),
+        (preparing, FollowWaitReason::CanonicalProgress),
+    ] {
+        assert_eq!(
+            (report.current_height, report.target_height),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            report.cause,
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(reason),
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_node_tip_ends_a_direct_outage_before_block_preparation()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The fixture has blocks through 5, so the first tip read at 99 fails.
+    let (outage, preparing) = reports_around_stalled_block_read(99).await?;
+    assert!(matches!(outage.cause, ReadinessCause::NodeUnavailable(_)));
+    assert_eq!(
+        preparing.cause,
+        ReadinessCause::Syncing {
+            lag_blocks: Some(1),
+            wait_reason: Some(FollowWaitReason::CanonicalProgress),
+        }
+    );
+    assert_eq!(
+        (preparing.current_height, preparing.target_height),
+        (Some(4), Some(5))
+    );
+    Ok(())
+}
+
+async fn reports_around_stalled_block_read(
+    initial_tip: u32,
+) -> Result<(ReadinessReport, ReadinessReport), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    let extended = forked_parseable_chain(&parseable_multi_block_chain()?, 5, 5, 1)?;
+    source.replace_chain(
+        extended.clone(),
+        checkpoints_for_parseable_chain(&extended, &activations)?,
+        BlockHeight::new(initial_tip),
+    );
+    source.clear_calls();
+    let (second_tip_read, resume_tip_read) = source.pause_tip_call(2);
+    let (entered, stalled) = oneshot::channel();
+    *source.stall_block_read.lock() = Some(entered);
+    let (_signal, gate) = zinder_ingest::mempool_ready_channel();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        activations,
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 1,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: Some(gate),
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        &readiness,
+        &cancel,
+    );
+    let observe = async {
+        second_tip_read.notified().await;
+        let before = readiness.runtime_readiness().report();
+        source.set_tip_height(BlockHeight::new(5));
+        resume_tip_read.notify_one();
+        stalled.await?;
+        let preparing = readiness.runtime_readiness().report();
+        cancel.cancel();
+        Ok::<_, oneshot::error::RecvError>((before, preparing))
+    };
+    let (outcome, reports) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(follow_canonical_tip(store, follower), observe)
+    })
+    .await?;
+    outcome?;
+    Ok(reports?)
 }
 
 /// A reader's deadline for one `WriterStatus` request.

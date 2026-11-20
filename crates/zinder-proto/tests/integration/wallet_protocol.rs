@@ -1520,6 +1520,22 @@ fn ops_readiness_report_round_trips_explorer_view_identities() -> eyre::Result<(
 }
 
 #[test]
+fn ops_syncing_detail_round_trips_the_follow_wait_reason() -> eyre::Result<()> {
+    for wait_reason in [
+        None,
+        Some(ops::FollowWaitReason::MempoolHydrationAtTip),
+        Some(ops::FollowWaitReason::CanonicalProgress),
+    ] {
+        let detail = ops::SyncingDetail {
+            lag_blocks: None,
+            wait_reason: wait_reason.map(|reason| reason as i32),
+        };
+        assert_eq!(round_trip(&detail)?, detail);
+    }
+    Ok(())
+}
+
+#[test]
 fn ops_readiness_report_round_trips_the_active_node_endpoint() -> eyre::Result<()> {
     let report = ops::ReadinessReport {
         cause: ops::ReadinessCause::Ready as i32,

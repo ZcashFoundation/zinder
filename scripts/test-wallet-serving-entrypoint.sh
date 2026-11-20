@@ -30,8 +30,7 @@ for function_name in \
   readiness_cause_is_store_damage \
   readiness_cause_is_projector_park \
   readiness_cause_is_upstream_outage \
-  writer_node_outage_behind_syncing_ingest \
-  readiness_body_height \
+  ingest_node_outage \
   update_node_unreachable_outage \
   reader_unready_behind_projector_park \
   wallet_reader_names \
@@ -71,6 +70,8 @@ projector_config_paths="$(entrypoint_setting projector_config_paths)"
 query_config_paths="$(entrypoint_setting query_config_paths)"
 compat_config_paths="$(entrypoint_setting compat_config_paths)"
 entrypoint_config_paths="$(entrypoint_setting entrypoint_config_paths)"
+ingest_ops_addr="$(entrypoint_setting ingest_ops_addr)"
+query_ops_addr="$(entrypoint_setting query_ops_addr)"
 compat_ops_addr="$(entrypoint_setting compat_ops_addr)"
 recurrence_clear_window_seconds="$(entrypoint_setting recurrence_clear_window_seconds)"
 recurrence_episode_budget="$(entrypoint_setting recurrence_episode_budget)"
@@ -99,8 +100,6 @@ poll_interval_seconds=15
 unready_report_interval_seconds=300
 probe_halted=0
 probe_parked=0
-probe_upstream_outage=0
-probe_node_unreachable=0
 lightwalletd_enabled=1
 response_separator='
 '
@@ -294,7 +293,6 @@ await_readiness zinder-projector 127.0.0.1:9110 60 \
 # is turned off. The subshell keeps the process stand-in and its state out of
 # the rest of this test.
 (
-  query_ops_addr=127.0.0.1:9106
   wallet_serving_deadline_seconds=60
   started_binaries=""
   awaited_phase_starts=""
@@ -410,23 +408,13 @@ await_readiness zinder-projector 127.0.0.1:9110 60 \
     || test_failure "startup let ops-ready compatibility through before the serving check succeeded"
 )
 
-# Exercise the foreground topology from its first child start into the serving
-# loop. Query answers gRPC at startup, then alternates timeouts with
-# recoveries while ops remains healthy, until the recurrence policy restarts it.
-serving_loop_events() (
-  local fake_grpc_status=0 serving_polls=0
+run_serving_topology() {
   eval "$(entrypoint_function log)"
   # These stand-ins are called by the evaluated topology.
   # shellcheck disable=SC2329
   start_runtime_process() { : & }
   # shellcheck disable=SC2329
   fail() { log "$*"; exit 1; }
-  # shellcheck disable=SC2329
-  sleep_interruptibly() {
-    serving_polls=$((serving_polls + 1))
-    [ "$serving_polls" -lt $((2 * recurrence_episode_budget)) ] || exit 0
-    fake_grpc_status=$((serving_polls % 2))
-  }
   lightwalletd_enabled=0
   canonical_construction_deadline_seconds=60
   wallet_construction_deadline_seconds=60
@@ -434,6 +422,20 @@ serving_loop_events() (
   serve 200 "$degraded_ready_body"
   eval "$(sed -n '/^ingest_ops_addr=/,/^projector_park_reported=0/p' "$entrypoint")"
   eval "$(sed -n '/^log "starting canonical construction/,$p' "$entrypoint")"
+}
+
+# Exercise the foreground topology from its first child start into the serving
+# loop. Query answers gRPC at startup, then alternates timeouts with
+# recoveries while ops remains healthy, until the recurrence policy restarts it.
+serving_loop_events() (
+  local fake_grpc_status=0 serving_polls=0
+  # shellcheck disable=SC2329
+  sleep_interruptibly() {
+    serving_polls=$((serving_polls + 1))
+    [ "$serving_polls" -lt $((2 * recurrence_episode_budget)) ] || exit 0
+    fake_grpc_status=$((serving_polls % 2))
+  }
+  run_serving_topology
 )
 
 : >"$grpc_calls"
@@ -505,7 +507,7 @@ serve 503 "$syncing_body"
 if observe_plane_readiness zinder-ingest 127.0.0.1:9105; then
   test_failure "a syncing ingest plane must count as unready while the projector is parked"
 fi
-[ "$probe_upstream_outage" -eq 0 ] || test_failure "a syncing plane is not an upstream outage"
+[ -z "$(ingest_node_outage "$probe_cause" "$probe_body" "")" ] || test_failure "a syncing plane is not an upstream outage"
 
 # An ingest plane that reports its node unavailable or unsynchronized is
 # unready, and the probe names the upstream outage so the serving loop can
@@ -527,124 +529,148 @@ for outage_body in "$ingest_node_unavailable_body" "$ingest_upstream_not_ready_b
   if observe_plane_readiness zinder-ingest 127.0.0.1:9105; then
     test_failure "an ingest plane in an upstream outage must still count as unready"
   fi
-  [ "$probe_upstream_outage" -eq 1 ] \
+  [ "$(ingest_node_outage "$probe_cause" "$probe_body" "")" = "$probe_cause" ] \
     || test_failure "the probe did not name the upstream outage in: $outage_body"
 done
-# While Zebra resyncs, or while only the node's mempool feed fails, ingest's
-# admission state reports `syncing` and hides its node probe. Query relays the
-# writer's own observations under its `ingest_control` dependency, so the
-# serving loop still recognizes an unsynchronized node behind any syncing
-# ingest. A relayed mempool `node_unavailable` starts the unreachable-node
-# clock only behind the mempool gate's `syncing` with no known lag and a
-# current height at or above the target height: a writer that trails a
-# reachable node also keeps its mempool hydrating, and stays on the ordinary
-# unready tolerance. None of this applies to an unrelated ingest
-# cause or to query's own view of the node.
-ingest_mempool_gated_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673,"target_height":4602673}'
-ingest_trailing_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":40}},"current_height":4602633,"target_height":4602673}'
+# During preparation of H+1 the heights may still describe the completed
+# iteration at H. Only the current wait reason qualifies a writer mempool relay.
+ingest_mempool_gated_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null,"wait_reason":"mempool_hydration_at_tip"}},"current_height":4602673,"target_height":4602673}'
+ingest_preparing_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null,"wait_reason":"canonical_progress"}},"current_height":4602673,"target_height":4602673}'
+ingest_trailing_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null,"wait_reason":"canonical_progress"}},"current_height":4602672,"target_height":4602673}'
+ingest_without_wait_reason='{"status":"not_ready","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673,"target_height":4602673}'
 query_relays_writer_upstream_not_ready_body="$degraded_ready_body"
 query_relays_writer_mempool_node_unavailable_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"ingest_control","dependency_cause":{"node_unavailable":{"failure_class":"stream_disconnected","last_reason":"the live mempool index is hydrating from the node","consecutive_failures":3,"outage_seconds":30}}}]}'
 query_node_not_ready_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"node_source","dependency_cause":{"upstream_not_ready":{"upstream_health":{"source":"zebra_ready_endpoint","reason":"syncing"}}}}]}'
 query_node_unavailable_body='{"status":"ready","cause":"ready","current_height":4602673,"degraded":[{"input":"node_source","dependency_cause":{"node_unavailable":{"failure_class":"node_unreachable","last_reason":"connection refused","consecutive_failures":4,"outage_seconds":45}}}]}'
 for ingest_syncing_body in "$ingest_mempool_gated_syncing_body" "$ingest_trailing_syncing_body"; do
-  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing "$ingest_syncing_body" \
+  relayed_outage="$(ingest_node_outage syncing "$ingest_syncing_body" \
     "$query_relays_writer_upstream_not_ready_body")"
   [ "$relayed_outage" = "upstream_not_ready" ] \
     || test_failure "a syncing ingest whose writer reports its node unsynchronized must be an upstream outage, got '$relayed_outage' behind '$ingest_syncing_body'"
 done
-relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+relayed_outage="$(ingest_node_outage syncing \
   "$ingest_mempool_gated_syncing_body" "$query_relays_writer_mempool_node_unavailable_body")"
 [ "$relayed_outage" = "node_unavailable" ] \
   || test_failure "a caught-up ingest whose writer mempool cannot reach its node must be an unreachable-node outage, got '$relayed_outage'"
-relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
-  "$ingest_trailing_syncing_body" "$query_relays_writer_mempool_node_unavailable_body")"
-[ -z "$relayed_outage" ] \
-  || test_failure "a trailing ingest whose mempool waits for canonical ingest must stay on the unready tolerance, got '$relayed_outage'"
-# The mempool gate also reports no lag over the one block the default follow
-# threshold admits, so only a current height at or above the target height
-# proves that canonical ingest caught up.
-ingest_ahead_of_target_gated_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602674,"target_height":4602673}'
-relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
-  "$ingest_ahead_of_target_gated_body" "$query_relays_writer_mempool_node_unavailable_body")"
-[ "$relayed_outage" = "node_unavailable" ] \
-  || test_failure "a gated ingest above its target height has caught up, so its writer mempool's refusal must be an unreachable-node outage, got '$relayed_outage'"
-ingest_one_block_behind_gated_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602672,"target_height":4602673}'
-ingest_gated_without_target_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673}'
-ingest_gated_without_current_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"target_height":4602673}'
-for unproven_body in "$ingest_one_block_behind_gated_body" "$ingest_gated_without_target_body" \
-  "$ingest_gated_without_current_body"; do
-  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+for unproven_body in "$ingest_preparing_syncing_body" "$ingest_trailing_syncing_body" \
+  "$ingest_without_wait_reason" \
+  '{"cause":{"syncing":{"lag_blocks":null}},"degraded":[{"input":"node_source","dependency_cause":{"syncing":{"wait_reason":"mempool_hydration_at_tip"}}}]}'; do
+  relayed_outage="$(ingest_node_outage syncing \
     "$unproven_body" "$query_relays_writer_mempool_node_unavailable_body")"
-  [ -z "$relayed_outage" ] \
-    || test_failure "a gated ingest that has not proven it caught up must stay on the unready tolerance, got '$relayed_outage' behind '$unproven_body'"
+  [ "$relayed_outage" = "mempool_wait_unconfirmed" ] \
+    || test_failure "a syncing writer without an at-tip wait must spend the ordinary budgets, got '$relayed_outage' behind '$unproven_body'"
 done
-[ "$(readiness_body_height "$ingest_one_block_behind_gated_body" target_height)" = "4602673" ] \
-  || test_failure "the target height was not read from an ingest body"
-[ -z "$(readiness_body_height "$ingest_gated_without_target_body" target_height)" ] \
-  || test_failure "a body without a target height must not report one"
 for unrelated_body in "$ready_body" "$query_node_not_ready_body" "$query_node_unavailable_body" \
   "$degraded_lagging_body" ""; do
-  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+  relayed_outage="$(ingest_node_outage syncing \
     "$ingest_mempool_gated_syncing_body" "$unrelated_body")"
   [ -z "$relayed_outage" ] \
     || test_failure "a syncing ingest is an upstream outage only when its writer reports its node, got '$relayed_outage' from '$unrelated_body'"
 done
-for unrelated_cause in storage_unavailable replica_lagging starting unreachable; do
+for unrelated_cause in ready storage_unavailable replica_lagging starting unreachable; do
   for relaying_body in "$query_relays_writer_upstream_not_ready_body" \
     "$query_relays_writer_mempool_node_unavailable_body"; do
-    relayed_outage="$(writer_node_outage_behind_syncing_ingest "$unrelated_cause" \
+    relayed_outage="$(ingest_node_outage "$unrelated_cause" \
       "$ingest_mempool_gated_syncing_body" "$relaying_body")"
     [ -z "$relayed_outage" ] \
       || test_failure "a writer node outage must not hide ingest's $unrelated_cause, got '$relayed_outage'"
   done
 done
 
-# Only an unreachable node starts the restart clock: a node that answers but is
-# not synchronized proves the ingest node client works.
-serve 503 "$ingest_node_unavailable_body"
-observe_plane_readiness zinder-ingest 127.0.0.1:9105 || true
-[ "$probe_node_unreachable" -eq 1 ] \
-  || test_failure "the probe did not name an unreachable node"
-serve 503 "$ingest_upstream_not_ready_body"
-observe_plane_readiness zinder-ingest 127.0.0.1:9105 || true
-[ "$probe_node_unreachable" -eq 0 ] \
-  || test_failure "an unsynchronized node that answers must not count as unreachable"
-serve 200 "$ready_body"
-observe_plane_readiness zinder-ingest 127.0.0.1:9105 \
-  || test_failure "a ready ingest plane must count as serving"
-[ "$probe_upstream_outage" -eq 0 ] || test_failure "a ready plane is not an upstream outage"
-[ "$probe_node_unreachable" -eq 0 ] || test_failure "a ready plane does not report an unreachable node"
+# Drive the shipped serving loop with an epoch and writer state per poll.
+# Query relays the writer mempool outage through every tip and lag transition.
+ingest_outage_events() (
+  local -a polls=("$@")
+  local poll_index=0 epoch=1000 ingest_status=200 ingest_json="$ready_body" query_json="$ready_body"
+  # shellcheck disable=SC2329
+  sleep_interruptibly() {
+    [ "$poll_index" -lt "${#polls[@]}" ] || exit 0
+    epoch="${polls[poll_index]%/*}"
+    ingest_status=503
+    query_json="$query_relays_writer_mempool_node_unavailable_body"
+    case "${polls[poll_index]#*/}" in
+      tip) ingest_json="$ingest_mempool_gated_syncing_body" ;;
+      lag) ingest_json="$ingest_trailing_syncing_body" ;;
+      preparing) ingest_json="$ingest_preparing_syncing_body" ;;
+      recovered) ingest_json="$ready_body"; ingest_status=200; query_json="$ready_body" ;;
+      node_down) ingest_json="$ingest_node_unavailable_body"; query_json="$ready_body" ;;
+      node_syncing) ingest_json="$ingest_trailing_syncing_body"; query_json="$query_relays_writer_upstream_not_ready_body" ;;
+      *) test_failure "unknown fixture poll ${polls[poll_index]}" ;;
+    esac
+    poll_index=$((poll_index + 1))
+  }
+  # shellcheck disable=SC2329
+  date() { printf '%s\n' "$epoch"; }
+  # shellcheck disable=SC2329
+  curl() {
+    local body="$ready_body" status=200
+    case "${*: -1}" in
+      "http://$ingest_ops_addr/readyz") body="$ingest_json"; status="$ingest_status" ;;
+      "http://$query_ops_addr/readyz") body="$query_json" ;;
+    esac
+    printf '%s%s%s 0.001' "$body" "$response_separator" "$status"
+  }
+  run_serving_topology
+)
 
-# An unreachable node escalates only after its own tolerance, which is much
-# longer than the contiguous-unready tolerance, so a long node outage does not
-# restart the container into a full outage, while an ingest wedged in its own
-# node client is still restarted eventually.
+expect_ingest_restart() {
+  local expected_epoch="$1" expected_reason="$2" events
+  shift 2
+  if events="$(ingest_outage_events "$@" 2>&1)"; then
+    test_failure "ingest stayed up past the $expected_reason deadline: $events"
+  fi
+  [[ "$events" = *"$expected_epoch zinder-wallet-serving-runtime: event=supervisor_restart_decided role=zinder-ingest reason=$expected_reason "* ]] \
+    || test_failure "expected an ingest $expected_reason restart at $expected_epoch: $events"
+  printf '%s\n' "$events"
+}
+
+outage_start=5000
+outage_deadline=$((outage_start + node_unreachable_tolerance_seconds))
 [ "$node_unreachable_tolerance_seconds" -gt "$serving_unready_tolerance_seconds" ] \
   || test_failure "the unreachable-node tolerance must outlast the unready tolerance"
-outage_state="0 0"
-poll_node_unreachable() {
-  # shellcheck disable=SC2046,SC2086 # the counters are separate arguments
-  set -- $(update_node_unreachable_outage "$1" "$2" ${outage_state%% *} "fixture report")
-  outage_state="$1 $2"
-}
-poll_node_unreachable 1 5000
-[ "$outage_state" = "5000 0" ] || test_failure "an unreachable-node outage started as '$outage_state'"
-poll_node_unreachable 1 $((5000 + serving_unready_tolerance_seconds))
-[ "${outage_state##* }" -eq 0 ] \
-  || test_failure "an unreachable-node outage escalated at the ordinary unready tolerance"
-poll_node_unreachable 1 $((5000 + node_unreachable_tolerance_seconds - 1))
-[ "${outage_state##* }" -eq 0 ] \
-  || test_failure "an unreachable-node outage escalated before its tolerance"
-poll_node_unreachable 1 $((5000 + node_unreachable_tolerance_seconds))
-[ "${outage_state##* }" -eq 1 ] \
-  || test_failure "an unreachable-node outage that outlasted its tolerance did not escalate"
-outage_state="0 0"
-poll_node_unreachable 1 7000
-poll_node_unreachable 0 7015
-[ "$outage_state" = "0 0" ] || test_failure "a cleared unreachable-node outage left state '$outage_state'"
-poll_node_unreachable 1 $((7030 + node_unreachable_tolerance_seconds - 1))
-[ "$outage_state" = "$((7030 + node_unreachable_tolerance_seconds - 1)) 0" ] \
-  || test_failure "a new unreachable-node outage did not restart its clock: '$outage_state'"
+for node_outage in tip node_down; do
+  expect_ingest_restart "$outage_deadline" node_timeout "$outage_start/$node_outage" \
+    "$((outage_start + serving_unready_tolerance_seconds))/$node_outage" \
+    "$((outage_deadline - 1))/$node_outage" "$outage_deadline/$node_outage" >/dev/null
+done
+
+events="$(ingest_outage_events "$outage_start/node_syncing" "$outage_deadline/node_syncing" 2>&1)" \
+  || test_failure "a reachable, unsynchronized writer node exhausted a restart budget: $events"
+
+# H/H is stale throughout this H+1 preparation. The stalled writer must
+# count a recurrence episode and exhaust the ordinary contiguous tolerance.
+lag_start=$((outage_start + 15))
+lag_deadline=$((lag_start + serving_unready_tolerance_seconds))
+events="$(expect_ingest_restart "$lag_deadline" unready_timeout "$outage_start/tip" \
+  "$lag_start/preparing" "$((lag_deadline - 1))/preparing" "$lag_deadline/preparing")"
+[[ "$events" = *"zinder-ingest flap episode 1 began"* ]] \
+  || test_failure "a stalled canonical writer skipped the episode budget: $events"
+
+# A completed lag interval can separately exhaust the cumulative budget.
+lag_end=$((lag_start + recurrence_cumulative_unready_seconds_budget))
+events="$(expect_ingest_restart "$lag_end" recurrence_budget "$outage_start/tip" \
+  "$lag_start/preparing" "$lag_end/tip")"
+[[ "$events" = *"episode_count=1 unready_seconds=$recurrence_cumulative_unready_seconds_budget "* ]] \
+  || test_failure "the resumed mempool wait did not account for the canonical lag: $events"
+
+# Two short lags exclude 75 seconds from the clock. The original outage
+# still reaches its deadline and is logged only once.
+resumed_deadline=$((outage_deadline + 75))
+events="$(expect_ingest_restart "$resumed_deadline" node_timeout "$outage_start/tip" \
+  "5030/lag" "5045/lag" "5075/tip" "5090/lag" "5120/tip" \
+  "$outage_deadline/tip" "$((resumed_deadline - 1))/tip" "$resumed_deadline/tip")"
+[[ "$(grep -c 'zinder-ingest cannot reach its node' <<<"$events")" = 1 ]] &&
+  [[ "$events" = *"spent ${node_unreachable_tolerance_seconds}s waiting"* ]] \
+  || test_failure "the clock lost its original outage or charged paused time: $events"
+
+# Recovery while paused clears both the running time and the outage start.
+second_start=$((outage_deadline - 10))
+second_deadline=$((second_start + node_unreachable_tolerance_seconds))
+events="$(expect_ingest_restart "$second_deadline" node_timeout "$outage_start/tip" \
+  "$((second_start - 30))/lag" "$((second_start - 15))/recovered" "$second_start/tip" \
+  "$((second_deadline - 1))/tip" "$second_deadline/tip")"
+[[ "$(grep -c 'zinder-ingest cannot reach its node' <<<"$events")" = 2 ]] \
+  || test_failure "a recovered node kept its old outage: $events"
 
 # The `degraded` list follows the top-level cause and names each dependency
 # cause under its own key, so the probe parses the plane's own cause.
@@ -654,8 +680,6 @@ probe_readiness 127.0.0.1:9106
   || test_failure "probe parsed cause '$probe_cause' from a degraded ready plane"
 observe_plane_readiness zinder-query 127.0.0.1:9106 \
   || test_failure "a degraded plane that admits traffic must count as serving"
-[ "$probe_upstream_outage" -eq 0 ] \
-  || test_failure "a degraded query plane is not an ingest upstream outage"
 serve 503 "$degraded_lagging_body"
 probe_readiness 127.0.0.1:9106
 [ "$probe_cause" = "replica_lagging" ] \

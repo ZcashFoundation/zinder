@@ -467,9 +467,12 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
     match cause {
         crate::ReadinessCause::Syncing {
             lag_blocks: Some(lag_blocks),
+            ..
         } => u64_to_f64(*lag_blocks),
         crate::ReadinessCause::Starting
-        | crate::ReadinessCause::Syncing { lag_blocks: None }
+        | crate::ReadinessCause::Syncing {
+            lag_blocks: None, ..
+        }
         | crate::ReadinessCause::Ready
         | crate::ReadinessCause::NodeUnavailable(_)
         | crate::ReadinessCause::NodeCapabilityMissing { .. }

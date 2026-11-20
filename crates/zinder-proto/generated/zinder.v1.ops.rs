@@ -142,6 +142,9 @@ pub struct SyncingDetail {
     /// Distance between the visible chain tip and the target tip when known.
     #[prost(uint64, optional, tag = "1")]
     pub lag_blocks: ::core::option::Option<u64>,
+    /// What the canonical writer is waiting for in its current follow iteration.
+    #[prost(enumeration = "FollowWaitReason", optional, tag = "2")]
+    pub wait_reason: ::core::option::Option<i32>,
 }
 /// Detail for READINESS_CAUSE_NODE_CAPABILITY_MISSING.
 #[allow(clippy::all)]
@@ -430,6 +433,41 @@ impl ReadinessCause {
             "READINESS_CAUSE_CANONICAL_STORE_DAMAGED" => {
                 Some(Self::CanonicalStoreDamaged)
             }
+            _ => None,
+        }
+    }
+}
+/// Work that keeps the canonical writer from admitting traffic while following.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FollowWaitReason {
+    Unspecified = 0,
+    /// The writer has confirmed its tip and is waiting for mempool hydration.
+    MempoolHydrationAtTip = 1,
+    /// The writer is checking its tip or processing a canonical transition.
+    CanonicalProgress = 2,
+}
+impl FollowWaitReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FOLLOW_WAIT_REASON_UNSPECIFIED",
+            Self::MempoolHydrationAtTip => "FOLLOW_WAIT_REASON_MEMPOOL_HYDRATION_AT_TIP",
+            Self::CanonicalProgress => "FOLLOW_WAIT_REASON_CANONICAL_PROGRESS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FOLLOW_WAIT_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "FOLLOW_WAIT_REASON_MEMPOOL_HYDRATION_AT_TIP" => {
+                Some(Self::MempoolHydrationAtTip)
+            }
+            "FOLLOW_WAIT_REASON_CANONICAL_PROGRESS" => Some(Self::CanonicalProgress),
             _ => None,
         }
     }

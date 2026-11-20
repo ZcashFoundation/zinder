@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallet supervision now applies the one-hour tolerance and recurrence budgets when ingest stalls preparing a block. If a mempool node outage continues through brief canonical lags, its 24-hour clock pauses and resumes with the time already spent waiting. Rust callers constructing syncing details must account for the new optional wait_reason field.
+time: 2026-11-20T14:49:00.771102795Z
+custom:
+    Bump: minor
+    PR: "420"

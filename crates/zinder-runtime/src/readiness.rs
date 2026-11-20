@@ -84,6 +84,26 @@ impl From<IngestPhase> for ingest_proto::WriterPhase {
     }
 }
 
+/// Work that keeps the canonical writer from admitting traffic while following.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FollowWaitReason {
+    /// The writer has confirmed its tip and is waiting for mempool hydration.
+    MempoolHydrationAtTip,
+    /// The writer is checking its tip or processing a canonical transition.
+    CanonicalProgress,
+}
+
+impl From<FollowWaitReason> for ops_proto::FollowWaitReason {
+    fn from(reason: FollowWaitReason) -> Self {
+        match reason {
+            FollowWaitReason::MempoolHydrationAtTip => Self::MempoolHydrationAtTip,
+            FollowWaitReason::CanonicalProgress => Self::CanonicalProgress,
+        }
+    }
+}
+
 /// Stable readiness cause matching `docs/reference/readiness.md`.
 ///
 /// Causes that carry operator-actionable detail use struct variants so the
@@ -102,6 +122,9 @@ pub enum ReadinessCause {
         /// Distance between the visible chain tip and the target tip, when
         /// known. `None` for read-only services with no observable tip.
         lag_blocks: Option<u64>,
+        /// What the canonical writer is waiting for in its current follow iteration.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wait_reason: Option<FollowWaitReason>,
     },
     /// Service is healthy and accepting production traffic.
     Ready,
@@ -925,10 +948,32 @@ impl ReadinessState {
         target_height: Option<u32>,
     ) -> Self {
         Self {
-            cause: ReadinessCause::Syncing { lag_blocks },
+            cause: ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason: None,
+            },
             current_height,
             target_height,
             phase: None,
+        }
+    }
+
+    /// Returns the canonical writer's syncing state for its current follow iteration.
+    #[must_use]
+    pub const fn follow_syncing(
+        wait_reason: FollowWaitReason,
+        lag_blocks: Option<u64>,
+        current_height: Option<u32>,
+        target_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason: Some(wait_reason),
+            },
+            current_height,
+            target_height,
+            phase: Some(IngestPhase::FollowingTip),
         }
     }
 
@@ -1240,11 +1285,14 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
     )]
     fn from(cause: &ReadinessCause) -> Self {
         let payload = match cause {
-            ReadinessCause::Syncing { lag_blocks } => {
-                ops_proto::readiness_cause_detail::Payload::Syncing(ops_proto::SyncingDetail {
-                    lag_blocks: *lag_blocks,
-                })
-            }
+            ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason,
+            } => ops_proto::readiness_cause_detail::Payload::Syncing(ops_proto::SyncingDetail {
+                lag_blocks: *lag_blocks,
+                wait_reason: wait_reason
+                    .map(|reason| ops_proto::FollowWaitReason::from(reason) as i32),
+            }),
             ReadinessCause::NodeCapabilityMissing { capability } => {
                 ops_proto::readiness_cause_detail::Payload::NodeCapabilityMissing(
                     ops_proto::NodeCapabilityMissingDetail {
@@ -1505,18 +1553,47 @@ mod tests {
         Ok(())
     }
 
-    // `deploy/wallet-serving-runtime-entrypoint` matches this exact text to
-    // tell ingest's mempool gate from a writer that trails its node.
     #[test]
     fn syncing_cause_renders_unknown_lag_as_null() -> Result<(), serde_json::Error> {
         for (lag_blocks, expected) in [
             (None, r#"{"syncing":{"lag_blocks":null}}"#),
             (Some(40), r#"{"syncing":{"lag_blocks":40}}"#),
         ] {
-            let rendered = serde_json::to_string(&ReadinessCause::Syncing { lag_blocks })?;
+            let rendered =
+                serde_json::to_string(&ReadinessState::syncing(lag_blocks, None, None).cause)?;
             assert_eq!(rendered, expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn syncing_detail_carries_the_current_follow_wait_reason() {
+        for (reason, expected) in [
+            (None, None),
+            (
+                Some(FollowWaitReason::MempoolHydrationAtTip),
+                Some(ops_proto::FollowWaitReason::MempoolHydrationAtTip),
+            ),
+            (
+                Some(FollowWaitReason::CanonicalProgress),
+                Some(ops_proto::FollowWaitReason::CanonicalProgress),
+            ),
+        ] {
+            let detail =
+                Option::<ops_proto::ReadinessCauseDetail>::from(&ReadinessCause::Syncing {
+                    lag_blocks: Some(1),
+                    wait_reason: reason,
+                });
+            assert_eq!(
+                detail.and_then(|detail| detail.payload),
+                Some(ops_proto::readiness_cause_detail::Payload::Syncing(
+                    ops_proto::SyncingDetail {
+                        lag_blocks: Some(1),
+                        wait_reason: expected.map(|reason| reason as i32),
+                    }
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1678,7 +1755,8 @@ mod tests {
         assert!(matches!(
             report.cause,
             ReadinessCause::Syncing {
-                lag_blocks: Some(5)
+                lag_blocks: Some(5),
+                wait_reason: None,
             }
         ));
         assert_eq!(report.current_height, Some(5));
@@ -1812,7 +1890,10 @@ mod tests {
         // variant count so a new variant cannot silently drop a gauge.
         let every_cause: &[ReadinessCause] = &[
             ReadinessCause::Starting,
-            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: None,
+            },
             ReadinessCause::Ready,
             ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
                 "node_unreachable",
@@ -1924,7 +2005,10 @@ mod tests {
     fn every_rust_cause() -> Vec<ReadinessCause> {
         vec![
             ReadinessCause::Starting,
-            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: None,
+            },
             ReadinessCause::Ready,
             ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
                 "node_unreachable",

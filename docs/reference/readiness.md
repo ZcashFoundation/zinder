@@ -199,7 +199,7 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 | Cause | Traffic | Meaning | What you do |
 | --- | --- | --- | --- |
 | `starting` | Refused | Initialization has not finished. | If ingest stays here with `node.health.addr` set, check the health endpoint and its JSON-RPC fallback. |
-| `syncing` | Refused | The runtime is healthy but behind its target. Ingest includes `lag_blocks`. | Wait. A first sync takes hours; see [Initial sync](../runbooks/initial-sync.md). |
+| `syncing` | Refused | The runtime is catching up. Ingest reports `lag_blocks` and can also be waiting for a mempool snapshot at the node's tip. | Check [ingest's wait reason](#ingest). A first sync takes hours. See [Initial sync](../runbooks/initial-sync.md). |
 | `ready` | Admitted | The runtime serves its contract. | Nothing. |
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
 | `node_capability_missing` | Refused | The node lacks a capability the runtime needs. Detail: `capability`. | Configure or upgrade the node to provide it. |
@@ -259,6 +259,19 @@ snapshot for up to 30 seconds while it loads the next one.
 | `reorg_window_exceeded` | A reorg was deeper than the window. Only shutdown replaces it. |
 | `canonical_store_damaged` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. Every `CanonicalControl.WriterStatus` answer reports the damage, so readers refuse traffic on their next refresh. After a restart, writer status reports the recorded damage from its first answer, and ingest reports this cause again once the verification pass confirms it, which it checks as soon as the store is published. A verification record ingest cannot read is damage without a height until a full verification cycle passes. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
 | `cursor_at_risk` | Explorer view replay falls near the event-retention limit. |
+
+While ingest follows the node, its `/readyz` can include the optional field
+`cause.syncing.wait_reason`. It has two values.
+
+- `mempool_hydration_at_tip` means canonical ingest has reached the node's
+  tip and is waiting for a mempool snapshot there.
+- `canonical_progress` means the current iteration is checking or advancing
+  the canonical chain, including preparing the next block. The last reported
+  heights can still match during preparation.
+
+Only `mempool_hydration_at_tip` lets the supervisor
+count a relayed mempool `node_unavailable` toward the 24-hour outage
+tolerance. See [Recovery](../architecture/service-operations.md#recovery).
 
 `IngestControl.WriterStatus` reports `upstream_not_ready` when the latest
 health probe says the node is syncing, even while ingest's own `/readyz`
@@ -380,9 +393,9 @@ Readers stop serving in these cases:
 - **Ingest restarts while the node is down.** Ingest needs a node to start and
   to confirm its tip. Readers report `canonical_tip_unconfirmed` until it
   does.
-- **The single-volume container's node stays unreachable for 24 hours.** Its
-  entrypoint then ends the container, so a stuck node client restarts. See
-  [Single-volume deployment](../runbooks/deploying-single-volume.md).
+- **The single-volume supervisor counts 24 hours of unreachable-node time.**
+  It then ends the container, so a stuck node client restarts. See
+  [Single-volume failure handling](../runbooks/deploying-single-volume.md#failure-handling).
 
 A reader that restarts during a node outage serves again once its pair
 converges, because readers start without contacting a node.

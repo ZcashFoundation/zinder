@@ -2887,7 +2887,8 @@ mod tests {
         assert!(matches!(
             report.cause,
             zinder_runtime::ReadinessCause::Syncing {
-                lag_blocks: Some(2)
+                lag_blocks: Some(2),
+                wait_reason: None,
             }
         ));
         assert_eq!(report.current_height, Some(1));
