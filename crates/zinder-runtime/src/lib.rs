@@ -26,9 +26,9 @@
 //!   ([`public_grpc_server`]), which bounds streams per connection, pings
 //!   idle connections, limits how many requests the process receives at
 //!   once ([`GrpcReceiveLimitLayer`]), and ends responses whose client stops
-//!   reading them ([`GrpcSendStallLayer`]), and the gRPC reflection and
-//!   health services those listeners serve ([`public_grpc_reflection`],
-//!   [`public_grpc_health`]).
+//!   reading them ([`GrpcSendStallLayer`]), and the wallet listener
+//!   assembly ([`public_grpc_router`]) that serves a wallet service behind
+//!   the readiness gate with gRPC reflection and `grpc.health.v1` outside it.
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -116,12 +116,11 @@ pub use ops_healthcheck::{
     OpsHealthcheckArgs, OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint,
     resolve_ops_healthcheck_addr,
 };
-pub use public_grpc_health::public_grpc_health;
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,
     GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
-    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PublicGrpcServer, public_grpc_reflection,
-    public_grpc_server, public_grpc_server_with,
+    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PublicGrpcRouter, PublicGrpcServer,
+    public_grpc_reflection, public_grpc_router, public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,

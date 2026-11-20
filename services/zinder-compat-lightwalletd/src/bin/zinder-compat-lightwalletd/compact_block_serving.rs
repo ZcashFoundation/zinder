@@ -4659,4 +4659,92 @@ mod tests {
         server.await??;
         Ok(())
     }
+
+    /// The compact-blocks listener's health follows `/readyz`.
+    ///
+    /// The listener is assembled as the runtime assembles it, and the drain
+    /// starts separately from the shutdown publication.
+    #[tokio::test]
+    async fn compact_blocks_listener_health_follows_readyz_through_readiness_and_shutdown()
+    -> eyre::Result<()> {
+        use tonic_health::pb::health_check_response::ServingStatus;
+        use zinder_testkit::{PublicListenerProbe, next_watch_status, watch_ends};
+
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(1);
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        let readiness = Readiness::default();
+        let serving_readiness = CompactServingReadiness::new(readiness.clone());
+        let drain = CancellationToken::new();
+        let router = zinder_runtime::public_grpc_router(
+            CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)))
+                .into_server(),
+            zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+            &serving_readiness.runtime(),
+            &drain,
+        )?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener_address = listener.local_addr()?;
+        tokio::spawn(router.serve_with_incoming_shutdown(
+            TcpListenerStream::new(listener),
+            drain.clone().cancelled_owned(),
+        ));
+        let ops_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let ops_address = ops_reservation.local_addr()?;
+        drop(ops_reservation);
+        let _readyz = zinder_runtime::spawn_ops_endpoint(
+            ops_address,
+            zinder_runtime::OpsServer {
+                service_name: "zinder-compat-lightwalletd",
+                service_version: "0.0.0",
+                network_name: "zcash-regtest",
+                advertised_capabilities: Arc::from([]),
+            },
+            readiness.clone(),
+        )
+        .await?;
+        let probe = PublicListenerProbe::connect(listener_address, ops_address).await?;
+        let mut streamer = CompactTxStreamerClient::new(probe.channel());
+        let mut watch = probe.watch("").await?;
+
+        assert_eq!(probe.agreed_status().await?, ServingStatus::NotServing);
+        assert_eq!(
+            next_watch_status(&mut watch).await?,
+            ServingStatus::NotServing
+        );
+        let refused = streamer.get_latest_block(lightwalletd::ChainSpec {}).await;
+        assert_eq!(
+            refused.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        let reflected = probe.reflected_services().await?;
+        assert!(
+            reflected
+                .iter()
+                .any(|name| name == "cash.z.wallet.sdk.rpc.CompactTxStreamer")
+                && reflected.iter().any(|name| name == "grpc.health.v1.Health"),
+            "reflection did not describe the streamer and health services: {reflected:?}"
+        );
+
+        serving_readiness.publish_storage(ReadinessState::ready(Some(1)));
+        assert_eq!(probe.agreed_status().await?, ServingStatus::Serving);
+        assert_eq!(next_watch_status(&mut watch).await?, ServingStatus::Serving);
+        streamer
+            .get_latest_block(lightwalletd::ChainSpec {})
+            .await?;
+
+        serving_readiness.publish_shutting_down();
+        assert_eq!(probe.agreed_status().await?, ServingStatus::NotServing);
+        assert_eq!(
+            next_watch_status(&mut watch).await?,
+            ServingStatus::NotServing
+        );
+
+        drain.cancel();
+        watch_ends(&mut watch).await
+    }
 }

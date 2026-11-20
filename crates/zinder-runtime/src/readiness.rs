@@ -13,6 +13,7 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
+use tokio::sync::watch;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
 use zinder_core::UnixTimestampMillis;
@@ -553,6 +554,18 @@ pub struct Readiness {
     inner: Arc<Mutex<RuntimeReadiness>>,
     materialized_view_identities: Arc<Mutex<Vec<String>>>,
     active_node: Arc<Mutex<Option<ActiveNodeEndpoint>>>,
+    traffic: watch::Sender<TrafficAdmission>,
+}
+
+/// Whether the runtime admits traffic, and how many times that has changed.
+///
+/// Every change of the admission is published while the state lock is held,
+/// so a subscriber that counts `changes` can tell how many changes it did
+/// not observe one by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TrafficAdmission {
+    pub(crate) permits_traffic: bool,
+    pub(crate) changes: u64,
 }
 
 /// One lock covers the state and the dependency causes a composition
@@ -575,6 +588,10 @@ impl Readiness {
     /// Creates a readiness handle seeded with `state`.
     #[must_use]
     pub fn new(state: ReadinessState) -> Self {
+        let (traffic, _) = watch::channel(TrafficAdmission {
+            permits_traffic: state.cause.permits_traffic(),
+            changes: 0,
+        });
         Self {
             inner: Arc::new(Mutex::new(RuntimeReadiness {
                 state,
@@ -583,7 +600,33 @@ impl Readiness {
             })),
             materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
             active_node: Arc::new(Mutex::new(None)),
+            traffic,
         }
+    }
+
+    /// Whether the runtime admits traffic now, as
+    /// [`ReadinessReport::is_ready`] reports it.
+    pub(crate) fn permits_traffic(&self) -> bool {
+        self.traffic.borrow().permits_traffic
+    }
+
+    /// Subscribes to changes of whether the runtime admits traffic.
+    pub(crate) fn subscribe_traffic_admission(&self) -> watch::Receiver<TrafficAdmission> {
+        self.traffic.subscribe()
+    }
+
+    /// Publishes the admission of `state` to traffic subscribers when it
+    /// changed. Callers hold the state lock, so publications keep its order.
+    fn publish_traffic_admission(&self, state: &ReadinessState) {
+        let permits_traffic = state.cause.permits_traffic();
+        self.traffic.send_if_modified(|admission| {
+            if admission.permits_traffic == permits_traffic {
+                return false;
+            }
+            admission.permits_traffic = permits_traffic;
+            admission.changes = admission.changes.wrapping_add(1);
+            true
+        });
     }
 
     /// Records the writer's commit time of the chain epoch this reader now
@@ -603,6 +646,7 @@ impl Readiness {
         let mut guard = self.inner.lock();
         guard.state = state;
         guard.dependencies = dependencies;
+        self.publish_traffic_admission(&guard.state);
     }
 
     /// Returns every dependency input's latest cause, degraded or not.
@@ -635,6 +679,7 @@ impl Readiness {
     pub fn set(&self, state: ReadinessState) {
         let mut guard = self.inner.lock();
         guard.state = state.replacing(&guard.state);
+        self.publish_traffic_admission(&guard.state);
     }
 
     /// Atomically mutates the current readiness state.
@@ -648,7 +693,9 @@ impl Readiness {
     where
         F: FnOnce(&mut ReadinessState),
     {
-        update(&mut self.inner.lock().state);
+        let mut guard = self.inner.lock();
+        update(&mut guard.state);
+        self.publish_traffic_admission(&guard.state);
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing

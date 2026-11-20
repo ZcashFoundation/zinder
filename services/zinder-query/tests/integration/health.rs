@@ -3,106 +3,108 @@
     reason = "Integration test names describe the gRPC health contract under test."
 )]
 
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc};
 
-use eyre::{Result, eyre};
+use eyre::Result;
 use tokio::net::TcpListener;
-use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Streaming, service::interceptor::InterceptedService, transport::Channel};
-use tonic_health::pb::{
-    HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
-    health_client::HealthClient,
-};
-use zinder_runtime::{Readiness, ReadinessState, TrafficReadinessInterceptor};
-
-const WAIT_LIMIT: Duration = Duration::from_secs(5);
+use tonic::Code;
+use tonic_health::pb::health_check_response::ServingStatus;
 use zinder_core::Network;
-use zinder_query::{WalletEndpointMetadata, WalletQueryGrpcAdapter};
-use zinder_testkit::ChainFixture;
+use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
+use zinder_query::{WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingReadiness};
+use zinder_runtime::{OpsEndpointHandle, OpsServer, Readiness, ReadinessState};
+use zinder_testkit::{ChainFixture, PublicListenerProbe, next_watch_status, watch_ends};
 
 use crate::common::native_serving_query_over;
 
+const WALLET_SERVICE: &str = "zinder.v1.wallet.WalletQuery";
+const HEALTH_SERVICE: &str = "grpc.health.v1.Health";
+
+/// The native listener's health follows `/readyz`.
+///
+/// The listener is assembled as `zinder-query` assembles it, and the drain
+/// starts separately from the shutdown publication.
 #[tokio::test]
-async fn native_listener_serves_health_that_follows_readiness_and_shutdown() -> Result<()> {
+async fn native_listener_health_follows_readyz_through_readiness_and_shutdown() -> Result<()> {
     let (wallet_query, _store_fixture, _ingest_control_fixture) =
         native_serving_query_over(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
             .await?;
     let readiness = Readiness::default();
-    let shutdown = CancellationToken::new();
-    let wallet_query_server =
+    let serving_readiness = WalletServingReadiness::pair_only(readiness.clone());
+    let drain = CancellationToken::new();
+    let router = zinder_runtime::public_grpc_router(
         WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default())
             .with_traffic_readiness(readiness.clone())
-            .into_server();
-    let health = zinder_runtime::public_grpc_health(
-        readiness.clone(),
-        shutdown.clone(),
-        &wallet_query_server,
+            .into_server(),
+        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        &readiness,
+        &drain,
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener_address = listener.local_addr()?;
+    tokio::spawn(router.serve_with_incoming_shutdown(
+        TcpListenerStream::new(listener),
+        drain.clone().cancelled_owned(),
+    ));
+    let (ops_address, _readyz) = spawn_readyz(&readiness).await?;
+    let probe = PublicListenerProbe::connect(listener_address, ops_address).await?;
+    let mut wallet_client = WalletQueryClient::new(probe.channel());
+    let mut watch = probe.watch("").await?;
+
+    assert_eq!(probe.agreed_status().await?, ServingStatus::NotServing);
+    assert_eq!(
+        next_watch_status(&mut watch).await?,
+        ServingStatus::NotServing
     );
-    let gated = InterceptedService::new(
-        wallet_query_server,
-        TrafficReadinessInterceptor::new(readiness.clone()),
+    let refused = wallet_client
+        .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
+        .await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+    let reflected = probe.reflected_services().await?;
+    assert!(
+        reflected.iter().any(|name| name == WALLET_SERVICE)
+            && reflected.iter().any(|name| name == HEALTH_SERVICE),
+        "reflection did not describe the wallet and health services: {reflected:?}"
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let server_shutdown = shutdown.clone();
-    tokio::spawn(
-        zinder_runtime::public_grpc_server()
-            .add_service(gated)
-            .add_service(health)
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                server_shutdown.cancelled_owned(),
-            ),
-    );
-    let channel = tonic::transport::Endpoint::new(format!("http://{server_addr}"))?
-        .connect()
+    readiness.set(ReadinessState::ready(Some(1)));
+    assert_eq!(probe.agreed_status().await?, ServingStatus::Serving);
+    assert_eq!(probe.check(WALLET_SERVICE).await?, ServingStatus::Serving);
+    assert_eq!(next_watch_status(&mut watch).await?, ServingStatus::Serving);
+    wallet_client
+        .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
         .await?;
 
-    let mut client = HealthClient::new(channel);
-    let mut watch = client
-        .watch(Request::new(HealthCheckRequest::default()))
-        .await?
-        .into_inner();
+    serving_readiness.publish_shutting_down();
+    assert_eq!(probe.agreed_status().await?, ServingStatus::NotServing);
+    assert_eq!(
+        next_watch_status(&mut watch).await?,
+        ServingStatus::NotServing
+    );
 
-    assert_eq!(check(&mut client).await?, ServingStatus::NotServing);
-    assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
-
-    readiness.set(ReadinessState::ready(Some(1)));
-    assert_eq!(check(&mut client).await?, ServingStatus::Serving);
-    assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
-
-    readiness.set(ReadinessState::syncing(Some(3), Some(1), Some(4)));
-    assert_eq!(check(&mut client).await?, ServingStatus::NotServing);
-    assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
-
-    readiness.set(ReadinessState::ready(Some(1)));
-    assert_eq!(next_status(&mut watch).await?, ServingStatus::Serving);
-
-    shutdown.cancel();
-    assert!(readiness.report().is_ready);
-    assert_eq!(check(&mut client).await?, ServingStatus::NotServing);
-    assert_eq!(next_status(&mut watch).await?, ServingStatus::NotServing);
-    let end = tokio::time::timeout(WAIT_LIMIT, watch.next())
-        .await
-        .map_err(|_| eyre!("health stream stayed open after shutdown"))?;
-    assert!(end.is_none(), "health stream stayed open: {end:?}");
-    Ok(())
+    drain.cancel();
+    watch_ends(&mut watch).await
 }
 
-async fn next_status(stream: &mut Streaming<HealthCheckResponse>) -> Result<ServingStatus> {
-    let message = tokio::time::timeout(WAIT_LIMIT, stream.next())
-        .await
-        .map_err(|_| eyre!("no health message within {WAIT_LIMIT:?}"))?
-        .ok_or_else(|| eyre!("health stream ended"))??;
-    Ok(ServingStatus::try_from(message.status).unwrap_or(ServingStatus::Unknown))
-}
-
-async fn check(client: &mut HealthClient<Channel>) -> Result<ServingStatus> {
-    let response = client
-        .check(Request::new(HealthCheckRequest::default()))
-        .await?
-        .into_inner();
-    Ok(ServingStatus::try_from(response.status).unwrap_or(ServingStatus::Unknown))
+async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let ops_address = reservation.local_addr()?;
+    drop(reservation);
+    let handle = zinder_runtime::spawn_ops_endpoint(
+        ops_address,
+        OpsServer {
+            service_name: "zinder-query",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from([]),
+        },
+        readiness.clone(),
+    )
+    .await?;
+    Ok((ops_address, handle))
 }

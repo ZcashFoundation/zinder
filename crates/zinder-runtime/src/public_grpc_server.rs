@@ -18,15 +18,19 @@
 //! process reads at once across connections. The receive limit does, so
 //! many large requests sent together cannot exhaust memory.
 //!
-//! Public listeners that serve gRPC reflection build it with
-//! [`public_grpc_reflection`], which applies the same request size bound as
-//! every other public service.
+//! A wallet listener assembles its services with [`public_grpc_router`]: the
+//! wallet service behind the [`TrafficReadinessInterceptor`], and gRPC
+//! reflection and `grpc.health.v1.Health` outside it, so both keep answering
+//! while the runtime refuses wallet calls. Reflection, built with
+//! [`public_grpc_reflection`], applies the same request size bound as every
+//! other public service.
 
 mod message_boundaries;
 mod receive_slots;
 mod send_stall;
 
 use std::{
+    convert::Infallible,
     future::Future,
     net::SocketAddr,
     num::NonZeroUsize,
@@ -40,13 +44,15 @@ use bytes::Bytes;
 use futures_util::future::{Either, Ready, ready};
 use http_body::{Frame, SizeHint};
 use tokio::time::{Instant, Sleep};
-use tokio_util::sync::WaitForCancellationFutureOwned;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::{
     Status,
     body::Body,
+    server::NamedService,
+    service::interceptor::InterceptedService,
     transport::{
         Server,
-        server::{TcpConnectInfo, TlsConnectInfo},
+        server::{Router, TcpConnectInfo, TlsConnectInfo},
     },
 };
 use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
@@ -61,6 +67,7 @@ use self::{
     message_boundaries::MessageBoundaries,
     receive_slots::{ReceiveSlot, ReceiveSlots},
 };
+use crate::{Readiness, TrafficReadinessInterceptor, public_grpc_health::public_grpc_health};
 
 /// Maximum concurrent HTTP/2 streams on one client connection.
 ///
@@ -105,9 +112,14 @@ const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_tota
 const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
 const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
 
+/// The layers every public Zinder listener applies to its requests.
+type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>;
+
 /// The tonic server type that [`public_grpc_server`] returns.
-pub type PublicGrpcServer =
-    Server<Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>>;
+pub type PublicGrpcServer = Server<PublicGrpcLayers>;
+
+/// The tonic router type that [`public_grpc_router`] returns.
+pub type PublicGrpcRouter = Router<PublicGrpcLayers>;
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
 /// default receive limits and send stall timeout.
@@ -140,6 +152,52 @@ pub fn public_grpc_server_with(
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
 
+/// Assembles a public Zinder wallet listener that serves `wallet_service`.
+///
+/// The router serves, on [`public_grpc_server`]'s transport policy:
+///
+/// - `wallet_service`, behind a [`TrafficReadinessInterceptor`] over
+///   `readiness`;
+/// - gRPC reflection v1, describing `wallet_descriptor_set` and
+///   `grpc.health.v1`; and
+/// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
+///   traffic, as `/readyz` reports it.
+///
+/// Reflection and health stay outside the traffic gate, so they answer while
+/// the runtime refuses wallet calls.
+///
+/// Serve the router with `drain` as its shutdown signal. To stop, publish
+/// `shutting_down` to `readiness` first and cancel `drain` after it: health
+/// then reports `NOT_SERVING` together with `/readyz`, and open health
+/// `Watch` streams send it and end as the drain starts.
+pub fn public_grpc_router<S>(
+    wallet_service: S,
+    wallet_descriptor_set: &'static [u8],
+    readiness: &Readiness,
+    drain: &CancellationToken,
+) -> Result<PublicGrpcRouter, tonic_reflection::server::Error>
+where
+    S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
+        + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let reflection =
+        reflection_describing(&[wallet_descriptor_set, tonic_health::pb::FILE_DESCRIPTOR_SET])?;
+    let health = public_grpc_health(readiness, drain, S::NAME);
+    let gated_wallet_service = InterceptedService::new(
+        wallet_service,
+        TrafficReadinessInterceptor::new(readiness.clone()),
+    );
+    Ok(public_grpc_server()
+        .add_service(gated_wallet_service)
+        .add_service(reflection)
+        .add_service(health))
+}
+
 /// Returns the gRPC reflection v1 service for a public Zinder listener,
 /// describing the services in `encoded_file_descriptor_set`.
 ///
@@ -149,8 +207,18 @@ pub fn public_grpc_server_with(
 pub fn public_grpc_reflection(
     encoded_file_descriptor_set: &'static [u8],
 ) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
-    Ok(tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(encoded_file_descriptor_set)
+    reflection_describing(&[encoded_file_descriptor_set])
+}
+
+fn reflection_describing(
+    encoded_file_descriptor_sets: &[&'static [u8]],
+) -> Result<ServerReflectionServer<impl ServerReflection + use<>>, tonic_reflection::server::Error>
+{
+    let builder = encoded_file_descriptor_sets.iter().copied().fold(
+        tonic_reflection::server::Builder::configure(),
+        tonic_reflection::server::Builder::register_encoded_file_descriptor_set,
+    );
+    Ok(builder
         .build_v1()?
         .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES))
 }
@@ -520,6 +588,7 @@ mod tests {
             zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
             tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET,
             tonic_reflection::pb::v1alpha::FILE_DESCRIPTOR_SET,
+            tonic_health::pb::FILE_DESCRIPTOR_SET,
         ];
         let mut client_streaming = BTreeSet::new();
         for encoded in descriptor_sets {

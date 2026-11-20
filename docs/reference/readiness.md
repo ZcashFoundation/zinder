@@ -127,7 +127,7 @@ disagree:
 | Status | When |
 | --- | --- |
 | `SERVING` | `/readyz` answers 200. Causes that admit traffic with a warning, such as `serving_pair_stale`, and a dependency that is degraded but not required to serve, stay `SERVING`. |
-| `NOT_SERVING` | `/readyz` answers 503, or the runtime has started to shut down. |
+| `NOT_SERVING` | `/readyz` answers 503, including `shutting_down` once shutdown starts. |
 
 An empty service name asks about the whole listener. The name of the service
 the listener serves (`zinder.v1.wallet.WalletQuery` or
@@ -135,12 +135,22 @@ the listener serves (`zinder.v1.wallet.WalletQuery` or
 name fails `Check` with `NOT_FOUND`, and `Watch` reports `SERVICE_UNKNOWN`.
 There is no per-method or per-capability status.
 
-The health service stays reachable while the runtime refuses wallet calls with
-`SERVICE_NOT_READY`, as it does for gRPC reflection. `Watch` sends the current
-status at once and again when it changes, sampling readiness a few times per
-second. On a termination signal the runtime answers `NOT_SERVING` from the moment
-shutdown starts, before its listener drains, and open `Watch` streams send that
-status and end, so a balancer stops routing to the listener while it closes.
+The health service and gRPC reflection stay reachable while the runtime
+refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
+`grpc.health.v1.Health` beside the wallet service, so `grpcurl` needs no proto
+files to call it.
+
+`Watch` sends the current status at once and again on every change, as soon
+as readiness publishes it. A change that reverses before the stream sends it
+still produces a message, followed by the status readiness returned to. The
+process bounds how many `Watch` streams stay open across all connections, as
+[Public gRPC listeners](configuration.md#public-grpc-listeners) lists; `Check`
+has no such bound.
+
+On a termination signal the runtime publishes `shutting_down` before its
+listener drains, so `Check`, `Watch`, and `/readyz` report it together. When
+the drain starts, open `Watch` streams send `NOT_SERVING` and end, so a
+balancer stops routing to the listener while it closes.
 
 A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
 the runtime, not its ops port:
