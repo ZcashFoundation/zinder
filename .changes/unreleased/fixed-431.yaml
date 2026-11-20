@@ -1,0 +1,6 @@
+kind: fixed
+body: In compact-blocks mode, zinder-compat-lightwalletd stops waiting for writer status and catch-up retries when shutdown begins. An interrupted refresh keeps the published reader and records no refresh failure.
+time: 2026-11-20T16:24:00.78994762Z
+custom:
+    Bump: patch
+    PR: "431"
