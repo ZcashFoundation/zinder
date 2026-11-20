@@ -193,8 +193,9 @@ reports an unrecognized refusal as `protocol_mismatch` and logs
 
 `getstandardfee` reports a zero fee, or an answer of another shape, as
 `SourceProtocolMismatch`, as the transparent-address lookups report an answer
-of another shape. A node without the method is `NodeCapabilityMissing` for
-`standard_fee`.
+of another shape. The answer must be a JSON object with a fee and an optional
+estimator version, so an array of the two numbers is another shape. A node
+without the method is `NodeCapabilityMissing` for `standard_fee`.
 
 ## Authentication
 

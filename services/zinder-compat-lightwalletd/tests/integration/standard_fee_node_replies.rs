@@ -45,6 +45,7 @@ async fn get_standard_fee_is_internal_for_an_unusable_node_reply() -> eyre::Resu
         ("zero fee", json!({"standard_fee": 0, "version": 0})),
         ("string instead of a fee object", json!("not json")),
         ("null", Value::Null),
+        ("array of the fee and version", json!([7_000, 3])),
         (
             "fee as a string",
             json!({"standard_fee": "1000", "version": 0}),

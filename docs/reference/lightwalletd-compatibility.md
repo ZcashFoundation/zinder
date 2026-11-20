@@ -193,7 +193,7 @@ The call uses the same verified endpoints and failover order as `SendTransaction
 | Situation | Status |
 | --- | --- |
 | A verified node answers with a fee | The fee and estimator version |
-| A verified node answers with a zero fee, or with a reply that is not a fee and estimator version | `INTERNAL` |
+| A verified node answers with a zero fee, or with a reply that is not a JSON object with a fee and estimator version, such as an array of the two numbers | `INTERNAL` |
 | No endpoint is verified yet, an endpoint is still awaiting verification and none answered, or every verified endpoint is unreachable or answers with an error other than method-not-found | `UNAVAILABLE` |
 | Every endpoint that can still be admitted is verified and lacks `getstandardfee`, or `[node]` is not set | `UNIMPLEMENTED` |
 
