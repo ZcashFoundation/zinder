@@ -262,11 +262,11 @@ The protocol has no lossless way to page past the cap. A single block with more 
 
 ### `GetMempoolTx`
 
-`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. An unknown-only selection yields an empty stream. A request containing `POOL_TYPE_INVALID` (0) fails with `INVALID_ARGUMENT` before any transaction is sent.
-
-Zinder accepts up to 1,024 entries in `exclude_txid_suffixes`, compared with 20,000 in Go lightwalletd v0.6.2. Both accept up to 32 bytes per suffix. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
+`GetMempoolTx` returns the compact form of every current mempool transaction, filtered by `poolTypes` as `GetBlockRange` filters blocks. Zinder accepts up to 1,024 entries in `exclude_txid_suffixes`, compared with 20,000 in Go lightwalletd v0.6.2. Both accept up to 32 bytes per suffix. A suffix excludes a transaction only if it matches exactly one ID in the entire snapshot, including transactions outside the requested pools. Send suffixes in internal byte order.
 
 When suffixes overlap, the shortest matching suffix takes precedence, as in Go lightwalletd v0.6.2. A list containing an empty suffix therefore excludes the only transaction in a singleton snapshot. An empty list excludes nothing. [Go mempool filter](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L1019-L1058)
+
+A pool list containing only unrecognized numeric values yields an empty stream. A request containing `POOL_TYPE_INVALID` (0) fails with `INVALID_ARGUMENT` before any transaction is sent.
 
 ### `GetMempoolStream`
 
