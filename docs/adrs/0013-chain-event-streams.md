@@ -50,3 +50,5 @@ Some changes revise what an existing RPC means without changing its name or fiel
 - 2026-11-20. Contract revision 12 projects settled-tip advances onto the
   Settled family. Initial gRPC metadata identifies a Settled subscription so
   clients can validate its ranges when the family comes from an opaque cursor.
+- 2026-11-20. Contract revision 13 requires a writer to withdraw a stale live
+  mempool tail and to honor the wallet’s mempool stream opening budget.

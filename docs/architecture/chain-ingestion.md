@@ -464,6 +464,24 @@ and invalidated events. Mempool state is not part of block commits. Readers get 
 through the private control API. See
 [ADR-0012](../adrs/0012-mempool-topology-and-retention.md).
 
+After a tip change, the certified mempool can serve at its own tip for up to
+30 seconds while ingest stages a replacement. Further tip changes do not
+restart the clock. At expiry, ingest withdraws mempool readiness and live
+reads return `NODE_UNAVAILABLE`. The owner keeps following the source and
+resumes serving when a complete snapshot matches the canonical tip.
+
+Live mempool reads and ingest readiness use the same endpoint certification.
+After a switch, snapshot and transaction reads and the caught-up event stream
+refuse with `NODE_UNAVAILABLE` until the new active endpoint certifies.
+Retained events remain available for replay.
+
+Ingest control bounds a read, including time waiting for the owner, by the
+caller’s `grpc-timeout`. It reserves 10% of that budget, up to one second,
+to return a typed refusal.
+Wallet clients send `x-zinder-mempool-events-open-timeout-ms` on
+`MempoolEvents` so the 15-second opening budget ends when the stream opens.
+When both budgets are present, the shorter applies.
+
 ## Supported networks
 
 Ingest indexes Zcash Mainnet, Testnet, and Regtest, each with a fixed genesis
