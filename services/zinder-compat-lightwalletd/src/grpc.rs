@@ -1003,6 +1003,12 @@ where
             .await
             .map_err(|error| tree_state_status(&error))?;
 
+        if tree_state.frontiers.sapling_final_state.is_none() {
+            return Err(Status::invalid_argument(
+                "GetTreeState: z_gettreestate did not return treestate",
+            ));
+        }
+
         Ok(Response::new(lightwalletd_tree_state(&tree_state)))
     }
 
