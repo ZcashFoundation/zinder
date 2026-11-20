@@ -1,6 +1,0 @@
-kind: fixed
-body: Canonical and materialized-view store admission uses less memory when validating an existing RocksDB store.
-time: 2026-11-20T12:08:45.702881439Z
-custom:
-    Bump: patch
-    PR: "404"

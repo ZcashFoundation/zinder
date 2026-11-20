@@ -1,6 +1,0 @@
-kind: added
-body: Wallet-serving metrics now report requests refused before handlers run, stream outcomes, and per-process memory. The reference Compose alerts identify missing scrape targets. For the distribution of updates returned per ingest segment, use `zinder_ingest_source_segment_updates`. The configured limit remains available as `zinder_ingest_source_segment_max_blocks`.
-time: 2026-11-20T13:07:22.747078439Z
-custom:
-    Bump: minor
-    PR: "415"
