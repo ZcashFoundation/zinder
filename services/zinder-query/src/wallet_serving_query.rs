@@ -16,9 +16,9 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
-    NetworkUpgradeActivations, RawTransactionBytes, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentOutpointSpendStatus, TxStatus,
+    NetworkUpgradeActivations, RawTransactionBytes, StandardFee, TransactionId,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -1402,6 +1402,20 @@ where
             }
             reservation
                 .hold_during(self.broadcaster.broadcast_transaction(raw_transaction))
+                .await
+                .map_err(QueryError::Node)
+        })
+        .await
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, QueryError> {
+        serving_read::record("standard_fee", None, async {
+            let pair = self.capture_pair();
+            if let Some(node_verifications) = &self.node_verifications {
+                node_verifications.track_broadcast_height(&pair);
+            }
+            self.broadcaster
+                .standard_fee()
                 .await
                 .map_err(QueryError::Node)
         })

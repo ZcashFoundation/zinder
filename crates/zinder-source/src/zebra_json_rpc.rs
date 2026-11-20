@@ -25,7 +25,7 @@ use zinder_core::{
     CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
     CommitmentTreeFrontiersError, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    StandardFee, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
     TransactionId, ValuePoolBalance,
 };
 
@@ -1806,6 +1806,30 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
             )),
         }
     }
+
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        let reply: ZebraStandardFee = self
+            .call_with_result_shape(
+                "getstandardfee",
+                ArrayParams::new(),
+                |error| {
+                    if error.code == Some(JSON_RPC_METHOD_NOT_FOUND_CODE) {
+                        SourceError::NodeCapabilityMissing {
+                            capability: NodeCapability::StandardFee,
+                        }
+                    } else {
+                        map_node_unavailable(error)
+                    }
+                },
+                "getstandardfee returned a result that is not a fee and estimator version",
+            )
+            .await?;
+        StandardFee::new(reply.standard_fee, reply.version).ok_or(
+            SourceError::SourceProtocolMismatch {
+                reason: "getstandardfee reported a zero standard fee",
+            },
+        )
+    }
 }
 
 fn map_node_unavailable(error: JsonRpcCallError) -> SourceError {
@@ -2299,6 +2323,9 @@ fn parse_openrpc_capabilities(
     if method_names.contains(&"getblockchaininfo") {
         probed_capabilities.push(NodeCapability::ChainValuePools);
     }
+    if method_names.contains(&"getstandardfee") {
+        probed_capabilities.push(NodeCapability::StandardFee);
+    }
     if stores_historical_block_bodies {
         probed_capabilities.push(NodeCapability::HistoricalBlockBodies);
     }
@@ -2655,6 +2682,15 @@ fn classify_rejection_reason(message: &str) -> BroadcastRejectionReason {
         return BroadcastRejectionReason::InvalidSignature;
     }
     BroadcastRejectionReason::Unknown
+}
+
+/// Reply of the `getstandardfee` RPC.
+#[derive(Deserialize)]
+struct ZebraStandardFee {
+    standard_fee: u64,
+    /// A node that omits the estimator version runs the static ZIP 317 fee.
+    #[serde(default)]
+    version: u32,
 }
 
 /// Domain-shaped JSON-RPC `error` object after we strip jsonrpsee internals.

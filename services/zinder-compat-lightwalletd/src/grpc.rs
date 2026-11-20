@@ -38,6 +38,7 @@ use zinder_query::{
     WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
+use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
 
@@ -1138,9 +1139,26 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::StandardFee>, Status> {
-        Err(Status::unimplemented(
-            "GetStandardFee is not implemented because Zinder does not expose a backend getstandardfee estimator",
-        ))
+        match self.query_api.standard_fee().await {
+            Ok(fee) => Ok(Response::new(lightwalletd::StandardFee {
+                fee_zat: fee.fee_zat(),
+                estimator_version: fee.estimator_version(),
+            })),
+            Err(QueryError::Node(
+                SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::StandardFee,
+                }
+                | SourceError::TransactionBroadcastDisabled,
+            )) => Err(Status::unimplemented(
+                "GetStandardFee is not implemented: no configured node implements the getstandardfee RPC",
+            )),
+            Err(QueryError::Node(error @ SourceError::SourceProtocolMismatch { .. })) => {
+                Err(Status::internal(format!(
+                    "GetStandardFee: the node's getstandardfee reply is unusable: {error}"
+                )))
+            }
+            Err(error) => Err(status_from_query_error(&error)),
+        }
     }
 
     async fn ping(

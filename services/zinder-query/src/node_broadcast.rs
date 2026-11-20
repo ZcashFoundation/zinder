@@ -13,7 +13,7 @@ use tokio::{
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
     BlockHeight, BlockId, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason,
-    ChainEpochId, ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes,
+    ChainEpochId, ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
     TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
@@ -352,6 +352,57 @@ where
         }
         attempt.exhausted()
     }
+
+    /// Reads the recommended fee from the first verified endpoint, in
+    /// preference order, that answers.
+    ///
+    /// Moves to the next endpoint when one is unreachable or does not
+    /// implement `getstandardfee`, and leaves the preferred endpoint in place.
+    /// Fails as unreachable when an endpoint was unreachable and none
+    /// answered. Also fails as unreachable when an endpoint still awaits its
+    /// first-contact verification and none answered, because that endpoint
+    /// may implement the method. Fails as a missing capability only when
+    /// every endpoint that could answer is verified and lacks the method.
+    /// Any other failure, such as an unusable reply, ends the read with that
+    /// endpoint's error.
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        let verifications = &self.inner.verifications;
+        let mut unreachable = None;
+        let mut capability_missing = None;
+        let mut support_unknown = false;
+        for position in verifications.preference_order() {
+            let Some(source) = self.inner.nodes.endpoint(position) else {
+                continue;
+            };
+            if !verifications.is_verified(position) {
+                support_unknown |= verifications.awaits_verification(position);
+                continue;
+            }
+            match source.standard_fee().await {
+                Ok(fee) => return Ok(fee),
+                Err(error)
+                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                {
+                    unreachable = Some(error);
+                }
+                Err(error @ SourceError::NodeCapabilityMissing { .. }) => {
+                    capability_missing = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = unreachable {
+            return Err(error);
+        }
+        match capability_missing {
+            Some(error) if !support_unknown => Err(error),
+            Some(_) | None => Err(SourceError::NodeUnavailable {
+                reason: "no node endpoint that may implement getstandardfee has passed \
+                         first-contact verification"
+                    .to_owned(),
+            }),
+        }
+    }
 }
 
 impl<Source> OrderedBroadcaster<Source> {
@@ -543,6 +594,18 @@ impl EndpointVerifications {
 
     fn is_verified(&self, position: usize) -> bool {
         self.verified_capabilities_at(position).is_some()
+    }
+
+    /// Returns whether the endpoint at `position` is not in force yet and a
+    /// later verification can still admit it, so what it implements is
+    /// unknown. An excluded endpoint was refused and is not waiting.
+    fn awaits_verification(&self, position: usize) -> bool {
+        self.endpoints.get(position).is_some_and(|verification| {
+            !matches!(
+                **verification.state.load(),
+                VerificationState::Excluded { .. }
+            )
+        })
     }
 
     pub(crate) fn verified_capabilities(&self) -> Option<UpstreamNodeCapabilities> {

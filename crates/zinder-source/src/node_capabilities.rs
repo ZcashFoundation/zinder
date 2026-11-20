@@ -36,6 +36,8 @@ pub enum NodeCapability {
     /// Source stores every historical block body, so any best-chain height
     /// can be fetched. A pruned node lacks it.
     HistoricalBlockBodies,
+    /// Source can report the recommended ZIP 317 fee (`getstandardfee`).
+    StandardFee,
 }
 
 impl fmt::Display for NodeCapability {
@@ -62,6 +64,7 @@ impl NodeCapability {
             Self::ChainValuePools => "chain_value_pools",
             Self::BlockValuePoolBalances => "block_value_pool_balances",
             Self::HistoricalBlockBodies => "historical_block_bodies",
+            Self::StandardFee => "standard_fee",
         }
     }
 }
@@ -80,6 +83,7 @@ const ORDERED_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::ChainValuePools,
     NodeCapability::BlockValuePoolBalances,
     NodeCapability::HistoricalBlockBodies,
+    NodeCapability::StandardFee,
 ];
 
 const fn capability_bit(capability: NodeCapability) -> u16 {
@@ -97,6 +101,7 @@ const fn capability_bit(capability: NodeCapability) -> u16 {
         NodeCapability::ChainValuePools => 1 << 10,
         NodeCapability::BlockValuePoolBalances => 1 << 11,
         NodeCapability::HistoricalBlockBodies => 1 << 12,
+        NodeCapability::StandardFee => 1 << 13,
     }
 }
 

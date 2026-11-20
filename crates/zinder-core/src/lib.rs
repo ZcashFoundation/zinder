@@ -93,8 +93,8 @@ pub use subtree_root::{
 pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, MAX_RAW_TRANSACTION_BYTES,
-    MinedTransaction, MinedTransactionChainContext, RawTransactionBytes, TransactionBlobArtifact,
-    TransactionBroadcastOutcome, TransactionFactsArtifact, TransactionId,
+    MinedTransaction, MinedTransactionChainContext, RawTransactionBytes, StandardFee,
+    TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TransactionLocation, TxStatus,
 };

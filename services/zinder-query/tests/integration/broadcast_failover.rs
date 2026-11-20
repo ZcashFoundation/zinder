@@ -9,7 +9,8 @@ use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transac
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastQueued, BroadcastRejected,
     BroadcastRejectionReason, ConsensusBranchId, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
+    NetworkUpgradeActivations, RawTransactionBytes, StandardFee, TransactionBroadcastOutcome,
+    TransactionId,
 };
 use zinder_query::{
     OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
@@ -788,6 +789,37 @@ async fn broadcast_skips_an_endpoint_whose_table_disagrees_at_the_broadcast_heig
     );
     assert_eq!(node.call_count(), 0);
     assert_eq!(node.capability_probe_count(), 1);
+    Ok(())
+}
+
+/// A fee read skips an endpoint whose verified table disagrees with the
+/// writer's schedule at the height a broadcast targets, as a broadcast does.
+///
+/// No verification has run against the pair that reached that height.
+#[tokio::test]
+async fn standard_fee_skips_an_endpoint_whose_table_disagrees_at_the_broadcast_height()
+-> eyre::Result<()> {
+    let activation = EndpointOnlyActivation::new()?;
+    let node = accepting_node(0x1c)
+        .with_node_activations(schedule_with_an_earlier_upgrade()?)
+        .with_standard_fee(
+            StandardFee::new(1_000, 2).ok_or_else(|| eyre!("the node fee must be non-zero"))?,
+        );
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    let query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(activation.at_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+    nodes.verify(&activation.below_slot).await?;
+
+    let outcome = query.standard_fee().await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(QueryError::Node(SourceError::NodeUnavailable { .. }))
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
     Ok(())
 }
 

@@ -111,8 +111,8 @@ such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 Each runtime uses `[node]` differently:
 
 - Ingest requires it.
-- Query and wallet-mode compatibility use it only to broadcast transactions,
-  for which a pruned node works. They start without contacting the node. Without `[node]` they serve stored
+- Query and wallet-mode compatibility use it only to broadcast transactions
+  and, in compatibility, to read the recommended fee, for which a pruned node works. They start without contacting the node. Without `[node]` they serve stored
   data and do not advertise broadcast. Any node setting requires
   `node.json_rpc_addr`.
 - Explorer uses it only to report the node's tip in its freshness envelope.

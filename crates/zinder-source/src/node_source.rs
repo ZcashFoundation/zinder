@@ -5,8 +5,8 @@ use std::{num::NonZeroU32, sync::Arc};
 use async_trait::async_trait;
 use zinder_core::{
     BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, CommitmentTreeCheckpoint,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, StandardFee,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
 };
 
 use crate::{
@@ -298,6 +298,18 @@ pub trait TransactionBroadcaster: Send + Sync + 'static {
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, SourceError>;
+
+    /// Reads the fee the same node recommends for a transaction to be mined
+    /// in the next block.
+    ///
+    /// The default returns [`SourceError::NodeCapabilityMissing`] for
+    /// [`NodeCapability::StandardFee`], as a node without the `getstandardfee`
+    /// RPC does.
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::StandardFee,
+        })
+    }
 }
 
 #[async_trait]
@@ -306,6 +318,10 @@ impl TransactionBroadcaster for () {
         &self,
         _raw_transaction: RawTransactionBytes,
     ) -> Result<TransactionBroadcastOutcome, SourceError> {
+        Err(SourceError::TransactionBroadcastDisabled)
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
         Err(SourceError::TransactionBroadcastDisabled)
     }
 }
@@ -321,6 +337,13 @@ where
     ) -> Result<TransactionBroadcastOutcome, SourceError> {
         match self {
             Some(broadcaster) => broadcaster.broadcast_transaction(raw_transaction).await,
+            None => Err(SourceError::TransactionBroadcastDisabled),
+        }
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
+        match self {
+            Some(broadcaster) => broadcaster.standard_fee().await,
             None => Err(SourceError::TransactionBroadcastDisabled),
         }
     }

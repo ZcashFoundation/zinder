@@ -10,14 +10,15 @@ use serde_json::json;
 use zinder_core::{
     BlockHash, BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES,
-    Network, NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
+    Network, NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
     TransactionBroadcastOutcome, TransactionId,
     wire::{encode_branch_id_hex, encode_rpc_block_hash_hex},
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_query::{OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingQuery};
 use zinder_source::{
-    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceError, ZebraJsonRpcSource,
+    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeCapability, NodeTarget, SourceError,
+    ZebraJsonRpcSource,
 };
 use zinder_testkit::{
     ChainFixture, JsonRpcTestServer, MockTransactionBroadcaster, RpcReply,
@@ -35,6 +36,146 @@ async fn broadcasting_query(
 ) -> eyre::Result<(NodeBroadcastQuery, WalletServingStoreFixture)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     verified_node_query_over(&chain, broadcaster).await
+}
+
+/// Builds the release serving query whose verified nodes answer `getstandardfee`
+/// in order.
+async fn ordered_fee_query(
+    nodes: Vec<MockTransactionBroadcaster>,
+) -> eyre::Result<(NodeBroadcastQuery, WalletServingStoreFixture)> {
+    let activations = sample_regtest_upgrade_activations();
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let mut nodes = nodes
+        .into_iter()
+        .map(|node| node.with_node_activations(activations.clone()));
+    let primary = nodes
+        .next()
+        .ok_or_else(|| eyre!("an ordered fee query needs a node"))?;
+    let nodes = OrderedBroadcaster::new(primary, nodes);
+    nodes.verify(&slot).await?;
+    let query = WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(nodes));
+    Ok((query, store_fixture))
+}
+
+fn accepting_node() -> MockTransactionBroadcaster {
+    MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+}
+
+fn node_fee() -> eyre::Result<StandardFee> {
+    StandardFee::new(1_000, 2).ok_or_else(|| eyre!("the node fee must be non-zero"))
+}
+
+/// A node that cannot be reached, or that lacks `getstandardfee`, does not
+/// stop a later verified endpoint from answering.
+#[tokio::test]
+async fn standard_fee_moves_past_an_unreachable_or_incapable_endpoint() -> eyre::Result<()> {
+    let (query, _store_fixture) = ordered_fee_query(vec![
+        MockTransactionBroadcaster::node_unavailable("node refuses connections"),
+        accepting_node(),
+        accepting_node().with_standard_fee(node_fee()?),
+    ])
+    .await?;
+
+    assert_eq!(query.standard_fee().await?, node_fee()?);
+    Ok(())
+}
+
+/// An unreachable endpoint takes precedence over one that lacks the method,
+/// so a transient outage is not reported as a permanent absence.
+#[tokio::test]
+async fn standard_fee_reports_unreachable_ahead_of_a_missing_method() -> eyre::Result<()> {
+    let (query, _store_fixture) = ordered_fee_query(vec![
+        accepting_node(),
+        MockTransactionBroadcaster::node_unavailable("node refuses connections"),
+    ])
+    .await?;
+
+    let error = query
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("no endpoint answered with a fee"))?;
+
+    assert!(
+        matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_fee_reports_a_missing_method_when_no_endpoint_has_it() -> eyre::Result<()> {
+    let (query, _store_fixture) =
+        ordered_fee_query(vec![accepting_node(), accepting_node()]).await?;
+
+    let error = query
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("no endpoint answered with a fee"))?;
+
+    assert!(
+        matches!(
+            error,
+            QueryError::Node(SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::StandardFee
+            })
+        ),
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}
+
+/// A fee-capable fallback that is unreachable during verification may
+/// implement the method, so a verified endpoint without it does not make the
+/// absence permanent.
+#[tokio::test]
+async fn standard_fee_is_unavailable_while_a_fallback_awaits_verification() -> eyre::Result<()> {
+    let unreachable_fallback = accepting_node().with_standard_fee(node_fee()?);
+    unreachable_fallback.report_unreachable();
+    let (query, _store_fixture) =
+        ordered_fee_query(vec![accepting_node(), unreachable_fallback]).await?;
+
+    let error = query
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("no endpoint answered with a fee"))?;
+
+    assert!(
+        matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
+        "unexpected error: {error:?}"
+    );
+    Ok(())
+}
+
+/// An endpoint that has not passed first-contact verification is not asked
+/// for a fee.
+#[tokio::test]
+async fn standard_fee_does_not_ask_an_unverified_endpoint() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = accepting_node()
+        .with_node_activations(sample_regtest_upgrade_activations())
+        .with_standard_fee(node_fee()?);
+    let query = WalletServingQuery::from_serving_pair_slot(slot)
+        .with_node_broadcast(Some(OrderedBroadcaster::new(node, [])));
+
+    let error = query
+        .standard_fee()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an unverified endpoint answered"))?;
+
+    assert!(
+        matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
+        "unexpected error: {error:?}"
+    );
+    Ok(())
 }
 
 /// A reader starts without contacting its node, so a broadcast that arrives

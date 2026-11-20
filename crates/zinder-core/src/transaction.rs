@@ -1,5 +1,7 @@
 //! Transaction identity, submission, and durable artifact values.
 
+use std::num::NonZeroU64;
+
 use crate::{
     BlockHash, BlockHeight, ChainEpoch, ConsensusBranchId, MempoolEntry, TransactionPublicFacts,
     TransparentInputFact, TransparentOutputFact,
@@ -90,6 +92,45 @@ impl RawTransactionBytes {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+/// The [ZIP 317](https://zips.z.cash/zip-0317) marginal fee a node recommends,
+/// as its `getstandardfee` RPC reports it.
+///
+/// A node that follows ZIP 317 never recommends a zero fee, so the fee is
+/// never zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardFee {
+    fee_zat: NonZeroU64,
+    estimator_version: u32,
+}
+
+impl StandardFee {
+    /// Creates a recommended fee, or returns `None` when `fee_zat` is zero.
+    ///
+    /// `estimator_version` `0` is the static ZIP 317 marginal fee.
+    #[must_use]
+    pub const fn new(fee_zat: u64, estimator_version: u32) -> Option<Self> {
+        match NonZeroU64::new(fee_zat) {
+            Some(fee_zat) => Some(Self {
+                fee_zat,
+                estimator_version,
+            }),
+            None => None,
+        }
+    }
+
+    /// Returns the recommended fee per logical action, in zatoshis.
+    #[must_use]
+    pub const fn fee_zat(self) -> u64 {
+        self.fee_zat.get()
+    }
+
+    /// Returns the version of the node's fee estimator.
+    #[must_use]
+    pub const fn estimator_version(self) -> u32 {
+        self.estimator_version
     }
 }
 

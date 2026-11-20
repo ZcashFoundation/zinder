@@ -115,7 +115,7 @@ with a `type` and `subject`.
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer view is not configured. Violation subject: the capability. |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | This wallet endpoint does not advertise the capability the method needs. Violation subject: the capability. |
 | `DEPENDENCY_NOT_CONFIGURED` | An explorer request needs a dependency that is not configured: the canonical store, a materialized view, or a wallet query endpoint. Waiting never clears it. |
-| `NODE_CAPABILITY_MISSING` | The node lacks a capability the request needs. Only broadcast, the one request forwarded to the node, returns it. |
+| `NODE_CAPABILITY_MISSING` | The node lacks a capability the request needs. Only broadcast returns it. |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state. |
 | `CANONICAL_HISTORY_UNAVAILABLE` | The store's history starts at a checkpoint, so a transaction lookup or `TransparentOutpointSpendStatus` miss cannot prove an absence. An unpinned lookup checks the live mempool first. Metadata: `first_available_height`. Client policy: `OperatorActionRequired`. A store with complete history answers with a proven absence instead. |
 
