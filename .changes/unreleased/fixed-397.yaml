@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallets following ChainEvents with an address filter continue to receive matching commits after long runs of quiet blocks. An idle subscription checks each quiet commit once, and matching events keep their usual resume cursors.
+time: 2026-11-20T11:25:04.171869429Z
+custom:
+    Bump: patch
+    PR: "397"
