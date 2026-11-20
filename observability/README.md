@@ -31,6 +31,12 @@ by rebuilding from the node, as
 [Service operations](../docs/architecture/service-operations.md#recovery)
 describes.
 
+To test the shipped Prometheus configs, rules, and Scrape Targets panel with
+isolated samples and no node, run `python3 scripts/test-observability-rules.py`.
+It checks base Compose, the Explorer overlay, and the local smoke stack using
+their configured Prometheus images. A down target and a target that disappears
+from discovery must each produce their own alert.
+
 ## Prerequisites
 
 - A Zebra node with JSON-RPC enabled. The default is Regtest at

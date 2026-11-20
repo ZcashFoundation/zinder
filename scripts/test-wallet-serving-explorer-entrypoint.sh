@@ -255,6 +255,9 @@ done
 kill -s TERM "$wrapper_pid"
 await_entrypoint_exit
 [[ "$wrapper_status" -eq 0 ]] || test_failure "a forwarded SIGTERM exited $wrapper_status"
+if grep -q 'event=supervisor_child_exited' "$work/case/stderr"; then
+  test_failure "an expected shutdown was counted as a child exit"
+fi
 [[ -e "$work/case/wallet.stopped" ]] || test_failure "SIGTERM did not reach wallet serving"
 [[ -e "$work/case/explorer.stopped" ]] || test_failure "SIGTERM did not reach the Explorer"
 
@@ -328,6 +331,10 @@ kill -0 "$wrapper_pid" 2>/dev/null || test_failure "an Explorer exit ended the c
 [[ ! -e "$work/case/wallet.stopped" ]] || test_failure "an Explorer exit stopped wallet serving"
 grep -q 'zinder-explorer exited with status 5 .*; wallet serving continues; restarting zinder-explorer in 1s' \
   "$work/case/stderr" || test_failure "the first Explorer exit was not logged: $(cat "$work/case/stderr")"
+for delay in 1 2; do
+  [[ "$(grep -Ec "event=supervisor_child_exited role=zinder-explorer phase=serving status=5 action=restart_child uptime_seconds=[0-9]+ restart_delay_seconds=$delay " "$work/case/stderr")" -eq 1 ]] \
+    || test_failure "expected one observed Explorer exit for restart delay $delay"
+done
 grep -q 'restarting zinder-explorer in 2s' "$work/case/stderr" \
   || test_failure "the Explorer restart delay did not grow: $(cat "$work/case/stderr")"
 kill -s TERM "$wrapper_pid"

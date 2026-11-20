@@ -6384,6 +6384,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "secrecy",

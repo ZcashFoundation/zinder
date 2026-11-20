@@ -84,6 +84,7 @@ where
         }))
         .option_layer(enabled.then(|| browser_cors(browser_origins)))
         .option_layer(enabled.then(GrpcWebLayer::new))
+        .layer(zinder_runtime::WalletRpcMetricsLayer::Lightwalletd)
         .option_layer(enabled.then(|| ValidateRequestHeaderLayer::custom(UnsupportedBrowserCall)))
         .into_inner()
 }

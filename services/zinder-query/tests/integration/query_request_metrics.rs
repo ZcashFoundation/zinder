@@ -30,6 +30,114 @@ use zinder_testkit::{
 
 const FIRST_CHAIN_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn native_listener_counts_readiness_refusals_and_completed_ranges_once() -> eyre::Result<()> {
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use wallet::wallet_query_client::WalletQueryClient;
+    use zinder_runtime::{
+        ClientAddressSource, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
+        WalletRpcMetricsLayer,
+    };
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let release = ReleaseAdapter::open().await?;
+    let runtime = SupervisedRuntime::new(RuntimeService::Query);
+    let readiness = Readiness::new(ReadinessState::starting());
+    let stream_shutdown = tokio_util::sync::CancellationToken::new();
+    let router = runtime.public_grpc_router_with_transport(
+        (
+            release
+                .adapter
+                .with_shutdown(stream_shutdown.clone())
+                .into_server(),
+            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ),
+        ClientAddressSource::Connection,
+        &readiness,
+        |server| server.layer(WalletRpcMetricsLayer::WalletQuery),
+    )?;
+    let incoming = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", incoming.local_addr()?);
+    let server = tokio::spawn(router.serve_with_incoming_shutdown(
+        TcpListenerStream::new(incoming),
+        runtime.grpc_server_shutdown(),
+    ));
+    let mut client = WalletQueryClient::connect(endpoint).await?;
+    let baseline = handle.render();
+    assert!(baseline.contains(r#"zinder_wallet_rpc_readiness_refusals_total{surface="wallet_query",method="CompactBlocksInRange"} 0"#), "{baseline}");
+    let refused = client
+        .server_info(wallet::ServerInfoRequest {})
+        .await
+        .err()
+        .ok_or_else(|| eyre!("starting listener served ServerInfo"))?;
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    readiness.set(ReadinessState::ready(Some(2)));
+    client.server_info(wallet::ServerInfoRequest {}).await?;
+    let range = wallet::CompactBlocksInRangeRequest {
+        start_height: 1,
+        end_height: 2,
+        at_epoch_id: None,
+    };
+    let mut chunks = client.compact_blocks_in_range(range).await?.into_inner();
+    let mut received = 0;
+    while chunks.message().await?.is_some() {
+        received += 1;
+    }
+    assert_eq!(received, 3);
+    compare_gate_and_stream_shutdown(&mut client, &readiness, &stream_shutdown, range).await?;
+    drop(client);
+    runtime.stopping().cancel();
+    server.await??;
+    let exposition = handle.render();
+    for sample in [
+        r#"zinder_wallet_rpc_requests_total{surface="wallet_query",method="ServerInfo",grpc_code="unavailable",error_class="SERVICE_NOT_READY"} 1"#,
+        r#"zinder_wallet_rpc_requests_total{surface="wallet_query",method="ServerInfo",grpc_code="ok",error_class="none"} 1"#,
+        r#"zinder_wallet_rpc_readiness_refusals_total{surface="wallet_query",method="ServerInfo"} 1"#,
+        r#"zinder_wallet_rpc_requests_total{surface="wallet_query",method="CompactBlocksInRange",grpc_code="ok",error_class="none"} 1"#,
+        r#"zinder_wallet_rpc_requests_total{surface="wallet_query",method="CompactBlocksInRange",grpc_code="unavailable",error_class="SERVICE_NOT_READY"} 2"#,
+        r#"zinder_wallet_rpc_readiness_refusals_total{surface="wallet_query",method="CompactBlocksInRange"} 1"#,
+        r#"zinder_wallet_rpc_block_range_blocks_sum{surface="wallet_query",method="CompactBlocksInRange",grpc_code="ok",error_class="none"} 2"#,
+        r#"zinder_wallet_rpc_open_streams{surface="wallet_query",method="CompactBlocksInRange"} 0"#,
+    ] {
+        assert!(
+            exposition.lines().any(|line| line == sample),
+            "{sample}\n{exposition}"
+        );
+    }
+    Ok(())
+}
+
+async fn compare_gate_and_stream_shutdown(
+    client: &mut wallet::wallet_query_client::WalletQueryClient<tonic::transport::Channel>,
+    readiness: &zinder_runtime::Readiness,
+    stream_shutdown: &tokio_util::sync::CancellationToken,
+    range: wallet::CompactBlocksInRangeRequest,
+) -> eyre::Result<()> {
+    use zinder_runtime::{ReadinessCause, ReadinessState};
+
+    readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+    let refused = client
+        .compact_blocks_in_range(range)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("closed gate served a range"))?;
+    readiness.set(ReadinessState::ready(Some(2)));
+    stream_shutdown.cancel();
+    let mut admitted = client.compact_blocks_in_range(range).await?.into_inner();
+    let ended = admitted
+        .message()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("shutdown stream served a block"))?;
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    assert_eq!(ended.code(), refused.code());
+    assert_eq!(ended.details(), refused.details());
+    Ok(())
+}
+
 #[test]
 fn release_native_reads_record_query_request_samples() -> eyre::Result<()> {
     let exposition = render_metrics_of(async {

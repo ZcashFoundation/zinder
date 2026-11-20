@@ -798,6 +798,12 @@ impl Interceptor for TrafficReadinessInterceptor {
         if report.is_ready {
             Ok(request)
         } else {
+            if let Some(method) = request
+                .extensions()
+                .get::<crate::public_grpc_server::WalletRpcMethod>()
+            {
+                method.record_readiness_refusal();
+            }
             Err(not_ready_status(&report.cause))
         }
     }

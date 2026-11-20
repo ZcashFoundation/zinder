@@ -1,0 +1,7 @@
+groups:
+  - name: zinder-explorer-target
+    labels: {stack: zinder}
+    rules:
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-explorer, job: zinder-explorer, instance: "zinder-ingest:9069"}

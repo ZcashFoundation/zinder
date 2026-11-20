@@ -49,6 +49,7 @@ zinder-source.workspace = true
 zinder-store.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["param"] }
 tikv-jemallocator.workspace = true
 
 [dev-dependencies]

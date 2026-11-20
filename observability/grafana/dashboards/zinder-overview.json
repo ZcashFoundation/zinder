@@ -22,7 +22,16 @@
             },
             "inspect": false
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": { "text": "Missing", "color": "orange" },
+                "0": { "text": "Down", "color": "red" },
+                "1": { "text": "Up", "color": "green" }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -66,7 +75,7 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "up{stack=\"zinder-local\"}",
+          "expr": "zinder:target_scrape_status",
           "format": "table",
           "instant": true,
           "legendFormat": "{{job}}",

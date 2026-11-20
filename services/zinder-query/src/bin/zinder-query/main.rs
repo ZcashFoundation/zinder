@@ -275,11 +275,14 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         cancel.clone(),
     );
     let publisher_handle = pair_publisher.spawn(cancel, runtime.serving_drained());
-    let router = runtime.public_grpc_router(
-        grpc_adapter.into_server(),
-        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+    let router = runtime.public_grpc_router_with_transport(
+        (
+            grpc_adapter.into_server(),
+            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ),
         query_config.client_address_source,
         &readiness,
+        |server| server.layer(zinder_runtime::WalletRpcMetricsLayer::WalletQuery),
     )?;
 
     tracing::info!(

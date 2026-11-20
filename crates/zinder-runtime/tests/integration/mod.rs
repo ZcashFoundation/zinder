@@ -1,4 +1,3 @@
-mod dashboard_metric_names;
 mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
