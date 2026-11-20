@@ -56,4 +56,4 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 
 ## Revision history
 
-- 2026-11-20. Decision 9 counts only time spent waiting on an unreachable node. Canonical catch-up pauses the clock while query continues to relay the same outage.
+- 2026-11-20. Decision 9 ties the node-outage budget to ingest’s current wait reason.
