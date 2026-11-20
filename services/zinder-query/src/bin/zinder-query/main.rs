@@ -22,6 +22,7 @@ use zinder_runtime::{
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
 
 mod config;
+mod grpc_healthcheck;
 
 use config::{QueryConfigError, QueryConfigOverrides};
 
@@ -87,13 +88,24 @@ enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
+    /// Probe the gRPC listener. Exit 0 if serving, 3 if it reports non-serving,
+    /// or 1 if the health check fails.
+    GrpcHealthcheck {
+        /// Plaintext listener socket. An unspecified IP probes loopback.
+        addr: SocketAddr,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
-        return run_healthcheck(healthcheck, cli.config_path.as_deref());
+    if let Some(command) = &cli.command {
+        return match command {
+            Command::Healthcheck(healthcheck) => {
+                run_healthcheck(healthcheck, cli.config_path.as_deref())
+            }
+            Command::GrpcHealthcheck { addr } => grpc_healthcheck::run(*addr).await,
+        };
     }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);

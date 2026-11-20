@@ -154,7 +154,6 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let readiness_report = self.readiness.runtime_readiness().report();
-        let node_source_observation = self.readiness.input_cause(ReadinessInput::NodeSource);
         // Fresh construction has no published epoch, and the writer services
         // its command queue only once it follows a published store.
         if readiness_report.phase == Some(IngestPhase::BulkCatchup) {
@@ -162,8 +161,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 self.network,
                 None,
                 &readiness_report,
-                node_source_observation.as_ref(),
-                FollowedNode::of(&self.readiness),
+                &self.readiness,
             )));
         }
         // A parked writer reports its frozen fence while it still answers;
@@ -185,8 +183,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             self.network,
             chain_epoch,
             &readiness_report,
-            node_source_observation.as_ref(),
-            FollowedNode::of(&self.readiness),
+            &self.readiness,
         )))
     }
 
@@ -469,22 +466,19 @@ fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
-    node_source_observation: Option<&ReadinessCause>,
-    followed_node: FollowedNode,
+    readiness: &ComposedReadiness,
 ) -> WriterStatusResponse {
-    let upstream_not_ready = [node_source_observation, Some(&readiness_report.cause)]
-        .into_iter()
-        .flatten()
-        .find_map(|cause| {
-            if let ReadinessCause::UpstreamNotReady(detail) = cause {
-                Some(detail)
-            } else {
-                None
-            }
-        });
-    // The health probe keeps its last observation when a probe fails, so
-    // while the follower reports the node unreachable that observation is
-    // stale and names no tip the node can still vouch for.
+    let followed_node = FollowedNode::of(readiness);
+    let node_source_observation = readiness.input_cause(ReadinessInput::NodeSource);
+    let upstream_not_ready = if let ReadinessCause::UpstreamNotReady(detail) =
+        node_source_observation
+            .as_ref()
+            .unwrap_or(&readiness_report.cause)
+    {
+        Some(detail)
+    } else {
+        None
+    };
     let upstream_tip = if followed_node.is_unavailable
         || matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_))
     {
@@ -520,10 +514,9 @@ fn writer_status_response(
 /// Returns the node tip to report from the follower's observed target and
 /// the node-health probe's not-ready report.
 ///
-/// A probe keeps its last report when a probe fails, so after an outage the
-/// report can name an older tip than the follower observes. Each height is
-/// therefore the larger of the two, and Zebra's `/ready` reports, which carry
-/// no heights, leave the follower's target.
+/// The follower can observe a newer tip between health probes. Each height
+/// is the larger of the two, and a heightless `/ready` report leaves the
+/// follower's target.
 fn upstream_tip_from_readiness(
     followed_target: Option<u32>,
     upstream_not_ready: Option<&UpstreamNotReadyDetail>,
@@ -1362,12 +1355,96 @@ mod tests {
         ))
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_health_observation_withdraws_the_writer_sync_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+
+        let (progress, reports) = tokio::sync::watch::channel(Some(0.5));
+        let (requests, mut seen_requests) = tokio::sync::watch::channel(0_u64);
+        let server =
+            JsonRpcTestServer::start([method("getblockchaininfo").reply_with(move |_| {
+                let progress = reports.borrow();
+                requests.send_modify(|count| *count += 1);
+                progress.map_or_else(
+                    || RpcReply::error("node temporarily unavailable"),
+                    |progress| {
+                        RpcReply::result(serde_json::json!({
+                            "blocks": 100, "estimatedheight": 100, "verificationprogress": progress,
+                        }))
+                    },
+                )
+            })])?;
+        let source = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            server.url(),
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?;
+        let fixture = shared_control_fixture().await?;
+        let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+        composed.publish_admission(
+            ReadinessState::syncing(Some(5), Some(95), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        let adapter = writer_status_adapter(&fixture, composed.clone())?;
+        let cancel = CancellationToken::new();
+        let probe = crate::spawn_upstream_health_probe_task(
+            Arc::new(source),
+            composed.clone(),
+            Duration::from_millis(5),
+            None,
+            cancel.clone(),
+        );
+        for (next_progress, expected_input) in [
+            (Some(0.5), "upstream_not_ready"),
+            (None, "node_unavailable"),
+            (Some(0.5), "upstream_not_ready"),
+            (Some(1.0), "ready"),
+        ] {
+            progress.send(next_progress)?;
+            // The second request starts only after the probe published the first reply.
+            let second_request = *seen_requests.borrow() + 2;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                seen_requests.wait_for(|n| *n >= second_request),
+            )
+            .await??;
+            let status =
+                IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+                    .await?
+                    .into_inner();
+            assert_eq!(
+                status.upstream_not_ready.is_some(),
+                expected_input == "upstream_not_ready"
+            );
+            let report = composed.runtime_readiness().report();
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: Some(5)
+                }
+            );
+            assert_eq!(
+                (report.current_height, report.target_height),
+                (Some(95), Some(100))
+            );
+            assert_eq!(
+                composed
+                    .input_cause(ReadinessInput::NodeSource)
+                    .map(|cause| cause.metric_label()),
+                Some(expected_input)
+            );
+        }
+        cancel.cancel();
+        probe.await?;
+        fixture.shutdown().await
+    }
+
     /// Writer status reports the newer of the probe's and the follower's tip.
     ///
-    /// The JSON-RPC health fallback's not-ready report from before an outage
-    /// names an older tip than the one the follower observes once the node
-    /// returns, and a failed probe keeps that report, so the old report must
-    /// not vouch for a stale tip.
+    /// The follower can observe a newer tip after an outage and before the
+    /// next health probe completes.
     #[tokio::test(flavor = "multi_thread")]
     async fn writer_status_never_reports_a_probe_tip_below_the_followed_one()
     -> Result<(), Box<dyn std::error::Error>> {

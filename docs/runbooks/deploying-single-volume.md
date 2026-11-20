@@ -225,8 +225,12 @@ curl -fsS http://127.0.0.1:9107/readyz   # lightwalletd compatibility
 
 ## Failure handling
 
-The entrypoint watches every process and its `/readyz`. When it gives
-up, it exits non-zero, and the platform's restart policy starts a clean set.
+The entrypoint watches every process and its `/readyz`. When an enabled
+wallet reader answers HTTP 200, the entrypoint also calls `grpc.health.v1.Health/Check`
+on that reader's serving socket. A non-serving reply counts as an answered
+unready poll. A connection failure or a missed reply counts as an unreachable
+listener. When a budget expires, the entrypoint exits non-zero, and the
+platform's restart policy starts a clean set.
 
 | Symptom | Cause | What the container does | Action |
 | --- | --- | --- | --- |

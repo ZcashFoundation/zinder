@@ -280,7 +280,12 @@ endpoint on the configured cadence. Each probe waits at most two seconds, or the
 cadence if shorter, and falls back to `getblockchaininfo` in the same poll when
 it fails. A node that accepts connections but never answers therefore cannot
 stall a caller. Without `[node.health].addr`, readiness comes from JSON-RPC
-observations.
+observations. Both JSON-RPC paths apply `verification_progress_floor` and
+`estimated_gap_floor_blocks` from the active node's health settings.
+
+Ingest starts its periodic readiness probe when the primary node has a health
+address. Setting only the fallback floors changes how JSON-RPC observations
+are classified. A reader with a configured node polls it on either path.
 
 The node's readiness caps ingest's readiness. Readers use their node only to
 broadcast and, in wallet-mode compatibility, to read the recommended fee, so

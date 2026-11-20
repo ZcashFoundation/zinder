@@ -39,8 +39,12 @@ for function_name in \
   require_projector_park_for_stopped_readers \
   classify_probe_failure \
   probe_readiness \
+  plane_admits_traffic \
+  resolve_reader_listen_addrs \
   observe_plane_readiness \
   await_readiness \
+  assert_child_alive \
+  check_recurrence_budget \
   update_plane_recurrence \
   zinder_variables_outside \
   start_runtime_process \
@@ -100,6 +104,21 @@ probe_node_unreachable=0
 lightwalletd_enabled=1
 response_separator='
 '
+
+scoping_root="$(mktemp -d)"
+trap 'rm -rf "$scoping_root"' EXIT
+resolve_reader_listen_addrs
+fake_grpc_status=0
+grpc_calls="$scoping_root/grpc-calls"
+
+# Called in a subshell, so capture the listener address on disk.
+# shellcheck disable=SC2329
+zinder-query() {
+  [ "$#" -eq 2 ] && [ "$1" = "grpc-healthcheck" ] && [ "${TOKIO_WORKER_THREADS:-}" = 1 ] || return 77
+  printf '%s\n' "$2" >>"$grpc_calls"
+  printf 'fixture status %s\n' "$fake_grpc_status" >&2
+  return "$fake_grpc_status"
+}
 
 fake_status=""
 fake_body=""
@@ -328,9 +347,104 @@ await_readiness zinder-projector 127.0.0.1:9110 60 \
   start_wallet_serving || test_failure "startup failed without compatibility: $fail_message"
   [ "$started_binaries" = " zinder-query" ] \
     || test_failure "startup started '$started_binaries' with compatibility turned off"
-  [ -z "$compat_pid" ] || test_failure "startup recorded a compatibility process it turned off"
+  [ -z "$compat_pid" ] && [[ "$awaited_phase_starts" != *"zinder-compat-lightwalletd"* ]] \
+    || test_failure "startup recorded or probed a compatibility process it turned off"
   wait
 )
+
+# A healthy ops socket is sufficient for the construction processes. Readers
+# must also answer grpc.health.v1 on the configured serving listener.
+# shellcheck disable=SC2154 # the evaluated probe functions set these fields
+(
+  resolve_reader_listen_addrs
+  [ "$query_grpc_addr" = '[::]:9102' ] && [ "$compat_grpc_addr" = '[::]:9067' ] \
+    || test_failure "the probe defaults differ from the installed reader addresses"
+  ZINDER_Query__Listen_Addr='127.0.0.1:9901' ZINDER_COMPAT__LISTEN_ADDR='[::1]:9902' resolve_reader_listen_addrs
+  : >"$grpc_calls"
+  serve 200 "$degraded_ready_body"
+  for role in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd; do
+    observe_plane_readiness "$role" 127.0.0.1:9106 \
+      || test_failure "$role failed its steady probe: $probe_report"
+  done
+  [ "$(cat "$grpc_calls")" = $'127.0.0.1:9901\n[::1]:9902' ] && [ "$probe_unreachable" -eq 0 ] \
+    || test_failure "the probes did not check both reader listeners on their configured ports"
+
+  for fake_grpc_status in 3 1; do
+    if observe_plane_readiness zinder-query 127.0.0.1:9106; then
+      test_failure "ops-ready query admitted traffic after gRPC exit $fake_grpc_status"
+    fi
+    [ "$probe_http_status" = 200 ] && [ "$probe_body" = "$degraded_ready_body" ] && [ "$probe_cause" = ready ] \
+      || test_failure "the gRPC probe replaced the ops dependency report"
+    [[ "$probe_report" = *"fixture status $fake_grpc_status"* ]] \
+      || test_failure "the failed serving probe omitted its diagnostic"
+    case "$fake_grpc_status/$probe_unreachable" in
+      3/0 | 1/1) ;;
+      *) test_failure "gRPC exit $fake_grpc_status gave unreachable=$probe_unreachable" ;;
+    esac
+    if reader_unready_behind_projector_park 1; then
+      test_failure "a park excused a gRPC failure on an ops-ready reader"
+    fi
+  done
+
+  : >"$grpc_calls"
+  serve 503 "$halted_body"
+  observe_plane_readiness zinder-query 127.0.0.1:9106 \
+    || test_failure "an unprobed canonical halt failed the supervisor"
+  [ "$probe_http_status" = 503 ] && [ "$probe_halted" -eq 1 ] &&
+    [ "$probe_cause" = reorg_window_exceeded ] && [ ! -s "$grpc_calls" ] \
+    || test_failure "the halt lost its HTTP cause or unnecessarily probed the listener"
+
+  serve 200 "$ready_body"
+  sleep_count=0
+  # The extracted startup wait retries after a failed serving check.
+  # shellcheck disable=SC2329
+  sleep_interruptibly() {
+    sleep_count=$((sleep_count + 1))
+    [ "$sleep_count" -eq 1 ] || test_failure "startup did not recover on the second serving check"
+    fake_grpc_status=0
+  }
+  fake_grpc_status=1
+  await_readiness zinder-compat-lightwalletd "$compat_ops_addr" 60 \
+    || test_failure "startup failed a recovered reader"
+  [ "$sleep_count" -eq 1 ] && [ "$(cat "$grpc_calls")" = $'[::1]:9902\n[::1]:9902' ] \
+    || test_failure "startup let ops-ready compatibility through before the serving check succeeded"
+)
+
+# Exercise the foreground topology from its first child start into the serving
+# loop. Query answers gRPC at startup, then alternates timeouts with
+# recoveries while ops remains healthy, until the recurrence policy restarts it.
+serving_loop_events() (
+  local fake_grpc_status=0 serving_polls=0
+  eval "$(entrypoint_function log)"
+  # These stand-ins are called by the evaluated topology.
+  # shellcheck disable=SC2329
+  start_runtime_process() { : & }
+  # shellcheck disable=SC2329
+  fail() { log "$*"; exit 1; }
+  # shellcheck disable=SC2329
+  sleep_interruptibly() {
+    serving_polls=$((serving_polls + 1))
+    [ "$serving_polls" -lt $((2 * recurrence_episode_budget)) ] || exit 0
+    fake_grpc_status=$((serving_polls % 2))
+  }
+  lightwalletd_enabled=0
+  canonical_construction_deadline_seconds=60
+  wallet_construction_deadline_seconds=60
+  wallet_serving_deadline_seconds=60
+  serve 200 "$degraded_ready_body"
+  eval "$(sed -n '/^ingest_ops_addr=/,/^projector_park_reported=0/p' "$entrypoint")"
+  eval "$(sed -n '/^log "starting canonical construction/,$p' "$entrypoint")"
+)
+
+: >"$grpc_calls"
+if events="$(serving_loop_events 2>&1)"; then
+  test_failure "the serving loop missed a wedged query listener with healthy ops"
+fi
+[ "$(wc -l <"$grpc_calls")" -eq $((2 * recurrence_episode_budget)) ] &&
+  [ "$(sort -u "$grpc_calls")" = "$query_grpc_addr" ] &&
+  [[ "$events" = *"event=supervisor_restart_decided role=zinder-query reason=recurrence_budget episode_count=$recurrence_episode_budget "* ]] &&
+  [[ "$(grep -c 'event=supervisor_restart_decided' <<<"$events")" = 1 ]] \
+  || test_failure "the serving loop probed a disabled reader or missed the query outage: $events"
 
 # A plane awaited against a serving deadline that started earlier fails once
 # that shared deadline passes, without spending a fresh one.
@@ -350,7 +464,7 @@ deadline_message="$(
   await_readiness zinder-compat-lightwalletd "$compat_ops_addr" 60 "$(($(date +%s) - 60))"
 )"
 case "$deadline_message" in
-  "zinder-compat-lightwalletd stayed unready for 60s:"*) ;;
+  "event=supervisor_restart_decided role=zinder-compat-lightwalletd reason=unready_timeout zinder-compat-lightwalletd stayed unready for 60s:"*) ;;
   *) test_failure "a reader past the shared serving deadline did not fail at once: '$deadline_message'" ;;
 esac
 
@@ -647,6 +761,86 @@ poll_recurrence 1 0 $((4315 + recurrence_clear_window_seconds))
 [ "$recurrence_state" = "0 0 0 0 4315" ] \
   || test_failure "a full clear window left recurrence state '$recurrence_state'"
 
+# Restore the entrypoint's foreground decision and teardown in a subshell
+# whose only runtime PID, if present, belongs to the fixture.
+load_supervisor_fixture() {
+  for name in log fail stop_processes alive_process_labels any_process_alive \
+    await_processes_exit assert_started_processes_alive; do
+    eval "$(entrypoint_function "$name")"
+  done
+  ingest_pid="" projector_pid="" query_pid="" compat_pid=""
+  shutdown_grace_seconds=1
+}
+
+recurrence_events() (
+  load_supervisor_fixture
+  recurrence_state="$1 0 0 $2 0"
+  shift 2
+  for ready_poll in "$@"; do
+    # shellcheck disable=SC2046,SC2086 # the poll and recurrence counters are separate arguments
+    set -- $(update_plane_recurrence zinder-query "${ready_poll%/*}" 0 "${ready_poll#*/}" $recurrence_state "fixture report")
+    recurrence_state="$1 $2 $3 $4 $5"
+    check_recurrence_budget zinder-query "$7" "$1" "$4" "$6" "fixture report"
+  done
+)
+
+events="$(recurrence_events 0 0 0/1000 0/1005 1/1015 "1/$((1015 + recurrence_clear_window_seconds))" 2>&1)" \
+  || test_failure "a short recovered drain restarted query: $events"
+event_fields="event=supervisor_readiness_episode role=zinder-query"
+[[ "$events" = *"$event_fields transition=begin episode_count=0 unready_seconds=0 counted=0"* ]] &&
+  [[ "$events" = *"$event_fields transition=end episode_count=0 unready_seconds=15 counted=0"* ]] &&
+  [[ "$events" = *"$event_fields transition=clear episode_count=0 unready_seconds=0"* ]] &&
+  [[ "$(grep -c 'event=supervisor_readiness_episode' <<<"$events")" = 3 ]] &&
+  [[ "$events" != *"event=supervisor_restart_decided"* ]] \
+  || test_failure "incorrect events for a recovered short drain: $events"
+
+previous_unready_seconds=$((recurrence_cumulative_unready_seconds_budget - 10))
+events="$(recurrence_events 0 "$previous_unready_seconds" 0/1000 0/1015 2>&1)" \
+  || test_failure "an active 15-second drain spent the completed-time budget: $events"
+[[ "$events" != *"event=supervisor_restart_decided"* ]] \
+  || test_failure "a decision was logged before the drain ended: $events"
+if events="$(recurrence_events 0 "$previous_unready_seconds" 0/1000 0/1015 1/1015 2>&1)"; then
+  test_failure "the completed drain over budget left the supervisor running"
+fi
+[[ "$events" = *"$event_fields transition=end episode_count=0 unready_seconds=$((previous_unready_seconds + 15)) counted=0"* ]] &&
+  [[ "$events" = *"event=supervisor_restart_decided role=zinder-query reason=recurrence_budget episode_count=0 unready_seconds=$((previous_unready_seconds + 15)) "* ]] &&
+  [[ "$(grep -c 'event=supervisor_restart_decided' <<<"$events")" = 1 ]] \
+  || test_failure "incorrect decision for completed drains over budget: $events"
+
+# The last answered episode can trigger the episode budget before recovery.
+# Its elapsed time belongs in the human report, while the seconds against the
+# cumulative budget still come only from the preceding completed intervals.
+previous_episodes=$((recurrence_episode_budget - 1))
+completed_seconds=$((previous_episodes * recurrence_min_answered_episode_seconds))
+decision_epoch=$((1000 + recurrence_min_answered_episode_seconds))
+if events="$(recurrence_events "$previous_episodes" "$completed_seconds" 0/1000 "0/$decision_epoch" 2>&1)"; then
+  test_failure "the final active episode over budget left the supervisor running"
+fi
+[[ "$events" = *"$event_fields transition=begin episode_count=$previous_episodes unready_seconds=$completed_seconds counted=0"* ]] &&
+  [[ "$events" != *"transition=end"* ]] &&
+  [[ "$events" = *"reason=recurrence_budget episode_count=$recurrence_episode_budget unready_seconds=$completed_seconds "* ]] &&
+  [[ "$events" = *"$recurrence_episode_budget episode(s), $((completed_seconds + recurrence_min_answered_episode_seconds))s unready"* ]] &&
+  [[ "$(grep -c 'event=supervisor_restart_decided' <<<"$events")" = 1 ]] \
+  || test_failure "incorrect decision for the final active episode: $events"
+
+reader_exit_events() (
+  load_supervisor_fixture
+  (exit 42) &
+  query_pid=$!
+  wait "$query_pid" || true
+  assert_started_processes_alive "$1"
+)
+for phase in startup serving; do
+  if events="$(reader_exit_events "$phase" 2>&1)"; then
+    test_failure "query exit during $phase left the supervisor running"
+  fi
+  [[ "$events" = *"event=supervisor_child_exited role=zinder-query phase=$phase"* ]] &&
+    [[ "$events" = *"event=supervisor_restart_decided role=zinder-query reason=child_exit"* ]] &&
+    [[ "$(grep -c 'event=supervisor_child_exited' <<<"$events")" = 1 ]] &&
+    [[ "$(grep -c 'event=supervisor_restart_decided' <<<"$events")" = 1 ]] \
+    || test_failure "incorrect supervisor events for query exit during $phase: $events"
+done
+
 for invalid_seconds in "" 0 010 1.5 -1 soon; do
   fail_message=""
   require_positive_seconds TEST_DEADLINE_SECONDS "$invalid_seconds" || true
@@ -762,8 +956,6 @@ ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
 
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
-scoping_root="$(mktemp -d)"
-trap 'rm -rf "$scoping_root"' EXIT
 mkdir "$scoping_root/bin" "$scoping_root/received"
 cat >"$scoping_root/bin/setpriv" <<'STUB'
 #!/bin/sh

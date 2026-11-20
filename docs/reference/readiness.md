@@ -121,8 +121,8 @@ balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
 directly, without an HTTP probe on the ops port. `zinder-ingest`,
 `zinder-projector`, and `zinder-explorer` do not serve it.
 
-The status comes from the same readiness state as `/readyz`, so the two never
-disagree:
+Both listeners read the same readiness state. Each response reflects the
+state at the time of its request.
 
 | Status | When |
 | --- | --- |
@@ -134,6 +134,12 @@ the listener serves (`zinder.v1.wallet.WalletQuery` or
 `cash.z.wallet.sdk.rpc.CompactTxStreamer`) returns the same status. Any other
 name fails `Check` with `NOT_FOUND`, and `Watch` reports `SERVICE_UNKNOWN`.
 There is no per-method or per-capability status.
+
+Use `zinder-query grpc-healthcheck <ADDR>` to check either reader's local
+plaintext gRPC socket. For example, `zinder-query grpc-healthcheck '[::1]:9067'`
+checks the single-volume lightwalletd listener. The command exits 0 for
+`SERVING`, 3 for a non-serving health response, and 1 if the call fails.
+Connecting and receiving the reply share a three-second deadline.
 
 The health service and gRPC reflection stay reachable while the runtime
 refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
@@ -192,7 +198,7 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 
 | Cause | Traffic | Meaning | What you do |
 | --- | --- | --- | --- |
-| `starting` | Refused | Initialization has not finished. | Wait. If ingest stays here with `[node.health]` set, check that the health endpoint answers. |
+| `starting` | Refused | Initialization has not finished. | If ingest stays here with `node.health.addr` set, check the health endpoint and its JSON-RPC fallback. |
 | `syncing` | Refused | The runtime is healthy but behind its target. Ingest includes `lag_blocks`. | Wait. A first sync takes hours; see [Initial sync](../runbooks/initial-sync.md). |
 | `ready` | Admitted | The runtime serves its contract. | Nothing. |
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
@@ -246,7 +252,7 @@ snapshot for up to 30 seconds while it loads the next one.
 
 | Cause | When |
 | --- | --- |
-| `starting` | Until startup finishes. With `[node.health]` set, also until the first successful health probe. |
+| `starting` | Until startup finishes. With `node.health.addr` set, also until the first successful health probe. |
 | `syncing` | During fresh construction, while trailing the node, or while the mempool snapshot trails the tip for more than 30 seconds. |
 | `node_unavailable` | The active node fails. Ingest keeps its state and retries. |
 | `upstream_not_ready` | The `[node.health]` probe reports the node not synchronized. |
@@ -254,10 +260,13 @@ snapshot for up to 30 seconds while it loads the next one.
 | `canonical_store_damaged` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. Every `CanonicalControl.WriterStatus` answer reports the damage, so readers refuse traffic on their next refresh. After a restart, writer status reports the recorded damage from its first answer, and ingest reports this cause again once the verification pass confirms it, which it checks as soon as the store is published. A verification record ingest cannot read is damage without a height until a full verification cycle passes. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
 | `cursor_at_risk` | Explorer view replay falls near the event-retention limit. |
 
-`IngestControl.WriterStatus` reports the health probe's latest observation
-even while `/readyz` shows a refusing admission state such as `syncing`. With
-fallback nodes, a switch resets the probe's input to `starting` until the new
-endpoint is probed. Node failover is described in
+`IngestControl.WriterStatus` reports `upstream_not_ready` when the latest
+health probe says the node is syncing, even while ingest's own `/readyz`
+shows `syncing`. If a later probe fails to obtain a health response, its
+input becomes `node_unavailable` and writer status clears `upstream_not_ready`.
+The supervisor then applies its ordinary unready budgets when ingest reports lag.
+With fallback nodes, a switch resets the probe's input to `starting` until
+the first successful observation of the new endpoint. See
 [Chain ingestion](../architecture/chain-ingestion.md#node-endpoint-failover).
 
 ### Projector

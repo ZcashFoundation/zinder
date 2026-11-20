@@ -362,8 +362,8 @@ fn describe_limit_metrics() {
     metrics::describe_counter!(
         PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
         metrics::Unit::Count,
-        "gRPC requests on a listener that trusts its proxy's client address that counted \
-         against the proxy's own connection. Label: reason (missing|repeated|invalid)."
+        "gRPC requests counted against the transport peer because the trusted proxy's address \
+         header was missing, repeated, or invalid. Excludes headerless loopback Health/Check calls."
     );
     metrics::describe_counter!(
         SEND_STALLS_METRIC,
@@ -533,12 +533,19 @@ fn client_address<B>(
         ClientAddressSource::ProxyHeader => match proxy_named_client(request.headers()) {
             Ok(client) => Some(client),
             Err(fallback) => {
-                metrics::counter!(
-                    PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
-                    "reason" => fallback.label()
-                )
-                .increment(1);
-                remote_address(request)
+                let peer = remote_address(request);
+                let direct_health_check = fallback == ProxyHeaderFallback::Missing
+                    && request.method() == http::Method::POST
+                    && request.uri().path() == "/grpc.health.v1.Health/Check"
+                    && peer.is_some_and(|addr| addr.ip().to_canonical().is_loopback());
+                if !direct_health_check {
+                    metrics::counter!(
+                        PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+                        "reason" => fallback.label()
+                    )
+                    .increment(1);
+                }
+                peer
             }
         },
     }
@@ -876,6 +883,78 @@ mod tests {
         }
         for address in ["203.0.113.7", "198.51.100.4", "127.0.0.1"] {
             assert!(!exposition.contains(address), "{exposition}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_headerless_loopback_health_checks_use_the_peer_without_a_proxy_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use http::Method;
+
+        use super::PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC;
+
+        let check = "/grpc.health.v1.Health/Check";
+        let watch = "/grpc.health.v1.Health/Watch";
+        let local = Some("127.0.0.1:1234");
+        let remote = Some("192.0.2.1:5678");
+        for (method, path, peer, headers, reason) in [
+            (Method::POST, check, local, &[][..], None),
+            (Method::POST, check, Some("[::1]:1234"), &[], None),
+            (
+                Method::POST,
+                check,
+                Some("[::ffff:127.0.0.1]:1234"),
+                &[],
+                None,
+            ),
+            (Method::POST, check, remote, &[], Some("missing")),
+            (Method::POST, check, None, &[], Some("missing")),
+            (Method::GET, check, local, &[], Some("missing")),
+            (Method::POST, watch, local, &[], Some("missing")),
+            (Method::POST, check, local, &["invalid"], Some("invalid")),
+            (
+                Method::POST,
+                check,
+                local,
+                &["192.0.2.1:5678"; 2],
+                Some("repeated"),
+            ),
+            (Method::POST, check, local, &["192.0.2.1:5678"], None),
+        ] {
+            let peer = peer.map(str::parse).transpose()?;
+            let mut request = proxied_request(headers)?;
+            *request.uri_mut() = path.parse()?;
+            *request.method_mut() = method;
+            request.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: peer,
+            });
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let client = metrics::with_local_recorder(&recorder, || {
+                client_address(&request, ClientAddressSource::ProxyHeader)
+            });
+            let expected = if let [address] = headers
+                && reason.is_none()
+            {
+                Some(address.parse()?)
+            } else {
+                peer
+            };
+            assert_eq!(client, expected);
+            let scrape = recorder.handle().render();
+            let counter = scrape
+                .lines()
+                .find(|line| line.starts_with(PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC));
+            let expected = reason.map(|reason| {
+                format!("{PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC}{{reason=\"{reason}\"}} 1")
+            });
+            assert_eq!(
+                counter,
+                expected.as_deref(),
+                "{} {path} {peer:?} {headers:?}",
+                request.method()
+            );
         }
         Ok(())
     }

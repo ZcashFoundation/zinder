@@ -48,8 +48,7 @@ pub(crate) enum SourceRecoveryDecision {
     /// continue the loop.
     Recover {
         /// Operator-actionable narrative for the readiness payload. The
-        /// caller is responsible for combining this with the current
-        /// outage window (see [`detail_for_ongoing_outage`]).
+        /// caller combines this with the current outage through [`SourceOutage::record`].
         failure_class: SourceFailureClass,
         /// Sanitized failure reason. Bounded in length by
         /// [`READINESS_REASON_MAX_BYTES`].
@@ -191,31 +190,48 @@ pub(crate) fn decide_recovery(
     }
 }
 
-/// Produces a [`NodeUnavailableDetail`] for the first iteration of a new
-/// outage from the supplied recovery decision.
-///
-/// `class` and `last_reason` come from the decision the loop just made;
-/// the iteration counter starts at one and `outage_seconds` is zero.
-#[must_use]
-pub(crate) fn detail_for_new_outage(
-    failure_class: SourceFailureClass,
-    last_reason: Cow<'static, str>,
-) -> NodeUnavailableDetail {
-    NodeUnavailableDetail::first_iteration(failure_class.label(), last_reason)
+/// The source outage in progress, counted per failure class so a switch
+/// threshold for one class never counts another.
+pub(crate) struct SourceOutage {
+    started_at: std::time::Instant,
+    pub(crate) detail: NodeUnavailableDetail,
+    pub(crate) failure_class: SourceFailureClass,
+    pub(crate) consecutive_same_class: u32,
 }
 
-/// Extends an outage with the latest recovery decision and elapsed time.
-#[must_use]
-pub(crate) fn detail_for_ongoing_outage(
-    previous: &NodeUnavailableDetail,
-    failure_class: SourceFailureClass,
-    last_reason: Cow<'static, str>,
-    outage_seconds: u32,
-) -> NodeUnavailableDetail {
-    NodeUnavailableDetail::extend_with(previous, failure_class.label(), last_reason, outage_seconds)
+impl SourceOutage {
+    pub(crate) fn record(
+        previous: Option<Self>,
+        failure_class: SourceFailureClass,
+        last_reason: Cow<'static, str>,
+    ) -> Self {
+        match previous {
+            None => Self {
+                started_at: std::time::Instant::now(),
+                detail: NodeUnavailableDetail::first_iteration(failure_class.label(), last_reason),
+                failure_class,
+                consecutive_same_class: 1,
+            },
+            Some(previous) => Self {
+                detail: NodeUnavailableDetail::extend_with(
+                    &previous.detail,
+                    failure_class.label(),
+                    last_reason,
+                    u32::try_from(previous.started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
+                ),
+                consecutive_same_class: if previous.failure_class == failure_class {
+                    previous.consecutive_same_class.saturating_add(1)
+                } else {
+                    1
+                },
+                started_at: previous.started_at,
+                failure_class,
+            },
+        }
+    }
 }
 
-fn sanitize_reason(error: &SourceError) -> Cow<'static, str> {
+pub(crate) fn sanitize_reason(error: &SourceError) -> Cow<'static, str> {
     Cow::Owned(truncate_reason(&error.to_string()))
 }
 

@@ -660,7 +660,8 @@ impl NodeAuthToml {
 pub struct NodeHealthToml {
     /// URL of the upstream node's readiness endpoint, with credentials
     /// redacted.
-    pub addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
     /// Upstream-health probe cadence in milliseconds.
     pub poll_interval_ms: u64,
     /// Verification-progress floor used by the JSON-RPC fallback.
@@ -674,7 +675,10 @@ impl NodeHealthToml {
     #[must_use]
     pub fn from_node_health_config(health: &NodeHealthConfig) -> Self {
         Self {
-            addr: redact_endpoint_url(&health.addr).into_owned(),
+            addr: health
+                .addr
+                .as_deref()
+                .map(|addr| redact_endpoint_url(addr).into_owned()),
             poll_interval_ms: duration_as_millis_u64(health.poll_interval),
             verification_progress_floor: health.verification_progress_floor,
             estimated_gap_floor_blocks: health.estimated_gap_floor_blocks,
@@ -816,7 +820,6 @@ impl Serialize for NodeFallbacksToml {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn require_field_returns_missing_field_for_none() {
         let outcome: Result<u32, _> =

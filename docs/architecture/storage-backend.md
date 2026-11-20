@@ -183,6 +183,13 @@ All generations in one process share one block cache per store. The configured
 `block_cache_bytes` therefore bounds the process, not each generation. Each
 generation keeps its own table cache and memtables.
 
+Each secondary replays the primary's write-ahead log into its own memtables.
+It can release those memtables after catch-up sees that the primary has flushed
+their contents and any reads holding the old view finish. A secondary cannot
+flush them itself. Its memory can therefore exceed `memtable_budget_bytes`.
+For each store role, the reader reports the sum of the budgets and the sum of
+usage across its open generations.
+
 ## Read interfaces
 
 `zinder-query` and `zinder-compat-lightwalletd` read stored data only through

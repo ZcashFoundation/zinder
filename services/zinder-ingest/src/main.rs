@@ -741,14 +741,14 @@ where
 /// Composes the writer's readiness and drains it to `shutting_down` as soon as
 /// `termination` is requested.
 ///
-/// A configured `[node.health]` probe gates readiness from startup, so ingest
+/// A configured `[node.health].addr` gates readiness from startup, so ingest
 /// stays `starting` until the probe's first successful observation.
 fn writer_readiness_for(
     readiness: Readiness,
     upstream_health: Option<&NodeHealthConfig>,
     termination: &CancellationToken,
 ) -> ComposedReadiness {
-    let required_inputs: &[ReadinessInput] = if upstream_health.is_some() {
+    let required_inputs: &[ReadinessInput] = if writer_probe_config(upstream_health).is_some() {
         &[ReadinessInput::NodeSource]
     } else {
         &[]
@@ -1468,7 +1468,7 @@ async fn admit_node_endpoints(
     };
     let failover_readiness = FailoverReadiness {
         readiness: readiness.clone(),
-        gates_node_source_input: node.health.is_some(),
+        gates_node_source_input: writer_probe_config(node.health.as_ref()).is_some(),
     };
     Ok((
         activations,
@@ -1598,20 +1598,25 @@ fn node_target_at(command_config: &IngestCommandConfig, position: usize) -> &Nod
         .unwrap_or(&command_config.runtime_config.node)
 }
 
+fn writer_probe_config(health: Option<&NodeHealthConfig>) -> Option<&NodeHealthConfig> {
+    health.filter(|health| health.addr.is_some())
+}
+
 fn spawn_upstream_health_probe_for(
     command_config: &IngestCommandConfig,
     nodes: &NodeSet<ZebraJsonRpcSource>,
     readiness: ComposedReadiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
-    let health_config = command_config.runtime_config.node.health.as_ref()?;
+    let health_config = writer_probe_config(command_config.runtime_config.node.health.as_ref())?;
     // The probe polls whichever endpoint is active, through that endpoint's
     // own health address or its JSON-RPC sync progress when it has none.
     let active_node_position = nodes.active_position();
     let active_health_addr = node_target_at(command_config, active_node_position)
         .health
         .as_ref()
-        .map(|health| zinder_source::redact_endpoint_url(&health.addr));
+        .and_then(|health| health.addr.as_deref())
+        .map(zinder_source::redact_endpoint_url);
     tracing::info!(
         target: "zinder::ingest",
         event = "upstream_health_probe_started",
@@ -1796,7 +1801,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_upstream_health_gates_readiness_until_the_first_probe() {
-        let health = zinder_source::NodeHealthConfig::new(
+        let mut health = zinder_source::NodeHealthConfig::new(
             "http://127.0.0.1:1/ready".to_owned(),
             Duration::from_secs(1),
             0.999,
@@ -1816,8 +1821,9 @@ mod tests {
         );
         assert!(readiness.report().is_ready);
 
+        health.addr = None;
         let readiness = zinder_runtime::Readiness::default();
-        let composed = writer_readiness_for(readiness.clone(), None, &termination);
+        let composed = writer_readiness_for(readiness.clone(), Some(&health), &termination);
         composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
         assert!(readiness.report().is_ready);
     }

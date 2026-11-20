@@ -73,8 +73,7 @@ recurrence_cumulative_unready_seconds_budget=900
 # so its drain becomes an episode only once it lasts this long. A shorter
 # drain still adds its unready time to the cumulative budget and restarts the
 # clear window, so a plane that is unready most of the time in short bursts
-# still escalates. An unanswerable ops listener counts at once: that is the
-# wedged runtime this budget exists to catch.
+# still escalates. An unanswerable ops or reader gRPC listener counts at once.
 recurrence_min_answered_episode_seconds=60
 
 # The configuration paths each process accepts: a section, or a field of a
@@ -132,6 +131,7 @@ compat_cumulative_unready_seconds=0
 compat_flap_ready_since_epoch=0
 
 probe_http_status=""
+probe_unreachable=0
 probe_body=""
 probe_cause=""
 probe_exit_code=0
@@ -289,20 +289,6 @@ classify_probe_failure() {
   esac
 }
 
-# This probes only the ops `/readyz` listener, never the data-plane gRPC port
-# (`query.listen_addr`, `compat.listen_addr`, and their ingest/projector
-# counterparts). A data-plane probe, such as a `grpc.health.v1.Health` check
-# or a round trip through the existing `ServerInfo` RPC, would catch a wedged
-# serving loop that keeps answering `/readyz`, which is the blind spot that
-# hid the outage this detector responds to. Adding one is out of scope here:
-# none of the gRPC servers register a health service yet, and this image
-# ships curl but no gRPC-aware client. A bare TCP connect to the data-plane
-# port would not close the gap either; a saturated tokio executor still
-# completes a TCP handshake without ever reaching the handler that a real
-# request would exercise. Closing this requires a server-side health service
-# plus a client the image can run, both belonging in a follow-up outside this
-# entrypoint.
-#
 # Reads one plane's readiness into `probe_http_status`, `probe_body`,
 # `probe_cause`, and `probe_report`. Both timeouts are bounded so a saturated
 # tokio runtime that accepted the connection cannot hold the foreground
@@ -328,8 +314,10 @@ probe_readiness() {
   probe_connect_seconds="${probe_trailer##* }"
   probe_cause="unreachable"
   probe_failure_class=""
+  probe_unreachable=0
 
   if [ "$probe_exit_code" -ne 0 ]; then
+    probe_unreachable=1
     probe_http_status=""
     probe_body=""
     classify_probe_failure
@@ -345,6 +333,31 @@ probe_readiness() {
   fi
 
   probe_report="http $probe_http_status: $probe_body"
+}
+
+# When ops admits traffic, check that the reader can answer on its serving
+# listener too. Keep the ops fields for upstream outage and park decisions.
+plane_admits_traffic() {
+  probe_readiness "$2"
+  [ "$probe_http_status" = "200" ] || return 1
+  case "$1" in
+    zinder-query) reader_addr="$query_grpc_addr" ;;
+    zinder-compat-lightwalletd) reader_addr="$compat_grpc_addr" ;;
+    *) return 0 ;;
+  esac
+
+  if grpc_report="$(TOKIO_WORKER_THREADS=1 zinder-query grpc-healthcheck "$reader_addr" 2>&1)"; then
+    return 0
+  else
+    grpc_status="$?"
+  fi
+  if [ "$grpc_status" -eq 3 ]; then
+    probe_report="$probe_report; gRPC health not serving: $grpc_report"
+  else
+    probe_unreachable=1
+    probe_report="$probe_report; gRPC health unavailable (exit $grpc_status): $grpc_report"
+  fi
+  return 1
 }
 
 # `/readyz` reports one 503 for causes that clear with time and causes that
@@ -480,7 +493,7 @@ readiness_body_height() {
 # probed answered unready behind it. A reader plane that stops answering
 # still counts as unready.
 reader_unready_behind_projector_park() {
-  [ "$1" -eq 1 ] && [ -n "$probe_http_status" ]
+  [ "$1" -eq 1 ] && [ -n "$probe_http_status" ] && [ "$probe_http_status" != "200" ]
 }
 
 # Names the wallet readers this container runs.
@@ -535,19 +548,18 @@ require_projector_park_for_stopped_readers() {
   fi
 }
 
+assert_child_alive() {
+  if [ -n "$2" ] && ! kill -0 "$2" 2>/dev/null; then
+    log "event=supervisor_child_exited role=$1 phase=$3"
+    fail "event=supervisor_restart_decided role=$1 reason=child_exit $1 exited"
+  fi
+}
+
 assert_started_processes_alive() {
-  if [ -n "$ingest_pid" ] && ! kill -0 "$ingest_pid" 2>/dev/null; then
-    fail "zinder-ingest exited"
-  fi
-  if [ -n "$projector_pid" ] && ! kill -0 "$projector_pid" 2>/dev/null; then
-    fail "zinder-projector exited"
-  fi
-  if [ -n "$query_pid" ] && ! kill -0 "$query_pid" 2>/dev/null; then
-    fail "zinder-query exited"
-  fi
-  if [ -n "$compat_pid" ] && ! kill -0 "$compat_pid" 2>/dev/null; then
-    fail "zinder-compat-lightwalletd exited"
-  fi
+  assert_child_alive zinder-ingest "$ingest_pid" "$1"
+  assert_child_alive zinder-projector "$projector_pid" "$1"
+  assert_child_alive zinder-query "$query_pid" "$1"
+  assert_child_alive zinder-compat-lightwalletd "$compat_pid" "$1"
 }
 
 # Waits for one plane to admit traffic within the phase deadline, measured
@@ -566,9 +578,8 @@ await_readiness() {
   next_report_epoch=$((phase_started_epoch + unready_report_interval_seconds))
 
   while true; do
-    assert_started_processes_alive
-    probe_readiness "$ops_addr"
-    if [ "$probe_http_status" = "200" ]; then
+    assert_started_processes_alive startup
+    if plane_admits_traffic "$role" "$ops_addr"; then
       return 0
     fi
     if readiness_cause_is_writer_halt "$probe_cause"; then
@@ -590,7 +601,7 @@ await_readiness() {
 
     probe_epoch="$(date +%s)"
     if [ "$probe_epoch" -ge "$deadline_epoch" ]; then
-      fail "$role stayed unready for ${phase_deadline_seconds}s: $probe_report"
+      fail "event=supervisor_restart_decided role=$role reason=unready_timeout $role stayed unready for ${phase_deadline_seconds}s: $probe_report"
     fi
     if [ "$probe_epoch" -ge "$next_report_epoch" ]; then
       log "$role unready after $((probe_epoch - phase_started_epoch))s: $probe_report"
@@ -616,8 +627,7 @@ observe_plane_readiness() {
   probe_parked=0
   probe_upstream_outage=0
   probe_node_unreachable=0
-  probe_readiness "$ops_addr"
-  if [ "$probe_http_status" = "200" ]; then
+  if plane_admits_traffic "$role" "$ops_addr"; then
     return 0
   fi
   if readiness_cause_is_writer_halt "$probe_cause"; then
@@ -697,6 +707,7 @@ update_plane_recurrence() {
   cumulative_unready_seconds="$8"
   flap_ready_since_epoch="$9"
   report="${10}"
+  episode_event="event=supervisor_readiness_episode role=$role"
 
   if [ "$is_ready" -eq 1 ]; then
     if [ "$flap_unready_since_epoch" -ne 0 ]; then
@@ -707,30 +718,39 @@ update_plane_recurrence() {
         episode_count=$((episode_count + 1))
         flap_episode_counted=1
       fi
+      end_fields="$episode_event transition=end episode_count=$episode_count unready_seconds=$cumulative_unready_seconds counted=$flap_episode_counted"
       if [ "$flap_episode_counted" -eq 1 ]; then
-        log "$role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
+        log "$end_fields $role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
       else
-        log "$role recovered after ${episode_seconds}s unready, too brief to count as an episode: ${cumulative_unready_seconds}s unready in the current recurrence window"
+        log "$end_fields $role recovered after ${episode_seconds}s unready, too brief to count as an episode: ${cumulative_unready_seconds}s unready in the current recurrence window"
       fi
       flap_ready_since_epoch="$now_epoch"
       flap_unready_since_epoch=0
       flap_episode_counted=0
     elif { [ "$episode_count" -gt 0 ] || [ "$cumulative_unready_seconds" -gt 0 ]; } \
       && [ $((now_epoch - flap_ready_since_epoch)) -ge "$recurrence_clear_window_seconds" ]; then
-      log "$role stayed ready for ${recurrence_clear_window_seconds}s, clearing $episode_count recorded episode(s) (${cumulative_unready_seconds}s unready)"
+      log "$episode_event transition=clear episode_count=0 unready_seconds=0 $role stayed ready for ${recurrence_clear_window_seconds}s, clearing $episode_count recorded episode(s) (${cumulative_unready_seconds}s unready)"
       episode_count=0
       cumulative_unready_seconds=0
     fi
   else
+    stretch_started=0
+    episode_message=""
     if [ "$flap_unready_since_epoch" -eq 0 ]; then
       flap_unready_since_epoch="$now_epoch"
+      stretch_started=1
     fi
     if [ "$flap_episode_counted" -eq 0 ] \
       && { [ "$is_unreachable" -eq 1 ] \
         || [ $((now_epoch - flap_unready_since_epoch)) -ge "$recurrence_min_answered_episode_seconds" ]; }; then
       episode_count=$((episode_count + 1))
       flap_episode_counted=1
-      log "$role flap episode $episode_count began $((now_epoch - flap_unready_since_epoch))s ago: $report"
+      episode_message="$role flap episode $episode_count began $((now_epoch - flap_unready_since_epoch))s ago: $report"
+    fi
+    if [ "$stretch_started" -eq 1 ]; then
+      log "$episode_event transition=begin episode_count=$episode_count unready_seconds=$cumulative_unready_seconds counted=$flap_episode_counted ${episode_message:-$role became unready: $report}"
+    elif [ -n "$episode_message" ]; then
+      log "$episode_message"
     fi
   fi
 
@@ -755,6 +775,12 @@ update_plane_recurrence() {
     "$episode_count" "$flap_unready_since_epoch" "$flap_episode_counted" \
     "$cumulative_unready_seconds" "$flap_ready_since_epoch" "$total_unready_seconds" \
     "$escalate"
+}
+
+check_recurrence_budget() {
+  if [ "$2" -eq 1 ]; then
+    fail "event=supervisor_restart_decided role=$1 reason=recurrence_budget episode_count=$3 unready_seconds=$4 $1 recurrence budget exceeded: $3 episode(s), ${5}s unready without a sustained recovery: $6"
+  fi
 }
 
 # Prints, one per line, every `ZINDER_*` variable in the environment that names
@@ -877,6 +903,13 @@ zinder_setting() {
   '
 }
 
+resolve_reader_listen_addrs() {
+  query_grpc_addr="$(zinder_setting query.listen_addr)"
+  query_grpc_addr="${query_grpc_addr:-[::]:9102}"
+  compat_grpc_addr="$(zinder_setting compat.listen_addr)"
+  compat_grpc_addr="${compat_grpc_addr:-[::]:9067}"
+}
+
 # Prints, one per line, the position N of every [node_fallbacks.N] endpoint
 # that a `ZINDER_*` variable configures, matched as zinder_setting matches.
 zinder_fallback_positions() {
@@ -921,6 +954,7 @@ require_positive_seconds ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SEC
   "$wallet_construction_deadline_seconds"
 resolve_lightwalletd_setting "$lightwalletd_setting"
 require_distinct_reader_secondaries
+resolve_reader_listen_addrs
 
 started_config_paths="$ingest_config_paths $projector_config_paths $query_config_paths"
 if [ "$lightwalletd_enabled" -eq 1 ]; then
@@ -1006,7 +1040,7 @@ unready_since_epoch=0
 
 while true; do
   sleep_interruptibly "$poll_interval_seconds"
-  assert_started_processes_alive
+  assert_started_processes_alive serving
 
   now_epoch="$(date +%s)"
 
@@ -1024,10 +1058,7 @@ while true; do
   ingest_body="$probe_body"
   ingest_upstream_outage="$probe_upstream_outage"
   ingest_node_unreachable="$probe_node_unreachable"
-  ingest_unreachable=0
-  if [ -z "$probe_http_status" ]; then
-    ingest_unreachable=1
-  fi
+  ingest_unreachable="$probe_unreachable"
   plane_halted=$((plane_halted | probe_halted))
   plane_damaged=$((plane_damaged | probe_damaged))
 
@@ -1036,10 +1067,7 @@ while true; do
     projector_ready=1
   fi
   projector_report="$probe_report"
-  projector_unreachable=0
-  if [ -z "$probe_http_status" ]; then
-    projector_unreachable=1
-  fi
+  projector_unreachable="$probe_unreachable"
   plane_halted=$((plane_halted | probe_halted))
   plane_damaged=$((plane_damaged | probe_damaged))
   projector_parked="$probe_parked"
@@ -1060,9 +1088,7 @@ while true; do
     fi
     query_report="$probe_report"
     query_body="$probe_body"
-    if [ -z "$probe_http_status" ]; then
-      query_unreachable=1
-    fi
+    query_unreachable="$probe_unreachable"
     plane_halted=$((plane_halted | probe_halted))
     plane_damaged=$((plane_damaged | probe_damaged))
   fi
@@ -1080,9 +1106,7 @@ while true; do
       compat_ready=1
     fi
     compat_report="$probe_report"
-    if [ -z "$probe_http_status" ]; then
-      compat_unreachable=1
-    fi
+    compat_unreachable="$probe_unreachable"
     plane_halted=$((plane_halted | probe_halted))
     plane_damaged=$((plane_damaged | probe_damaged))
   fi
@@ -1107,7 +1131,7 @@ while true; do
     "$ingest_node_unreachable_since_epoch" "$ingest_report")
   ingest_node_unreachable_since_epoch="$1"
   if [ "$2" -eq 1 ]; then
-    fail "zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
+    fail "event=supervisor_restart_decided role=zinder-ingest reason=node_timeout zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
   fi
   if [ "$ingest_upstream_outage" -eq 1 ]; then
     ingest_ready=1
@@ -1189,18 +1213,14 @@ while true; do
   compat_total_unready_seconds="$6"
   compat_escalate="$7"
 
-  if [ "$ingest_escalate" -eq 1 ]; then
-    fail "zinder-ingest recurrence budget exceeded: $ingest_episode_count episode(s), ${ingest_total_unready_seconds}s unready without a sustained recovery: $ingest_report"
-  fi
-  if [ "$projector_escalate" -eq 1 ]; then
-    fail "zinder-projector recurrence budget exceeded: $projector_episode_count episode(s), ${projector_total_unready_seconds}s unready without a sustained recovery: $projector_report"
-  fi
-  if [ "$query_escalate" -eq 1 ]; then
-    fail "zinder-query recurrence budget exceeded: $query_episode_count episode(s), ${query_total_unready_seconds}s unready without a sustained recovery: $query_report"
-  fi
-  if [ "$compat_escalate" -eq 1 ]; then
-    fail "zinder-compat-lightwalletd recurrence budget exceeded: $compat_episode_count episode(s), ${compat_total_unready_seconds}s unready without a sustained recovery: $compat_report"
-  fi
+  check_recurrence_budget zinder-ingest "$ingest_escalate" "$ingest_episode_count" \
+    "$ingest_cumulative_unready_seconds" "$ingest_total_unready_seconds" "$ingest_report"
+  check_recurrence_budget zinder-projector "$projector_escalate" "$projector_episode_count" \
+    "$projector_cumulative_unready_seconds" "$projector_total_unready_seconds" "$projector_report"
+  check_recurrence_budget zinder-query "$query_escalate" "$query_episode_count" \
+    "$query_cumulative_unready_seconds" "$query_total_unready_seconds" "$query_report"
+  check_recurrence_budget zinder-compat-lightwalletd "$compat_escalate" "$compat_episode_count" \
+    "$compat_cumulative_unready_seconds" "$compat_total_unready_seconds" "$compat_report"
 
   if [ "$ingest_ready" -eq 1 ] && [ "$projector_ready" -eq 1 ] && [ "$query_ready" -eq 1 ] \
     && [ "$compat_ready" -eq 1 ]; then
@@ -1229,6 +1249,6 @@ while true; do
     unready_since_epoch="$now_epoch"
     log "$hard_down_plane stopped admitting traffic: $hard_down_report"
   elif [ $((now_epoch - unready_since_epoch)) -ge "$serving_unready_tolerance_seconds" ]; then
-    fail "$hard_down_plane has not admitted traffic for $((now_epoch - unready_since_epoch))s: $hard_down_report"
+    fail "event=supervisor_restart_decided role=$hard_down_plane reason=unready_timeout $hard_down_plane has not admitted traffic for $((now_epoch - unready_since_epoch))s: $hard_down_report"
   fi
 done
