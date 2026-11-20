@@ -2,14 +2,17 @@
 """Run paired benchmark commands on prepared targets and retain their reports."""
 
 import argparse
+from contextlib import suppress
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -18,10 +21,22 @@ import time
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]*")
 PARAMETER = re.compile(r"\{([a-zA-Z][a-zA-Z0-9_]*)\}")
 OUTPUT_ARGUMENTS = {"{report}": "report.json", "{scratch}": "scratch"}
+CAMPAIGN_FILES = {"provenance.json", "summary.json"}
 
 
 def write_json(path, payload):
     path.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def finite_float(token):
+    number = float(token)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite JSON number {token}")
+    return number
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"), parse_float=finite_float, parse_constant=finite_float)
 
 
 def sha256(path):
@@ -41,7 +56,7 @@ def is_pointer(pointer):
 
 
 def read_campaign(path):
-    campaign = json.loads(path.read_text(encoding="utf-8"))
+    campaign = read_json(path)
     repeats = campaign.get("repeats", 4)
     timeout = campaign.get("timeout_seconds", 600)
     if not positive_int(repeats) or not positive_int(timeout):
@@ -60,6 +75,8 @@ def read_campaign(path):
     commands = {}
     executables = {}
     for name, case in cases.items():
+        if name.casefold() in CAMPAIGN_FILES:
+            raise ValueError(f"case name {name!r} is reserved for campaign metadata")
         template = case["command"]
         if not isinstance(template, list) or not template or not all(isinstance(arg, str) for arg in template):
             raise ValueError(f"{name}: command must be a nonempty array of strings")
@@ -81,7 +98,7 @@ def read_campaign(path):
             binary = shutil.which(command[0])
             if binary is None:
                 raise ValueError(f"{name}/{arm}: executable not found: {command[0]}")
-            command[0] = str(Path(binary).resolve())
+            command[0] = str(Path(binary).absolute())
             if command[0] not in executables:
                 executables[command[0]] = sha256(command[0])
             commands[name, arm] = command
@@ -105,6 +122,20 @@ def at_pointer(document, pointer):
     return document
 
 
+def run_command(command, stdout, stderr, timeout):
+    use_process_group = os.name == "posix"
+    with subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=use_process_group) as process:
+        try:
+            return process.wait(timeout=timeout)
+        except (KeyboardInterrupt, subprocess.TimeoutExpired):
+            with suppress(ProcessLookupError):
+                if use_process_group:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            raise
+
+
 def run_case(command, directory, timeout, case):
     directory.mkdir(parents=True)
     report_path = directory / "report.json"
@@ -117,7 +148,7 @@ def run_case(command, directory, timeout, case):
     exit_code = None
     with stdout_path.open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
         try:
-            exit_code = subprocess.run(command, stdout=stdout, stderr=stderr, timeout=timeout).returncode
+            exit_code = run_command(command, stdout, stderr, timeout)
             if exit_code:
                 problems.append(f"command exited {exit_code}")
         except subprocess.TimeoutExpired:
@@ -127,7 +158,7 @@ def run_case(command, directory, timeout, case):
 
     match = {}
     try:
-        report = json.loads((report_path if file_report else stdout_path).read_text(encoding="utf-8"))
+        report = read_json(report_path if file_report else stdout_path)
         if not isinstance(report, (dict, list)) or not report:
             raise ValueError("expected a nonempty JSON object or array")
         if not file_report:

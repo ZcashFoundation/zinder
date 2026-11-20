@@ -2,6 +2,7 @@
 """Exercise the paired benchmark runner through its CLI."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -59,7 +60,7 @@ class BenchmarkCampaignTests(unittest.TestCase):
         self.assertEqual(self.read_json("range/round-1/after/report.json"), {"arm": "after", "blocks": [10]})
         provenance = self.read_json("provenance.json")
         self.assertIn(str(self.root / "heights.txt"), provenance["inputs_sha256"])
-        self.assertIn(str(Path(sys.executable).resolve()), provenance["executables_sha256"])
+        self.assertIn(str(Path(sys.executable).absolute()), provenance["executables_sha256"])
 
     def test_failures_keep_reports_and_run_later_pairs(self):
         self.campaign["repeats"] = 1
@@ -97,6 +98,58 @@ class BenchmarkCampaignTests(unittest.TestCase):
 
         self.run_campaign(2)
         self.assertEqual(existing.read_text(encoding="utf-8"), "retained evidence")
+
+    def test_reserved_case_name_fails_preflight(self):
+        self.campaign["cases"]["summary.json"] = {"command": [sys.executable, "-c", "print('{}')"]}
+
+        completed = self.run_campaign(2)
+        self.assertIn("reserved for campaign metadata", completed.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_nonfinite_reports_are_failed_trials(self):
+        self.campaign["repeats"] = 1
+        for name, number in [("nan", "NaN"), ("overflow", "1e400")]:
+            self.campaign["cases"][name] = {
+                "command": [sys.executable, "-c", f"print('{{\"blocks\": {number}}}')"],
+                "match": ["/blocks"],
+            }
+
+        self.run_campaign(1)
+        summary = self.read_json("summary.json")
+        self.assertEqual(len(summary), 2)
+        for pair in summary:
+            self.assertIn("non-finite JSON number", pair["runs"]["before"]["problems"][0])
+            self.assertTrue((self.output / pair["runs"]["before"]["path"] / "stdout.log").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX symlinks and executable scripts")
+    def test_invokes_the_selected_symlink(self):
+        executable = self.root / "client"
+        executable.write_text(
+            f"#!{sys.executable}\nimport json, sys; print(json.dumps({{'path': sys.argv[0]}}))\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        alias = self.root / "client-alias"
+        alias.symlink_to(executable)
+        self.campaign["repeats"] = 1
+        self.campaign["cases"]["alias"] = {"command": [str(alias)], "expect": {"/path": str(alias)}}
+
+        self.run_campaign(0)
+        self.assertIn(str(alias), self.read_json("provenance.json")["executables_sha256"])
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_timeout_stops_processes_started_by_a_wrapper(self):
+        marker = self.root / "child-still-running"
+        child = "import sys, time; from pathlib import Path; time.sleep(1.5); Path(sys.argv[1]).touch()"
+        wrapper = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]]); time.sleep(30)"
+        self.campaign["repeats"] = 1
+        self.campaign["timeout_seconds"] = 1
+        self.campaign["cases"]["timed"] = {"command": [sys.executable, "-c", wrapper, str(marker)]}
+
+        self.run_campaign(1)
+        summary = self.read_json("summary.json")
+        self.assertIn("command timed out", summary[0]["runs"]["before"]["problems"][0])
+        self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
