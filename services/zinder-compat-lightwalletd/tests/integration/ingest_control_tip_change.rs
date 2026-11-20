@@ -3,11 +3,18 @@
     reason = "Integration test names describe the production control-plane contract under test."
 )]
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::{Future, poll_fn},
+    pin::pin,
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{net::TcpListener, time::Instant};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -33,6 +40,54 @@ use zinder_testkit::sample_regtest_upgrade_activations;
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
 const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
+
+/// Bounds the whole scenario below nextest's kill window.
+///
+/// `.config/nextest.toml` grants this test 120 s, so a hang reports the
+/// condition it was waiting on instead of being killed without one. `cargo test`
+/// has no kill window, so the same bound stops a hang there.
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(90);
+
+type WriterHandle = tokio::task::JoinHandle<Result<(), zinder_ingest::CanonicalWriterError>>;
+
+struct ScenarioDeadline(Instant);
+
+impl ScenarioDeadline {
+    fn start() -> Self {
+        Self(Instant::now() + SCENARIO_DEADLINE)
+    }
+
+    async fn wait_for<T>(
+        &self,
+        outstanding_condition: &'static str,
+        wait: impl Future<Output = T>,
+    ) -> eyre::Result<T> {
+        tokio::time::timeout_at(self.0, wait).await.map_err(|_| {
+            eyre::eyre!(
+                "the {SCENARIO_DEADLINE:?} scenario deadline passed while waiting for \
+                 {outstanding_condition}"
+            )
+        })
+    }
+}
+
+/// Ends `wait` early with an error when the canonical writer task stops
+/// before the condition `wait` is for.
+async fn until_writer_stops<T>(
+    writer: &mut WriterHandle,
+    outstanding_condition: &'static str,
+    wait: impl Future<Output = T>,
+) -> eyre::Result<T> {
+    tokio::select! {
+        outcome = wait => Ok(outcome),
+        writer_outcome = &mut *writer => match writer_outcome? {
+            Ok(()) => Err(eyre::eyre!(
+                "canonical writer stopped before {outstanding_condition}"
+            )),
+            Err(writer_error) => Err(writer_error.into()),
+        },
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(
@@ -60,16 +115,17 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
         }
         .run(),
     );
-    // Each wait below ends on the condition it needs or on the task that
-    // would satisfy it stopping. A machine too loaded to finish is bounded by
-    // the nextest slow-timeout, not by a wall-clock guess in the test.
-    let writer_status = tokio::select! {
-        writer_status = canonical.writer_status() => writer_status,
-        writer_outcome = &mut writer => return match writer_outcome? {
-            Ok(()) => Err(eyre::eyre!("canonical writer stopped before serving control requests")),
-            Err(writer_error) => Err(writer_error.into()),
-        },
-    };
+    let deadline = ScenarioDeadline::start();
+    let writer_status = deadline
+        .wait_for(
+            "the canonical writer to serve control requests",
+            until_writer_stops(
+                &mut writer,
+                "serving control requests",
+                canonical.writer_status(),
+            ),
+        )
+        .await??;
     let initial_event_sequence = match writer_status {
         Ok(status) => {
             status
@@ -104,27 +160,39 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
             )
             .await
     });
-    wait_for_ingest_control(&endpoint, &mut server).await?;
+    deadline
+        .wait_for(
+            "the ingest-control endpoint to answer writer status requests",
+            wait_for_ingest_control(&endpoint, &mut server),
+        )
+        .await??;
     let (watcher, publisher) =
         spawn_ingest_control_tip_change_publisher(endpoint, None, cancel.clone());
-    let (waiting_sender, waiting_receiver) = oneshot::channel();
-    let mut waiting = tokio::spawn(async move {
-        let _ = waiting_sender.send(());
-        watcher
-            .await_tip_change_after(ChainEpochId::new(initial_event_sequence))
-            .await
-    });
-    waiting_receiver.await?;
+    // The first poll registers the watcher with the retained events replayed
+    // so far. Pending proves none is newer than the starting sequence, so the
+    // event that resolves the watcher is one the advance below produces.
+    let mut waiting =
+        pin!(watcher.await_tip_change_after(ChainEpochId::new(initial_event_sequence)));
+    let first_poll = poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context))).await;
+    assert!(
+        first_poll.is_pending(),
+        "the tip-change watcher resolved before the source advanced: {first_poll:?}"
+    );
     let observed_height = 3;
     source.set_tip_height(BlockHeight::new(observed_height));
-    tokio::select! {
-        waiting_result = &mut waiting => waiting_result??,
-        writer_outcome = &mut writer => {
-            writer_outcome??;
-            return Err(eyre::eyre!("canonical writer stopped before the tip-change watcher observed an event"));
-        }
-    }
-    let status = canonical.writer_status().await?;
+    deadline
+        .wait_for(
+            "the tip-change watcher to observe the advanced tip",
+            until_writer_stops(
+                &mut writer,
+                "the tip-change watcher observed an event",
+                waiting,
+            ),
+        )
+        .await???;
+    let status = deadline
+        .wait_for("the final writer status", canonical.writer_status())
+        .await??;
     let writer_fence = status
         .fence
         .ok_or_else(|| eyre::eyre!("writer status omitted its canonical fence"))?;
