@@ -15,6 +15,7 @@ mod source_chain_update;
 mod source_error;
 mod source_subtree_root;
 mod source_transaction;
+mod source_transparent_address;
 mod transparent_address;
 mod transport;
 mod upstream_health;
@@ -60,6 +61,11 @@ pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
 pub use source_transaction::{
     TransactionPublicFactSet, parse_transaction_public_fact_set, parse_transaction_public_facts,
     transaction_component_counts, transaction_public_fact_set_from_parsed,
+};
+pub use source_transparent_address::{
+    MAX_TRANSPARENT_ADDRESS_LOOKUP_ADDRESSES, SourceTransparentAddressBalance,
+    SourceTransparentUnspentOutput, TransparentAddressLookup, TransparentAddressLookupError,
+    TransparentAddressRowLimit,
 };
 pub use transparent_address::{
     MAX_TRANSPARENT_ADDRESS_TEXT_BYTES, TransparentAddressParseError, parse_transparent_address,

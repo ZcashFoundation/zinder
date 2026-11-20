@@ -16,6 +16,7 @@ use crate::NodeCapability;
 
 /// Error returned while normalizing upstream node source values.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SourceError {
     /// Display-order block hash hex could not be decoded.
     #[error("block hash is not valid hex: {reason}")]
@@ -236,6 +237,25 @@ pub enum SourceError {
         max_response_bytes: u64,
     },
 
+    /// The node refused to send an answer larger than its own response limit.
+    ///
+    /// Zebra and Zakura answer JSON-RPC error -32008 instead of a response
+    /// that would exceed their `rpc.max_response_body_size`. That limit
+    /// belongs to the node, not to `node.max_response_bytes`
+    /// ([`Self::SourceResponseTooLarge`]). The node is healthy and gives the
+    /// same answer to the same request, so the caller narrows the request or
+    /// the operator raises the node's limit. The source reports it for
+    /// transparent-address lookups, which Zakura answers without a row limit.
+    #[error(
+        "node refused to send its {operation} answer because it exceeds the node's response size limit: {reason}"
+    )]
+    NodeResponseTooLarge {
+        /// Node method whose answer was too large.
+        operation: &'static str,
+        /// Node error message.
+        reason: String,
+    },
+
     /// The configured upstream node does not support a required capability.
     #[error("node capability is missing: {capability}")]
     NodeCapabilityMissing {
@@ -258,6 +278,40 @@ pub enum SourceError {
         source_name: &'static str,
         /// Unsupported authentication scheme.
         auth_scheme: &'static str,
+    },
+
+    /// The node's chain tip changed during every attempt of a request whose
+    /// answer depends on that tip.
+    ///
+    /// The node bounds a `getaddresstxids` height range by the tip it sees
+    /// when it answers. The source reads the tip before and after the
+    /// request and accepts the answer, or a refusal of its size, only when
+    /// both reads name the same block, because a tip that fell below the
+    /// range in between makes the node answer for its new tip instead. It is
+    /// classed [`SourceFailureClass::UpstreamViewChanged`], so the caller
+    /// retries against the node's fresh tip.
+    #[error("chain tip changed during each of {attempts} {operation} attempts")]
+    ChainTipChangedDuringFetch {
+        /// Node method whose answer depends on the tip.
+        operation: &'static str,
+        /// Number of attempts made.
+        attempts: u32,
+    },
+
+    /// The node committed a block while it read its address index, and
+    /// refused to answer from a mix of the old and new state.
+    ///
+    /// Zebra and Zakura refuse `getaddressbalance`, and some
+    /// `getaddresstxids` and `getaddressutxos` lookups, with an error that
+    /// says `state was committing a block`. The node is healthy, so it is
+    /// classed [`SourceFailureClass::UpstreamViewChanged`] and the caller
+    /// retries the same node.
+    #[error("node committed a block while answering {operation}: {reason}")]
+    BlockCommittedDuringRead {
+        /// Node method the node refused.
+        operation: &'static str,
+        /// Node error message.
+        reason: String,
     },
 
     /// The node responded but the requested block could not be returned.
@@ -352,6 +406,42 @@ pub enum SourceError {
         start_index: zinder_core::SubtreeRootIndex,
         /// Node error message.
         reason: String,
+    },
+
+    /// The node cannot answer transparent-address lookups.
+    ///
+    /// A Zakura node in pruned storage mode with checkpoint sync stops
+    /// maintaining its transparent address indexes and refuses
+    /// `getaddressbalance`, `getaddresstxids`, and `getaddressutxos` instead
+    /// of answering from partial data. A node without these methods is
+    /// reported the same way. Retrying the same node cannot succeed.
+    #[error("transparent address lookups are unavailable from this node: {reason}")]
+    TransparentAddressIndexesUnavailable {
+        /// Node error message.
+        reason: String,
+    },
+
+    /// A transparent-address lookup matched more rows than one answer holds.
+    ///
+    /// The caller narrows the lookup and retries: a shorter height range for
+    /// transaction ids, or fewer addresses for unspent outputs.
+    #[error("{operation} matched more than {max_rows} rows; narrow the lookup")]
+    TransparentAddressRowLimitExceeded {
+        /// Node method that matched too many rows.
+        operation: &'static str,
+        /// Most rows one answer holds.
+        max_rows: u32,
+    },
+
+    /// A transparent-address lookup targets another network than the source.
+    #[error(
+        "transparent address lookup for {lookup_network:?} sent to a {source_network:?} node source"
+    )]
+    TransparentAddressLookupNetworkMismatch {
+        /// Network the lookup was validated for.
+        lookup_network: zinder_core::Network,
+        /// Network the node source serves.
+        source_network: zinder_core::Network,
     },
 
     /// The node response did not match the expected JSON-RPC contract.
@@ -470,8 +560,9 @@ pub enum SourceFailureClass {
     /// Bytes returned by the upstream could not be decoded or parsed as
     /// valid Zcash data. Operator action: investigate the upstream version.
     Malformed,
-    /// Adapter configuration is invalid (unsupported auth scheme,
-    /// broadcast disabled by deliberate read-only configuration).
+    /// Adapter configuration or a request bound refused the operation
+    /// (unsupported auth scheme, broadcast disabled by deliberate read-only
+    /// configuration, a response or row limit exceeded).
     Configuration,
 }
 
@@ -536,12 +627,19 @@ impl SourceError {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
             Self::SourceResponseTooLarge { .. }
+            | Self::NodeResponseTooLarge { .. }
             | Self::MempoolTransactionCountLimitExceeded { .. }
             | Self::MempoolRawTransactionBytesLimitExceeded { .. }
             | Self::TransactionBroadcastDisabled
-            | Self::UnsupportedNodeAuth { .. } => SourceFailureClass::Configuration,
+            | Self::UnsupportedNodeAuth { .. }
+            | Self::TransparentAddressRowLimitExceeded { .. }
+            | Self::TransparentAddressLookupNetworkMismatch { .. } => {
+                SourceFailureClass::Configuration
+            }
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
+            | Self::ChainTipChangedDuringFetch { .. }
+            | Self::BlockCommittedDuringRead { .. }
             | Self::SubtreeRootsUnavailable { .. }
             | Self::MempoolHydrationFailed { .. } => SourceFailureClass::UpstreamViewChanged,
             Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {
@@ -550,7 +648,8 @@ impl SourceError {
             Self::NodeCapabilityMissing { .. }
             | Self::HistoricalTreeStateUnavailable { .. }
             | Self::HistoricalBlockBodyUnavailable { .. }
-            | Self::HistoricalSubtreeRootsUnavailable { .. } => {
+            | Self::HistoricalSubtreeRootsUnavailable { .. }
+            | Self::TransparentAddressIndexesUnavailable { .. } => {
                 SourceFailureClass::CapabilityMissing
             }
             Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,

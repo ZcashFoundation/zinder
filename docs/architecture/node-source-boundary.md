@@ -21,7 +21,7 @@ own refusal messages.
 
 | Type | Role | Selected when |
 | --- | --- | --- |
-| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast | Always; `ingest.source` accepts only `zebra-json-rpc` |
+| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast, transparent-address lookups | Always; `ingest.source` accepts only `zebra-json-rpc` |
 | `ZebraIndexerMempoolSource` | Streaming mempool events | `node.indexer_grpc_addr` is set |
 | `JsonRpcMempoolSource` | Polling mempool | No indexer endpoint is set |
 | `ZebraIndexerBlockSource`, `ZebraIndexerChainTipSource` | Block reads and tip notifications over indexer gRPC | Library only; no runtime selects them |
@@ -57,6 +57,81 @@ Zakura refuses more than 1,000 entries per batch, so ingest rejects
 response exceeds `node.max_response_bytes`, or the node answers the batch with
 a single error, the source splits the height range in half and retries each
 half. It logs `source_chain_segment_split`.
+
+## Transparent address lookups
+
+`ZebraJsonRpcSource` can forward transparent-address lookups to the node's
+own address index. No runtime calls these methods.
+
+| Method | Node RPC | Returns |
+| --- | --- | --- |
+| `fetch_transparent_address_balance` | `getaddressbalance` | Unspent balance and total received |
+| `fetch_transparent_address_transaction_ids` | `getaddresstxids` | Transaction ids in a height range, in chain order |
+| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order |
+| `fetch_transparent_address_utxo_prefix` | `getaddressutxos` | The first `max_rows` unspent outputs at or above a height, in chain order |
+
+Every method takes a `TransparentAddressLookup`: 1 to 10,000 distinct
+addresses of the source's network. TEX addresses are refused, because the
+index holds the P2PKH address a TEX address encodes; Zebra refuses one and
+Zakura matches nothing for it. Zebra 7.1.0 and Zakura 1.8.6 answer
+differently, and the source gives both the same result:
+
+- **Row limit.** One answer holds at most 100,000 rows. Zebra refuses a
+  larger `getaddresstxids` answer, and a larger `getaddressutxos` answer when
+  `maxEntries` is zero. Zakura has no limit, so the source counts the rows
+  that match and refuses more than 100,000. Both are reported as
+  `TransparentAddressRowLimitExceeded`, and the caller narrows the lookup: a
+  shorter height range for transaction ids, or fewer addresses for unspent
+  outputs.
+- **Height range.** Both nodes clamp `getaddresstxids` heights to the tip they
+  see when they answer, and read an end height of zero as the tip. The source
+  reads the tip first, returns nothing for a range above it, and sends no
+  request for a range that ends at genesis, which neither node indexes. It
+  reads the tip again after the request and keeps the answer only when both
+  reads name the same block, because a tip that fell below the range in
+  between makes the node answer with its new tip's transactions. It treats a
+  refusal of the answer's size the same way, because that refusal may be for
+  the new tip's range. After three attempts whose tip changed, it reports
+  `ChainTipChangedDuringFetch`, classed `upstream_view_changed`.
+- **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
+  `maxEntries` zero, the only value for which Zebra refuses a lookup over the
+  row limit. With a positive `maxEntries`, Zebra returns that many outputs and
+  does not say whether more match.
+- **Prefix of unspent outputs.** `fetch_transparent_address_utxo_prefix`
+  sends `startHeight` and `maxEntries`, which Zebra applies to its index scan.
+  Zakura ignores both and returns every unspent output, so the source drops
+  the rows below the start height and truncates the rest. A full prefix may
+  have more outputs after it, and no later lookup resumes losslessly: the node
+  pages only by height, and one block can hold more matching outputs than one
+  prefix.
+- **Response size.** An answer above `node.max_response_bytes` is reported as
+  `SourceResponseTooLarge`. Zakura's unspent-output answer counts in full,
+  even for a prefix or a high start height. Either node answers JSON-RPC error
+  -32008 instead of an answer above its own `rpc.max_response_body_size`. The
+  source reports that refusal as `NodeResponseTooLarge`, classed
+  `configuration`, because the same request to the same node fails the same
+  way.
+
+The source checks every unspent-output row the node returns, including the
+rows it drops below the start height or past a prefix. A row must name an
+address of the lookup and carry a P2PKH or P2SH script that pays that
+address, the address both nodes' indexes derive from the script. Rows must
+be in chain order: by height, with each transaction's outputs together and
+in increasing index order, so no outpoint repeats. Any other row is reported
+as `SourceProtocolMismatch`, as is an answer of another shape, such as a
+balance without `received`. That class is `protocol_mismatch`, not
+`node_unreachable`, so such an answer does not count toward the client
+rebuild described under [Authentication](#authentication).
+
+Both nodes refuse an address lookup with code -1 and a message containing
+`state was committing a block` when they commit a block while reading their
+index. The source reports that refusal as `BlockCommittedDuringRead`,
+classed `upstream_view_changed`, and the caller retries the same node.
+
+A Zakura node in pruned storage mode with checkpoint sync stops maintaining its
+transparent indexes and refuses `getaddressbalance`, `getaddresstxids`, and
+`getaddressutxos`. The source reports that refusal, and a node without the
+methods, as `TransparentAddressIndexesUnavailable`.
 
 ## Capabilities
 
@@ -105,13 +180,13 @@ another network or chain. See
 | `capability_missing` | The node cannot provide a required operation |
 | `protocol_mismatch` | A response violates the expected wire contract |
 | `malformed` | Node bytes cannot be parsed |
-| `configuration` | The adapter configuration is invalid |
+| `configuration` | The adapter configuration or a request limit refused the operation |
 
 Some refusals are permanent: a fast-synced Zakura node lacks old trees and
 subtree roots, and Zebra refuses a damaged stored block. The source reports
 them as `HistoricalTreeStateUnavailable`, `HistoricalSubtreeRootsUnavailable`,
-and `HistoricalBlockBodyUnavailable`, classed `capability_missing`. It matches
-the node's error text. A reworded refusal of a read by height falls back to
+and `HistoricalBlockBodyUnavailable`, classed `capability_missing`, as is
+`TransparentAddressIndexesUnavailable`. It matches the node's error text. A reworded refusal of a read by height falls back to
 `upstream_view_changed`. For a tree-state read by block hash, the source
 reports an unrecognized refusal as `protocol_mismatch` and logs
 `tree_state_block_hash_refused`.
