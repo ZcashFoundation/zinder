@@ -552,6 +552,36 @@ paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
 projector or wallet store. The feature is for qualification only. Release
 builds accept `wallet` and `compact-blocks`.
 
+Use `GetAddressUtxosStream` when a wallet may receive a large set. The
+generated Rust client's default unary decoding limit is 4 MiB. The
+100,000-output transport fixture produces a 10,748,600-byte unary response.
+The default client streams all rows, and a client configured with a 16 MiB
+decoding limit also receives the complete unary response.
+
+The parity workflow compares this build with ordinary wallet serving on
+both pinned nodes. To repeat it, use the workflow's disposable height-150 chain
+and its wallet-serving process on port 9087. The harness calls
+`getblockchaininfo` without credentials at the host's loopback endpoint and at
+`127.0.0.1:39232` inside the node container. Both compatibility processes use
+`ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0` because the fixture has historical
+block timestamps and the outage removes the node witness for its tip.
+Copy the qualification binaries
+before running the default-feature test client. With the Regtest node
+authentication exported, run the following in place of the two manual processes
+above. The harness creates fresh stores for both policies. It submits one
+signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and
+`GetMempoolStream` on the ordinary wallet endpoint and both qualification
+instances. It stops the named node for the outage checks and restarts it on exit.
+Use `zakura-regtest` for the Zakura lane.
+
+```bash
+mkdir -p .tmp/qualification-bin
+cp target/debug/{zinder-ingest,zinder-compat-lightwalletd} .tmp/qualification-bin/
+ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  scripts/test-light-wallet-qualification.sh .tmp/qualification-bin \
+  zebra-regtest http://127.0.0.1:9087
+```
+
 ### Testnet
 
 Testnet uses the same command with a cookie-authenticated node. This example

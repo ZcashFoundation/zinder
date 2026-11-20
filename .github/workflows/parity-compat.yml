@@ -3,9 +3,9 @@ name: parity-compat
 # T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
 # and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
 # pointed at the same pinned regtest node. One leg runs against Zebra 7.1.0 and
-# one against Zakura 1.8.6; both legs must pass on a release commit. Mempool
-# parity remains outside this workflow until dedicated ingest-control
-# composition is restored.
+# one against Zakura 1.8.6; both legs must pass on a release commit. Each
+# leg also compares the qualification build with ordinary wallet serving,
+# including a signed spend and a node outage under both retention policies.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 
@@ -33,6 +33,7 @@ on:
       - "deploy/zakura/**"
       - "deploy/zebra/**"
       - "scripts/mine-live-regtest.sh"
+      - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
@@ -67,7 +68,7 @@ jobs:
   parity-regtest:
     name: parity diff (regtest, ${{ matrix.node }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +99,17 @@ jobs:
 
       - name: Build Zinder binaries
         run: cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
+
+      - name: Build qualification binaries and the live test client
+        run: |
+          cargo build --locked --bins -p zinder-ingest -p zinder-compat-lightwalletd \
+            --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
+          # The ordinary parity test builds a default-feature compat binary
+          # in target/debug before qualification starts.
+          mkdir -p "$RUNNER_TEMP/qualification-bin"
+          cp target/debug/{zinder-ingest,zinder-compat-lightwalletd} "$RUNNER_TEMP/qualification-bin/"
+          # Compile the client before starting the fixed-fence fixture.
+          cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance --profile=ci-live --no-run
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -250,7 +262,8 @@ jobs:
             exit 1
           fi
 
-          ZINDER_STORAGE__RAW_BLOB_POLICY=all \
+          # The mined Regtest timestamps predate the outage by years.
+          ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0 ZINDER_STORAGE__RAW_BLOB_POLICY=all \
             ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
             --canonical-primary-path .tmp/parity-store \
             --canonical-secondary-root .tmp/parity-secondary-compat-canonical \
@@ -290,6 +303,15 @@ jobs:
         run: |
           cargo nextest run --locked -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
             -E 'test(/^live::parity_against_lightwalletd::/) and not test(/mempool/)'
+
+      - name: Compare light-wallet qualification with wallet serving
+        env:
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ env.REGTEST_NODE_RPC_URL }}
+          ZINDER_NODE__AUTH__METHOD: basic
+          ZINDER_NODE__AUTH__USERNAME: zebra
+          ZINDER_NODE__AUTH__PASSWORD: zebra
+          REGTEST_CONTAINER: ${{ matrix.container }}
+        run: scripts/test-light-wallet-qualification.sh "$RUNNER_TEMP/qualification-bin" "$REGTEST_CONTAINER" http://127.0.0.1:9087
 
       - name: Dump pipeline logs on failure
         if: failure()
