@@ -68,8 +68,6 @@ impl CanonicalReaderSlot {
 impl CompactBlockReads for CanonicalReaderSlot {
     type View = Arc<RocksDbCanonicalReader>;
 
-    const BLOCK_RANGE_QUEUE_CAPACITY: usize = 8;
-
     fn capture_view(
         &self,
     ) -> impl Future<Output = Result<Arc<RocksDbCanonicalReader>, Status>> + Send {
@@ -168,7 +166,7 @@ fn read_chunk_on_this_thread<Output>(
     let ChunkRead {
         chunk,
         order,
-        budget,
+        max_bytes,
         view,
     } = read;
     let reader = match view {
@@ -181,7 +179,7 @@ fn read_chunk_on_this_thread<Output>(
     }
     let started_at = Instant::now();
     let blocks =
-        read_on_blocking_thread(reader.compact_blocks_in_range_up_to(chunk, order, budget));
+        read_on_blocking_thread(reader.compact_blocks_in_range_up_to(chunk, order, max_bytes));
     let read_duration = started_at.elapsed();
     drop(reader);
     ChunkReadOutcome {

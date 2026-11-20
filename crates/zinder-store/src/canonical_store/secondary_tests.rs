@@ -19,8 +19,7 @@ use super::{
     rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
 };
 use crate::{
-    CompactBlockReadBudget, HeightOrder, RawBlobRetention, RocksDbOpenResources,
-    RocksDbResourceBudget, SharedBlockCache,
+    HeightOrder, RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache,
 };
 
 const REORG_WINDOW: u32 = 2;
@@ -255,11 +254,7 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
         for max_bytes in [0, first_row_bytes] {
             let before = range_read_tickers(secondary);
             assert_eq!(
-                secondary.compact_blocks_in_range_up_to(
-                    split_heights(),
-                    *order,
-                    CompactBlockReadBudget::bytes(max_bytes)
-                )?,
+                secondary.compact_blocks_in_range_up_to(split_heights(), *order, max_bytes)?,
                 std::slice::from_ref(&first_block),
                 "a {order:?} read with a {max_bytes}-byte budget"
             );
@@ -350,11 +345,7 @@ fn a_range_read_does_not_depend_on_a_deleted_table_file_outside_its_range()
     ] {
         let before = range_read_tickers(&secondary);
         assert_eq!(
-            secondary.compact_blocks_in_range_up_to(
-                range,
-                order,
-                CompactBlockReadBudget::bytes(max_bytes)
-            )?,
+            secondary.compact_blocks_in_range_up_to(range, order, max_bytes)?,
             kept_blocks,
             "a {order:?} read of {range:?} with a {max_bytes}-byte budget"
         );
@@ -392,19 +383,11 @@ fn a_range_read_still_reports_a_deleted_table_file_it_needs()
         ),
         (
             "ascending",
-            secondary.compact_blocks_in_range_up_to(
-                split_heights(),
-                Ascending,
-                CompactBlockReadBudget::bytes(usize::MAX),
-            ),
+            secondary.compact_blocks_in_range_up_to(split_heights(), Ascending, usize::MAX),
         ),
         (
             "descending",
-            secondary.compact_blocks_in_range_up_to(
-                split_heights(),
-                Descending,
-                CompactBlockReadBudget::bytes(usize::MAX),
-            ),
+            secondary.compact_blocks_in_range_up_to(split_heights(), Descending, usize::MAX),
         ),
         (
             "replay",

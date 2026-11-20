@@ -119,8 +119,8 @@ These outcomes fail the call before any block is sent:
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
-| A block missing from the first byte-bounded chunk | `UNAVAILABLE` |
-| A stored block in the first byte-bounded chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
+| A block missing inside retained history, where the read of the first chunk reaches it | `UNAVAILABLE` |
+| A stored block of the first chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
 
 Once a stream has started, a client can rely on the following:
 
@@ -129,10 +129,14 @@ Once a stream has started, a client can rely on the following:
 3. **One chain as read.** An ascending stream that crosses a reorg above its last sent block continues on the new branch. A descending stream continues on the chain it started on. An `OK` stream does not promise its blocks are still the best chain on arrival.
 4. **Reorg ending.** A stream ends with `ABORTED` when a reorg replaces a block it already linked to (ascending) or the next height it must send (descending), as lightwalletd v0.5.5 and later do. It ends with `OUT_OF_RANGE` when a reorg leaves the tip below a height it still must send. To recover, request again from the height the wallet needs.
 5. **Settled history never ends a stream.** Ingest never replaces a block at or below the settled tip, so only the last reorg window (1,000 blocks by default) can end a stream early.
-6. **Other mid-stream endings.** A storage failure, such as a block missing from a later chunk, ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
+6. **Other mid-stream endings.** A storage failure, including a block missing inside retained history past the read of the first chunk, ends the stream with `UNAVAILABLE`. A chunk with a stored block that a lightwalletd message cannot carry ends it with `DATA_LOSS`, before any block of that chunk is sent. A descending range that runs below retained history, or, in wallet serving, a reorg that lowers the tip during a chunk read, ends it with `NOT_FOUND`.
 7. **No time limit.** Elapsed time, new blocks, and slow reading never end a stream. Shutdown, unanswered keepalive pings, and the listener's send-stall deadline do.
 
-A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. The first chunk holds at most 64 blocks, so the stream opens after a small read, while the outcomes above still cover the first 1,000 heights. The server reads each later chunk while it sends the one before it, so a stream holds at most two chunks plus 16 queued blocks in wallet serving or 8 in compact-blocks serving. A waiting stream holds no chain epoch, so a slow client never delays new blocks.
+A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, counted before pool filtering; a single larger block forms its own chunk. The first chunk holds at most 256 KiB, so the stream opens after a small read. A thousand blocks of up to 262 stored bytes each fit in it, so a request for such small blocks is read in one chunk, and a denser range opens after its first few blocks.
+
+The read of the first chunk checks all of the first 1,000 heights against retained history, but reads and converts only the blocks of the first chunk. That is why the table above covers retained history for the first 1,000 heights, and missing or unconvertible blocks only for the first chunk; past it they end the stream as item 6 describes. A chunk that stops short of the heights its read checked leaves the rest of them to the next chunk, so the stream sends every height a read has checked before it reads past them.
+
+A stream holds at most two chunks: the one the client is receiving and the next, which the server reads meanwhile. The server reads a third only once the client has received every block of the first of them. A waiting stream holds no chain epoch, so a slow client never delays new blocks. When the client goes away, the server finishes the read in flight and starts no other.
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 

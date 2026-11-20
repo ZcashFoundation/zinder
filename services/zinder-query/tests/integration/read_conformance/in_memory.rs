@@ -28,9 +28,9 @@ use zinder_query::{ArtifactKey, CanonicalReader, IndexedTransaction, StorageRead
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalActivationSchedule,
     CanonicalEventFence, ChainEpochCommitted, ChainEvent, ChainEventEnvelope,
-    ChainEventStreamFamily, ChainEventStreamResume, ChainRangeReverted, CompactBlockReadBudget,
-    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
-    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventStreamFamily, ChainEventStreamResume, ChainRangeReverted, EventStreamStartPosition,
+    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
+    TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_testkit::{CanonicalBaseline, ChainFixture};
 
@@ -488,7 +488,7 @@ impl CanonicalReader for InMemoryCanonicalReader {
         &self,
         range: BlockHeightRange,
         order: HeightOrder,
-        budget: CompactBlockReadBudget,
+        max_bytes: usize,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
         let mut blocks = self.compact_blocks_in_range(range).await?;
         if matches!(order, HeightOrder::Descending) {
@@ -498,11 +498,7 @@ impl CanonicalReader for InMemoryCanonicalReader {
         let mut kept = Vec::new();
         for block in blocks {
             let block_bytes = BLOCK_BYTES.saturating_add(block.transactions().len());
-            let is_full = usize::try_from(budget.max_blocks.get())
-                .is_ok_and(|max_blocks| kept.len() >= max_blocks);
-            if !kept.is_empty()
-                && (is_full || kept_bytes.saturating_add(block_bytes) > budget.max_bytes)
-            {
+            if !kept.is_empty() && kept_bytes.saturating_add(block_bytes) > max_bytes {
                 break;
             }
             kept_bytes = kept_bytes.saturating_add(block_bytes);

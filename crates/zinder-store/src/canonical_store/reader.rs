@@ -1,6 +1,6 @@
 //! Typed serving reads for an admitted canonical store.
 
-use std::{mem::size_of, num::NonZeroU32};
+use std::mem::size_of;
 
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
@@ -203,30 +203,27 @@ macro_rules! impl_canonical_typed_reads {
             }
 
             /// Reads compact blocks from one end of an inclusive range until
-            /// the read has spent `budget`.
+            /// the next block would take their stored bytes past `max_bytes`.
             ///
             /// The read starts at the lowest height for
             /// [`HeightOrder::Ascending`] and at the highest for
             /// [`HeightOrder::Descending`], and walks toward the other end. It
-            /// stops at `budget.max_blocks` blocks, or before the block that
-            /// would take their stored bytes past `budget.max_bytes`. It
             /// always keeps the first block, so a block larger than
-            /// `budget.max_bytes` is read alone. The blocks come back in
-            /// ascending height order and cover consecutive heights at the
-            /// starting end.
+            /// `max_bytes` is read alone. The blocks come back in ascending
+            /// height order and cover consecutive heights at the starting end.
             ///
             /// Every height of `range` is checked against retained history
             /// first, so a range that reaches outside it fails with
             /// [`CanonicalStoreError::ArtifactUnavailable`] exactly as
-            /// [`Self::compact_blocks_in_range`] does, even where the budget
-            /// would stop the read before that height.
+            /// [`Self::compact_blocks_in_range`] does, even where the byte
+            /// budget would stop the read before that height.
             pub fn compact_blocks_in_range_up_to(
                 &self,
                 range: zinder_core::BlockHeightRange,
                 order: HeightOrder,
-                budget: CompactBlockReadBudget,
+                max_bytes: usize,
             ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-                read_compact_blocks_up_to(self, range, order, budget)
+                read_compact_blocks_up_to(self, range, order, max_bytes)
             }
 
             /// Reads the canonical location of one transaction.
@@ -511,39 +508,6 @@ pub enum HeightOrder {
     Descending,
 }
 
-/// What one bounded compact-block read may keep.
-///
-/// The read keeps at most `max_blocks` blocks and stops before the block that
-/// would take their stored bytes past `max_bytes`. It always keeps its first
-/// block, so a block larger than `max_bytes` is read alone.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CompactBlockReadBudget {
-    /// Most blocks the read keeps.
-    pub max_blocks: NonZeroU32,
-    /// Most stored compact-block bytes the read keeps, except that it always
-    /// keeps its first block.
-    pub max_bytes: usize,
-}
-
-impl CompactBlockReadBudget {
-    /// Keeps blocks while their stored bytes fit `max_bytes`, with no limit
-    /// on how many.
-    #[must_use]
-    pub const fn bytes(max_bytes: usize) -> Self {
-        Self {
-            max_blocks: NonZeroU32::MAX,
-            max_bytes,
-        }
-    }
-
-    /// The same budget, keeping at most `max_blocks` blocks.
-    #[must_use]
-    pub const fn with_max_blocks(mut self, max_blocks: NonZeroU32) -> Self {
-        self.max_blocks = max_blocks;
-        self
-    }
-}
-
 /// Most rows one batch of a byte-bounded compact-block read fetches.
 const BOUNDED_COMPACT_BLOCK_BATCH_SIZE: usize = 16;
 
@@ -551,14 +515,9 @@ fn read_compact_blocks_up_to(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
     order: HeightOrder,
-    budget: CompactBlockReadBudget,
+    max_bytes: usize,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
     require_retained_compact_blocks(store, range)?;
-    let CompactBlockReadBudget {
-        max_blocks,
-        max_bytes,
-    } = budget;
-    let max_blocks = usize::try_from(max_blocks.get()).unwrap_or(usize::MAX);
     let mut unread = range.start.value()..=range.end.value();
     let mut next_height = || {
         match order {
@@ -571,11 +530,10 @@ fn read_compact_blocks_up_to(
     let mut kept_bytes = 0_usize;
     let mut largest_row_bytes = 0_usize;
     let is_budget_spent = |blocks: &[CompactBlockArtifact], kept_bytes: usize| {
-        !blocks.is_empty() && (kept_bytes >= max_bytes || blocks.len() >= max_blocks)
+        !blocks.is_empty() && kept_bytes >= max_bytes
     };
     'batches: while !is_budget_spent(&blocks, kept_bytes) {
-        let batch_len = bounded_batch_len(max_bytes.saturating_sub(kept_bytes), largest_row_bytes)
-            .min(max_blocks.saturating_sub(blocks.len()));
+        let batch_len = bounded_batch_len(max_bytes.saturating_sub(kept_bytes), largest_row_bytes);
         let batch = std::iter::from_fn(&mut next_height)
             .take(batch_len)
             .collect::<Vec<_>>();

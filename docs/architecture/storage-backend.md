@@ -76,10 +76,9 @@ The read then fetches rows with batched point lookups (`MultiGet`):
 
 - An unbounded range read fetches up to 1,024 heights per batch.
 - The tree-state replay fetches up to 16 heights per batch.
-- A bounded read keeps at most a block count and a byte budget. It fetches
-  one row first. Each later batch holds as many rows as the byte budget left
-  fits at the size of the largest row read so far, from 1 to 16, and no more
-  than the block count left.
+- A byte-bounded read fetches one row first. Each later batch holds as many
+  rows as the budget left fits at the size of the largest row read so far,
+  from 1 to 16.
 
 Each row must decode to the block at its key's height. A height missing inside
 retained history fails the read as store damage.

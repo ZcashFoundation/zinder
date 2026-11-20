@@ -449,8 +449,8 @@ mod tests {
         },
     };
     use crate::{
-        CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState,
-        CompactBlockReadBudget, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+        CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RawBlobRetention,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     };
 
     #[cfg(unix)]
@@ -937,19 +937,11 @@ mod tests {
                 ("unbounded", store.compact_blocks_in_range(range)),
                 (
                     "ascending",
-                    store.compact_blocks_in_range_up_to(
-                        range,
-                        Ascending,
-                        CompactBlockReadBudget::bytes(usize::MAX),
-                    ),
+                    store.compact_blocks_in_range_up_to(range, Ascending, usize::MAX),
                 ),
                 (
                     "descending",
-                    store.compact_blocks_in_range_up_to(
-                        range,
-                        Descending,
-                        CompactBlockReadBudget::bytes(usize::MAX),
-                    ),
+                    store.compact_blocks_in_range_up_to(range, Descending, usize::MAX),
                 ),
             ] {
                 let error = outcome
@@ -993,11 +985,7 @@ mod tests {
         assert_eq!(store.compact_blocks_in_range(range)?, before);
         for order in [Ascending, Descending] {
             assert_eq!(
-                store.compact_blocks_in_range_up_to(
-                    range,
-                    order,
-                    CompactBlockReadBudget::bytes(usize::MAX)
-                )?,
+                store.compact_blocks_in_range_up_to(range, order, usize::MAX)?,
                 before,
                 "{order:?} read"
             );
@@ -1050,19 +1038,11 @@ mod tests {
                 ("unbounded", store.compact_blocks_in_range(range)),
                 (
                     "ascending",
-                    store.compact_blocks_in_range_up_to(
-                        range,
-                        Ascending,
-                        CompactBlockReadBudget::bytes(usize::MAX),
-                    ),
+                    store.compact_blocks_in_range_up_to(range, Ascending, usize::MAX),
                 ),
                 (
                     "descending",
-                    store.compact_blocks_in_range_up_to(
-                        range,
-                        Descending,
-                        CompactBlockReadBudget::bytes(usize::MAX),
-                    ),
+                    store.compact_blocks_in_range_up_to(range, Descending, usize::MAX),
                 ),
             ] {
                 let error = outcome
@@ -1129,38 +1109,16 @@ mod tests {
         for order in [Ascending, Descending] {
             assert_eq!(
                 lookups_of(
-                    &|| store.compact_blocks_in_range_up_to(
-                        range,
-                        order,
-                        CompactBlockReadBudget::bytes(usize::MAX)
-                    ),
+                    &|| store.compact_blocks_in_range_up_to(range, order, usize::MAX),
                     3
                 )?,
                 [2, 3, 0, 0, 0],
                 "a {order:?} read of the whole range"
             );
             assert_eq!(
-                lookups_of(
-                    &|| store.compact_blocks_in_range_up_to(
-                        range,
-                        order,
-                        CompactBlockReadBudget::bytes(0)
-                    ),
-                    1
-                )?,
+                lookups_of(&|| store.compact_blocks_in_range_up_to(range, order, 0), 1)?,
                 [1, 1, 0, 0, 0],
                 "a {order:?} read its first block fills"
-            );
-            // A block limit stops the read without fetching the rows past it.
-            let two_blocks = CompactBlockReadBudget::bytes(usize::MAX)
-                .with_max_blocks(NonZeroU32::MIN.saturating_add(1));
-            assert_eq!(
-                lookups_of(
-                    &|| store.compact_blocks_in_range_up_to(range, order, two_blocks),
-                    2
-                )?,
-                [2, 2, 0, 0, 0],
-                "a {order:?} read limited to two blocks"
             );
         }
         Ok(())
@@ -1197,71 +1155,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_compact_block_read_keeps_at_most_its_block_limit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::HeightOrder::{Ascending, Descending};
-
-        let temporary = TempDir::new()?;
-        let store_path = temporary.path().join("canonical");
-        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
-        let range = |start, end| {
-            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
-        };
-        let read_heights =
-            |order, budget: CompactBlockReadBudget| -> Result<Vec<u32>, CanonicalStoreError> {
-                Ok(store
-                    .compact_blocks_in_range_up_to(range(1, 3), order, budget)?
-                    .iter()
-                    .map(|block| block.height().value())
-                    .collect())
-            };
-        let blocks =
-            |max_blocks| CompactBlockReadBudget::bytes(usize::MAX).with_max_blocks(max_blocks);
-        let one_block = NonZeroU32::MIN;
-        let two_blocks = NonZeroU32::MIN.saturating_add(1);
-        assert_eq!(read_heights(Ascending, blocks(one_block))?, [1]);
-        assert_eq!(read_heights(Descending, blocks(one_block))?, [3]);
-        assert_eq!(read_heights(Ascending, blocks(two_blocks))?, [1, 2]);
-        assert_eq!(read_heights(Descending, blocks(two_blocks))?, [2, 3]);
-        // Whichever limit the read reaches first stops it.
-        let low_row = crate::encode_compact_block_artifact(
-            &store
-                .compact_block_at(BlockHeight::new(1))?
-                .ok_or("the test store must hold block 1")?,
-        )
-        .len();
-        assert_eq!(
-            read_heights(
-                Ascending,
-                CompactBlockReadBudget::bytes(low_row).with_max_blocks(two_blocks)
-            )?,
-            [1]
-        );
-
-        // Retained history is checked for the whole range before the block
-        // limit can stop the read.
-        for (start, end, first_absent) in [(4, 5, 4), (0, 1, 0), (3, 4, 4), (0, 3, 0)] {
-            for order in [Ascending, Descending] {
-                let error = store
-                    .compact_blocks_in_range_up_to(range(start, end), order, blocks(one_block))
-                    .err()
-                    .ok_or("a range outside stored history must fail")?;
-                assert!(
-                    matches!(
-                        error,
-                        CanonicalStoreError::ArtifactUnavailable {
-                            family: crate::ArtifactFamily::CompactBlock,
-                            height,
-                        } if height == BlockHeight::new(first_absent)
-                    ),
-                    "{order:?} range {start}..={end}: unexpected error {error:?}"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn bounded_compact_block_read_keeps_the_blocks_at_its_starting_end_within_the_budget()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::HeightOrder::{Ascending, Descending};
@@ -1272,10 +1165,9 @@ mod tests {
         let range = |start, end| {
             zinder_core::BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
         };
-        let bytes = CompactBlockReadBudget::bytes;
         let read_heights = |order, max_bytes| -> Result<Vec<u32>, CanonicalStoreError> {
             Ok(store
-                .compact_blocks_in_range_up_to(range(1, 3), order, bytes(max_bytes))?
+                .compact_blocks_in_range_up_to(range(1, 3), order, max_bytes)?
                 .iter()
                 .map(|block| block.height().value())
                 .collect())
@@ -1291,7 +1183,7 @@ mod tests {
 
         for order in [Ascending, Descending] {
             assert_eq!(
-                store.compact_blocks_in_range_up_to(range(1, 3), order, bytes(usize::MAX))?,
+                store.compact_blocks_in_range_up_to(range(1, 3), order, usize::MAX)?,
                 all,
                 "an unbounded {order:?} read returns the whole range in ascending order"
             );
@@ -1308,7 +1200,7 @@ mod tests {
         for (start, end, first_absent) in [(4, 5, 4), (0, 1, 0), (3, 4, 4), (2, 4, 4)] {
             for order in [Ascending, Descending] {
                 let error = store
-                    .compact_blocks_in_range_up_to(range(start, end), order, bytes(0))
+                    .compact_blocks_in_range_up_to(range(start, end), order, 0)
                     .err()
                     .ok_or("a range outside stored history must fail")?;
                 assert!(

@@ -28,8 +28,8 @@ use zinder_proto::capabilities::{
 use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventStreamFamily, ChainEventStreamResume,
-    CompactBlockReadBudget, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -824,7 +824,7 @@ where
         &self,
         block_range: BlockHeightRange,
         order: HeightOrder,
-        budget: CompactBlockReadBudget,
+        max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
         let requested_blocks = Some(block_range.into_iter().len());
@@ -834,7 +834,7 @@ where
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let compact_blocks = pair
                     .canonical()
-                    .compact_blocks_in_range_up_to(block_range, order, budget)
+                    .compact_blocks_in_range_up_to(block_range, order, max_bytes)
                     .await
                     .map_err(QueryError::canonical_read)?;
                 let block_range = match (compact_blocks.first(), compact_blocks.last()) {
@@ -883,7 +883,7 @@ where
                             .compact_blocks_in_range_up_to(
                                 block_range,
                                 HeightOrder::Ascending,
-                                CompactBlockReadBudget::bytes(sub_read_bytes),
+                                sub_read_bytes,
                             )
                             .await
                             .map_err(QueryError::canonical_read)?;
@@ -1627,7 +1627,7 @@ async fn drive_serving_pair_compact_block_range(
                     .compact_blocks_in_range_up_to(
                         remaining,
                         HeightOrder::Ascending,
-                        CompactBlockReadBudget::bytes(reads.sub_read_bytes),
+                        reads.sub_read_bytes,
                     )
                     .await
                     .map_err(QueryError::canonical_read)?;

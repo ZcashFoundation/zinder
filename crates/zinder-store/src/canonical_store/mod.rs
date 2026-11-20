@@ -86,7 +86,7 @@ pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,
 };
-pub use reader::{CompactBlockReadBudget, HeightOrder};
+pub use reader::HeightOrder;
 pub use rocksdb::RocksDbCanonicalStore;
 pub use rocksdb::{
     CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalReadyStoreSummary,

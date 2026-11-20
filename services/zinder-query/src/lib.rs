@@ -26,8 +26,8 @@ use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
 use zinder_store::{
     ArtifactFamily, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
-    CompactBlockReadBudget, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition,
-    HeightOrder, StoreError, StreamCursorTokenV1,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, HeightOrder, StoreError,
+    StreamCursorTokenV1,
 };
 
 mod broadcast_byte_budget;
@@ -193,13 +193,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     }
 
     /// Reads compact block artifacts from one end of an inclusive height
-    /// range, up to a block and byte budget.
+    /// range, up to a byte budget.
     ///
     /// The read starts at the end of `block_range` that `order` visits first
-    /// and stops at `budget.max_blocks` blocks, or before the block that
-    /// would take the stored bytes of the blocks it keeps past
-    /// `budget.max_bytes`. It always keeps one block, so a block larger than
-    /// `budget.max_bytes` is returned alone. The response's
+    /// and stops before the block that would take the stored bytes of the
+    /// blocks it keeps past `max_bytes`. It always keeps one block, so a
+    /// block larger than `max_bytes` is returned alone. The response's
     /// `block_range` is the heights kept, and its blocks are in ascending
     /// height order.
     ///
@@ -211,7 +210,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         block_range: BlockHeightRange,
         order: HeightOrder,
-        budget: CompactBlockReadBudget,
+        max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
 

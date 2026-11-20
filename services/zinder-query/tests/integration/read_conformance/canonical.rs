@@ -12,9 +12,9 @@ use zinder_core::{
 use zinder_query::{ArtifactKey, CanonicalReader, StorageReadError};
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalBuildSubtreeRoot,
-    ChainEvent, ChainEventEnvelope, ChainEventStreamFamily, CompactBlockReadBudget,
-    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
-    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ChainEvent, ChainEventEnvelope, ChainEventStreamFamily, EventStreamStartPosition, HeightOrder,
+    RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay,
+    TreeStateReplayOutcome,
 };
 use zinder_testkit::{
     CanonicalBaseline, ChainFixture, FixtureBlock, FixtureTransactionRows,
@@ -161,48 +161,24 @@ pub(crate) async fn byte_bounded_ranges_keep_whole_blocks_from_the_first_end<H: 
     let whole = range(1, TIP);
 
     let one_ascending = reader
-        .compact_blocks_in_range_up_to(
-            whole,
-            HeightOrder::Ascending,
-            CompactBlockReadBudget::bytes(1),
-        )
+        .compact_blocks_in_range_up_to(whole, HeightOrder::Ascending, 1)
         .await?;
     assert_eq!(heights(&one_ascending), vec![1]);
     let one_descending = reader
-        .compact_blocks_in_range_up_to(
-            whole,
-            HeightOrder::Descending,
-            CompactBlockReadBudget::bytes(1),
-        )
+        .compact_blocks_in_range_up_to(whole, HeightOrder::Descending, 1)
         .await?;
     assert_eq!(heights(&one_descending), vec![TIP]);
     for order in [HeightOrder::Ascending, HeightOrder::Descending] {
         let all = reader
-            .compact_blocks_in_range_up_to(whole, order, CompactBlockReadBudget::bytes(usize::MAX))
+            .compact_blocks_in_range_up_to(whole, order, usize::MAX)
             .await?;
         assert_eq!(heights(&all), (1..=TIP).collect::<Vec<_>>());
     }
-    let two_blocks = CompactBlockReadBudget::bytes(usize::MAX)
-        .with_max_blocks(NonZeroU32::MIN.saturating_add(1));
-    let two_descending = reader
-        .compact_blocks_in_range_up_to(whole, HeightOrder::Descending, two_blocks)
-        .await?;
-    assert_eq!(heights(&two_descending), vec![TIP - 1, TIP]);
 
     // The whole range is checked before the budget stops the read.
     assert_unavailable_height(
         reader
-            .compact_blocks_in_range_up_to(
-                range(TIP, TIP + 1),
-                HeightOrder::Ascending,
-                CompactBlockReadBudget::bytes(1),
-            )
-            .await,
-        TIP + 1,
-    )?;
-    assert_unavailable_height(
-        reader
-            .compact_blocks_in_range_up_to(range(TIP, TIP + 1), HeightOrder::Ascending, two_blocks)
+            .compact_blocks_in_range_up_to(range(TIP, TIP + 1), HeightOrder::Ascending, 1)
             .await,
         TIP + 1,
     )?;
