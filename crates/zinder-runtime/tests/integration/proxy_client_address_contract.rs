@@ -21,7 +21,7 @@ use zinder_runtime::{ENVIRONMENT_VARIABLES, PROXY_CLIENT_ADDRESS_HEADER};
 
 const CADDYFILE: &str = include_str!("../../../../deploy/compat-lightwalletd.Caddyfile");
 const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-tls.md");
-const DEPLOY_DIRECTORY: &str = "../../deploy";
+const DEPLOY_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
 const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
 
 /// The base Compose file and every overlay that adds to its `zinder-ingest`
