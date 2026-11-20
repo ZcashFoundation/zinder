@@ -81,6 +81,9 @@ jobs:
       - name: Test (unit + integration)
         run: cargo nextest run --profile=ci
 
+      - name: Check canonical store defaults across runtimes
+        run: python3 scripts/test-canonical-storage-defaults.py
+
       - name: Check configured nextest selectors
         run: scripts/test-nextest-selectors.sh
 

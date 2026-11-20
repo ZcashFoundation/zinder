@@ -29,6 +29,7 @@ use zinder_runtime::{
     duration_as_millis_u64, guard_optional_serving_bind, require_field, resolve_allow_public_bind,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
     resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
+    section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
@@ -151,11 +152,7 @@ pub(crate) fn load_ingest_config(
     overrides: IngestConfigOverrides,
 ) -> Result<IngestCommandConfig, IngestConfigError> {
     let raw_config: IngestConfig = ConfigLoader::new()
-        // Storage default matches the canonical Zinder layout. The writer's
-        // primary store lives at `/var/lib/zinder/store`. Operators on
-        // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
-        // `--storage-path` CLI flag.
-        .with_default("storage.path", "/var/lib/zinder/store")?
+        .with_default("storage.path", DEFAULT_CANONICAL_PATH)?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.explorer_views_min_free_bytes",

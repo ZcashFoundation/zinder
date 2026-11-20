@@ -50,8 +50,9 @@ The runtime images change those defaults. Each image installs a file from
 | `zinder-explorer` | `explorer.listen_addr = "[::]:9068"`, `ops.listen_addr = "[::]:9069"` |
 
 Other listeners, such as `ingest_control.listen_addr`, keep their loopback
-defaults. The image files set no network, node, or storage values, so supply
-those with `ZINDER_*` variables or a mounted file. A file you mount at
+defaults. The image files leave network, node, and storage settings to each
+binary. Supply required values and any overrides with `ZINDER_*` variables
+or a mounted file. A file you mount at
 `/etc/zinder/config.toml` replaces the image file whole. A listener it does
 not set then binds loopback, and without `allow_public_bind = true` a
 listener on `[::]` or a public address is refused. Arguments after the image
@@ -204,7 +205,7 @@ not check descriptions or defaults.
 | `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR` | zinder-projector | Optional | `projector_control.listen_addr` | Loopback-only private ProjectorControl gRPC endpoint for coherent capture. Empty or unset disables it; an enabled endpoint requires projector_control.bearer_token_path. |
 | `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH` | zinder-projector | When `projector control is enabled` | `projector_control.bearer_token_path` | Path to the token required by ProjectorControl and presented as the canonical checkpoint capability. Mount it only into projector and ingest; query and compatibility never read it. |
 | `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-projector | Optional | `projector_control.checkpoint_staging_root` | Shared candidate root whose realpath must match ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 root binding to canonical control, never a path. |
-| `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.path` | Canonical RocksDB store path. Writers open it as primary; readers open it as a secondary. |
+| `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-query or zinder-compat-lightwalletd` | `storage.path` | Canonical RocksDB store directory. Defaults to `/var/lib/zinder/canonical` for ingest and Explorer. Ingest writes the primary store here. Explorer locates its materialized-view store beneath this directory. Query and lightwalletd open the canonical store as a secondary. |
 | `ZINDER_STORAGE__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
 | `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.initial_catchup_timeout_ms` | Maximum startup RocksDB secondary catchup duration before a reader starts with the opened secondary and lets /readyz report replica lag. Defaults to 30000. |
 | `ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.secondary_catchup_interval_ms` | Cadence of RocksDB secondary catchup ticks in milliseconds. Defaults to 1000. Must be greater than zero. |

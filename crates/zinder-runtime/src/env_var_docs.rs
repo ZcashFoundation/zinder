@@ -743,10 +743,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::Required,
+        requirement: Requirement::ConditionalOn(
+            "running zinder-query or zinder-compat-lightwalletd",
+        ),
         sensitive: false,
-        description: "Canonical RocksDB store path. Writers open it as primary; readers open it \
-                      as a secondary.",
+        description: "Canonical RocksDB store directory. Defaults to `/var/lib/zinder/canonical` \
+                      for ingest and Explorer. Ingest writes the primary store here. Explorer \
+                      locates its materialized-view store beneath this directory. Query and \
+                      lightwalletd open the canonical store as a secondary.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__SECONDARY_PATH",

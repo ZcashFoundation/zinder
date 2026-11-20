@@ -1171,14 +1171,9 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<dyn Error>> {
-    // The binary's default for `storage.path` matches the canonical Zinder
-    // layout under `/var/lib/zinder/store`. Operators on non-PaaS hosts
-    // override via `ZINDER_STORAGE__PATH` or the `--storage-path` flag.
-    // This test guards the default's stability so the env-only deployment
-    // shape (single-container Docker image) keeps working without a TOML
-    // file or a `--config` argument.
+fn storage_path_env_override_keeps_the_legacy_store() -> Result<(), Box<dyn Error>> {
     let output = zinder_ingest_command()
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/store")
         .args([
             "--print-config",
             "--network",
@@ -1195,11 +1190,10 @@ fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<
         "print-config failed: stderr=\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(
-        stdout.contains("path = \"/var/lib/zinder/store\"")
-            || stdout.contains("path = '/var/lib/zinder/store'"),
-        "stdout does not carry the canonical storage.path default:\n{stdout}"
+    let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    assert_eq!(
+        config["storage"]["path"].as_str(),
+        Some("/var/lib/zinder/store")
     );
 
     Ok(())
