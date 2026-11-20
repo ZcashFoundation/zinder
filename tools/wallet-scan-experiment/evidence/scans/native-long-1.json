@@ -1,0 +1,151 @@
+{
+  "arch": "x86_64",
+  "batch_size": 128,
+  "corpus_sha256": "5c7a2f5e13cbdc9c276b3b88f098579a01e57e78daf849b799751c774b7d3afb",
+  "cycles": 1,
+  "diagnostics": {
+    "actions_with_fixture": 46324,
+    "archived_actions": 46318,
+    "fixture": {
+      "fixture_actions": 6,
+      "foreign_notes": 2,
+      "ironwood_known_receipts": 2,
+      "orchard_known_receipts": 2,
+      "receipts_with_malformed_points": 4,
+      "receipts_with_one_wrong_point": 3,
+      "receipts_without_hints": 4
+    },
+    "receipt_digest_blake2b256": "d22887c278eb22ce6f44f4d106a244b0c666699ee5decc7bb3177e6b2939a3ff",
+    "total_receipts": 12
+  },
+  "executable_sha256": "33b8e51214a5e992e67c6ec91225fd362abcb9b22c42592d768a10f733bc48c4",
+  "os": "linux",
+  "samples": [
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 2543.568487,
+      "order": 0,
+      "process_cpu_ms": 2543.3716309999995
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2751.923992,
+      "order": 0,
+      "process_cpu_ms": 2745.381910000001
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2195.6628060000003,
+      "order": 0,
+      "process_cpu_ms": 2195.509960999999
+    },
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 2585.663985,
+      "order": 1,
+      "process_cpu_ms": 2585.4908839999985
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2155.546164,
+      "order": 1,
+      "process_cpu_ms": 2155.422613999999
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2608.166862,
+      "order": 1,
+      "process_cpu_ms": 2608.013420999999
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2642.314301,
+      "order": 2,
+      "process_cpu_ms": 2642.1543099999985
+    },
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 2647.7932929999997,
+      "order": 2,
+      "process_cpu_ms": 2647.600221000001
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2272.073258,
+      "order": 2,
+      "process_cpu_ms": 2271.9336950000047
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2745.038539,
+      "order": 3,
+      "process_cpu_ms": 2744.881212999999
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2231.087774,
+      "order": 3,
+      "process_cpu_ms": 2230.9655379999995
+    },
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 2614.9485600000003,
+      "order": 3,
+      "process_cpu_ms": 2614.781207
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2339.68862,
+      "order": 4,
+      "process_cpu_ms": 2339.541435000001
+    },
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 2968.71988,
+      "order": 4,
+      "process_cpu_ms": 2960.150990999999
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2938.098703,
+      "order": 4,
+      "process_cpu_ms": 2937.8771290000004
+    },
+    {
+      "arm": "hinted",
+      "cycle": 0,
+      "elapsed_ms": 2369.1065550000003,
+      "order": 5,
+      "process_cpu_ms": 2368.9615250000033
+    },
+    {
+      "arm": "ordinary-prefilter",
+      "cycle": 0,
+      "elapsed_ms": 2878.585269,
+      "order": 5,
+      "process_cpu_ms": 2878.431662000004
+    },
+    {
+      "arm": "stock",
+      "cycle": 0,
+      "elapsed_ms": 3026.82024,
+      "order": 5,
+      "process_cpu_ms": 3026.6565000000014
+    }
+  ]
+}
