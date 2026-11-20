@@ -5,8 +5,9 @@ use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
 use zinder_runtime::{
-    ComposedReadiness, OpsServer, OpsServerError, Readiness, ReadinessCause, ReadinessInput,
-    ReadinessState, RuntimeService, install_metrics_recorder_for_service, spawn_ops_endpoint,
+    ComposedReadiness, FollowWaitReason, OpsServer, OpsServerError, Readiness, ReadinessCause,
+    ReadinessInput, ReadinessState, RuntimeService, install_metrics_recorder_for_service,
+    spawn_ops_endpoint,
 };
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
@@ -110,13 +111,34 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         "node_unreachable"
     );
 
-    // `deploy/wallet-serving-runtime-entrypoint` compares both heights to tell
-    // a caught-up writer from one that trails its node.
     readiness.set(ReadinessState::syncing(None, Some(7), Some(7)));
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 503);
     assert_eq!(readyz_value["current_height"], 7);
     assert_eq!(readyz_value["target_height"], 7);
+    assert_eq!(
+        readyz_value["cause"]["syncing"],
+        serde_json::json!({ "lag_blocks": null })
+    );
+
+    for (reason, expected) in [
+        (
+            FollowWaitReason::MempoolHydrationAtTip,
+            "mempool_hydration_at_tip",
+        ),
+        (FollowWaitReason::CanonicalProgress, "canonical_progress"),
+    ] {
+        readiness.set(ReadinessState::follow_syncing(
+            reason,
+            None,
+            Some(7),
+            Some(7),
+        ));
+        let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+        assert_eq!(status, 503);
+        assert_eq!(readyz_value["phase"], "following_tip");
+        assert_eq!(readyz_value["cause"]["syncing"]["wait_reason"], expected);
+    }
 
     let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
     assert_eq!(status, 200);

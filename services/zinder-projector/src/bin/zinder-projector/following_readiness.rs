@@ -260,6 +260,7 @@ impl<'a> FollowingReadiness<'a> {
                                 .zip(state.current_height)
                                 .and_then(|(target, current)| target.checked_sub(current))
                                 .map(u64::from),
+                            wait_reason: None,
                         };
                     }
                 }),
@@ -287,7 +288,13 @@ mod tests {
     fn assert_syncing(readiness: &Readiness, lag_blocks: Option<u64>) {
         let report = readiness.report();
         assert!(!report.is_ready);
-        assert_eq!(report.cause, ReadinessCause::Syncing { lag_blocks });
+        assert_eq!(
+            report.cause,
+            ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason: None
+            }
+        );
     }
 
     fn assert_ready_at(readiness: &Readiness, current_height: u32, target_height: u32) {

@@ -133,9 +133,9 @@ pub use public_grpc_server::{
     public_grpc_server_with,
 };
 pub use readiness::{
-    ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
-    ReadinessDependency, ReadinessReport, ReadinessState, TrafficReadinessInterceptor,
-    UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
+    ActiveNodeEndpoint, FollowWaitReason, IngestPhase, NodeUnavailableDetail, Readiness,
+    ReadinessCause, ReadinessDependency, ReadinessReport, ReadinessState,
+    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
 };
 pub use repeated_field_limits::{
     MethodFieldLimits, RepeatedElementEncoding, RepeatedFieldGuard, RepeatedFieldLimit,

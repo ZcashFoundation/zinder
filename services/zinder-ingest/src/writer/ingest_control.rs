@@ -1422,7 +1422,8 @@ mod tests {
             assert_eq!(
                 report.cause,
                 ReadinessCause::Syncing {
-                    lag_blocks: Some(5)
+                    lag_blocks: Some(5),
+                    wait_reason: None,
                 }
             );
             assert_eq!(

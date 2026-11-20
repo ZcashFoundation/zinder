@@ -31,7 +31,9 @@ use zinder_ingest::{
     load_fresh_canonical, prepare_canonical_block,
 };
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
-use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
+use zinder_runtime::{
+    ComposedReadiness, FollowWaitReason, NodeUnavailableDetail, Readiness, ReadinessCause,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
@@ -100,6 +102,7 @@ pub(super) struct RecordingParseableSource {
     calls: Arc<Mutex<Vec<SourceCall>>>,
     tip_call_count: Arc<Mutex<u32>>,
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
+    stall_block_read: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
     cancel_after_subtree_read: Arc<Mutex<Option<CancellationToken>>>,
@@ -155,6 +158,7 @@ impl RecordingParseableSource {
             calls: Arc::new(Mutex::new(Vec::new())),
             tip_call_count: Arc::new(Mutex::new(0)),
             tip_call_gate: Arc::new(Mutex::new(None)),
+            stall_block_read: Arc::default(),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
             cancel_after_subtree_read: Arc::new(Mutex::new(None)),
@@ -281,6 +285,11 @@ impl NodeSource for RecordingParseableSource {
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.calls.lock().push(SourceCall::Block(height));
+        let stall = self.stall_block_read.lock().take();
+        if let Some(entered) = stall {
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        }
         self.block_at(height)
     }
 
@@ -1886,6 +1895,75 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
         readiness.runtime_readiness().report().cause,
         ReadinessCause::NodeUnavailable(_)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_block_preparation_replaces_the_at_tip_mempool_wait()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    let extended = forked_parseable_chain(&parseable_multi_block_chain()?, 5, 5, 1)?;
+    source.replace_chain(
+        extended.clone(),
+        checkpoints_for_parseable_chain(&extended, &activations)?,
+        BlockHeight::new(4),
+    );
+    source.clear_calls();
+    let (second_tip_read, resume_tip_read) = source.pause_tip_call(2);
+    let (entered, stalled) = oneshot::channel();
+    *source.stall_block_read.lock() = Some(entered);
+    let (_signal, gate) = zinder_ingest::mempool_ready_channel();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        activations,
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 1,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: Some(gate),
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        &readiness,
+        &cancel,
+    );
+    let observe = async {
+        second_tip_read.notified().await;
+        let at_tip = readiness.runtime_readiness().report();
+        source.set_tip_height(BlockHeight::new(5));
+        resume_tip_read.notify_one();
+        stalled.await?;
+        let preparing = readiness.runtime_readiness().report();
+        cancel.cancel();
+        Ok::<_, oneshot::error::RecvError>((at_tip, preparing))
+    };
+    let (outcome, reports) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(follow_canonical_tip(store, follower), observe)
+    })
+    .await?;
+    outcome?;
+    let (at_tip, preparing) = reports?;
+    for (report, reason) in [
+        (at_tip, FollowWaitReason::MempoolHydrationAtTip),
+        (preparing, FollowWaitReason::CanonicalProgress),
+    ] {
+        assert_eq!(
+            (report.current_height, report.target_height),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            report.cause,
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(reason)
+            }
+        );
+    }
     Ok(())
 }
 

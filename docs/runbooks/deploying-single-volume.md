@@ -220,10 +220,10 @@ describes each phase.
 From a shell in the container, such as `railway ssh`, check each process:
 
 ```bash
-curl -fsS http://127.0.0.1:9105/readyz   # ingest
-curl -fsS http://127.0.0.1:9110/readyz   # projector
-curl -fsS http://127.0.0.1:9106/readyz   # query
-curl -fsS http://127.0.0.1:9107/readyz   # lightwalletd compatibility
+curl --fail-with-body -sS http://127.0.0.1:9105/readyz   # ingest
+curl --fail-with-body -sS http://127.0.0.1:9110/readyz   # projector
+curl --fail-with-body -sS http://127.0.0.1:9106/readyz   # query
+curl --fail-with-body -sS http://127.0.0.1:9107/readyz   # lightwalletd compatibility
 ```
 
 ## Failure handling
@@ -242,13 +242,23 @@ platform's restart policy starts a clean set.
 | `/readyz` reports `schema_mismatch` or `node_capability_missing` | Incompatible store, or a pruned or incapable node | Exits at once | Use empty paths for a new schema, or an archive node. |
 | A process stays unready for an hour | Lag or a fault that did not clear | Exits | Read the logged `/readyz` body. |
 | A process flaps between ready and unready | Repeated short faults | Exits after six unready episodes, or 900 seconds unready in total, without 10 ready minutes in a row | Read the logged episodes. |
-| Ingest cannot reach its node | Node outage | Keeps serving stored data. Logs the outage once when it starts and once when it ends. Exits after 24 hours. | Restore the node. After a restart, the container serves nothing until a node answers, because ingest needs one to start. |
+| Ingest cannot reach its node | Node outage | Keeps serving stored data. Logs the outage once when it starts and once when it ends. Exits after 24 hours of active outage time. | Restore the node. After a restart, the container serves nothing until a node answers, because ingest needs one to start. |
 | Ingest reports `upstream_not_ready`, for example while the node resyncs | The node answers but is not synchronized | Keeps serving stored data with no time limit | Wait for the node. |
 | Query and compatibility refuse wallets with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the reorg window, `ZINDER_INGEST__REORG_WINDOW_BLOCKS`, default 1000. Ingest parks. | Stays up and keeps the typed refusal | Look for a replaced or misbehaving node, then rebuild. Do not redeploy otherwise: ingest parks again on the same reorg. |
 | Ingest, query, and compatibility report `canonical_store_damaged` | Ingest found a stored row of the canonical store that fails verification and logged it as `tree_state_verification_mismatch`. | Stays up, and query and compatibility refuse wallets with `SERVICE_NOT_READY` | Rebuild the canonical store. Do not redeploy otherwise: ingest reports the recorded damage again and confirms it on the next start. |
 | Query and compatibility report `canonical_store_damaged` without a height | Ingest cannot read its verification record and logged `tree_state_verification_record_unreadable`. | Stays up, refuses wallets, and verifies every settled row at once | Wait for the cycle to pass, which clears the cause, or rebuild the canonical store. |
 | Projector reports `wallet_transition_limit_exceeded` | See [below](#wallet-transition-exceeds-its-logical-byte-limit) | Stays up | Raise the limit and redeploy. |
 | Query logs `wallet_serving_pair_table_file_missing` | Compaction deleted a file under an open read view. Query replaced the view and retried. | Stays up | None for an occasional warning. If it follows most blocks, check for `wallet_serving_pair_publisher_refresh_failed` and for bulk compactions. |
+
+If ingest reports `syncing`, check the `ingest_control` entry in query's
+`/readyz`. A relayed `upstream_not_ready` means the node is answering and
+syncing. For a relayed `node_unavailable`, read `cause.syncing.wait_reason`
+on ingest. With `mempool_hydration_at_tip`, check the writer's connection
+to the node's mempool feed.
+With `canonical_progress`, inspect ingest's progress even if the reported
+heights match. Lag and block preparation use the one-hour tolerance and the
+recurrence budgets. The 24-hour clock pauses until ingest is back at the tip
+if the same mempool outage continues.
 
 The image `HEALTHCHECK` runs `zinder-wallet-serving-healthcheck`. It passes
 when query and compatibility each return 200 from `/readyz` or serve the
