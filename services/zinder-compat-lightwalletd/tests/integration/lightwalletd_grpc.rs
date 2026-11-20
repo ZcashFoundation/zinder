@@ -958,6 +958,86 @@ async fn convert_a_chunk_while_the_blocking_pool_is_held() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Returns the seconds `rendered` records for the block-range `stage`.
+fn block_range_stage_seconds(rendered: &str, stage: &str) -> Option<f64> {
+    let series =
+        format!("zinder_compat_block_range_stage_duration_seconds_sum{{stage=\"{stage}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str())?.parse::<f64>().ok())
+}
+
+/// A chunk's read stage ends when the wallet query returns, so it leaves out
+/// the time the chunk then waits for a blocking thread to be converted.
+#[test]
+fn get_block_range_read_stage_leaves_out_the_wait_to_convert() -> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let hold = std::time::Duration::from_secs(1);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(convert_a_chunk_after_the_blocking_pool_is_held_for(hold))?;
+
+    let rendered = metrics_handle.render();
+    assert_eq!(block_range_stage_samples(&rendered, "read"), Some(1));
+    let read_seconds =
+        block_range_stage_seconds(&rendered, "read").ok_or_else(|| eyre!("no read stage"))?;
+    assert!(
+        read_seconds < hold.as_secs_f64(),
+        "the read stage counted the {hold:?} its chunk waited to be converted: {read_seconds}s"
+    );
+    Ok(())
+}
+
+/// Streams heights 1 through 10, one chunk, while the test holds the only
+/// blocking thread from before the chunk is read until `hold` after.
+async fn convert_a_chunk_after_the_blocking_pool_is_held_for(
+    hold: std::time::Duration,
+) -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(10));
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let (gate_held, gate_held_receiver) = tokio::sync::oneshot::channel();
+    let (release_gate, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate_thread = tokio::task::spawn_blocking(move || {
+        let _ = gate_held.send(());
+        let _ = gate.blocking_recv();
+    });
+    gate_held_receiver.await?;
+
+    let mut call = Box::pin(adapter.get_block_range(Request::new(block_range_request(1, 10))));
+    let chunk_read = async {
+        while recorder.recorded_compact_block_ranges().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => {
+            return Err(eyre!(
+                "the call answered before its chunk was read: {:?}",
+                outcome.map(|_| ())
+            ));
+        }
+        () = chunk_read => {}
+    }
+    assert!(
+        tokio::time::timeout(hold, &mut call).await.is_err(),
+        "a read chunk must wait for the blocking pool to be converted"
+    );
+
+    let _ = release_gate.send(());
+    gate_thread.await?;
+    let blocks = collect_stream(call.await?.into_inner()).await?;
+    assert_one_linked_chain(&blocks, 1, 10);
+    Ok(())
+}
+
 fn block_range_request(start: u64, end: u64) -> lightwalletd::BlockRange {
     lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {

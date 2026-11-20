@@ -336,6 +336,8 @@ where
 {
     type View = ChainEpoch;
 
+    const BLOCK_RANGE_QUEUE_CAPACITY: usize = 16;
+
     async fn capture_view(&self) -> Result<ChainEpoch, Status> {
         self.visible_tip_block(None)
             .await
@@ -405,19 +407,22 @@ where
             }
         };
         let started_at = Instant::now();
-        let compact_block_range = match self
+        let compact_block_range = self
             .compact_blocks_in_range_up_to(
                 read.chunk,
                 read.order,
                 BLOCK_RANGE_CHUNK_MAX_BYTES,
                 at_epoch_id,
             )
-            .await
-        {
+            .await;
+        // The read stage ends when the query returns, so it leaves out the
+        // conversion's wait for a blocking thread.
+        let read_duration = Some(started_at.elapsed());
+        let compact_block_range = match compact_block_range {
             Ok(compact_block_range) => compact_block_range,
             Err(error) => {
                 return ChunkReadOutcome {
-                    read_duration: Some(started_at.elapsed()),
+                    read_duration,
                     converted: Err(ChunkReadFailure::Failed(status_from_query_error(&error))),
                 };
             }
@@ -426,29 +431,22 @@ where
         // moves to the blocking pool, inside the caller's span.
         let span = tracing::Span::current();
         let converted = tokio::task::spawn_blocking(move || {
-            let read_duration = started_at.elapsed();
-            let output = span.in_scope(|| {
+            span.in_scope(|| {
                 convert(
                     compact_block_range.chain_epoch,
                     compact_block_range.compact_blocks,
                 )
-            });
-            (read_duration, output)
+            })
         })
-        .await;
-        match converted {
-            Ok((read_duration, output)) => ChunkReadOutcome {
-                read_duration: Some(read_duration),
-                converted: Ok(output),
-            },
-            Err(error) => ChunkReadOutcome {
-                read_duration: Some(started_at.elapsed()),
-                converted: Err(ChunkReadFailure::Failed(status_from_query_error(
-                    &QueryError::BlockingTaskFailed {
-                        reason: error.to_string(),
-                    },
-                ))),
-            },
+        .await
+        .map_err(|error| {
+            ChunkReadFailure::Failed(status_from_query_error(&QueryError::BlockingTaskFailed {
+                reason: error.to_string(),
+            }))
+        });
+        ChunkReadOutcome {
+            read_duration,
+            converted,
         }
     }
 }

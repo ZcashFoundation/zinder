@@ -36,8 +36,9 @@ use std::{
 use tokio::sync::{
     OwnedSemaphorePermit, Semaphore,
     mpsc::{self, error::SendError},
+    oneshot,
 };
-use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_stream::Stream;
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
@@ -495,6 +496,9 @@ impl BlockRangeStreamSlot {
     ///
     /// The response and the reader's sink each hold this slot, so the reader
     /// keeps the slot while it reads, even after the client has gone away.
+    /// The response tells the sink once the client asks for a message past
+    /// `first_messages`, which [`BlockRangeSink::first_chunk_taken`] waits
+    /// for.
     pub(crate) fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,
@@ -506,13 +510,17 @@ impl BlockRangeStreamSlot {
         Reader: Future<Output = ()> + Send + 'static,
     {
         let (messages, queued_messages) = mpsc::channel(capacity);
+        let (first_chunk_taken, first_chunk_taken_receiver) = oneshot::channel();
         tokio::spawn(reader(BlockRangeSink {
             messages,
+            first_chunk_taken: Some(first_chunk_taken_receiver),
             _stream_slot: self.clone(),
         }));
-        self.hold_for_stream(Box::pin(
-            tokio_stream::iter(first_messages).chain(ReceiverStream::new(queued_messages)),
-        ))
+        self.hold_for_stream(Box::pin(QueuedChunks {
+            first_messages: first_messages.into_iter(),
+            first_chunk_taken: Some(first_chunk_taken),
+            queued_messages,
+        }))
     }
 
     fn hold_for_stream<Message: 'static>(
@@ -532,6 +540,9 @@ impl BlockRangeStreamSlot {
 #[derive(Debug)]
 pub(crate) struct BlockRangeSink<Message> {
     messages: mpsc::Sender<Message>,
+    /// Resolves once the client has asked for a message past the first
+    /// chunk, or `None` once it has.
+    first_chunk_taken: Option<oneshot::Receiver<()>>,
     _stream_slot: BlockRangeStreamSlot,
 }
 
@@ -543,6 +554,53 @@ impl<Message> BlockRangeSink<Message> {
     /// Returns the message when the client has dropped the response.
     pub(crate) async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
         self.messages.send(message).await
+    }
+
+    /// Waits until the client has taken every message of the stream's first
+    /// chunk and asked for the next, and returns at once after that.
+    ///
+    /// A queue of `capacity` messages could otherwise fill with as many
+    /// one-block chunks, each up to [`BLOCK_RANGE_CHUNK_MAX_BYTES`], before
+    /// the client reads anything. A reader that waits here before each read
+    /// after its first reads at most two chunks ahead of a client that has
+    /// not started.
+    ///
+    /// Returns `false` when the client dropped the response first.
+    pub(crate) async fn first_chunk_taken(&mut self) -> bool {
+        match self.first_chunk_taken.take() {
+            Some(taken) => taken.await.is_ok(),
+            None => true,
+        }
+    }
+}
+
+/// The messages of a stream with later chunks: those of its first chunk,
+/// then those its reader queues.
+struct QueuedChunks<Message> {
+    first_messages: std::vec::IntoIter<Message>,
+    /// Told when the client asks for a message past the first chunk.
+    first_chunk_taken: Option<oneshot::Sender<()>>,
+    queued_messages: mpsc::Receiver<Message>,
+}
+
+// No field is pinned: the stream moves its messages out by value.
+impl<Message> Unpin for QueuedChunks<Message> {}
+
+impl<Message> Stream for QueuedChunks<Message> {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
+        if let Some(message) = self.first_messages.next() {
+            return Poll::Ready(Some(message));
+        }
+        if let Some(first_chunk_taken) = self.first_chunk_taken.take() {
+            let _ = first_chunk_taken.send(());
+        }
+        self.queued_messages.poll_recv(context)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.first_messages.len(), None)
     }
 }
 

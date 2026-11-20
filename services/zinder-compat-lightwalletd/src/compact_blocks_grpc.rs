@@ -69,6 +69,8 @@ impl CanonicalReaderSlot {
 impl CompactBlockReads for CanonicalReaderSlot {
     type View = Arc<RocksDbCanonicalReader>;
 
+    const BLOCK_RANGE_QUEUE_CAPACITY: usize = 8;
+
     fn capture_view(
         &self,
     ) -> impl Future<Output = Result<Arc<RocksDbCanonicalReader>, Status>> + Send {

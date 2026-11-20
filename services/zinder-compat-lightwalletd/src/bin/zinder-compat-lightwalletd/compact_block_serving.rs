@@ -3409,56 +3409,71 @@ mod tests {
                 .extend_blocks(LARGE_BLOCK_TIP - fork_height + 1);
         }
         for height in 1..=LARGE_BLOCK_TIP {
-            let block = chain
-                .block_at(BlockHeight::new(height))
-                .ok_or("fixture block missing")?
-                .clone();
-            let parent_hash = if height == 1 {
-                Network::ZcashRegtest.genesis_hash()
-            } else {
-                block.parent_hash
-            };
-            let transaction = zinder_core::CompactTransaction {
-                index: 0,
-                transaction_id: range_parity_transaction_id(height, 0),
-                data: zinder_core::CompactTransactionData {
-                    sapling_spends: (0..LARGE_BLOCK_SAPLING_SPENDS)
-                        .map(|spend| {
-                            let mut nullifier = [0_u8; 32];
-                            nullifier[..4].copy_from_slice(&height.to_le_bytes());
-                            nullifier[4..8].copy_from_slice(&spend.to_le_bytes());
-                            zinder_core::CompactSaplingSpend { nullifier }
-                        })
-                        .collect(),
+            let spends = (0..LARGE_BLOCK_SAPLING_SPENDS)
+                .map(|spend| {
+                    let mut nullifier = [0_u8; 32];
+                    nullifier[..4].copy_from_slice(&height.to_le_bytes());
+                    nullifier[4..8].copy_from_slice(&spend.to_le_bytes());
+                    zinder_core::CompactSaplingSpend { nullifier }
+                })
+                .collect();
+            chain = with_one_transaction_at(
+                chain,
+                height,
+                zinder_core::CompactTransactionData {
+                    sapling_spends: spends,
                     ..zinder_core::CompactTransactionData::default()
                 },
-            };
-            let mut rows = zinder_testkit::FixtureTransactionRows::from_raw_transaction(
-                transaction.transaction_id,
-                block.height,
-                block.hash,
-                0,
-                format!("large-block-{height}").into_bytes(),
-            );
-            rows.facts.public_facts.counts = zinder_core::TransactionComponentCounts {
-                sapling_spend_count: LARGE_BLOCK_SAPLING_SPENDS,
-                ..zinder_core::TransactionComponentCounts::EMPTY
-            };
-            chain = chain
-                .with_transaction_rows(rows)
-                .with_compact_block_artifact(zinder_core::CompactBlockArtifact::new(
-                    BlockId::new(block.height, block.hash),
-                    parent_hash,
-                    block.block_time_seconds,
-                    vec![transaction],
-                    zinder_core::CompactChainMetadata {
-                        sapling_commitment_tree_size: 0,
-                        orchard_commitment_tree_size: 0,
-                        ironwood_commitment_tree_size: 0,
-                    },
-                )?);
+            )?;
         }
         Ok(chain)
+    }
+
+    /// Replaces the compact block at `height` of `chain` with one that holds
+    /// a single transaction of `data`.
+    fn with_one_transaction_at(
+        chain: zinder_testkit::ChainFixture,
+        height: u32,
+        data: zinder_core::CompactTransactionData,
+    ) -> Result<zinder_testkit::ChainFixture, Box<dyn std::error::Error>> {
+        let block = chain
+            .block_at(BlockHeight::new(height))
+            .ok_or("fixture block missing")?
+            .clone();
+        let parent_hash = if height == 1 {
+            Network::ZcashRegtest.genesis_hash()
+        } else {
+            block.parent_hash
+        };
+        let mut rows = zinder_testkit::FixtureTransactionRows::from_raw_transaction(
+            range_parity_transaction_id(height, 0),
+            block.height,
+            block.hash,
+            0,
+            format!("one-transaction-block-{height}").into_bytes(),
+        );
+        rows.facts.public_facts.counts = zinder_core::TransactionComponentCounts {
+            sapling_spend_count: u32::try_from(data.sapling_spends.len())?,
+            ..zinder_core::TransactionComponentCounts::EMPTY
+        };
+        let transaction = zinder_core::CompactTransaction {
+            index: 0,
+            transaction_id: range_parity_transaction_id(height, 0),
+            data,
+        };
+        Ok(chain
+            .with_transaction_rows(rows)
+            .with_compact_block_artifact(zinder_core::CompactBlockArtifact::new(
+                BlockId::new(block.height, block.hash),
+                parent_hash,
+                block.block_time_seconds,
+                vec![transaction],
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )?))
     }
 
     /// Opens the canonical reader of `chain`.
@@ -3546,6 +3561,199 @@ mod tests {
             "a descending stream must send the one-block reads in reverse"
         );
         Ok(())
+    }
+
+    /// Sapling spends in each block of the read-ahead test, about 1.1 MB per
+    /// stored block, so each byte-capped chunk keeps one block.
+    const ONE_BLOCK_CHUNK_SAPLING_SPENDS: u32 = 34_000;
+
+    /// Waits until `condition` holds, polling while other tasks run.
+    async fn wait_until(
+        condition: impl Fn() -> bool + Send + Sync,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// A stream of one-block chunks reads two chunks before its client takes
+    /// a block.
+    ///
+    /// The response holds the first chunk and the stream's reader queues the
+    /// second. The reader reads on once the client has taken the first.
+    #[tokio::test]
+    async fn an_unread_stream_of_one_block_chunks_reads_two_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 22;
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+        let mut chain =
+            zinder_testkit::ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP_HEIGHT);
+        for height in 1..=TIP_HEIGHT {
+            let spends = (0..ONE_BLOCK_CHUNK_SAPLING_SPENDS)
+                .map(|spend| {
+                    let mut nullifier = [0_u8; 32];
+                    nullifier[..4].copy_from_slice(&height.to_le_bytes());
+                    nullifier[4..8].copy_from_slice(&spend.to_le_bytes());
+                    zinder_core::CompactSaplingSpend { nullifier }
+                })
+                .collect();
+            chain = with_one_transaction_at(
+                chain,
+                height,
+                zinder_core::CompactTransactionData {
+                    sapling_spends: spends,
+                    ..zinder_core::CompactTransactionData::default()
+                },
+            )?;
+        }
+        let (reader, _fixture) = large_block_reader(&chain)?;
+        let first_chunk = reader.secondary().compact_blocks_in_range_up_to(
+            zinder_core::BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(TIP_HEIGHT),
+            ),
+            zinder_store::HeightOrder::Ascending,
+            zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES,
+        )?;
+        assert_eq!(first_chunk.len(), 1, "each chunk must keep one block");
+        let adapter = adapter_serving(&reader);
+        let chunk_reads =
+            || block_range_stage_samples(&metrics_handle.render(), "read").unwrap_or(0);
+
+        let mut stream = adapter
+            .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
+            .await?
+            .into_inner();
+        wait_until(|| chunk_reads() >= 2).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            chunk_reads(),
+            2,
+            "a stream must read no chunk past its second before its client takes a block"
+        );
+
+        let mut blocks = Vec::new();
+        read_blocks(&mut stream, &mut blocks, usize::MAX).await?;
+        assert_linked_from_genesis(&blocks, TIP_HEIGHT);
+        assert_eq!(chunk_reads(), u64::from(TIP_HEIGHT));
+        Ok(())
+    }
+
+    /// A compact-blocks adapter served on a local listener, and a generated
+    /// client connected to it.
+    struct ServedAdapter {
+        client: CompactTxStreamerClient<tonic::transport::Channel>,
+        shutdown: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl ServedAdapter {
+        async fn start(
+            adapter: CompactBlocksGrpcAdapter,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let (shutdown, shutdown_receiver) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(adapter.into_server())
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            });
+            let client = CompactTxStreamerClient::connect(endpoint).await?;
+            Ok(Self {
+                client,
+                shutdown,
+                server,
+            })
+        }
+
+        async fn stop(self) -> Result<(), Box<dyn std::error::Error>> {
+            drop(self.client);
+            let _ = self.shutdown.send(());
+            self.server.await??;
+            Ok(())
+        }
+    }
+
+    /// Serves heights `1..=tip_height`, where the block at `unconvertible`
+    /// carries a fee that lightwalletd's `uint32` fee field cannot hold.
+    async fn serve_a_chain_with_an_unconvertible_block(
+        tip_height: u32,
+        unconvertible: u32,
+    ) -> Result<
+        (ServedAdapter, zinder_testkit::WalletServingStoreFixture),
+        Box<dyn std::error::Error>,
+    > {
+        let chain = with_one_transaction_at(
+            zinder_testkit::ChainFixture::new(Network::ZcashRegtest).extend_blocks(tip_height),
+            unconvertible,
+            zinder_core::CompactTransactionData {
+                fee_zat: Some(u64::from(u32::MAX) + 1),
+                sapling_spends: vec![zinder_core::CompactSaplingSpend { nullifier: [7; 32] }],
+                ..zinder_core::CompactTransactionData::default()
+            },
+        )?;
+        let (reader, fixture) = large_block_reader(&chain)?;
+        Ok((
+            ServedAdapter::start(adapter_serving(&reader)).await?,
+            fixture,
+        ))
+    }
+
+    /// A first chunk with a block that cannot be converted fails the call
+    /// before the stream opens, so the client receives no block of it.
+    #[tokio::test]
+    async fn an_unconvertible_block_in_the_first_chunk_fails_the_call()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut served, _fixture) = serve_a_chain_with_an_unconvertible_block(3, 2).await?;
+
+        let refusal = served
+            .client
+            .get_block_range(block_range(1, 3))
+            .await
+            .err()
+            .ok_or("the call opened a stream over an unconvertible block")?;
+
+        assert_eq!(refusal.code(), Code::DataLoss, "{refusal:?}");
+        served.stop().await
+    }
+
+    /// A later chunk with a block that cannot be converted ends the stream
+    /// after the chunks before it, and sends no block of that chunk.
+    #[tokio::test]
+    async fn an_unconvertible_block_in_a_later_chunk_sends_none_of_that_chunk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut served, _fixture) =
+            serve_a_chain_with_an_unconvertible_block(1_005, 1_003).await?;
+
+        let mut stream = served
+            .client
+            .get_block_range(block_range(1, 1_005))
+            .await?
+            .into_inner();
+        let mut received = Vec::new();
+        let ending = loop {
+            match stream.message().await {
+                Ok(Some(block)) => received.push(block),
+                Ok(None) => break None,
+                Err(status) => break Some(status),
+            }
+        };
+
+        assert_eq!(ending.map(|status| status.code()), Some(Code::DataLoss));
+        assert_linked_from_genesis(&received, 1_000);
+        drop(stream);
+        served.stop().await
     }
 
     /// Returns how many block-range streams `rendered` reports open.

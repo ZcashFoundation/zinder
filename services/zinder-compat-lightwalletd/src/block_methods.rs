@@ -4,16 +4,16 @@
 //!
 //! Each mode supplies only its canonical reads, through
 //! [`CompactBlockReads`]: wallet serving reads through `WalletQueryApi` at its
-//! serving pair, and compact-blocks serving through the `CanonicalReader` of
-//! its published generation. A request captures one chain view and makes
-//! every read at it, so one response never mixes two chain epochs. A
-//! block-range stream reads its first chunk at that view and each later chunk
-//! at the view current when it is read, as the `block_range` module
-//! describes.
+//! serving pair, and compact-blocks serving through the
+//! `RocksDbCanonicalReader` of its published generation. A request captures
+//! one chain view and makes every read at it, so one response never mixes two
+//! chain epochs. A block-range stream reads its first chunk at that view and
+//! each later chunk at the view current when it is read, as the `block_range`
+//! module describes.
 //!
-//! A chunk's blocks become lightwalletd messages on the blocking pool, so a
-//! chunk of up to [`BLOCK_RANGE_CHUNK_MAX_BYTES`](crate::BLOCK_RANGE_CHUNK_MAX_BYTES)
-//! never holds a reactor thread while it is converted.
+//! A chunk's lightwalletd messages are built on the blocking pool, and a
+//! chunk whose blocks cannot all be converted sends none of them. Tonic
+//! encodes the messages to protobuf on the async runtime as it sends them.
 
 use std::{
     num::NonZeroU32,
@@ -38,10 +38,6 @@ use crate::compact_block_messages::{CompactBlockShape, compact_block_to_lightwal
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
-
-/// Blocks a slow block-range client can stall behind, on top of the chunk the
-/// stream's reader is sending.
-const BLOCK_RANGE_CHANNEL_CAPACITY: usize = 16;
 
 /// The chain view a chunk read answers at.
 pub(crate) enum ChunkView<View> {
@@ -116,6 +112,10 @@ pub(crate) enum RequestedBlock {
 pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// One captured chain view, which every read of one request answers at.
     type View: Send + Sync + 'static;
+
+    /// Blocks a block-range stream queues ahead of a slow client, on top of
+    /// the chunk the stream's reader is sending.
+    const BLOCK_RANGE_QUEUE_CAPACITY: usize;
 
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
@@ -318,7 +318,7 @@ impl BlockMethods {
             block_range.end,
             Reads::view_chain_epoch(&view).visible_tip_height,
         )?;
-        let encoding = ChunkEncoding {
+        let conversion = ChunkConversion {
             shape,
             is_descending,
         };
@@ -327,18 +327,18 @@ impl BlockMethods {
                 reads.clone(),
                 view,
                 BlockRangeChunks::new(block_range, is_descending),
-                encoding,
+                conversion,
             ))
             .await?;
         let Some((chunks, continuity)) = later_chunks else {
             return Ok(stream_slot.hold_for(first_messages));
         };
         let reads = reads.clone();
-        Ok(
-            stream_slot.hold_with_reader(first_messages, BLOCK_RANGE_CHANNEL_CAPACITY, |sink| {
-                stream_later_chunks(reads, chunks, continuity, encoding, sink)
-            }),
-        )
+        Ok(stream_slot.hold_with_reader(
+            first_messages,
+            Reads::BLOCK_RANGE_QUEUE_CAPACITY,
+            |sink| stream_later_chunks(reads, chunks, continuity, conversion, sink),
+        ))
     }
 
     /// Captures the current view, reads the times of its tip for the tip call
@@ -526,34 +526,34 @@ fn lightd_info(
 
 /// How a block-range stream shapes and orders the blocks it sends.
 #[derive(Clone, Copy)]
-struct ChunkEncoding {
+struct ChunkConversion {
     shape: CompactBlockShape,
     is_descending: bool,
 }
 
+/// The messages of one chunk, as the response stream yields them. Each is
+/// `Ok`, because a chunk that cannot be converted fails whole.
 type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
 
 /// The chunks after the first, and the continuity the next must follow.
 type LaterChunks = Option<(BlockRangeChunks, BlockRangeContinuity)>;
 
-impl ChunkEncoding {
+impl ChunkConversion {
     /// Converts a chunk's blocks, in ascending height order, to the messages
-    /// the stream sends, in its order. The messages end at the first block
-    /// that cannot be converted, with its status.
-    fn messages(self, mut blocks: Vec<CompactBlockArtifact>) -> ChunkMessages {
+    /// the stream sends, in its order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the status of the first block that cannot be converted, and
+    /// no message, so a stream never sends part of a chunk.
+    fn messages(self, mut blocks: Vec<CompactBlockArtifact>) -> Result<ChunkMessages, Status> {
         if self.is_descending {
             blocks.reverse();
         }
-        let mut messages = Vec::with_capacity(blocks.len());
-        for block in &blocks {
-            let message = self.shape.message(block);
-            let unconvertible = message.is_err();
-            messages.push(message);
-            if unconvertible {
-                break;
-            }
-        }
-        messages
+        blocks
+            .iter()
+            .map(|block| self.shape.message(block).map(Ok))
+            .collect()
     }
 }
 
@@ -570,10 +570,10 @@ struct ChunkTimings {
 }
 
 impl ChunkTimings {
-    /// Runs `encode` and keeps how long it took as the convert stage.
-    fn time_convert<Output>(&mut self, encode: impl FnOnce() -> Output) -> Output {
+    /// Runs `convert` and keeps how long it took as the convert stage.
+    fn time_convert<Output>(&mut self, convert: impl FnOnce() -> Output) -> Output {
         let started_at = Instant::now();
-        let output = encode();
+        let output = convert();
         self.convert = Some(started_at.elapsed());
         output
     }
@@ -600,7 +600,7 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
     reads: Reads,
     view: Reads::View,
     mut chunks: BlockRangeChunks,
-    encoding: ChunkEncoding,
+    conversion: ChunkConversion,
 ) -> Result<(ChunkMessages, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
@@ -615,13 +615,15 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
         let later_chunks = chunks
             .has_remaining()
             .then(|| {
-                BlockRangeContinuity::after_first_chunk(&blocks, read_at.id, encoding.is_descending)
-                    .map(|continuity| (chunks, continuity))
+                BlockRangeContinuity::after_first_chunk(
+                    &blocks,
+                    read_at.id,
+                    conversion.is_descending,
+                )
+                .map(|continuity| (chunks, continuity))
             })
             .transpose()?;
-        let messages = timings.time_convert(|| encoding.messages(blocks));
-        // An unconvertible block ends the stream, so no later chunk is read.
-        let later_chunks = later_chunks.filter(|_| messages.last().is_none_or(Result::is_ok));
+        let messages = timings.time_convert(|| conversion.messages(blocks))?;
         Ok((messages, later_chunks))
     })
     .await
@@ -638,18 +640,22 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 ///
 /// The task holds no view while it waits for a read or for the client, so a
 /// slow client cannot keep a serving pair or a generation from being
-/// replaced. A read failure, a reorg ending, or an unconvertible block ends
-/// the stream with that status, and a client that stops draining ends it on
-/// the next send.
+/// replaced. A read failure, a reorg ending, or a chunk that cannot be
+/// converted ends the stream with that status, and a client that stops
+/// draining ends it on the next send.
+///
+/// Before it reads the third chunk, the task waits until the client has
+/// taken every message of the first, so a stream reads at most two chunks
+/// ahead of a client that has not started, however few blocks each holds.
 async fn stream_later_chunks<Reads: CompactBlockReads>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    encoding: ChunkEncoding,
-    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
+    conversion: ChunkConversion,
+    mut sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
 ) {
     while let Some(chunk) = chunks.next_chunk() {
-        let messages = match read_later_chunk(&reads, chunk, chunks, continuity, encoding).await {
+        let messages = match read_later_chunk(&reads, chunk, chunks, continuity, conversion).await {
             Ok((next_chunks, next_continuity, messages)) => {
                 chunks = next_chunks;
                 continuity = next_continuity;
@@ -663,12 +669,11 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
         let sent_chunk = BlockRangeStage::Send
             .time_async(async {
                 for message in messages {
-                    let is_terminal = message.is_err();
-                    if sink.send(message).await.is_err() || is_terminal {
+                    if sink.send(message).await.is_err() {
                         return false;
                     }
                 }
-                true
+                sink.first_chunk_taken().await
             })
             .await;
         if !sent_chunk {
@@ -690,7 +695,7 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
     chunk: BlockHeightRange,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    encoding: ChunkEncoding,
+    conversion: ChunkConversion,
 ) -> Result<(BlockRangeChunks, BlockRangeContinuity, ChunkMessages), Status> {
     let read = ChunkRead {
         chunk,
@@ -702,7 +707,7 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
         let link = sent.link(chunk, read_at.id, &blocks);
         let kept_blocks = blocks.len();
         let messages = if link.continues() {
-            timings.time_convert(|| encoding.messages(blocks))
+            timings.time_convert(|| conversion.messages(blocks))?
         } else {
             Vec::new()
         };
@@ -812,6 +817,8 @@ mod tests {
 
     impl CompactBlockReads for SlowTipHeaderReads {
         type View = ChainEpoch;
+
+        const BLOCK_RANGE_QUEUE_CAPACITY: usize = 1;
 
         fn capture_view(&self) -> impl Future<Output = Result<ChainEpoch, Status>> + Send {
             std::future::ready(Ok(ChainEpoch {
