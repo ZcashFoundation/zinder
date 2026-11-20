@@ -54,20 +54,22 @@ impl LazyZinderGrpcChannel {
     /// Returns the cached channel, or waits for the dial in flight, starting
     /// one when none is.
     ///
-    /// Must be called within a Tokio runtime, which runs the dial.
+    /// Must be called within a Tokio runtime, which runs the dial. The call
+    /// fails with [`BearerTokenConnectError::DialAbandoned`] when that runtime
+    /// shuts down, or the dial panics, before the dial reports.
     pub async fn channel(&self) -> Result<AuthenticatedChannel, Arc<BearerTokenConnectError>> {
         loop {
-            let mut dial = {
+            let (mut dial, started_here) = {
                 let mut state = self.shared.state.lock();
                 match &*state {
                     DialState::Connected(channel) => return Ok(channel.clone()),
-                    DialState::Dialing(dial) => dial.clone(),
+                    DialState::Dialing(dial) => (dial.clone(), false),
                     DialState::Idle => {
                         let (outcome_sender, dial) = watch::channel(None);
                         *state = DialState::Dialing(dial.clone());
                         drop(state);
                         tokio::spawn(Arc::clone(&self.shared).dial(outcome_sender));
-                        dial
+                        (dial, true)
                     }
                 }
             };
@@ -76,10 +78,15 @@ impl LazyZinderGrpcChannel {
             {
                 return outcome.clone();
             }
-            // The dial task ended without reporting, which happens only when
-            // its runtime shut down. Forgetting that dial lets this caller
-            // start one on its own runtime that later callers share.
+            // The dial task ended without reporting: its runtime shut down, or
+            // the task panicked. A dial another caller started may have run on
+            // a runtime that has since stopped, so this caller starts one on
+            // its own runtime that later callers share. A dial this caller
+            // started would end the same way again.
             self.shared.reset_abandoned_dial(&dial);
+            if started_here {
+                return Err(Arc::new(BearerTokenConnectError::DialAbandoned));
+            }
         }
     }
 }
@@ -146,7 +153,10 @@ mod tests {
     use tonic::transport::Server;
 
     use super::LazyZinderGrpcChannel;
-    use crate::{DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, auth::BearerTokenConnectError};
+    use crate::{
+        DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT,
+        auth::{AuthenticatedChannel, BearerTokenConnectError},
+    };
 
     /// Accepts every connection and holds it open without answering, sending
     /// the client address of each one on the returned channel in the order
@@ -287,6 +297,61 @@ mod tests {
             "the abandoned dial and one dial the callers share"
         );
         assert!(format!("{lazy:?}").contains("connected"));
+        Ok(())
+    }
+
+    /// Runs `call` on a thread of its own and returns what it returns, or an
+    /// error when it has not returned within five seconds.
+    fn returned_within_five_seconds<T: Send + 'static>(
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let (returned, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = returned.send(call());
+        });
+        outcome
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "the call did not return within five seconds".into())
+    }
+
+    fn is_dial_abandoned(
+        outcome: &Result<AuthenticatedChannel, Arc<BearerTokenConnectError>>,
+    ) -> bool {
+        outcome
+            .as_ref()
+            .is_err_and(|error| matches!(**error, BearerTokenConnectError::DialAbandoned))
+    }
+
+    #[test]
+    fn a_dial_on_a_runtime_that_shut_down_fails_instead_of_dialing_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let lazy = LazyZinderGrpcChannel::new("http://127.0.0.1:9", None);
+
+        // The shut-down runtime drops every task spawned on it unpolled.
+        let outcome = returned_within_five_seconds(move || handle.block_on(lazy.channel()))?;
+
+        assert!(is_dial_abandoned(&outcome), "got {outcome:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dial_that_panics_fails_instead_of_dialing_again() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Without a time driver, the dial panics when it arms its timeout.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?;
+        let lazy = LazyZinderGrpcChannel::new("http://127.0.0.1:9", None);
+
+        let outcome = returned_within_five_seconds(move || runtime.block_on(lazy.channel()))?;
+
+        assert!(is_dial_abandoned(&outcome), "got {outcome:?}");
         Ok(())
     }
 

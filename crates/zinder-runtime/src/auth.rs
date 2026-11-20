@@ -243,7 +243,8 @@ pub fn bearer_metadata(
 /// client type.
 pub type AuthenticatedChannel = InterceptedService<Channel, BearerTokenClientInterceptor>;
 
-/// Errors returned by [`crate::transport::connect_zinder_grpc`].
+/// Errors returned by [`crate::transport::connect_zinder_grpc`] and
+/// [`crate::transport::LazyZinderGrpcChannel::channel`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BearerTokenConnectError {
@@ -259,6 +260,10 @@ pub enum BearerTokenConnectError {
         /// Bound the dial was given.
         connect_timeout: std::time::Duration,
     },
+    /// A [`crate::transport::LazyZinderGrpcChannel`] dial ended without an
+    /// outcome, because the runtime running it shut down or the dial panicked.
+    #[error("zinder gRPC dial ended without an outcome")]
+    DialAbandoned,
     /// TLS for an `https` endpoint could not be set up.
     #[error("zinder gRPC TLS setup failed: {reason}")]
     TlsSetup {
