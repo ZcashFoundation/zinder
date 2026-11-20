@@ -160,7 +160,7 @@ fn run_tip_reorg(args: RocksDbTipReorgArgs) -> Result<(), BenchError> {
             benchmark_version: env!("CARGO_PKG_VERSION").to_owned(),
             software_revision: plan.args.software_revision.clone(),
             label: plan.args.label.clone(),
-            build: super::report::BuildProvenance::of_this_binary(),
+            build: crate::build_provenance::BuildProvenance::of_this_binary(),
             host: super::report::HostProvenance::current(),
             started_at_unix_millis: started_at.value(),
             completed_at_unix_millis: UnixTimestampMillis::now().value(),

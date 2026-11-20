@@ -40,49 +40,10 @@ pub(super) struct Provenance {
     /// Source revision supplied by the operator with `--software-revision`.
     pub(super) software_revision: String,
     pub(super) label: Option<String>,
-    pub(super) build: BuildProvenance,
+    pub(super) build: crate::build_provenance::BuildProvenance,
     pub(super) host: HostProvenance,
     pub(super) started_at_unix_millis: u64,
     pub(super) completed_at_unix_millis: u64,
-}
-
-/// Compiler settings recorded by the build script.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct BuildProvenance {
-    /// Cargo profile directory, such as `release`, or `debug` for the dev profile.
-    pub(super) cargo_profile: String,
-    /// `release` or `debug`, the profile family Cargo reports to build scripts.
-    pub(super) cargo_profile_kind: String,
-    pub(super) opt_level: String,
-    pub(super) debug_info: String,
-    pub(super) debug_assertions: bool,
-    /// Every rustflag Cargo passed, from the environment or Cargo configuration.
-    pub(super) rustflags: String,
-    pub(super) rustc_version: String,
-    pub(super) target: String,
-}
-
-const BUILD_PROFILE: &str = env!("ZINDER_BENCH_BUILD_PROFILE");
-const BUILD_PROFILE_KIND: &str = env!("ZINDER_BENCH_BUILD_PROFILE_KIND");
-const BUILD_OPT_LEVEL: &str = env!("ZINDER_BENCH_BUILD_OPT_LEVEL");
-const BUILD_DEBUG_INFO: &str = env!("ZINDER_BENCH_BUILD_DEBUG_INFO");
-const BUILD_RUSTFLAGS: &str = env!("ZINDER_BENCH_BUILD_RUSTFLAGS");
-const BUILD_RUSTC_VERSION: &str = env!("ZINDER_BENCH_BUILD_RUSTC_VERSION");
-const BUILD_TARGET: &str = env!("ZINDER_BENCH_BUILD_TARGET");
-
-impl BuildProvenance {
-    pub(super) fn of_this_binary() -> Self {
-        Self {
-            cargo_profile: BUILD_PROFILE.to_owned(),
-            cargo_profile_kind: BUILD_PROFILE_KIND.to_owned(),
-            opt_level: BUILD_OPT_LEVEL.to_owned(),
-            debug_info: BUILD_DEBUG_INFO.to_owned(),
-            debug_assertions: cfg!(debug_assertions),
-            rustflags: BUILD_RUSTFLAGS.to_owned(),
-            rustc_version: BUILD_RUSTC_VERSION.to_owned(),
-            target: BUILD_TARGET.to_owned(),
-        }
-    }
 }
 
 /// Host the replay ran on.

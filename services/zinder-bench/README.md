@@ -672,6 +672,92 @@ checkpoint, the replayed blocks and note commitments, and its cold and warm
 seconds. `cold_seconds` and `warm_seconds` summarize the anchors as
 nearest-rank p50, p90, and p99 and the maximum.
 
+### Attribute compact-block and subtree-root reads
+
+Use the following release build to match the x86-64 CPU flags used in Zinder's
+release images. Keep the executable and inputs fixed when comparing read paths.
+
+```bash
+CARGO_TARGET_DIR=.tmp/target-v3 \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq" \
+  cargo build --release --locked -p zinder-bench
+
+bench=.tmp/target-v3/release/zinder-bench
+store=(--fixture ./fixtures/testnet --canonical-store ./candidate/canonical
+       --software-revision "$(git rev-parse HEAD)")
+mkdir -p .tmp/reads
+"$bench" rocksdb-compact-block-range "${store[@]}" \
+  --secondary-root .tmp/reads/ranges --rocksdb-statistics-level full \
+  --report .tmp/reads/ranges.json
+"$bench" rocksdb-subtree-roots "${store[@]}" --protocol orchard --max-entries 1000 \
+  --secondary-root .tmp/reads/roots --report .tmp/reads/roots.json
+"$bench" rocksdb-store-properties "${store[@]}" \
+  --secondary-root .tmp/reads/properties --report .tmp/reads/properties.json
+```
+
+These commands and `rocksdb-tree-state-replay` admit the READY primary
+read-only. Give each invocation an absent `--secondary-root` under an
+existing directory outside the primary. `--report` writes a new JSON file
+outside the primary. Omit it to print JSON to stdout. Set `--workload`
+(`wallet` or `explorer`), `--raw-blob-retention` (`none`, `transactions`, or
+`all`), and `--supported-reorg-depth` to the values persisted in the store.
+The defaults are `wallet`, `transactions`, and 1,000 blocks.
+
+The compact-block report (version 4) retains the 128-, 512-, and 1,024-block
+unbounded calls in `cases`. Each entry in `bounded_cases` measures one
+`compact_blocks_in_range_up_to` call over the same final 1,000 heights. The
+256 KiB opening budget and the 2 MiB steady budget each run independently in
+both directions. Descending reads select the high end of the range and return
+their rows in height order. A single oversized block occupies a whole chunk.
+Use `output.block_count`, `first_height`, `last_height`, and `stored_bytes` to
+see what fit. Throughput uses the returned block count. The structured digest
+checks that all four reads of a case agree.
+
+The subtree command measures one page in `--protocol` (`sapling` by default,
+`orchard`, or `ironwood`). Its default start is the first root completed in
+retained history. Use `--start-index` to select another page.
+`--max-entries` accepts 1 through 1,024 and defaults to 1,000. The visible
+tree bounds the page. The command requires at least one available root and
+checks the returned indices, root hashes, and completing blocks across reads.
+
+Each range and subtree case opens a fresh secondary for the direct read and
+another at the same READY fence for the query reader. **Cold** is the first
+measured read after admission. **Warm** repeats it on the same handle. Admission
+may already have populated the block cache, and the host page cache persists
+across opens. Tree replay uses one secondary for the window. Its checkpoint
+discovery and earlier anchors can warm later reads.
+
+`--rocksdb-statistics-level` defaults to `tickers`. At `off`, ticker and
+histogram deltas are null. At `tickers`, each read records DB-wide counter
+deltas for Gets, MultiGets, seeks, iterator steps, bytes, data and index cache
+hits and misses, file opens and errors, and prefetch. At `full`, each of the
+six read histograms also reports the change in sample count and sum in
+microseconds. **Full and Tickers runs are not directly comparable** because
+collecting the histograms adds work.
+
+All three read benchmarks measure thread-local PerfContext at every statistics
+level. Times are nanoseconds. Block read bytes include separate data, index, and
+filter counters. A cache hit can serve bytes without a file read. Query-reader
+latency includes dispatch to and return from the blocking pool, with counters
+sampled on the thread that performs the read. Timers exclude taking snapshots
+and hashing the output. Tree replay report version 2 adds `cold_counters` and
+`warm_counters` to each anchor. Each report records the cache budget, statistics
+level, host CPU model when available, Cargo profile, compiler, target, Rust
+flags, explicit target CPU, and compiled target features.
+
+### Inspect column-family properties
+
+`rocksdb-store-properties` reports the default family and every canonical
+data family from one admitted secondary. Each row includes total SST bytes,
+estimated live bytes, and the file count and estimated compression ratio at
+each level from 0 to 6. A null ratio means RocksDB has no estimate. The
+parsed aggregate table properties include index, filter, and data bytes,
+raw key and value bytes, and entry and block counts. RocksDB omits format
+versions from this aggregate, so `sst_files_by_format_version` counts the
+version in each live block-based SST's read-only footer. Compression ratios
+describe the existing files. Measuring savings from another codec requires a
+separate recompression run on copies.
+
 ## 7. Drive wallet-shaped load at an endpoint
 
 `lightwalletd-wallet-load` syncs a height range from a running

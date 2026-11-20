@@ -304,6 +304,61 @@ impl RocksDbCanonicalSecondary {
         });
     }
 
+    /// Returns this secondary's cumulative ticker, or zero with statistics off.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.bounded_open.statistics.get_ticker_count(ticker)
+    }
+
+    /// Snapshots a cumulative histogram on this secondary. Timer histograms
+    /// collect observations when the resource budget selects full statistics.
+    #[must_use]
+    pub fn rocksdb_histogram_data(
+        &self,
+        histogram: rust_rocksdb::statistics::Histogram,
+    ) -> rust_rocksdb::statistics::HistogramData {
+        self.bounded_open.statistics.get_histogram_data(histogram)
+    }
+
+    /// Returns the admitted column families, including the default family.
+    #[must_use]
+    pub fn rocksdb_column_family_names(&self) -> Vec<String> {
+        self.bounded_open.db.cf_names()
+    }
+
+    /// Reads one engine property at this secondary's view of a column family.
+    /// An unsupported property returns `None`.
+    pub fn rocksdb_property_value_cf(
+        &self,
+        family: &str,
+        property: &str,
+    ) -> Result<Option<String>, CanonicalStoreError> {
+        let db = &self.bounded_open.db;
+        let cf = db.cf_handle(family).ok_or_else(|| {
+            CanonicalStoreError::admission(
+                &self.primary_path,
+                format!("unknown column family {family}"),
+            )
+        })?;
+        db.property_value_cf(&cf, property).map_err(|source| {
+            CanonicalStoreError::RocksDbOperation {
+                operation: "read canonical secondary column family property",
+                source,
+            }
+        })
+    }
+
+    /// Lists the live SST metadata at the secondary's current view.
+    pub fn rocksdb_live_files(&self) -> Result<Vec<rust_rocksdb::LiveFile>, CanonicalStoreError> {
+        self.bounded_open
+            .db
+            .live_files()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "list canonical secondary live SSTs",
+                source,
+            })
+    }
+
     /// Samples the memory this secondary holds outside its block cache.
     #[must_use]
     pub fn instance_memory(&self) -> RocksDbInstanceMemory {

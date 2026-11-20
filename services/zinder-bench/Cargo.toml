@@ -36,6 +36,7 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zebra-chain.workspace = true
+zinder-compat-lightwalletd.workspace = true
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
 zinder-ingest.workspace = true
@@ -58,5 +59,4 @@ rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
 tower.workspace = true
-zinder-compat-lightwalletd.workspace = true
 zinder-testkit.workspace = true
