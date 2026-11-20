@@ -10,10 +10,10 @@ use crate::state_bundle::StateBundleError;
 
 use super::{
     CANONICAL_CHECKPOINT_DIRECTORY_NAME, RECOVERY_ARCHIVE_MANIFEST_FILE_NAME, RecoveryArchiveError,
-    STATE_BUNDLE_MANIFEST_FILE_NAME, WALLET_CHECKPOINT_DIRECTORY_NAME, admit_archive_contents,
-    copy_archive_payload, create_private_directory, publish_directory, read_archive_manifest,
-    require_absent, require_contract, resolve_existing_directory, sync_directory,
-    validate_absolute_lexical_path, with_private_workspace,
+    RecoveryValidationBudget, STATE_BUNDLE_MANIFEST_FILE_NAME, WALLET_CHECKPOINT_DIRECTORY_NAME,
+    admit_archive_contents, copy_archive_payload, create_private_directory, publish_directory,
+    read_archive_manifest, require_absent, require_contract, resolve_existing_directory,
+    sync_directory, validate_absolute_lexical_path, with_private_workspace,
 };
 
 /// Verifies a private backup against the independently retained SHA-256 of its outer manifest.
@@ -25,6 +25,7 @@ pub fn verify_private_backup(
     archive: &Path,
     network: Network,
     expected_sha256: &[u8; 32],
+    validation_budget: RecoveryValidationBudget,
 ) -> Result<(), RecoveryArchiveError> {
     let archive = resolve_existing_directory(&absolute_path(archive)?, "private backup")?;
     tracing::info!("verifying the private backup inventory");
@@ -47,7 +48,10 @@ pub fn verify_private_backup(
     let scratch = builder
         .tempdir_in(&temporary)
         .map_err(|source| RecoveryArchiveError::io(&temporary, source))?;
-    state_bundle.cold_admit_recovery_checkpoints(&archive, scratch.path())?;
+    state_bundle.cold_admit_recovery_checkpoints(
+        &archive,
+        validation_budget.wallet_admission(scratch.path()),
+    )?;
     scratch
         .close()
         .map_err(|source| RecoveryArchiveError::io(&temporary, source))
@@ -65,6 +69,7 @@ pub fn restore_private_backup(
     destination: &Path,
     network: Network,
     expected_sha256: &[u8; 32],
+    validation_budget: RecoveryValidationBudget,
 ) -> Result<(), RecoveryArchiveError> {
     let archive = resolve_existing_directory(&absolute_path(archive)?, "private backup")?;
     let destination = absolute_path(destination)?;
@@ -108,7 +113,8 @@ pub fn restore_private_backup(
         )?;
         let scratch = workspace.join("validation");
         create_private_directory(&scratch)?;
-        let observed = state_bundle.cold_admit_recovery_checkpoints(&pair, &scratch)?;
+        let observed = state_bundle
+            .cold_admit_recovery_checkpoints(&pair, validation_budget.wallet_admission(&scratch))?;
         let canonical = pair.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME);
         RocksDbCanonicalStore::release_restored_projection_leases(&canonical, &observed)
             .map_err(StateBundleError::CanonicalRecovery)?;
@@ -168,21 +174,31 @@ fn prepare_deployment_directory(pair: &Path) -> Result<(), RecoveryArchiveError>
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, num::NonZeroU32};
+    use std::{
+        error::Error,
+        num::{NonZeroU32, NonZeroU64},
+    };
 
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
-    use zinder_core::{BlockHeight, MempoolEvictionReason, TransactionId, UnixTimestampMillis};
+    use zinder_core::{
+        BlockHeight, MempoolEvictionReason, TransactionId, TransparentAddressScriptHash,
+        TransparentOutPoint, TransparentUnspentOutput, UnixTimestampMillis,
+    };
+    use zinder_rocksdb_bulk_load::BulkLoadError;
     use zinder_store::{
-        CanonicalEventHistoryRequest, ChainEventHistoryRequest, ChainEventStreamFamily,
-        MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest, ProjectionBuildLease,
-        ProjectionBuildLeaseId, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+        CanonicalEventHistoryRequest, ChainEventEnvelope, ChainEventHistoryRequest,
+        ChainEventStreamFamily, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
+        ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalSecondary,
+        RocksDbResourceBudget,
     };
     use zinder_testkit::{
-        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, TransparentTestKey,
+        sample_regtest_upgrade_activations,
     };
     use zinder_wallet_rocksdb::{
-        RocksDbWalletBuildOptions, RocksDbWalletStore, build_wallet_from_canonical,
+        RocksDbWalletBuildOptions, RocksDbWalletError, RocksDbWalletStore,
+        build_wallet_from_canonical,
     };
 
     use super::*;
@@ -226,15 +242,91 @@ mod tests {
 
     fn capture_fixture(root: &Path) -> eyre::Result<(PathBuf, [u8; 32])> {
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let credit_block = chain
+            .block_at(BlockHeight::new(2))
+            .ok_or_else(|| eyre::eyre!("missing credit block"))?;
+        let script = TransparentTestKey::from_seed(&[42; 32])?.address_script_bytes();
+        let credit = TransparentUnspentOutput::new(
+            TransparentAddressScriptHash::of_script_pub_key(&script),
+            script,
+            TransparentOutPoint::new(TransactionId::from_bytes([1; 32]), 0),
+            10,
+            credit_block.height,
+            credit_block.hash,
+        );
+        let chain = chain.with_address_output_index(credit);
         let mut writer = CanonicalWriterFixture::publish(
-            &CanonicalBaseline::new(&chain),
+            &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(1)),
             &sample_regtest_upgrade_activations(),
         )?;
         capture_checkpoints(root, &mut writer.take_canonical_primary()?)
     }
 
     #[test]
+    fn recovery_enforces_the_callers_wallet_validation_budgets() -> eyre::Result<()> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path();
+        let network = Network::ZcashRegtest;
+        let (staging, capture_digest) = capture_fixture(root)?;
+        let archive = root.join("backup");
+        let destination = root.join("restored");
+        let sufficient = RecoveryValidationBudget::default();
+        let low_memory = RecoveryValidationBudget {
+            max_sort_memory_bytes_per_sorter: NonZeroU64::MIN,
+            ..sufficient
+        };
+        let low_spill = RecoveryValidationBudget {
+            max_temporary_file_bytes_per_sorter: NonZeroU64::MIN,
+            ..sufficient
+        };
+        let low_undo = RecoveryValidationBudget {
+            max_accounted_reorg_undo_bytes: NonZeroU64::MIN,
+            ..sufficient
+        };
+        assert!(matches!(
+            export_private_backup(&staging, &archive, network, &capture_digest, low_memory),
+            Err(RecoveryArchiveError::StateBundle {
+                source: StateBundleError::WalletRecovery(RocksDbWalletError::BulkLoad(
+                    BulkLoadError::AccountedMemoryLimit { limit_bytes: 1, .. },
+                )),
+            })
+        ));
+        assert!(!archive.exists());
+        let digest =
+            export_private_backup(&staging, &archive, network, &capture_digest, sufficient)?;
+        assert!(matches!(
+            export_private_backup(&staging, &archive, network, &capture_digest, low_undo),
+            Err(RecoveryArchiveError::StateBundle {
+                source: StateBundleError::WalletRecovery(
+                    RocksDbWalletError::AccountedReorgUndoMemoryLimit { limit_bytes: 1, .. }
+                ),
+            })
+        ));
+        assert!(matches!(
+            verify_private_backup(&archive, network, &digest, low_spill),
+            Err(RecoveryArchiveError::StateBundle {
+                source: StateBundleError::WalletRecovery(RocksDbWalletError::BulkLoad(
+                    BulkLoadError::TemporaryFileLimit { limit_bytes: 1, .. },
+                )),
+            })
+        ));
+        assert!(matches!(
+            restore_private_backup(&archive, &destination, network, &digest, low_undo),
+            Err(RecoveryArchiveError::StateBundle {
+                source: StateBundleError::WalletRecovery(
+                    RocksDbWalletError::AccountedReorgUndoMemoryLimit { limit_bytes: 1, .. }
+                ),
+            })
+        ));
+        assert!(!destination.exists());
+        verify_private_backup(&archive, network, &digest, sufficient)?;
+        restore_private_backup(&archive, &destination, network, &digest, sufficient)?;
+        Ok(())
+    }
+
+    #[test]
     fn private_backup_requires_the_canonical_construction_manifest() -> eyre::Result<()> {
+        let validation_budget = RecoveryValidationBudget::default();
         let temporary = TempDir::new()?;
         let root = temporary.path();
         let (staging, capture_digest) = capture_fixture(root)?;
@@ -246,8 +338,14 @@ mod tests {
         )?;
         let archive = root.join("backup");
         assert!(
-            export_private_backup(&staging, &archive, Network::ZcashRegtest, &capture_digest)
-                .is_err()
+            export_private_backup(
+                &staging,
+                &archive,
+                Network::ZcashRegtest,
+                &capture_digest,
+                validation_budget
+            )
+            .is_err()
         );
         assert!(!archive.exists());
         Ok(())
@@ -256,6 +354,7 @@ mod tests {
     #[test]
     fn private_backup_refuses_mismatched_checkpoints_and_retries_after_repair() -> eyre::Result<()>
     {
+        let validation_budget = RecoveryValidationBudget::default();
         let temporary = TempDir::new()?;
         let root = temporary.path();
         let network = Network::ZcashRegtest;
@@ -270,14 +369,29 @@ mod tests {
         let (inner, inner_digest) = StateBundleManifest::read_with_sha256(&source, network)?;
         let archive = root.join("backup");
         assert!(matches!(
-            export_private_backup(&staging, &archive, network, &inner_digest),
+            export_private_backup(
+                &staging,
+                &archive,
+                network,
+                &inner_digest,
+                validation_budget
+            ),
             Err(RecoveryArchiveError::StateBundle { .. })
         ));
         assert!(!archive.exists());
         fs::write(&capture, &original)?;
-        assert!(export_private_backup(&staging, &archive, network, &[0; 32]).is_err());
+        assert!(
+            export_private_backup(&staging, &archive, network, &[0; 32], validation_budget)
+                .is_err()
+        );
         assert!(!archive.exists());
-        let digest = export_private_backup(&staging, &archive, network, &capture_digest)?;
+        let digest = export_private_backup(
+            &staging,
+            &archive,
+            network,
+            &capture_digest,
+            validation_budget,
+        )?;
         assert_eq!(
             digest,
             <[u8; 32]>::from(Sha256::digest(fs::read(
@@ -285,7 +399,13 @@ mod tests {
             )?))
         );
         assert_eq!(
-            export_private_backup(&staging, &archive, network, &capture_digest)?,
+            export_private_backup(
+                &staging,
+                &archive,
+                network,
+                &capture_digest,
+                validation_budget
+            )?,
             digest
         );
 
@@ -301,12 +421,12 @@ mod tests {
         fs::write(archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME), encoded)?;
         admit_recovery_archive(root, "backup", network)?;
         assert!(matches!(
-            verify_private_backup(&archive, network, &digest),
+            verify_private_backup(&archive, network, &digest, validation_budget),
             Err(RecoveryArchiveError::StateBundle { .. })
         ));
         let destination = root.join("mismatched-restore");
         assert!(matches!(
-            restore_private_backup(&archive, &destination, network, &digest),
+            restore_private_backup(&archive, &destination, network, &digest, validation_budget),
             Err(RecoveryArchiveError::StateBundle { .. })
         ));
         assert!(!destination.exists());
@@ -388,12 +508,39 @@ mod tests {
         Ok(())
     }
 
+    fn assert_restored_reader_resumes_cursor(
+        source: &RocksDbCanonicalStore,
+        restored_primary: &Path,
+        secondary: &Path,
+        captured_history: &[ChainEventEnvelope],
+    ) -> eyre::Result<()> {
+        let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+            restored_primary,
+            secondary,
+            source.network(),
+            source.workload(),
+            source.raw_blob_retention(),
+            source.reorg_policy(),
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reader.wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
+                Some(&captured_history[0].cursor),
+                ChainEventStreamFamily::Visible,
+                NonZeroU32::MIN,
+            ))?,
+            &captured_history[1..]
+        );
+        Ok(())
+    }
+
     fn assert_corruption_refused(
         archive: &Path,
         network: Network,
         digest: &[u8; 32],
         root: &Path,
     ) -> eyre::Result<()> {
+        let validation_budget = RecoveryValidationBudget::default();
         fs::write(
             archive
                 .join(WALLET_CHECKPOINT_DIRECTORY_NAME)
@@ -401,8 +548,10 @@ mod tests {
             b"damaged",
         )?;
         let refused = root.join("refused");
-        assert!(verify_private_backup(archive, network, digest).is_err());
-        assert!(restore_private_backup(archive, &refused, network, digest).is_err());
+        assert!(verify_private_backup(archive, network, digest, validation_budget).is_err());
+        assert!(
+            restore_private_backup(archive, &refused, network, digest, validation_budget).is_err()
+        );
         assert!(!refused.exists());
         Ok(())
     }
@@ -410,6 +559,7 @@ mod tests {
     #[test]
     fn private_restore_preserves_retained_cursor_history_and_releases_old_build_leases()
     -> eyre::Result<()> {
+        let validation_budget = RecoveryValidationBudget::default();
         let temporary = TempDir::new()?;
         let root = temporary.path();
         let network = Network::ZcashRegtest;
@@ -451,40 +601,37 @@ mod tests {
 
         let (staging, capture_digest) = capture_checkpoints(root, &mut owner)?;
         let archive = root.join("backup");
-        let digest = export_private_backup(&staging, &archive, network, &capture_digest)?;
+        let digest = export_private_backup(
+            &staging,
+            &archive,
+            network,
+            &capture_digest,
+            validation_budget,
+        )?;
         let destination = root.join("restored");
         assert!(
-            restore_private_backup(&archive, &destination, Network::ZcashMainnet, &digest).is_err()
+            restore_private_backup(
+                &archive,
+                &destination,
+                Network::ZcashMainnet,
+                &digest,
+                validation_budget
+            )
+            .is_err()
         );
         assert!(!destination.exists());
-        verify_private_backup(&archive, network, &digest)?;
-        restore_private_backup(&archive, &destination, network, &digest)?;
+        verify_private_backup(&archive, network, &digest, validation_budget)?;
+        restore_private_backup(&archive, &destination, network, &digest, validation_budget)?;
         assert_eq!(fs::read_dir(&destination)?.count(), 2);
         assert!(destination.join("wallet/CURRENT").is_file());
         let canonical = destination.join("canonical");
         let restored = open_owner(&canonical)?;
         assert_new_lease_generation(&owner, &restored, lease, now)?;
         assert_mempool_stops_at_capture(&owner, &restored, mempool)?;
-        let after = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
-            &canonical,
-            root.join("after"),
-            network,
-            workload,
-            retention,
-            policy,
-            budget,
-        )?;
-        assert_eq!(
-            after.wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
-                Some(&history[0].cursor),
-                ChainEventStreamFamily::Visible,
-                NonZeroU32::MIN
-            ))?,
-            &history[1..]
-        );
-        verify_private_backup(&archive, network, &digest)?;
+        assert_restored_reader_resumes_cursor(&owner, &canonical, &root.join("after"), &history)?;
+        verify_private_backup(&archive, network, &digest, validation_budget)?;
         assert!(matches!(
-            restore_private_backup(&archive, &destination, network, &digest),
+            restore_private_backup(&archive, &destination, network, &digest, validation_budget),
             Err(RecoveryArchiveError::TargetExists { .. })
         ));
 
@@ -494,6 +641,7 @@ mod tests {
     #[test]
     fn trusted_digest_is_checked_before_decoding_the_outer_manifest() -> Result<(), Box<dyn Error>>
     {
+        let validation_budget = RecoveryValidationBudget::default();
         let temporary = TempDir::new()?;
         let archive = temporary.path().join("private");
         fs::create_dir(&archive)?;
@@ -502,15 +650,20 @@ mod tests {
         let destination = temporary.path().join("destination");
         let network = Network::ZcashRegtest;
         assert!(matches!(
-            verify_private_backup(&archive, network, &[0; 32]),
+            verify_private_backup(&archive, network, &[0; 32], validation_budget),
             Err(RecoveryArchiveError::Contract { reason }) if reason.contains("trusted digest")
         ));
         assert!(matches!(
-            restore_private_backup(&archive, &destination, network, &[0; 32]),
+            restore_private_backup(&archive, &destination, network, &[0; 32], validation_budget),
             Err(RecoveryArchiveError::Contract { reason }) if reason.contains("trusted digest")
         ));
         assert!(matches!(
-            verify_private_backup(&archive, network, &Sha256::digest(manifest).into()),
+            verify_private_backup(
+                &archive,
+                network,
+                &Sha256::digest(manifest).into(),
+                validation_budget
+            ),
             Err(RecoveryArchiveError::ManifestDecode { .. })
         ));
         assert!(!destination.exists());
@@ -521,6 +674,7 @@ mod tests {
     #[test]
     fn restore_refuses_existing_directories_and_destinations_inside_the_archive()
     -> Result<(), Box<dyn Error>> {
+        let validation_budget = RecoveryValidationBudget::default();
         let temporary = TempDir::new()?;
         let archive = temporary.path().join("private");
         fs::create_dir(&archive)?;
@@ -528,13 +682,19 @@ mod tests {
         fs::create_dir(&destination)?;
         for target in [&destination, &archive] {
             assert!(matches!(
-                restore_private_backup(&archive, target, Network::ZcashRegtest, &[0; 32]),
+                restore_private_backup(
+                    &archive,
+                    target,
+                    Network::ZcashRegtest,
+                    &[0; 32],
+                    validation_budget
+                ),
                 Err(RecoveryArchiveError::TargetExists { .. })
             ));
         }
         let nested = archive.join("deployment");
         assert!(matches!(
-            restore_private_backup(&archive, &nested, Network::ZcashRegtest, &[0; 32]),
+            restore_private_backup(&archive, &nested, Network::ZcashRegtest, &[0; 32], validation_budget),
             Err(RecoveryArchiveError::Contract { reason }) if reason.contains("outside the backup")
         ));
         assert_eq!(fs::read_dir(&archive)?.count(), 0);

@@ -1,8 +1,10 @@
 //! Private backup operations on the projector release binary.
 
 use std::{
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{Args, Subcommand};
@@ -10,7 +12,7 @@ use hex::FromHex;
 use thiserror::Error;
 use zinder_core::{Network, wire::decode_zinder_native_chain_name};
 use zinder_projector::recovery_archive::{
-    RecoveryArchiveError, export_private_backup, restore_private_backup,
+    RecoveryArchiveError, RecoveryValidationBudget, export_private_backup, restore_private_backup,
     validate_private_backup_destination, verify_private_backup,
 };
 use zinder_proto::v1::ingest::{
@@ -36,6 +38,11 @@ pub(super) enum RecoveryCommand {
         /// letters, digits, or interior hyphens. Choose a new name for a new capture.
         #[arg(long)]
         archive: PathBuf,
+        /// Maximum seconds to wait for the owner to return a capture receipt.
+        #[arg(long, default_value = "3600", value_name = "SECONDS")]
+        capture_timeout_seconds: NonZeroU32,
+        #[command(flatten)]
+        validation: ValidationArgs,
     },
     /// Verify a private backup against the SHA-256 recorded at capture.
     Verify(ArchiveArgs),
@@ -60,6 +67,31 @@ pub(super) struct ArchiveArgs {
     /// Expected outer manifest SHA-256 (64 hex characters) recorded when the archive was created.
     #[arg(long, value_parser = parse_sha256, value_name = "HEX")]
     sha256: [u8; 32],
+    #[command(flatten)]
+    validation: ValidationArgs,
+}
+
+#[derive(Args)]
+pub(super) struct ValidationArgs {
+    /// Maximum memory in bytes per sorter while validating the wallet checkpoint.
+    #[arg(long = "max-sort-memory-bytes-per-sorter", value_name = "BYTES", default_value_t = RecoveryValidationBudget::default().max_sort_memory_bytes_per_sorter)]
+    sort_memory_bytes_per_sorter: NonZeroU64,
+    /// Maximum temporary file bytes per sorter while validating the wallet checkpoint.
+    #[arg(long = "max-temporary-file-bytes-per-sorter", value_name = "BYTES", default_value_t = RecoveryValidationBudget::default().max_temporary_file_bytes_per_sorter)]
+    temporary_file_bytes_per_sorter: NonZeroU64,
+    /// Maximum accounted reorg undo bytes while validating the wallet checkpoint.
+    #[arg(long = "max-accounted-reorg-undo-bytes", value_name = "BYTES", default_value_t = RecoveryValidationBudget::default().max_accounted_reorg_undo_bytes)]
+    accounted_reorg_undo_bytes: NonZeroU64,
+}
+
+impl From<ValidationArgs> for RecoveryValidationBudget {
+    fn from(args: ValidationArgs) -> Self {
+        Self {
+            max_sort_memory_bytes_per_sorter: args.sort_memory_bytes_per_sorter,
+            max_temporary_file_bytes_per_sorter: args.temporary_file_bytes_per_sorter,
+            max_accounted_reorg_undo_bytes: args.accounted_reorg_undo_bytes,
+        }
+    }
 }
 
 fn parse_sha256(input: &str) -> Result<[u8; 32], hex::FromHexError> {
@@ -76,6 +108,13 @@ enum RecoveryCommandError {
     Connect(#[from] BearerTokenConnectError),
     #[error("projector capture failed ({code}): {message}")]
     Capture { code: tonic::Code, message: String },
+    #[error(
+        "timed out after {seconds}s waiting for the capture receipt for '{candidate}'. The owner may still complete the capture. Retry with the same --archive path"
+    )]
+    CaptureTimeout {
+        candidate: String,
+        seconds: NonZeroU32,
+    },
     #[error(transparent)]
     StagedCapture(#[from] CaptureReceiptError),
     #[error("the projector capture receipt does not match the staged manifest")]
@@ -92,21 +131,43 @@ impl RecoveryCommand {
     )]
     pub(super) async fn run(self, mut cli: Cli) -> ExitCode {
         let outcome = match self {
-            Self::Backup { archive } => {
+            Self::Backup {
+                archive,
+                capture_timeout_seconds,
+                validation,
+            } => {
                 let path = cli.config_path.take();
                 match load_backup_config(path, cli.into()) {
-                    Ok((network, control)) => backup(&archive, network, &control).await,
+                    Ok((network, control)) => {
+                        backup(
+                            &archive,
+                            network,
+                            &control,
+                            capture_timeout_seconds,
+                            validation.into(),
+                        )
+                        .await
+                    }
                     Err(error) => Err(error.into()),
                 }
             }
-            Self::Verify(args) => verify_private_backup(&args.archive, args.network, &args.sha256)
-                .map(|()| args.sha256)
-                .map_err(RecoveryCommandError::from),
-            Self::Restore { backup, into } => {
-                restore_private_backup(&backup.archive, &into, backup.network, &backup.sha256)
-                    .map(|()| backup.sha256)
-                    .map_err(RecoveryCommandError::from)
-            }
+            Self::Verify(args) => verify_private_backup(
+                &args.archive,
+                args.network,
+                &args.sha256,
+                args.validation.into(),
+            )
+            .map(|()| args.sha256)
+            .map_err(RecoveryCommandError::from),
+            Self::Restore { backup, into } => restore_private_backup(
+                &backup.archive,
+                &into,
+                backup.network,
+                &backup.sha256,
+                backup.validation.into(),
+            )
+            .map(|()| backup.sha256)
+            .map_err(RecoveryCommandError::from),
         };
         match outcome {
             Ok(digest) => {
@@ -128,6 +189,8 @@ async fn backup(
     archive: &Path,
     network: Network,
     control: &ResolvedProjectorControl,
+    capture_timeout_seconds: NonZeroU32,
+    validation: RecoveryValidationBudget,
 ) -> Result<[u8; 32], RecoveryCommandError> {
     let (Some(address), Some(token)) = (control.listen_addr, control.bearer_token.as_ref()) else {
         return Err(RecoveryCommandError::ControlDisabled);
@@ -139,17 +202,24 @@ async fn backup(
         "requesting a coherent checkpoint from the projector"
     );
     let channel = connect_zinder_grpc(&format!("http://{address}"), Some(token)).await?;
-    let receipt = ProjectorControlClient::new(channel)
-        .create_state_bundle_capture(CreateStateBundleCaptureRequest {
+    let mut client = ProjectorControlClient::new(channel);
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(capture_timeout_seconds.get().into()),
+        client.create_state_bundle_capture(CreateStateBundleCaptureRequest {
             candidate_id: candidate.to_owned(),
             reuse_completed: true,
-        })
-        .await
-        .map_err(|status| RecoveryCommandError::Capture {
-            code: status.code(),
-            message: status.message().to_owned(),
-        })?
-        .into_inner();
+        }),
+    )
+    .await
+    .map_err(|_| RecoveryCommandError::CaptureTimeout {
+        candidate: candidate.to_owned(),
+        seconds: capture_timeout_seconds,
+    })?
+    .map_err(|status| RecoveryCommandError::Capture {
+        code: status.code(),
+        message: status.message().to_owned(),
+    })?
+    .into_inner();
     let (staged_receipt, digest) =
         read_capture_receipt(&staging_root.join(candidate), candidate, network, None)?;
     if staged_receipt != receipt {
@@ -160,5 +230,6 @@ async fn backup(
         archive,
         network,
         &digest,
+        validation,
     )?)
 }

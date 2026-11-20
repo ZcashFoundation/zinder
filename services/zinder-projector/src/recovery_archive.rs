@@ -12,6 +12,7 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::{self, Read, Write},
+    num::NonZeroU64,
     path::{Component, Path, PathBuf},
 };
 
@@ -21,8 +22,9 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
-    RocksDbCanonicalStore,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
+use zinder_wallet_rocksdb::WalletRecoveryAdmissionConfig;
 
 use crate::state_bundle::{
     CANONICAL_CHECKPOINT_DIRECTORY_NAME, STATE_BUNDLE_MANIFEST_FILE_NAME, StateBundleError,
@@ -57,6 +59,46 @@ pub const MAX_RECOVERY_ARCHIVE_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 const RECOVERY_ARCHIVE_TEMPORARY_FILE_NAME: &str = ".recovery-archive.json.incomplete";
 const RECOVERY_ARCHIVE_FILE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Resource ceilings for the local semantic scan of a wallet checkpoint.
+///
+/// The operator supplies these limits independently of the archive. The default
+/// allows 128 MiB of memory and 192 GiB of temporary files per sorter, and
+/// 512 MiB of accounted reorg undo data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryValidationBudget {
+    /// Accounted memory available to each external sorter. Defaults to 128 MiB.
+    pub max_sort_memory_bytes_per_sorter: NonZeroU64,
+    /// Temporary file space available to each external sorter. Defaults to 192 GiB.
+    pub max_temporary_file_bytes_per_sorter: NonZeroU64,
+    /// Accounted memory for rebuilding the retained reorg undo history. Defaults to 512 MiB.
+    pub max_accounted_reorg_undo_bytes: NonZeroU64,
+}
+
+impl Default for RecoveryValidationBudget {
+    fn default() -> Self {
+        Self {
+            max_sort_memory_bytes_per_sorter: NonZeroU64::new(128 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            max_temporary_file_bytes_per_sorter: NonZeroU64::new(192 * 1024 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+            max_accounted_reorg_undo_bytes: NonZeroU64::new(512 * 1024 * 1024)
+                .unwrap_or(NonZeroU64::MIN),
+        }
+    }
+}
+
+impl RecoveryValidationBudget {
+    fn wallet_admission(self, staging_path: &Path) -> WalletRecoveryAdmissionConfig<'_> {
+        WalletRecoveryAdmissionConfig {
+            staging_path,
+            resource_budget: RocksDbResourceBudget::read_only_probe_defaults(),
+            max_sort_memory_bytes_per_sorter: self.max_sort_memory_bytes_per_sorter.get(),
+            max_temporary_file_bytes_per_sorter: self.max_temporary_file_bytes_per_sorter.get(),
+            max_accounted_reorg_undo_bytes: self.max_accounted_reorg_undo_bytes.get(),
+        }
+    }
+}
 
 /// Immutable-at-admission descriptor for one byte-verified recovery artifact.
 ///

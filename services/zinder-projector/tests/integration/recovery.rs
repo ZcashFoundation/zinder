@@ -168,16 +168,22 @@ async fn capture_with_owner(
         Ok::<(), eyre::Report>(())
     })
     .await??;
-    let mut backup = projector(root);
-    backup
-        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
-        .env("ZINDER_WALLET_SERVING__LIGHTWALLETD", "true")
-        .args(["--config", "projector.toml", "backup", "--archive"])
-        .arg(archive);
-    let pin = receipt(&mut backup).await?;
+    let backup = || {
+        let mut command = projector(root);
+        command
+            .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+            .env("ZINDER_WALLET_SERVING__LIGHTWALLETD", "true")
+            .args(["--config", "projector.toml", "backup", "--archive"])
+            .arg(archive);
+        command
+    };
+    assert_insufficient_sort_memory(backup()).await?;
+    assert!(!archive.exists());
+    let pin = receipt(&mut backup()).await?;
     let manifest = fs::read(archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME))?;
     assert_eq!(pin, hex::encode(Sha256::digest(manifest)));
-    assert_eq!(receipt(&mut backup).await?, pin);
+    assert_insufficient_sort_memory(backup()).await?;
+    assert_eq!(receipt(&mut backup()).await?, pin);
     owner.kill().await?;
     fs::remove_dir_all(root.join("staging"))?;
     fs::remove_file(root.join("projector.toml"))?;
@@ -208,11 +214,31 @@ async fn verify_and_restore_offline(root: &Path, archive: &Path, pin: &str) -> R
         assert!(!bad.status.success(), "{bad:?}");
         assert_eq!(bad.stdout, b"");
         assert!(String::from_utf8(bad.stderr)?.contains("trusted digest"));
+        assert_insufficient_sort_memory(command(pin)).await?;
         assert!(!destination.exists());
         assert_eq!(receipt(&mut command(pin)).await?, pin);
     }
     assert!(destination.join("canonical/CURRENT").is_file());
     assert!(destination.join("wallet/CURRENT").is_file());
+    Ok(())
+}
+
+async fn assert_insufficient_sort_memory(mut command: Command) -> Result<()> {
+    let output = timeout(
+        WAIT,
+        command
+            .args(["--max-sort-memory-bytes-per-sorter", "1"])
+            .output(),
+    )
+    .await??;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("wallet recovery checkpoint admission failed")
+            && stderr.contains("accounted bytes, limit is 1"),
+        "{stderr}"
+    );
     Ok(())
 }
 

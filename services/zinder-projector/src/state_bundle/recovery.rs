@@ -6,10 +6,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigest, NetworkUpgradeActivationsFingerprintVersion,
     ShieldedProtocol,
 };
-use zinder_store::{
-    CanonicalOwnerCheckpointEvidence, CanonicalReorgPolicy, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
-};
+use zinder_store::{CanonicalOwnerCheckpointEvidence, CanonicalReorgPolicy, RocksDbCanonicalStore};
 use zinder_wallet_rocksdb::{RocksDbWalletFollowingStore, WalletRecoveryAdmissionConfig};
 
 use super::{
@@ -38,7 +35,7 @@ impl StateBundleManifest {
     pub(crate) fn cold_admit_recovery_checkpoints(
         &self,
         root: &Path,
-        scratch: &Path,
+        wallet_admission: WalletRecoveryAdmissionConfig<'_>,
     ) -> Result<CanonicalOwnerCheckpointEvidence, StateBundleError> {
         require_manifest_value(
             self.fence.network_upgrade_schedule.is_some(),
@@ -68,13 +65,7 @@ impl StateBundleManifest {
         let observed = RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
             root.join(WALLET_CHECKPOINT_DIRECTORY_NAME),
             network,
-            WalletRecoveryAdmissionConfig {
-                staging_path: scratch,
-                resource_budget: RocksDbResourceBudget::read_only_probe_defaults(),
-                max_sort_memory_bytes_per_sorter: 128 * 1024 * 1024,
-                max_temporary_file_bytes_per_sorter: 192 * 1024 * 1024 * 1024,
-                max_accounted_reorg_undo_bytes: 512 * 1024 * 1024,
-            },
+            wallet_admission,
         )
         .map_err(StateBundleError::WalletRecovery)?;
         let wallet = WalletAdmission::try_from(&observed)?;

@@ -1,6 +1,16 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use tempfile::tempdir;
+use tonic::{Request, Response, Status};
+use zinder_proto::v1::ingest::{
+    CreateStateBundleCaptureRequest, CreateStateBundleCaptureResponse,
+    projector_control_server::ProjectorControl,
+};
 
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
@@ -34,31 +44,34 @@ fn private_backup_requires_authenticated_owner_control() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn backup_presents_the_control_token_and_reuses_the_named_candidate() -> eyre::Result<()> {
-    use std::str::FromStr as _;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::{Request, Response, Status};
-    use zinder_proto::v1::ingest::{
-        CreateStateBundleCaptureRequest, CreateStateBundleCaptureResponse,
-        projector_control_server::{ProjectorControl, ProjectorControlServer},
-    };
-    use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
-
-    struct Owner;
-    #[tonic::async_trait]
-    impl ProjectorControl for Owner {
-        async fn create_state_bundle_capture(
-            &self,
-            request: Request<CreateStateBundleCaptureRequest>,
-        ) -> Result<Response<CreateStateBundleCaptureResponse>, Status> {
-            let request = request.into_inner();
-            if request.candidate_id != "wallet-backup" || !request.reuse_completed {
-                return Err(Status::invalid_argument("unexpected capture request"));
-            }
-            Err(Status::failed_precondition("incomplete capture"))
+#[derive(Default)]
+struct StalledCaptureOwner {
+    received_capture: AtomicBool,
+}
+#[tonic::async_trait]
+impl ProjectorControl for StalledCaptureOwner {
+    async fn create_state_bundle_capture(
+        &self,
+        request: Request<CreateStateBundleCaptureRequest>,
+    ) -> Result<Response<CreateStateBundleCaptureResponse>, Status> {
+        let request = request.into_inner();
+        if request.candidate_id != "wallet-backup" || !request.reuse_completed {
+            return Err(Status::invalid_argument("unexpected capture request"));
         }
+        if !self.received_capture.swap(true, Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        Err(Status::failed_precondition("incomplete capture"))
     }
+}
+
+#[tokio::test]
+async fn backup_times_out_waiting_for_the_owner_and_retries_the_named_candidate() -> eyre::Result<()>
+{
+    use std::{str::FromStr as _, time::Duration};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use zinder_proto::v1::ingest::projector_control_server::ProjectorControlServer;
+    use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 
     const TOKEN: &str = "fixture-projector-token";
     let directory = tempdir()?;
@@ -78,7 +91,7 @@ async fn backup_presents_the_control_token_and_reuses_the_named_candidate() -> e
         ),
     )?;
     let owner = ProjectorControlServer::with_interceptor(
-        Owner,
+        StalledCaptureOwner::default(),
         BearerTokenServerInterceptor::new(Some(BearerToken::from_str(TOKEN)?)),
     );
     let server = tokio::spawn(
@@ -87,13 +100,24 @@ async fn backup_presents_the_control_token_and_reuses_the_named_candidate() -> e
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     let archive = directory.path().join("wallet-backup");
-    let mut invocation = projector_command();
+    let mut invocation = tokio::process::Command::from(projector_command());
     invocation
+        .kill_on_drop(true)
         .arg("--config")
         .arg(config)
-        .args(["backup", "--archive"])
+        .args(["backup", "--capture-timeout-seconds", "1", "--archive"])
         .arg(&archive);
-    let output = tokio::task::spawn_blocking(move || invocation.output()).await??;
+    let timeout = tokio::time::timeout(Duration::from_secs(15), invocation.output()).await??;
+    assert!(!timeout.status.success());
+    let stderr = String::from_utf8(timeout.stderr)?;
+    assert!(stderr.contains("timed out after 1s"), "{stderr}");
+    assert!(stderr.contains("wallet-backup"), "{stderr}");
+    assert!(stderr.contains("Retry with the same --archive"), "{stderr}");
+    assert!(!stderr.contains(TOKEN));
+    assert_eq!(timeout.stdout, b"");
+    assert!(!archive.try_exists()?);
+
+    let output = tokio::time::timeout(Duration::from_secs(15), invocation.output()).await??;
     server.abort();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
@@ -101,6 +125,24 @@ async fn backup_presents_the_control_token_and_reuses_the_named_candidate() -> e
     assert!(!stderr.contains(TOKEN));
     assert_eq!(output.stdout, b"");
     assert!(!archive.try_exists()?);
+    Ok(())
+}
+
+#[test]
+fn backup_rejects_a_zero_capture_timeout() -> eyre::Result<()> {
+    let output = projector_command()
+        .args([
+            "backup",
+            "--capture-timeout-seconds",
+            "0",
+            "--archive",
+            "test",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("invalid value '0'"), "{stderr}");
+    assert!(stderr.contains("--capture-timeout-seconds"), "{stderr}");
     Ok(())
 }
 

@@ -22,6 +22,12 @@ archive=/srv/zinder-backups/wallet-20261120
 receipt=$(zinder-projector --config /etc/zinder/projector.toml backup --archive "$archive")
 ```
 
+Backup waits up to one hour for the projector to return the capture receipt.
+Set `--capture-timeout-seconds` to a positive number of seconds if the owner
+needs longer. If the wait expires, the owner may still finish the checkpoint.
+Retry with the same `--archive` path to recover its receipt. The deadline
+ends when the receipt arrives, before the local copy and validation begin.
+
 For a single-volume wallet container named `zinder-wallet`, mount the archive
 parent writable by the runtime user. Run this alternative in your host shell.
 
@@ -58,6 +64,20 @@ new name to capture a later block. If capture stopped before its manifest
 was published, use a fresh name. Once the off-host copy verifies, retire the
 corresponding checkpoint candidate and local archive according to your
 retention policy.
+
+## Choose wallet validation limits
+
+`backup`, `verify`, and `restore` accept the same three limits when checking the
+wallet database. Each command uses the defaults below unless you pass an
+override in bytes. For example, add `--max-accounted-reorg-undo-bytes 1073741824`
+to allow 1 GiB of accounted reorg undo data. Supply the override again for
+offline verification and restore on the replacement host.
+
+| Limit | Default | CLI flag |
+| --- | --- | --- |
+| Memory per sorter | 128 MiB | `--max-sort-memory-bytes-per-sorter` |
+| Temporary file space per sorter | 192 GiB | `--max-temporary-file-bytes-per-sorter` |
+| Accounted reorg undo data | 512 MiB | `--max-accounted-reorg-undo-bytes` |
 
 ## Restore on an empty host
 

@@ -5,14 +5,15 @@ use std::{fs, io, path::Path};
 use sha2::{Digest, Sha256};
 
 use zinder_core::Network;
+use zinder_wallet_rocksdb::WalletRecoveryAdmissionConfig;
 
 use super::{
     MAX_RECOVERY_ARCHIVE_MANIFEST_BYTES, PayloadLayout, RECOVERY_ARCHIVE_MANIFEST_FILE_NAME,
-    RecoveryArchiveError, RecoveryArchiveManifest, StateBundleManifest, admit_archive_contents,
-    collect_payload_files, copy_archive_payload, create_private_directory, publish_directory,
-    publish_manifest_last, read_bounded_regular_file, require_contract, resolve_existing_directory,
-    validate_absolute_lexical_path, validate_archive_root_entries, validate_candidate_id,
-    with_private_workspace,
+    RecoveryArchiveError, RecoveryArchiveManifest, RecoveryValidationBudget, StateBundleManifest,
+    admit_archive_contents, collect_payload_files, copy_archive_payload, create_private_directory,
+    publish_directory, publish_manifest_last, read_bounded_regular_file, require_contract,
+    resolve_existing_directory, validate_absolute_lexical_path, validate_archive_root_entries,
+    validate_candidate_id, with_private_workspace,
 };
 
 /// Validates the proposed archive path and returns its opaque owner capture identifier.
@@ -64,6 +65,7 @@ pub fn export_private_backup(
     archive: &Path,
     network: Network,
     expected_capture_sha256: &[u8; 32],
+    validation_budget: RecoveryValidationBudget,
 ) -> Result<[u8; 32], RecoveryArchiveError> {
     let candidate = validate_private_backup_destination(staging_root, archive)?;
     let source =
@@ -81,9 +83,9 @@ pub fn export_private_backup(
             return readmit_private_export(
                 &source,
                 archive,
-                workspace,
                 &manifest,
                 expected_capture_sha256,
+                validation_budget.wallet_admission(workspace),
             );
         }
         let target = workspace.join("archive");
@@ -103,7 +105,10 @@ pub fn export_private_backup(
             candidate,
             "verifying the private copy before sealing the backup"
         );
-        copied_manifest.cold_admit_recovery_checkpoints(&target, workspace)?;
+        copied_manifest.cold_admit_recovery_checkpoints(
+            &target,
+            validation_budget.wallet_admission(workspace),
+        )?;
         let outer = RecoveryArchiveManifest::from_state_bundle(
             &copied_manifest,
             hex::encode(copied_digest),
@@ -119,9 +124,9 @@ pub fn export_private_backup(
 fn readmit_private_export(
     source: &Path,
     archive: &Path,
-    scratch: &Path,
     captured: &StateBundleManifest,
     capture_digest: &[u8; 32],
+    wallet_admission: WalletRecoveryAdmissionConfig<'_>,
 ) -> Result<[u8; 32], RecoveryArchiveError> {
     let encoded = read_bounded_regular_file(
         &archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME),
@@ -141,7 +146,7 @@ fn readmit_private_export(
         "existing private backup differs from the authenticated owner capture",
     )?;
     require_private_archive_permissions(archive, &outer)?;
-    inner.cold_admit_recovery_checkpoints(archive, scratch)?;
+    inner.cold_admit_recovery_checkpoints(archive, wallet_admission)?;
     Ok(digest)
 }
 
