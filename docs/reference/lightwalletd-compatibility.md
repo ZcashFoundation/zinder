@@ -115,7 +115,7 @@ These outcomes fail the call before any block is sent:
 
 | Condition | Status |
 | --- | --- |
-| Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
+| Malformed request, including a missing bound or, for `GetBlockRange`, an invalid pool type | `INVALID_ARGUMENT` |
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
