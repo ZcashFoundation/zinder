@@ -34,7 +34,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use transport::TlsOptions;
 use zinder_bench::BenchError;
-use zinder_proto::compat::lightwalletd::{ChainSpec, CompactBlock, Empty};
+use zinder_proto::compat::lightwalletd::{CompactBlock, Empty};
 
 const DEFAULT_WALLETS: u32 = 1;
 const DEFAULT_TRANSACTIONS_PER_WALLET: u32 = 16;
@@ -187,6 +187,8 @@ pub(crate) struct LightwalletdWalletLoadReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
     server: ServerIdentity,
+    tip_before: setup::ObservedBlock,
+    tip_after: ClosingTip,
     from_height: u64,
     to_height: u64,
     wallets: u32,
@@ -218,6 +220,9 @@ pub(crate) struct LightwalletdWalletLoadReport {
     time_to_first_block_seconds: Percentiles,
     /// From a wallet's start to its last call, over completed wallets.
     wallet_sync_seconds: Percentiles,
+    /// SHA-256 of the sorted per-wallet request digests. Each wallet counts
+    /// its `GetBlockRange`, `GetTreeState`, and `GetTransaction` attempts.
+    wallet_request_identity_sha256: String,
     rpcs: BTreeMap<&'static str, RpcSummary>,
     tree_state_heights: TreeStateHeights,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +247,29 @@ struct ServerIdentity {
     chain_name: String,
     block_height: u64,
     latest_block_height: u64,
+}
+
+/// A failed closing probe preserves the wallet results while leaving the tip unverified.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ClosingTip {
+    Block(setup::ObservedBlock),
+    Unavailable { error: String },
+}
+
+impl ClosingTip {
+    async fn observe(connector: &Connector) -> Self {
+        let probe = async {
+            let mut client = connector.connect().await?;
+            setup::chain_tip(connector, &mut client).await
+        };
+        match probe.await {
+            Ok(block) => Self::Block(block),
+            Err(failure) => Self::Unavailable {
+                error: format!("{}: {}", failure.label, failure.detail),
+            },
+        }
+    }
 }
 
 /// Constants and settings the run's workload used.
@@ -433,7 +461,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
     let recorder = Arc::new(CallRecorder::default());
     let connector = Connector::new(&args.endpoint, Arc::clone(&recorder), &tls_options)
         .map_err(|reason| BenchError::invalid_argument(format!("--endpoint: {reason}")))?;
-    let (server, plan) = probe(&connector, &args).await?;
+    let (server, plan, tip_before) = probe(&connector, &args).await?;
     let probe_totals = RecordedTotals::of(&recorder);
     let plan = Arc::new(plan);
     let setup_connector = connector.with_recorder(Arc::default());
@@ -461,27 +489,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
         None => None,
     };
     let started = Instant::now();
-    let mut wallets = Vec::new();
-    for wallet_index in 0..args.wallets {
-        if wallet_index > 0 && args.wallet_start_interval_millis > 0 {
-            tokio::time::sleep(Duration::from_millis(args.wallet_start_interval_millis)).await;
-        }
-        wallets.push(tokio::spawn(sync_wallet(
-            args.workload,
-            connector.clone(),
-            Arc::clone(&plan),
-            Arc::clone(&settings),
-            wallet_index,
-        )));
-    }
-    let mut outcomes = Vec::with_capacity(wallets.len());
-    for wallet in wallets {
-        outcomes.push(
-            wallet
-                .await
-                .unwrap_or_else(|error| WalletOutcome::task_failed(&error)),
-        );
-    }
+    let outcomes = sync_wallets(&args, &connector, &plan, &settings).await;
     let wall = started.elapsed();
     let (server_observed, server_metrics_error) = match observation {
         Some(observation) => observation.finish().await,
@@ -492,6 +500,8 @@ pub(crate) async fn run_lightwalletd_wallet_load(
             &args,
             RunEvidence {
                 server,
+                tip_before,
+                tip_after: ClosingTip::observe(&setup_connector).await,
                 plan: &plan,
                 parameters,
                 wall,
@@ -580,6 +590,36 @@ impl WorkloadSettings {
     }
 }
 
+async fn sync_wallets(
+    args: &LightwalletdWalletLoadArgs,
+    connector: &Connector,
+    plan: &Arc<WalletPlan>,
+    settings: &Arc<WorkloadSettings>,
+) -> Vec<WalletOutcome> {
+    let mut wallets = Vec::new();
+    for wallet_index in 0..args.wallets {
+        if wallet_index > 0 && args.wallet_start_interval_millis > 0 {
+            tokio::time::sleep(Duration::from_millis(args.wallet_start_interval_millis)).await;
+        }
+        wallets.push(tokio::spawn(sync_wallet(
+            args.workload,
+            connector.for_wallet(),
+            Arc::clone(plan),
+            Arc::clone(settings),
+            wallet_index,
+        )));
+    }
+    let mut outcomes = Vec::with_capacity(wallets.len());
+    for wallet in wallets {
+        outcomes.push(
+            wallet
+                .await
+                .unwrap_or_else(|error| WalletOutcome::task_failed(&error)),
+        );
+    }
+    outcomes
+}
+
 async fn sync_wallet(
     workload: WalletWorkload,
     connector: Connector,
@@ -606,7 +646,7 @@ async fn sync_wallet(
 async fn probe(
     connector: &Connector,
     args: &LightwalletdWalletLoadArgs,
-) -> Result<(ServerIdentity, WalletPlan), BenchError> {
+) -> Result<(ServerIdentity, WalletPlan, setup::ObservedBlock), BenchError> {
     let unreachable = |failure: CallFailure| {
         BenchError::wallet_load_endpoint(format!(
             "probe failed with {}: {}",
@@ -622,14 +662,9 @@ async fn probe(
     )
     .await
     .map_err(unreachable)?;
-    let latest_block = calls::unary(
-        connector.recorder(),
-        "GetLatestBlock",
-        PROBE_DEADLINE,
-        client.get_latest_block(ChainSpec {}),
-    )
-    .await
-    .map_err(unreachable)?;
+    let latest_block = setup::chain_tip(connector, &mut client)
+        .await
+        .map_err(unreachable)?;
     let to_height = args.to_height.unwrap_or(latest_block.height);
     if to_height < args.from_height {
         return Err(BenchError::invalid_argument(format!(
@@ -651,12 +686,14 @@ async fn probe(
         block_height: lightd_info.block_height,
         latest_block_height: latest_block.height,
     };
-    Ok((server, plan))
+    Ok((server, plan, latest_block))
 }
 
 /// What one run left behind, before it is summarized.
 struct RunEvidence<'run> {
     server: ServerIdentity,
+    tip_before: setup::ObservedBlock,
+    tip_after: ClosingTip,
     plan: &'run WalletPlan,
     parameters: WorkloadParameters,
     wall: Duration,
@@ -706,6 +743,8 @@ impl LightwalletdWalletLoadReport {
     fn new(args: &LightwalletdWalletLoadArgs, run: RunEvidence<'_>) -> Self {
         let RunEvidence {
             server,
+            tip_before,
+            tip_after,
             plan,
             parameters,
             wall,
@@ -745,6 +784,8 @@ impl LightwalletdWalletLoadReport {
             endpoint: args.endpoint.clone(),
             target_label: args.target_label.clone(),
             server,
+            tip_before,
+            tip_after,
             from_height: plan.from_height,
             to_height: plan.to_height,
             wallets: args.wallets,
@@ -771,6 +812,7 @@ impl LightwalletdWalletLoadReport {
                     .filter(|outcome| outcome.failure.is_none())
                     .map(|outcome| outcome.seconds),
             ),
+            wallet_request_identity_sha256: recorder.wallet_request_identity_sha256(),
             rpcs: recorder.rpc_summaries(),
             tree_state_heights: server_observed.map_or_else(
                 || recorder.tree_state_heights(),
@@ -1114,6 +1156,55 @@ mod tests {
             (1 + 1 + 1 + 3..=1 + 1 + 2 + 3).contains(&connects),
             "{report}"
         );
+        Ok(())
+    }
+
+    async fn report_with_closing_tip(
+        tip: Result<Vec<u8>, tonic::Code>,
+    ) -> Result<Value, Box<dyn Error>> {
+        let mock = mock_streamer::serve(MockStreamer {
+            tip_height: CHAIN_TIP,
+            subsequent_tip: Some(tip),
+            ..MockStreamer::new(RangeEnding::Clean)
+        })
+        .await?;
+        report_json(mock_args(&mock.url, WalletWorkload::ClassicSdk, 1)).await
+    }
+
+    #[tokio::test]
+    async fn same_height_tip_replacement_is_reported_outside_the_wallet_rpcs() -> TestResult {
+        let report = report_with_closing_tip(Ok((0_u8..32).collect())).await?;
+        assert_eq!(report["tip_before"]["height"], CHAIN_TIP);
+        assert_eq!(
+            report["tip_before"]["hash_hex"],
+            "00000000000000fa".repeat(4)
+        );
+        assert_eq!(report["tip_after"]["height"], CHAIN_TIP);
+        assert_eq!(
+            report["tip_after"]["hash_hex"],
+            "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+        );
+        assert_eq!(count(&report, "/rpcs/GetLatestBlock/requests")?, 1);
+        assert_eq!(count(&report, "/wallets_completed")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unverified_closing_tips_preserve_the_wallet_report() -> TestResult {
+        let missing = report_with_closing_tip(Ok(Vec::new())).await?;
+        assert_eq!(missing["tip_after"]["hash_hex"], "");
+        assert_eq!(count(&missing, "/wallets_completed")?, 1);
+
+        let failed = report_with_closing_tip(Err(tonic::Code::Unavailable)).await?;
+        assert!(failed["tip_after"].get("hash_hex").is_none());
+        assert!(
+            failed["tip_after"]["error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("tip probe failed")),
+            "{failed}",
+        );
+        assert_eq!(count(&failed, "/wallets_completed")?, 1);
+        assert_eq!(count(&failed, "/rpcs/GetLatestBlock/requests")?, 1);
         Ok(())
     }
 
@@ -1972,6 +2063,11 @@ mod tests {
 
         assert_eq!(count(&report, "/wallets_failed")?, 1);
         assert!(count(&report, "/incomplete_streams")? >= 1);
+        // The failed wallet asked for the tree at 39 and attempted 40..=90 five times.
+        assert_eq!(
+            report["wallet_request_identity_sha256"].as_str(),
+            Some("354445829c3eadb408aebf4a433fd66dd872e0d3b65d6d5d5c650d2a7b0a7b9c")
+        );
         assert_eq!(
             count(&report, "/incomplete_streams")?,
             count(&report, "/rpcs/GetBlockRange/incomplete_streams")?

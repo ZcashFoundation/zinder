@@ -1065,6 +1065,17 @@ identity, the workload's constants, and, over all wallets:
   `tip_before`'s height and the same 32-byte hash; it is false when a hash is
   missing or not 32 bytes, because the identity cannot be shown. A `hash_hex` is in RPC byte order, as block explorers show
   it, or the bytes as sent when the server's hash is not 32 bytes.
+- `wallet_request_identity_sha256`: identifies how range, tree-state, and
+  transaction requests were distributed among the simulated wallets. Each
+  wallet contributes its own digest of full requests, counting retries and
+  duplicates. Sorting the wallet digests allows wallets to run in any order
+  while preserving the work each wallet performed. Compare this field, RPC
+  statuses, and delivered bytes across runs.
+- `tip_before` and `tip_after`: the height and RPC-display hash observed at
+  the boundaries of the wallet workload. The closing probe is outside the
+  measured interval. If it fails, `tip_after.error` records the failure and
+  the report retains the wallet results. A frozen-snapshot comparison
+  requires both observations to match the expected height and hash.
 - `tree_state_heights`: how many requested heights sit on Zinder's 100-block
   checkpoint stride, and each other height's offset from it. Below the
   first-sync tip, that offset is the number of blocks Zinder replays. Above
