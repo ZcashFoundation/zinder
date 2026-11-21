@@ -1208,6 +1208,30 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn oversized_tip_hashes_fail_the_probe_and_preserve_completed_wallets() -> TestResult {
+        let mock = mock_streamer::serve(MockStreamer {
+            tip_height: CHAIN_TIP,
+            subsequent_tip: Some(Ok(vec![0xab; 33])),
+            ..MockStreamer::new(RangeEnding::Clean)
+        })
+        .await?;
+        let args = || mock_args(&mock.url, WalletWorkload::ClassicSdk, 1);
+
+        let report = report_json(args()).await?;
+        let reason = "invalid_block_hash: block hash exceeds 32 bytes (received 33)";
+        assert_eq!(report["tip_after"]["error"], reason);
+        assert!(report["tip_after"].get("hash_hex").is_none());
+        assert_eq!(count(&report, "/wallets_completed")?, 1);
+
+        let error = report_json(args())
+            .await
+            .err()
+            .ok_or("opening probe accepted an oversized hash")?;
+        assert!(error.to_string().contains(reason), "{error}");
+        Ok(())
+    }
+
     /// A mock endpoint with the tip at 90, serving `PointReads` over 10..=90.
     async fn serve_point_reads(
         streamer: MockStreamer,
@@ -1797,6 +1821,25 @@ mod tests {
             );
         }
         assert_eq!(observed["sapling"]["returned_with_zero_max"], 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subtree_observation_rejects_an_oversized_metadata_hash() -> TestResult {
+        let mut streamer = subtree_roots_streamer(None);
+        streamer.block_hash = Some(vec![0xab; 33]);
+        let observed = subtree_roots_observation(streamer).await?;
+
+        assert_eq!(observed["chain_metadata_block"], Value::Null);
+        assert_eq!(
+            observed["chain_metadata_error"],
+            "invalid_block_hash: block hash exceeds 32 bytes (received 33)"
+        );
+        assert_eq!(observed["chain_metadata_block_is_tip"], false);
+        assert_eq!(
+            observed["sapling"]["completed_subtrees_at_tip"],
+            Value::Null
+        );
         Ok(())
     }
 

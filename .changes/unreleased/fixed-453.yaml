@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallet benchmarks reject block hashes longer than 32 bytes during tip and subtree checks. A failed closing tip check preserves completed wallet results.
+time: 2026-11-21T16:56:54.187995369Z
+custom:
+    Bump: patch
+    PR: "453"

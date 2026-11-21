@@ -117,24 +117,35 @@ fn failure_text(failure: &CallFailure) -> String {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ObservedBlock {
     pub(super) height: u64,
-    /// RPC byte order hex for a 32-byte hash, otherwise the bytes as sent.
+    /// RPC byte order hex for a complete hash, or the bytes as sent for a short hash.
     hash_hex: String,
 }
 
 impl ObservedBlock {
-    fn new(height: u64, hash: &[u8]) -> Self {
+    const HASH_BYTES: usize = 32;
+
+    fn from_wire(height: u64, hash: &[u8]) -> Result<Self, CallFailure> {
+        if hash.len() > Self::HASH_BYTES {
+            return Err(CallFailure {
+                label: "invalid_block_hash",
+                detail: format!(
+                    "block hash exceeds {} bytes (received {})",
+                    Self::HASH_BYTES,
+                    hash.len()
+                ),
+            });
+        }
         let hash_hex = decode_internal_block_hash(hash)
             .map_or_else(|_| hex::encode(hash), encode_rpc_block_hash_hex);
-        Self { height, hash_hex }
+        Ok(Self { height, hash_hex })
     }
 
     /// Whether `other` is the same block: equal heights and equal 32-byte
     /// hashes. A missing or malformed hash identifies nothing, so two blocks
     /// that both lack one do not match.
     fn is_same_block_as(&self, other: &Self) -> bool {
-        const HASH_HEX_CHARS: usize = 64;
         self.height == other.height
-            && self.hash_hex.len() == HASH_HEX_CHARS
+            && self.hash_hex.len() == 2 * Self::HASH_BYTES
             && self.hash_hex == other.hash_hex
     }
 }
@@ -456,13 +467,16 @@ async fn observe_subtree_roots(
             hash: Vec::new(),
         }),
     )
-    .await;
+    .await
+    .and_then(|block| {
+        ObservedBlock::from_wire(block.height, &block.hash)
+            .map(|observed| (observed, block.chain_metadata))
+    });
     let (chain_metadata_block, chain_metadata_error, sizes) = match tip_block {
-        Ok(block) => {
-            let observed = ObservedBlock::new(block.height, &block.hash);
+        Ok((observed, metadata)) => {
             let sizes = observed
                 .is_same_block_as(&tip_before)
-                .then_some(block.chain_metadata)
+                .then_some(metadata)
                 .flatten();
             (Some(observed), None, sizes)
         }
@@ -512,7 +526,7 @@ pub(super) async fn chain_tip(
         client.get_latest_block(ChainSpec {}),
     )
     .await?;
-    Ok(ObservedBlock::new(tip.height, &tip.hash))
+    ObservedBlock::from_wire(tip.height, &tip.hash)
 }
 
 /// Asks for every root of `protocol` with `max_entries` of 0, then, unless
@@ -964,34 +978,38 @@ mod tests {
     }
 
     #[test]
-    fn observed_hashes_are_rpc_byte_order_hex_and_other_lengths_stay_as_sent() {
+    fn observed_hashes_use_rpc_hex_and_short_hashes_stay_as_sent() -> Result<(), super::CallFailure>
+    {
         let mut internal = vec![0; 32];
         internal[0] = 0xab;
 
         assert_eq!(
-            ObservedBlock::new(7, &internal).hash_hex,
+            ObservedBlock::from_wire(7, &internal)?.hash_hex,
             format!("{}ab", "00".repeat(31))
         );
-        assert_eq!(ObservedBlock::new(7, &[1, 2]).hash_hex, "0102");
-        assert_eq!(ObservedBlock::new(7, &[]).hash_hex, "");
+        assert_eq!(ObservedBlock::from_wire(7, &[1, 2])?.hash_hex, "0102");
+        assert_eq!(ObservedBlock::from_wire(7, &[])?.hash_hex, "");
+        Ok(())
     }
 
     #[test]
-    fn a_block_matches_only_with_equal_heights_and_equal_32_byte_hashes() {
-        let block = |height, hash: &[u8]| ObservedBlock::new(height, hash);
-
-        assert!(block(7, &[1; 32]).is_same_block_as(&block(7, &[1; 32])));
-        assert!(!block(7, &[1; 32]).is_same_block_as(&block(8, &[1; 32])));
-        assert!(!block(7, &[1; 32]).is_same_block_as(&block(7, &[2; 32])));
+    fn a_block_matches_only_with_equal_heights_and_equal_32_byte_hashes()
+    -> Result<(), super::CallFailure> {
+        let block = ObservedBlock::from_wire(7, &[1; 32])?;
+        assert!(block.is_same_block_as(&block));
+        assert!(!block.is_same_block_as(&ObservedBlock::from_wire(8, &[1; 32])?));
+        assert!(!block.is_same_block_as(&ObservedBlock::from_wire(7, &[2; 32])?));
+        Ok(())
     }
 
     #[test]
-    fn blocks_without_a_usable_hash_never_match() {
-        let block = |height, hash: &[u8]| ObservedBlock::new(height, hash);
-
-        assert!(!block(7, &[]).is_same_block_as(&block(7, &[])));
-        assert!(!block(7, &[1, 2]).is_same_block_as(&block(7, &[1, 2])));
-        assert!(!block(7, &[]).is_same_block_as(&block(7, &[1; 32])));
+    fn blocks_without_a_usable_hash_never_match() -> Result<(), super::CallFailure> {
+        let missing = ObservedBlock::from_wire(7, &[])?;
+        let short = ObservedBlock::from_wire(7, &[1, 2])?;
+        assert!(!missing.is_same_block_as(&missing));
+        assert!(!short.is_same_block_as(&short));
+        assert!(!missing.is_same_block_as(&ObservedBlock::from_wire(7, &[1; 32])?));
+        Ok(())
     }
 
     #[test]
