@@ -522,6 +522,8 @@ jobs:
             awk '{ printf "| `%s` | `%s` |\n", $2, $1 }' dist/build/binaries.sha256
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Enable the wallet gate here after provisioning the pinned client bundle.
+  # See scripts/release-wallet-roundtrip.md for the publication prerequisite.
   publish-sdk-crates:
     name: publish public SDK crates
     needs:

@@ -1,0 +1,6 @@
+{
+  "ingest": "ghcr.io/zcashfoundation/zinder-ingest@sha256:4e7df3629bc5fb62e32e5b2b5b3ef2d6a8cd63d95fc34113c6ca6091c6f022f2",
+  "projector": "ghcr.io/zcashfoundation/zinder-projector@sha256:4b1e72a152cf75461cc8b802892d662ef002c0d470a31ab8202282d9d283921f",
+  "query": "ghcr.io/zcashfoundation/zinder-query@sha256:9a4235afc52e0de9baf60c8c92fefdbeafa6955ac90f88dbc11c8a14658dc65a",
+  "compat-lightwalletd": "ghcr.io/zcashfoundation/zinder-compat-lightwalletd@sha256:5bc430441d75e76fa940f7ffb23b8ff74d6de43e54bee7cb0063eee7ca7e015e"
+}
