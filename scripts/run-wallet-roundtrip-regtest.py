@@ -48,7 +48,34 @@ def process_alive(pid):
     return state != b"Z"
 
 
-def stop_group(proc, first, grace):
+def kill_remaining_members(leader, membership, grace):
+    # The unreaped leader reserves the group or session ID while members exit.
+    deadline = time.monotonic() + grace
+    while True:
+        live = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            try:
+                if membership(pid) != leader or not process_alive(pid):
+                    continue
+                fd = os.pidfd_open(pid)
+                try:
+                    if membership(pid) == leader:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        live = True
+                finally:
+                    os.close(fd)
+            except ProcessLookupError:
+                continue
+        if not live:
+            return
+        require(time.monotonic() < deadline, "owned processes remain after SIGKILL")
+        time.sleep(.02)
+
+
+def stop_group(proc, first, grace, whole_session=False):
     if proc.returncode is not None:
         return
     try:
@@ -61,7 +88,10 @@ def stop_group(proc, first, grace):
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    proc.wait(timeout=grace)
+    try:
+        kill_remaining_members(proc.pid, os.getsid if whole_session else os.getpgid, grace)
+    finally:
+        proc.wait(timeout=grace)
 
 
 def execute(script, args, log, timeout, grace):

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import runpy
 import signal
 import subprocess
@@ -764,6 +765,58 @@ class CampaignSupervision(unittest.TestCase):
                 time.sleep(.02)
             self.assertFalse(process_alive(pid))
 
+    def test_fixture_timeouts_stop_the_operator_and_its_compose_child(self):
+        fixture = self.scratch / "regtest-fixture.py"
+        fixture.write_text(
+            "import os, signal, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'])\n"
+            "Path(__file__).with_suffix('.' + sys.argv[1]).write_text(f'{os.getpid()} {child.pid}')\n"
+            "time.sleep(60)\n")
+        args = argparse.Namespace(output=self.scratch / "output", port_base=22400, images="images",
+                                  revision="rev", bin_dir=None)
+        recovery = M["Recovery"]("disconnect", args)
+        recovery.private.mkdir(parents=True)
+        launch = M["launch_bounded"]
+        def bounded(command, log, timeout, grace, *, new_session):
+            return launch(command, log, .4, .2, new_session=new_session)
+        with patch.dict(GLOBALS, SCRIPTS=self.scratch, launch_bounded=bounded):
+            for action, run in (("up", recovery.start), ("down", recovery.stop)):
+                if action == "down":
+                    recovery.project_dir.mkdir(parents=True)
+                    (recovery.project_dir / "state.json").write_text("{}")
+                with self.subTest(action=action):
+                    with self.assertRaisesRegex(ValueError, "exceeded"):
+                        run()
+                    for pid in map(int, fixture.with_suffix("." + action).read_text().split()):
+                        try:
+                            self.assertFalse(process_alive(pid))
+                        finally:
+                            if process_alive(pid):
+                                os.kill(pid, signal.SIGKILL)
+
+    def test_outer_timeout_reaps_fixture_groups_even_when_the_case_is_stopped(self):
+        record = self.scratch / "nested.pid"
+        script = ("import os, signal, subprocess, sys\n"
+                  "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                  "process_group=0)\n"
+                  "with open(sys.argv[1], 'w') as f: print(child.pid, file=f)\n"
+                  "os.kill(os.getpid(), signal.SIGSTOP)\n")
+        sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   start_new_session=True)
+        try:
+            result = M["launch_case"]([sys.executable, "-c", script, str(record)],
+                                      self.scratch / "nested.log", .4, .3)
+            self.assertTrue(result["timeout"])
+            self.assertFalse(process_alive(int(record.read_text())))
+            self.assertIsNone(sibling.poll())
+        finally:
+            sibling.kill()
+            sibling.wait(timeout=2)
+            if record.exists() and process_alive(int(record.read_text())):
+                os.kill(int(record.read_text()), signal.SIGKILL)
+
     def test_parent_cancellation_during_timeout_grace_waits_for_the_child_to_be_reaped(self):
         child = ("import os, signal, sys, time\n"
                  "signal.signal(signal.SIGTERM, lambda *_: os.kill(os.getppid(), int(sys.argv[1])))\n"
@@ -803,7 +856,7 @@ class CampaignSupervision(unittest.TestCase):
                                      TimeoutExpired=subprocess.TimeoutExpired,
                                      STDOUT=subprocess.STDOUT)
         with patch.dict(GLOBALS, {"subprocess": fake,
-                                  "stop_group": lambda proc, sig, grace: stopped.append(sig)}):
+                                  "stop_group": lambda proc, sig, grace, whole_session: stopped.append(sig)}):
             with self.assertRaises(KeyboardInterrupt):
                 M["launch_case"](["fake"], self.scratch / "interrupt.log", 5, 1)
         self.assertEqual(stopped, [signal.SIGINT])

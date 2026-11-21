@@ -327,16 +327,13 @@ class Recovery:
         state_root = self.private / "projects"
         self.project, self.project_dir = case_project(
             self.case, state_root, getattr(self.args, "project", None))
-        command = [sys.executable, "-B", str(SCRIPTS / "regtest-fixture.py"), "up",
-                   "--project", self.project, "--state-root", str(state_root),
-                   "--port-base", str(self.args.port_base), "--images", str(self.args.images),
-                   "--revision", self.args.revision, "--node-config", str(NODE_CONFIG),
-                   "--raw-blob-policy", "all", "--tip", "150"]
+        arguments = ["up", "--project", self.project, "--state-root", state_root,
+                     "--port-base", self.args.port_base, "--images", self.args.images,
+                     "--revision", self.args.revision, "--node-config", NODE_CONFIG,
+                     "--raw-blob-policy", "all", "--tip", 150]
         if self.args.bin_dir:
-            command.extend(["--bin-dir", str(self.args.bin_dir)])
-        with (self.private / "up.log").open("w", encoding="utf-8") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=600)
-        require(result.returncode == 0, "fixture startup failed; see private/up.log")
+            arguments.extend(["--bin-dir", self.args.bin_dir])
+        run_fixture(arguments, self.private / "up.log", 600)
         ready_path = self.project_dir / "ready.initial.json"
         require(ready_path.is_file(), "fixture did not publish an immutable readiness receipt")
         shutil.copyfile(ready_path, self.private / "fixture-initial.json")
@@ -376,12 +373,8 @@ class Recovery:
         if self.project_dir is None or not (self.project_dir / "state.json").is_file():
             return {"fixture_removed": False, "reason": "no owned fixture started",
                     "project_resources_remaining": self.project_resources()}
-        with (self.private / "down.log").open("w", encoding="utf-8") as log:
-            result = subprocess.run([sys.executable, "-B", str(SCRIPTS / "regtest-fixture.py"),
-                                     "down", "--project", self.project,
-                                     "--state-root", str(self.private / "projects")],
-                                    stdout=log, stderr=subprocess.STDOUT, timeout=180)
-        require(result.returncode == 0, "owned fixture teardown failed; see private/down.log")
+        run_fixture(["down", "--project", self.project, "--state-root", self.private / "projects"],
+                    self.private / "down.log", 180)
         remaining = self.project_resources()
         return {"fixture_removed": remaining == 0, "project_resources_remaining": remaining}
 
@@ -1064,20 +1057,32 @@ def finish_before_cancellation(action, *args):
     return result, interrupted
 
 
+def run_fixture(arguments, log, timeout):
+    command = [sys.executable, "-B", *(["-O"] * sys.flags.optimize),
+               str(SCRIPTS / "regtest-fixture.py"), *map(str, arguments)]
+    result = launch_bounded(command, log, timeout, DEFAULT_CASE_GRACE, new_session=False)
+    require(not result["timeout"], f"fixture {arguments[0]} exceeded {timeout}s; see {log}")
+    require(result["exit_code"] == 0, f"fixture {arguments[0]} failed; see {log}")
+
+
 def launch_case(command, log, timeout, grace):
-    """Run one bounded case in its own session so a hang cannot escape the watchdog."""
+    return launch_bounded(command, log, timeout, grace, new_session=True)
+
+
+def launch_bounded(command, log, timeout, grace, *, new_session):
+    # Each fixture command has its own group but stays inside its case's session.
     with log.open("x", encoding="utf-8") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+                                   start_new_session=new_session, process_group=None if new_session else 0)
         try:
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _, interrupted = finish_before_cancellation(stop_group, process, signal.SIGTERM, grace)
+            _, interrupted = finish_before_cancellation(stop_group, process, signal.SIGTERM, grace, new_session)
             if interrupted is not None:
                 raise interrupted
             return {"exit_code": process.returncode, "timeout": True}
         except BaseException:
-            finish_before_cancellation(stop_group, process, signal.SIGINT, grace)
+            finish_before_cancellation(stop_group, process, signal.SIGINT, grace, new_session)
             raise
     return {"exit_code": exit_code, "timeout": False}
 
