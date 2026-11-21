@@ -4,9 +4,10 @@ Use this campaign to check both sides of a payment against a selected Zinder rel
 
 ## Prepare the wallet builds
 
-Use Linux with Docker Compose, strace, and the wallet Python environment and generated descriptors described in the [two-wallet setup](roundtrip.md#prepare-the-clients). Install the clients’ proving parameters before starting. Set `zkool_source` and `cake_source` to local upstream Git checkouts and `build_dir` to a new absolute scratch directory. The reference source revisions below select Zkool 6.37.0 and the Zcash engine used by Cake Wallet 6.5.4.
+Use Linux with Docker Compose, strace, and the wallet Python environment and generated descriptors described in the [two-wallet setup](roundtrip.md#prepare-the-clients). Cake also requires Python’s `cryptography` package to authenticate its private GraphQL connection. Install it in the wallet environment and install the clients’ proving parameters before starting. Set `wallet_python` to the prepared interpreter, `zkool_source` and `cake_source` to local upstream Git checkouts and `build_dir` to a new absolute scratch directory. The reference source revisions below select Zkool 6.37.0 and the Zcash engine used by Cake Wallet 6.5.4.
 
 ```bash
+"$wallet_python" -m pip install cryptography==46.0.5
 mkdir -p "$build_dir"/{zkool,cake}
 git -C "$zkool_source" archive d80892f163bc650e3b453f448da8c83eb5c32ddc | tar -x -C "$build_dir/zkool"
 git -C "$cake_source" archive cb3e96f10e58a8fc8632b40636a0c64aa21fb653 | tar -x -C "$build_dir/cake"

@@ -22,6 +22,7 @@ No operator wallet, public chain, or shared checkout state is used.
 import argparse
 import fcntl
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -1455,6 +1456,12 @@ def main():
             "timeouts must be positive")
     for path in (args.zkool_bin, args.cake_engine, args.zallet_backend, args.trace_tool):
         require(Path(path).is_file(), f"missing client or harness file: {path}")
+    selected = (args.case,) if args.action == "case" else args.cases
+    if "cake" in selected:
+        try:
+            importlib.import_module("cryptography.hazmat.primitives.asymmetric.ec")
+        except ImportError as error:
+            raise ValueError("Cake requires the Python cryptography package for local GraphQL authentication") from error
     if args.action == "case":
         run_case(args)
     else:

@@ -193,6 +193,28 @@ class FakeFixture:
 
 
 class MatrixTests(unittest.TestCase):
+
+    def test_missing_cake_auth_dependency_is_reported_before_fixture_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "campaign"
+            source = str(Path(__file__).resolve())
+            argv = ["wallet-payments", "campaign", "--state", str(state),
+                    "--revision", "a" * 40, "--images", source, "--node-config", source,
+                    "--zkool-bin", source, "--cake-engine", source,
+                    "--zallet-backend", source, "--trace-tool", source]
+            with (patch.object(MATRIX, "verify_release"),
+                  patch.object(MATRIX.os, "umask"),
+                  patch.object(MATRIX.importlib, "import_module", side_effect=ImportError),
+                  patch.object(MATRIX, "run_campaign") as start):
+                with patch.object(sys, "argv", argv):
+                    with self.assertRaisesRegex(ValueError, "Cake requires.*cryptography"):
+                        MATRIX.main()
+                start.assert_not_called()
+                self.assertFalse(state.exists())
+                with patch.object(sys, "argv", [*argv, "--cases", "zkool-internal"]):
+                    MATRIX.main()
+                start.assert_called_once()
+
     def test_execute_timeout_kills_whole_group(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
