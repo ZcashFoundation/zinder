@@ -1,0 +1,6 @@
+kind: added
+body: Operators can repeat a shielded Zingo and Zallet payment on independent Regtest chains and compare wallet behavior against a versioned release baseline.
+time: 2026-11-21T14:18:26.745686273Z
+custom:
+    Bump: patch
+    PR: "444"
