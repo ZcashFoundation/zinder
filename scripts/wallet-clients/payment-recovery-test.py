@@ -95,6 +95,37 @@ class WalletSettlement(unittest.TestCase):
             self.assertEqual(recovery.receipt["initial_wallet_heights"], {"zingo": 150, "zallet": 150})
             self.assertEqual(zallet.snapshot.call_count, 2)
 
+    def test_disconnect_waits_for_both_wallets_at_the_payment_predecessor(self):
+        runner = M["Recovery"]
+        for heights in ([260, 261], [262]):
+            with self.subTest(heights=heights):
+                recovery = Mock(spec=runner)
+                recovery.args = argparse.Namespace(wait_seconds=5)
+                recovery.payee, recovery.receipt = "recipient", {}
+                recovery.zingo, recovery.zallet, recovery.trip = Mock(), Mock(), Mock()
+                recovery.zallet._owned_identity.return_value = None
+                recovery.broadcast.return_value = TXID
+                recovery.rpc.side_effect = lambda method: 261 if method == "getblockcount" else [TXID]
+                recovery.balances.side_effect = [{}, {"zingo": balance(0, height=261),
+                                                      "zallet": balance(0, height=heights[0])}]
+                recovery.zingo.snapshot.return_value = balance(0, height=261)
+                recovery.zallet.snapshot.side_effect = [balance(0, height=h) for h in heights]
+                recovery.wait_height.side_effect = lambda *args: runner.wait_height(recovery, *args)
+                recovery.wait.side_effect = lambda label, probe, **kwargs: probe() or probe()
+                recovery.canonical.side_effect = LookupError("check inclusion")
+                if heights[-1] == 261:
+                    with self.assertRaises(LookupError):
+                        runner.run_disconnect(recovery)
+                    self.assertEqual(recovery.zallet.snapshot.call_count, 2)
+                    self.assertEqual(recovery.receipt["disconnect"]["last_online_heights"],
+                                     {"zingo": 261, "zallet": 261})
+                    recovery.canonical.assert_called_once_with(TXID, 262)
+                else:
+                    with self.assertRaisesRegex(ValueError, "pre-mining tip"):
+                        runner.run_disconnect(recovery)
+                    recovery.zallet.close.assert_not_called()
+                    recovery.trip.mine_to.assert_not_called()
+
     def test_preexisting_spendable_funds_cannot_satisfy_return_maturity(self):
         recovery = M["Recovery"]("disconnect", argparse.Namespace(output=Path("."), wait_seconds=5))
         existing, returned = 10_000_000, M["RETURN"]

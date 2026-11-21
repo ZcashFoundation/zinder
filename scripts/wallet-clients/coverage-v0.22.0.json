@@ -297,7 +297,7 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "f6db96cde6bba620a08a1e92882ffa5c4c09eb841fd7f5113df0d4630596706f"
+        "sha256": "f82b71ee88b991d14ff29e9d20ae588f5667c7ea31008ea9632959fc0eac4f5d"
       }
     },
     {
@@ -345,7 +345,7 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "f6db96cde6bba620a08a1e92882ffa5c4c09eb841fd7f5113df0d4630596706f"
+        "sha256": "f82b71ee88b991d14ff29e9d20ae588f5667c7ea31008ea9632959fc0eac4f5d"
       }
     },
     {

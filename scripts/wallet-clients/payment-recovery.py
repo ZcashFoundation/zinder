@@ -745,23 +745,28 @@ class Recovery:
             raw = self.capture_raw(txid, "outbound")
         except ValueError:
             raw = None
-        last_online = self.balances()
+        pre_mining_tip = self.rpc("getblockcount")
+        last_online = self.wait_height("last online wallet scan", pre_mining_tip)
+        require(all(snapshot["height"] == pre_mining_tip for snapshot in last_online.values()),
+                "last online wallet height differs from the pre-mining tip")
         counts_before = self.lightwalletd_counts()
         require(txid in self.rpc("getrawmempool"),
                 "transfer left the node mempool before the disconnect window")
         self.zallet.close()
         require(self.zallet._owned_identity() is None,
                 "Zallet daemon did not stop for the disconnect window")
+        require(txid in self.rpc("getrawmempool"),
+                "transfer left the node mempool after the wallets disconnected")
         disconnect = {
             "zingo": "not invoked; the CLI has no resident process",
             "zallet": "daemon stopped and its process identity was cleared",
-            "mempool_before_mining": txid in self.rpc("getrawmempool"),
+            "mempool_before_mining": True,
             "last_online_heights": {"zingo": last_online["zingo"]["height"],
                                     "zallet": last_online["zallet"]["height"]},
         }
         self.receipt["disconnect"] = disconnect
         self.trip.mine_to("outbound-while-disconnected", 10)
-        inclusion = self.canonical(txid)
+        inclusion = self.canonical(txid, pre_mining_tip + 1)
         if raw is None:
             try:
                 raw = self.capture_raw(txid, "outbound", inclusion["block_hash"])
