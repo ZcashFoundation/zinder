@@ -44,6 +44,7 @@ wait_for = RUNNER["wait_for"]
 # The round-trip campaign already owns bounded stages and ownership-checked cleanup. Reuse those
 # helpers instead of inventing a second signal and readback protocol for supervised cases.
 SUPERVISOR = runpy.run_path(str(SCRIPTS / "run-wallet-roundtrip-regtest.py"))
+wait_for_owned_exit = SUPERVISOR["wait_for_owned_exit"]
 stop_group = SUPERVISOR["stop_group"]
 stop_owned_process = SUPERVISOR["stop_owned_process"]
 execute_owned = SUPERVISOR["execute"]
@@ -1088,7 +1089,7 @@ def launch_bounded(command, log, timeout, grace, *, new_session):
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=new_session, process_group=None if new_session else 0)
         try:
-            exit_code = process.wait(timeout=timeout)
+            exit_code = wait_for_owned_exit(process, timeout, grace, whole_session=new_session)
         except subprocess.TimeoutExpired:
             _, interrupted = finish_before_cancellation(stop_group, process, signal.SIGTERM, grace, new_session)
             if interrupted is not None:
@@ -1235,7 +1236,7 @@ def supervise_case(case, child, args, root):
         "exit_code": exit_code,
         "status": status,
         "supervision": kind,
-        "error": reason or launch_error,
+        "error": launch_error or reason,
         "case_timeout": args.case_timeout,
         "case_grace": args.case_grace,
         "receipt_sha256": digest(receipt_path) if receipt_path.is_file() else None,

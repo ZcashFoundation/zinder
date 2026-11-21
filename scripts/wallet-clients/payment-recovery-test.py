@@ -911,6 +911,38 @@ class CampaignSupervision(unittest.TestCase):
                             if process_alive(pid):
                                 os.kill(pid, signal.SIGKILL)
 
+    def test_exited_leader_cannot_leave_work_running_into_teardown(self):
+        script = (
+            "import os, signal, subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "process_group=0 if sys.argv[2] == 'session' else None)\n"
+            "with open(sys.argv[1], 'w') as out: print(child.pid, file=out)\n"
+            "if sys.argv[3] == 'signal': os.kill(os.getpid(), signal.SIGKILL)\n")
+        pidfile = self.scratch / "descendant.pid"
+        sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            for scope in ("group", "session"):
+                for outcome in ("signal", "zero"):
+                    with self.subTest(scope=scope, outcome=outcome):
+                        command = [sys.executable, "-c", script, str(pidfile), scope, outcome]
+                        log = self.scratch / f"{scope}-{outcome}.log"
+                        try:
+                            if outcome == "zero":
+                                with self.assertRaisesRegex(RuntimeError, "left owned processes"):
+                                    M["launch_bounded"](command, log, 4, 1, new_session=scope == "session")
+                            else:
+                                result = M["launch_bounded"](command, log, 4, 1, new_session=scope == "session")
+                                self.assertEqual(result, {"timeout": False, "exit_code": -signal.SIGKILL})
+                            self.assertFalse(process_alive(int(pidfile.read_text())))
+                            self.assertIsNone(sibling.poll())
+                        finally:
+                            if pidfile.exists() and process_alive(int(pidfile.read_text())):
+                                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                            pidfile.unlink(missing_ok=True)
+        finally:
+            sibling.kill()
+            sibling.wait(timeout=2)
+
     def test_outer_timeout_reaps_fixture_groups_even_when_the_case_is_stopped(self):
         record = self.scratch / "nested.pid"
         script = ("import os, signal, subprocess, sys\n"
@@ -960,17 +992,9 @@ class CampaignSupervision(unittest.TestCase):
     def test_launch_case_stops_the_group_before_propagating_an_interruption(self):
         stopped = []
 
-        class FakeProcess:
-            pid = 4242
-            returncode = None
-
-            def wait(self, timeout=None):
-                raise KeyboardInterrupt
-
-        fake = types.SimpleNamespace(Popen=lambda *args, **kwargs: FakeProcess(),
-                                     TimeoutExpired=subprocess.TimeoutExpired,
-                                     STDOUT=subprocess.STDOUT)
-        with patch.dict(GLOBALS, {"subprocess": fake,
+        fake = types.SimpleNamespace(Popen=Mock(return_value=object()),
+                                     TimeoutExpired=subprocess.TimeoutExpired, STDOUT=subprocess.STDOUT)
+        with patch.dict(GLOBALS, {"subprocess": fake, "wait_for_owned_exit": Mock(side_effect=KeyboardInterrupt),
                                   "stop_group": lambda proc, sig, grace, whole_session: stopped.append(sig)}):
             with self.assertRaises(KeyboardInterrupt):
                 M["launch_case"](["fake"], self.scratch / "interrupt.log", 5, 1)

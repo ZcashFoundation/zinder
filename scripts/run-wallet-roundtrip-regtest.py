@@ -2,6 +2,7 @@
 """Run and audit a signed wallet round trip on two fresh, disposable Regtest fixtures."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -51,6 +52,7 @@ def process_alive(pid):
 def kill_remaining_members(leader, membership, grace):
     # The unreaped leader reserves the group or session ID while members exit.
     deadline = time.monotonic() + grace
+    stopped = False
     while True:
         live = False
         for entry in Path("/proc").iterdir():
@@ -64,13 +66,13 @@ def kill_remaining_members(leader, membership, grace):
                 try:
                     if membership(pid) == leader:
                         signal.pidfd_send_signal(fd, signal.SIGKILL)
-                        live = True
+                        live = stopped = True
                 finally:
                     os.close(fd)
             except ProcessLookupError:
                 continue
         if not live:
-            return
+            return stopped
         require(time.monotonic() < deadline, "owned processes remain after SIGKILL")
         time.sleep(.02)
 
@@ -94,17 +96,34 @@ def stop_group(proc, first, grace, whole_session=False):
         proc.wait(timeout=grace)
 
 
+def wait_for_owned_exit(proc, timeout, grace, *, whole_session):
+    # A readable pidfd reports exit without reaping the leader and releasing its ID.
+    fd = os.pidfd_open(proc.pid)
+    try:
+        exited = select.poll()
+        exited.register(fd, select.POLLIN)
+        if not exited.poll(math.ceil(timeout * 1000)):
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+    finally:
+        os.close(fd)
+    stopped = kill_remaining_members(proc.pid, os.getsid if whole_session else os.getpgid, grace)
+    code = proc.wait(timeout=grace)
+    if stopped and code == 0:
+        raise RuntimeError("command exited successfully but left owned processes running")
+    return code
+
+
 def execute(script, args, log, timeout, grace):
     cmd = [sys.executable, "-B", *(["-O"] * sys.flags.optimize), str(script), *map(str, args)]
     with log.open("x") as output:
         proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            code = proc.wait(timeout=timeout)
+            code = wait_for_owned_exit(proc, timeout, grace, whole_session=True)
         except subprocess.TimeoutExpired:
-            stop_group(proc, signal.SIGTERM, grace)
+            stop_group(proc, signal.SIGTERM, grace, whole_session=True)
             raise RuntimeError(f"{script.name} exceeded its {timeout}s stage limit; see {log}") from None
         except BaseException:
-            stop_group(proc, signal.SIGINT, grace)
+            stop_group(proc, signal.SIGINT, grace, whole_session=True)
             raise
     if code:
         raise RuntimeError(f"{script.name} stopped with exit {code}. See {log}")
