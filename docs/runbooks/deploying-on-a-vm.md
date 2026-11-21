@@ -324,8 +324,9 @@ not been qualified.
    ```
 
    The reader verifies the signature, segments, and settled anchor before
-   binding. It admits later extensions while running. The live tail and
-   chunks crossing a coverage boundary use the canonical reader. The overlay
+   binding. It admits later extensions while running. A default shielded range
+   can cross from signed history into the encoded tail when the tail matches
+   the reader’s chain view. Uncovered heights use canonical storage. The overlay
    uses per-payload digest verification. Strict fs-verity requires separate
    segment staging as described in [signed settled history](../reference/lightwalletd-compatibility.md#signed-settled-history).
 

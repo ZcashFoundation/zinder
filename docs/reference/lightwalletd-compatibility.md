@@ -176,9 +176,9 @@ zinder-compat-lightwalletd --config reader.toml publish-shielded-history \
   --segment-blocks 4096
 ```
 
-The command opens a temporary canonical secondary, publishes complete segments through its captured settled tip, and exits. Add `--follow-interval-secs 60` to keep the publisher running and catch up its secondary every minute. The listener fills the recent unsettled or incomplete suffix from its canonical reader. The [single-host Compose runbook](../runbooks/deploying-on-a-vm.md#publish-signed-wallet-history) covers installation and key rotation.
+The command opens a temporary canonical secondary, publishes complete segments through its captured settled tip, and exits. Add `--follow-interval-secs 60` to keep the publisher running and catch up its secondary every minute. The listener can serve the recent unpublished suffix from its encoded tail while the chain view matches. It reads other uncovered heights from canonical storage. The [single-host Compose runbook](../runbooks/deploying-on-a-vm.md#publish-signed-wallet-history) covers installation and key rotation.
 
-One publisher holds the directory lock. On each restart it verifies the existing segments and links before appending. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
+One publisher holds the directory lock. On restart it reclaims its temporary files, `.publisher-write.tmp` and `.publisher-segment.tmp`, and verifies the existing segments and links before appending. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
 
 Install the raw 32-byte Ed25519 public key on the reader through a trusted channel. Copy the referenced `segment-*.bin` files to the reader before atomically installing their signed `current.json`. The reader process needs read access to these files. Enable the catalog in the listener's configuration:
 
