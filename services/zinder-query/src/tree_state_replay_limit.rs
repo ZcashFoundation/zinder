@@ -2,7 +2,9 @@
 //! tree-state read.
 
 mod flights;
-pub(crate) use flights::{ReadyState, ReplayKey, read_missing_height};
+#[cfg(feature = "light-wallet-qualification")]
+pub(crate) use flights::ReadyState;
+pub(crate) use flights::{ReplayKey, read_missing_height};
 
 use std::{
     num::NonZeroU32,
