@@ -297,7 +297,7 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "ca282ba36f4254502cd0f99115206e23be3224c37d576387089b7c491b021974"
+        "sha256": "f6db96cde6bba620a08a1e92882ffa5c4c09eb841fd7f5113df0d4630596706f"
       }
     },
     {
@@ -345,7 +345,7 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "ca282ba36f4254502cd0f99115206e23be3224c37d576387089b7c491b021974"
+        "sha256": "f6db96cde6bba620a08a1e92882ffa5c4c09eb841fd7f5113df0d4630596706f"
       }
     },
     {
@@ -397,7 +397,7 @@
       },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
-        "sha256": "14d8a4cf70508d5ef2fb684ef96adc8fa92ceb25d0e91244e9af01cf127b73d1"
+        "sha256": "45d1fba2113e40ce9eca44424a32015cd37b166d92912646f9e25502d4d4d27c"
       }
     },
     {
@@ -449,7 +449,7 @@
       },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
-        "sha256": "14d8a4cf70508d5ef2fb684ef96adc8fa92ceb25d0e91244e9af01cf127b73d1"
+        "sha256": "45d1fba2113e40ce9eca44424a32015cd37b166d92912646f9e25502d4d4d27c"
       }
     },
     {
@@ -500,7 +500,7 @@
       },
       "evidence": {
         "description": "Transport wallet recovery / receipt.json",
-        "sha256": "007115d5058a314f8161bc65d40cca8997d727940685c67436cf2d17077e4f28",
+        "sha256": "61e7d7427f49094392ba215f35902873aa035743404171706c98094da5d1406c",
         "local_status_rpc_during_outage": "wallet-rpc-error"
       }
     },
