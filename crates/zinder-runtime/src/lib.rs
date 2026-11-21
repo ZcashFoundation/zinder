@@ -302,15 +302,44 @@ pub fn host_cpu_meets_compiled_baseline() -> bool {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn missing_required_cpu_features() -> Vec<&'static str> {
+    let cpu = raw_cpuid::CpuId::new();
+    let basic = cpu.get_feature_info();
+    let extended = host_extended_features();
+    let avx = basic
+        .as_ref()
+        .is_some_and(|info| info.has_avx() && info.has_oxsave())
+        && std::arch::is_x86_feature_detected!("avx");
     let required = [
-        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
-        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
-        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-        ("fma", std::arch::is_x86_feature_detected!("fma")),
-        ("lzcnt", std::arch::is_x86_feature_detected!("lzcnt")),
+        (
+            "avx2",
+            avx && extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_avx2),
+        ),
+        (
+            "bmi1",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi1),
+        ),
+        (
+            "bmi2",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        ),
+        (
+            "fma",
+            avx && basic.as_ref().is_some_and(|info| info.has_fma()),
+        ),
+        (
+            "lzcnt",
+            cpu.get_extended_processor_and_feature_identifiers()
+                .is_some_and(|info| info.has_lzcnt()),
+        ),
         (
             "pclmulqdq",
-            std::arch::is_x86_feature_detected!("pclmulqdq"),
+            basic.as_ref().is_some_and(|info| info.has_pclmulqdq()),
         ),
     ];
     required
@@ -387,11 +416,22 @@ fn missing_pasta_features(backend: &str, bmi2: bool, adx: bool) -> Vec<&'static 
 }
 
 #[cfg(target_arch = "x86_64")]
+fn host_extended_features() -> Option<raw_cpuid::ExtendedFeatures> {
+    // Rust's detection macro folds features enabled by target-cpu to true.
+    raw_cpuid::CpuId::new().get_extended_feature_info()
+}
+
+#[cfg(target_arch = "x86_64")]
 fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    let features = host_extended_features();
     missing_pasta_features(
         pasta_backend(),
-        std::arch::is_x86_feature_detected!("bmi2"),
-        std::arch::is_x86_feature_detected!("adx"),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_adx),
     )
 }
 

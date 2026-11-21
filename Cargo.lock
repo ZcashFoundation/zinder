@@ -6390,6 +6390,7 @@ dependencies = [
  "pasta_curves",
  "prost",
  "prost-types",
+ "raw-cpuid",
  "rcgen",
  "rustix",
  "rustls",
