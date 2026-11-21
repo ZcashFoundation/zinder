@@ -1208,7 +1208,45 @@ scripts/test-regtest-fixture.py --images /tmp/fixture-images.json \
   --revision 830b426060169f5b2e94d84ff0f134bc1ad96004 --port-base 43100
 ```
 
-#### Gate a real wallet lifecycle
+## Gate a real wallet lifecycle
+
+Start the disposable fixture for the wallet's activation schedule, then use the
+client's entrypoint with the fixture's immutable `ready.initial.json`. Allocate
+a new wallet and output directory on each run.
+
+| Wallet engine | Reproduction entrypoint |
+| --- | --- |
+| Zingo and standalone Zkool | [Build the pinned engine and generate the case manifest](../../scripts/wallet-clients/README.md). Run each Zkool internal-address setting as its own case. |
+| Vizor | [Build the tagged Rust engine and run the funded wallet case](../../scripts/wallet-clients/vizor.md). |
+| Cake Wallet | [Build and run the exact Zcash engine pinned by the app](../../scripts/wallet-clients/cake-regtest.md). |
+| zcash-devtool | Use [run-devtool-regtest.py](../../scripts/wallet-clients/run-devtool-regtest.py) with the Regtest-enabled CLI, its source revision and binary SHA-256, the readiness receipt, and a fresh output directory. |
+
+For native WalletQuery, select the lifecycle adapter from the exact Zallet
+integration-tests or Zally revision under test. Zallet also requires canonical
+full blocks. Retain them during ingest and configure the query service with the
+same retention policy before starting the wallet.
+
+To run the pinned zcash-devtool case, start the all-at-one Regtest fixture and
+set `fixture_ready` to its `ready.initial.json`. From the Zinder checkout, build
+the wallet in a private directory and pass its lockfile and binary digest to
+the runner. Each step checks the node's block hash at the recorded fixture
+height. To exercise a candidate service on the same node, keep the release
+fixture as `--ready` and pass its service receipt with `--candidate`.
+The runner creates fresh wallet and evidence directories.
+
+```bash
+case_dir=$(mktemp -d)
+git clone https://github.com/zcash/zcash-devtool.git "$case_dir/client"
+git -C "$case_dir/client" checkout --detach c8322f7e71ae46ab24801a721523ba83b27d911b
+CARGO_TARGET_DIR="$case_dir/target" cargo +1.100.0 build --locked \
+  --manifest-path "$case_dir/client/Cargo.toml" --features regtest_support
+client="$case_dir/target/debug/zcash-devtool"
+python3 scripts/wallet-clients/run-devtool-regtest.py \
+  --client "$client" --client-sha256 "$(sha256sum "$client" | cut -d' ' -f1)" \
+  --client-revision "$(git -C "$case_dir/client" rev-parse HEAD)" \
+  --input "$case_dir/client/Cargo.lock" --ready "$fixture_ready" \
+  --output "$case_dir/evidence"
+```
 
 Run a pinned wallet adapter against an isolated, funded fixture:
 
