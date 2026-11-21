@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.22.0] - 2026-11-21
+
+### Added
+
+- Wallet integrators can verify funded recovery, transaction confirmation, and process restart against an isolated Regtest stack with wallet-specific activation schedules. ([#437](https://github.com/ZcashFoundation/zinder/pull/437))
+- The rocksdb-tree-state-replay benchmark accepts an explicit height file to compare stored and replayed WalletQuery storage reads at identical heights, preserving their order and duplicates and recording the input digest and per-height read counters. ([#438](https://github.com/ZcashFoundation/zinder/pull/438))
+- Wallet integrators can replay funded Regtest recovery, sends, and restart checks for Zingo, Zkool, Vizor, the Cake Wallet Zcash engine, and zcash-devtool. ([#439](https://github.com/ZcashFoundation/zinder/pull/439))
+
+### Fixed
+
+- Tree-state requests before Sapling activation now return INVALID_ARGUMENT, matching Go lightwalletd, including latest-state requests on a pre-Sapling chain. Native WalletQuery continues to return pre-activation states with inactive pools absent. ([#436](https://github.com/ZcashFoundation/zinder/pull/436))
+
+
 ## [0.21.0] - 2026-11-20
 
 ### Changed
