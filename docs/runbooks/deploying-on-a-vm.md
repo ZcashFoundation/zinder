@@ -293,7 +293,11 @@ access to the private key. The wallet reader mounts the public key and
 catalog read-only.
 
 The wallet listener verifies the publisher's signed empty checkpoint before
-serving canonical ranges during bootstrap. It adopts each signed catalog
+serving canonical ranges during bootstrap. A newly starting reader waits up to
+30 seconds for the publisher to create this checkpoint. If it times out,
+Compose retries the process. Once the local stores pass admission, the reader
+can reopen existing signed state without a running publisher or an upstream
+node connection. It adopts each signed catalog
 after verifying the segments and settled chain anchor. Wallets keep using
 the same endpoint throughout. A range can cross into the encoded tail when
 its chain view matches. Uncovered blocks use canonical storage. On a compatible Linux filesystem, the publisher protects each new segment with fs-verity before publishing the signed catalog. Other filesystems use per-payload verification. See the
@@ -309,6 +313,43 @@ container separately.
 all of `catalog/`, including its hidden publisher checkpoint, then restart
 the publisher. Restore that generation together. A missing checkpoint beside
 an existing catalog requires recovery.
+
+**Serve canonical ranges during an incident.** If a key is compromised or a
+catalog is damaged, take the reader out of traffic. From the release checkout,
+use your normal Compose arguments, including any installation-specific
+overlays and profiles. Create a private recovery configuration from that
+deployment. It keeps the listener, store paths, limits, and project identity,
+and removes the publisher, trust key, and catalog mounts. The shipped reader
+TOML has no history section. If you added one, remove it from the recovery
+reader configuration as well.
+
+```bash
+set -euo pipefail
+normal=(docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml)
+sudo install -m 0600 /dev/null /etc/zinder/canonical-recovery.pending.json
+"${normal[@]}" config --format json |
+  jq 'del(.services["zinder-history-publisher"])
+    | .services["zinder-compat-lightwalletd"] |=
+      (.environment |= with_entries(select(.key | startswith("ZINDER_COMPAT__SHIELDED_HISTORY__") | not))
+       | .volumes |= map(select(.target != "/var/lib/zinder-history"
+                           and .target != "/run/zinder-history/publisher.pub")))' |
+  sudo tee /etc/zinder/canonical-recovery.pending.json >/dev/null
+sudo docker compose -f /etc/zinder/canonical-recovery.pending.json config -q
+sudo mv /etc/zinder/canonical-recovery{.pending,}.json
+"${normal[@]}" stop zinder-history-publisher
+sudo docker compose -f /etc/zinder/canonical-recovery.json up -d --no-build \
+  --no-deps --force-recreate zinder-compat-lightwalletd
+```
+
+Check the reader's `/readyz` and a wallet range before returning it to traffic.
+The rendered file contains your effective deployment configuration. Keep it
+root-readable. To retain this recovery across a host restart, use
+`-f /etc/zinder/canonical-recovery.json` in each Compose command of the
+[systemd unit](#6-supervise-with-systemd) and run `sudo systemctl daemon-reload`.
+After restoring or rotating the trusted generation, restore the original
+Compose arguments in the unit, reload systemd, and recreate the publisher and
+reader from the normal deployment. Remove the private recovery file after
+checking readiness.
 
 **Rotate or recover the key.** Choose a fresh generation on the same network.
 For example, run these commands from the release checkout on Testnet.

@@ -181,20 +181,38 @@ async fn wallet_adopts_first_publication_on_the_same_connection() -> Result<()> 
     let mut fixture = canonical_fixture(&chain)?;
     let (canonical, _) = fixture.take_readers()?;
     let reader = RocksDbCanonicalReader::new(canonical)?;
-    let mut publisher =
-        ShieldedCatalogPublisher::open(directory, &private, BlockHeight::new(1), NonZeroU32::MIN)?;
     let section = format!(
         "[compat.shielded_history]\ndirectory = \"{}\"\npublisher_key = \"{}\"\n",
         directory.display(),
         public.display()
     );
-    let runtime =
-        CompatProcess::start_with_history("wallet", Some(super::ORIGIN), &section).await?;
+    let storage = tempfile::tempdir()?;
+    let log = storage.path().join("compat.log");
+    let (runtime, publisher) = tokio::join!(
+        CompatProcess::start_with_history_in("wallet", Some(super::ORIGIN), &section, storage),
+        async {
+            wait_for_log_file(&log, "shielded_publisher_starting").await?;
+            Ok::<_, eyre::Report>(ShieldedCatalogPublisher::open(
+                directory,
+                &private,
+                BlockHeight::new(1),
+                NonZeroU32::MIN,
+            )?)
+        }
+    );
+    let runtime = runtime?;
+    let mut publisher = publisher?;
     let mut wallet = runtime.native_client().await?;
     let expected = collect_range(&mut wallet, 1, 3).await?;
-    let manifest = directory.join("current.json");
-    replace_manifest(&manifest, b"invalid first manifest")?;
+    let checkpoint = directory.join(".publisher-head.json");
+    let empty_head = fs::read(&checkpoint)?;
+    replace_manifest(&checkpoint, b"invalid signed publisher checkpoint")?;
     wait_for_log(&runtime, "shielded_catalog_refresh_failed").await?;
+    assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
+    replace_manifest(&checkpoint, &empty_head)?;
+    let manifest = directory.join("current.json");
+    replace_manifest(&manifest, b"{}")?;
+    wait_for_log(&runtime, "missing field `manifest`").await?;
     assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
     assert!(publisher.publish_next(&reader)?);
     wait_for_log(&runtime, "shielded_catalog_installed").await?;
@@ -357,11 +375,17 @@ fn replace_manifest(manifest: &Path, contents: &[u8]) -> Result<()> {
 }
 
 async fn wait_for_log(runtime: &CompatProcess, message: &str) -> Result<()> {
-    let log = runtime.storage.path().join("compat.log");
+    wait_for_log_file(&runtime.storage.path().join("compat.log"), message).await
+}
+
+async fn wait_for_log_file(log: &Path, message: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if fs::read_to_string(&log)?.contains(message) {
-                return Ok(());
+            match fs::read_to_string(log) {
+                Ok(contents) if contents.contains(message) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }

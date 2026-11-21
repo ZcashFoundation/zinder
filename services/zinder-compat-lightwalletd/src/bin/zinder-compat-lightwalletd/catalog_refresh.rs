@@ -75,28 +75,30 @@ impl ShieldedHistorySection {
 }
 
 #[derive(Eq, PartialEq)]
-enum ManifestStamp {
-    Unpublished,
-    Present {
-        length: u64,
-        modified: SystemTime,
-        #[cfg(unix)]
-        identity: (u64, u64, i64, i64),
-    },
+struct FileStamp {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
 }
 
-impl ManifestStamp {
-    async fn read(path: &Path) -> io::Result<Self> {
-        let path = path.to_owned();
-        let metadata = match tokio::task::spawn_blocking(move || std::fs::metadata(path))
-            .await
-            .map_err(io::Error::other)?
-        {
+impl FileStamp {
+    fn read(path: &Path) -> io::Result<Option<Self>> {
+        let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Unpublished),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Ok(link) if !link.is_symlink() => link,
+                    Ok(_) => return Err(error),
+                    Err(link_error) if link_error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(None);
+                    }
+                    Err(link_error) => return Err(link_error),
+                }
+            }
             Err(error) => return Err(error),
         };
-        Ok(Self::Present {
+        Ok(Some(Self {
             length: metadata.len(),
             modified: metadata.modified()?,
             #[cfg(unix)]
@@ -106,15 +108,68 @@ impl ManifestStamp {
                 metadata.ctime(),
                 metadata.ctime_nsec(),
             ),
+        }))
+    }
+}
+
+#[derive(Eq, PartialEq)]
+enum CatalogStamp {
+    Missing,
+    Checkpoint(FileStamp),
+    Manifest(FileStamp),
+}
+
+impl HistoryLocation {
+    async fn stamp(&self) -> io::Result<CatalogStamp> {
+        let location = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(stamp) = FileStamp::read(&location.manifest())? {
+                return Ok(CatalogStamp::Manifest(stamp));
+            }
+            if let Self::Directory(directory) = location
+                && let Some(stamp) = FileStamp::read(&directory.join(".publisher-head.json"))?
+            {
+                return Ok(CatalogStamp::Checkpoint(stamp));
+            }
+            Ok(CatalogStamp::Missing)
         })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    async fn initial_stamp(&self, timeout: Duration) -> io::Result<CatalogStamp> {
+        let stamp = self.stamp().await?;
+        if matches!(self, Self::Manifest(_)) || stamp != CatalogStamp::Missing {
+            return Ok(stamp);
+        }
+        tracing::info!(target: "zinder::compat_lightwalletd",
+            event = "shielded_publisher_starting",
+            "waiting for the first signed publisher checkpoint"
+        );
+        tokio::time::timeout(timeout, async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let stamp = self.stamp().await?;
+                if stamp != CatalogStamp::Missing {
+                    return Ok(stamp);
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for the first signed publisher checkpoint",
+            )
+        })?
     }
 }
 
 pub(super) struct CatalogRefresh {
     pub(super) history: Arc<PublishedShieldedHistory>,
     source: CatalogSource,
-    manifest: std::path::PathBuf,
-    applied: Option<ManifestStamp>,
+    location: HistoryLocation,
+    applied: Option<CatalogStamp>,
 }
 
 impl CatalogRefresh {
@@ -122,17 +177,16 @@ impl CatalogRefresh {
         paths: &ShieldedHistorySection,
         source: CatalogSource,
     ) -> Result<Self, LightwalletdConfigError> {
-        let manifest = paths.location.manifest();
-        let before = ManifestStamp::read(&manifest)
+        let location = &paths.location;
+        let before = location
+            .initial_stamp(Duration::from_secs(30))
             .await
             .map_err(admission_error)?;
         let history = source.open(paths).await.map_err(admission_error)?;
-        let after = ManifestStamp::read(&manifest)
-            .await
-            .map_err(admission_error)?;
+        let after = location.stamp().await.map_err(admission_error)?;
         Ok(Self {
             history: Arc::new(history),
-            manifest,
+            location: location.clone(),
             source,
             applied: (before == after).then_some(after),
         })
@@ -169,7 +223,7 @@ impl CatalogRefresh {
             match admission {
                 Ok(()) => reported_error = None,
                 Err(reason) if reported_error.as_ref() != Some(&reason) => {
-                    tracing::warn!(target: "zinder::compat_lightwalletd", event = "shielded_catalog_refresh_failed", %reason, "retaining the admitted shielded history");
+                    tracing::warn!(target: "zinder::compat_lightwalletd", event = "shielded_catalog_refresh_failed", %reason, "continuing to serve the last verified wallet view");
                     reported_error = Some(reason);
                 }
                 Err(_) => {}
@@ -178,7 +232,9 @@ impl CatalogRefresh {
     }
 
     async fn refresh(&mut self) -> Result<(), String> {
-        let stamp = ManifestStamp::read(&self.manifest)
+        let stamp = self
+            .location
+            .stamp()
             .await
             .map_err(|error| error.to_string())?;
         if self.applied.as_ref() == Some(&stamp) {
@@ -196,7 +252,9 @@ impl CatalogRefresh {
         if changed {
             tracing::info!(target: "zinder::compat_lightwalletd", event = "shielded_catalog_installed", "serving the new signed shielded history");
         }
-        self.applied = ManifestStamp::read(&self.manifest)
+        self.applied = self
+            .location
+            .stamp()
             .await
             .ok()
             .filter(|after| *after == stamp);
@@ -206,4 +264,34 @@ impl CatalogRefresh {
 
 fn admission_error(error: impl std::fmt::Display) -> ConfigError {
     ConfigError::invalid(format!("shielded range admission failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_a_fresh_managed_directory_waits_for_publisher_initialization() -> eyre::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let files = HistoryLocation::Directory(dir.path().into());
+        let timeout = Duration::from_millis(20);
+        let error = files
+            .initial_stamp(timeout)
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("missing timeout"))?;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let snapshot = HistoryLocation::Manifest(files.manifest());
+        assert!(snapshot.initial_stamp(timeout).await? == CatalogStamp::Missing);
+        std::fs::write(
+            files.manifest(),
+            b"requires immediate signature verification",
+        )?;
+        assert!(matches!(
+            files.initial_stamp(timeout).await?,
+            CatalogStamp::Manifest(_)
+        ));
+        Ok(())
+    }
 }
