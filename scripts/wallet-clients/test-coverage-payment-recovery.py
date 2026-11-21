@@ -389,6 +389,47 @@ class RecoveryImport(unittest.TestCase):
         self.assertEqual(baseline["fixture"], current["fixture"])
         self.assertNotEqual(baseline["evidence"]["sha256"], current["evidence"]["sha256"])
 
+    def test_remined_height_and_block_hash_must_match_the_rollback_contract(self):
+        baseline = self.receipts["rollback"]["scenario"]
+        old, block_hash = baseline["remine"]["old_height"], baseline["remine"]["new_block_hash"]
+
+        def remined(height, digest=block_hash, empty_replacement=True, returned=None):
+            case = copy.deepcopy(self.receipts["rollback"])
+            scenario = case["scenario"]
+            scenario["remine"].update(new_height=height, new_block_hash=digest,
+                                      empty_replacement=empty_replacement,
+                                      height_changed=height != old)
+            scenario["replacement"].update(wallet_new_height=height,
+                                           wallet_observed_height_change=height != old)
+            if height > scenario["replacement"]["tip_height"]:
+                tip = {"height": height, "hash": token(f"tip-{height}")}
+                scenario["replacement"].update(tip_height=height, tip_hash=tip["hash"],
+                                               surfaces={"lightwalletd": dict(tip),
+                                                         "native": dict(tip)})
+            if returned is not None:
+                scenario["return"].update(mined_height=returned,
+                                          surfaces=surfaces(returned, "return"))
+            return case
+
+        cases = (
+            {"label": "negative height", "height": -1},
+            {"label": "height beyond the next block", "height": old + 2},
+            {"label": "empty replacement at the old height", "height": old},
+            {"label": "readmission at the next height", "height": old + 1,
+             "empty_replacement": False},
+            {"label": "remine at the return height", "height": old + 1, "returned": old + 1},
+            {"label": "remine after the return height", "height": old + 2, "returned": old + 1},
+            {"label": "boolean height", "height": True},
+            {"label": "uppercase block hash", "height": old + 1, "digest": block_hash.upper()},
+            {"label": "short block hash", "height": old + 1, "digest": block_hash[:-1]},
+            {"label": "non-hex block hash", "height": old + 1, "digest": "not-a-block-hash"},
+        )
+        for mutation in cases:
+            with self.subTest(label=mutation["label"]):
+                self.write("rollback", remined(**{k: v for k, v in mutation.items() if k != "label"}))
+                with self.assertRaises(ValueError):
+                    self.rows("rollback")
+
     def test_automatic_readmission_in_a_new_block_at_the_same_height(self):
         case = self.receipts["rollback"]
         scenario = case["scenario"]

@@ -236,18 +236,24 @@ def rollback_evidence(result, outbound):
         "retained orphan header must identify an inactive block")
     require(orphan["old_chain_tip_status"] in {None, "unsupported", "invalid", "valid-fork"},
             "unexpected old chain tip status")
+    old_height, new_height = remine["old_height"], remine["new_height"]
+    require(type(old_height) is int and type(new_height) is int
+            and old_height > 0 and new_height in {old_height, old_height + 1},
+            "remined height is not the invalidated height or its successor")
+    require(new_height < scenario["return"]["mined_height"],
+            "remined payment does not precede the return payment")
     if remine["empty_replacement"]:
         token(orphan["empty_replacement_hash"], "empty replacement")
         require(orphan["empty_replacement_height"] == orphan["old_height"]
+                and type(orphan["empty_replacement_height"]) is int
                 and orphan["empty_replacement_hash"] != orphan["old_block_hash"]
                 and orphan["empty_replacement_excludes_tx"] is True
                 and orphan["readded_after_recovery_attempts"] is False,
                 "empty replacement did not exclude the orphaned transfer")
-        require(remine["new_height"] != remine["old_height"] and remine["height_changed"] is True,
+        require(new_height == old_height + 1 and remine["height_changed"] is True,
                 "remined payment did not change height after the empty replacement")
     else:
-        require(remine["new_height"] == remine["old_height"]
-                and remine["height_changed"] is False,
+        require(new_height == old_height and remine["height_changed"] is False,
                 "readmitted payment was not remined at the invalidated height")
     require(readmission["mempool_present"] is True
             and readmission["method"] in {"sendrawtransaction-same-bytes", "node-reorg-readmission"},
@@ -263,6 +269,7 @@ def rollback_evidence(result, outbound):
             "remined bytes differ from the readmitted signed bytes")
     require(remine["tx_fingerprint"] == outbound["tx_fingerprint"],
             "remined payment identity changed")
+    token(remine["new_block_hash"], "remine block")
     require(remine["old_height"] == orphan["old_height"]
             and remine["old_block_hash"] == orphan["old_block_hash"]
             and remine["new_block_hash"] != remine["old_block_hash"],

@@ -257,7 +257,7 @@ class Transport(RECOVERY.Recovery):
         try:
             same_process = self.wait_process_confirmed(
                 txid, inclusion["height"], down["node_tip"], identity=zallet_identity)
-        except BaseException as error:
+        except Exception as error:
             changed = self.zallet._owned_identity() != zallet_identity
             self.receipt["same_process"] = {
                 "reconnected": False,

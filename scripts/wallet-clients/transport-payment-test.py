@@ -49,6 +49,25 @@ class TransportHarnessPinTests(unittest.TestCase):
 
 
 class TransportScanTests(unittest.TestCase):
+    def test_only_reconnect_errors_run_the_restart_control(self):
+        for error in (KeyboardInterrupt(), SystemExit(143), TimeoutError("wallet did not reconnect")):
+            with self.subTest(error=type(error).__name__):
+                transport = Mock()
+                transport.ready = {"native_wallet_query": "http://127.0.0.1:20902"}
+                transport.receipt = {"transport": {}, "assertions": {}}
+                transport.broadcast.return_value = "payment"
+                transport.balances.return_value = {"zallet": {"total_zat": 0}}
+                transport.rpc.side_effect = [["payment"], 271, []]
+                transport.canonical.return_value = {"height": 262}
+                transport.wait_process_confirmed.side_effect = error
+                with patch.object(tool, "reachable", side_effect=[False, True, False, True, True]):
+                    with self.assertRaises(type(error)):
+                        tool.Transport.run_transport(transport)
+                if isinstance(error, TimeoutError):
+                    transport.restart_control.assert_called_once_with("payment", 262, 271)
+                else:
+                    transport.restart_control.assert_not_called()
+
     def test_confirmed_payment_waits_for_the_same_process_to_scan_the_outage_tip(self):
         transport = object.__new__(tool.Transport)
         transport.args = Mock(wait_seconds=30)
