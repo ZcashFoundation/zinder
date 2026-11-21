@@ -212,6 +212,7 @@ jobs:
           python3 -B scripts/wallet-clients/payment-recovery-test.py
           python3 -B scripts/wallet-clients/transport-payment-test.py
           python3 -B scripts/wallet-clients/test-coverage-payment-recovery.py
+          python3 -B scripts/release-wallet-tests.py
           python3 -B scripts/wallet-clients/coverage.py check
 
       - name: Test storage benchmark contracts

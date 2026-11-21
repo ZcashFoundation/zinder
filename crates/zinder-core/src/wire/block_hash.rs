@@ -95,9 +95,14 @@ pub fn decode_rpc_block_hash_hex(input: &str) -> Result<BlockHash, WireDecodeErr
         });
     }
     let mut buffer = [0u8; BLOCK_HASH_BYTE_COUNT];
-    hex::decode_to_slice(input, &mut buffer).map_err(|hex_error| WireDecodeError::InvalidHex {
-        reason: hex_error.to_string(),
-    })?;
+    if base16ct::mixed::decode(input, &mut buffer).is_err() {
+        // Preserve the offending character and its position in wire errors.
+        hex::decode_to_slice(input, &mut buffer).map_err(|hex_error| {
+            WireDecodeError::InvalidHex {
+                reason: hex_error.to_string(),
+            }
+        })?;
+    }
     buffer.reverse();
     Ok(BlockHash::from_bytes(buffer))
 }
@@ -213,8 +218,14 @@ mod tests {
 
     #[test]
     fn rpc_hex_decode_matches_storage_form_for_testnet_block() -> TestResult {
-        let decoded = decode_rpc_block_hash_hex(TESTNET_BLOCK_HASH_RPC_HEX)?;
-        assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        for input in [
+            TESTNET_BLOCK_HASH_RPC_HEX.to_owned(),
+            TESTNET_BLOCK_HASH_RPC_HEX.to_ascii_uppercase(),
+            TESTNET_BLOCK_HASH_RPC_HEX.replacen('f', "F", 1),
+        ] {
+            let decoded = decode_rpc_block_hash_hex(&input)?;
+            assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        }
         Ok(())
     }
 
@@ -290,10 +301,13 @@ mod tests {
 
     #[test]
     fn rpc_hex_rejects_non_hex_characters() {
-        let invalid = "z".repeat(BLOCK_HASH_HEX_LEN);
-        assert!(matches!(
+        let mut invalid = TESTNET_BLOCK_HASH_RPC_HEX.to_owned();
+        invalid.replace_range(17..18, "z");
+        assert_eq!(
             decode_rpc_block_hash_hex(&invalid),
-            Err(WireDecodeError::InvalidHex { .. })
-        ));
+            Err(WireDecodeError::InvalidHex {
+                reason: "Invalid character 'z' at position 17".to_owned(),
+            })
+        );
     }
 }
