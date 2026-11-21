@@ -28,10 +28,9 @@
         "/rpcs/GetLatestBlock/statuses": {"ok": 1},
         "/rpcs/GetLightdInfo/statuses": {"ok": 1},
         "/rpcs/GetTransaction/statuses": {"ok": 256},
-        "/rpcs/GetTreeState/statuses": {"ok": 80},
-        "/rpcs/connect/statuses": {"ok": 49}
+        "/rpcs/GetTreeState/statuses": {"ok": 80}
       },
-      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights"]
+      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights", "/request_identity_sha256", "/rpcs/connect/statuses"]
     },
     "vizor": {
       "command": ["zinder-bench", "lightwalletd-wallet-load", "--endpoint", "{endpoint}", "--workload", "vizor", "--wallets", "16", "--from-height", "4624102", "--to-height", "4644091", "--report", "{report}"],
@@ -57,7 +56,7 @@
         "/rpcs/GetTreeState/statuses": {"ok": 336},
         "/rpcs/connect/statuses": {"ok": 17}
       },
-      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights"]
+      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights", "/request_identity_sha256"]
     }
   }
 }

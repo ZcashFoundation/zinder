@@ -218,6 +218,9 @@ pub(crate) struct LightwalletdWalletLoadReport {
     time_to_first_block_seconds: Percentiles,
     /// From a wallet's start to its last call, over completed wallets.
     wallet_sync_seconds: Percentiles,
+    /// SHA-256 of the counted wallet `GetBlockRange`, `GetTreeState`, and
+    /// `GetTransaction` request identities, including retries and cancellations.
+    request_identity_sha256: String,
     rpcs: BTreeMap<&'static str, RpcSummary>,
     tree_state_heights: TreeStateHeights,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -771,6 +774,7 @@ impl LightwalletdWalletLoadReport {
                     .filter(|outcome| outcome.failure.is_none())
                     .map(|outcome| outcome.seconds),
             ),
+            request_identity_sha256: recorder.request_identity_sha256(),
             rpcs: recorder.rpc_summaries(),
             tree_state_heights: server_observed.map_or_else(
                 || recorder.tree_state_heights(),

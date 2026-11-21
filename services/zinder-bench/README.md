@@ -1065,6 +1065,12 @@ identity, the workload's constants, and, over all wallets:
   `tip_before`'s height and the same 32-byte hash; it is false when a hash is
   missing or not 32 bytes, because the identity cannot be shown. A `hash_hex` is in RPC byte order, as block explorers show
   it, or the bytes as sent when the server's hash is not 32 bytes.
+- `request_identity_sha256`: identifies the ranges, tree states, and transactions
+  the simulated wallets requested. It includes the full request for each
+  attempted read and counts duplicates, including retries. Concurrent
+  wallets can issue the same requests in a different order and still match.
+  The digest excludes setup probes and response data. Use it together with
+  RPC statuses and delivered bytes when comparing runs.
 - `tree_state_heights`: how many requested heights sit on Zinder's 100-block
   checkpoint stride, and each other height's offset from it. Below the
   first-sync tip, that offset is the number of blocks Zinder replays. Above

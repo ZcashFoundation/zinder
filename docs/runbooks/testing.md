@@ -929,7 +929,8 @@ and build flags constant. Run each profile once on each endpoint to warm
 the caches, and exclude those runs from the comparison.
 Copy the example to `compact-range-campaign.json` and record the server
 revisions, binary hashes, fixture identity, and CPU sets in its `environment`
-object. Put the shared `zinder-bench` binary on `PATH` and run the command on
+object. Use the same `zinder-bench` binary with request-identity reporting
+for both endpoints. Put it on `PATH` and run the command on
 your reserved client cores (8–11 here).
 
 ```sh
@@ -938,7 +939,12 @@ taskset -c 8-11 python3 scripts/run-benchmark-campaign.py compact-range-campaign
 ```
 
 A successful run has eight pairs per profile, 319,840 blocks per endpoint
-in each pair, and matching delivered bytes. After the runner exits successfully,
+in each pair, and matching delivered bytes. Both reports must also have the
+same `request_identity_sha256`. It covers the range requests, transaction
+IDs, and requested tree states, including how often each request was made.
+Concurrent wallets can issue these requests in different orders. Slipstream
+connection counts can vary between runs and must agree within each pair.
+After the runner exits successfully,
 calculate each pair's change in `GetBlockRange` first-message p99 and whole-wallet sync p99 separately.
 A positive difference means the candidate took longer.
 

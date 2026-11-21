@@ -169,6 +169,7 @@ pub(super) struct CallRecorder {
 #[derive(Default)]
 struct RecorderState {
     calls: BTreeMap<&'static str, CallSamples>,
+    request_counts: BTreeMap<[u8; 32], u64>,
     tree_state_heights: Vec<u64>,
     tree_state_frontiers: BTreeSet<[u8; 32]>,
 }
@@ -188,6 +189,31 @@ struct CallSamples {
 }
 
 impl CallRecorder {
+    fn note_request(&self, method: &'static str, request: &impl prost::Message) {
+        let mut hash = Sha256::new();
+        hash.update(method.as_bytes());
+        hash.update([0]);
+        hash.update(request.encode_to_vec());
+        *self
+            .state
+            .lock()
+            .request_counts
+            .entry(hash.finalize().into())
+            .or_default() += 1;
+    }
+
+    /// Hashes sorted request identities and their counts so concurrent wallets
+    /// can issue the same work in different orders, including repeated reads.
+    pub(super) fn request_identity_sha256(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"zinder-wallet-load-requests-v1\0");
+        for (identity, count) in &self.state.lock().request_counts {
+            hash.update(identity);
+            hash.update(count.to_be_bytes());
+        }
+        hex::encode(hash.finalize())
+    }
+
     pub(super) fn record_call(&self, method: &'static str, sample: CallSample) {
         let mut state = self.state.lock();
         let samples = state.calls.entry(method).or_default();
@@ -521,15 +547,17 @@ pub(super) async fn get_tree_state_as(
     limits: &CallLimits,
     height: u64,
 ) -> Result<(), CallFailure> {
+    let request = BlockId {
+        height,
+        hash: Vec::new(),
+    };
     recorder.note_tree_state_height(height);
+    recorder.note_request("GetTreeState", &request);
     let tree_state = unary(
         recorder,
         method,
         limits.unary,
-        client.get_tree_state(BlockId {
-            height,
-            hash: Vec::new(),
-        }),
+        client.get_tree_state(request),
     )
     .await?;
     recorder.note_tree_state_frontier(&tree_state);
@@ -543,11 +571,13 @@ pub(super) async fn get_transaction(
     limits: CallLimits,
     txid: Vec<u8>,
 ) -> Result<(), CallFailure> {
+    let request = transaction_filter(txid);
+    recorder.note_request("GetTransaction", &request);
     unary(
         recorder,
         "GetTransaction",
         limits.unary,
-        client.get_transaction(transaction_filter(txid)),
+        client.get_transaction(request),
     )
     .await
     .map(drop)
@@ -632,19 +662,17 @@ pub(super) async fn read_transaction(
     read: TransactionRead,
     txid: Vec<u8>,
 ) -> Result<(), CallFailure> {
+    let request = transaction_filter(txid);
+    recorder.note_request("GetTransaction", &request);
     let mut pending = PendingCall::new(recorder, read.requested_method());
     if read == TransactionRead::Missing {
         pending.expected_miss = Some(status_label(Code::NotFound));
     }
-    let outcome = await_unary(
-        &mut pending,
-        limits.unary,
-        client.get_transaction(transaction_filter(txid)),
-    )
-    .await
-    .map(|transaction| {
-        pending.method = read.answered_method(TransactionAnswer::of_height(transaction.height));
-    });
+    let outcome = await_unary(&mut pending, limits.unary, client.get_transaction(request))
+        .await
+        .map(|transaction| {
+            pending.method = read.answered_method(TransactionAnswer::of_height(transaction.height));
+        });
     pending.finish(outcome.as_ref().map(drop));
     outcome
 }
@@ -753,7 +781,6 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
     range: BlockRangeCall,
     mut on_block: impl FnMut(&CompactBlock, u64) -> Handled,
 ) -> Result<(), CallFailure> {
-    let mut pending = PendingCall::new(recorder, "GetBlockRange");
     let request = BlockRange {
         start: Some(BlockId {
             height: range.start,
@@ -765,6 +792,8 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
         }),
         pool_types: range.pool_types,
     };
+    recorder.note_request("GetBlockRange", &request);
+    let mut pending = PendingCall::new(recorder, "GetBlockRange");
     let stream = async {
         let mut blocks = open_stream(limits, client.get_block_range(request)).await?;
         let mut expected = range.start;
@@ -957,6 +986,60 @@ mod tests {
         stream_idle: Some(Duration::from_secs(5)),
         stream_total: None,
     };
+
+    #[tokio::test]
+    async fn request_identity_ignores_order_but_detects_changed_txids_and_repeated_attempts()
+    -> Result<(), Box<dyn Error>> {
+        let server = mock_streamer::serve(MockStreamer::new(RangeEnding::Clean)).await?;
+        let original = "ca892fceeb47ae135d5fcbbdb5c0e1de09f585ab90899c1be96f1621eeacc22d";
+        let changed = "c767c571a53eed4bc64b4cb2c0bc5b821fe0d23f9e325d708aba0a246d21d76f";
+        for (tree_first, txid_byte, expected) in [
+            (true, 0x98, original),
+            (false, 0x98, original),
+            (false, 0x99, changed),
+        ] {
+            let recorder = Arc::new(CallRecorder::default());
+            let connector =
+                Connector::new(&server.url, Arc::clone(&recorder), &TlsOptions::default())?;
+            let mut client = connector
+                .connect()
+                .await
+                .map_err(|failure| failure.detail)?;
+            if tree_first {
+                super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                    .await
+                    .map_err(|failure| failure.detail)?;
+            }
+            let range = BlockRangeCall {
+                start: 1,
+                end: 2,
+                pool_types: vec![1, 2],
+            };
+            get_block_range(&recorder, &mut client, &LIMITS, range, |_, _| {
+                std::future::ready(())
+            })
+            .await
+            .map_err(|failure| failure.detail)?;
+            let missing =
+                super::get_transaction(&recorder, client.clone(), LIMITS, vec![txid_byte; 32])
+                    .await;
+            assert_eq!(
+                missing.err().map(|failure| failure.label),
+                Some("not_found")
+            );
+            if !tree_first {
+                super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                    .await
+                    .map_err(|failure| failure.detail)?;
+            }
+            assert_eq!(recorder.request_identity_sha256(), expected);
+            super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                .await
+                .map_err(|failure| failure.detail)?;
+            assert_ne!(recorder.request_identity_sha256(), expected);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_block_past_the_range_counts_as_received_but_not_handled()

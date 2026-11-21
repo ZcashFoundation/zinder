@@ -1,0 +1,6 @@
+kind: added
+body: Wallet-load benchmark reports include a request identity digest so paired runs can verify that they fetched the same ranges, transactions, and tree states.
+time: 2026-11-21T16:24:50.550790954Z
+custom:
+    Bump: minor
+    PR: "447"
