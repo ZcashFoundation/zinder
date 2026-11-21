@@ -91,6 +91,13 @@ containers. It derives source and preparation concurrency from the envelope and
 `ZINDER_NODE_MAX_RESPONSE_BYTES`. The CPU limit is a quota, not a reservation:
 Zebra shares the Docker engine and is not measured.
 
+Canonical construction uses `every-block` tree-state checkpoint coverage by
+default, matching fresh default `zinder-ingest` deployments. Set
+`ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=cadence-and-tip` to
+measure the sparse cadence-and-tip construction baseline instead. The chosen
+coverage is recorded in `resource_limits.tree_state_checkpoint_coverage` and
+cross-checked against `canonical_storage_ready.tree_state_checkpoint_count`.
+
 ## State and cleanup
 
 Before each run, the runner checks the rendered Compose model. It refuses an
@@ -117,8 +124,9 @@ versions. It rejects the evidence unless:
 
 - the store schema, replay, digest, and report versions match the values it
   pins;
-- canonical `READY` covers heights 1 through the fixed tip and survives a cold
-  reopen;
+- canonical `READY` covers heights 1 through the fixed tip, persists the exact
+  tree-state checkpoint count required by
+  `resource_limits.tree_state_checkpoint_coverage`, and survives a cold reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,
   and transaction count, and both stores pass the final cold admission;
 - wallet row counts, projection digest, UTXO commitment, and undo depth are

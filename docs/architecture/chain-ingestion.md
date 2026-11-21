@@ -187,13 +187,15 @@ construction checkpoint coverage and the background densification pass:
 Live following already stores one checkpoint per block. Once ingest follows
 the tip, and Explorer views have caught up when they are enabled, the
 background pass runs for existing sparse stores, `commitment-budget` stores,
-and to verify and watermark settled strides on freshly constructed stores.
+and to check checkpoint-height coverage and advance the watermark on freshly
+constructed stores.
 Heights in a sparse store's stride that the settled tip has not yet passed,
 such as 301 to 359 while the tip is settled at 360, still replay from the
 nearest checkpoint until the tip crosses the stride's end.
 
 The pass works one stride at a time, from one stored checkpoint to the next
-multiple of 100. It replays the stride's compact blocks from the first
+multiple of 100. When the selected heights already have rows, the pass skips
+replay. For an incomplete stride, it replays compact blocks from the first
 checkpoint with the per-block step a tree-state rebuild runs, checks every
 replayed block against the canonical header at its height, and accepts the result
 only when the replay reproduces every checkpoint already stored in the stride,

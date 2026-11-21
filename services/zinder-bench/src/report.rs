@@ -1,11 +1,11 @@
 //! Machine-readable benchmark report and its assembly from scraped metrics.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zinder_core::CanonicalBlockReplayFormatVersion;
-use zinder_store::RocksDbResourceBudget;
+use zinder_store::{RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE};
 
 use crate::{
     canonical_replay_storage::postgres::PostgresServerSettings,
@@ -314,6 +314,83 @@ pub enum FixtureCachePolicy {
     Cold,
     /// The operator deliberately retained or preloaded the fixture cache.
     Warm,
+}
+
+/// Tree-state checkpoint coverage persisted during fresh canonical construction.
+///
+/// [`Self::EveryBlock`] matches default `zinder-ingest` construction
+/// (`ingest.tree_state_densification.enabled = true`, `selection = "every-block"`).
+/// [`Self::CadenceAndTip`] preserves the sparse construction mode that writes
+/// checkpoints only at the history predecessor, every
+/// [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at the build tip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TreeStateCheckpointCoverage {
+    /// Persist and cross-check a tree-state checkpoint for every loaded block.
+    #[default]
+    EveryBlock,
+    /// Persist sparse checkpoints only at the predecessor, every
+    /// `TREE_STATE_CHECKPOINT_STRIDE` blocks, and at the build tip.
+    CadenceAndTip,
+}
+
+impl TreeStateCheckpointCoverage {
+    /// Returns the stable kebab-case identifier used in CLI flags and reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EveryBlock => "every-block",
+            Self::CadenceAndTip => "cadence-and-tip",
+        }
+    }
+
+    /// Returns whether construction stores a tree-state checkpoint for every loaded block.
+    #[must_use]
+    pub const fn stores_every_block(self) -> bool {
+        matches!(self, Self::EveryBlock)
+    }
+
+    /// Maps a builder's effective per-block checkpoint setting back to its coverage enum.
+    #[must_use]
+    pub const fn from_every_block(every_block: bool) -> Self {
+        if every_block {
+            Self::EveryBlock
+        } else {
+            Self::CadenceAndTip
+        }
+    }
+
+    /// Returns the exact persisted tree-state checkpoint count, including the
+    /// predecessor checkpoint at `first_height - 1`, for contiguous loaded
+    /// heights `first_height..=tip_height`.
+    ///
+    /// Returns `None` when `first_height == 0` or `tip_height < first_height`.
+    #[must_use]
+    pub fn expected_checkpoint_count(self, first_height: u32, tip_height: u32) -> Option<u64> {
+        if first_height == 0 || tip_height < first_height {
+            return None;
+        }
+        let predecessor_height = first_height - 1;
+        match self {
+            Self::EveryBlock => {
+                let loaded_blocks = u64::from(tip_height) - u64::from(first_height) + 1;
+                Some(loaded_blocks + 1)
+            }
+            Self::CadenceAndTip => {
+                let stride = TREE_STATE_CHECKPOINT_STRIDE;
+                let cadence_checkpoints =
+                    u64::from(tip_height / stride) - u64::from(predecessor_height / stride);
+                let tip_checkpoint = u64::from(!tip_height.is_multiple_of(stride));
+                Some(1 + cadence_checkpoints + tip_checkpoint)
+            }
+        }
+    }
+}
+
+impl fmt::Display for TreeStateCheckpointCoverage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Operator-supplied runner and complete-arm resource provenance.
@@ -729,6 +806,8 @@ pub struct RocksDbCanonicalFixtureReplayResourceLimits {
     pub supported_reorg_depth: u32,
     /// Fixed delay applied to each outer fixture segment response.
     pub source_segment_delay_millis: u64,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Canonical embedded-store writer and cold-reopen budget.
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
 }
@@ -968,6 +1047,8 @@ pub struct StorageLifecycleResourceLimits {
     pub block_prepare_memory_watermark_bytes: u64,
     /// Canonical embedded-store resource budget.
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Wallet embedded-store resource budget.
     pub wallet_rocksdb: RocksDbResourceBudgetSummary,
     /// Retained wallet reorg depth.
@@ -1035,6 +1116,8 @@ pub struct CanonicalStorageReadySummary {
     pub block_count: u64,
     /// Parsed source transaction count.
     pub transaction_count: u64,
+    /// Persisted tree-state checkpoints, including the predecessor checkpoint.
+    pub tree_state_checkpoint_count: u64,
     /// Source-authenticated completed subtree-root count.
     pub subtree_root_count: u64,
     /// Canonical semantic replay format version.
@@ -1414,7 +1497,11 @@ impl RocksDbCanonicalFixtureReplayReport {
     /// Validates authenticated checkpointed fixture replay without claiming live-source certification.
     pub fn validate_evidence(&self) -> Result<(), BenchError> {
         validate_canonical_fixture_report_identity_and_resources(self)?;
-        validate_canonical_fixture_source_load(&self.fixture, &self.source_load)?;
+        validate_canonical_fixture_source_load(
+            &self.fixture,
+            &self.source_load,
+            self.resource_limits.tree_state_checkpoint_coverage,
+        )?;
         validate_canonical_fixture_ready(&self.source_load, &self.canonical_ready)?;
         validate_canonical_fixture_source_attribution(
             self.source_load.block_count,
@@ -1519,6 +1606,7 @@ fn validate_canonical_fixture_report_identity_and_resources(
 fn validate_canonical_fixture_source_load(
     fixture: &FixtureSummary,
     load: &RocksDbCanonicalFixtureSourceLoadSummary,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
 ) -> Result<(), BenchError> {
     let expected_digest = &fixture.canonical_block_facts_digest_evidence;
     if load.first_block.height != fixture.from_height
@@ -1537,6 +1625,8 @@ fn validate_canonical_fixture_source_load(
             "canonical fixture replay load range, tip, count, or digest differs from the fixture",
         ));
     }
+    let expected_checkpoint_count = tree_state_checkpoint_coverage
+        .expected_checkpoint_count(load.first_block.height, load.tip.height);
     if load.block_count == 0
         || load.block_header_count != load.block_count
         || load.block_hash_index_count != load.block_count
@@ -1546,7 +1636,7 @@ fn validate_canonical_fixture_source_load(
         || load.transaction_blob_count != load.transaction_count
         || load.block_blob_count != 0
         || load.block_final_note_commitment_roots_count != 0
-        || load.tree_state_checkpoint_count == 0
+        || Some(load.tree_state_checkpoint_count) != expected_checkpoint_count
         || load.logical_bytes == 0
         || load.sst_file_bytes == 0
         || load.sst_file_count == 0
@@ -1661,6 +1751,13 @@ impl RocksDbStorageLifecycleReport {
                 "storage lifecycle report contains an unowned acceptance boundary",
             ));
         }
+        let expected_checkpoint_count = self
+            .resource_limits
+            .tree_state_checkpoint_coverage
+            .expected_checkpoint_count(
+                canonical.first_retained_block.height,
+                canonical.visible_tip.height,
+            );
         if canonical.first_retained_block.height != 1
             || canonical.visible_epoch_id != 1
             || canonical.visible_event_sequence != 1
@@ -1669,6 +1766,7 @@ impl RocksDbStorageLifecycleReport {
             || canonical.sequence_digest.sequence_digest_version != 1
             || canonical.block_count == 0
             || canonical.block_count != canonical.sequence_digest.block_count
+            || Some(canonical.tree_state_checkpoint_count) != expected_checkpoint_count
             || !canonical.source_tip_checkpoint_authenticated
             || !canonical.cold_reopen_evidence_match
         {
@@ -2407,9 +2505,127 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             encoded["storage_candidate"]["id"],
             "rocksdb-canonical-fixture-replay"
         );
+        assert_eq!(
+            encoded["resource_limits"]["tree_state_checkpoint_coverage"],
+            "every-block"
+        );
+        assert_eq!(encoded["source_load"]["tree_state_checkpoint_count"], 11);
         assert!(encoded.get("wallet_storage_ready").is_none());
         assert!(encoded.get("acceptance").is_none());
         assert!(encoded.get("replay").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_checkpoint_coverage_expected_counts_are_exact() {
+        use super::TreeStateCheckpointCoverage::{CadenceAndTip, EveryBlock};
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(0, 10), None);
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(0, 10), None);
+        assert_eq!(EveryBlock.expected_checkpoint_count(10, 9), None);
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(10, 9), None);
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(603, 603), Some(2));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(603, 603), Some(2));
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(1, 5), Some(6));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(1, 5), Some(2));
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(1, 100), Some(101));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(1, 100), Some(2));
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(1, 105), Some(106));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(1, 105), Some(3));
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(100, 205), Some(107));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(100, 205), Some(4));
+
+        assert_eq!(EveryBlock.expected_checkpoint_count(101, 200), Some(101));
+        assert_eq!(CadenceAndTip.expected_checkpoint_count(101, 200), Some(2));
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_report_validates_declared_coverage_and_rejects_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut sparse_measurements = rocksdb_canonical_fixture_measurements();
+        sparse_measurements
+            .resource_limits
+            .tree_state_checkpoint_coverage = super::TreeStateCheckpointCoverage::CadenceAndTip;
+        sparse_measurements.source_load.tree_state_checkpoint_count = 2;
+        let sparse_report = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            sparse_measurements,
+            Some(canonical_fixture_source_exposition()),
+        );
+        sparse_report.validate()?;
+        let encoded = serde_json::to_value(&sparse_report)?;
+        assert_eq!(
+            encoded["resource_limits"]["tree_state_checkpoint_coverage"],
+            "cadence-and-tip"
+        );
+        assert_eq!(encoded["source_load"]["tree_state_checkpoint_count"], 2);
+
+        let mut mismatched_dense = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        if let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut mismatched_dense
+        {
+            inner.source_load.tree_state_checkpoint_count = 2;
+        }
+        assert!(mismatched_dense.validate().is_err());
+
+        let mut mismatched_sparse = sparse_report;
+        if let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut mismatched_sparse
+        {
+            inner.source_load.tree_state_checkpoint_count = 11;
+        }
+        assert!(mismatched_sparse.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_storage_lifecycle_report_validates_declared_coverage_and_rejects_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dense =
+            super::build_rocksdb_storage_lifecycle_report(rocksdb_storage_lifecycle_measurements(
+                super::TreeStateCheckpointCoverage::EveryBlock,
+                206,
+            ));
+        dense.validate()?;
+        let encoded = serde_json::to_value(&dense)?;
+        assert_eq!(
+            encoded["resource_limits"]["tree_state_checkpoint_coverage"],
+            "every-block"
+        );
+        assert_eq!(
+            encoded["canonical_storage_ready"]["tree_state_checkpoint_count"],
+            206
+        );
+
+        let sparse =
+            super::build_rocksdb_storage_lifecycle_report(rocksdb_storage_lifecycle_measurements(
+                super::TreeStateCheckpointCoverage::CadenceAndTip,
+                4,
+            ));
+        sparse.validate()?;
+        let encoded = serde_json::to_value(&sparse)?;
+        assert_eq!(
+            encoded["resource_limits"]["tree_state_checkpoint_coverage"],
+            "cadence-and-tip"
+        );
+        assert_eq!(
+            encoded["canonical_storage_ready"]["tree_state_checkpoint_count"],
+            4
+        );
+
+        let mismatched =
+            super::build_rocksdb_storage_lifecycle_report(rocksdb_storage_lifecycle_measurements(
+                super::TreeStateCheckpointCoverage::EveryBlock,
+                4,
+            ));
+        assert!(mismatched.validate().is_err());
         Ok(())
     }
 
@@ -2770,6 +2986,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
                 supported_reorg_depth: 5,
                 source_segment_delay_millis: 0,
+                tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage::EveryBlock,
                 canonical_rocksdb: RocksDbResourceBudgetSummary::from(
                     zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
                 ),
@@ -2789,7 +3006,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 transaction_location_count: 20,
                 transaction_blob_count: 20,
                 block_blob_count: 0,
-                tree_state_checkpoint_count: 2,
+                tree_state_checkpoint_count: 11,
                 block_final_note_commitment_roots_count: 0,
                 subtree_root_count: 0,
                 logical_bytes: 20_000,
@@ -2879,6 +3096,200 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 ..WorkloadDensity::default()
             },
             segment_count: 1,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle report fixture keeps all cross-field evidence visibly consistent"
+    )]
+    fn rocksdb_storage_lifecycle_measurements(
+        tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage,
+        tree_state_checkpoint_count: u64,
+    ) -> super::RocksDbStorageLifecycleMeasurements {
+        let first_block = StorageLifecycleBlockId {
+            height: 1,
+            hash_hex: "11".repeat(32),
+        };
+        let fixed_tip = StorageLifecycleBlockId {
+            height: 205,
+            hash_hex: "22".repeat(32),
+        };
+        let sequence_digest = CanonicalBlockFactsSequenceDigestSummary {
+            block_digest_version: 1,
+            sequence_digest_version: 1,
+            block_count: 205,
+            sha256: "33".repeat(32),
+        };
+        let empty_sort = |max_memory_bytes: u64| super::WalletVariableValueSortEvidence {
+            record_count: 0,
+            initial_run_count: 0,
+            merge_pass_count: 0,
+            peak_accounted_sort_memory_bytes: 0,
+            max_accounted_sort_memory_bytes: max_memory_bytes,
+            peak_temporary_file_bytes: 0,
+            max_temporary_file_bytes: 1_024,
+            final_run_file_bytes: 0,
+        };
+        let budget = RocksDbResourceBudgetSummary::from(
+            zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
+        );
+        super::RocksDbStorageLifecycleMeasurements {
+            provenance: super::ReportProvenance {
+                benchmark_version: env!("CARGO_PKG_VERSION"),
+                software_revision: Some("0".repeat(40)),
+                run: super::BenchmarkRunProvenance {
+                    trial_id: Some("trial-01".to_owned()),
+                    fixture_cache_policy: None,
+                    started_at_unix_millis: 1_000,
+                    completed_at_unix_millis: 2_000,
+                },
+                runner: super::RunnerProvenance {
+                    id: Some("runner-01".to_owned()),
+                    cpu_limit_cores: Some(10.0),
+                    memory_limit_bytes: Some(10 * 1024 * 1024 * 1024),
+                    storage_class: Some("local-nvme".to_owned()),
+                },
+                image_reference: Some(format!("sha256:{}", "a".repeat(64))),
+                target_os: "linux",
+                target_arch: "x86_64",
+            },
+            source: super::StorageLifecycleSourceSummary {
+                family: "zebra-json-rpc",
+                network: "zcash-testnet".to_owned(),
+                network_upgrade_activation_count: 11,
+                network_upgrade_activations_fingerprint_version: 1,
+                network_upgrade_activations_fingerprint_hex: "44".repeat(32),
+                source_tip_at_freeze: fixed_tip.clone(),
+                fixed_build_tip: fixed_tip.clone(),
+                source_tip_after_canonical_load: fixed_tip.clone(),
+            },
+            contracts: super::StorageLifecycleContractSummary {
+                canonical_store_identity: zinder_store::CANONICAL_STORE_IDENTITY,
+                canonical_store_schema_version: zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
+                wallet_store_identity: "wallet",
+                wallet_store_schema_version: zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION,
+                wallet_projection_schema_version:
+                    zinder_wallet_projection::WALLET_PROJECTION_SCHEMA_VERSION,
+                wallet_value_encoding_version:
+                    zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION,
+            },
+            resource_limits: super::StorageLifecycleResourceLimits {
+                request_timeout_seconds: 30,
+                max_response_bytes: 64 * 1024 * 1024,
+                source_segment_target_response_bytes: 32 * 1024 * 1024,
+                source_segment_max_blocks: 64,
+                source_fetch_max_in_flight_requests: 12,
+                source_fetch_max_in_flight_bytes: 160 * 1024 * 1024,
+                block_prepare_concurrency: 10,
+                block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
+                canonical_rocksdb: budget,
+                tree_state_checkpoint_coverage,
+                wallet_rocksdb: budget,
+                supported_reorg_depth: 100,
+                wallet_max_outpoint_sort_memory_bytes: 4_096,
+                wallet_max_secondary_sort_memory_bytes_per_sorter: 2_048,
+                wallet_max_temporary_file_bytes_per_sorter: 1_024,
+                wallet_sst_target_logical_bytes: 4_096,
+                wallet_max_accounted_reorg_undo_bytes: 4_096,
+            },
+            acceptance: summarize_rocksdb_storage_lifecycle_acceptance(5.0, None, 2.0, None),
+            phase_durations: super::StorageLifecyclePhaseDurations {
+                source_discovery_seconds: 0.5,
+                canonical_store_initialization_seconds: 0.5,
+                canonical_source_load_seconds: 2.0,
+                canonical_cold_validation_seconds: 1.0,
+                canonical_ready_publication_seconds: 0.5,
+                canonical_cold_reopen_seconds: 0.5,
+                wallet_build_seconds: 1.5,
+                final_cold_reopen_seconds: 0.5,
+                total_seconds: 7.0,
+            },
+            canonical_storage_ready: super::CanonicalStorageReadySummary {
+                scope: "canonical-storage-ready",
+                workload: "wallet",
+                first_retained_block: first_block,
+                visible_tip: fixed_tip.clone(),
+                visible_epoch_id: 1,
+                visible_event_sequence: 1,
+                block_count: 205,
+                transaction_count: 205,
+                tree_state_checkpoint_count,
+                subtree_root_count: 0,
+                replay_format_version: 1,
+                sequence_digest: sequence_digest.clone(),
+                logical_replay_bytes: 10_000,
+                logical_storage_bytes: 20_000,
+                sst_file_bytes: 12_000,
+                sst_file_count: 6,
+                physical_store_bytes: 15_000,
+                database_io_mode: "buffered".to_owned(),
+                source_tip_checkpoint_authenticated: true,
+                cold_reopen_evidence_match: true,
+            },
+            wallet_storage_ready: super::WalletStorageReadySummary {
+                scope: "wallet-storage-ready",
+                source_epoch_id: 1,
+                source_tip: fixed_tip,
+                source_event_sequence: 1,
+                source_sequence_digest: sequence_digest,
+                wallet_projection_digest_hex: "55".repeat(32),
+                row_counts: super::WalletStorageRowCounts {
+                    transparent_unspent_output_count: 0,
+                    transparent_unspent_output_by_address_count: 0,
+                    transparent_spent_output_count: 0,
+                    transparent_address_transaction_count: 0,
+                    transparent_address_balance_count: 0,
+                    reorg_undo_count: 100,
+                },
+                utxo_summary: super::WalletStorageUtxoSummary {
+                    utxo_count: 0,
+                    total_value_zat: 0,
+                    commitment_scheme: "lthash16",
+                    commitment_accumulator_hex: "00".repeat(2048),
+                    commitment_display_digest_hex: "66".repeat(32),
+                },
+                scanned_block_count: 205,
+                scanned_transaction_count: 205,
+                historical_prevout_read_count: 0,
+                construction: super::WalletStorageConstructionEvidence {
+                    outpoint_sort: empty_sort(4_096),
+                    address_index_sort: empty_sort(2_048),
+                    address_transaction_sort: empty_sort(2_048),
+                    peak_accounted_reorg_undo_bytes: 1_024,
+                    max_accounted_reorg_undo_bytes: 4_096,
+                    cold_validation_peak_accounted_reorg_undo_bytes: 1_024,
+                    cold_validation_max_accounted_reorg_undo_bytes: 4_096,
+                    cold_validation_random_read_count: 0,
+                    logical_row_bytes: 2_048,
+                    sst_file_bytes: 1_024,
+                    sst_file_count: 2,
+                },
+                phase_durations: super::WalletStoragePhaseDurations {
+                    store_initialization_seconds: 0.1,
+                    canonical_scan_seconds: 0.2,
+                    outpoint_sort_seconds: 0.1,
+                    outpoint_merge_seconds: 0.1,
+                    secondary_row_derivation_seconds: 0.1,
+                    logical_evidence_seconds: 0.1,
+                    row_load_seconds: 0.1,
+                    flush_and_cold_reopen_seconds: 0.1,
+                    cold_validation_seconds: 0.2,
+                    cold_validation_primary_output_scan_seconds: 0.05,
+                    cold_validation_address_index_and_balance_readback_seconds: 0.05,
+                    cold_validation_address_transaction_readback_seconds: 0.05,
+                    cold_validation_reorg_undo_readback_seconds: 0.05,
+                    ready_publication_seconds: 0.1,
+                    total_seconds: 1.5,
+                },
+                physical_store_bytes: 4_096,
+                cold_reopen_evidence_match: true,
+                canonical_fence_match: true,
+            },
+            benchmark_client_peak_rss: crate::rss::PeakRss {
+                bytes: Some(1_048_576),
+                source: "proc_status_vmhwm",
+            },
         }
     }
 }

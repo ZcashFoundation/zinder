@@ -2,8 +2,7 @@
 //!
 //! Each simulated wallet repeats one round: `GetLightdInfo` and
 //! `GetLatestBlock`, as wallets do to pick and follow a server; a tree state
-//! at a stored construction checkpoint and one a block below it, which
-//! Zinder rebuilds by replaying the 99 blocks above the checkpoint below; and,
+//! at a checkpoint cadence boundary and one at the preceding height; and,
 //! for each `--transparent-address`, `GetTaddressTxids` over the range and
 //! one `GetAddressUtxosStream` for all of them. Opt-in settings add tree
 //! states at distinct frontiers, `GetTransaction` for mined, pending, and
@@ -39,8 +38,8 @@ const LIMITS: CallLimits = CallLimits {
 #[derive(Debug, Serialize)]
 pub(super) struct Parameters {
     rounds: u32,
-    stored_checkpoint_height: Option<u64>,
-    replay_height: Option<u64>,
+    on_cadence_height: Option<u64>,
+    off_cadence_height: Option<u64>,
     transparent_addresses: usize,
     distinct_frontier_heights: Vec<u64>,
     mined_txids: usize,
@@ -57,8 +56,8 @@ impl Parameters {
         let heights = TreeStateHeights::within(plan);
         Self {
             rounds: settings.rounds,
-            stored_checkpoint_height: heights.map(|heights| heights.stored_checkpoint),
-            replay_height: heights.map(|heights| heights.replay),
+            on_cadence_height: heights.map(|heights| heights.on_cadence),
+            off_cadence_height: heights.map(|heights| heights.off_cadence),
             transparent_addresses: settings.transparent_addresses.len(),
             distinct_frontier_heights: settings.distinct_frontier_heights.clone(),
             mined_txids: settings.mined_txids.len(),
@@ -72,23 +71,22 @@ impl Parameters {
     }
 }
 
-/// A construction checkpoint inside the range, and the height one below it.
+/// A cadence boundary inside the range and its preceding height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TreeStateHeights {
-    stored_checkpoint: u64,
-    replay: u64,
+    on_cadence: u64,
+    off_cadence: u64,
 }
 
 impl TreeStateHeights {
-    /// The highest checkpoint at least one stride below the range end, so
-    /// it was built by construction rather than by following the tip.
+    /// Selects the highest cadence boundary at least one stride below the range end.
     fn within(plan: &WalletPlan) -> Option<Self> {
         let stride = u64::from(TREE_STATE_CHECKPOINT_STRIDE);
-        let stored_checkpoint = (plan.to_height / stride).checked_sub(1)? * stride;
-        let replay = stored_checkpoint.checked_sub(1)?;
-        (replay >= plan.from_height).then_some(Self {
-            stored_checkpoint,
-            replay,
+        let on_cadence = (plan.to_height / stride).checked_sub(1)? * stride;
+        let off_cadence = on_cadence.checked_sub(1)?;
+        (off_cadence >= plan.from_height).then_some(Self {
+            on_cadence,
+            off_cadence,
         })
     }
 }
@@ -180,8 +178,8 @@ async fn run_round(ctx: &PointReadContext<'_>, client: &mut LwdClient, round_ind
     .await;
     if let Some(heights) = ctx.heights {
         for (method, height) in [
-            ("GetTreeState(stored checkpoint)", heights.stored_checkpoint),
-            ("GetTreeState(replay)", heights.replay),
+            ("GetTreeState(on cadence)", heights.on_cadence),
+            ("GetTreeState(off cadence)", heights.off_cadence),
         ] {
             let _ = calls::get_tree_state_as(ctx.recorder, method, client, &LIMITS, height).await;
         }
@@ -332,8 +330,8 @@ mod tests {
         assert_eq!(
             TreeStateHeights::within(&plan(37, 7_400)),
             Some(TreeStateHeights {
-                stored_checkpoint: 7_300,
-                replay: 7_299,
+                on_cadence: 7_300,
+                off_cadence: 7_299,
             })
         );
         assert_eq!(TreeStateHeights::within(&plan(37, 199)), None);

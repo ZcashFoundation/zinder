@@ -5,9 +5,8 @@
 //! disabled or `commitment-budget` is selected, construction checkpoints the
 //! commitment trees every 100 blocks and at the build tip. This pass fills
 //! each settled stride of an existing sparse store or `commitment-budget`
-//! build with the checkpoints its selection picks, and verifies and watermarks
-//! settled strides on a freshly constructed dense store (committing zero rows
-//! when every stride is already satisfied). A canonical secondary replays
+//! build with the checkpoints its selection picks. For fully covered strides,
+//! the pass checks checkpoint heights and advances the watermark. A canonical secondary replays
 //! incomplete strides on a bounded number of blocking threads, and the writer
 //! commits the rows through its command queue between live commits. The pass
 //! runs only while historical work may run. It records its progress as a
