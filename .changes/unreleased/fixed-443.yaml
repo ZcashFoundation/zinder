@@ -1,0 +1,6 @@
+kind: fixed
+body: Vizor qualification checks the running wallet service revision over HTTP and gRPC and requires a version 2 receipt for the driver compiled by Cargo. Rebuild engines with older receipts.
+time: 2026-11-21T05:47:10.129392203Z
+custom:
+    Bump: patch
+    PR: "443"
