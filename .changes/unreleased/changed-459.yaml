@@ -1,0 +1,6 @@
+kind: changed
+body: Listeners bound concurrent published-history chunk reads and share the range byte budget under load. Wallets waiting for a chunk keep their place in arrival order and release it on disconnect.
+time: 2026-11-21T22:18:48.427752597Z
+custom:
+    Bump: patch
+    PR: "459"
