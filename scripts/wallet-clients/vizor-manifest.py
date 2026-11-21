@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     source = json.loads(args.engine_provenance.read_text())
+    if source.get("schema_version") != 2:
+        parser.error("rebuild the Vizor engine to record the compiled driver digest")
     if source["vizor_source"] != "d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6" or source["vizor_release"] != "v0.0.65":
         parser.error("expected the v0.0.65 engine provenance")
     try:

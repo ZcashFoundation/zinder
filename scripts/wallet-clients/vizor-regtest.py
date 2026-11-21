@@ -54,6 +54,11 @@ def run(args):
     port = loopback(endpoint)
     loopback(ops)
     opener = build_opener(ProxyHandler({}))
+    revision = service["source_commit" if args.candidate else "zinder_commit"]
+    with opener.open(ops + "/healthz", timeout=5) as response:
+        health = json.load(response)
+    require(health.get("service") == "zinder-compat-lightwalletd" and health.get("network") == service["network"]
+            and health.get("git_commit") == revision, "live service identity differs from the selected fixture")
 
     def rpc(method, *params):
         message = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -82,7 +87,7 @@ def run(args):
         trace = args.evidence / f"{step}-{command}-{time.time_ns()}"
         argv = [sys.executable, str(args.trace_tool), "--endpoint-port", str(port),
                 "--output", str(trace), "--", str(args.engine), command, str(args.scratch),
-                endpoint, str(heights["37a5165b"])]
+                endpoint, str(heights["37a5165b"]), revision]
         with (args.evidence / f"{trace.name}.stderr").open("w") as errors:
             output = subprocess.run(argv, stdout=subprocess.PIPE, stderr=errors, text=True, check=True)
         observed = json.loads((trace / "report.json").read_text())

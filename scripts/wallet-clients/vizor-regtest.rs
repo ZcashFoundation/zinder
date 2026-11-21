@@ -1,9 +1,31 @@
 //! Build as an example in Vizor v0.0.65's rust crate. The release harness owns the node.
 use rust_lib_zcash_wallet::api::{simple, sync, wallet};
 use serde_json::{Value, json};
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, time::Duration};
+use tonic::transport::Endpoint;
+use zcash_client_backend::proto::service::{
+    Empty, compact_tx_streamer_client::CompactTxStreamerClient,
+};
 
 const NETWORK: &str = "regtest";
+
+async fn verify_endpoint(url: &str, revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_secs(5);
+    let channel = Endpoint::from_shared(url.to_owned())?
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .connect()
+        .await?;
+    let info = CompactTxStreamerClient::new(channel)
+        .get_lightd_info(Empty {})
+        .await?
+        .into_inner();
+    // Zinder uses the BIP70 chain name "test" for Regtest on the lightwalletd interface.
+    if info.chain_name != "test" || info.git_commit != revision {
+        return Err("live wallet endpoint identity differs from the selected fixture".into());
+    }
+    Ok(())
+}
 
 fn account(db: &str) -> Result<String, String> {
     let accounts = wallet::list_accounts(db.into(), NETWORK.into())?;
@@ -36,9 +58,10 @@ fn snapshot(db: &str) -> Result<Value, String> {
 
 fn run() -> Result<Value, String> {
     let args: Vec<_> = env::args().skip(1).collect();
-    let [command, scratch, endpoint, activation] = args.as_slice() else {
+    let [command, scratch, endpoint, activation, revision] = args.as_slice() else {
         return Err(
-            "usage: vizor-regtest COMMAND PRIVATE-DIRECTORY LOOPBACK-URL NU6.3-HEIGHT".into(),
+            "usage: vizor-regtest COMMAND PRIVATE-DIRECTORY LOOPBACK-URL NU6.3-HEIGHT REVISION"
+                .into(),
         );
     };
     let port = endpoint
@@ -47,6 +70,12 @@ fn run() -> Result<Value, String> {
     if port.is_none() || port == Some(0) {
         return Err("expected IPv4 loopback endpoint with port".into());
     }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(verify_endpoint(endpoint, revision))
+        .map_err(|e| e.to_string())?;
     simple::configure_regtest_ironwood_activation_height(
         activation.parse::<u32>().map_err(|e| e.to_string())?,
     )?;

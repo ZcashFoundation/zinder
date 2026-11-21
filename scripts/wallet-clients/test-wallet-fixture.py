@@ -9,6 +9,7 @@ import runpy
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from types import SimpleNamespace
@@ -97,11 +98,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 403)
         raised.exception.close()
 
-    def vizor_manifest(self, driver_digest):
+    def vizor_manifest(self, driver_digest, schema_version=2):
         engine = self.root / 'engine'
         engine.write_bytes(b'fixture build')
         provenance = {'vizor_release': 'v0.0.65', 'vizor_source': 'd0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6',
                       'engine_sha256': hashlib.sha256(engine.read_bytes()).hexdigest()}
+        if schema_version is not None:
+            provenance['schema_version'] = schema_version
         if driver_digest is not None:
             provenance['driver_sha256'] = driver_digest
         (self.root / 'build.json').write_text(json.dumps(provenance))
@@ -115,6 +118,10 @@ class FixtureTests(unittest.TestCase):
         manifest = self.root / 'manifest'
         driver = SCRIPTS / 'vizor-regtest.rs'
         digest = hashlib.sha256(driver.read_bytes()).hexdigest()
+        legacy = self.vizor_manifest(digest, schema_version=None)
+        self.assertNotEqual(legacy.returncode, 0)
+        self.assertIn('rebuild the Vizor engine', legacy.stderr)
+        self.assertFalse(manifest.exists())
         for invalid in [None, '0' * 64]:
             with self.subTest(digest=invalid):
                 result = self.vizor_manifest(invalid)
@@ -127,6 +134,71 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(case['inputs'][str(driver)], digest)
         helper = SCRIPTS / 'wallet_fixture.py'
         self.assertEqual(case['inputs'][str(helper)], hashlib.sha256(helper.read_bytes()).hexdigest())
+
+    def test_vizor_build_records_only_the_driver_compiled_by_cargo(self):
+        build = runpy.run_path(str(SCRIPTS / 'build-vizor-regtest.py'))['main']
+        root_name = 'vizor-wallet-' + build.__globals__['SOURCE']
+        source = self.root / root_name / 'rust'
+        (source / 'examples').mkdir(parents=True)
+        (source / 'Cargo.toml').touch()
+        (source / 'Cargo.lock').touch()
+        archive = self.root / 'source.tar.gz'
+        with tarfile.open(archive, 'w:gz') as packed:
+            packed.add(source.parent, arcname=root_name)
+        checkout = self.root / 'vizor-regtest.rs'
+        original = b'original driver'
+        for edited in ('checkout', 'copied'):
+            with self.subTest(edited=edited):
+                checkout.write_bytes(original)
+                output = self.root / edited
+                copied = output / root_name / 'rust/examples/vizor-regtest.rs'
+
+                def compile_example(*args, **kwargs):
+                    self.assertEqual(copied.read_bytes(), original)
+                    (checkout if edited == 'checkout' else copied).write_bytes(b'changed driver')
+                    engine = output / 'target/debug/examples/vizor-regtest'
+                    engine.parent.mkdir(parents=True)
+                    engine.write_bytes(original)
+
+                receipt = output / 'engine-source.json'
+                argv = ['build-vizor-regtest.py', '--archive', str(archive), '--output', str(output)]
+                old_umask = os.umask(0o077)
+                try:
+                    with patch.dict(build.__globals__, __file__=str(self.root / argv[0]),
+                                    ARCHIVE_SHA256=hashlib.sha256(archive.read_bytes()).hexdigest()), \
+                         patch.object(sys, 'argv', argv), patch.object(subprocess, 'run', side_effect=compile_example), \
+                         patch.object(subprocess, 'check_output', return_value='rustc'):
+                        if edited == 'copied':
+                            with self.assertRaises(SystemExit), patch('sys.stderr', new_callable=io.StringIO):
+                                build()
+                            self.assertFalse(receipt.exists())
+                        else:
+                            build()
+                            self.assertEqual(json.loads(receipt.read_text())['driver_sha256'],
+                                             hashlib.sha256(original).hexdigest())
+                finally:
+                    os.umask(old_umask)
+
+    def test_vizor_refuses_wrong_live_service_before_node_or_wallet_setup(self):
+        run = runpy.run_path(str(SCRIPTS / 'vizor-regtest.py'))['run']
+        self.release['compat_ops'] = 'http://127.0.0.1:11107'
+        self.ready.write_text(json.dumps(self.release))
+        self.overlay['ops_endpoint'] = 'http://127.0.0.1:11127'
+        self.candidate.write_text(json.dumps(self.overlay))
+        for candidate, fixture, revision, ops, endpoint in (
+                (None, self.release, 'zinder_commit', 'compat_ops', 'lightwalletd'),
+                (self.candidate, self.overlay, 'source_commit', 'ops_endpoint', 'client_endpoint')):
+            health = {'service': 'zinder-compat-lightwalletd', 'network': 'zcash-regtest',
+                      'git_commit': fixture[revision]}
+            for field, wrong in [('git_commit', 'f' * 40), ('network', 'zcash-testnet'), ('service', 'zinder-query')]:
+                with self.subTest(candidate=bool(candidate), field=field):
+                    opener = Mock()
+                    opener.open.return_value = io.BytesIO(json.dumps(dict(health, **{field: wrong})).encode())
+                    args = SimpleNamespace(fixture=self.ready, candidate=candidate, endpoint=fixture[endpoint])
+                    with patch.dict(run.__globals__, build_opener=Mock(return_value=opener)), \
+                         self.assertRaisesRegex(ValueError, 'live service identity'):
+                        run(args)
+                    opener.open.assert_called_once_with(fixture[ops] + '/healthz', timeout=5)
 
     def test_vizor_rejects_unbound_candidate_before_wallet_or_node_access(self):
         run = runpy.run_path(str(SCRIPTS / 'vizor-regtest.py'))['run']
