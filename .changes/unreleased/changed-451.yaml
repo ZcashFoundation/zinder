@@ -1,9 +1,10 @@
 kind: changed
 body: >-
-    Fresh canonical construction stores a tree-state checkpoint for every loaded block by default,
-    so each height through the build tip can be read directly at READY. Set
-    `ingest.tree_state_densification.enabled = false` or select `commitment-budget` before the first
-    sync to keep sparse construction. Benchmark report consumers should select their parser by
+    Fresh canonical construction keeps its sparse checkpoint cadence by default. To serve every
+    constructed height directly at READY, set `ingest.tree_state_densification.during_construction = true`
+    before the first sync with densification enabled and `selection = "every-block"`. This moves
+    hashing and storage ahead of READY. Full Mainnet startup time and disk growth await qualification.
+    Benchmark report consumers should select their parser by
     report kind and format version. RocksDB storage lifecycle and canonical fixture replay now emit
     v5, and raw-blob retention comparison emits v3. Point-reads v2 replaces
     `stored_checkpoint_height` and `replay_height` with `on_cadence_height` and

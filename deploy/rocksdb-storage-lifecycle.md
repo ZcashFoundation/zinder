@@ -91,10 +91,10 @@ containers. It derives source and preparation concurrency from the envelope and
 `ZINDER_NODE_MAX_RESPONSE_BYTES`. The CPU limit is a quota, not a reservation:
 Zebra shares the Docker engine and is not measured.
 
-Canonical construction uses `every-block` tree-state checkpoint coverage by
-default, matching fresh default `zinder-ingest` deployments. Set
-`ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=cadence-and-tip` to
-measure the sparse cadence-and-tip construction baseline instead. Report format
+Canonical construction uses `cadence-and-tip` tree-state checkpoint coverage by
+default, matching fresh ingest defaults. Set
+`ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=every-block` to
+measure dense construction before READY. Report format
 version 5 records the chosen coverage in
 `resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
 in `resource_limits.canonical_publication_mode` (`trusted-fresh` or

@@ -1654,13 +1654,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Whether ingest stores dense historical tree-state checkpoints: during fresh \
-                      construction when `selection = \"every-block\"`, and through the background \
-                      pass for existing sparse stores or `commitment-budget` selections. The \
-                      background pass runs only with `ingest_control.listen_addr` set; fresh \
-                      construction applies `every-block` whenever enabled. Setting `false` keeps \
-                      fresh construction on the 100-block cadence and disables the background \
-                      pass. Defaults to `true`.",
+        description: "Enables tree-state densification. The background pass requires `ingest_control.listen_addr`. Defaults to `true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION",
+        toml_path: "ingest.tree_state_densification.during_construction",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to store every block before READY when densification is enabled and the selection is `every-block`. Full Mainnet time to READY and disk growth for this mode are unqualified. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
@@ -1668,24 +1670,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Which historical blocks receive a stored tree-state checkpoint: \
-                      `every-block` stores one for every loaded block during fresh construction \
-                      (so every constructed height through the build tip is a stored read at \
-                      READY) and fills existing sparse stores in the background, while \
-                      `commitment-budget` keeps fresh construction on the 100-block cadence and \
-                      stores one in the background each time `commitment_budget` note commitments \
-                      have accumulated. Defaults to `every-block`, or to `commitment-budget` when \
-                      only `commitment_budget` is set. An operator who wants sparse construction \
-                      or `commitment-budget` selects `enabled = false` or `commitment-budget` \
-                      before the first sync or first upgraded start; switching later keeps every \
-                      stored row, because a dense stride already satisfies the looser budget and \
-                      the pass only inserts missing rows, and only changes the work still \
-                      outstanding. Under `every-block`, writing checkpoints during construction \
-                      moves frontier cross-checking before READY publication and avoids a second \
-                      commitment-replay pass afterward; full Mainnet construction cost and disk \
-                      growth (estimated at about 2.4 GB of rows before compression, or 4 to 5 \
-                      CPU-hours to backfill an existing sparse store) await heavy-workload \
-                      qualification.",
+        description: "Which settled checkpoints the background pass adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint each time `commitment_budget` commitments accumulate and is the default when only that budget is set. Changing selection retains existing rows.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",

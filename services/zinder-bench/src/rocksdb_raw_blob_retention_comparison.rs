@@ -83,11 +83,7 @@ pub(crate) struct RocksDbRawBlobRetentionComparisonArgs {
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
     /// Tree-state checkpoint coverage persisted during canonical construction.
-    #[arg(
-        long = "tree-state-checkpoint-coverage",
-        value_enum,
-        default_value_t = TreeStateCheckpointCoverage::EveryBlock
-    )]
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Write the JSON report to this fresh path instead of stdout.
     #[arg(long)]
@@ -972,20 +968,20 @@ mod tests {
         );
         assert_eq!(
             validated.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::EveryBlock
+            super::TreeStateCheckpointCoverage::CadenceAndTip
         );
         assert!(!validated.transactions_canonical_store.exists());
         assert!(!validated.transactions_secondary_root.exists());
         assert!(!validated.all_canonical_store.exists());
         assert!(!validated.all_secondary_root.exists());
 
-        let sparse = TestCli::try_parse_from(arguments(
+        let dense = TestCli::try_parse_from(arguments(
             root.path(),
-            &["--tree-state-checkpoint-coverage", "cadence-and-tip"],
+            &["--tree-state-checkpoint-coverage", "every-block"],
         ))?;
         assert_eq!(
-            sparse.comparison.validate()?.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::CadenceAndTip
+            dense.comparison.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
         );
         Ok(())
     }

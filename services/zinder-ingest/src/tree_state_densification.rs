@@ -1,11 +1,8 @@
 //! Background densification of settled tree-state checkpoints.
 //!
-//! Under the default `every-block` selection, fresh construction stores a
-//! tree-state checkpoint for every loaded block; when densification is
-//! disabled or `commitment-budget` is selected, construction checkpoints the
-//! commitment trees every 100 blocks and at the build tip. This pass fills
-//! each settled stride of an existing sparse store or `commitment-budget`
-//! build with the checkpoints its selection picks. For fully covered strides,
+//! Fresh construction checkpoints the commitment trees every 100 blocks and at
+//! the build tip by default. Operators can opt into every-block construction.
+//! This background pass fills settled strides with the selected checkpoints. For fully covered strides,
 //! the pass checks checkpoint heights and advances the watermark. A canonical secondary replays
 //! incomplete strides on a bounded number of blocking threads, and the writer
 //! commits the rows through its command queue between live commits. The pass
@@ -92,6 +89,8 @@ const FAILED_SCAN_CHARGE_BLOCKS: u32 =
 pub struct TreeStateDensificationConfig {
     /// Whether the pass runs.
     pub enabled: bool,
+    /// Whether every-block densification also runs during fresh construction.
+    pub during_construction: bool,
     /// Which blocks of a stride receive a stored checkpoint.
     pub selection: TreeStateCheckpointSelection,
     /// Strides replayed at once, each on one blocking thread.
@@ -107,7 +106,9 @@ impl TreeStateDensificationConfig {
     /// cadence and at the build tip.
     #[must_use]
     pub fn stores_checkpoints_during_construction(&self) -> bool {
-        self.enabled && self.selection == TreeStateCheckpointSelection::EveryBlock
+        self.during_construction
+            && self.enabled
+            && self.selection == TreeStateCheckpointSelection::EveryBlock
     }
 }
 
@@ -115,6 +116,7 @@ impl Default for TreeStateDensificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            during_construction: false,
             selection: TreeStateCheckpointSelection::EveryBlock,
             workers: NonZeroU32::new(DEFAULT_TREE_STATE_DENSIFICATION_WORKERS)
                 .unwrap_or(NonZeroU32::MIN),

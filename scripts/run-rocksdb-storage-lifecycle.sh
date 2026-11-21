@@ -16,7 +16,7 @@ cpu_limit_cores="${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES:-10}"
 memory_limit_bytes="${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-10737418240}"
 node_max_response_bytes="${ZINDER_NODE_MAX_RESPONSE_BYTES:-67108864}"
 canonical_publication_mode="${ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE:-trusted-fresh}"
-tree_state_checkpoint_coverage="${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-every-block}"
+tree_state_checkpoint_coverage="${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-cadence-and-tip}"
 
 fail() {
   echo >&2 "RocksDB storage lifecycle refused to run: $*"

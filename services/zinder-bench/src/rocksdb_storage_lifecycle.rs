@@ -124,11 +124,7 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     #[arg(long = "wallet-storage-ready-hard-limit-secs")]
     wallet_storage_ready_hard_limit_seconds: Option<f64>,
     /// Tree-state checkpoint coverage persisted during canonical construction.
-    #[arg(
-        long = "tree-state-checkpoint-coverage",
-        value_enum,
-        default_value_t = TreeStateCheckpointCoverage::EveryBlock
-    )]
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Canonical publication checks to include before READY.
     #[arg(long, value_enum, default_value = "trusted-fresh")]
@@ -938,20 +934,20 @@ mod tests {
         );
         assert_eq!(
             validated.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::EveryBlock
+            super::TreeStateCheckpointCoverage::CadenceAndTip
         );
         Ok(())
     }
 
     #[test]
-    fn tree_state_checkpoint_coverage_accepts_cadence_and_tip_and_rejects_unknown()
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
     -> Result<(), Box<dyn Error>> {
         let mut argv = required_args();
-        argv.extend(["--tree-state-checkpoint-coverage", "cadence-and-tip"]);
+        argv.extend(["--tree-state-checkpoint-coverage", "every-block"]);
         let cli = TestCli::try_parse_from(argv)?;
         assert_eq!(
             cli.args.validate()?.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::CadenceAndTip
+            super::TreeStateCheckpointCoverage::EveryBlock
         );
 
         let mut invalid = required_args();

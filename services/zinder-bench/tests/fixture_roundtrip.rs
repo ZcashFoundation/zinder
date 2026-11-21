@@ -821,7 +821,7 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
     );
     assert_eq!(
         report["resource_limits"]["tree_state_checkpoint_coverage"],
-        "every-block"
+        "cadence-and-tip"
     );
     assert_eq!(report["source_load"]["tree_state_checkpoint_count"], 2);
     assert_eq!(
@@ -1042,7 +1042,7 @@ fn run_canonical_fixture_replay_cli(
 }
 
 #[tokio::test]
-async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_cadence_and_tip()
+async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_every_block()
 -> Result<()> {
     let (fixture_directory, blocks) = write_multi_block_regtest_fixture()?;
     let activations = sample_regtest_upgrade_activations();
@@ -1060,7 +1060,7 @@ async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_caden
         fixture_directory.path(),
         &dense_store_path,
         &output_directory.path().join("dense-report.json"),
-        None,
+        Some("every-block"),
     )?;
     assert_eq!(dense_report["report_format_version"], 5);
     assert_eq!(
@@ -1088,7 +1088,7 @@ async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_caden
                 dense_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
                 Some(TreeStateLookup::Stored(_))
             ),
-            "default every-block fixture replay must store checkpoint at height {height}"
+            "every-block fixture replay must store checkpoint at height {height}"
         );
     }
 
@@ -1097,7 +1097,7 @@ async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_caden
         fixture_directory.path(),
         &sparse_store_path,
         &output_directory.path().join("sparse-report.json"),
-        Some("cadence-and-tip"),
+        None,
     )?;
     assert_eq!(sparse_report["report_format_version"], 5);
     assert_eq!(
@@ -1179,7 +1179,7 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
     assert_raw_blob_retention_comparison_report(&report, &fixture.manifest);
     assert_eq!(
         report["transactions"]["effective_limits"]["tree_state_checkpoint_coverage"],
-        "every-block"
+        "cadence-and-tip"
     );
     assert!(transactions_canonical.is_dir());
     assert!(transactions_secondary.is_dir());

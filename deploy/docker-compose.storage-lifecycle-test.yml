@@ -104,7 +104,7 @@ services:
       - --canonical-publication-mode
       - ${ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE:-trusted-fresh}
       - --tree-state-checkpoint-coverage
-      - ${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-every-block}
+      - ${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-cadence-and-tip}
       - --software-revision
       - ${ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION:?set the exact tested revision}
       - --trial-id

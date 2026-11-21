@@ -112,11 +112,7 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
     /// Tree-state checkpoint coverage persisted during canonical construction.
-    #[arg(
-        long = "tree-state-checkpoint-coverage",
-        value_enum,
-        default_value_t = TreeStateCheckpointCoverage::EveryBlock
-    )]
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
@@ -683,21 +679,21 @@ mod tests {
         );
         assert_eq!(
             validated.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::EveryBlock
+            super::TreeStateCheckpointCoverage::CadenceAndTip
         );
         Ok(())
     }
 
     #[test]
-    fn tree_state_checkpoint_coverage_accepts_cadence_and_tip_and_rejects_unknown()
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
     -> Result<(), Box<dyn Error>> {
         let cli = TestCli::try_parse_from(arguments(&[
             "--tree-state-checkpoint-coverage",
-            "cadence-and-tip",
+            "every-block",
         ]))?;
         assert_eq!(
             cli.replay.validate()?.tree_state_checkpoint_coverage,
-            super::TreeStateCheckpointCoverage::CadenceAndTip
+            super::TreeStateCheckpointCoverage::EveryBlock
         );
         assert!(
             TestCli::try_parse_from(arguments(&["--tree-state-checkpoint-coverage", "sparse"]))

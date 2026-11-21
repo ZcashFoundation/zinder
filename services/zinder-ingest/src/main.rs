@@ -594,7 +594,7 @@ fn spawn_canonical_control_tasks(
 /// The background tree-state densification pass commits through the writer's
 /// command queue, which exists only with a control listener, so it does not
 /// run here. Fresh construction still writes per-block checkpoints directly
-/// when configured with the default `every-block` selection.
+/// when every-block construction is explicitly enabled.
 fn control_tasks_without_listener(densification_enabled: bool) -> CanonicalControlTasks {
     if densification_enabled {
         tracing::info!(
@@ -1882,7 +1882,7 @@ source = "zebra-json-rpc"
             writer_config.construction.request_timeout,
             Duration::from_secs(30)
         );
-        assert!(writer_config.every_block_tree_state_checkpoints);
+        assert!(!writer_config.every_block_tree_state_checkpoints);
         Ok(())
     }
 
@@ -1890,10 +1890,22 @@ source = "zebra-json-rpc"
     fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_densification_config()
     -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
-            ("", true),
+            ("", false),
             (
                 "[ingest.tree_state_densification]\nenabled = true\nselection = \"every-block\"\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\n",
                 true,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\nenabled = false\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\n",
+                false,
             ),
             (
                 "[ingest.tree_state_densification]\nenabled = false\n",

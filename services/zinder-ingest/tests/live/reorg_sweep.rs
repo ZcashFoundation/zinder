@@ -86,7 +86,7 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
         checkpoint_height: Some(checkpoint_height),
         raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
         reorg_window_blocks: REORG_WINDOW_BLOCKS,
-        every_block_tree_state_checkpoints: true,
+        every_block_tree_state_checkpoints: false,
         follow: CanonicalFollowConfig {
             request_timeout: env.target.request_timeout,
             poll_interval: TIP_FOLLOW_POLL_INTERVAL,

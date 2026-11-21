@@ -322,19 +322,16 @@ pub enum FixtureCachePolicy {
 
 /// Tree-state checkpoint coverage persisted during fresh canonical construction.
 ///
-/// [`Self::EveryBlock`] matches default `zinder-ingest` construction
-/// (`ingest.tree_state_densification.enabled = true`, `selection = "every-block"`).
-/// [`Self::CadenceAndTip`] preserves the sparse construction mode that writes
-/// checkpoints only at the history predecessor, every
-/// [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at the build tip.
+/// [`Self::CadenceAndTip`] matches default ingest construction. Select
+/// [`Self::EveryBlock`] to measure dense checkpoints before READY.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeStateCheckpointCoverage {
     /// Persist and cross-check a tree-state checkpoint for every loaded block.
-    #[default]
     EveryBlock,
     /// Persist sparse checkpoints only at the predecessor, every
     /// `TREE_STATE_CHECKPOINT_STRIDE` blocks, and at the build tip.
+    #[default]
     CadenceAndTip,
 }
 

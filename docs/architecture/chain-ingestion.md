@@ -64,10 +64,10 @@ once in the reply. A short reply or a repeated ID causes ingest to report
 `SourceProtocolMismatch` for the batch before assigning any reply to a height.
 
 Ingest rebuilds the note commitment trees from the blocks and stores
-tree-state checkpoints as configured by `[ingest.tree_state_densification]`:
-for every loaded block under the default `every-block` selection (when enabled),
-or every 100 blocks and at the build tip when densification is disabled or
-`commitment-budget` is selected. The loader
+tree-state checkpoints every 100 blocks and at the build tip by default.
+To store one at each height before publication, enable
+`ingest.tree_state_densification.during_construction` with the enabled
+`every-block` selection. The loader
 refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
 tree is still empty.
@@ -163,18 +163,17 @@ commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
 The `[ingest.tree_state_densification]` settings control both initial
 construction checkpoint coverage and the background densification pass:
 
-- `every-block` (with `enabled = true`), the default, stores a tree-state
-  checkpoint for every loaded block during fresh construction, so a freshly
-  constructed store serves every height through the build tip (including the
-  final partial stride) as a stored read immediately at READY without replaying
-  commitments a second time. That moves frontier cross-checking ahead of READY
-  publication; full Mainnet construction time and disk growth await
-  heavy-workload qualification (the stored rows are estimated at about 2.4 GB
-  before compression). On an existing sparse store, such as an upgraded
-  deployment, the background pass fills the missing settled rows once ingest
-  follows the tip (estimated at about 4 to 5 CPU-hours for a full Mainnet
-  backfill). On a freshly constructed dense store, the background pass scans
-  settled strides, commits zero rows, and records its watermark.
+- The default, `enabled = true`, `selection = "every-block"`, and
+  `during_construction = false`, keeps the first sync sparse. Once ingest
+  follows the tip, the background pass fills missing checkpoints in settled
+  strides. A full Mainnet backfill is estimated at 4 to 5 CPU-hours.
+- To serve every constructed height through the build tip directly at READY,
+  including the final partial stride, set `during_construction = true` before
+  the first sync with the enabled `every-block` selection. Ingest then
+  cross-checks and stores each frontier on the serial loader. Completed
+  strides already satisfy the background pass, avoiding a second replay of
+  their commitments. Full Mainnet time to READY and disk growth await
+  qualification. The rows are estimated at about 2.4 GB before compression.
 - `commitment-budget` keeps fresh construction sparse (every 100 blocks and at
   the build tip), and the background pass stores one each time
   `commitment_budget` note commitments (1,024 by default) have accumulated
@@ -237,8 +236,8 @@ checkpoint is store damage: a read at its height is refused, as is any read
 above it that would replay from below it. The background pass commits through
 the writer's command queue, so it runs only when `ingest_control.listen_addr`
 is set, as it is for wallet serving. Fresh construction writes `every-block`
-checkpoints directly into its SSTs whenever `enabled = true` and
-`selection = "every-block"`, even without `ingest_control.listen_addr`.
+checkpoints directly into its SSTs when `during_construction = true`,
+`enabled = true`, and `selection = "every-block"`, even without `ingest_control.listen_addr`.
 
 `ingest.tree_state_densification.workers` (2 by default) bounds how many
 strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
@@ -253,10 +252,9 @@ scan that fails is charged 350 reads before its retry, the 199 reads a chunk
 makes before its last stride plus the 150 reads the costliest stride adds, so
 repeated failures stay within the configured rate. Progress is reported by the
 `zinder_ingest_tree_state_densification_*` metrics in
-[Metrics](../reference/metrics.md). A canonical rebuild under the default
-`every-block` setting writes every block's checkpoint during construction; a
-rebuild with densification disabled or `commitment-budget` selected builds on
-the 100-block cadence until the background pass runs.
+[Metrics](../reference/metrics.md). A canonical rebuild uses the same
+construction settings as a first sync. Changing those settings on an
+existing store preserves its checkpoint rows.
 
 ### Tree-state verification
 

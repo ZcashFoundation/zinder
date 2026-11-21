@@ -693,7 +693,7 @@ fn held_construction_writer_config(
         checkpoint_height: None,
         raw_blob_retention: RawBlobRetention::Transactions,
         reorg_window_blocks: 100,
-        every_block_tree_state_checkpoints: true,
+        every_block_tree_state_checkpoints: false,
         follow: CanonicalFollowConfig {
             request_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(10),
@@ -1341,7 +1341,7 @@ async fn staged_ready_dense_store_installs_on_restart_even_if_config_switches_to
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prior_sparse_store_reopens_under_every_block_default_without_rebuilding()
+async fn prior_sparse_store_reopens_with_dense_construction_enabled_without_rebuilding()
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = regtest_activations();
     let source = MultiBlockConstructionSource::build(6, &activations)?;

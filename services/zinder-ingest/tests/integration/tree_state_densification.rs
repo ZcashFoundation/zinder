@@ -762,6 +762,7 @@ async fn replays_the_writer_did_not_commit_are_charged_against_the_rate() -> eyr
             gate: following_tip_gate(),
             config: TreeStateDensificationConfig {
                 enabled: true,
+                during_construction: false,
                 selection: EVERY_BLOCK,
                 workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
                 max_blocks_per_second: NonZeroU32::MIN,
@@ -1126,6 +1127,7 @@ impl Harness {
                 gate: following_tip_gate(),
                 config: TreeStateDensificationConfig {
                     enabled: true,
+                    during_construction: false,
                     selection,
                     workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
                     max_blocks_per_second: NonZeroU32::MAX,
