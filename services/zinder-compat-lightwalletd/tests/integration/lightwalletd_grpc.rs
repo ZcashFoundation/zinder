@@ -3008,6 +3008,7 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 #[derive(Clone)]
 struct EpochPinRecorder<Inner> {
     expose_range_fence: bool,
+    gated_chunk_reads: Option<tokio::sync::mpsc::UnboundedSender<GatedChunkRead>>,
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
@@ -3041,6 +3042,12 @@ struct EpochPinRecorder<Inner> {
     block_time_override: Arc<Mutex<Option<i64>>>,
 }
 
+struct GatedChunkRead {
+    range: BlockHeightRange,
+    max_bytes: usize,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
 /// A gate on one read that tells the test when the read has reached it.
 #[derive(Clone)]
 struct FirstChunkGate {
@@ -3064,6 +3071,7 @@ impl<Inner> EpochPinRecorder<Inner> {
         Self {
             inner,
             expose_range_fence: false,
+            gated_chunk_reads: None,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             offered_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
@@ -3504,6 +3512,25 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
+        if let Some(gates) = self.gated_chunk_reads.clone() {
+            tokio::task::spawn_blocking(move || {
+                let (release, gate) = tokio::sync::oneshot::channel();
+                if gates
+                    .send(GatedChunkRead {
+                        range: block_range,
+                        max_bytes,
+                        release,
+                    })
+                    .is_ok()
+                {
+                    let _ = gate.blocking_recv();
+                }
+            })
+            .await
+            .map_err(|error| QueryError::BlockingTaskFailed {
+                reason: error.to_string(),
+            })?;
+        }
         let first_chunk_gate = if at_epoch_id.is_some() {
             self.first_chunk_gate.lock().take()
         } else {
@@ -3852,6 +3879,51 @@ async fn tree_state_matches_go_for_height_zero_and_the_genesis_hash() -> eyre::R
         "GetTreeState: z_gettreestate did not return treestate"
     );
     Ok(())
+}
+
+pub(super) fn checkpointed_tree_state_store() -> eyre::Result<WalletServingStoreFixture> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(2)),
+        &sample_regtest_upgrade_activations(),
+    )?
+    .into_serving_store_fixture()
+}
+
+pub(super) async fn assert_checkpointed_tree_state_selectors(
+    adapter: &impl CompactTxStreamer,
+) -> eyre::Result<()> {
+    let genesis = encode_rpc_block_hash_bytes(Network::ZcashRegtest.genesis_hash()).to_vec();
+    let request = |height, hash| Request::new(lightwalletd::BlockId { height, hash });
+    let pruned = adapter
+        .get_tree_state(request(1, Vec::new()))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("served a pruned height"))?;
+    assert_eq!(pruned.code(), Code::NotFound);
+    let retained = adapter
+        .get_tree_state(request(3, genesis.clone()))
+        .await?
+        .into_inner();
+    assert_eq!(retained.height, 3);
+    let status = adapter
+        .get_tree_state(request(0, genesis))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("served a pre-Sapling tree state"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "GetTreeState: z_gettreestate did not return treestate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpointed_tree_state_rejects_genesis_but_preserves_height_lookups() -> eyre::Result<()>
+{
+    let store = AcceptanceStore::from_store_fixture(checkpointed_tree_state_store()?, Vec::new())?;
+    assert_checkpointed_tree_state_selectors(&acceptance_adapter(&store)).await
 }
 
 #[tokio::test]

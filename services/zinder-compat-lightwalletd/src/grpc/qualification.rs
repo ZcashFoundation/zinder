@@ -31,7 +31,7 @@ use super::{
     CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
     address_utxo_limit_exceeded, lightwalletd_tree_state, reject_future_tree_state_height,
-    require_sapling_tree_state, send_response_from_broadcast_outcome,
+    reject_genesis_tree_state, require_sapling_tree_state, send_response_from_broadcast_outcome,
     shielded_protocol_from_request, spawn_response_stream, standard_fee_response,
     transparent_address_tx_history_request, tree_state_block_lookup_status, tree_state_status,
     u32_to_usize, wire_decode_error_to_status,
@@ -713,7 +713,8 @@ impl compact_tx_streamer_server::CompactTxStreamer
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let reader = self.query_api.slot.capture();
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
-        let height = match super::tree_state_selector(block, reader.network()) {
+        reject_genesis_tree_state(block, reader.network())?;
+        let height = match block {
             RequestedBlock::Height(height) => height,
             RequestedBlock::Hash(hash) => match reader
                 .block_hash_lookup(hash)

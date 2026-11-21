@@ -4,6 +4,9 @@ use std::{fs::File, io};
 use super::invalid;
 
 #[cfg(target_os = "linux")]
+const SHA256: u8 = fs_verity::InnerHashAlgorithm::Sha256 as u8;
+
+#[cfg(target_os = "linux")]
 fn native_filesystem(file: &File) -> io::Result<bool> {
     // Userspace and network filesystems can supply their own verity attributes.
     let stats = rustix::fs::fstatfs(file)?;
@@ -27,28 +30,24 @@ pub(crate) fn reopen_staged(staged: &tempfile::NamedTempFile) -> io::Result<File
 
 #[cfg(target_os = "linux")]
 pub(crate) fn protect_new_segment(file: &File, expected: Option<[u8; 32]>) -> io::Result<()> {
-    use std::os::fd::AsFd as _;
-
+    use composefs_ioctls::fsverity::{EnableVerityError, fs_ioc_enable_verity};
     use rustix::io::Errno;
+
     if !native_filesystem(file)? {
         return Ok(());
     }
-    match fs_verity::linux::fsverity_enable(
-        file.as_fd(),
-        4096,
-        fs_verity::InnerHashAlgorithm::Sha256,
-        &[],
-    ) {
+    match fs_ioc_enable_verity(file, SHA256, 4096) {
         Ok(()) => {}
-        Err(error)
-            if matches!(
-                Errno::from_io_error(&error),
-                Some(Errno::NOTTY | Errno::OPNOTSUPP | Errno::NOPKG | Errno::INVAL)
-            ) =>
-        {
-            return Ok(());
+        Err(EnableVerityError::FilesystemNotSupported) => return Ok(()),
+        Err(EnableVerityError::Io(error)) => match Errno::from_io_error(&error) {
+            Some(Errno::NOPKG | Errno::INVAL) => return Ok(()),
+            _ => return Err(error),
+        },
+        Err(EnableVerityError::AlreadyEnabled) => return Err(Errno::EXIST.into()),
+        Err(EnableVerityError::FileOpenedForWrite) => return Err(Errno::TXTBSY.into()),
+        Err(EnableVerityError::SignatureVerificationFailed) => {
+            return Err(Errno::KEYREJECTED.into());
         }
-        Err(error) => return Err(error),
     }
     if expected.is_none() || measure(file)? != expected {
         return Err(invalid("new shielded segment fs-verity digest mismatch"));
@@ -58,7 +57,9 @@ pub(crate) fn protect_new_segment(file: &File, expected: Option<[u8; 32]>) -> io
 
 #[cfg(target_os = "linux")]
 pub(super) fn measure(file: &File) -> io::Result<Option<[u8; 32]>> {
+    use composefs_ioctls::fsverity::{MeasureVerityError, fs_ioc_measure_verity};
     use rustix::fs::{AtFlags, StatxAttributes, StatxFlags, statx};
+
     if !native_filesystem(file)?
         || !statx(file, c"", AtFlags::EMPTY_PATH, StatxFlags::empty()).is_ok_and(|stat| {
             stat.stx_attributes_mask.contains(StatxAttributes::VERITY)
@@ -67,15 +68,19 @@ pub(super) fn measure(file: &File) -> io::Result<Option<[u8; 32]>> {
     {
         return Ok(None);
     }
-    let (algorithm, digest) = fs_verity::linux::fsverity_measure(std::os::fd::AsFd::as_fd(file))?;
-    if algorithm != fs_verity::InnerHashAlgorithm::Sha256 {
-        return Err(invalid("unsupported shielded segment fs-verity algorithm"));
-    }
-    digest
-        .as_ref()
-        .try_into()
+    fs_ioc_measure_verity(file, SHA256)
         .map(Some)
-        .map_err(|_| invalid("invalid shielded segment fs-verity digest"))
+        .map_err(|error| match error {
+            MeasureVerityError::Io(source) => source,
+            MeasureVerityError::FilesystemNotSupported => {
+                io::Error::new(io::ErrorKind::Unsupported, error)
+            }
+            MeasureVerityError::VerityMissing
+            | MeasureVerityError::InvalidDigestAlgorithm { .. }
+            | MeasureVerityError::InvalidDigestSize { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
+        })
 }
 
 #[cfg(not(target_os = "linux"))]

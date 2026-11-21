@@ -128,11 +128,13 @@ impl PublishedShieldedCatalog {
             }
             segments.push(Arc::new(segment));
         }
+        let tail = previous
+            .and_then(|catalog| catalog.tail.load_full())
+            .zip(entries.last())
+            .map(|(tail, segment)| tail.after_published(BlockHeight::new(segment.last)));
         Ok(Self {
             segments,
-            tail: Arc::new(arc_swap::ArcSwapOption::from(
-                previous.and_then(|catalog| catalog.tail.load_full()),
-            )),
+            tail: Arc::new(arc_swap::ArcSwapOption::from(tail)),
         })
     }
 

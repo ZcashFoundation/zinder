@@ -418,6 +418,40 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem"]
+fn kernel_protected_publication_recovers_portable_orphans() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (_canonical_files, canonical) =
+        reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(4))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&canonical)?);
+    let dir = fixture.directory.path();
+    let next = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(4));
+    let description = manifest::publish_segment(&canonical, dir, next)?;
+    let destination = segment_path(dir, description.identity.sha256);
+    let ordinary_copy = dir.join("portable-backup");
+    fs::copy(&destination, &ordinary_copy)?;
+    fs::remove_file(&destination)?;
+    fs::hard_link(&ordinary_copy, &destination)?;
+    fs::hard_link(&ordinary_copy, dir.join(".publisher-segment.tmp"))?;
+
+    assert!(publisher.publish_next(&canonical)?);
+    let key = verification_key_from(&fixture.public)?;
+    let catalog =
+        PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None)?;
+    assert_eq!(catalog.bounds().end, BlockHeight::new(4));
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .is_err()
+    );
+    fs::OpenOptions::new().write(true).open(ordinary_copy)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Result<()> {
@@ -500,5 +534,121 @@ async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> 
             assert!(tail.select(span, order, 0, false).is_empty());
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Result<()> {
+    use zinder_store::HeightOrder;
+    let fixture = Fixture::new()?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    let first = fixture.catalog(None)?;
+    first.refresh_tail(&source).await?;
+    let original = first
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+
+    assert!(publisher.publish_next(&source)?);
+    let extension = fixture.catalog(Some(&first))?;
+    extension.refresh_tail(&source).await?;
+    let retained = extension
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+    let suffix = BlockHeightRange::inclusive(BlockHeight::new(5), BlockHeight::new(6));
+    assert_eq!(retained.bounds(), Some(suffix));
+    assert_eq!(
+        original.bounds().map(|span| span.start),
+        Some(BlockHeight::new(3))
+    );
+    let reused = retained.select(suffix, HeightOrder::Ascending, usize::MAX, true);
+    let previous = original.select(suffix, HeightOrder::Ascending, usize::MAX, true);
+    assert_eq!(reused.len(), 2);
+    assert!(
+        previous
+            .iter()
+            .zip(reused)
+            .all(|(old, row)| old.payload.as_ptr() == row.payload.as_ptr())
+    );
+
+    assert!(publisher.publish_next(&source)?);
+    let complete = fixture.catalog(Some(&extension))?;
+    assert_eq!(
+        complete.tail.load_full().and_then(|tail| tail.bounds()),
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_read() -> Result<()> {
+    use crate::{
+        CanonicalReaderSlot,
+        block_methods::{ChunkRead, ChunkReadFailure, ChunkView, RangeSource as _},
+        block_range::RangeBlock as _,
+        compact_block_messages::CompactBlockShape,
+        published_range::PublishedRangeRead,
+    };
+    use zinder_store::HeightOrder;
+    let fixture = Fixture::new()?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    assert!(publisher.publish_next(&source)?);
+    let segment = segment_path(fixture.directory.path(), fixture.entries()?[1].sha256);
+    let ordinary = segment.with_extension("copy");
+    fs::copy(&segment, &ordinary)?;
+    fs::rename(ordinary, &segment)?;
+    let catalog = Arc::new(fixture.catalog(None)?);
+    catalog.refresh_tail(&source).await?;
+    let fifth = BlockHeight::new(5);
+    let tail = catalog
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+    let row = tail
+        .select(
+            BlockHeightRange::inclusive(fifth, fifth),
+            HeightOrder::Descending,
+            0,
+            true,
+        )
+        .pop()
+        .ok_or_else(|| eyre!("missing tail row at height 5"))?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(segment)?
+        .set_len(0)?;
+
+    let range = PublishedRangeRead::new(
+        catalog,
+        CompactBlockShape::for_range(&[])?,
+        true,
+        crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+    );
+    let slot = CanonicalReaderSlot::new(Arc::new(source));
+    let read = |first, last, max_bytes| {
+        range.read(
+            &slot,
+            ChunkRead {
+                chunk: BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last)),
+                order: HeightOrder::Descending,
+                max_bytes,
+                view: ChunkView::Current,
+            },
+            |_, rows| rows.into_iter().map(|row| row.height()).collect::<Vec<_>>(),
+        )
+    };
+    for first in [1, 4] {
+        let answer = read(first, 5, row.native_bytes + 1).await;
+        assert!(matches!(answer.converted, Ok(heights) if heights == [fifth]));
+    }
+    let damaged = read(4, 4, 1).await;
+    assert!(
+        matches!(damaged.converted, Err(ChunkReadFailure::Failed(status)) if status.code() == tonic::Code::DataLoss)
+    );
     Ok(())
 }

@@ -635,13 +635,14 @@ where
     }
 }
 
-fn tree_state_selector(block: RequestedBlock, network: zinder_core::Network) -> RequestedBlock {
-    match block {
-        RequestedBlock::Hash(hash) if hash == network.genesis_hash() => {
-            RequestedBlock::Height(BlockHeight::new(0))
-        }
-        RequestedBlock::Height(_) | RequestedBlock::Hash(_) => block,
+fn reject_genesis_tree_state(
+    block: RequestedBlock,
+    network: zinder_core::Network,
+) -> Result<(), Status> {
+    if block == RequestedBlock::Hash(network.genesis_hash()) {
+        return Err(pre_sapling_tree_state());
     }
+    Ok(())
 }
 
 fn tree_state_block_lookup_status(error: &QueryError) -> Status {
@@ -1064,13 +1065,10 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
         let view = self.query_api.capture_view().await?;
-        let height = resolve_block_height(
-            &self.query_api,
-            &view,
-            tree_state_selector(block, view.network),
-        )
-        .await
-        .map_err(|error| tree_state_block_lookup_status(&error))?;
+        reject_genesis_tree_state(block, view.network)?;
+        let height = resolve_block_height(&self.query_api, &view, block)
+            .await
+            .map_err(|error| tree_state_block_lookup_status(&error))?;
         reject_future_tree_state_height(height, view.visible_tip_height)?;
         let tree_state = self
             .query_api
@@ -1823,11 +1821,13 @@ fn subtree_roots_status(error: &QueryError) -> Status {
     status_from_query_error(error)
 }
 
+fn pre_sapling_tree_state() -> Status {
+    Status::invalid_argument("GetTreeState: z_gettreestate did not return treestate")
+}
+
 fn require_sapling_tree_state(tree_state: &TreeState) -> Result<(), Status> {
     if tree_state.frontiers.sapling_final_state.is_none() {
-        return Err(Status::invalid_argument(
-            "GetTreeState: z_gettreestate did not return treestate",
-        ));
+        return Err(pre_sapling_tree_state());
     }
     Ok(())
 }

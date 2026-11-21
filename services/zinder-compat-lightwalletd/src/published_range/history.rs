@@ -213,6 +213,7 @@ impl PublishedShieldedCatalog {
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
+        allow_oversized: bool,
     ) -> io::Result<Vec<SealedBlock>> {
         let segments = self.segments();
         let start =
@@ -228,7 +229,9 @@ impl PublishedShieldedCatalog {
                 )
             })?;
         if let [part] = selected {
-            return part.segment.bounded_rows(range, order, max_bytes, true);
+            return part
+                .segment
+                .bounded_rows(range, order, max_bytes, allow_oversized);
         }
         let mut output = Vec::new();
         let mut remaining = max_bytes;
@@ -242,7 +245,7 @@ impl PublishedShieldedCatalog {
                 range.start.max(identity.start),
                 range.end.min(identity.end.height),
             );
-            let allow_oversized = output.is_empty();
+            let allow_oversized = allow_oversized && output.is_empty();
             let mut rows = part
                 .segment
                 .bounded_rows(span, order, remaining, allow_oversized)?;
