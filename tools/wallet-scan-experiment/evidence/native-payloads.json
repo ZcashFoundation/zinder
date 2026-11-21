@@ -1,0 +1,74 @@
+{
+  "native_schema_revision": "fae7b818584e00e61981da5e367c593aef4365ca",
+  "network": "zcash-testnet",
+  "units": "Uncompressed CompactBlocksInRangeChunk item bytes",
+  "rustc": "1.100.0",
+  "build": "release",
+  "cpu": "AMD Ryzen 9 9950X",
+  "cpu_affinity": "one logical CPU",
+  "ranges": [
+    {
+      "start_height": 4597953,
+      "end_height": 4600000,
+      "end_hash": "00001cbedbd2e19a8416c31a4244b253e3bfb69bdb525f547da016fe80000e9c",
+      "full_native_item_bytes": 1206536,
+      "shielded_native_item_bytes": 1070103,
+      "shielded_with_hints_native_item_bytes": 1213345,
+      "orchard_actions": 12,
+      "ironwood_actions": 4201,
+      "shifted_keys": 4213,
+      "corpus_sha256": "3178713f3197d43a8c7e4693bf6b879953e5fad375cfa9ba74f476adcf4dee90",
+      "hint_derivation_seconds_samples": [
+        0.12140267100000002,
+        0.09561594500000009,
+        0.09200234700000001,
+        0.08848729800000033,
+        0.08771888100000004,
+        0.11913046200000038,
+        0.11152167700000028
+      ]
+    },
+    {
+      "start_height": 4580011,
+      "end_height": 4600000,
+      "end_hash": "00001cbedbd2e19a8416c31a4244b253e3bfb69bdb525f547da016fe80000e9c",
+      "full_native_item_bytes": 13593471,
+      "shielded_native_item_bytes": 11414646,
+      "shielded_with_hints_native_item_bytes": 12989458,
+      "orchard_actions": 291,
+      "ironwood_actions": 46027,
+      "shifted_keys": 46318,
+      "corpus_sha256": "5c7a2f5e13cbdc9c276b3b88f098579a01e57e78daf849b799751c774b7d3afb",
+      "hint_derivation_seconds_samples": [
+        0.9637397430000025,
+        0.8667125789999891,
+        0.8946115599999883,
+        0.897634226999987,
+        0.8589084229999975,
+        0.833216545999992,
+        0.8037501819999959
+      ]
+    },
+    {
+      "start_height": 2100000,
+      "end_height": 2102047,
+      "end_hash": "00ba56564eba94a27c04d621a033ba20f5ae543efc3572866d5fcf5c9786e5ec",
+      "full_native_item_bytes": 676923,
+      "shielded_native_item_bytes": 319488,
+      "shielded_with_hints_native_item_bytes": 319488,
+      "orchard_actions": 0,
+      "ironwood_actions": 0,
+      "shifted_keys": 0,
+      "corpus_sha256": "1dfeba81afd69d8dbea58ee1a9901e13933636ed5b0b16b6a40cc199ece800ec",
+      "hint_derivation_seconds_samples": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}
