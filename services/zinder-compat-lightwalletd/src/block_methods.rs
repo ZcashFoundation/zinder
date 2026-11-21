@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::OwnedSemaphorePermit;
 use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
@@ -398,6 +399,39 @@ impl BlockMethods {
     }
 }
 
+async fn published_read_permit(
+    limit: Option<&BlockRangeStreamLimit>,
+) -> Result<Option<OwnedSemaphorePermit>, Status> {
+    match limit {
+        Some(limit) => limit.published_read_permit().await.map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn first_chunk_view<Reads: CompactBlockReads>(
+    reads: &Reads,
+    end: BlockHeight,
+    published_limit: Option<&BlockRangeStreamLimit>,
+) -> Result<(Reads::View, Option<OwnedSemaphorePermit>), Status> {
+    let checked_view = async || {
+        let view = reads.capture_view().await?;
+        reject_future_block_height(end, Reads::view_chain_epoch(&view).visible_tip_height)?;
+        Ok::<_, Status>(view)
+    };
+    let view = checked_view().await?;
+    let Some(limit) = published_limit else {
+        return Ok((view, None));
+    };
+    if let Some(permit) = limit.try_published_read_permit() {
+        return Ok((view, Some(permit)));
+    }
+
+    // A queued read must not pin a generation. Recheck the tip after admission.
+    drop(view);
+    let permit = limit.published_read_permit().await?;
+    Ok((checked_view().await?, Some(permit)))
+}
+
 async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: &Reads,
     block_range: BlockHeightRange,
@@ -405,12 +439,8 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     stream_slot: crate::block_range::BlockRangeStreamSlot,
     conversion: Source,
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
-    let read_permit = conversion.read_permit().await?;
-    let view = reads.capture_view().await?;
-    reject_future_block_height(
-        block_range.end,
-        Reads::view_chain_epoch(&view).visible_tip_height,
-    )?;
+    let (view, read_permit) =
+        first_chunk_view(reads, block_range.end, conversion.published_read_limit()).await?;
     let first_read = read_first_chunk(
         reads.clone(),
         view,
@@ -605,11 +635,8 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     type Block: RangeBlock + Send + 'static;
     type Message: Send + 'static;
 
-    fn read_permit(
-        &self,
-    ) -> impl Future<Output = Result<Option<tokio::sync::OwnedSemaphorePermit>, Status>> + Send
-    {
-        std::future::ready(Ok(None))
+    fn published_read_limit(&self) -> Option<&BlockRangeStreamLimit> {
+        None
     }
 
     fn messages(&self, blocks: Vec<Self::Block>) -> Result<ChunkMessages<Self::Message>, Status>;
@@ -788,7 +815,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
         let read_permit = tokio::select! {
             biased;
             () = sink.closed() => return,
-            admission = conversion.read_permit() => match admission {
+            admission = published_read_permit(conversion.published_read_limit()) => match admission {
                 Ok(permit) => permit,
                 Err(status) => { room.fill(vec![Err(status)]); return; }
             }

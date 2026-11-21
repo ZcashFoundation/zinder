@@ -215,8 +215,8 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Block = ReadBlock;
     type Message = Bytes;
 
-    async fn read_permit(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Status> {
-        self.limits.published_read_permit().await.map(Some)
+    fn published_read_limit(&self) -> Option<&crate::block_range::BlockRangeStreamLimit> {
+        Some(&self.limits)
     }
 
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {

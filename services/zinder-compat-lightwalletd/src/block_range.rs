@@ -320,6 +320,10 @@ impl BlockRangeStreamLimit {
             .min((PUBLISHED_READERS * BLOCK_RANGE_CHUNK_MAX_BYTES) / active.max(PUBLISHED_READERS))
     }
 
+    pub(crate) fn try_published_read_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.published_reads.clone().try_acquire_owned().ok()
+    }
+
     pub(crate) async fn published_read_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
         self.published_reads
             .clone()
