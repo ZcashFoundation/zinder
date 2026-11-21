@@ -515,6 +515,95 @@ fn handoff_writer(chain: &ChainFixture) -> eyre::Result<CanonicalWriterFixture> 
 }
 
 #[tokio::test]
+async fn retiring_the_epoch_during_a_covered_later_chunk_reads_the_linked_current_range()
+-> eyre::Result<()> {
+    const TIP: u32 = 1_005;
+    let dir = tempfile::tempdir()?;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP + 1);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain)
+            .through(BlockHeight::new(TIP))
+            .with_settled_tip(BlockHeight::new(TIP)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let before = ReaderFixture::new(writer.serving_store_fixture()?)?;
+    let published = before.publish(&dir.path().join("settled"), TIP).await?;
+    writer.append_live_block(&chain)?;
+    let after = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+    let mut recorder =
+        EpochPinRecorder::new(before.query.clone()).with_later_views(vec![after.query.clone()]);
+    recorder.replace_before_header = Some((0, BlockHeight::new(PUBLISHED_CHUNK_END + 1)));
+    let mut endpoint = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(published)
+                .into_server(),
+        ),
+    )
+    .await?;
+    let received = endpoint
+        .blocks(block_range_request(1, u64::from(TIP)))
+        .await?;
+    assert_one_linked_chain(&received, 1, u64::from(TIP));
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        [BlockHeightRange::inclusive(
+            BlockHeight::new(PUBLISHED_CHUNK_END + 1),
+            BlockHeight::new(TIP),
+        )]
+    );
+    assert_eq!(recorder.recorded_epoch_ids().last(), Some(&None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retiring_the_epoch_during_a_later_anchor_check_reads_the_linked_current_range()
+-> eyre::Result<()> {
+    const END: u32 = 1_005;
+    const TIP: u32 = 1_010;
+    let dir = tempfile::tempdir()?;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP + 2);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain)
+            .through(BlockHeight::new(TIP))
+            .with_settled_tip(BlockHeight::new(END)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let before = ReaderFixture::new(writer.serving_store_fixture()?)?;
+    let published = before.publish(&dir.path().join("settled"), END).await?;
+    let settled = fixture_block(&chain, BlockHeight::new(END + 1))?;
+    writer
+        .append_live_block_with_settled_tip(&chain, BlockId::new(settled.height, settled.hash))?;
+    let advanced = ReaderFixture::new(writer.serving_store_fixture()?)?;
+    writer.append_live_block(&chain)?;
+    let replacement = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+    let mut recorder = EpochPinRecorder::new(before.query.clone())
+        .with_later_views(vec![advanced.query.clone(), replacement.query.clone()]);
+    recorder.replace_before_header = Some((1, BlockHeight::new(END)));
+    let mut endpoint = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(published)
+                .into_server(),
+        ),
+    )
+    .await?;
+    let received = endpoint
+        .blocks(block_range_request(u64::from(TIP), 1))
+        .await?;
+    assert_one_linked_chain(&received, u64::from(TIP), 1);
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        [
+            BlockHeightRange::inclusive(BlockHeight::new(11), BlockHeight::new(TIP)),
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(10)),
+        ]
+    );
+    assert_eq!(recorder.recorded_epoch_ids().last(), Some(&None));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_replaced_tail_must_link_to_the_last_published_block() -> eyre::Result<()> {
     const TIP: u32 = 1_015;
     let dir = tempfile::tempdir()?;

@@ -2,9 +2,11 @@ use std::{sync::Arc, time::Instant};
 
 use prost::{Message, bytes::Bytes};
 use tonic::Status;
+use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact,
 };
+use zinder_proto::{ZINDER_ERROR_DOMAIN, v1::ops::ErrorReason};
 
 use super::PublishedShieldedCatalog;
 use crate::{
@@ -92,16 +94,6 @@ fn task_failure(error: &tokio::task::JoinError) -> ChunkReadFailure {
     ChunkReadFailure::Failed(Status::internal(error.to_string()))
 }
 
-async fn resolve_view<Reads: CompactBlockReads>(
-    reads: &Reads,
-    view: ChunkView<Reads::View>,
-) -> Result<Reads::View, Status> {
-    match view {
-        ChunkView::Captured(view) => Ok(view),
-        ChunkView::Current => reads.capture_view().await,
-    }
-}
-
 async fn native_chunk<Reads, Output, Convert>(
     reads: &Reads,
     read: ChunkRead<Reads::View>,
@@ -151,35 +143,56 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if !self.covers_selected_history(read.chunk) {
             return native_chunk(reads, read, convert).await;
         }
-        let view = match resolve_view(reads, read.view).await {
-            Ok(view) => view,
-            Err(status) => return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status)),
-        };
-        let epoch = Reads::view_chain_epoch(&view);
-        if !view_reaches(&epoch, read.chunk) {
-            return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(epoch));
-        }
-        let started = Instant::now();
-        // The same settled tip may be served from a replacement with a higher floor.
-        // Let the native range return its precise error for an unavailable height.
-        if reads.block_hash_at(&view, read.chunk.start).await.is_err() {
-            return native_chunk(
-                reads,
-                ChunkRead {
-                    view: ChunkView::Captured(view),
-                    ..read
-                },
-                convert,
-            )
-            .await;
-        }
-        if let Err(status) = self.history.terminal().check_view(reads, &view).await {
-            return ChunkReadOutcome {
-                read_duration: Some(started.elapsed()),
-                converted: Err(ChunkReadFailure::Failed(status)),
+        let (epoch, started, anchor) = {
+            let current;
+            let view = match &read.view {
+                ChunkView::Captured(view) => view,
+                ChunkView::Current => {
+                    current = match reads.capture_view().await {
+                        Ok(view) => view,
+                        Err(status) => {
+                            return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status));
+                        }
+                    };
+                    &current
+                }
             };
+            let epoch = Reads::view_chain_epoch(view);
+            if !view_reaches(&epoch, read.chunk) {
+                return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(epoch));
+            }
+            let started = Instant::now();
+            // A replacement with the same settled tip can have a higher retention floor.
+            let anchor = if reads.block_hash_at(view, read.chunk.start).await.is_ok() {
+                Some(self.history.terminal().check_view(reads, view).await)
+            } else {
+                None
+            };
+            (epoch, started, anchor)
+        };
+        match anchor {
+            Some(Ok(())) => {}
+            None => return native_chunk(reads, read, convert).await,
+            Some(Err(status)) => {
+                if matches!(read.view, ChunkView::Current)
+                    && status
+                        .get_error_details()
+                        .error_info()
+                        .is_some_and(|detail| {
+                            detail.domain == ZINDER_ERROR_DOMAIN
+                                && detail.reason
+                                    == ErrorReason::ChainEpochPinUnavailable.as_str_name()
+                        })
+                {
+                    return native_chunk(reads, read, convert).await;
+                }
+                return ChunkReadOutcome {
+                    read_duration: Some(started.elapsed()),
+                    converted: Err(ChunkReadFailure::Failed(status)),
+                };
+            }
         }
-        drop(view);
+        drop(read.view);
         let history = self.history.clone();
         tokio::task::spawn_blocking(move || {
             let rows = history.read_chunk(read.chunk, read.order, read.max_bytes);

@@ -3019,6 +3019,7 @@ struct EpochPinRecorder<Inner> {
     /// Real queries that replace `inner` as the served view, in order.
     later_views: Arc<[Inner]>,
     current_view_index: Arc<AtomicUsize>,
+    replace_before_header: Option<(usize, BlockHeight)>,
     completed_subtree_reads: Arc<AtomicUsize>,
     /// Epoch of the view that answered each successful compact-block range read.
     served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
@@ -3068,6 +3069,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             synthetic_views: None,
             later_views: Arc::from(Vec::new()),
             current_view_index: Arc::new(AtomicUsize::new(0)),
+            replace_before_header: None,
             completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
@@ -3440,6 +3442,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
         self.record(at_epoch_id);
+        if let BlockSelector::Height(height) = selector
+            && self.replace_before_header == Some((self.view_index(), height))
+        {
+            self.advance_view();
+        }
         let mut header = self
             .served_inner(self.view_index())
             .block_header_by_selector(selector, at_epoch_id)
