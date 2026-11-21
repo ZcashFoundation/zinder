@@ -280,6 +280,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
             .await
     }
 
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        admitted_activations(&self.secondary)?;
+        self.read(move |secondary| secondary.stored_tree_state_at(height))
+            .await
+    }
+
     async fn tree_state_lookup(
         &self,
         height: BlockHeight,

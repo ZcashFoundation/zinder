@@ -7,12 +7,12 @@ use zinder_core::{
     TransactionBroadcastOutcome,
 };
 use zinder_source::{SourceError, TransactionBroadcaster, ZebraJsonRpcSource};
-use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup};
+use zinder_store::{ArtifactFamily, BlockHashLookup};
 
 use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
-    tree_state_replay_limit::{ReplayKey, TreeStateReplayLimit, record_stored_tree_state_read},
+    tree_state_replay_limit::{ReadyState, ReplayKey, TreeStateReplayLimit, read_missing_height},
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
 
@@ -98,58 +98,52 @@ impl QualificationWalletQuery {
                 })?;
             return Ok(tree_state_response(epoch, checkpoint));
         };
+        let mut deadline = None;
         loop {
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
-            let lookup = reader
-                .tree_state_lookup(height)
-                .await
-                .map_err(QueryError::canonical_read)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-            let replay = match lookup {
-                TreeStateLookup::Stored(state) => {
-                    record_stored_tree_state_read(height, &state);
-                    return Ok(tree_state_response(epoch, state));
+            if let Some(state) = self.replays.ready_state(key, reader.as_ref()).await? {
+                let ReadyState::Cached(ref cached) = state else {
+                    return Ok(tree_state_response(epoch, state.serve()));
+                };
+                let expected = cached.block_id();
+                let current = (self.capture)();
+                if !retains_block(&current, epoch, expected).await? {
+                    return Err(QueryError::BlockNotInBestChain);
                 }
-                TreeStateLookup::Replay(replay) => replay,
-            };
+                if ReplayKey::new(height, current.as_ref()) == key {
+                    return Ok(tree_state_response(epoch, state.serve()));
+                }
+                self.replays.admission_deadline(&mut deadline)?;
+                reader = current;
+                continue;
+            }
             let block = reader
                 .block_header_at(height)
                 .await
                 .map_err(QueryError::canonical_read)?
                 .ok_or(QueryError::BlockNotInBestChain)?;
             let expected = BlockId::new(height, block.block_hash);
+            let generation = Arc::downgrade(&reader);
             drop(reader);
-            let flight = self.replays.flight(key);
-            if let Some(state) = flight.cached() {
-                let current = (self.capture)();
-                if !retains_block(&current, epoch, expected).await? {
+            let deadline = self.replays.admission_deadline(&mut deadline)?;
+            let subscription = self.replays.subscribe(key, &generation, deadline)?;
+            let slot = subscription.admit(&self.replays, deadline).await?;
+            reader = (self.capture)();
+            if !generation.ptr_eq(&Arc::downgrade(&reader)) {
+                drop(subscription);
+                drop(slot);
+                if !retains_block(&reader, epoch, expected).await? {
                     return Err(QueryError::BlockNotInBestChain);
                 }
-                if ReplayKey::new(height, current.as_ref()) == key {
-                    crate::tree_state_replay_limit::record_cached_tree_state_read(height, &state);
-                    return Ok(tree_state_response(epoch, state));
-                }
-                reader = current;
                 continue;
             }
-            let replay_slot = flight.admit(&self.replays).await?;
-            reader = (self.capture)();
-            let replay_epoch = reader.chain_epoch();
-            if !retains_block(&reader, epoch, expected).await? {
-                return Err(QueryError::BlockNotInBestChain);
-            }
-            if ReplayKey::new(height, reader.as_ref()) != key {
-                continue;
-            }
-            return flight
-                .replay(replay_slot, |cancelled| async move {
-                    reader
-                        .replay_tree_state_until_cancelled(replay, cancelled)
-                        .await
+            return subscription
+                .replay(slot, |cancelled| async move {
+                    read_missing_height(reader.as_ref(), height, cancelled).await
                 })
                 .await
-                .map(|state| tree_state_response(replay_epoch, state));
+                .map(|state| tree_state_response(epoch, state));
         }
     }
 

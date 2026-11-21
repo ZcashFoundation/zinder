@@ -28,7 +28,6 @@ use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
-    TreeStateLookup,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -51,8 +50,7 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, TreeStateReplayLimit,
-        record_stored_tree_state_read,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, TreeStateReplayLimit, read_missing_height,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1271,49 +1269,37 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         serving_read::record("tree_state_at", None, async {
+            let mut deadline = None;
             loop {
-                let (lookup_epoch, key, lookup) =
-                    serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                        if height > chain_epoch.visible_tip_height {
-                            return Err(QueryError::BlockNotInBestChain);
-                        }
-                        let lookup = pair
-                            .canonical()
-                            .tree_state_lookup(height)
-                            .await
-                            .map_err(QueryError::canonical_read)?
-                            .ok_or(QueryError::BlockNotInBestChain)?;
-                        Ok((
-                            chain_epoch,
-                            ReplayKey::new(height, pair.canonical()),
-                            lookup,
-                        ))
+                let (epoch, key, generation, ready) =
+                    serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
+                        let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                        let key = ReplayKey::new(height, pair.canonical());
+                        let ready = self
+                            .tree_state_replays
+                            .ready_state(key, pair.canonical())
+                            .await?;
+                        Ok((epoch, key, Arc::downgrade(&pair), ready))
                     })
                     .await?;
-                let replay = match lookup {
-                    TreeStateLookup::Stored(stored) => {
-                        record_stored_tree_state_read(height, &stored);
-                        return Ok(tree_state_response(lookup_epoch, stored));
-                    }
-                    TreeStateLookup::Replay(replay) => replay,
-                };
-                let flight = self.tree_state_replays.flight(key);
-                if let Some(state) = flight.cached() {
-                    crate::tree_state_replay_limit::record_cached_tree_state_read(height, &state);
-                    return Ok(tree_state_response(lookup_epoch, state));
+                if let Some(state) = ready {
+                    return Ok(tree_state_response(epoch, state.serve()));
                 }
-                let permit = flight.admit(&self.tree_state_replays).await?;
+                let deadline = self.tree_state_replays.admission_deadline(&mut deadline)?;
+                let subscription = self
+                    .tree_state_replays
+                    .subscribe(key, &generation, deadline)?;
+                let slot = subscription
+                    .admit(&self.tree_state_replays, deadline)
+                    .await?;
                 let answer = serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                     let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    if ReplayKey::new(height, pair.canonical()) != key {
+                    if !generation.ptr_eq(&Arc::downgrade(&pair)) {
                         return Ok(None);
                     }
-                    let state = flight
-                        .replay(permit, |cancelled| async move {
-                            pair.canonical()
-                                .replay_tree_state_until_cancelled(replay, cancelled)
-                                .await
+                    let state = subscription
+                        .replay(slot, |cancelled| async move {
+                            read_missing_height(pair.canonical(), height, cancelled).await
                         })
                         .await?;
                     Ok(Some(tree_state_response(epoch, state)))
@@ -2013,16 +1999,12 @@ mod tree_state_replay_limit_tests {
             let query = query.clone();
             async move { query.tree_state_at(reconstructed, None).await }
         });
-        let pair = query.capture_pair();
-        let key = super::ReplayKey::new(reconstructed, pair.canonical());
-        let flight = query.tree_state_replays.flight(key);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&flight) < 5 {
+            while query.tree_state_replays.waiter_count() != 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
-        drop(flight);
         cancelled.abort();
         assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
         assert!(!second.is_finished());
@@ -2045,6 +2027,69 @@ mod tree_state_replay_limit_tests {
             query.tree_state_at(reconstructed, None).await?.height,
             reconstructed
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_surviving_wallet_counts_one_answer_and_one_shared_seed_lookup()
+    -> Result<(), Box<dyn Error>> {
+        use std::sync::atomic::Ordering;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store =
+            WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+        let (canonical, wallet) = store.take_readers()?;
+        let (reader, gate) =
+            ObservedCanonicalReader::holding_replays(RocksDbCanonicalReader::new(canonical)?);
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(reader),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO)
+            .with_waiters_per_slot(NonZeroU32::MIN);
+        let height = BlockHeight::new(2);
+        let request = || {
+            let query = query.clone();
+            tokio::spawn(async move { query.tree_state_at(height, None).await })
+        };
+        let first = request();
+        gate.replay_started().await;
+        let follower = request();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while query.tree_state_replays.waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(matches!(
+            request().await?,
+            Err(QueryError::TreeStateReplayLimitReached { .. })
+        ));
+        first.abort();
+        assert!(first.await.is_err_and(|error| error.is_cancelled()));
+        gate.release();
+        assert_eq!(follower.await??.height, height);
+        assert_eq!(query.tree_state_at(height, None).await?.height, height);
+        assert_eq!(gate.runs.load(Ordering::Relaxed), 1);
+        assert_eq!(gate.seed_lookups.load(Ordering::Relaxed), 1);
+        let rendered = metrics.render();
+        for expected in [
+            r#"zinder_query_tree_state_reads_total{source="coalesced",height_band="0"} 1"#,
+            r#"zinder_query_tree_state_reads_total{source="cached",height_band="0"} 1"#,
+            r#"zinder_query_tree_state_replayed_blocks_count{height_band="0"} 1"#,
+            r#"zinder_query_tree_state_replay_duration_seconds_count{height_band="0"} 1"#,
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!rendered.contains(r#"source="replayed""#));
         Ok(())
     }
 
@@ -2188,9 +2233,7 @@ mod tree_state_replay_limit_tests {
         Ok(())
     }
 
-    /// Every served tree state samples its replay depth, a stored checkpoint
-    /// included, and each reconstruction records its slot wait, its replay
-    /// time, and whether it was admitted or refused.
+    /// Reads count per caller and reconstruction work counts per rebuild.
     #[tokio::test]
     async fn tree_state_reads_record_depth_slot_and_replay_time() -> Result<(), Box<dyn Error>> {
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -2228,10 +2271,10 @@ mod tree_state_replay_limit_tests {
             "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"0\"} 1",
             "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 1",
             "zinder_query_tree_state_reads_total{source=\"cached\",height_band=\"0\"} 1",
-            "zinder_query_tree_state_replayed_blocks_count{height_band=\"0\"} 3",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"sapling\",height_band=\"0\"} 3",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"orchard\",height_band=\"0\"} 3",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"ironwood\",height_band=\"0\"} 3",
+            "zinder_query_tree_state_replayed_blocks_count{height_band=\"0\"} 1",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"sapling\",height_band=\"0\"} 1",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"orchard\",height_band=\"0\"} 1",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"ironwood\",height_band=\"0\"} 1",
             "zinder_query_tree_state_replay_duration_seconds_count{height_band=\"0\"} 1",
             "zinder_query_tree_state_replay_wait_duration_seconds_count 3",
             "zinder_query_tree_state_replay_admissions_total 2",
@@ -2242,12 +2285,6 @@ mod tree_state_replay_limit_tests {
                 "missing {expected}:\n{rendered}"
             );
         }
-        assert!(
-            rendered.lines().any(|line| line.starts_with(
-                "zinder_query_tree_state_replayed_blocks{height_band=\"0\",quantile=\"0\"} 0"
-            )),
-            "a stored checkpoint samples zero replayed blocks:\n{rendered}"
-        );
         Ok(())
     }
 }

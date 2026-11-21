@@ -39,6 +39,7 @@ pub(crate) struct ReplayGate {
     open: Semaphore,
     started: Notify,
     pub(crate) runs: AtomicUsize,
+    pub(crate) seed_lookups: AtomicUsize,
 }
 
 impl ReplayGate {
@@ -60,6 +61,7 @@ impl ObservedCanonicalReader {
             open: Semaphore::new(0),
             started: Notify::new(),
             runs: AtomicUsize::new(0),
+            seed_lookups: AtomicUsize::new(0),
         };
         replays.release();
         Self {
@@ -76,6 +78,7 @@ impl ObservedCanonicalReader {
             open: Semaphore::new(0),
             started: Notify::new(),
             runs: AtomicUsize::new(0),
+            seed_lookups: AtomicUsize::new(0),
         });
         (
             Self {
@@ -214,10 +217,18 @@ impl CanonicalReader for ObservedCanonicalReader {
             .await
     }
 
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        self.count().stored_tree_state_at(height).await
+    }
+
     async fn tree_state_lookup(
         &self,
         height: BlockHeight,
     ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        self.replays.seed_lookups.fetch_add(1, Ordering::Relaxed);
         self.count().tree_state_lookup(height).await
     }
 

@@ -119,14 +119,14 @@ async fn tree_state_metrics_count_each_height_read_from_its_served_outcome() -> 
     for expected in [
         r#"zinder_query_tree_state_reads_total{source="stored",height_band="0"} 2"#,
         r#"zinder_query_tree_state_reads_total{source="replayed",height_band="0"} 1"#,
-        r#"zinder_query_tree_state_replayed_blocks_count{height_band="0"} 3"#,
+        r#"zinder_query_tree_state_replayed_blocks_count{height_band="0"} 1"#,
         &format!(
             r#"zinder_query_tree_state_replayed_blocks_sum{{height_band="0"}} {}"#,
             replay.replayed_blocks()
         ),
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="sapling",height_band="0"} 3"#,
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="orchard",height_band="0"} 3"#,
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="ironwood",height_band="0"} 3"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="sapling",height_band="0"} 1"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="orchard",height_band="0"} 1"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="ironwood",height_band="0"} 1"#,
         r#"zinder_query_tree_state_replay_duration_seconds_count{height_band="0"} 1"#,
         "zinder_query_tree_state_replay_admissions_total 1",
     ] {

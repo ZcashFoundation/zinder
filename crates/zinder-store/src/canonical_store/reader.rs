@@ -304,6 +304,25 @@ macro_rules! impl_canonical_typed_reads {
                     .transpose()
             }
 
+            /// Reads the wallet checkpoint stored at exactly `height` without loading a replay seed.
+            pub fn stored_tree_state_at(
+                &self,
+                height: BlockHeight,
+            ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
+                let predecessor = self
+                    .serving_build_plan()
+                    .history_predecessor()
+                    .block_id
+                    .height;
+                if height < predecessor || height > self.serving_ready_evidence().visible_tip.height
+                {
+                    return Ok(None);
+                }
+                read_tree_state_row_at(self, height)?
+                    .map(|encoded| decode_served_tree_state(self, height, &encoded))
+                    .transpose()
+            }
+
             /// Reads the commitment-tree checkpoint after the canonical block
             /// at `height`, reconstructing it when no checkpoint is stored
             /// there.
@@ -970,14 +989,21 @@ pub(super) fn read_stored_tree_state_checkpoint_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    read_tree_state_row_at(store, height)?
+        .map(|encoded| decode_stored_tree_state_checkpoint(store, height, &encoded))
+        .transpose()
+}
+
+fn read_tree_state_row_at(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
     read_optional(
         store,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         &encode_block_position(height),
         "tree-state checkpoint read",
-    )?
-    .map(|encoded| decode_stored_tree_state_checkpoint(store, height, &encoded))
-    .transpose()
+    )
 }
 
 /// One stored tree-state checkpoint row, not yet decoded.

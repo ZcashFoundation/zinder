@@ -180,6 +180,17 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError>;
 
+    /// Reads a checkpoint at exactly this height without reconstructing its frontier.
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        Ok(self
+            .tree_state_checkpoint_at_or_before(height)
+            .await?
+            .filter(|state| state.block_id().height == height))
+    }
+
     /// Finds how the tree state at `height` is answered under the admitted
     /// network-upgrade schedule: by the checkpoint stored there, or by a
     /// reconstruction [`Self::replay_tree_state`] runs.
