@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from coverage_payment_recovery import recovery_actions
 from coverage_roundtrip import roundtrip_actions
 from coverage_evidence import digest, interrupted_actions, load, native_expiry_actions, reorg_actions, require, subtree_actions
 
@@ -82,7 +83,8 @@ def validate(matrix):
     require(isinstance(matrix["scenarios"], list) and matrix["scenarios"], "no scenarios")
     for row in matrix["scenarios"]:
         closed(row, {"id", *IDENTITY, "action", "status", "method_scope", "assertions",
-                     "methods", "evidence", "client_sha256", "observed_methods", "accounting_zat"}, "scenario")
+                     "methods", "evidence", "client_sha256", "observed_methods", "accounting_zat",
+                     "return_accounting_zat"}, "scenario")
         required_text(row, ("id", *IDENTITY, "action"), "scenario")
         ident = row["id"]
         require(re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", ident) and ident not in seen,
@@ -126,13 +128,27 @@ def validate(matrix):
                 require(re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", field)
                         and claim["handling"] in HANDLING and claim["assertion"] in checks,
                         f"{ident}: field claim requires a named check")
-        if "accounting_zat" in row:
-            accounting = row["accounting_zat"]
-            closed(accounting, {"amount", "fee", "change", "balance_after", "spendable_after"}, "wallet accounting")
+        for field in ("accounting_zat", "return_accounting_zat"):
+            if field not in row:
+                continue
+            accounting = row[field]
+            allowed = {"amount", "fee", "change", "balance_after", "spendable_after"}
+            if field == "return_accounting_zat":
+                require("accounting_zat" in row, f"{ident}: return payment without outbound accounting")
+                allowed.update(("debit", "credit"))
+            closed(accounting, allowed, "wallet accounting")
             require("amount" in accounting and "balance_after" in accounting and
                     all(type(v) is int and v >= 0 for v in accounting.values()), f"{ident}: invalid wallet accounting")
         evidence = row["evidence"]
-        closed(evidence, {"description", "sha256", "related_sha256"}, "evidence pointer")
+        closed(evidence, {"description", "sha256", "related_sha256", "local_status_rpc_during_outage", "release_binaries_sha256"},
+               "evidence pointer")
+        if "release_binaries_sha256" in evidence:
+            require(isinstance(evidence["release_binaries_sha256"], str)
+                    and re.fullmatch(r"[0-9a-f]{64}", evidence["release_binaries_sha256"]),
+                    f"{ident}: invalid release binary set digest")
+        if "local_status_rpc_during_outage" in evidence:
+            require(evidence["local_status_rpc_during_outage"] in {"available", "unavailable", "wallet-rpc-error"},
+                    f"{ident}: unknown local status RPC observation")
         if "related_sha256" in evidence:
             sources = evidence["related_sha256"]
             closed(sources, {"repeat-receipt", "canonical-audit"}, "related evidence")
@@ -208,6 +224,12 @@ def compare(baseline, current, prefixes=()):
             changes.append(f"{ident}: missing scenario")
             continue
         mismatched = [k for k in (*IDENTITY, "client_sha256") if new.get(k) != old.get(k)]
+        old_build = old.get("evidence", {}).get("release_binaries_sha256")
+        if old_build is not None:
+            new_build = new["evidence"].get("release_binaries_sha256")
+            same_revision = baseline.get("release", {}).get("commit") == current.get("release", {}).get("commit")
+            if new_build is None or (same_revision and old_build != new_build):
+                mismatched.append("release binaries")
         if mismatched:
             changes.append(f"{ident}: incomparable " + ", ".join(mismatched))
             continue
@@ -218,9 +240,10 @@ def compare(baseline, current, prefixes=()):
         if new["method_scope"] != "complete":
             for lost in sorted(set(old.get("observed_methods", [])) - set(new.get("observed_methods", []))):
                 changes.append(f"{ident}: lost observation of {lost}")
-        for field, amount in old.get("accounting_zat", {}).items():
-            if new.get("accounting_zat", {}).get(field) != amount:
-                changes.append(f"{ident}: changed wallet accounting for {field}")
+        for key, direction in (("accounting_zat", "wallet"), ("return_accounting_zat", "return")):
+            for field, amount in old.get(key, {}).items():
+                if new.get(key, {}).get(field) != amount:
+                    changes.append(f"{ident}: changed {direction} accounting for {field}")
         for check, status in old["assertions"].items():
             if status == "pass" and new["assertions"].get(check) != "pass":
                 changes.append(f"{ident}: lost passing assertion {check}")
@@ -300,6 +323,8 @@ def main():
     collect.add_argument("--roundtrip-pair", nargs=2, type=Path, metavar=("FIRST", "SECOND"),
                          help="receipts from two independent signed Regtest round trips")
     collect.add_argument("--roundtrip-audit", type=Path, help="optional independent canonical audit of that pair")
+    collect.add_argument("--recovery-result", type=Path, action="append", default=[], metavar="RECEIPT",
+                         help="one stopped-wallet, shallow rollback, or live native reconnect receipt (repeatable)")
     collect.add_argument("--native-expiry-result", type=Path, help="private native-expiry.py receipt.json")
     collect.add_argument("--reorg-result", type=Path, help="private reorg-zkool.py receipt.json")
     collect.add_argument("--counterparty-result", type=Path, action="append", default=[], metavar="RECEIPT",
@@ -324,6 +349,8 @@ def main():
         require(not args.roundtrip_audit or args.roundtrip_pair, "roundtrip canonical audit requires paired receipts")
         if args.roundtrip_pair:
             rows.extend(roundtrip_actions(args.roundtrip_pair, release, args.roundtrip_audit))
+        for path in args.recovery_result:
+            rows.extend(recovery_actions(path, release))
         if args.native_expiry_result:
             rows.extend(native_expiry_actions(args.native_expiry_result, release))
         if args.reorg_result:
