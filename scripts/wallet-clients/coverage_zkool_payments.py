@@ -363,7 +363,8 @@ def require_journal_bindings(receipt, journal, case):
                 f"{case}/{name}: mined height differs from journal")
         for field in ("amount_zat", "fee_zat", "memo", "memo_verified",
                       "payer_before_zat", "payer_after_zat", "payee_before_zat",
-                      "payee_after_zat", "sender_spendable_zat", "receiver_spendable_zat"):
+                      "payee_after_zat", "sender_spendable_zat", "receiver_spendable_zat",
+                      "payer_scanned_height", "payee_scanned_height"):
             require(observed.get(field) == leg.get(field),
                     f"{case}/{name}: {field} differs from journal")
         pending = journal["observations"].get(name + "-pending")
@@ -391,7 +392,8 @@ def case_ledger(receipt, inputs):
     for name in LEGS:
         raw = receipt["legs"][name]
         require(isinstance(raw, dict) and set(OUTCOME_LEGS) <= set(raw)
-                <= set(OUTCOME_LEGS) | {"memo", "sender_spendable_zat", "receiver_spendable_zat"},
+                <= set(OUTCOME_LEGS) | {"memo", "sender_spendable_zat", "receiver_spendable_zat",
+                                        "payer_scanned_height", "payee_scanned_height"},
                 f"{name}: unexpected fields in the leg record")
         require(raw.get("memo") == MEMOS[name], f"{name}: memo label differs from the campaign")
         for field in ("sender_spendable_zat", "receiver_spendable_zat"):
@@ -409,6 +411,12 @@ def case_ledger(receipt, inputs):
                 - raw["fee_zat"], f"{name}: payer debit does not reconcile")
         require(raw["payee_after_zat"] == raw["payee_before_zat"] + raw["amount_zat"],
                 f"{name}: payee credit does not reconcile")
+        for actor, spendable in (("payer", "sender_spendable_zat"), ("payee", "receiver_spendable_zat")):
+            height = raw.get(f"{actor}_scanned_height")
+            require(type(height) is int and height == raw["mined_height"] + 9,
+                    f"{name}: {actor} has not scanned exactly ten confirmations")
+            require(raw[spendable] == raw[f"{actor}_after_zat"],
+                    f"{name}: {actor} balance is not fully spendable at ten confirmations")
         legs[name] = raw
 
     require(set(receipt["legs"]) == set(LEGS), "case legs are missing or substituted")

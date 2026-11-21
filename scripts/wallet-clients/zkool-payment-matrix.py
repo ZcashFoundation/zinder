@@ -634,12 +634,15 @@ class Case:
                     f"{name}: node did not observe the signed transaction")
             observations[name + "-pending"] = seen
             self.journal.save()
-        self.mine(name, 10)
+        tip = self.mine(name, 10)
         block = self.mined(txid)
+        require(tip == block["height"] + 9, f"{name}: expected ten confirmations")
 
         def checked():
-            tip = self.tip()
+            require(self.tip() == tip, f"{name}: node advanced during wallet settlement")
             a, b = sender.snapshot(tip), receiver.snapshot(tip)
+            if not self.balances_settled(a, b, tip):
+                return None
             sent, received = self.wallet_tx(a, txid), self.wallet_tx(b, txid)
             if not all(t and not t["pending"] and t["height"] == block["height"]
                        for t in (sent, received)):
@@ -657,10 +660,16 @@ class Case:
                     "memo": memo, "memo_verified": True, "payer_before_zat": before["payer"],
                     "payee_before_zat": before["payee"], "payer_after_zat": a["total_zat"],
                     "payee_after_zat": b["total_zat"],
+                    "payer_scanned_height": a["height"], "payee_scanned_height": b["height"],
                     "sender_spendable_zat": a["spendable_zat"],
                     "receiver_spendable_zat": b["spendable_zat"]}
         observations[name] = self.wait("wallet accounting for " + name, checked)
         self.journal.save()
+
+    @staticmethod
+    def balances_settled(payer, payee, tip):
+        return all(wallet["height"] == tip and wallet["spendable_zat"] == wallet["total_zat"]
+                   for wallet in (payer, payee))
 
     @staticmethod
     def wallet_tx(snapshot, txid):

@@ -193,6 +193,16 @@ class FakeFixture:
 
 
 class MatrixTests(unittest.TestCase):
+    def test_accounting_waits_for_both_scans_and_the_full_spendable_balance(self):
+        payer = {"height": 402, "total_zat": 3_980_000, "spendable_zat": 3_980_000}
+        payee = {"height": 402, "total_zat": 495_970_000, "spendable_zat": 492_970_000}
+        self.assertFalse(MATRIX.Case.balances_settled(payer, payee, 402))
+        payee["spendable_zat"] = payee["total_zat"]
+        for wallet in (payer, payee):
+            with patch.dict(wallet, height=401):
+                self.assertFalse(MATRIX.Case.balances_settled(payer, payee, 402))
+        self.assertTrue(MATRIX.Case.balances_settled(payer, payee, 402))
+
 
     def test_missing_cake_auth_dependency_is_reported_before_fixture_start(self):
         with tempfile.TemporaryDirectory() as directory:

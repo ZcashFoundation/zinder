@@ -5,11 +5,12 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import coverage as cov
 from coverage_evidence import digest
-from coverage_zkool_payments import actions
+from coverage_zkool_payments import actions, case_ledger
 
 
 HERE = Path(__file__).resolve().parent
@@ -91,6 +92,7 @@ def leg(name, height, payer_before, amount, fee, payee_before, sender_spendable,
             "payer_before_zat": payer_before, "payee_before_zat": payee_before,
             "payer_after_zat": payer_before - amount - fee,
             "payee_after_zat": payee_before + amount,
+            "payer_scanned_height": height + 9, "payee_scanned_height": height + 9,
             "sender_spendable_zat": sender_spendable,
             "receiver_spendable_zat": receiver_spendable}
 
@@ -257,7 +259,8 @@ class Campaign:
                 **{key: entry[key] for key in ("amount_zat", "fee_zat", "memo", "memo_verified",
                                                "payer_before_zat", "payer_after_zat", "payee_before_zat",
                                                "payee_after_zat", "sender_spendable_zat",
-                                               "receiver_spendable_zat")},
+                                               "receiver_spendable_zat", "payer_scanned_height",
+                                               "payee_scanned_height")},
                 "txid": txid, "block": {"height": entry["mined_height"]},
             }
             journal_operations[name] = {"txid": txid}
@@ -401,6 +404,19 @@ class ZkoolPaymentImport(unittest.TestCase):
 
     def rejects(self):
         return self.assertRaises(ValueError)
+
+    def test_cake_spendback_rejects_early_wallet_accounting(self):
+        for key, value, message in (
+            ("receiver_spendable_zat", 492_978_000, "not fully spendable"),
+            ("sender_spendable_zat", 3_995_999, "not fully spendable"),
+            ("payer_scanned_height", 401, "ten confirmations"),
+            ("payee_scanned_height", 403, "ten confirmations"),
+        ):
+            with self.subTest(key=key):
+                receipt = self.campaign.receipts["cake"]
+                with patch.dict(receipt["legs"]["spendback"], {key: value}):
+                    with self.assertRaisesRegex(ValueError, message):
+                        case_ledger(receipt, receipt["inputs"])
 
     def test_actor_rows_bind_legs_pins_and_payer_accounting(self):
         rows = self.rows()
