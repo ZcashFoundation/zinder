@@ -532,6 +532,30 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));
+        for coverage in ["every-block", "cadence-and-tip"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "zinder-bench",
+                    "rocksdb-storage-lifecycle",
+                    "--network",
+                    "zcash-testnet",
+                    "--json-rpc-addr",
+                    "http://zebra:18232",
+                    "--canonical-store",
+                    "canonical",
+                    "--wallet-store",
+                    "wallet",
+                    "--cpu-limit-cores",
+                    "10",
+                    "--memory-limit-bytes",
+                    "10737418240",
+                    "--tree-state-checkpoint-coverage",
+                    coverage,
+                ])?
+                .command,
+                Command::RocksDbStorageLifecycle(_)
+            ));
+        }
         Ok(())
     }
 
@@ -550,6 +574,22 @@ mod tests {
             cli.command,
             Command::RocksDbCanonicalFixtureReplay(_)
         ));
+        for coverage in ["every-block", "cadence-and-tip"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "zinder-bench",
+                    "rocksdb-canonical-fixture-replay",
+                    "--fixture",
+                    "fixture",
+                    "--canonical-store",
+                    "canonical",
+                    "--tree-state-checkpoint-coverage",
+                    coverage,
+                ])?
+                .command,
+                Command::RocksDbCanonicalFixtureReplay(_)
+            ));
+        }
         Ok(())
     }
 
@@ -569,6 +609,8 @@ mod tests {
             "all-canonical",
             "--all-secondary-root",
             "all-secondary",
+            "--tree-state-checkpoint-coverage",
+            "cadence-and-tip",
         ])?;
 
         assert!(matches!(

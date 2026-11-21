@@ -1,0 +1,6 @@
+kind: added
+body: Operators can compare shielded payments, fees, and spending of received notes for both Zkool address profiles and Cake Wallet’s Zcash engine against Zallet on disposable Regtest chains.
+time: 2026-11-21T17:01:38.334671479Z
+custom:
+    Bump: patch
+    PR: "454"

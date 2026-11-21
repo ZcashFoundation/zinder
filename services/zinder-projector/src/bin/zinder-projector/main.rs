@@ -23,8 +23,8 @@ use zinder_runtime::{
     OpsServerError, Readiness, ReadinessState, StartupPhase, StartupPhaseGuard,
     TracingSubscriberError, cancel_on_terminating_signal, compare_canonical_writer_fences,
     converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
-    install_metrics_recorder, install_tracing_subscriber, spawn_ops_endpoint,
-    writer_attests_network_upgrade_schedule,
+    host_cpu_meets_pasta_backend_baseline, install_metrics_recorder, install_tracing_subscriber,
+    spawn_ops_endpoint, writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
@@ -180,6 +180,9 @@ async fn main() -> ExitCode {
         return emit_tracing_subscriber_error(&error);
     }
     if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+    if !host_cpu_meets_pasta_backend_baseline() {
         return ExitCode::FAILURE;
     }
     if cli.print_config {

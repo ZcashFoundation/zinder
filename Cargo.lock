@@ -407,6 +407,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit_field"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb2907cc03d08cdb1c6724ad0670ce67c4a71e1c45a6d7635224011714cfc4b1"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,6 +777,12 @@ name = "const-oid"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
+
+[[package]]
+name = "const_fn"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "const_format"
@@ -5117,6 +5129,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "volatile"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5650,6 +5668,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "x86_64"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be4ec631e1a81d50e46c35a4a00322bd076c47491b64c2fb10a7ffa89002c697"
+dependencies = [
+ "bit_field",
+ "bitflags",
+ "const_fn",
+ "rustversion",
+ "volatile",
+]
+
+[[package]]
 name = "yasna"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6158,6 +6189,7 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "parking_lot 0.13.0",
+ "pasta_curves",
  "prost",
  "sapling-crypto",
  "sha2 0.11.1",
@@ -6389,8 +6421,10 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot 0.13.0",
+ "pasta_curves",
  "prost",
  "prost-types",
+ "raw-cpuid",
  "rcgen",
  "rustix",
  "rustls",
@@ -6416,6 +6450,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "x86_64",
  "zinder-core",
  "zinder-proto",
  "zinder-source",

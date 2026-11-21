@@ -43,6 +43,7 @@ zcash_protocol = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 eyre.workspace = true
+pasta_curves.workspace = true
 
 [lints]
 workspace = true

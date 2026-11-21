@@ -53,6 +53,10 @@ pub struct CanonicalWriterConfig {
     /// Reorg window depth, which also places fresh construction's build tip,
     /// and so the baseline settled tip, this far below the node's tip.
     pub reorg_window_blocks: u32,
+    /// Whether fresh construction stores a tree-state checkpoint for every
+    /// loaded block instead of only on the 100-block cadence and at the build
+    /// tip.
+    pub every_block_tree_state_checkpoints: bool,
     /// Continuous follower policy.
     pub follow: CanonicalFollowConfig,
 }
@@ -492,17 +496,13 @@ where
         )
         .with_phase(IngestPhase::BulkCatchup),
     );
-    let builder = RocksDbCanonicalBuilder::create_fresh(
-        staging_path,
-        CanonicalStoreWorkload::Wallet,
-        build_plan,
-        config.resource_budget,
-    )?;
+    let builder = create_fresh_canonical_builder(staging_path, build_plan, config)?;
     tracing::info!(
         target: "zinder::ingest",
         event = "canonical_fresh_construction_started",
         staging_path = %staging_path.display(),
         fixed_tip_height = build_tip.height.value(),
+        every_block_tree_state_checkpoints = config.every_block_tree_state_checkpoints,
         "started canonical construction"
     );
     let loaded =
@@ -539,6 +539,24 @@ where
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)
+}
+
+fn create_fresh_canonical_builder(
+    staging_path: &std::path::Path,
+    build_plan: CanonicalStoreBuildPlan,
+    config: &CanonicalWriterConfig,
+) -> Result<RocksDbCanonicalBuilder, CanonicalStoreError> {
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        staging_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        config.resource_budget,
+    )?;
+    if config.every_block_tree_state_checkpoints {
+        builder.with_every_block_tree_state_checkpoints()
+    } else {
+        Ok(builder)
+    }
 }
 
 /// Validates and publishes the staged build on the blocking pool.
@@ -1244,6 +1262,7 @@ mod tests {
             checkpoint_height: None,
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_window_blocks: 1,
+            every_block_tree_state_checkpoints: false,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
@@ -1423,6 +1442,7 @@ mod tests {
             checkpoint_height: Some(BlockHeight::new(0)),
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             reorg_window_blocks: 100,
+            every_block_tree_state_checkpoints: false,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),

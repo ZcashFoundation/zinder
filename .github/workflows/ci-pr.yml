@@ -25,6 +25,40 @@ env:
   PROTOC_VERSION: "36.2"
 
 jobs:
+  pasta-parity:
+    name: Pasta commitment-tree parity (${{ matrix.backend }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            backend: x86-64
+            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+          - runner: ubuntu-24.04-arm
+            backend: aarch64
+            rustflags: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - name: Check portable and assembly commitment-tree vectors
+        env:
+          ASSEMBLY_BACKEND: ${{ matrix.backend }}
+        shell: bash
+        run: |
+          vector=commitment_tree_codec::tests::accumulator_appends_known_commitments_with_protocol_root_order
+          for backend in portable "$ASSEMBLY_BACKEND"; do
+            features=()
+            if [[ "$backend" != portable ]]; then
+              features=(--features pasta_curves/asm)
+            fi
+            ZINDER_TEST_EXPECT_PASTA_BACKEND="$backend" cargo test --locked -p zinder-core --lib "${features[@]}" \
+              -- "$vector" --exact --format pretty | tee "$RUNNER_TEMP/pasta-$backend.log"
+            grep -Fx "test $vector ... ok" "$RUNNER_TEMP/pasta-$backend.log"
+          done
+
   rust:
     name: rust
     runs-on: ubuntu-latest
@@ -93,6 +127,9 @@ jobs:
           trap 'sudo umount "$scratch/mount" && rm -r "$scratch"' EXIT
           sudo chown "$(id -u):$(id -g)" "$scratch/mount"
           TMPDIR="$scratch/mount" cargo nextest run -p zinder-compat-lightwalletd --lib --run-ignored=only -E 'test(/kernel_protected/)'
+
+      - name: Test the assembly-enabled Pasta guard
+        run: cargo nextest run --locked --profile=ci -p zinder-runtime --features pasta_curves/asm -E 'test(/pasta_/)'
 
       - name: Check canonical store defaults across runtimes
         run: python3 scripts/test-canonical-storage-defaults.py
@@ -221,7 +258,16 @@ jobs:
           python3 -B scripts/wallet-clients/test-audit-wallet-roundtrip.py
           python3 -B scripts/wallet-clients/test-roundtrip-regtest-command.py
           python3 -B scripts/wallet-clients/coverage_test.py
+          python3 -B scripts/wallet-clients/test-coverage-counterparty-roles.py
+          python3 -B scripts/wallet-clients/test-payment-roles.py
+          python3 -B scripts/wallet-clients/test-zally-payment.py
+          python3 -B scripts/wallet-clients/test-devtool-endpoint-identity.py
+          python3 -B scripts/wallet-clients/test-zkool-payment-matrix.py
+          python3 -B scripts/wallet-clients/test-coverage-zkool-payments.py
           python3 -B scripts/wallet-clients/test-coverage-evidence.py
+          python3 -B scripts/wallet-clients/payment-recovery-test.py
+          python3 -B scripts/wallet-clients/transport-payment-test.py
+          python3 -B scripts/wallet-clients/test-coverage-payment-recovery.py
           python3 -B scripts/release-wallet-tests.py
           python3 -B scripts/wallet-clients/coverage.py check
 

@@ -51,6 +51,7 @@ pub struct CanonicalBaseline<'chain> {
     history_floor: Option<BlockHeight>,
     settled_tip_height: Option<BlockHeight>,
     subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
+    every_block_tree_state_checkpoints: bool,
 }
 
 impl<'chain> CanonicalBaseline<'chain> {
@@ -63,6 +64,7 @@ impl<'chain> CanonicalBaseline<'chain> {
             history_floor: None,
             settled_tip_height: None,
             subtree_roots: Vec::new(),
+            every_block_tree_state_checkpoints: false,
         }
     }
 
@@ -100,6 +102,14 @@ impl<'chain> CanonicalBaseline<'chain> {
     #[must_use]
     pub fn with_subtree_root(mut self, subtree_root: CanonicalBuildSubtreeRoot) -> Self {
         self.subtree_roots.push(subtree_root);
+        self
+    }
+
+    /// Publishes a tree-state checkpoint for every constructed block instead
+    /// of only on the global cadence and at the build tip.
+    #[must_use]
+    pub const fn with_every_block_tree_state_checkpoints(mut self) -> Self {
+        self.every_block_tree_state_checkpoints = true;
         self
     }
 
@@ -186,12 +196,17 @@ impl CanonicalWriterFixture {
         let temporary_directory =
             TempDir::new().wrap_err("create canonical writer fixture directory")?;
         let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        let builder = RocksDbCanonicalBuilder::create_fresh(
             &canonical_primary_path,
             CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
+        let mut builder = if baseline.every_block_tree_state_checkpoints {
+            builder.with_every_block_tree_state_checkpoints()?
+        } else {
+            builder
+        };
         let blocks = baseline_blocks(
             &artifacts,
             &mut trees,
@@ -199,6 +214,7 @@ impl CanonicalWriterFixture {
                 first_height: first_retained_height,
                 tip_height,
             },
+            baseline.every_block_tree_state_checkpoints,
         )?;
         let tip_checkpoint = blocks
             .last()
@@ -530,13 +546,15 @@ fn baseline_blocks(
     artifacts: &FixtureChainArtifacts,
     trees: &mut FixtureCommitmentTrees<'_>,
     range: BaselineRange,
+    every_block_tree_state_checkpoints: bool,
 ) -> eyre::Result<Vec<CanonicalBuildBlock>> {
     let mut blocks = Vec::new();
     for height in range.first_height.value()..=range.tip_height.value() {
         let height = BlockHeight::new(height);
         let tip_metadata =
             trees.apply_cold(&artifacts.chain, height, artifacts.compact_block(height)?)?;
-        let checkpoint_required = height == range.tip_height
+        let checkpoint_required = every_block_tree_state_checkpoints
+            || height == range.tip_height
             || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
         let checkpoint_frontiers = checkpoint_required.then(|| trees.frontiers()).transpose()?;
         blocks.push(artifacts.build_block(height, tip_metadata, checkpoint_frontiers)?);

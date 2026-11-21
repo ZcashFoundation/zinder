@@ -1,0 +1,6 @@
+kind: added
+body: Release operators can verify payments, return spends, and reopened balances between Zingo and the pinned Vizor, zcash-devtool, and Zally wallets on isolated Regtest chains.
+time: 2026-11-21T18:48:48.82235102Z
+custom:
+    Bump: patch
+    PR: "455"

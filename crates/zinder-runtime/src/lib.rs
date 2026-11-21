@@ -281,12 +281,21 @@ async fn await_terminating_signal() {
 ///
 /// Release images compile with `-C target-cpu=x86-64-v3`, which lets both the
 /// Rust code and the vendored `RocksDB` C++ emit AVX2/BMI2 instructions
-/// unconditionally. A host below that baseline dies with `SIGILL` deep inside
-/// storage code, so binaries call this before opening storage and exit with a
-/// readable error instead. Builds without the flag (tests, local dev, non-x86
-/// images) require nothing and always pass.
+/// unconditionally. The startup check reports missing features before opening
+/// storage. Deployments must meet the baseline even for code that runs before
+/// this check.
 #[must_use]
 pub fn host_cpu_meets_compiled_baseline() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if cfg!(target_feature = "avx2") && !host_has_avx_state() {
+        tracing::error!(
+            target: "zinder::runtime",
+            event = "host_cpu_below_compiled_baseline",
+            missing = "avx",
+            "AVX requires OS-enabled XMM and YMM state"
+        );
+        return false;
+    }
     let missing = missing_required_cpu_features();
     if missing.is_empty() {
         return true;
@@ -302,15 +311,42 @@ pub fn host_cpu_meets_compiled_baseline() -> bool {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn missing_required_cpu_features() -> Vec<&'static str> {
+    let cpu = raw_cpuid::CpuId::new();
+    let basic = cpu.get_feature_info();
+    let extended = host_extended_features();
     let required = [
-        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
-        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
-        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-        ("fma", std::arch::is_x86_feature_detected!("fma")),
-        ("lzcnt", std::arch::is_x86_feature_detected!("lzcnt")),
+        (
+            "avx2",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_avx2),
+        ),
+        (
+            "bmi1",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi1),
+        ),
+        (
+            "bmi2",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        ),
+        (
+            "fma",
+            basic.as_ref().is_some_and(raw_cpuid::FeatureInfo::has_fma),
+        ),
+        (
+            "lzcnt",
+            cpu.get_extended_processor_and_feature_identifiers()
+                .is_some_and(|features| features.has_lzcnt()),
+        ),
         (
             "pclmulqdq",
-            std::arch::is_x86_feature_detected!("pclmulqdq"),
+            basic
+                .as_ref()
+                .is_some_and(raw_cpuid::FeatureInfo::has_pclmulqdq),
         ),
     ];
     required
@@ -320,7 +356,167 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         .collect()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn host_has_avx_state() -> bool {
+    raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|features| {
+            host_avx_enabled(
+                features.has_avx() && features.has_xsave() && features.has_oxsave(),
+                x86_64::registers::xcontrol::XCr0::read,
+            )
+        })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_avx_enabled(
+    can_read_avx_state: bool,
+    read_xcr0: impl FnOnce() -> x86_64::registers::xcontrol::XCr0Flags,
+) -> bool {
+    use x86_64::registers::xcontrol::XCr0Flags;
+
+    // XGETBV is valid only after the CPU and OS have enabled XSAVE.
+    can_read_avx_state && read_xcr0().contains(XCr0Flags::SSE | XCr0Flags::AVX)
+}
+
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 fn missing_required_cpu_features() -> Vec<&'static str> {
     Vec::new()
+}
+
+/// The Pasta field-arithmetic backend compiled into this build, from
+/// `pasta_curves`: `"portable"`, `"x86-64"`, `"aarch64"`, or `"armv7em"`.
+///
+/// `pasta_curves` selects the backend at compile time from its opt-in `asm`
+/// feature and the target. Operators build an accelerated binary by enabling
+/// `pasta_curves/asm` (see the deploying runbook); this function names the
+/// backend that build actually compiled so a silent fall back to portable
+/// arithmetic is visible in the startup log instead of being hidden.
+#[must_use]
+pub const fn pasta_backend() -> &'static str {
+    pasta_curves::BACKEND
+}
+
+/// Verifies the host CPU provides every instruction-set feature the compiled
+/// Pasta backend requires, logging the selected backend and returning `false`
+/// when the host falls short.
+///
+/// The `pasta_curves` x86-64 assembly backend uses BMI2 and ADX instructions
+/// and does not detect them at run time. ADX is outside the x86-64-v3
+/// release baseline, so a build that opted into `asm` must refuse to start on
+/// a host that lacks ADX rather than die with `SIGILL` inside commitment
+/// hashing. The portable backend, and the `AArch64` and `ARMv7E-M` backends,
+/// require nothing beyond their target. This is a separate check from
+/// [`host_cpu_meets_compiled_baseline`], which covers the x86-64-v3 baseline
+/// every release binary requires.
+#[must_use]
+pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
+    tracing::info!(
+        target: "zinder::runtime",
+        event = "pasta_backend_selected",
+        backend = pasta_backend(),
+        "Pasta field-arithmetic backend compiled into this build"
+    );
+    let missing = missing_pasta_backend_cpu_features();
+    if missing.is_empty() {
+        return true;
+    }
+    tracing::error!(
+        target: "zinder::runtime",
+        event = "host_cpu_below_pasta_backend_baseline",
+        backend = pasta_backend(),
+        missing = missing.join(", "),
+        "this build compiled the Pasta x86-64 assembly backend, which requires these CPU features"
+    );
+    false
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+fn missing_pasta_features(backend: &str, bmi2: bool, adx: bool) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if backend == "x86-64" {
+        if !bmi2 {
+            missing.push("bmi2");
+        }
+        if !adx {
+            missing.push("adx");
+        }
+    }
+    missing
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_extended_features() -> Option<raw_cpuid::ExtendedFeatures> {
+    // Rust's detection macro folds features enabled by target-cpu to true.
+    raw_cpuid::CpuId::new().get_extended_feature_info()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    let features = host_extended_features();
+    missing_pasta_features(
+        pasta_backend(),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_adx),
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{missing_pasta_features, pasta_backend};
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx_requires_os_enabled_xmm_and_ymm_state() {
+        use x86_64::registers::xcontrol::XCr0Flags;
+
+        let mut xcr0_read = false;
+        assert!(!super::host_avx_enabled(false, || {
+            xcr0_read = true;
+            XCr0Flags::all()
+        }));
+        assert!(!xcr0_read);
+        for state in [XCr0Flags::empty(), XCr0Flags::SSE, XCr0Flags::AVX] {
+            assert!(!super::host_avx_enabled(true, || state));
+        }
+        assert!(super::host_avx_enabled(true, || XCr0Flags::SSE | XCr0Flags::AVX));
+    }
+
+    #[test]
+    fn pasta_backend_names_a_known_backend() {
+        assert!(
+            ["portable", "x86-64", "aarch64", "armv7em"].contains(&pasta_backend()),
+            "unexpected Pasta backend: {}",
+            pasta_backend()
+        );
+    }
+
+    #[test]
+    fn pasta_guard_requires_both_x86_assembly_features() {
+        assert_eq!(
+            missing_pasta_features("x86-64", false, false),
+            ["bmi2", "adx"]
+        );
+        assert_eq!(missing_pasta_features("x86-64", true, false), ["adx"]);
+        assert_eq!(missing_pasta_features("x86-64", false, true), ["bmi2"]);
+        assert_eq!(
+            missing_pasta_features("x86-64", true, true),
+            [] as [&str; 0]
+        );
+        for backend in ["portable", "aarch64", "armv7em"] {
+            assert_eq!(
+                missing_pasta_features(backend, false, false),
+                [] as [&str; 0]
+            );
+        }
+    }
 }

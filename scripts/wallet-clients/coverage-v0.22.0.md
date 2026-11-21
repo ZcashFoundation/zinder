@@ -1,6 +1,6 @@
 # Wallet correctness coverage for v0.22.0
 
-Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 35 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
+Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 82 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
 
 ## What the funded lifecycle established
 
@@ -29,6 +29,31 @@ Two fresh Regtest chains each ran Zingo CLI 8.0.0 on lightwalletd and the ordina
 For each payment the sender, recipient, and node all observed the same transaction pending before mining. Both wallets confirmed the transfers at heights 262 and 272 and retained the confirmed transactions and balances after reopening. An independent node audit checked active-chain block membership for four distinct signed transactions. Neither wallet invocation had a method-level trace, so the four new observations add wallet behavior coverage without attributing an RPC. [Round-trip procedure](roundtrip.md)
 
 The private evidence files are `verified-r6/receipt.json` (SHA-256 `bdb21fdfc5e57498c5410371db98f773e42dc3a9203cba24377c2b6e4308420b`), `verified-r7/receipt.json` (`a9ef2384176bb5509073a6b4a4b740c4ef4e67201433f6167612faf95b1f0ef1`), the runner's comparison `paired-r6-r7.json` (`5ccf3b5dfe983340a7a6f2d486eef24de9cf05fd6437a7d8b1e02c4e3b5c7d78`), and `canonical-r6-r7.json` (`faaa579db3101aaf11edb191ea74aee4bdb332f6a0c9732cef2f5facfd4c4c50`). The independent audit binds both receipt hashes, both fixture hashes, and each leg's transaction fingerprint.
+
+## Vizor, zcash-devtool, and Zally payments with Zingo
+
+On three independent Regtest chains, each engine paid a Zingo wallet, received a
+payment from a second Zingo wallet, and spent the received funds back. The 18
+rows capture what the payer and recipient could observe for each of the nine
+signed transfers. Both wallets recorded their balances at the ninth block after
+inclusion (ten confirmations). Zingo read back its balance and history offline. [Reproduce and compare the payment roles](payment-roles.md)
+
+| Engine | Evidence and limits |
+|---|---|
+| Vizor | The confirmed outbound and return transactions reported fees of 25,000 and 10,000 zatoshis, matching both proposals. Its Regtest fixture activated NU6.3 at height 2. |
+| zcash-devtool | The Sapling receiver credited the payment and spent it back. Its inbound row retained no memo. Zingo observed the outbound payment pending in this run. Earlier snapshots missed that row. The server returned the release revision and anchor before and after use. All 16 online commands connected only to the selected endpoint. |
+| Zally | The observed balance changes imply fees of 10,000 zatoshis for each engine payment. The wallet API exposes balances on reopen. Its sent history, pending state, and fee accessor remain unexercised. |
+
+On one repeat, Zingo showed the incoming Zally payment before mining. On other
+repeats it first appeared after mining. The settled credit agreed in every run.
+
+## Spending a note received from another wallet
+
+Two independent campaigns each exercised Zkool 6.37.0 with internal addresses enabled and disabled, and Cake Wallet’s 6.5.4 software Zcash engine. Each ran against ordinary Zallet on its own Regtest chain. The engine paid Zallet, swept its funding change, received 6,000,000 zatoshis from Zallet, and spent 3,000,000 from that incoming note. After restart, both wallets retained all four transaction records at their confirmed heights and recovered their balances. Each campaign produced 12 distinct canonical payments. The matrix records 24 observations, one for each payer and recipient on each leg. [Repeat the three-chain campaign](zkool-payment.md)
+
+Both wallets had scanned the block giving each payment ten confirmations before the runner sampled their total and spendable balances. All 24 observations agreed across two independent campaigns. In particular, Zallet reported its full 495,970,000-zatoshi balance as spendable after Cake’s final payment.
+
+The two Zkool configurations paid 2,000 zatoshis per sending transaction. Cake paid 10,000, and Zallet paid 20,000 on its return payment in each case. The node and Zallet observed all four pending transactions in every case. Zkool and Cake exposed each confirmed payment, but their own pending state stayed unobserved during the sampled intervals. The endpoint traces cover Zkool’s online commands and Cake’s engine sessions. The Zallet evidence records its configured native endpoint. These runs used rebuilt engine binaries, with separate digests from the earlier lifecycle clients. Signed mobile applications and hardware signing remain untested.
 
 ## Public Testnet payment
 
@@ -86,3 +111,15 @@ python3 scripts/wallet-clients/coverage.py compare \
 A zero exit means the selected baseline scenarios retained their passing assertions, method observations, field evidence, and recorded payment accounting. Exit 1 identifies a loss or incomparable client or fixture. Exit 2 identifies an invalid input. The comparison does not require identical RPC invocation counts across releases. Omit the prefix to compare the entire baseline. Missing scenarios remain visible, including historical measurements for which a candidate has no equivalent receipt.
 
 Additional instruments can emit `--observations FILE` with `schema_version: 1`, the selected release tag and commit, and `scenarios` using the row format in the JSON baseline. Scope the observation to one action and one interface. Supply the SHA-256 of the raw evidence and a privacy-safe description. A positive count records an observed method, `observed_methods` names the methods monitored throughout a partial trace, and `fields` links a field and handling to a named assertion. A `none` method scope has no attributed calls. The three historical restore samples and three independent probes use this import form.
+
+## Payment recovery observed on Regtest
+
+Zingo CLI and the ordinary Zallet daemon agreed on the payer debit, recipient credit, fees, pending observations, confirmed history, and spendable funds after each interruption. Each case used an independent peer-isolated chain and both wallets signed a payment. The five additional matrix rows describe wallet outcomes. RPC method coverage was not measured for these cases.
+
+| Case | What happened to the original payment | Wallet evidence |
+| --- | --- | --- |
+| Both wallets offline | The node mined it at 262 while Zallet was stopped and Zingo was uninvoked. | Both wallets reopened, caught up, and recorded it once. |
+| Shallow rollback | The node dropped block 262. An empty replacement excluded the payment. The fixture explicitly resubmitted the same signed bytes, which were mined at 263. | Both wallets followed the replacement branch and recorded one debit and credit. |
+| Native route interrupted | The node mined the payment while the private route to Zallet was down. | The same Zallet process reconnected, reconciled the 10,000,000-zatoshi credit and fixture memo, and signed a 4,000,000-zatoshi return. |
+
+The return payment and a later wallet reopen verified spendability and persistence. The tests leave intermediate orphan display, deeper reorganizations, signed mobile apps, and public TLS behavior unexercised. [Recovery commands and evidence comparison](payment-recovery.md)

@@ -13,7 +13,7 @@ use zinder_bench::{
     BenchError,
     canonical_fixture_replay::{
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        replay_canonical_fixture_into_rocksdb,
+        TreeStateCheckpointCoverage, replay_canonical_fixture_into_rocksdb,
     },
     fixture::FixtureManifest,
     report::{
@@ -29,7 +29,7 @@ use zinder_store::{
 };
 
 const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-raw-blob-retention-comparison";
-const REPORT_FORMAT_VERSION: u16 = 2;
+const REPORT_FORMAT_VERSION: u16 = 3;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
@@ -82,6 +82,9 @@ pub(crate) struct RocksDbRawBlobRetentionComparisonArgs {
     /// Aggregate canonical preparation memory watermark.
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Write the JSON report to this fresh path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -127,6 +130,7 @@ struct EffectiveLimits {
     request_timeout_seconds: u64,
     supported_reorg_depth: u32,
     source_segment_delay_millis: u64,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     derived_for_cpu_limit_cores: u32,
     derived_for_memory_limit_bytes: u64,
     pipeline: PipelineLimitSummary,
@@ -273,6 +277,7 @@ struct ValidatedComparisonArgs {
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
     source_segment_delay_millis: u64,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     report: Option<PathBuf>,
 }
 
@@ -347,6 +352,7 @@ async fn run_retention_arm(
         raw_blob_retention,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
+        tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
     })
     .await?;
     let authenticated_replay_lifecycle_seconds = replay_started.elapsed().as_secs_f64();
@@ -377,7 +383,10 @@ async fn run_retention_arm(
         replay_plan_digest_sha256: outcome.replay_plan_digest_sha256.clone(),
         canonical_store_path: canonical_store_path.to_string_lossy().into_owned(),
         secondary_root_path: secondary_root_path.to_string_lossy().into_owned(),
-        effective_limits: EffectiveLimits::from_validated(validated),
+        effective_limits: EffectiveLimits::from_validated(
+            validated,
+            outcome.tree_state_checkpoint_coverage,
+        ),
         logical_replay_identity: LogicalReplayIdentity::from_outcome(&outcome),
         raw_blob_counts: RawBlobCounts::from_outcome(&outcome),
         ready_identity: ReadyIdentity::from(outcome.reopened_ready_evidence),
@@ -410,6 +419,7 @@ impl RocksDbRawBlobRetentionComparisonArgs {
             supported_reorg_depth: limits.supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
             source_segment_delay_millis: self.source_segment_delay_millis,
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
             report: paths.report,
         })
     }
@@ -539,12 +549,16 @@ impl RocksDbRawBlobRetentionComparisonArgs {
 }
 
 impl EffectiveLimits {
-    fn from_validated(validated: &ValidatedComparisonArgs) -> Self {
+    fn from_validated(
+        validated: &ValidatedComparisonArgs,
+        tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    ) -> Self {
         Self {
             workload: CanonicalStoreWorkload::Wallet.as_str(),
             request_timeout_seconds: validated.request_timeout_seconds,
             supported_reorg_depth: validated.supported_reorg_depth,
             source_segment_delay_millis: validated.source_segment_delay_millis,
+            tree_state_checkpoint_coverage,
             derived_for_cpu_limit_cores: CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES,
             derived_for_memory_limit_bytes: CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES,
             pipeline: PipelineLimitSummary::from(validated.pipeline_limits),
@@ -952,10 +966,23 @@ mod tests {
             validated.supported_reorg_depth,
             zinder_store::DEFAULT_REORG_WINDOW_BLOCKS
         );
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
         assert!(!validated.transactions_canonical_store.exists());
         assert!(!validated.transactions_secondary_root.exists());
         assert!(!validated.all_canonical_store.exists());
         assert!(!validated.all_secondary_root.exists());
+
+        let dense = TestCli::try_parse_from(arguments(
+            root.path(),
+            &["--tree-state-checkpoint-coverage", "every-block"],
+        ))?;
+        assert_eq!(
+            dense.comparison.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
         Ok(())
     }
 
@@ -1022,6 +1049,6 @@ mod tests {
             REPORT_CONTRACT_IDENTITY,
             "rocksdb-raw-blob-retention-comparison"
         );
-        assert_eq!(REPORT_FORMAT_VERSION, 2);
+        assert_eq!(REPORT_FORMAT_VERSION, 3);
     }
 }

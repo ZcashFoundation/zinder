@@ -1,16 +1,17 @@
 //! Densifying the tree-state checkpoints of settled history.
 //!
-//! Construction stores a tree-state checkpoint at its history predecessor,
-//! every [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its build tip, so a
-//! read between two of them replays stored compact blocks. Densification fills
-//! a stride, from one stored checkpoint to the next cadence checkpoint, with
-//! the checkpoints a [`TreeStateCheckpointSelection`] picks. It replays the
-//! stride with the per-block step a tree-state reconstruction runs, and
-//! accepts the result only when the replay reproduces every checkpoint already
-//! stored in the stride, including the one that ends it, byte for byte. Each
-//! stride commits in one batch, so a stride is either complete or untouched,
-//! and only settled strides are densified, so no reorg can remove a densified
-//! row.
+//! Sparse construction stores a tree-state checkpoint at its history
+//! predecessor, every [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its
+//! build tip, so a read between two of them replays stored compact blocks;
+//! dense construction stores one for every loaded block directly.
+//! Densification fills any incomplete stride, from one stored checkpoint to
+//! the next cadence checkpoint, with the checkpoints a
+//! [`TreeStateCheckpointSelection`] picks. It replays the stride with the
+//! per-block step a tree-state reconstruction runs, and accepts the result
+//! only when the replay reproduces every checkpoint already stored in the
+//! stride, including the one that ends it, byte for byte. Each stride commits
+//! in one batch, so a stride is either complete or untouched, and only settled
+//! strides are densified, so no reorg can remove a densified row.
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 

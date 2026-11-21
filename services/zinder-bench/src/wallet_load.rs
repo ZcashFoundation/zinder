@@ -171,6 +171,15 @@ pub(crate) enum WalletWorkload {
     PointReads,
 }
 
+impl WalletWorkload {
+    const fn report_format_version(self) -> u16 {
+        match self {
+            Self::PointReads => 2,
+            Self::ClassicSdk | Self::Slipstream | Self::Vizor => 1,
+        }
+    }
+}
+
 /// Report and optional output path produced by one load run.
 pub(crate) struct LightwalletdWalletLoadOutput {
     pub(crate) report: LightwalletdWalletLoadReport,
@@ -779,7 +788,7 @@ impl LightwalletdWalletLoadReport {
         };
         Self {
             contract_identity: "lightwalletd-wallet-load",
-            report_format_version: 1,
+            report_format_version: args.workload.report_format_version(),
             workload: args.workload,
             endpoint: args.endpoint.clone(),
             target_label: args.target_label.clone(),
@@ -1097,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_reads_separate_stored_checkpoints_from_replays() -> TestResult {
+    async fn point_reads_report_requested_heights_by_cadence() -> TestResult {
         let server = CompatServer::start().await?;
         let mut args = server.args(WalletWorkload::PointReads, 1);
         args.rounds = 2;
@@ -1109,14 +1118,13 @@ mod tests {
         // The probe adds one GetLightdInfo and one GetLatestBlock.
         assert_eq!(status(&report, "GetLightdInfo", "ok")?, 3);
         assert_eq!(status(&report, "GetLatestBlock", "ok")?, 3);
-        // Below the tip of 250, the checkpoint at 100 and the height 99,
-        // which replays from the checkpoint at 0.
-        assert_eq!(count(&report, "/parameters/stored_checkpoint_height")?, 100);
-        assert_eq!(count(&report, "/parameters/replay_height")?, 99);
+        assert_eq!(count(&report, "/report_format_version")?, 2);
+        assert_eq!(count(&report, "/parameters/on_cadence_height")?, 100);
+        assert_eq!(count(&report, "/parameters/off_cadence_height")?, 99);
         assert_eq!(
-            status(&report, "GetTreeState(stored checkpoint)", "ok")?
-                + status(&report, "GetTreeState(replay)", "ok")?
-                + status(&report, "GetTreeState(replay)", "unavailable")?,
+            status(&report, "GetTreeState(on cadence)", "ok")?
+                + status(&report, "GetTreeState(off cadence)", "ok")?
+                + status(&report, "GetTreeState(off cadence)", "unavailable")?,
             4
         );
         // An address with no history streams nothing, successfully.
@@ -1205,6 +1213,30 @@ mod tests {
         );
         assert_eq!(count(&failed, "/wallets_completed")?, 1);
         assert_eq!(count(&failed, "/rpcs/GetLatestBlock/requests")?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_tip_hashes_fail_the_probe_and_preserve_completed_wallets() -> TestResult {
+        let mock = mock_streamer::serve(MockStreamer {
+            tip_height: CHAIN_TIP,
+            subsequent_tip: Some(Ok(vec![0xab; 33])),
+            ..MockStreamer::new(RangeEnding::Clean)
+        })
+        .await?;
+        let args = || mock_args(&mock.url, WalletWorkload::ClassicSdk, 1);
+
+        let report = report_json(args()).await?;
+        let reason = "invalid_block_hash: block hash exceeds 32 bytes (received 33)";
+        assert_eq!(report["tip_after"]["error"], reason);
+        assert!(report["tip_after"].get("hash_hex").is_none());
+        assert_eq!(count(&report, "/wallets_completed")?, 1);
+
+        let error = report_json(args())
+            .await
+            .err()
+            .ok_or("opening probe accepted an oversized hash")?;
+        assert!(error.to_string().contains(reason), "{error}");
         Ok(())
     }
 
@@ -1797,6 +1829,25 @@ mod tests {
             );
         }
         assert_eq!(observed["sapling"]["returned_with_zero_max"], 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subtree_observation_rejects_an_oversized_metadata_hash() -> TestResult {
+        let mut streamer = subtree_roots_streamer(None);
+        streamer.block_hash = Some(vec![0xab; 33]);
+        let observed = subtree_roots_observation(streamer).await?;
+
+        assert_eq!(observed["chain_metadata_block"], Value::Null);
+        assert_eq!(
+            observed["chain_metadata_error"],
+            "invalid_block_hash: block hash exceeds 32 bytes (received 33)"
+        );
+        assert_eq!(observed["chain_metadata_block_is_tip"], false);
+        assert_eq!(
+            observed["sapling"]["completed_subtrees_at_tip"],
+            Value::Null
+        );
         Ok(())
     }
 

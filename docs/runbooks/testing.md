@@ -1597,4 +1597,8 @@ python3 scripts/wallet-clients/coverage.py render "$evidence/coverage.json" > "$
 
 ## Verify a two-wallet payment and return
 
-Use the [Zingo and Zallet round-trip procedure](../../scripts/wallet-clients/roundtrip.md) to verify a transfer through lightwalletd and native WalletQuery on the same chain. The disposable Regtest case controls mining and compares outcomes across independent runs. The live Testnet case can fund one payer through Fauzec and observe the payment through the selected release. Keep its private wallet state for interruption recovery.
+For Vizor, zcash-devtool, and Zally, the [counterparty payment procedure](../../scripts/wallet-clients/payment-roles.md) checks the engine and Zingo in both payment roles, the return spend, and persisted balances. It also shows how to compare the eighteen role observations against a release baseline.
+
+Use the [Zingo and Zallet round-trip procedure](../../scripts/wallet-clients/roundtrip.md) to verify a transfer through lightwalletd and native WalletQuery on the same chain. The disposable Regtest case controls mining and compares outcomes across independent runs. The live Testnet case can fund one payer through Fauzec and observe the payment through the selected release. Keep its private wallet state for interruption recovery. The [payment recovery cases](../../scripts/wallet-clients/payment-recovery.md) exercise a stopped wallet, a shallow rollback, and a running native wallet reconnecting to its endpoint.
+
+For Zkool’s internal-enabled and external-only profiles and Cake Wallet’s software Zcash engine, run the [two-party payment campaign](../../scripts/wallet-clients/zkool-payment.md). Each profile uses its own NU6.3-at-250 chain and verifies a spend from a note received from Zallet.

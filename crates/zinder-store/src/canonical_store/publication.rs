@@ -21,8 +21,8 @@ use super::{
     RocksDbCanonicalStore,
     block_load::{
         CanonicalBlockLoadEvidence, CanonicalTrustedFreshBlockEvidence,
-        read_persisted_tip_metadata, validate_persisted_commitment_tree_families,
-        validate_source_tip_checkpoint,
+        TreeStateCheckpointCoverage, read_persisted_tip_metadata,
+        validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
     },
     block_replay::{
         PersistedBlockReplayValidation, validate_persisted_block_replays_with_checkpoints,
@@ -114,6 +114,7 @@ struct PublicationContext {
     workload: super::CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     block_evidence: CanonicalBlockLoadEvidence,
     trusted_fresh_block_evidence: CanonicalTrustedFreshBlockEvidence,
     staged_ssts: Vec<super::block_load::CanonicalStagedSstEvidence>,
@@ -214,6 +215,7 @@ impl PublicationContext {
             workload: builder.workload,
             build_plan: builder.build_plan.clone(),
             cursor_auth_key: builder.cursor_auth_key,
+            tree_state_checkpoint_coverage: builder.tree_state_checkpoint_coverage,
             block_evidence,
             trusted_fresh_block_evidence,
             staged_ssts,
@@ -295,6 +297,7 @@ impl PublicationContext {
             &bounded_open.db,
             self.workload,
             &self.build_plan,
+            self.tree_state_checkpoint_coverage,
             &self.block_evidence,
         )?;
         validate_cold_evidence_matches_writer(
@@ -1331,10 +1334,15 @@ fn validate_reopened_identity_and_control(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "cold publication validates each source-derived family in one ordered readback path"
+)]
 fn validate_cold_block_families(
     db: &DB,
     workload: super::CanonicalStoreWorkload,
     build_plan: &super::CanonicalStoreBuildPlan,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     expected: &CanonicalBlockLoadEvidence,
 ) -> Result<ColdCanonicalBlockValidation, CanonicalStoreError> {
     let retained_checkpoint_count =
@@ -1344,7 +1352,13 @@ fn validate_cold_block_families(
     if !replay.evidence.has_same_sequence(expected) {
         return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
     }
-    validate_persisted_commitment_tree_families(db, workload, build_plan, expected)?;
+    validate_persisted_commitment_tree_families(
+        db,
+        workload,
+        build_plan,
+        tree_state_checkpoint_coverage,
+        expected,
+    )?;
     let expected_families = [
         (
             BLOCK_HEADER_COLUMN_FAMILY,

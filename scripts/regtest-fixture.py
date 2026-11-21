@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Own a disposable single-host Regtest Compose project and its readiness receipt."""
 import argparse
+from contextlib import suppress
 import hashlib
 import ipaddress
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import signal
 import shutil
 import socket
@@ -21,10 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 NODE_IMAGE = 'docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba'
 SERVICES = {'ingest': 5, 'projector': 10, 'query': 6, 'compat-lightwalletd': 7}
 OFFSETS = [2, 5, 6, 7, 10, 32, 67]
+RELAY_DOCKER_TIMEOUT = 10
+RELAY_STOP_GRACE = 5
 
 
-def run(*args, env=None):
-    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, env=env).strip()
+def run(*args, env=None, timeout=None):
+    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, env=env, timeout=timeout).strip()
 
 
 def digest(path):
@@ -80,30 +84,50 @@ def verify_owner(state):
                 raise RuntimeError('project name is owned by a different fixture instance')
 
 
-def stop_relay(state):
+def stop_relay(directory, state):
     pid = state.get('relay_pid')
     if not pid:
         return
-    proc = Path('/proc') / str(pid)
+    expected = [os.fsencode(directory / 'relay.json'), state['owner'].encode()]
     try:
-        arguments = (proc / 'cmdline').read_bytes().split(b'\0')
-        if state['owner'].encode() in arguments:
-            os.kill(pid, signal.SIGTERM)
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                wait(lambda: not proc.exists() or (proc / 'stat').read_text().split()[2] == 'Z',
-                     bool, 5)
-    except FileNotFoundError:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        proc = Path('/proc') / str(pid)
+        argv = (proc / 'cmdline').read_bytes().rstrip(b'\0').split(b'\0')
+        if (proc.stat().st_uid != os.geteuid() or len(argv) != 4 or
+                os.path.basename(argv[1]) != b'regtest-fixture-relay.py' or argv[2:] != expected):
+            return
+        exited = select.poll()
+        exited.register(fd, select.POLLIN)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            signal.pidfd_send_signal(fd, sig)
+            if exited.poll(int(RELAY_STOP_GRACE * 1000)):
+                return
+        raise RuntimeError('owned fixture relay failed to exit')
+    except (FileNotFoundError, ProcessLookupError):
         pass
+    finally:
+        os.close(fd)
+        with suppress(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
 
 
 def start_relay(directory, state, serving=False):
-    stop_relay(state)
+    stop_relay(directory, state)
+
     def address(service):
-        identifier = compose(directory, 'ps', '-q', service)
-        container = json.loads(run('docker', 'container', 'inspect', identifier))[0]
+        identifiers = run('docker', 'ps', '-q', '--no-trunc',
+                          '--filter', 'label=com.docker.compose.project=' + state['project'],
+                          '--filter', 'label=com.docker.compose.service=' + service,
+                          '--filter', 'label=io.zinder.fixture.owner=' + state['owner'],
+                          timeout=RELAY_DOCKER_TIMEOUT).splitlines()
+        if len(identifiers) != 1:
+            raise RuntimeError('expected one running owned container for ' + service)
+        container = json.loads(run('docker', 'container', 'inspect', identifiers[0], timeout=RELAY_DOCKER_TIMEOUT))[0]
         return container['NetworkSettings']['Networks'][state['project'] + '_node']['IPAddress']
+
     targets = [[state['port_base'] + 32, address('node'), 39232]]
     if serving:
         host = address('zinder-ingest')
@@ -114,9 +138,16 @@ def start_relay(directory, state, serving=False):
         relay = subprocess.Popen([sys.executable, str(ROOT / 'scripts/regtest-fixture-relay.py'),
                                   str(directory / 'relay.json'), state['owner']],
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    state['relay_pid'] = relay.pid
-    write(directory / 'state.json', state)
-    wait(lambda: rpc(state, 'getblockcount', []), lambda h: isinstance(h, int), 60)
+    try:
+        state['relay_pid'] = relay.pid
+        write(directory / 'state.json', state)
+        wait(lambda: rpc(state, 'getblockcount', []), lambda h: isinstance(h, int), 60)
+        if relay.poll() is not None:
+            raise RuntimeError('owned fixture relay exited during startup')
+    except BaseException:
+        relay.kill()
+        relay.wait(timeout=RELAY_STOP_GRACE)
+        raise
 
 
 def fixture_subnets(pool):
@@ -315,7 +346,7 @@ def provision(args, directory):
             pass
         (directory / 'ready.json').unlink(missing_ok=True)
         verify_owner(state)
-        stop_relay(state)
+        stop_relay(directory, state)
         compose(directory, 'down', '-v', '--remove-orphans')
         raise
 
@@ -355,7 +386,7 @@ def main():
             raise ValueError('project ownership mismatch')
         verify_owner(state)
         if args.action == 'down':
-            stop_relay(state)
+            stop_relay(directory, state)
             compose(directory, 'down', '-v', '--remove-orphans')
             (directory / 'ready.json').unlink(missing_ok=True)
         else:

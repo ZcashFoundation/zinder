@@ -334,6 +334,7 @@ struct IngestSection {
 #[serde(default, deny_unknown_fields)]
 struct IngestTreeStateDensificationSection {
     enabled: Option<bool>,
+    during_construction: Option<bool>,
     selection: Option<TreeStateSelectionName>,
     commitment_budget: Option<u32>,
     workers: Option<u32>,
@@ -755,6 +756,9 @@ fn resolve_tree_state_densification(
     };
     Ok(TreeStateDensificationConfig {
         enabled: section.enabled.unwrap_or(defaults.enabled),
+        during_construction: section
+            .during_construction
+            .unwrap_or(defaults.during_construction),
         selection,
         workers: nonzero(
             section.workers,
@@ -1073,6 +1077,7 @@ mod tests {
             defaults,
             Ok(TreeStateDensificationConfig {
                 enabled: true,
+                during_construction: false,
                 selection: zinder_store::TreeStateCheckpointSelection::EveryBlock,
                 workers,
                 max_blocks_per_second,

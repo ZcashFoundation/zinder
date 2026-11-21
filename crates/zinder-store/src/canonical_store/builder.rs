@@ -13,8 +13,8 @@ use super::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, CanonicalStagedSstEvidence,
         CanonicalTrustedFreshBlockEvidence, REVERSE_INDEX_SORT_MEMORY_BYTES,
-        canonical_block_families_are_empty, ingest_canonical_block_ssts,
-        validate_source_tip_checkpoint, write_canonical_block_ssts,
+        TreeStateCheckpointCoverage, canonical_block_families_are_empty,
+        ingest_canonical_block_ssts, validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
     rocksdb::{
         canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
@@ -37,6 +37,7 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) network: Network,
     pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: CanonicalStoreBuildPlan,
+    pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
     pub(super) canonical_block_staged_ssts: Option<Vec<CanonicalStagedSstEvidence>>,
     pub(super) trusted_fresh_block_evidence: Option<CanonicalTrustedFreshBlockEvidence>,
@@ -90,6 +91,7 @@ impl RocksDbCanonicalBuilder {
             network,
             workload,
             build_plan,
+            tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::CadenceAndTip,
             canonical_block_evidence: None,
             canonical_block_staged_ssts: None,
             trusted_fresh_block_evidence: None,
@@ -152,6 +154,26 @@ impl RocksDbCanonicalBuilder {
         &self.build_plan
     }
 
+    /// Requires and stores a tree-state checkpoint for every loaded block
+    /// instead of only on the global cadence and at the build tip.
+    pub fn with_every_block_tree_state_checkpoints(mut self) -> Result<Self, CanonicalStoreError> {
+        if self.canonical_block_evidence.is_some() {
+            return Err(CanonicalStoreError::BlockLoadAlreadyLoaded);
+        }
+        self.tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::EveryBlock;
+        Ok(self)
+    }
+
+    /// Returns whether this fresh build requires and stores a tree-state
+    /// checkpoint for every loaded block.
+    #[must_use]
+    pub const fn stores_every_block_tree_state_checkpoints(&self) -> bool {
+        matches!(
+            self.tree_state_checkpoint_coverage,
+            TreeStateCheckpointCoverage::EveryBlock
+        )
+    }
+
     /// Bulk-loads every source-derived canonical block family.
     ///
     /// All seven families are completely staged before any column family is
@@ -211,6 +233,7 @@ impl RocksDbCanonicalBuilder {
                 workload: self.workload,
                 build_plan: &self.build_plan,
                 network_upgrade_activations,
+                tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
                 sst_target_logical_bytes,
                 reverse_index_sort_memory_bytes,
             },
@@ -543,6 +566,180 @@ mod tests {
         assert_eq!(evidence.block_blob_count, 0);
         assert_eq!(evidence.tip_metadata, ChainTipMetadata::new(0, 0, 0));
         assert_eq!(evidence.tree_state_checkpoint_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn every_block_tree_state_checkpoints_stages_and_cold_validates_each_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = testnet_activations()?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?
+        .with_every_block_tree_state_checkpoints()?;
+        let mut blocks = chain_with_checkpoints(BlockHeight::new(2), |_| {})?;
+        for block in blocks.iter_mut().flatten() {
+            add_tree_state_checkpoint(block)?;
+        }
+
+        let evidence = store.bulk_load_blocks(&activations, blocks)?;
+        assert!(store.stores_every_block_tree_state_checkpoints());
+        assert_eq!(evidence.tree_state_checkpoint_count, 3);
+        store.load_subtree_roots(std::iter::empty())?;
+        store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            2,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(2))?,
+        ))?;
+
+        store.prepare_cold_certified_publication()?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_block_tree_state_checkpoints_preserves_checkpointed_history_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = testnet_activations()?;
+        let predecessor = zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(37), BlockHash::from_bytes([37; 32])),
+            37,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(37))?,
+        );
+        let build_plan = CanonicalStoreBuildPlan::checkpointed(
+            &activations,
+            predecessor,
+            BlockId::new(BlockHeight::new(40), BlockHash::from_bytes([40; 32])),
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?
+        .with_every_block_tree_state_checkpoints()?;
+        let mut blocks = Vec::new();
+        for height in 38_u32..=40 {
+            let block_byte = u8::try_from(height)?;
+            let parent_byte = u8::try_from(height - 1)?;
+            let mut block = canonical_build_block(
+                BlockHeight::new(height),
+                [block_byte; 32],
+                [parent_byte; 32],
+            );
+            add_tree_state_checkpoint(&mut block)?;
+            blocks.push(Ok::<_, std::io::Error>(block));
+        }
+
+        let evidence = store.bulk_load_blocks(&activations, blocks)?;
+        assert_eq!(evidence.tree_state_checkpoint_count, 4);
+        store.load_subtree_roots(std::iter::empty())?;
+        store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(40), BlockHash::from_bytes([40; 32])),
+            40,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(40))?,
+        ))?;
+
+        store.prepare_cold_certified_publication()?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_block_tree_state_checkpoints_rejects_a_missing_input_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = testnet_activations()?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?
+        .with_every_block_tree_state_checkpoints()?;
+        let blocks = chain_with_checkpoints(BlockHeight::new(2), |_| {})?;
+
+        let error = store
+            .bulk_load_blocks(&activations, blocks)
+            .err()
+            .ok_or("every-block construction must reject a missing checkpoint")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { ref reason })
+                if reason.contains("missing its required tree-state checkpoint")
+        ));
+        assert!(canonical_block_families_are_empty(&store.bounded_open.db)?);
+        Ok(())
+    }
+
+    #[test]
+    fn every_block_tree_state_checkpoints_cold_readback_rejects_a_missing_persisted_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = testnet_activations()?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            complete_build_plan()?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?
+        .with_every_block_tree_state_checkpoints()?;
+        let mut blocks = chain_with_checkpoints(BlockHeight::new(2), |_| {})?;
+        for block in blocks.iter_mut().flatten() {
+            add_tree_state_checkpoint(block)?;
+        }
+        store.bulk_load_blocks(&activations, blocks)?;
+        store.load_subtree_roots(std::iter::empty())?;
+        store.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            2,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(2))?,
+        ))?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::super::rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+            .ok_or("tree-state checkpoint family must exist")?;
+        let first_height_key = super::super::block_load::encode_block_position(BlockHeight::new(1));
+        store.bounded_open.db.delete_cf(&family, first_height_key)?;
+        drop(family);
+
+        let error = store
+            .prepare_cold_certified_publication()
+            .err()
+            .ok_or("cold readback must reject a missing dense checkpoint")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
+                if reason.contains("gap 2 exceeds 1 blocks")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_block_tree_state_checkpoints_cannot_be_enabled_after_block_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let mut store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
+        let blocks = chain_with_checkpoints(BlockHeight::new(2), |_| {})?;
+        store.bulk_load_blocks(&testnet_activations()?, blocks)?;
+
+        let error = store
+            .with_every_block_tree_state_checkpoints()
+            .err()
+            .ok_or("enabling every-block checkpoints after bulk_load_blocks must fail")?;
+        assert!(matches!(error, CanonicalStoreError::BlockLoadAlreadyLoaded));
         Ok(())
     }
 

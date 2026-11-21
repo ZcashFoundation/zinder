@@ -42,7 +42,8 @@ use zinder_runtime::{
     ComposedReadiness, ConfigError, OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError,
     Readiness, ReadinessInput, ReadinessState, RuntimeService, StartupPhase,
     TracingSubscriberError, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    host_cpu_meets_pasta_backend_baseline, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
@@ -186,6 +187,10 @@ async fn main() -> ExitCode {
     }
 
     if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+
+    if !host_cpu_meets_pasta_backend_baseline() {
         return ExitCode::FAILURE;
     }
 
@@ -591,8 +596,10 @@ fn spawn_canonical_control_tasks(
 
 /// Control tasks for a writer no other process reaches.
 ///
-/// Tree-state densification commits through the writer's command queue, which
-/// exists only with a control listener, so it does not run here.
+/// The background tree-state densification pass commits through the writer's
+/// command queue, which exists only with a control listener, so it does not
+/// run here. Fresh construction still writes per-block checkpoints directly
+/// when every-block construction is explicitly enabled.
 fn control_tasks_without_listener(densification_enabled: bool) -> CanonicalControlTasks {
     if densification_enabled {
         tracing::info!(
@@ -1244,6 +1251,9 @@ fn canonical_writer_config(
             .checkpoint_height,
         raw_blob_retention: command_config.runtime_config.raw_blob_policy.to_retention(),
         reorg_window_blocks: command_config.runtime_config.reorg_window_blocks,
+        every_block_tree_state_checkpoints: command_config
+            .tree_state_densification
+            .stores_checkpoints_during_construction(),
         follow: CanonicalFollowConfig {
             request_timeout: command_config.runtime_config.longest_node_request_timeout(),
             poll_interval: command_config.runtime_config.follow.poll_interval,
@@ -1285,6 +1295,7 @@ fn log_canonical_writer_start(
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
         raw_blob_retention = %writer_config.raw_blob_retention,
         reorg_window_blocks = writer_config.reorg_window_blocks,
+        every_block_tree_state_checkpoints = writer_config.every_block_tree_state_checkpoints,
         checkpoint_height = ?writer_config.checkpoint_height.map(BlockHeight::value),
         target_height = ?writer_config.follow.target_height.map(BlockHeight::value),
         historical_prevout_reads = 0_u64,
@@ -1876,6 +1887,83 @@ source = "zebra-json-rpc"
             writer_config.construction.request_timeout,
             Duration::from_secs(30)
         );
+        assert!(!writer_config.every_block_tree_state_checkpoints);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_densification_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            ("", false),
+            (
+                "[ingest.tree_state_densification]\nenabled = true\nselection = \"every-block\"\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\n",
+                true,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\nenabled = false\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nenabled = false\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nenabled = false\nselection = \"every-block\"\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\nselection = \"commitment-budget\"\n",
+                false,
+            ),
+            (
+                "[ingest.tree_state_densification]\ncommitment_budget = 512\n",
+                false,
+            ),
+        ];
+        for (section, expected) in cases {
+            let temporary = tempdir()?;
+            let config_path = temporary.path().join("zinder-ingest.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"[network]
+name = "zcash-regtest"
+
+[node]
+json_rpc_addr = "http://127.0.0.1:39232"
+
+[storage]
+path = "{}"
+
+[ingest]
+source = "zebra-json-rpc"
+
+{section}"#,
+                    temporary.path().join("store").display()
+                ),
+            )?;
+            let command_config = super::config::load_ingest_config(
+                Some(config_path),
+                super::IngestConfigOverrides::default(),
+            )?;
+            let writer_config = super::canonical_writer_config(
+                &command_config,
+                Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            );
+            assert_eq!(
+                writer_config.every_block_tree_state_checkpoints, expected,
+                "unexpected construction checkpoint setting for section:\n{section}"
+            );
+        }
         Ok(())
     }
 

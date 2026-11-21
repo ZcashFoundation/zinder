@@ -91,6 +91,24 @@ containers. It derives source and preparation concurrency from the envelope and
 `ZINDER_NODE_MAX_RESPONSE_BYTES`. The CPU limit is a quota, not a reservation:
 Zebra shares the Docker engine and is not measured.
 
+Canonical construction uses `cadence-and-tip` tree-state checkpoint coverage by
+default, matching fresh ingest defaults. Set
+`ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=every-block` to
+measure dense construction before READY. Report format
+version 5 records the chosen coverage in
+`resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
+in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
+`cold-certified`), and cross-checks coverage against
+`canonical_storage_ready.tree_state_checkpoint_count`.
+
+The default run publishes from the fresh writer's authenticated construction
+evidence, as ingest does. For a separate run that measures a full prepublication
+scan, set `ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE=cold-certified`.
+The report records this choice in `resource_limits.canonical_publication_mode`.
+For `trusted-fresh`, preparation counts toward `canonical_ready_publication_seconds`
+and `canonical_cold_validation_seconds` is zero. Both modes reopen the published
+store before the canonical storage-ready timer stops.
+
 ## State and cleanup
 
 Before each run, the runner checks the rendered Compose model. It refuses an
@@ -116,9 +134,14 @@ independent of the Rust code and pins the exact report shape and contract
 versions. It rejects the evidence unless:
 
 - the store schema, replay, digest, and report versions match the values it
-  pins;
-- canonical `READY` covers heights 1 through the fixed tip and survives a cold
-  reopen;
+  pins (report format version 5 for current evidence, with a separate exact
+  version 4 branch for archived reports when no version 5 expectation is
+  passed);
+- canonical `READY` covers heights 1 through the fixed tip, persists the exact
+  tree-state checkpoint count required by
+  `resource_limits.tree_state_checkpoint_coverage` (and records zero
+  `canonical_cold_validation_seconds` under `trusted-fresh` publication in
+  version 5), and survives a cold reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,
   and transaction count, and both stores pass the final cold admission;
 - wallet row counts, projection digest, UTXO commitment, and undo depth are

@@ -36,6 +36,12 @@ ARG RUST_IMAGE_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798
 ARG DEBIAN_IMAGE_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG DISTROLESS_IMAGE_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG ZINDER_BINARIES_SOURCE=zinder-binaries
+# Opt-in Pasta assembly backend. Set to 1 to build the runtime binaries with
+# `--features pasta_curves/asm`, which selects the x86-64 (BMI2 + ADX) or
+# AArch64 assembly field arithmetic. The default 0 keeps the portable backend
+# so the shipped images run on every x86-64-v3 and AArch64 host. Any other
+# value fails the build instead of silently producing a portable binary.
+ARG ZINDER_PASTA_ASM=0
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
 
@@ -90,13 +96,19 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
+ARG ZINDER_PASTA_ASM=0
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
     rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    && case "${ZINDER_PASTA_ASM}" in \
+        0|1) ;; \
+        *) printf '%s\n' "ZINDER_PASTA_ASM must be 0 or 1, got '${ZINDER_PASTA_ASM}'" >&2; exit 1 ;; \
+    esac \
+    && pasta_asm_flag="$(if [ "${ZINDER_PASTA_ASM}" = "1" ]; then printf '%s' '--features pasta_curves/asm'; else printf '%s' ''; fi)" \
     && rustup target add "$rust_target" \
-    && cargo auditable build --locked --release --target "$rust_target" \
+    && cargo auditable build --locked --release --target "$rust_target" $pasta_asm_flag \
         --bin zinder-ingest \
         --bin zinder-projector \
         --bin zinder-query \
