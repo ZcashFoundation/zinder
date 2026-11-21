@@ -1,0 +1,6 @@
+kind: added
+body: Single-host wallet operators can publish signed shielded history as settlement advances. The Compose publisher keeps its signing key private, resumes from a durable checkpoint, and supports key rotation while the wallet endpoint is serving.
+time: 2026-11-21T22:32:48.786707571Z
+custom:
+    Bump: minor
+    PR: "461"
