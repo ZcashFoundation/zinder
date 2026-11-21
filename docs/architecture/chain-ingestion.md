@@ -182,10 +182,10 @@ construction checkpoint coverage and the background densification pass:
 - Setting `enabled = false` keeps fresh construction sparse (every 100 blocks
   and at the build tip) and disables the background pass.
 
-The wallet-only default is a draft candidate. Before it can merge,
-[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md) requires measured
-time to READY and disk growth from full Mainnet fresh construction. The
-checkpoint rows alone are estimated at 2.4 GB before compression.
+Writing dense checkpoints moves work onto the construction path before READY.
+The checkpoint rows alone are estimated at 2.4 GB before compression on
+Mainnet. [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md)
+defines the construction-time and disk-growth requirements.
 
 Live following already stores one checkpoint per block. Once ingest follows
 the tip, and Explorer views have caught up when they are enabled, the
