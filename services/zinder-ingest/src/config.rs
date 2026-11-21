@@ -633,8 +633,11 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         checkpoint_staging_root: ingest_control_checkpoint_staging_root,
     } = resolve_ingest_control_writer(config.ingest_control)?;
     let retention = resolve_retention(config.retention)?;
-    let tree_state_densification =
-        resolve_tree_state_densification(config.ingest.tree_state_densification)?;
+    let mut densification = config.ingest.tree_state_densification;
+    if coverage == IngestCoverage::WalletServing && !explorer_views {
+        densification.during_construction.get_or_insert(true);
+    }
+    let tree_state_densification = resolve_tree_state_densification(densification)?;
     let tree_state_verification =
         resolve_tree_state_verification(config.ingest.tree_state_verification)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
@@ -969,6 +972,7 @@ struct IngestTreeStateVerificationToml {
 #[derive(Serialize)]
 struct IngestTreeStateDensificationToml {
     enabled: bool,
+    during_construction: bool,
     selection: TreeStateSelectionName,
     #[serde(skip_serializing_if = "Option::is_none")]
     commitment_budget: Option<u32>,
@@ -988,6 +992,7 @@ impl IngestTreeStateDensificationToml {
         };
         Self {
             enabled: config.enabled,
+            during_construction: config.during_construction,
             selection,
             commitment_budget,
             workers: config.workers.get(),

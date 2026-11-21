@@ -63,14 +63,12 @@ them in order. For a JSON-RPC `getblock` batch, each requested ID must appear
 once in the reply. A short reply or a repeated ID causes ingest to report
 `SourceProtocolMismatch` for the batch before assigning any reply to a height.
 
-Ingest rebuilds the note commitment trees from the blocks and stores
-tree-state checkpoints every 100 blocks and at the build tip by default.
-To store one at each height before publication, enable
-`ingest.tree_state_densification.during_construction` with the enabled
-`every-block` selection. The loader
-refuses a checkpoint that does not carry a frontier for exactly the pools the
-node's activation table makes active at its height, including a pool whose
-tree is still empty.
+Ingest rebuilds the note commitment trees from the blocks. It stores tree-state
+checkpoints at the heights selected by the
+[construction checkpoint policy](#tree-state-densification), including the
+build tip. The loader refuses a checkpoint that does not carry a frontier for
+exactly the pools the node's activation table makes active at its height,
+including a pool whose tree is still empty.
 
 Before publishing, construction compares its derived tree state at the build
 tip, and every subtree root the loaded blocks complete, with the node's. A
@@ -163,17 +161,18 @@ commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
 The `[ingest.tree_state_densification]` settings control both initial
 construction checkpoint coverage and the background densification pass:
 
-- The default, `enabled = true`, `selection = "every-block"`, and
-  `during_construction = false`, keeps the first sync sparse. Once ingest
-  follows the tip, the background pass fills missing checkpoints in settled
-  strides. A full Mainnet backfill is estimated at 4 to 5 CPU-hours.
-- To serve every constructed height through the build tip directly at READY,
-  including the final partial stride, set `during_construction = true` before
-  the first sync with the enabled `every-block` selection. Ingest then
-  cross-checks and stores each frontier on the serial loader. Completed
-  strides already satisfy the background pass, avoiding a second replay of
-  their commitments. Full Mainnet time to READY and disk growth await
-  qualification. The rows are estimated at about 2.4 GB before compression.
+- With `wallet-serving` coverage and Explorer views off, fresh construction
+  defaults to a checkpoint for every block through the build tip. The loader
+  cross-checks and stores each frontier before READY. Reads at every constructed
+  height can then use a stored checkpoint, including in the final partial
+  stride. Completed strides already satisfy the background pass.
+- With Explorer views on or `explicit` coverage, construction defaults to one
+  checkpoint every 100 blocks and at the build tip. Set
+  `during_construction = true` before the first sync to opt into every-block
+  writes with densification enabled and `selection = "every-block"`.
+  For the same sparse construction in a wallet-only deployment, set
+  `during_construction = false`. The background pass then fills missing
+  settled checkpoints. A full Mainnet backfill is estimated at 4 to 5 CPU-hours.
 - `commitment-budget` keeps fresh construction sparse (every 100 blocks and at
   the build tip), and the background pass stores one each time
   `commitment_budget` note commitments (1,024 by default) have accumulated
@@ -182,6 +181,11 @@ construction checkpoint coverage and the background densification pass:
   Setting `commitment_budget` without a `selection` chooses it.
 - Setting `enabled = false` keeps fresh construction sparse (every 100 blocks
   and at the build tip) and disables the background pass.
+
+The wallet-only default is a draft candidate. Before it can merge,
+[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md) requires measured
+time to READY and disk growth from full Mainnet fresh construction. The
+checkpoint rows alone are estimated at 2.4 GB before compression.
 
 Live following already stores one checkpoint per block. Once ingest follows
 the tip, and Explorer views have caught up when they are enabled, the

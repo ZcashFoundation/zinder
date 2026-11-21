@@ -1894,44 +1894,24 @@ source = "zebra-json-rpc"
     #[test]
     fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_densification_config()
     -> Result<(), Box<dyn std::error::Error>> {
-        let cases = [
-            ("", false),
+        let temporary = tempdir()?;
+        let config_path = temporary.path().join("zinder-ingest.toml");
+        for (policy, explicit, wallet) in [
+            ("", false, true),
+            ("enabled = true\nselection = \"every-block\"", false, true),
+            ("during_construction = false", false, false),
+            ("during_construction = true", true, true),
+            ("during_construction = true\nenabled = false", false, false),
             (
-                "[ingest.tree_state_densification]\nenabled = true\nselection = \"every-block\"\n",
+                "during_construction = true\nselection = \"commitment-budget\"",
+                false,
                 false,
             ),
-            (
-                "[ingest.tree_state_densification]\nduring_construction = true\n",
-                true,
-            ),
-            (
-                "[ingest.tree_state_densification]\nduring_construction = true\nenabled = false\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nenabled = false\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nenabled = false\nselection = \"every-block\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nselection = \"commitment-budget\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\ncommitment_budget = 512\n",
-                false,
-            ),
-        ];
-        for (section, expected) in cases {
-            let temporary = tempdir()?;
-            let config_path = temporary.path().join("zinder-ingest.toml");
+            ("enabled = false", false, false),
+            ("enabled = false\nselection = \"every-block\"", false, false),
+            ("selection = \"commitment-budget\"", false, false),
+            ("commitment_budget = 512", false, false),
+        ] {
             fs::write(
                 &config_path,
                 format!(
@@ -1941,28 +1921,27 @@ name = "zcash-regtest"
 [node]
 json_rpc_addr = "http://127.0.0.1:39232"
 
-[storage]
-path = "{}"
-
-[ingest]
-source = "zebra-json-rpc"
-
-{section}"#,
-                    temporary.path().join("store").display()
+[ingest.tree_state_densification]
+{policy}"#
                 ),
             )?;
-            let command_config = super::config::load_ingest_config(
-                Some(config_path),
-                super::IngestConfigOverrides::default(),
-            )?;
-            let writer_config = super::canonical_writer_config(
-                &command_config,
-                Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
-            );
-            assert_eq!(
-                writer_config.every_block_tree_state_checkpoints, expected,
-                "unexpected construction checkpoint setting for section:\n{section}"
-            );
+            for (wallet_serving, expected) in [(false, explicit), (true, wallet)] {
+                let command_config = super::config::load_ingest_config(
+                    Some(config_path.clone()),
+                    super::IngestConfigOverrides {
+                        wallet_serving: Some(wallet_serving),
+                        ..Default::default()
+                    },
+                )?;
+                let writer = super::canonical_writer_config(
+                    &command_config,
+                    Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+                );
+                assert_eq!(
+                    writer.every_block_tree_state_checkpoints, expected,
+                    "wallet_serving={wallet_serving}, policy={policy:?}"
+                );
+            }
         }
         Ok(())
     }

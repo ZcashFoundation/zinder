@@ -9,7 +9,7 @@ The "Stored in" column names where the data lives. `zinder-ingest` writes the ca
 | Block identity, headers, and best-chain hash index | Canonical | `WalletQuery` tips and `BlockIdBySelector`; lightwalletd `GetLatestBlock`, `GetBlock`; `ExplorerQuery.BlockDetail` | `BlockHeaderBySelector` is not advertised |
 | Compact blocks | Canonical | `WalletQuery.CompactBlock`, `CompactBlocksInRange`; lightwalletd `GetBlock`, `GetBlockRange`, nullifier variants | Built at commit, never on request |
 | Full serialized blocks | Canonical | `WalletQuery.FullBlock`, `FullBlocksInRange` | Only when `storage.raw_blob_policy = "all"` |
-| Tree states (Sapling, Orchard, Ironwood) | Canonical | `WalletQuery.TreeStateAtHeight`, `LatestTreeStateCheckpoint`; lightwalletd `GetTreeState`, `GetLatestTreeState` | Checkpoints every 100 blocks and at every followed block; other heights rebuilt from compact blocks |
+| Tree states (Sapling, Orchard, Ironwood) | Canonical | `WalletQuery.TreeStateAtHeight`, `LatestTreeStateCheckpoint`; lightwalletd `GetTreeState`, `GetLatestTreeState` | Historical checkpoints follow the [construction and backfill policy](../architecture/chain-ingestion.md#tree-state-densification). Live following stores one per block. Other heights replay compact blocks. |
 | Shielded subtree roots | Canonical | `WalletQuery.SubtreeRoots`; lightwalletd `GetSubtreeRoots` | |
 | Note commitment tree roots per block | Materialized views | None | `ExplorerQuery.CommitmentRootSearch` is not advertised and always fails |
 | Network-upgrade schedule | Canonical, from the node | `WalletQuery.NetworkUpgradeActivations`; lightwalletd `GetLightdInfo`; `ExplorerQuery.NetworkUpgradeStatus` | |
