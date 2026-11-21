@@ -3829,7 +3829,33 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
 }
 
 #[tokio::test]
-async fn tree_state_requires_sapling_only_on_the_compatibility_surface() -> eyre::Result<()> {
+async fn tree_state_matches_go_for_height_zero_and_the_genesis_hash() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+    let missing = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId::default()))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("unspecified block identifier was accepted"))?;
+    assert_eq!(missing.code(), Code::InvalidArgument);
+    let genesis = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 0,
+            hash: encode_rpc_block_hash_bytes(Network::ZcashRegtest.genesis_hash()).to_vec(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("genesis has no Sapling frontier"))?;
+    assert_eq!(genesis.code(), Code::InvalidArgument);
+    assert_eq!(
+        genesis.message(),
+        "GetTreeState: z_gettreestate did not return treestate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_matches_go_at_the_sapling_activation_boundary() -> eyre::Result<()> {
     let mut upgrades = sample_regtest_upgrade_activations().activations().to_vec();
     for upgrade in &mut upgrades {
         upgrade.activation_height = BlockHeight::new(upgrade.activation_height.value().max(2));

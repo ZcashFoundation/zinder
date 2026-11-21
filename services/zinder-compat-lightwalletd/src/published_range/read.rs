@@ -22,6 +22,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct PublishedRangeRead {
     history: Arc<PublishedShieldedCatalog>,
+    limits: crate::block_range::BlockRangeStreamLimit,
     shape: CompactBlockShape,
     is_descending: bool,
 }
@@ -74,9 +75,11 @@ impl PublishedRangeRead {
         history: Arc<PublishedShieldedCatalog>,
         shape: CompactBlockShape,
         is_descending: bool,
+        limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
         Self {
             history,
+            limits,
             shape,
             is_descending,
         }
@@ -94,16 +97,18 @@ impl PublishedRangeRead {
             HeightOrder::Ascending => chunk.start,
             HeightOrder::Descending => chunk.end,
         };
-        let mut spans = vec![catalog];
-        if let Some(live) = tail.bounds() {
-            if catalog.end.next().is_some_and(|next| next >= live.start) {
-                spans[0].end = catalog.end.max(live.end);
-            } else {
-                spans.push(live);
-            }
-        }
+        let spans = match tail.bounds() {
+            Some(live) if catalog.end.next().is_some_and(|next| next >= live.start) => [
+                Some(BlockHeightRange::inclusive(
+                    catalog.start,
+                    catalog.end.max(live.end),
+                )),
+                None,
+            ],
+            live => [Some(catalog), live],
+        };
         let mut span = chunk;
-        for covered in spans {
+        for covered in spans.into_iter().flatten() {
             if (covered.start..=covered.end).contains(&start) {
                 span.start = span.start.max(covered.start);
                 span.end = span.end.min(covered.end);
@@ -210,6 +215,10 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Block = ReadBlock;
     type Message = Bytes;
 
+    async fn read_permit(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Status> {
+        self.limits.published_read_permit().await.map(Some)
+    }
+
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {
         if self.is_descending {
             blocks.reverse();
@@ -235,6 +244,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
     {
+        read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
             return native_chunk(reads, read, convert).await;
         }

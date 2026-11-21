@@ -712,7 +712,8 @@ impl compact_tx_streamer_server::CompactTxStreamer
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let reader = self.query_api.slot.capture();
-        let height = match requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)? {
+        let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
+        let height = match super::tree_state_selector(block, reader.network()) {
             RequestedBlock::Height(height) => height,
             RequestedBlock::Hash(hash) => match reader
                 .block_hash_lookup(hash)

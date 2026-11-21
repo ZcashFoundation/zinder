@@ -635,6 +635,15 @@ where
     }
 }
 
+fn tree_state_selector(block: RequestedBlock, network: zinder_core::Network) -> RequestedBlock {
+    match block {
+        RequestedBlock::Hash(hash) if hash == network.genesis_hash() => {
+            RequestedBlock::Height(BlockHeight::new(0))
+        }
+        RequestedBlock::Height(_) | RequestedBlock::Hash(_) => block,
+    }
+}
+
 fn tree_state_block_lookup_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::BlockNotInBestChain) {
         return Status::invalid_argument("block hash is not in the best chain");
@@ -1054,9 +1063,13 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
         let view = self.query_api.capture_view().await?;
-        let height = resolve_block_height(&self.query_api, &view, block)
-            .await
-            .map_err(|error| tree_state_block_lookup_status(&error))?;
+        let height = resolve_block_height(
+            &self.query_api,
+            &view,
+            tree_state_selector(block, view.network),
+        )
+        .await
+        .map_err(|error| tree_state_block_lookup_status(&error))?;
         reject_future_tree_state_height(height, view.visible_tip_height)?;
         let tree_state = self
             .query_api

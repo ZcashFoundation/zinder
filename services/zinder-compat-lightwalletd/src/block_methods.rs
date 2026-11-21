@@ -356,7 +356,12 @@ impl BlockMethods {
         let (range, is_descending) = block_range_from_request(request)?;
         let slot = self.block_range_streams.open().await?;
         let shape = CompactBlockShape::for_range(&request.pool_types)?;
-        let source = crate::published_range::PublishedRangeRead::new(history, shape, is_descending);
+        let source = crate::published_range::PublishedRangeRead::new(
+            history,
+            shape,
+            is_descending,
+            self.block_range_streams.clone(),
+        );
         stream_range(reads, range, is_descending, slot, source).await
     }
 
@@ -400,18 +405,24 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     stream_slot: crate::block_range::BlockRangeStreamSlot,
     conversion: Source,
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
+    let read_permit = conversion.read_permit().await?;
     let view = reads.capture_view().await?;
     reject_future_block_height(
         block_range.end,
         Reads::view_chain_epoch(&view).visible_tip_height,
     )?;
+    let first_read = read_first_chunk(
+        reads.clone(),
+        view,
+        BlockRangeChunks::new(block_range, is_descending),
+        conversion.clone(),
+    );
     let (first_messages, later_chunks) = stream_slot
-        .hold_during(read_first_chunk(
-            reads.clone(),
-            view,
-            BlockRangeChunks::new(block_range, is_descending),
-            conversion.clone(),
-        ))
+        .hold_during(async move {
+            let outcome = first_read.await;
+            drop(read_permit);
+            outcome
+        })
         .await?;
     let Some((chunks, continuity)) = later_chunks else {
         return Ok(stream_slot.hold_for(first_messages));
@@ -594,6 +605,13 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     type Block: RangeBlock + Send + 'static;
     type Message: Send + 'static;
 
+    fn read_permit(
+        &self,
+    ) -> impl Future<Output = Result<Option<tokio::sync::OwnedSemaphorePermit>, Status>> + Send
+    {
+        std::future::ready(Ok(None))
+    }
+
     fn messages(&self, blocks: Vec<Self::Block>) -> Result<ChunkMessages<Self::Message>, Status>;
 
     fn read<Output, Convert>(
@@ -767,6 +785,14 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
         else {
             return;
         };
+        let read_permit = tokio::select! {
+            biased;
+            () = sink.closed() => return,
+            admission = conversion.read_permit() => match admission {
+                Ok(permit) => permit,
+                Err(status) => { room.fill(vec![Err(status)]); return; }
+            }
+        };
         let mut outcome =
             read_later_chunk(&reads, chunk, chunks, continuity, conversion.clone()).await;
         if let Err(status) = &outcome
@@ -783,6 +809,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
             )
             .await;
         }
+        drop(read_permit);
         match outcome {
             Ok((next_chunks, next_continuity, messages)) => {
                 chunks = next_chunks;

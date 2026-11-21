@@ -1003,3 +1003,154 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
     }
     Ok(())
 }
+
+fn dense_history() -> eyre::Result<ChainFixture> {
+    let mut chain = ChainFixture::new(NETWORK)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(40);
+    for number in 2_u8..=40 {
+        let block = fixture_block(&chain, BlockHeight::new(u32::from(number)))?;
+        let txid = TransactionId::from_bytes([number; 32]);
+        let mut rows = FixtureTransactionRows::from_raw_transaction(
+            txid,
+            block.height,
+            block.hash,
+            0,
+            [number],
+        );
+        rows.facts.public_facts.counts.sapling_spend_count = 2048;
+        let compact = CompactBlockArtifact::new(
+            BlockId::new(block.height, block.hash),
+            block.parent_hash,
+            block.block_time_seconds,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: txid,
+                data: CompactTransactionData {
+                    sapling_spends: vec![
+                        CompactSaplingSpend {
+                            nullifier: [number; 32]
+                        };
+                        2048
+                    ],
+                    ..Default::default()
+                },
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?;
+        chain = chain
+            .with_transaction_rows(rows)
+            .with_compact_block_artifact(compact);
+    }
+    Ok(chain)
+}
+
+async fn paced_clients(
+    client: &CompactTxStreamerClient<Channel>,
+    expected: &Arc<Vec<Vec<u8>>>,
+    count: usize,
+    cancellations: bool,
+) -> eyre::Result<usize> {
+    use prost::Message as _;
+    let opened = Arc::new(tokio::sync::Barrier::new(count));
+    let mut clients = tokio::task::JoinSet::new();
+    for index in 0..count {
+        let mut client = client.clone();
+        let expected = expected.clone();
+        let opened = opened.clone();
+        clients.spawn(async move {
+            let descending = index % 2 == 1;
+            let (first, last) = if descending { (40, 1) } else { (1, 40) };
+            let mut stream = client
+                .get_block_range(block_range_request(first, last))
+                .await?
+                .into_inner();
+            opened.wait().await;
+            for n in 0..expected.len() {
+                let offset = if descending {
+                    expected.len() - n - 1
+                } else {
+                    n
+                };
+                let block = stream
+                    .message()
+                    .await?
+                    .ok_or_else(|| eyre!("early end of dense stream"))?;
+                eyre::ensure!(
+                    block.encode_to_vec() == expected[offset],
+                    "incorrect dense block at {offset}"
+                );
+                if cancellations && index % 4 == 0 && n == 3 {
+                    return Ok(false);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            eyre::ensure!(stream.message().await?.is_none(), "extra dense block");
+            Ok::<_, eyre::Report>(true)
+        });
+    }
+    let mut completed = 0;
+    while let Some(joined) = clients.join_next().await {
+        completed += usize::from(joined??);
+    }
+    Ok(completed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paced_dense_ranges_complete_and_cancelled_readers_release_capacity() -> eyre::Result<()> {
+    use prost::Message;
+    use std::time::Duration;
+    let files = tempfile::tempdir()?;
+    let chain = dense_history()?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let reader = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+    let catalog = reader.publish(&files.path().join("catalog"), 40).await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(reader.query.clone()).into_server()),
+    )
+    .await?;
+    let expected = Arc::new(
+        stock
+            .blocks(block_range_request(1, 40))
+            .await?
+            .iter()
+            .map(Message::encode_to_vec)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        expected.iter().map(Vec::len).sum::<usize>()
+            > zinder_compat_lightwalletd::BLOCK_RANGE_CHUNK_MAX_BYTES
+    );
+    let published = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(reader.query)
+                .with_published_shielded_history(catalog)
+                .with_max_concurrent_block_range_streams(32_u32.try_into()?)
+                .with_block_range_admission_wait(Duration::ZERO)
+                .into_server(),
+        ),
+    )
+    .await?;
+    for (count, cancel, completed) in [
+        (1, false, 1),
+        (16, false, 16),
+        (32, true, 24),
+        (32, false, 32),
+    ] {
+        let actual = tokio::time::timeout(
+            Duration::from_secs(45),
+            paced_clients(&published.client, &expected, count, cancel),
+        )
+        .await??;
+        assert_eq!(actual, completed);
+    }
+    Ok(())
+}
