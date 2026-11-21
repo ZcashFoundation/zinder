@@ -1,0 +1,6 @@
+kind: added
+body: Wallet operators can serve settled shielded block ranges from a signed history catalog and require Linux fs-verity for segment reads. Wallet clients use the same lightwalletd endpoint.
+time: 2026-11-21T16:39:46.184906727Z
+custom:
+    Bump: minor
+    PR: "450"
