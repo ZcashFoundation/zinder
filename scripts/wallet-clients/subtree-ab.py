@@ -23,11 +23,20 @@ from subtree_proxy import READ_METHODS, RawReader, serve
 HERE = Path(__file__).resolve().parent
 TRACE = HERE.parent / "trace-wallet-endpoint.py"
 FIXTURE = HERE / "subtree-testnet.json"
+FIXTURE_FIELDS = ("network", "tip", "tip_hash", "birthday", "sapling_roots", "cli_revision",
+                  "cli_sha256", "expected_outputs", "expected_confirmed_zat", "history_sha256",
+                  "ztreamer_witness", "expected_spendable_zat")
 
 
 def check(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def sanitized_fixture(fixture):
+    """Return only the public fixture fields, so private additions never leave the run."""
+    check(isinstance(fixture, dict) and set(fixture) == set(FIXTURE_FIELDS), "unexpected fixture fields")
+    return {key: fixture[key] for key in FIXTURE_FIELDS}
 
 
 def sha(raw):
@@ -256,15 +265,20 @@ def main():
     url = urlsplit(args.endpoint)
     check(url.scheme == "http" and url.hostname == "127.0.0.1" and url.port and url.path in ("", "/") and not url.username and not url.password and not url.query and not url.fragment, "require loopback http endpoint")
     check(re.fullmatch(r"[a-f0-9]{40}", args.release_commit), "expected full source revision")
-    fixture = json.loads(args.fixture.read_bytes())
+    fixture_bytes = args.fixture.read_bytes()
+    fixture = json.loads(fixture_bytes)
     cli = str(args.client.resolve())
-    inputs = [Path(cli), args.fixture, HERE / "subtree-ab.py", HERE / "subtree_proxy.py",
+    inputs = [Path(cli), HERE / "subtree-ab.py", HERE / "subtree_proxy.py",
               TRACE, HERE.parent / "run-zkool-restore.py", Path(pb.__file__), Path(service_pb2_grpc.__file__)]
     pins = {p: sha(p.read_bytes()) for p in inputs}
+    pins[args.fixture] = sha(fixture_bytes)
     check(pins[Path(cli)] == fixture["cli_sha256"], "wallet binary mismatch")
     os.umask(0o077)
     output = args.output.resolve()
     output.mkdir(mode=0o700)
+    preserved = output / "fixture.json"
+    preserved.write_text(json.dumps(sanitized_fixture(fixture), indent=2, sort_keys=True) + "\n")
+    preserved_sha256 = sha(preserved.read_bytes())
     env = dict(os.environ)
     env.pop("ZINGO_SEED", None)
     with grpc.insecure_channel(url.netloc) as channel:
@@ -288,7 +302,9 @@ def main():
             server.stop(0).wait()
             save(output / "wallet-rpcs.json", experiment.events)
     check(all(sha(p.read_bytes()) == pin for p, pin in pins.items()), "source or fixture changed during experiment")
-    save(output / "summary.json", {"schema": 1, "server": identity, "fixture_sha256": pins[args.fixture],
+    check(sha(preserved.read_bytes()) == preserved_sha256, "preserved fixture changed during experiment")
+    save(output / "summary.json", {"schema": 1, "server": identity, "fixture_sha256": preserved_sha256,
+         "selected_fixture_sha256": pins[args.fixture],
          "wallet": {"revision": fixture["cli_revision"], "sha256": fixture["cli_sha256"]}, "arms": arms,
          "primary_wire_comparison": matched, "negative_control": negative, "observed_methods": sorted(READ_METHODS),
          "distinct_wallet_files": len(databases),

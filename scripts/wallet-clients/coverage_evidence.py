@@ -1,6 +1,7 @@
 """Read private experiment receipts and emit privacy-safe action and method observations."""
 import hashlib
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -19,20 +20,31 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def subtree_fixture(directory, report):
+    """Prefer the fixture preserved with the run, and accept the pinned default for older runs."""
+    preserved = directory / "fixture.json"
+    path = preserved if preserved.is_file() else Path(__file__).with_name("subtree-testnet.json")
+    raw = path.read_bytes()
+    require(report["fixture_sha256"] == hashlib.sha256(raw).hexdigest(), "subtree release or frozen fixture mismatch")
+    return json.loads(raw)
+
+
 def subtree_actions(directory, release):
     path = directory / "summary.json"
     report = load(path)
     trace = load(directory / "wallet-rpcs.json")
-    fixture_path = Path(__file__).with_name("subtree-testnet.json")
-    fixture = load(fixture_path)
+    fixture = subtree_fixture(directory, report)
     server = report["server"]
-    require(report["schema"] == 1 and report["fixture_sha256"] == digest(fixture_path)
+    require(report["schema"] == 1
             and server["commit"] == release["commit"] and server["version"] == release["tag"][1:]
             and server["height"] == fixture["tip"] and server["hash"] == fixture["tip_hash"]
             and server["network"] == fixture["network"], "subtree release or frozen fixture mismatch")
     require(report["wallet"] == {"sha256": fixture["cli_sha256"], "revision": fixture["cli_revision"]},
             "subtree wallet identity mismatch")
-    common = dict(wallet="zingo", version="8.0.0", variant="nakednet-cli", implementation="engine",
+    revision = fixture["cli_revision"]
+    require(re.fullmatch(r"[0-9a-f]{40}", revision), "subtree wallet source revision missing")
+    version = "8.0.0" if revision == "81d799775f11e882896e8710e8af12d6d4d29a41" else f"source {revision[:12]}"
+    common = dict(wallet="zingo", version=version, variant="nakednet-cli", implementation="engine",
                   interface="lightwalletd", network="testnet", client_sha256=fixture["cli_sha256"],
                   fixture=f"Testnet birthday {fixture['birthday']} through {fixture['tip']}/{fixture['tip_hash']}",
                   method_scope="partial", status="pass",
@@ -197,6 +209,12 @@ def native_expiry_actions(path, release):
             result["case"] == "zallet-bounded-scan-expiry" and result["interface"] == "native-wallet-query" and
             fixture["release_revision"] == release["commit"] and fixture["release_version"] == release["tag"][1:] and
             fixture["raw_blob_policy"] == "all", "native expiry did not pass on selected all-retention release")
+    require(re.fullmatch(r"[0-9a-f]{64}", client["driver_sha256"]) and
+            re.fullmatch(r"[0-9a-f]{64}", client["backend_sha256"]),
+            "native expiry requires driver and ordinary backend digests")
+    identity = dict(wallet="zallet", version="ZIT pinned driver", implementation="engine",
+                    variant=f"{client['driver_feature']} driver {client['driver_sha256']}",
+                    client_sha256=client["backend_sha256"])
     first, retry = result["attempts"]
     require(first["chain_epoch_id"] != retry["chain_epoch_id"] and
             first["requested_start_height_inclusive"] == retry["requested_start_height_inclusive"] and
@@ -219,8 +237,7 @@ def native_expiry_actions(path, release):
                 require(passed is True, f"missing native expiry check {key}")
                 assertions[key.replace("_", "-")] = "pass"
             assertions["typed-expired-view-error"] = "pass"
-        yield dict(id=f"zallet-bounded-{phase}", wallet="zallet", version="ZIT pinned driver", implementation="engine",
-                   variant=client["driver_feature"], client_sha256=client["driver_sha256"], interface=result["interface"],
+        yield dict(id=f"zallet-bounded-{phase}", **identity, interface=result["interface"],
                    network=fixture["network"], fixture=f"disposable native all-retention at height {fixture['anchor_height']}",
                    action=phase.replace("-", " ").capitalize() + " during bounded native scan", status="pass",
                    method_scope="partial", methods=methods, assertions=assertions,
