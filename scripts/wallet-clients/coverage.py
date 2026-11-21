@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from coverage_payment_recovery import recovery_actions
 from coverage_roundtrip import roundtrip_actions
 from coverage_evidence import digest, interrupted_actions, load, native_expiry_actions, reorg_actions, require, subtree_actions
 
@@ -300,6 +301,8 @@ def main():
     collect.add_argument("--roundtrip-pair", nargs=2, type=Path, metavar=("FIRST", "SECOND"),
                          help="receipts from two independent signed Regtest round trips")
     collect.add_argument("--roundtrip-audit", type=Path, help="optional independent canonical audit of that pair")
+    collect.add_argument("--recovery-result", type=Path, action="append", default=[], metavar="RECEIPT",
+                         help="one stopped-wallet, shallow rollback, or live native reconnect receipt (repeatable)")
     collect.add_argument("--native-expiry-result", type=Path, help="private native-expiry.py receipt.json")
     collect.add_argument("--reorg-result", type=Path, help="private reorg-zkool.py receipt.json")
     collect.add_argument("--output", type=Path, required=True)
@@ -322,6 +325,8 @@ def main():
         require(not args.roundtrip_audit or args.roundtrip_pair, "roundtrip canonical audit requires paired receipts")
         if args.roundtrip_pair:
             rows.extend(roundtrip_actions(args.roundtrip_pair, release, args.roundtrip_audit))
+        for path in args.recovery_result:
+            rows.extend(recovery_actions(path, release))
         if args.native_expiry_result:
             rows.extend(native_expiry_actions(args.native_expiry_result, release))
         if args.reorg_result:

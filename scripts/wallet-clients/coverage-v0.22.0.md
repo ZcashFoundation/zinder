@@ -1,6 +1,6 @@
 # Wallet correctness coverage for v0.22.0
 
-Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 35 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
+Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 40 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
 
 ## What the funded lifecycle established
 
@@ -86,3 +86,15 @@ python3 scripts/wallet-clients/coverage.py compare \
 A zero exit means the selected baseline scenarios retained their passing assertions, method observations, field evidence, and recorded payment accounting. Exit 1 identifies a loss or incomparable client or fixture. Exit 2 identifies an invalid input. The comparison does not require identical RPC invocation counts across releases. Omit the prefix to compare the entire baseline. Missing scenarios remain visible, including historical measurements for which a candidate has no equivalent receipt.
 
 Additional instruments can emit `--observations FILE` with `schema_version: 1`, the selected release tag and commit, and `scenarios` using the row format in the JSON baseline. Scope the observation to one action and one interface. Supply the SHA-256 of the raw evidence and a privacy-safe description. A positive count records an observed method, `observed_methods` names the methods monitored throughout a partial trace, and `fields` links a field and handling to a named assertion. A `none` method scope has no attributed calls. The three historical restore samples and three independent probes use this import form.
+
+## Payment recovery observed on Regtest
+
+Zingo CLI and the ordinary Zallet daemon agreed on the payer debit, recipient credit, fees, pending observations, confirmed history, and spendable funds after each interruption. Each case used an independent peer-isolated chain and both wallets signed a payment. The five additional matrix rows describe wallet outcomes. RPC method coverage was not measured for these cases.
+
+| Case | What happened to the original payment | Wallet evidence |
+| --- | --- | --- |
+| Both wallets offline | The node mined it at 262 while Zallet was stopped and Zingo was uninvoked. | Both wallets reopened, caught up, and recorded it once. |
+| Shallow rollback | The node dropped block 262. An empty replacement excluded the payment. The fixture explicitly resubmitted the same signed bytes, which were mined at 263. | Both wallets followed the replacement branch and recorded one debit and credit. |
+| Native route interrupted | The node mined the payment while the private route to Zallet was down. | The same Zallet process reconnected, reconciled the 10,000,000-zatoshi credit and fixture memo, and signed a 4,000,000-zatoshi return. |
+
+The return payment and a later wallet reopen verified spendability and persistence. The tests leave intermediate orphan display, deeper reorganizations, signed mobile apps, and public TLS behavior unexercised. [Recovery commands and evidence comparison](payment-recovery.md)
