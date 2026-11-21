@@ -8,6 +8,8 @@ For Android and iOS app builds, follow the [signed wallet qualification procedur
 
 For other engines, use the [Vizor build and replay](vizor.md), [Cake build and replay](cake-regtest.md), or [zcash-devtool build and replay](../../docs/runbooks/testing.md#gate-a-real-wallet-lifecycle).
 
+The [two-party payment campaign](zkool-payment.md) exercises Zkool in both address modes and Cake Wallet’s Zcash engine. Each signs payments against ordinary Zallet, receives a shielded payment, spends the new note, and reopens both ledgers.
+
 ## Prerequisites
 
 To exercise Vizor, zcash-devtool, or Zally as both payer and recipient against Zingo, follow the [counterparty payment procedure](payment-roles.md).

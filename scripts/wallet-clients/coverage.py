@@ -329,6 +329,8 @@ def main():
     collect.add_argument("--reorg-result", type=Path, help="private reorg-zkool.py receipt.json")
     collect.add_argument("--counterparty-result", type=Path, action="append", default=[], metavar="RECEIPT",
                          help="payer and payee observations from a completed payment-roles.py run")
+    collect.add_argument("--zkool-cake-result", type=Path,
+                         help="private Zkool and Cake payment campaign summary.json")
     collect.add_argument("--output", type=Path, required=True)
     check = commands.add_parser("check", help="validate a matrix and compare its inventory to its tagged protocols")
     check.add_argument("matrix", nargs="?", type=Path, default=BASELINE)
@@ -359,6 +361,9 @@ def main():
             from coverage_counterparty_roles import counterparty_actions
             for receipt in args.counterparty_result:
                 rows.extend(counterparty_actions(receipt, release, allow_provisional=False))
+        if args.zkool_cake_result:
+            from coverage_zkool_payments import actions as payment_actions
+            rows.extend(payment_actions(args.zkool_cake_result, release))
         for path in args.observations:
             part = load(path)
             require(part["schema_version"] == 1 and part["release"] == release,

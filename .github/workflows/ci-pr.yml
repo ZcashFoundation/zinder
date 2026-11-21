@@ -249,6 +249,8 @@ jobs:
           python3 -B scripts/wallet-clients/test-payment-roles.py
           python3 -B scripts/wallet-clients/test-zally-payment.py
           python3 -B scripts/wallet-clients/test-devtool-endpoint-identity.py
+          python3 -B scripts/wallet-clients/test-zkool-payment-matrix.py
+          python3 -B scripts/wallet-clients/test-coverage-zkool-payments.py
           python3 -B scripts/wallet-clients/test-coverage-evidence.py
           python3 -B scripts/wallet-clients/payment-recovery-test.py
           python3 -B scripts/wallet-clients/transport-payment-test.py
