@@ -1,0 +1,6 @@
+kind: added
+body: Release operators can compare a candidate archive against the established wallet payment baseline on two isolated Regtest chains.
+time: 2026-11-21T15:09:48.172504064Z
+custom:
+    Bump: patch
+    PR: "445"
