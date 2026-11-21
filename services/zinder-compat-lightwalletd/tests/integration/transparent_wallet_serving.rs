@@ -1976,3 +1976,37 @@ impl CanonicalReader for InstrumentedCanonicalReader {
             .await
     }
 }
+
+#[tokio::test]
+async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() -> eyre::Result<()> {
+    use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
+
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(4);
+    let mut store =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let (secondary, _) = store.take_readers()?;
+    let reader = InstrumentedCanonicalReader::new(secondary)?;
+    let directory = tempfile::tempdir()?;
+    let (private, public) = crate::common::shielded_catalog_keys(directory.path())?;
+    let mut publisher = ShieldedCatalogPublisher::open(
+        directory.path(),
+        &private,
+        BlockHeight::new(1),
+        NonZeroU32::MIN,
+    )?;
+    assert!(publisher.publish_next(&reader.canonical_reader)?);
+    let history = PublishedShieldedHistory::open(
+        &directory.path().join("current.json"),
+        &public,
+        false,
+        &reader,
+    )
+    .await?;
+    assert!(history.refresh_tail(&reader).await.is_err());
+    assert!(publisher.publish_next(&reader.canonical_reader)?);
+    assert!(history.refresh(&reader).await?);
+    assert!(history.refresh_tail(&reader).await.is_err());
+    Ok(())
+}

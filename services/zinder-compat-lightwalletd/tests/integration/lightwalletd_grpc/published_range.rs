@@ -1,3 +1,5 @@
+mod admission;
+
 use super::{
     EpochPinRecorder, assert_one_linked_chain, assert_stream_ended_with, block_range_request,
     drain_slowly, fixture_block,
