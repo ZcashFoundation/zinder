@@ -180,7 +180,9 @@ The command opens a temporary canonical secondary, publishes complete segments t
 
 One publisher holds the directory lock. On restart it reclaims its temporary files, `.publisher-write.tmp` and `.publisher-segment.tmp`, and verifies the existing segments and links before appending. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
 
-Install the raw 32-byte Ed25519 public key on the reader through a trusted channel. Copy the referenced `segment-*.bin` files to the reader before atomically installing their signed `current.json`. The reader process needs read access to these files. Enable the catalog in the listener's configuration:
+Single-host Compose points `compat.shielded_history.directory` at the publisher's read-only catalog and mounts its raw 32-byte Ed25519 public key separately. The reader authenticates the signed publisher checkpoint before binding. An empty checkpoint lets it serve canonical ranges until the first catalog arrives. A populated checkpoint requires a signed catalog containing that prefix. The listener adopts the first verified catalog and later extensions on the same wallet connection.
+
+For a separately distributed snapshot, install the public key through a trusted channel. Copy the referenced `segment-*.bin` files to the reader before atomically installing their signed `current.json`. Select the existing snapshot by its manifest:
 
 ```toml
 [compat.shielded_history]
@@ -193,7 +195,7 @@ Segments start with the 52-byte `ZSHRNG02` header and end with one 112-byte inde
 
 For a portable segment, admission streams the exact file once and compares the signed SHA-256 before using the index. It checks the index against the streamed framing, payload hashes, and block links. With a matching kernel-measured digest and signed fs-verity pin, admission reads only the header and index. Both paths check the terminal block against the canonical settled chain and retain the admitted file descriptor.
 
-A running reader checks for changes at the secondary catch-up interval. It reuses the verified prefix and admits new segments only after their files and chain anchor validate. A rejected update leaves the previous catalog active and is retried. A restarted reader accepts any correctly signed catalog that matches its retained settled chain. An older valid catalog gives it less coverage. Restart the listener to change the trusted key.
+A running reader checks for changes at the secondary catch-up interval. It reuses the verified prefix and admits new segments only after their files and chain anchor validate. A rejected update leaves the previous catalog active and is retried. A restarted snapshot reader accepts any correctly signed catalog that matches its retained settled chain. An older valid snapshot gives it less coverage. A reader following the publisher additionally checks the signed checkpoint in the same directory. Restart the listener to change the trusted key.
 
 By default, each read of an ordinary file checks the selected payloads against the digests captured during admission. To require kernel-verified reads, use a verity-enabled ext4, F2FS, or Btrfs filesystem on Linux. Run `fsverity enable --hash-alg sha256 --block-size 4096` on each destination segment before publishing the manifest, then set `require_fs_verity = true`. A regular copy loses the verity attribute. The reader uses `FS_IOC_MEASURE_VERITY` on the serving descriptor and compares the digest with the signed `fs_verity_sha256` field. Strict mode requires both kernel protection and this pin. An unprotected segment fails strict admission. A payload digest mismatch or a protected page read failure ends the affected covered stream with `DATA_LOSS`. [Linux fs-verity](https://docs.kernel.org/filesystems/fsverity.html)
 

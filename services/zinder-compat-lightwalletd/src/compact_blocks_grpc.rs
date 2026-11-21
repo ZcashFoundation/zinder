@@ -335,7 +335,7 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         let range = self
             .published_history
             .as_ref()
-            .map(|history| history.catalog())
+            .and_then(|history| history.catalog())
             .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
         self.block_methods
             .published_block_range(&self.slot, &request.into_inner(), range)
@@ -349,6 +349,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         self.published_history
             .as_ref()
+            .filter(|history| history.has_catalog())
             .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
     }
 

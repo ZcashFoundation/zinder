@@ -11,9 +11,9 @@ exact release tag, and read each release's notes before you upgrade.
 ## What you deploy
 
 Zinder reads the chain from your Zcash node, stores it once, and serves it to
-wallets and applications. A deployment is four processes on one host
-filesystem, plus an optional fifth. `zinder-ingest` is the only process that
-writes the chain store, and `zinder-projector` is the only one that writes the
+wallets and applications. The single-host Compose deployment also runs a
+publisher that signs settled shielded ranges for the lightwalletd endpoint.
+`zinder-ingest` is the only process that writes the chain store, and `zinder-projector` is the only one that writes the
 wallet store. Native query and lightwalletd compatibility read both stores.
 The optional Explorer reads the chain store and the Explorer views that ingest
 writes, and it gets wallet data through native query. The
@@ -24,6 +24,7 @@ together.
 | --- | --- | --- | --- |
 | `zinder-ingest` | Nothing to clients. Reads the node and writes the chain store. | none | 9105 |
 | `zinder-projector` | Nothing to clients. Builds the wallet store. | none | 9110 |
+| `zinder-history-publisher` | Writes signed shielded ranges for lightwalletd. | none | none |
 | `zinder-query` | Native `WalletQuery` gRPC | 9102 | 9106 |
 | `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC | 9067 | 9107 |
 | `zinder-explorer` (optional) | `ExplorerQuery` gRPC | 9068 | 9069 |
@@ -61,7 +62,10 @@ its own disk on top of the figures below.
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
-ceilings, not measured use. Give the single-volume container at least 8 GB.
+ceilings. Actual usage varies. The publisher has its own container with the same memory limit as
+the compatibility reader. Reserve additional disk for signed history.
+Full Mainnet catalog size, startup I/O, memory, and file descriptor usage remain
+unmeasured. Give the single-volume container at least 8 GB.
 The release binaries need an x86-64-v3 or AArch64 CPU. CPU use is not
 measured.
 
@@ -106,7 +110,7 @@ build has been timed on the current release.
 | --- | --- | --- |
 | Docker Compose beside a node | You want to try Zinder, or run it on a host that already runs your node in Docker. | [Quickstart](#quickstart-with-docker-compose) below |
 | Docker Compose under systemd on a VM | You run a long-lived service on a VM you manage. This is the complete topology. | [Deploying on a VM](deploying-on-a-vm.md) |
-| Single-volume container | Your platform attaches one volume to one container, such as Railway. It runs the same four processes in one container and serves both native `WalletQuery` and lightwalletd. | [Deploying the single-volume container](deploying-single-volume.md) |
+| Single-volume container | Your platform attaches one volume to one container, such as Railway. It runs ingest, the projector, and both wallet readers in one container and serves native `WalletQuery` and lightwalletd. | [Deploying the single-volume container](deploying-single-volume.md) |
 
 ## Quickstart with Docker Compose
 
@@ -138,9 +142,9 @@ images from source instead, see [Build from source](#build-from-source).
    git checkout vX.Y.Z
    ```
 
-3. Create the two control tokens that the Zinder processes use to talk to
-   each other. `deploy/.env.testnet` expects them in
-   `/etc/zinder/control-secrets`, readable by the container group, GID 10001:
+3. Create the two control tokens and the publisher key on the host. The
+   Testnet env file uses the paths below. Keep the key and its catalog on
+   durable storage.
 
    ```bash
    sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
@@ -148,6 +152,8 @@ images from source instead, see [Build from source](#build-from-source).
    openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
    sudo chown root:10001 /etc/zinder/control-secrets/*.token
    sudo chmod 0440 /etc/zinder/control-secrets/*.token
+   sudo install -d -m 0700 /srv/zinder-history/testnet
+   sudo scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
    ```
 
 4. Pull the release images for the tag you checked out, and start Zinder:
@@ -167,8 +173,12 @@ images from source instead, see [Build from source](#build-from-source).
    images from source and label the result as the release.
 
    Compose starts ingest first. It starts the projector only once ingest is
-   healthy, and the two readers only once the projector is healthy, so on a
-   first sync the command keeps waiting while the stores are built.
+   healthy. The publisher also starts at that point. The two wallet readers
+   start once the projector is healthy. A new generation serves canonical
+   ranges after the reader verifies the publisher's empty checkpoint. The
+   listener automatically adopts signed ranges as they become available.
+   See [Publish signed wallet history](deploying-on-a-vm.md#publish-signed-wallet-history)
+   for backup, key rotation, and recovery.
    [Initial sync](initial-sync.md) describes each phase.
 
 5. Check readiness. Each command prints a JSON body that starts with
@@ -222,9 +232,6 @@ lists what must stay private.
 
 ## Optional pieces
 
-- **Signed wallet history.** The Compose publisher prepares settled shielded
-  ranges for the existing lightwalletd endpoint. See
-  [Publish signed wallet history](deploying-on-a-vm.md#publish-signed-wallet-history).
 - **Fallback nodes.** Ingest can switch to a second node when the first stops
   answering, and broadcasts move to the next node. See
   [Fail over to a second node](deploying-on-a-vm.md#fail-over-to-a-second-node)

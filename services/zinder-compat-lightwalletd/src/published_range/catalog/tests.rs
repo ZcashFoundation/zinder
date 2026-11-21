@@ -62,6 +62,7 @@ impl Fixture {
             &verification_key_from(&self.public)?,
             false,
             previous,
+            None,
         )
     }
 
@@ -134,6 +135,66 @@ async fn catching_up_the_secondary_extends_and_reuses_the_admitted_prefix() -> R
     fs::write(f.current(), preceding)?;
     assert!(f.catalog(Some(&extended)).is_err());
     assert!(f.publisher().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let (_files, canonical) = reader(&chain)?;
+    let f = Fixture::new()?;
+    let other = Fixture::new()?;
+    let trusted = tempdir()?;
+    let public = trusted.path().join("publisher.pub");
+    fs::copy(&f.public, &public)?;
+    let follow = || {
+        super::super::PublishedShieldedHistory::follow_publisher(
+            f.directory.path(),
+            &public,
+            false,
+            &canonical,
+        )
+    };
+    assert!(follow().await.is_err());
+    let mut publisher = f.publisher()?;
+    assert!(
+        super::super::PublishedShieldedHistory::follow_publisher(
+            f.directory.path(),
+            &f.public,
+            false,
+            &canonical
+        )
+        .await
+        .is_err()
+    );
+    let waiting = follow().await?;
+    assert!(waiting.catalog().is_none());
+    assert!(
+        super::super::PublishedShieldedHistory::follow_publisher(
+            f.directory.path(),
+            &other.public,
+            false,
+            &canonical
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        super::super::PublishedShieldedHistory::open(&f.current(), &f.public, false, &canonical)
+            .await
+            .is_err()
+    );
+    assert!(publisher.publish_next(&canonical)?);
+    assert!(waiting.refresh(&canonical).await?);
+    let first = fs::read(f.current())?;
+    assert!(publisher.publish_next(&canonical)?);
+    fs::write(f.current(), &first)?;
+    assert!(follow().await.is_err());
+    assert!(waiting.refresh(&canonical).await.is_err());
+    fs::remove_file(f.current())?;
+    assert!(follow().await.is_err());
+    assert!(waiting.refresh(&canonical).await.is_err());
+    assert!(waiting.has_catalog());
     Ok(())
 }
 
@@ -225,6 +286,7 @@ fn initial_publication_creates_and_reopens_nested_directories() -> Result<()> {
         &verification_key_from(&fixture.public)?,
         false,
         None,
+        None,
     )?;
     assert_eq!(catalog.bounds().end, first);
     Ok(())
@@ -282,6 +344,7 @@ async fn adjacent_signed_files_from_disconnected_chains_and_wrong_keys_are_rejec
             &f.current(),
             &verification_key_from(&wrong.public)?,
             false,
+            None,
             None
         )
         .is_err()
@@ -319,7 +382,9 @@ fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
         reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
     assert!(fixture.publisher()?.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
-    assert!(PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None).is_err());
+    assert!(
+        PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None).is_err()
+    );
     Ok(())
 }
 
@@ -334,7 +399,7 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     assert!(publisher.publish_next(&canonical)?);
     assert!(publisher.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
-    let open = || PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None);
+    let open = || PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None);
     for entry in fixture.entries()? {
         assert!(open().is_err());
         let path = segment_path(fixture.directory.path(), entry.sha256);

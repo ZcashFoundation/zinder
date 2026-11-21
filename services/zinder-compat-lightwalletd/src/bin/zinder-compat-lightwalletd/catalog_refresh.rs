@@ -13,7 +13,7 @@ use zinder_compat_lightwalletd::{CanonicalReaderSlot, PublishedShieldedHistory};
 use zinder_query::WalletServingPairSlot;
 use zinder_runtime::{ConfigError, SupervisedTasks};
 
-use super::config::{LightwalletdConfigError, ShieldedHistorySection};
+use super::config::{HistoryLocation, LightwalletdConfigError, ShieldedHistorySection};
 
 pub(super) enum CatalogSource {
     Wallet(WalletServingPairSlot),
@@ -25,17 +25,9 @@ impl CatalogSource {
         &self,
         config: &ShieldedHistorySection,
     ) -> Result<PublishedShieldedHistory, tonic::Status> {
-        let open = |source| {
-            PublishedShieldedHistory::open(
-                &config.manifest,
-                &config.publisher_key,
-                config.require_fs_verity,
-                source,
-            )
-        };
         match self {
-            Self::Wallet(slot) => open(slot.capture().canonical()).await,
-            Self::Compact(slot) => open(slot.capture().as_ref()).await,
+            Self::Wallet(slot) => config.open(slot.capture().canonical()).await,
+            Self::Compact(slot) => config.open(slot.capture().as_ref()).await,
         }
     }
 
@@ -54,21 +46,57 @@ impl CatalogSource {
     }
 }
 
-#[derive(Eq, PartialEq)]
-struct FileStamp {
-    length: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
+impl ShieldedHistorySection {
+    async fn open(
+        &self,
+        source: &dyn zinder_query::CanonicalReader,
+    ) -> Result<PublishedShieldedHistory, tonic::Status> {
+        match &self.location {
+            HistoryLocation::Manifest(path) => {
+                PublishedShieldedHistory::open(
+                    path,
+                    &self.publisher_key,
+                    self.require_fs_verity,
+                    source,
+                )
+                .await
+            }
+            HistoryLocation::Directory(path) => {
+                PublishedShieldedHistory::follow_publisher(
+                    path,
+                    &self.publisher_key,
+                    self.require_fs_verity,
+                    source,
+                )
+                .await
+            }
+        }
+    }
 }
 
-impl FileStamp {
+#[derive(Eq, PartialEq)]
+enum ManifestStamp {
+    Unpublished,
+    Present {
+        length: u64,
+        modified: SystemTime,
+        #[cfg(unix)]
+        identity: (u64, u64, i64, i64),
+    },
+}
+
+impl ManifestStamp {
     async fn read(path: &Path) -> io::Result<Self> {
         let path = path.to_owned();
-        let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(path))
+        let metadata = match tokio::task::spawn_blocking(move || std::fs::metadata(path))
             .await
-            .map_err(io::Error::other)??;
-        Ok(Self {
+            .map_err(io::Error::other)?
+        {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Unpublished),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::Present {
             length: metadata.len(),
             modified: metadata.modified()?,
             #[cfg(unix)]
@@ -85,8 +113,8 @@ impl FileStamp {
 pub(super) struct CatalogRefresh {
     pub(super) history: Arc<PublishedShieldedHistory>,
     source: CatalogSource,
-    paths: ShieldedHistorySection,
-    applied: Option<FileStamp>,
+    manifest: std::path::PathBuf,
+    applied: Option<ManifestStamp>,
 }
 
 impl CatalogRefresh {
@@ -94,16 +122,17 @@ impl CatalogRefresh {
         paths: &ShieldedHistorySection,
         source: CatalogSource,
     ) -> Result<Self, LightwalletdConfigError> {
-        let before = FileStamp::read(&paths.manifest)
+        let manifest = paths.location.manifest();
+        let before = ManifestStamp::read(&manifest)
             .await
             .map_err(admission_error)?;
         let history = source.open(paths).await.map_err(admission_error)?;
-        let after = FileStamp::read(&paths.manifest)
+        let after = ManifestStamp::read(&manifest)
             .await
             .map_err(admission_error)?;
         Ok(Self {
             history: Arc::new(history),
-            paths: paths.clone(),
+            manifest,
             source,
             applied: (before == after).then_some(after),
         })
@@ -149,7 +178,7 @@ impl CatalogRefresh {
     }
 
     async fn refresh(&mut self) -> Result<(), String> {
-        let stamp = FileStamp::read(&self.paths.manifest)
+        let stamp = ManifestStamp::read(&self.manifest)
             .await
             .map_err(|error| error.to_string())?;
         if self.applied.as_ref() == Some(&stamp) {
@@ -167,7 +196,7 @@ impl CatalogRefresh {
         if changed {
             tracing::info!(target: "zinder::compat_lightwalletd", event = "shielded_catalog_installed", "serving the new signed shielded history");
         }
-        self.applied = FileStamp::read(&self.paths.manifest)
+        self.applied = ManifestStamp::read(&self.manifest)
             .await
             .ok()
             .filter(|after| *after == stamp);

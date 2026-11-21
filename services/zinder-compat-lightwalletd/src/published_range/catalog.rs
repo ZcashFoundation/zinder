@@ -1,6 +1,7 @@
 //! Append-only signed coverage for settled shielded blocks.
 mod publisher;
 
+pub(super) use publisher::PublisherHead;
 pub use publisher::ShieldedCatalogPublisher;
 
 use std::{io, path::Path, sync::Arc};
@@ -85,8 +86,12 @@ impl PublishedShieldedCatalog {
         key: &[u8; 32],
         require_fs_verity: bool,
         previous: Option<&Self>,
+        head: Option<&PublisherHead>,
     ) -> io::Result<Self> {
         let entries = load_entries(path, key)?;
+        if let Some(head) = head {
+            head.verify(&entries)?;
+        }
         let mut segments = Vec::with_capacity(entries.len());
         if let Some(previous) = previous {
             if previous.segments.len() > entries.len()

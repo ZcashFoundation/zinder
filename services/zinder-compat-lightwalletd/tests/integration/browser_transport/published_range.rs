@@ -172,6 +172,37 @@ async fn configured_listener_rejects_a_signed_manifest_from_a_displaced_branch_a
 }
 
 #[tokio::test]
+async fn wallet_adopts_first_publication_on_the_same_connection() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let directory = files.path();
+    let trusted = tempfile::tempdir()?;
+    let (private, public) = signing_keys(trusted.path())?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut fixture = canonical_fixture(&chain)?;
+    let (canonical, _) = fixture.take_readers()?;
+    let reader = RocksDbCanonicalReader::new(canonical)?;
+    let mut publisher =
+        ShieldedCatalogPublisher::open(directory, &private, BlockHeight::new(1), NonZeroU32::MIN)?;
+    let section = format!(
+        "[compat.shielded_history]\ndirectory = \"{}\"\npublisher_key = \"{}\"\n",
+        directory.display(),
+        public.display()
+    );
+    let runtime =
+        CompatProcess::start_with_history("wallet", Some(super::ORIGIN), &section).await?;
+    let mut wallet = runtime.native_client().await?;
+    let expected = collect_range(&mut wallet, 1, 3).await?;
+    let manifest = directory.join("current.json");
+    replace_manifest(&manifest, b"invalid first manifest")?;
+    wait_for_log(&runtime, "shielded_catalog_refresh_failed").await?;
+    assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
+    assert!(publisher.publish_next(&reader)?);
+    wait_for_log(&runtime, "shielded_catalog_installed").await?;
+    assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
+    Ok(())
+}
+
+#[tokio::test]
 async fn running_wallet_admits_an_extension_and_keeps_it_after_a_signed_rollback() -> Result<()> {
     let files = tempfile::tempdir()?;
     let directory = files.path();
@@ -185,7 +216,15 @@ async fn running_wallet_admits_an_extension_and_keeps_it_after_a_signed_rollback
     assert!(publisher.publish_next(&reader)?);
     let manifest = directory.join("current.json");
     let initial = fs::read(&manifest)?;
-    let runtime = start_signed_listener("wallet", &manifest, &public).await?;
+    #[cfg(unix)]
+    let listener_manifest = {
+        let link = directory.join("snapshot.json");
+        std::os::unix::fs::symlink(&manifest, &link)?;
+        link
+    };
+    #[cfg(not(unix))]
+    let listener_manifest = manifest.clone();
+    let runtime = start_signed_listener("wallet", &listener_manifest, &public).await?;
     let mut wallet = runtime.native_client().await?;
     let expected = collect_range(&mut wallet, 1, 3).await?;
 

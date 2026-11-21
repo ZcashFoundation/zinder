@@ -3,7 +3,8 @@
 # The four release runtimes share one host filesystem. zinder-ingest is the
 # only canonical writer, zinder-projector is the only wallet writer,
 # zinder-query serves the native WalletQuery protocol, and
-# zinder-compat-lightwalletd serves the compatibility protocol. All readers
+# zinder-compat-lightwalletd serves the compatibility protocol. A separate
+# publisher signs ranges of settled shielded blocks. Wallet query processes
 # share ingest's network namespace so the authenticated control plane remains
 # loopback-only.
 #
@@ -24,6 +25,13 @@ networks:
     name: ${ZINDER_SOURCE_NETWORK_NAME:?set the node's external Docker network name}
   observability:
     name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-observability}
+
+x-compat-image: &compat-image
+  image: ${ZINDER_COMPAT_IMAGE:-ghcr.io/zcashfoundation/zinder-compat-lightwalletd:${ZINDER_VERSION:-local}}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: zinder-compat-lightwalletd
 
 services:
   state-init:
@@ -182,13 +190,46 @@ services:
       start_period: 5m
       retries: 3
 
+  zinder-history-publisher:
+    <<: *compat-image
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-${ZINDER_COMPAT_MEMORY_LIMIT:-4g}}
+    network_mode: none
+    restart: unless-stopped
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    command:
+      - --config
+      - /etc/zinder/publisher.toml
+      - publish-shielded-history
+      - --directory
+      - /var/lib/zinder-history
+      - --signing-key
+      - /run/zinder-history/publisher.pk8
+      - --follow-interval-secs
+      - "60"
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+    volumes:
+      - data:/var/lib/zinder:ro
+      - ./config/history-publisher.toml:/etc/zinder/publisher.toml:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pk8
+        target: /run/zinder-history/publisher.pk8
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
+        target: /var/lib/zinder-history
+        bind:
+          create_host_path: false
+
   zinder-compat-lightwalletd:
-    image: ${ZINDER_COMPAT_IMAGE:-ghcr.io/zcashfoundation/zinder-compat-lightwalletd:${ZINDER_VERSION:-local}}
+    <<: *compat-image
     mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: zinder-compat-lightwalletd
     restart: on-failure
     network_mode: "service:zinder-ingest"
     # Same dependency rule as zinder-query.
@@ -202,8 +243,22 @@ services:
       - ./config/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
       - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pub
+        target: /run/zinder-history/publisher.pub
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
+        target: /var/lib/zinder-history
+        read_only: true
+        bind:
+          create_host_path: false
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
+      ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
+      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}

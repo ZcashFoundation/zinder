@@ -294,6 +294,12 @@ def provision(args, directory):
         if name != 'projector':
             service['environment']['ZINDER_NODE__AUTH__METHOD'] = 'none'
         if name == 'compat-lightwalletd':
+            # This four-runtime fixture admits released readers predating catalog support.
+            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY')
+            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY')
+            service['volumes'] = [mount for mount in service['volumes']
+                                  if mount['target'] not in ('/var/lib/zinder-history',
+                                                             '/run/zinder-history/publisher.pub')]
             service['environment']['ZINDER_COMPAT__STALE_TIP_LIMIT_MS'] = '0'
         if args.bin_dir:
             binary = args.bin_dir.resolve() / ('zinder-' + name)
