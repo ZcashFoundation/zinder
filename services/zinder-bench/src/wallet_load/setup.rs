@@ -116,7 +116,7 @@ fn failure_text(failure: &CallFailure) -> String {
 /// A block's height and hash as the server reported them.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ObservedBlock {
-    height: u64,
+    pub(super) height: u64,
     /// RPC byte order hex for a 32-byte hash, otherwise the bytes as sent.
     hash_hex: String,
 }
@@ -444,7 +444,9 @@ async fn observe_subtree_roots(
     served: ServedProtocol,
     attempts: u32,
 ) -> Result<SubtreeRootsObservation, BenchError> {
-    let tip_before = chain_tip(connector, client).await?;
+    let tip_before = chain_tip(connector, client)
+        .await
+        .map_err(|failure| setup_failure(&failure))?;
     let tip_block = calls::unary(
         connector.recorder(),
         "GetBlock",
@@ -479,7 +481,9 @@ async fn observe_subtree_roots(
     } else {
         None
     };
-    let tip_after = chain_tip(connector, client).await?;
+    let tip_after = chain_tip(connector, client)
+        .await
+        .map_err(|failure| setup_failure(&failure))?;
     let chain_metadata_block_is_tip = chain_metadata_block
         .as_ref()
         .is_some_and(|block| block.is_same_block_as(&tip_before));
@@ -497,18 +501,17 @@ async fn observe_subtree_roots(
 }
 
 /// The chain tip's height and hash.
-async fn chain_tip(
+pub(super) async fn chain_tip(
     connector: &Connector,
     client: &mut LwdClient,
-) -> Result<ObservedBlock, BenchError> {
+) -> Result<ObservedBlock, CallFailure> {
     let tip = calls::unary(
         connector.recorder(),
         "GetLatestBlock",
         SETUP_LIMITS.unary,
         client.get_latest_block(ChainSpec {}),
     )
-    .await
-    .map_err(|failure| setup_failure(&failure))?;
+    .await?;
     Ok(ObservedBlock::new(tip.height, &tip.hash))
 }
 
