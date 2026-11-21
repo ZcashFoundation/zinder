@@ -296,7 +296,7 @@ The wallet listener verifies the publisher's signed empty checkpoint before
 serving canonical ranges during bootstrap. It adopts each signed catalog
 after verifying the segments and settled chain anchor. Wallets keep using
 the same endpoint throughout. A range can cross into the encoded tail when
-its chain view matches. Uncovered blocks use canonical storage. See the
+its chain view matches. Uncovered blocks use canonical storage. On a compatible Linux filesystem, the publisher protects each new segment with fs-verity before publishing the signed catalog. Other filesystems use per-payload verification. See the
 [signed history reference](../reference/lightwalletd-compatibility.md#signed-settled-history)
 for coverage, tail reads, and fs-verity requirements.
 

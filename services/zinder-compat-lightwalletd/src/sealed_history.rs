@@ -26,6 +26,7 @@ const HEADER_LEN: usize = 52;
 const LENGTHS_LEN: usize = 8;
 const INDEX_LEN: usize = 112;
 mod index;
+pub(crate) mod verity;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -252,7 +253,7 @@ impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
-        let protected = index::pinned_verity(expected.verity, || measured_verity(&file))?;
+        let protected = index::pinned_verity(expected.verity, || verity::measure(&file))?;
         let rows = index::admit(&mut &file, expected, file_len, protected)?;
         Ok(Self {
             kernel_verified: protected,
@@ -356,46 +357,6 @@ impl SealedHistory {
             })
             .collect()
     }
-}
-
-#[cfg(target_os = "linux")]
-fn kernel_verifies_reads(file: &File) -> bool {
-    use rustix::fs::{AtFlags, StatxAttributes, StatxFlags, fstatfs, statx};
-
-    // Restrict the attestation to kernel filesystems implementing fs-verity.
-    // A userspace or network filesystem can supply its own statx attributes.
-    let native = fstatfs(file).is_ok_and(|stats| {
-        matches!(
-            i128::from(stats.f_type) & 0xffff_ffff,
-            0xef53 | 0x9123_683e | 0xf2f5_2010
-        )
-    });
-    native
-        && statx(file, c"", AtFlags::EMPTY_PATH, StatxFlags::empty()).is_ok_and(|stat| {
-            stat.stx_attributes_mask.contains(StatxAttributes::VERITY)
-                && stat.stx_attributes.contains(StatxAttributes::VERITY)
-        })
-}
-
-#[cfg(target_os = "linux")]
-fn measured_verity(file: &File) -> io::Result<Option<[u8; 32]>> {
-    if !kernel_verifies_reads(file) {
-        return Ok(None);
-    }
-    let (algorithm, digest) = fs_verity::linux::fsverity_measure(std::os::fd::AsFd::as_fd(file))?;
-    if algorithm != fs_verity::InnerHashAlgorithm::Sha256 {
-        return Err(invalid("unsupported shielded segment fs-verity algorithm"));
-    }
-    digest
-        .as_ref()
-        .try_into()
-        .map(Some)
-        .map_err(|_| invalid("invalid shielded segment fs-verity digest"))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn measured_verity(_file: &File) -> io::Result<Option<[u8; 32]>> {
-    Ok(None)
 }
 
 #[cfg(unix)]

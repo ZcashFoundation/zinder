@@ -304,6 +304,7 @@ fn a_damaged_orphan_cannot_replace_the_last_good_pointer() -> Result<()> {
     let next = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(4));
     let description = manifest::publish_segment(&canonical, dir, next)?;
     let orphan = segment_path(dir, description.identity.sha256);
+    fs::remove_file(&orphan)?;
     fs::write(&orphan, b"partial segment")?;
     assert!(publisher.publish_next(&canonical).is_err());
     assert_eq!(fs::read(fixture.current())?, previous_pointer);
@@ -382,6 +383,11 @@ fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
         reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
     assert!(fixture.publisher()?.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
+    let segment = segment_path(fixture.directory.path(), fixture.entries()?[0].sha256);
+    let ordinary = segment.with_extension("copy");
+    fs::copy(&segment, &ordinary)?;
+    fs::rename(ordinary, segment)?;
+    assert!(fixture.catalog(None).is_ok());
     assert!(
         PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None).is_err()
     );
@@ -390,7 +396,7 @@ fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem"]
 fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<()> {
     let fixture = Fixture::new()?;
     let (_canonical_files, canonical) =
@@ -400,19 +406,15 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     assert!(publisher.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
     let open = || PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None);
-    for entry in fixture.entries()? {
-        assert!(open().is_err());
-        let path = segment_path(fixture.directory.path(), entry.sha256);
-        assert!(
-            std::process::Command::new("fsverity")
-                .arg("enable")
-                .arg(path)
-                .status()?
-                .success()
-        );
-    }
     let catalog = open()?;
     assert_eq!(catalog.bounds().end, BlockHeight::new(4));
+    let mut entries = fixture.entries()?;
+    let path = segment_path(fixture.directory.path(), entries[1].sha256);
+    assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+    entries[1].fs_verity_sha256 = Some([0; 32]);
+    fixture.force_catalog(entries)?;
+    assert!(open().is_err());
+    assert!(fixture.catalog(None).is_err());
     Ok(())
 }
 

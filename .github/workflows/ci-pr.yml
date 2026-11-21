@@ -121,7 +121,7 @@ jobs:
           sudo apt-get install -y fsverity
           scratch=$(mktemp -d)
           truncate -s 128M "$scratch/ext4.img"
-          mkfs.ext4 -q -F -O verity "$scratch/ext4.img"
+          mkfs.ext4 -q -F -b 4096 -O verity "$scratch/ext4.img"
           mkdir "$scratch/mount"
           sudo mount -o loop,nodev,nosuid "$scratch/ext4.img" "$scratch/mount"
           trap 'sudo umount "$scratch/mount" && rm -r "$scratch"' EXIT
