@@ -186,8 +186,9 @@ impl SegmentWriter {
             if failure.error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(failure.error);
             }
-            // A crash after the directory entry appeared can leave a complete earlier publication.
+            // Keep the newly written inode for protection after authenticating the old staging name.
             SealedHistory::open(&self.target, identity)?;
+            failure.file.persist(&self.target)?;
         }
         File::open(parent_directory(&self.target))?.sync_all()?;
         Ok(identity)

@@ -353,6 +353,39 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem"]
+fn kernel_protected_publication_recovers_portable_orphans() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (_canonical_files, canonical) =
+        reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(4))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&canonical)?);
+    let dir = fixture.directory.path();
+    let next = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(4));
+    let description = manifest::publish_segment(&canonical, dir, next)?;
+    let destination = segment_path(dir, description.identity.sha256);
+    let ordinary_copy = dir.join("portable-backup");
+    fs::copy(&destination, &ordinary_copy)?;
+    fs::remove_file(&destination)?;
+    fs::hard_link(&ordinary_copy, &destination)?;
+    fs::hard_link(&ordinary_copy, dir.join(".publisher-segment.tmp"))?;
+
+    assert!(publisher.publish_next(&canonical)?);
+    let key = verification_key_from(&fixture.public)?;
+    let catalog = PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None)?;
+    assert_eq!(catalog.bounds().end, BlockHeight::new(4));
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .is_err()
+    );
+    fs::OpenOptions::new().write(true).open(ordinary_copy)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Result<()> {
