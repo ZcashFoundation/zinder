@@ -98,6 +98,19 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(production_tip_change_publisher_observes_a_post_wait_canonical_event)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.ci.overrides]]
+# These qualification tests pass 100,000 UTXOs through JSON-RPC to exercise
+# the node's actual page limit. The cutoff proof can read a full page more
+# than once for each node. Each RPC has its own 30s timeout.
+filter = """
+package(=zinder-compat-lightwalletd) & (
+  test(cap_sized_cutoff_height_returns_a_smaller_wallet_ordered_prefix)
+  | test(cap_sized_multi_height_prefix_stays_bounded_and_wallet_ordered)
+  | test(later_outputs_can_prevent_proving_a_full_cutoff_height)
+)
+"""
+slow-timeout = { period = "30s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }
