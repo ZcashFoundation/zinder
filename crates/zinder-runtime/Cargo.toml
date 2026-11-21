@@ -55,6 +55,7 @@ tikv-jemallocator.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 raw-cpuid.workspace = true
+x86_64.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }

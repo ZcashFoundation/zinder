@@ -68,6 +68,7 @@ prost = "0.14.6"
 prost-types = "0.14.6"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 raw-cpuid = "11.6.0"
+x86_64 = { version = "0.15.5", default-features = false, features = ["instructions"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.54.1", features = ["multi-threaded-cf"] }

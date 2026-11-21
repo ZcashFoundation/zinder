@@ -281,12 +281,21 @@ async fn await_terminating_signal() {
 ///
 /// Release images compile with `-C target-cpu=x86-64-v3`, which lets both the
 /// Rust code and the vendored `RocksDB` C++ emit AVX2/BMI2 instructions
-/// unconditionally. A host below that baseline dies with `SIGILL` deep inside
-/// storage code, so binaries call this before opening storage and exit with a
-/// readable error instead. Builds without the flag (tests, local dev, non-x86
-/// images) require nothing and always pass.
+/// unconditionally. The startup check reports missing features before opening
+/// storage. Deployments must meet the baseline even for code that runs before
+/// this check.
 #[must_use]
 pub fn host_cpu_meets_compiled_baseline() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if !host_has_avx_state() {
+        tracing::error!(
+            target: "zinder::runtime",
+            event = "host_cpu_below_compiled_baseline",
+            missing = "avx",
+            "AVX requires OS-enabled XMM and YMM state"
+        );
+        return false;
+    }
     let missing = missing_required_cpu_features();
     if missing.is_empty() {
         return true;
@@ -305,14 +314,10 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
     let cpu = raw_cpuid::CpuId::new();
     let basic = cpu.get_feature_info();
     let extended = host_extended_features();
-    let avx = basic
-        .as_ref()
-        .is_some_and(|features| features.has_avx() && features.has_oxsave())
-        && std::arch::is_x86_feature_detected!("avx");
     let required = [
         (
             "avx2",
-            avx && extended
+            extended
                 .as_ref()
                 .is_some_and(raw_cpuid::ExtendedFeatures::has_avx2),
         ),
@@ -330,7 +335,7 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         ),
         (
             "fma",
-            avx && basic.as_ref().is_some_and(raw_cpuid::FeatureInfo::has_fma),
+            basic.as_ref().is_some_and(raw_cpuid::FeatureInfo::has_fma),
         ),
         (
             "lzcnt",
@@ -349,6 +354,29 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         .filter(|(_, detected)| !detected)
         .map(|(feature, _)| feature)
         .collect()
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn host_has_avx_state() -> bool {
+    raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|features| {
+            host_avx_enabled(
+                features.has_avx() && features.has_xsave() && features.has_oxsave(),
+                x86_64::registers::xcontrol::XCr0::read,
+            )
+        })
+}
+
+#[cfg(all(target_arch = "x86_64", any(target_feature = "avx2", test)))]
+fn host_avx_enabled(
+    can_read_avx_state: bool,
+    read_xcr0: impl FnOnce() -> x86_64::registers::xcontrol::XCr0Flags,
+) -> bool {
+    use x86_64::registers::xcontrol::XCr0Flags;
+
+    // XGETBV is valid only after the CPU and OS have enabled XSAVE.
+    can_read_avx_state && read_xcr0().contains(XCr0Flags::SSE | XCr0Flags::AVX)
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -445,6 +473,23 @@ fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{missing_pasta_features, pasta_backend};
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx_requires_os_enabled_xmm_and_ymm_state() {
+        use x86_64::registers::xcontrol::XCr0Flags;
+
+        let mut xcr0_read = false;
+        assert!(!super::host_avx_enabled(false, || {
+            xcr0_read = true;
+            XCr0Flags::all()
+        }));
+        assert!(!xcr0_read);
+        for state in [XCr0Flags::empty(), XCr0Flags::SSE, XCr0Flags::AVX] {
+            assert!(!super::host_avx_enabled(true, || state));
+        }
+        assert!(super::host_avx_enabled(true, || XCr0Flags::SSE | XCr0Flags::AVX));
+    }
 
     #[test]
     fn pasta_backend_names_a_known_backend() {
