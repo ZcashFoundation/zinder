@@ -326,9 +326,11 @@ not been qualified.
    The reader verifies the signature, segments, and settled anchor before
    binding. It admits later extensions while running. A default shielded range
    can cross from signed history into the encoded tail when the tail matches
-   the reader’s chain view. Uncovered heights use canonical storage. The overlay
-   uses per-payload digest verification. Strict fs-verity requires separate
-   segment staging as described in [signed settled history](../reference/lightwalletd-compatibility.md#signed-settled-history).
+   the reader's chain view. Uncovered heights use canonical storage. The
+   publisher automatically protects each new segment with fs-verity on a
+   supported Linux filesystem. Other filesystems use per-payload verification.
+   For copied segments and strict admission, see
+   [signed settled history](../reference/lightwalletd-compatibility.md#signed-settled-history).
 
 4. Save `ZINDER_HISTORY_DIR` in `/etc/zinder/env` and add the history overlay
    to every [systemd Compose command](#6-supervise-with-systemd) for subsequent
