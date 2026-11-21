@@ -24,15 +24,15 @@ use rlz::api::sync::SyncOutcome;
 use rlz::pay::pool::{POOL_IRONWOOD, POOL_ORCHARD, POOL_SAPLING, POOL_TRANSPARENT};
 use sqlx::{Connection as _, SqliteConnection};
 
-/// Disposable local Regtest.
-const COIN: u8 = 2;
+const REGTEST: u8 = 2;
+const TESTNET: u8 = 1;
 /// What Zkool's server passes to a sync.
 const ACTIONS_PER_SYNC: u32 = 100_000;
 
 fn usage() -> ! {
     eprintln!(
         "usage: sync_eval sync <lightwalletd-url> <birthday> <mnemonic> <wallet-dir>\n       \
-         sync_eval report <wallet-dir>"
+         sync_eval report <wallet-dir>\n       sync_eval testnet-read [sync|resume|report] <args...>"
     );
     std::process::exit(2);
 }
@@ -41,19 +41,21 @@ fn usage() -> ! {
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider().install_default().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    let argv: Vec<_> = args.iter().map(String::as_str).collect();
+    let (network, action) = match argv.as_slice() {
+        ["testnet-read", rest @ ..] => (TESTNET, rest),
+        rest => (REGTEST, rest),
+    };
+    match action {
         ["sync", server, birthday, mnemonic, dir] => {
-            sync(server, birthday.parse().context("birthday")?, mnemonic, Path::new(dir)).await
+            sync(network, server, birthday.parse().context("birthday")?, mnemonic, Path::new(dir)).await
         }
-        ["report", dir] => report(Path::new(dir)).await,
-        ["resume", server, dir] => resume(server, Path::new(dir)).await,
-        ["addresses", dir] => addresses(Path::new(dir)).await,
-        ["send", server, dir, address, amount, pools] => send(server, Path::new(dir), address, amount.parse()?, pools.parse()?).await,
+        ["report", dir] => report(network, Path::new(dir)).await,
+        ["resume", server, dir] => resume(network, server, Path::new(dir)).await,
+        ["addresses", dir] if network == REGTEST => addresses(Path::new(dir)).await,
+        ["send", server, dir, address, amount, pools] if network == REGTEST => {
+            send(server, Path::new(dir), address, amount.parse()?, pools.parse()?).await
+        }
         _ => usage(),
     }
 }
@@ -62,14 +64,14 @@ fn db_path(dir: &Path) -> String {
     dir.join("zkool.db").to_string_lossy().into_owned()
 }
 
-async fn open(dir: &Path) -> Result<Coin> {
-    Coin::new(Some(COIN)).open_database(db_path(dir), None).await
+async fn open(network: u8, dir: &Path) -> Result<Coin> {
+    Coin::new(Some(network)).open_database(db_path(dir), None).await
 }
 
-async fn sync(server: &str, birthday: u32, mnemonic: &str, dir: &Path) -> Result<()> {
+async fn sync(network: u8, server: &str, birthday: u32, mnemonic: &str, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).context("wallet dir")?;
-    rlz::api::db::create_db(&db_path(dir), None, COIN).await?;
-    let coin = open(dir).await?.set_lwd(0, server.into())?;
+    rlz::api::db::create_db(&db_path(dir), None, network).await?;
+    let coin = open(network, dir).await?.set_lwd(0, server.into())?;
     let account = new_account(
         &NewAccount {
             icon: None,
@@ -91,11 +93,11 @@ async fn sync(server: &str, birthday: u32, mnemonic: &str, dir: &Path) -> Result
     .await?;
     // The report step needs the account; writing it is a few bytes.
     std::fs::write(dir.join("account"), account.to_string()).context("write account")?;
-    resume(server, dir).await
+    resume(network, server, dir).await
 }
 
-async fn report(dir: &Path) -> Result<()> {
-    let coin = open(dir).await?;
+async fn report(network: u8, dir: &Path) -> Result<()> {
+    let coin = open(network, dir).await?;
     let account: u32 = std::fs::read_to_string(dir.join("account"))
         .context("read account")?
         .parse()
@@ -134,8 +136,8 @@ async fn report(dir: &Path) -> Result<()> {
 async fn account(dir: &Path) -> Result<u32> {
     Ok(std::fs::read_to_string(dir.join("account"))?.parse()?)
 }
-async fn resume(server: &str, dir: &Path) -> Result<()> {
-    let coin = open(dir).await?.set_lwd(0, server.into())?;
+async fn resume(network: u8, server: &str, dir: &Path) -> Result<()> {
+    let coin = open(network, dir).await?.set_lwd(0, server.into())?;
     let account = account(dir).await?;
     let tip = rlz::api::network::get_current_height(&coin).await?;
     let driver = rlz::sync::driver::SyncDriver::start();
@@ -159,13 +161,13 @@ async fn resume(server: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 async fn addresses(dir: &Path) -> Result<()> {
-    let coin = open(dir).await?;
+    let coin = open(REGTEST, dir).await?;
     let a = rlz::api::account::get_addresses(15, account(dir).await?, &coin).await?;
     println!("{}", serde_json::json!({"transparent": a.taddr, "sapling": a.saddr, "unified": a.ua}));
     Ok(())
 }
 async fn send(server: &str, dir: &Path, address: &str, amount: u64, pools: u8) -> Result<()> {
-    let coin = open(dir).await?.set_lwd(0, server.into())?;
+    let coin = open(REGTEST, dir).await?.set_lwd(0, server.into())?;
     let account = account(dir).await?;
     let recipient = rlz::pay::Recipient {address:address.into(), amount, pools:Some(POOL_IRONWOOD), ..Default::default()};
     let package = rlz::api::pay::prepare(&[recipient], rlz::api::pay::PaymentOptions {src_pools:pools,recipient_pays_fee:false,smart_transparent:false,category:None}, account,&coin).await?;

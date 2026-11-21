@@ -201,6 +201,14 @@ jobs:
           python3 scripts/test-observability-rules.py
           python3 scripts/test-metric-names.py
 
+      - name: Test wallet round-trip contracts
+        run: |
+          python3 -B scripts/wallet-clients/test-wallet-roundtrip.py
+          python3 -B scripts/wallet-clients/test-roundtrip-wallets.py
+          python3 -B scripts/wallet-clients/test-audit-wallet-roundtrip.py
+          python3 -B scripts/wallet-clients/test-roundtrip-regtest-command.py
+          python3 -B scripts/wallet-clients/coverage_test.py
+
       - name: Test storage benchmark contracts
         run: |
           scripts/test-container-resource-evidence.sh
