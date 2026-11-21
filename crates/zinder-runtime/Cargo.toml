@@ -24,6 +24,7 @@ hyper-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
+pasta_curves.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 secrecy.workspace = true

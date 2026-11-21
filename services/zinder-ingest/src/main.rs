@@ -42,7 +42,8 @@ use zinder_runtime::{
     ComposedReadiness, ConfigError, OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError,
     Readiness, ReadinessInput, ReadinessState, RuntimeService, StartupPhase,
     TracingSubscriberError, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    host_cpu_meets_pasta_backend_baseline, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
@@ -186,6 +187,10 @@ async fn main() -> ExitCode {
     }
 
     if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+
+    if !host_cpu_meets_pasta_backend_baseline() {
         return ExitCode::FAILURE;
     }
 

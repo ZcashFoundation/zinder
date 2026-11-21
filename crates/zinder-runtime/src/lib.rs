@@ -324,3 +324,105 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
 fn missing_required_cpu_features() -> Vec<&'static str> {
     Vec::new()
 }
+
+/// The Pasta field-arithmetic backend compiled into this build, from
+/// `pasta_curves`: `"portable"`, `"x86-64"`, `"aarch64"`, or `"armv7em"`.
+///
+/// `pasta_curves` selects the backend at compile time from its opt-in `asm`
+/// feature and the target. Operators build an accelerated binary by enabling
+/// `pasta_curves/asm` (see the deploying runbook); this function names the
+/// backend that build actually compiled so a silent fall back to portable
+/// arithmetic is visible in the startup log instead of being hidden.
+#[must_use]
+pub const fn pasta_backend() -> &'static str {
+    pasta_curves::BACKEND
+}
+
+/// Verifies the host CPU provides every instruction-set feature the compiled
+/// Pasta backend requires, logging the selected backend and returning `false`
+/// when the host falls short.
+///
+/// The `pasta_curves` x86-64 assembly backend uses BMI2 and ADX instructions
+/// and does not detect them at run time. Neither is part of the x86-64-v3
+/// release baseline, so a build that opted into `asm` must refuse to start on
+/// a host that lacks ADX rather than die with `SIGILL` inside commitment
+/// hashing. The portable backend, and the `AArch64` and `ARMv7E-M` backends,
+/// require nothing beyond their target. This is a separate check from
+/// [`host_cpu_meets_compiled_baseline`], which covers the x86-64-v3 baseline
+/// every release binary requires.
+#[must_use]
+pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
+    tracing::info!(
+        target: "zinder::runtime",
+        event = "pasta_backend_selected",
+        backend = pasta_backend(),
+        "Pasta field-arithmetic backend compiled into this build"
+    );
+    let missing = missing_pasta_backend_cpu_features();
+    if missing.is_empty() {
+        return true;
+    }
+    tracing::error!(
+        target: "zinder::runtime",
+        event = "host_cpu_below_pasta_backend_baseline",
+        backend = pasta_backend(),
+        missing = missing.join(", "),
+        "this build compiled the Pasta x86-64 assembly backend, which requires these CPU features"
+    );
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    if pasta_curves::BACKEND == "x86-64" {
+        let required = [
+            ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
+            ("adx", std::arch::is_x86_feature_detected!("adx")),
+        ];
+        required
+            .into_iter()
+            .filter(|(_, detected)| !detected)
+            .map(|(feature, _)| feature)
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{missing_pasta_backend_cpu_features, pasta_backend};
+
+    #[test]
+    fn pasta_backend_names_a_known_backend() {
+        assert!(
+            ["portable", "x86-64", "aarch64", "armv7em"].contains(&pasta_backend()),
+            "unexpected Pasta backend: {}",
+            pasta_backend()
+        );
+    }
+
+    #[test]
+    fn only_the_x86_64_backend_requires_bmi2_or_adx() {
+        let missing = missing_pasta_backend_cpu_features();
+        if pasta_backend() == "x86-64" {
+            for feature in &missing {
+                assert!(
+                    ["bmi2", "adx"].contains(feature),
+                    "unexpected required CPU feature: {feature}"
+                );
+            }
+        } else {
+            assert!(
+                missing.is_empty(),
+                "backend {} must not require CPU features",
+                pasta_backend()
+            );
+        }
+    }
+}

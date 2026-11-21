@@ -58,6 +58,12 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.13.0"
 orchard = { version = "0.16.0", default-features = false }
+# Pin the Pasta field-arithmetic crate so the opt-in `asm` feature selects the
+# version already locked transitively through `orchard`. The `asm` feature is
+# enabled only by an explicit `--features pasta_curves/asm` build (see
+# docs/runbooks/deploying.md); it is neither a default feature nor reachable
+# through `--all-features`, so the portable backend remains the shipped default.
+pasta_curves = { version = "=0.6.3", default-features = false }
 prost = "0.14.6"
 prost-types = "0.14.6"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }

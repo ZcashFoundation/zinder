@@ -65,6 +65,23 @@ ceilings, not measured use. Give the single-volume container at least 8 GB.
 The release binaries need an x86-64-v3 or AArch64 CPU. CPU use is not
 measured.
 
+### Optional Pasta assembly backend
+
+The shipped images compile the portable Pasta field-arithmetic backend, which
+runs on every supported CPU. To build images with the faster assembly backend
+instead, pass `--build-arg ZINDER_PASTA_ASM=1` to the Docker build, or pass
+`--features pasta_curves/asm` to a source build. On x86-64 the assembly backend
+needs BMI2 and ADX, which the x86-64-v3 baseline does not include; the binaries
+refuse to start on a host that lacks ADX instead of crashing during
+commitment hashing. Each binary logs the backend it compiled (`portable`,
+`x86-64`, or `aarch64`) at startup.
+
+A paired comparison on two retained 2,000-block fixtures measured the x86-64
+backend at about 7% lower process CPU and 6% lower elapsed time on an
+Ironwood-heavy window, and about 2% lower on a Sapling-heavy window. Dense
+Pasta history, the AArch64 backend, and a full first sync have not been
+measured.
+
 The Mainnet disk figures come from separate observations, so do not add them
 up to get a peak:
 
