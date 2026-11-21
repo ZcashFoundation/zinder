@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from wallet_fixture import binding
 
 
 def sha256(path):
@@ -26,19 +27,17 @@ def main():
     source = json.loads(args.engine_provenance.read_text())
     if source["vizor_source"] != "d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6" or source["vizor_release"] != "v0.0.65":
         parser.error("expected the v0.0.65 engine provenance")
-    if source["engine_sha256"] != sha256(args.engine):
-        parser.error("engine binary differs from its build provenance")
-    fixture = json.loads(args.fixture.read_text())
-    if fixture["network"] != "zcash-regtest":
-        parser.error("expected a Regtest fixture")
+    try:
+        endpoint, _, _, _ = binding(args.fixture, args.candidate)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        parser.error(str(error))
     if args.evidence.exists() or args.output.exists():
         parser.error("manifest and private evidence paths must be fresh")
     interpreter = Path(sys.executable).resolve()
     adapter = Path(__file__).with_name("vizor-regtest.py").resolve()
     driver = adapter.with_suffix(".rs")
     inputs = [interpreter, args.engine, args.engine_provenance, args.fixture, args.trace_tool,
-              adapter, driver, Path(__file__)]
-    endpoint = fixture["lightwalletd"]
+              adapter, driver, adapter.with_name("wallet_fixture.py"), Path(__file__)]
     command = [str(interpreter), "-O", str(adapter), "--engine", str(args.engine.resolve()),
                "--fixture", str(args.fixture.resolve()), "--trace-tool", str(args.trace_tool.resolve()),
                "--evidence", str(args.evidence.resolve()), "--scratch", "{scratch}",
@@ -46,8 +45,11 @@ def main():
     if args.candidate:
         inputs.append(args.candidate)
         command += ["--candidate", str(args.candidate.resolve())]
-        endpoint = json.loads(args.candidate.read_text())["client_endpoint"]
     inputs = {str(path.resolve()): sha256(path) for path in inputs}
+    if inputs[str(args.engine.resolve())] != source.get("engine_sha256"):
+        parser.error("engine binary differs from its build provenance")
+    if inputs[str(driver)] != source.get("driver_sha256"):
+        parser.error("wallet driver differs from its build provenance")
     steps = ["bootstrap", "restore", "transparent-discovery", "shielded-discovery",
              "send", "pending", "mined", "scanned", "restart", "resume"]
     case = {"wallet": "vizor", "version": "v0.0.65", "variant": "rust-engine", "network": "zcash-regtest",
