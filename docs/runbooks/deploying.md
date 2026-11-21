@@ -222,6 +222,9 @@ lists what must stay private.
 
 ## Optional pieces
 
+- **Signed wallet history.** The Compose publisher prepares settled shielded
+  ranges for the existing lightwalletd endpoint. See
+  [Publish signed wallet history](deploying-on-a-vm.md#publish-signed-wallet-history).
 - **Fallback nodes.** Ingest can switch to a second node when the first stops
   answering, and broadcasts move to the next node. See
   [Fail over to a second node](deploying-on-a-vm.md#fail-over-to-a-second-node)

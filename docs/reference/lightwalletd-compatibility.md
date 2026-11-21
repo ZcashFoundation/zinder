@@ -168,15 +168,17 @@ Both serving modes can serve the default shielded `GetBlockRange` projection fro
 
 Up to 16 published-range chunks read concurrently per listener. Additional reads wait in arrival order. Above 16 active streams the listener divides a 32 MiB native-byte allowance among them for each chunk, retaining the first-block exception for oversized rows. A client that disconnects while waiting to read its next chunk gives up its place.
 
-To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. To publish all retained history, start at height 1 for a complete store. For a checkpointed store, start at its first retained height, one above the checkpoint. Keep the signing key outside the catalog directory.
+To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. Keep the signing key outside the catalog directory. The publisher starts at the first retained height, which is 1 for a complete store or one above the checkpoint for a checkpointed store. To start later, pass the same `--first-height` on every run.
 
 ```sh
 zinder-compat-lightwalletd --config reader.toml publish-shielded-history \
   --directory /srv/zinder/published-history --signing-key /etc/zinder/publisher.pk8 \
-  --first-height 1 --segment-blocks 4096
+  --segment-blocks 4096
 ```
 
-The command opens a temporary canonical secondary, appends complete segments through its captured settled tip, and exits. Rerun it as settlement advances. One publisher holds the directory lock. On each restart it reads the existing segments to verify their contents and links before appending. Allow for that I/O when scheduling publication. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication. The listener fills the recent unsettled or incomplete suffix from its canonical reader.
+The command opens a temporary canonical secondary, publishes complete segments through its captured settled tip, and exits. Add `--follow-interval-secs 60` to keep the publisher running and catch up its secondary every minute. The listener fills the recent unsettled or incomplete suffix from its canonical reader. The [single-host Compose runbook](../runbooks/deploying-on-a-vm.md#publish-signed-wallet-history) covers installation and key rotation.
+
+One publisher holds the directory lock. On each restart it verifies the existing segments and links before appending. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
 
 Install the raw 32-byte Ed25519 public key on the reader through a trusted channel. Copy the referenced `segment-*.bin` files to the reader before atomically installing their signed `current.json`. The reader process needs read access to these files. Enable the catalog in the listener's configuration:
 

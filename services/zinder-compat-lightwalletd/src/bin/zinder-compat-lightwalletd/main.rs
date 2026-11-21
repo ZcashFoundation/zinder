@@ -101,7 +101,7 @@ enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
-    /// Append complete settled segments to a signed wallet history catalog, then exit.
+    /// Append complete settled segments to a signed wallet history catalog.
     PublishShieldedHistory(publish_history::PublishHistory),
 }
 
@@ -173,7 +173,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
         }
     };
     if let Some(Command::PublishShieldedHistory(args)) = command {
-        return args.publish(&lightwalletd_config);
+        return args.publish(&lightwalletd_config).await;
     }
     tracing::info!(
         target: "zinder::compat_lightwalletd",
