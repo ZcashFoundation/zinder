@@ -372,20 +372,36 @@ pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
     false
 }
 
+/// The instruction-set features a Pasta backend requires beyond its baseline.
+///
+/// The x86-64 assembly backend uses BMI2 and ADX and does not detect them;
+/// every other backend, including the portable one, needs nothing extra.
+#[cfg(any(target_arch = "x86_64", test))]
+fn required_pasta_backend_features(backend: &str) -> &'static [&'static str] {
+    match backend {
+        "x86-64" => &["bmi2", "adx"],
+        _ => &[],
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
-    if pasta_curves::BACKEND == "x86-64" {
-        let required = [
-            ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-            ("adx", std::arch::is_x86_feature_detected!("adx")),
-        ];
-        required
-            .into_iter()
-            .filter(|(_, detected)| !detected)
-            .map(|(feature, _)| feature)
-            .collect()
-    } else {
-        Vec::new()
+    required_pasta_backend_features(pasta_curves::BACKEND)
+        .iter()
+        .copied()
+        .filter(|feature| !host_has_x86_feature(feature))
+        .collect()
+}
+
+/// Reports whether the host provides the named x86-64 feature. `std::arch`
+/// detection needs a literal feature name, so the mapping lives here rather
+/// than in a data table.
+#[cfg(target_arch = "x86_64")]
+fn host_has_x86_feature(feature: &str) -> bool {
+    match feature {
+        "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+        "adx" => std::arch::is_x86_feature_detected!("adx"),
+        _ => true,
     }
 }
 
@@ -396,7 +412,9 @@ fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_pasta_backend_cpu_features, pasta_backend};
+    use super::{
+        missing_pasta_backend_cpu_features, pasta_backend, required_pasta_backend_features,
+    };
 
     #[test]
     fn pasta_backend_names_a_known_backend() {
@@ -424,5 +442,13 @@ mod tests {
                 pasta_backend()
             );
         }
+    }
+
+    #[test]
+    fn required_features_match_the_upstream_x86_64_isa() {
+        assert_eq!(required_pasta_backend_features("x86-64"), ["bmi2", "adx"]);
+        assert_eq!(required_pasta_backend_features("portable"), &[] as &[&str]);
+        assert_eq!(required_pasta_backend_features("aarch64"), &[] as &[&str]);
+        assert_eq!(required_pasta_backend_features("armv7em"), &[] as &[&str]);
     }
 }
