@@ -114,6 +114,12 @@ def fee(engine, amount, value, source):
             "ledger_delta_zat": None if engine == "zally" else -(amount + value)}
 
 
+def vizor_source_pins():
+    root = "/private/source/vizor/rust/"
+    return {root + name: token(value) for name, value in (
+        ("src/lib.rs", "lib"), ("Cargo.toml", "manifest"), ("Cargo.lock", "vizor-lock"))}
+
+
 def provenance(engine, sources, engine_sha=None):
     record = {"engine_binary_sha256": (engine_sha or ENGINE_SHA)[engine],
               "rustc": "rustc 1.100.0",
@@ -123,7 +129,7 @@ def provenance(engine, sources, engine_sha=None):
     if engine == "vizor":
         record.update({"source_commit": VIZOR_COMMIT,
                        "archive_sha256": token("vizor-archive"),
-                       "lock_sha256": token("vizor-lock"),
+                       **counterparty_builds.vizor_source_fields(record["source"], vizor_source_pins()),
                        "driver_sha256": digest(dict(sources)["vizor-payment.rs"]),
                        "provenance_sha256": token("vizor-provenance"),
                        "build_log_sha256": token("vizor-build-log")})
@@ -259,6 +265,7 @@ def receipt(engine, ready_path, ready_data, sources, release=RELEASE,
     pins["Cargo.lock"] = token(f"{engine}-lock")
     if engine == "vizor":
         pins["engine-source.json"] = token("vizor-provenance")
+        pins.update(vizor_source_pins())
     if engine == "devtool":
         pins["lightwalletd-identity.py"] = PROBE_SHA
     for name in roles.SERVICES:
@@ -279,6 +286,9 @@ def receipt(engine, ready_path, ready_data, sources, release=RELEASE,
         back_value, back_source = 10_000, "wallet confirmed network fee"
     out_fee = fee(engine, AMOUNTS["engine_pays"], out_value, out_source)
     back_fee = fee(engine, AMOUNTS["engine_returns"], back_value, back_source)
+    if engine == "vizor":
+        out_fee["proposal_fee_zat"] = out_value
+        back_fee["proposal_fee_zat"] = back_value
     payer_balance = 500_000_000 - out_fee["debit_zat"]
     history = None if engine == "zally" else 1
     engine_wallet = None if engine == "zally" else {
@@ -497,7 +507,7 @@ class CounterpartyCase(unittest.TestCase):
             block = provenance(engine, roles.local_sources(engine))
             keys = ("label", "commit", "lock_sha256")
             if engine == "vizor":
-                keys = ("label", "source_commit", "archive_sha256", "driver_sha256", "lock_sha256")
+                keys = ("label", "source_commit", "archive_sha256", "driver_sha256", "lock_sha256", "rust_source_sha256", "source_manifest_sha256")
             record = {key: block[key] for key in keys}
             if engine == "zally":
                 record["harness_sha256"] = block["harness_sha256"]
@@ -952,6 +962,16 @@ class CounterpartyRows(CounterpartyCase):
             with self.assertRaisesRegex(ValueError, "registered executable"):
                 roles.counterparty_actions(changed.receipt_path(engine), RELEASE)
         self.reject("vizor", lambda r: r["provenance"]["zingo"].update(source="f" * 40))
+
+    def test_vizor_requires_the_selected_source_tree_and_the_observed_proposal(self):
+        for src in (None, "/different/source"):
+            self.reject("vizor", lambda r: r["provenance"]["engine"].update(source=src))
+        for field in ("src/lib.rs", "Cargo.toml", "Cargo.lock"):
+            def change(r):
+                for pins in (r["pins"]["client_inputs_sha256"], r["client_inputs_sha256_after"]):
+                    pins["/private/source/vizor/rust/" + field] = token("changed")
+            self.reject("vizor", change)
+        self.reject("vizor", lambda r: r["engine_pays"]["payer_fee"].pop("proposal_fee_zat"))
 
     def test_local_zally_build_record_binds_compiler_output_and_inputs(self):
         engine = "zally"

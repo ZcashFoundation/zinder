@@ -1,9 +1,16 @@
 """Source labels for the wallet executables used in the counterparty baseline."""
 
+import hashlib
+import json
+from pathlib import Path
+
+
 REGISTERED_BUILDS = {
     "5f09ca06fbcb758e0fc4a903cee5eb5642ac50a47b4169aeafb8b51bec575814": {
         "engine": "vizor",
         "label": "Vizor v0.0.65",
+        "rust_source_sha256": "308876075eab3a25001ee28e88ab3531d09dc936a9f6f9db6c1ca7de91bde4fb",
+        "source_manifest_sha256": "01b9810ac29a71268a2c62ebf8dedeeac0a161d0c6af7bb784a83bf3e654fbdf",
         "source_commit": "d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6",
         "archive_sha256": "0641e4f5ad8a37250dde1f90bd4faf36b981ed4bf07ff9048966d94ea5667d0c",
         "driver_sha256": "d1bec32b05f27cf9294a2f69d81ad4e2290d9fcf0b558de9f7183d1bc319bd74",
@@ -29,6 +36,19 @@ REGISTERED_BUILDS = {
         "version": "Zingo CLI 0.1.1"
     }
 }
+
+
+def vizor_source_fields(source, pins):
+    rust = Path(source) / "rust"
+    prefix = str(rust / "src") + "/"
+    files = {"src/" + key.removeprefix(prefix): value for key, value in pins.items() if key.startswith(prefix)}
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    manifest = pins.get(str(rust / "Cargo.toml"))
+    # The standalone build appends an empty [workspace] to the archived manifest.
+    if manifest == "b1e2b45c65437b00d91020f1f6b1e9bd83286c50ab3d21a55451c74014f58753":
+        manifest = "01b9810ac29a71268a2c62ebf8dedeeac0a161d0c6af7bb784a83bf3e654fbdf"
+    return {"rust_source_sha256": hashlib.sha256(encoded).hexdigest() if files else None,
+            "source_manifest_sha256": manifest, "lock_sha256": pins.get(str(rust / "Cargo.lock"))}
 
 
 def matches_source(engine, build, record):

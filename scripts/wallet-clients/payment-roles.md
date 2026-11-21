@@ -130,10 +130,11 @@ python3 scripts/wallet-clients/coverage.py compare "$output/roles.json" \
 
 The producer and collector check both the executable digest and its source
 inputs before assigning a version. A supplied executable with an unregistered
-digest produces an `unverified-inputs` receipt. To register a new build, retain
+digest produces an `unverified-inputs` receipt for a complete, disposable run. To register a new build, retain
 the source revision, lockfile, driver, build log, and digest of the executable
 reported by Cargo. Review those inputs before adding the digest and its source
-record to the registry. [Registered wallet builds](counterparty_builds.py)
+record to the registry. For Vizor, the receipt also binds the selected Rust source
+files, Cargo manifest, and lockfile to the release archive. [Registered wallet builds](counterparty_builds.py)
 
 For a Zally driver compiled by the runner, keep `zally-build.json` beside the
 receipt. It binds the executable selected by Cargo to the measured source
@@ -145,8 +146,8 @@ fails the comparison.
 
 ## What these runs establish
 
-Vizor’s confirmed transaction supplies the network fee. If the proposal supplies
-a fee, the two must agree. Devtool supplies its persisted transaction fee. A
+Vizor’s confirmed transaction supplies the network fee. The pinned driver also
+reports its proposal fee. Both values must be present and agree. Devtool supplies its persisted transaction fee. A
 missing, nonpositive, or inconsistent confirmed fee fails those payer cases.
 
 Vizor also exposes its outgoing pending row. Its incoming
@@ -166,8 +167,7 @@ decryption remain unexercised for this build. The connect trace identifies
 the wallet's destination. The probe measures the server's revision and block
 hash. Neither identifies the gRPC methods used by the wallet.
 
-Pending assertions describe the snapshot taken before mining. Across repeated
-Zally-to-Zingo payments, Zingo sometimes had a pending receive row at that
-instant. The receipt identifies the wallet height at which each settled credit was measured.
+Pending assertions describe the snapshot taken before mining. Across repeated transfers from devtool and Zally to Zingo, the pending receive
+row appeared in some pre-mining snapshots and was absent in others. The receipt identifies the wallet height at which each settled credit was measured.
 The coverage rows describe tested wallet engines and interfaces. Mobile apps,
 hardware signing, and production capacity require separate evidence.

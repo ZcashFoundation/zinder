@@ -23,7 +23,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
-from counterparty_builds import matches_build, matches_local_zally_build
+from counterparty_builds import matches_build, matches_local_zally_build, vizor_source_fields
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -170,11 +170,16 @@ def directory_files(path):
     return [path] if path.is_file() else []
 
 
-def input_hashes(paths):
+def input_hashes(paths, vizor_source=None):
     hashes = {}
     for root in paths:
         for path in directory_files(root):
             hashes[str(path.resolve())] = digest(path)
+    if vizor_source is not None:
+        rust = Path(vizor_source).resolve() / "rust"
+        for path in (rust / "Cargo.toml", rust / "Cargo.lock", *(rust / "src").rglob("*")):
+            if path.is_file():
+                hashes[str(path)] = digest(path)
     return hashes
 
 
@@ -257,9 +262,8 @@ def engine_payer(engine, amount, sent, before, after, detail, delta):
         fee = detail.get("network_fee")
         fee_source = "wallet confirmed network fee"
         proposal = sent.get("fee_zatoshi")
-        if proposal is not None:
-            require(type(proposal) is int and proposal > 0 and proposal == fee,
-                    "Vizor proposal fee differs from the confirmed transaction fee")
+        require(type(proposal) is int and proposal > 0 and proposal == fee,
+                "Vizor proposal fee is missing or differs from the confirmed transaction fee")
     elif engine == "devtool":
         fee = detail.get("fee_zat")
         fee_source = "wallet transaction fee_paid"
@@ -659,7 +663,7 @@ def build_zally_for_run(source, directory, evidence):
     return binary
 
 
-def provenance(engine, args, engine_binary, local_build=None):
+def provenance(engine, args, engine_binary, local_build=None, *, pins=None):
     record = {"engine_binary_sha256": digest(engine_binary), "rustc": rust_version()}
     if engine == "devtool":
         state = git_state(args.devtool_source)
@@ -681,10 +685,10 @@ def provenance(engine, args, engine_binary, local_build=None):
         source = json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
         build_log = args.vizor_build_log
         record.update({
-            "source": str(args.vizor_source),
+            "source": str(args.vizor_source.resolve()),
             "source_commit": source.get("vizor_source"),
             "archive_sha256": source.get("release_archive_sha256"),
-            "lock_sha256": source.get("lock_sha256"),
+            **vizor_source_fields(args.vizor_source.resolve(), pins),
             "driver_sha256": digest(HERE / "vizor-payment.rs"),
             "provenance_sha256": digest(provenance_path) if provenance_path.is_file() else None,
             "build_log_sha256": digest(build_log) if build_log and Path(build_log).is_file() else None,
@@ -980,7 +984,7 @@ def main():
                 require('"NU6.3" = 2' in node_config.read_text(),
                         "could not derive the Vizor schedule")
             input_paths.append(node_config)
-            before_inputs = input_hashes(input_paths)
+            before_inputs = input_hashes(input_paths, args.vizor_source if engine == "vizor" else None)
             ready, ready_path = fixture_up(state_root, base, evidence, project, node_config,
                                            images_path=images_path, bin_dir=bin_dir,
                                            revision=revision, images_name=images_name)
@@ -993,7 +997,7 @@ def main():
                     "--ready must be the named project's immutable readiness receipt")
             ready = json.loads(ready_path.read_text())
             require(ready.get("project") == project, "reused fixture receipt names another project")
-            before_inputs = input_hashes(input_paths)
+            before_inputs = input_hashes(input_paths, args.vizor_source if engine == "vizor" else None)
         from wallet_fixture import binding, loopback
         binding(ready_path)
         for service in ("compat_ops", "query_ops", "native_wallet_query"):
@@ -1013,7 +1017,7 @@ def main():
             require_identity(before, ready, revision, "before admission")
             live = {"before": before, "endpoint": ready["lightwalletd"],
                     "negative_controls": lightwalletd_negatives(args, ready, node, revision)}
-        template = provenance(engine, args, engine_binary, local_build)
+        template = provenance(engine, args, engine_binary, local_build, pins=before_inputs)
         zingo_record = zingo_provenance(zingo)
         pins = {"release": args.release_tag, "release_commit": revision,
                 "fixture_ready_sha256": digest(ready_path), "node_image": ready.get("node_image"),
@@ -1105,7 +1109,7 @@ def main():
         else:
             cleanup.update({"reused_fixture": True, "verified": None})
         receipt["cleanup"] = cleanup
-        after_inputs = input_hashes(input_paths)
+        after_inputs = input_hashes(input_paths, args.vizor_source if engine == "vizor" else None)
         receipt["client_inputs_sha256_after"] = after_inputs
         inputs_stable = before_inputs is not None and after_inputs == before_inputs
         receipt["inputs_stable"] = inputs_stable

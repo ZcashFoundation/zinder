@@ -109,7 +109,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from counterparty_builds import matches_build, matches_local_zally_build
+from counterparty_builds import matches_build, matches_local_zally_build, vizor_source_fields
 from coverage_evidence import digest, load, require
 
 
@@ -837,8 +837,8 @@ def fee_claim(engine, value, amount, where):
             f"{where}: payer ledger delta does not reconcile the debit")
     source = value.get("fee_source")
     require(source == FEE_SOURCES[engine], f"{where}: wrong fee source for {engine}")
-    if "proposal_fee_zat" in value:
-        proposal = value["proposal_fee_zat"]
+    if engine == "vizor" or "proposal_fee_zat" in value:
+        proposal = value.get("proposal_fee_zat")
         require(engine == "vizor" and type(proposal) is int and proposal == value["fee_zat"],
                 f"{where}: proposal and confirmed fees differ")
     return {"amount": amount, "fee": value["fee_zat"],
@@ -1291,6 +1291,11 @@ def version_claim(result, engine, pins, inputs, receipt_dir):
         require(isinstance(block.get(key), str) and block[key].strip(),
                 f"{engine}: verified label lacks {key}")
     if engine == "vizor":
+        source = block.get("source")
+        require(isinstance(source, str) and Path(source).is_absolute(),
+                "vizor: verified label lacks its measured source directory")
+        require(all(block.get(k) == v and v is not None for k, v in vizor_source_fields(source, inputs).items()),
+                "vizor: source files differ from the recorded build")
         commit(block.get("source_commit"), f"{engine} source")
         token(block.get("archive_sha256"), f"{engine} archive")
         require(block.get("driver_sha256") == pin_value(inputs, ("vizor-payment.rs",)),

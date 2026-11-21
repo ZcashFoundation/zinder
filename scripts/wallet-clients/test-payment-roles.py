@@ -25,6 +25,40 @@ V0_22_0_COMMIT = "999d51ab835037a2466763ca1a1e7739a26b72c1"
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_vizor_producer_verifies_the_selected_tree_and_executable(self):
+        builds = importlib.import_module("counterparty_builds")
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            rust = root / "rust"
+            (rust / "src").mkdir(parents=True)
+            lib = rust / "src/lib.rs"
+            lib.write_text("pub fn verify() {}")
+            (rust / "Cargo.toml").write_text("manifest")
+            (rust / "Cargo.lock").write_text("lock")
+            binary = root / "wallet"
+            binary.write_bytes(b"wallet")
+            metadata = root / "engine-source.json"
+            metadata.write_text(json.dumps({"vizor_source": "a" * 40, "release_archive_sha256": "b" * 64}))
+            args = SimpleNamespace(vizor_source=root, vizor_provenance=metadata, vizor_build_log=None)
+            fields = builds.vizor_source_fields(root, MODULE["input_hashes"]([], root))
+            reference = dict(fields, engine="vizor", label="Vizor v0.0.65", source_commit="a" * 40,
+                             archive_sha256="b" * 64, driver_sha256=MODULE["digest"](SCRIPTS / "vizor-payment.rs"))
+
+            def verified():
+                observed = MODULE["input_hashes"]([], args.vizor_source)
+                return MODULE["provenance"]("vizor", args, binary, pins=observed)["label_verified"]
+
+            with patch.dict(builds.REGISTERED_BUILDS, {MODULE["digest"](binary): reference}):
+                self.assertTrue(verified())
+                args.vizor_source = root / "absent"
+                self.assertFalse(verified())
+                args.vizor_source = root
+                lib.write_text("pub fn changed() {}")
+                self.assertFalse(verified())
+                lib.write_text("pub fn verify() {}")
+                binary.write_bytes(b"other build")
+                self.assertFalse(verified())
+
     def test_local_build_refuses_a_dirty_checkout_before_cargo(self):
         with tempfile.TemporaryDirectory() as work:
             folder = Path(work)
@@ -43,13 +77,12 @@ class ReproducibilityTests(unittest.TestCase):
             for amount in (None, 0, -1, "10", True, 11):
                 with self.subTest(engine=engine, amount=amount), self.assertRaises(ValueError):
                     payer(engine, 100, {"fee_zatoshi": 10}, 500, 390, {field: amount}, -110)
-        for proposed in (-1, True, "10", 11):
+        for proposed in (None, -1, True, "10", 11):
             with self.assertRaisesRegex(ValueError, "proposal"):
                 payer("vizor", 100, {"fee_zatoshi": proposed}, 500, 390, {"network_fee": 10}, -110)
-        for sent in ({}, {"fee_zatoshi": 10}):
-            f = payer("vizor", 100, sent, 500, 390, {"network_fee": 10}, -110)
-            self.assertEqual(f["fee_source"], "wallet confirmed network fee")
-            self.assertEqual(f.get("proposal_fee_zat"), sent.get("fee_zatoshi"))
+        f = payer("vizor", 100, {"fee_zatoshi": 10}, 500, 390, {"network_fee": 10}, -110)
+        self.assertEqual(f["fee_source"], "wallet confirmed network fee")
+        self.assertEqual(f["proposal_fee_zat"], 10)
         residual = payer("zally", 100, {}, 500, 390, {}, None)
         self.assertEqual(residual["fee_zat"], 10)
         self.assertIn("derived", residual["fee_source"])

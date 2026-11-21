@@ -142,7 +142,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -197,7 +197,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -253,7 +253,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -294,7 +294,7 @@
         "own-receive-history-row-after-new-process": "pass",
         "reopen-balance-unchanged": "pass",
         "own-balance-after-payment-recorded": "pass",
-        "own-pending-state-observed": "unexercised",
+        "own-pending-state-observed": "pass",
         "node-mempool-pending-observed": "pass",
         "leg-balance-observed-after-confirmations": "pass",
         "recipient-fee-not-applicable": "pass"
@@ -305,7 +305,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -361,7 +361,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -413,7 +413,7 @@
       },
       "evidence": {
         "description": "Devtool counterparty payment roles / receipt.json",
-        "sha256": "89bb2b230133e815523bc7d54d5b85cc54b1962c2fd3c1194e2e290c5fd22ae0"
+        "sha256": "0855440318cc8e855927e03b76ebf5b6d60bd706af55059f5a5724a07db48a8e"
       }
     },
     {
@@ -468,7 +468,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -523,7 +523,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -579,7 +579,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -631,7 +631,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -687,7 +687,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -739,7 +739,7 @@
       },
       "evidence": {
         "description": "Vizor counterparty payment roles / receipt.json",
-        "sha256": "d87166812c67036945739d1568948681f7768ad9097f31d8ae949f20092b16ac"
+        "sha256": "c8ca5dc7d4013d95605fcf815376eb228478d17f086bd50026557dce61671aa6"
       }
     },
     {
@@ -794,7 +794,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
@@ -849,7 +849,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
@@ -904,7 +904,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
@@ -956,7 +956,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
@@ -1011,7 +1011,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
@@ -1063,7 +1063,7 @@
       },
       "evidence": {
         "description": "Zally counterparty payment roles / receipt.json",
-        "sha256": "e4901f58cb3bc472ed34c048d427c7987cf3627e1cf58d3770b49c3be2d0d3f1"
+        "sha256": "be2979a622f940ed41756fa7da29dcd7323dbc4231d697fee83cfc7af76e8c5d"
       }
     },
     {
