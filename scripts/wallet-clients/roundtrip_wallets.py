@@ -115,8 +115,8 @@ class Zingo:
     def transparent_address(self):
         return json.loads(self._cli("t_addresses"))[0]["encoded_address"]
 
-    def snapshot(self):
-        sync = json.loads(self._cli("sync", "status", online=True))
+    def snapshot(self, *, online=True):
+        sync = json.loads(self._cli("sync", "status", online=online))
         height = max((int(r["end_block"]) for r in sync["scan_ranges"] if r["priority"] == "Scanned"),
                      default=self.birthday - 1)
         balances = re.findall(r"(?m)^\s*confirmed_(?:transparent|sapling|orchard|ironwood)_balance: ([\d_]+)$",

@@ -208,6 +208,10 @@ jobs:
           python3 -B scripts/wallet-clients/test-audit-wallet-roundtrip.py
           python3 -B scripts/wallet-clients/test-roundtrip-regtest-command.py
           python3 -B scripts/wallet-clients/coverage_test.py
+          python3 -B scripts/wallet-clients/test-coverage-counterparty-roles.py
+          python3 -B scripts/wallet-clients/test-payment-roles.py
+          python3 -B scripts/wallet-clients/test-zally-payment.py
+          python3 -B scripts/wallet-clients/test-devtool-endpoint-identity.py
           python3 -B scripts/wallet-clients/test-coverage-evidence.py
           python3 -B scripts/wallet-clients/payment-recovery-test.py
           python3 -B scripts/wallet-clients/transport-payment-test.py

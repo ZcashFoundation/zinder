@@ -10,6 +10,8 @@ For other engines, use the [Vizor build and replay](vizor.md), [Cake build and r
 
 ## Prerequisites
 
+To exercise Vizor, zcash-devtool, or Zally as both payer and recipient against Zingo, follow the [counterparty payment procedure](payment-roles.md).
+
 Provision the dedicated node and serving endpoint with the [Regtest fixture command](../../docs/runbooks/testing.md). Use its immutable `ready.initial.json`. The manifest derives the node and lightwalletd addresses from this receipt. Before funding, the adapter compares the live schedule, node block hash, and lightwalletd compact block hash against the pinned chain anchor. The adapters accept numeric loopback HTTP endpoints and mine only through the node identified by the receipt. Never supply an existing operator wallet or production node.
 
 The unmodified engine schedules differ:
