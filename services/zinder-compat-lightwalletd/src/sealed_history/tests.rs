@@ -385,6 +385,27 @@ fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+fn kernel_protected_segment_with_sha512_rejects_a_signed_sha256_pin() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 3)?;
+    let status = std::process::Command::new("fsverity")
+        .args(["enable", "--hash-alg", "sha512", "--block-size", "4096"])
+        .arg(&path)
+        .status()?;
+    eyre::ensure!(status.success(), "fsverity enable failed: {status}");
+    assert_eq!(
+        SealedHistory::open(&path, identity)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    Ok(())
+}
+
 #[test]
 fn payload_length_bounds_include_the_exact_limit_and_native_length() {
     assert!(validate_lengths(1, 0).is_err());
