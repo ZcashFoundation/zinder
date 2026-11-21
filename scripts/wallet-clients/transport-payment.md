@@ -15,6 +15,6 @@ Prepare the [wallet clients, Python environment, and fixture inputs](roundtrip.m
 
 Both wallets and the control node first observe the pending 0.10 TAZ transfer. The runner stops the native relay and checks that its listener is down while the native service, lightwalletd, and control node remain available. It mines ten blocks, checks that the original payment is canonical, and restores the same local endpoint.
 
-A passing receipt requires the original Zallet process identity throughout the outage, one reconciled payment at the canonical height, the decrypted fixture memo, the expected credit and fee, and spendable funds. Zallet then signs a 0.04 TAZ return. A subsequent intentional wallet restart verifies that both ledgers persisted. Private logs and wallet data stay beside the receipt.
+After reconnecting, the original Zallet process must scan through the node tip recorded during the outage. The same wallet snapshot must show exactly one confirmed payment at its canonical height, with the expected amount and decrypted fixture memo. The runner also checks the fee and spendable balance. Zallet then signs a 0.04 TAZ return. A subsequent intentional wallet restart verifies that both ledgers persisted. Private logs and wallet data stay beside the receipt.
 
 This exercises one interrupted native connection on Regtest. For a stopped wallet or a shallow rollback, use the [payment recovery cases](payment-recovery.md).

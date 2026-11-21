@@ -58,6 +58,10 @@ def reachable(port):
         return False
 
 
+def scanned_through(height, target):
+    return type(height) is int and type(target) is int and 0 <= target <= height
+
+
 class Transport(RECOVERY.Recovery):
     def __init__(self, args):
         super().__init__("transport", args)
@@ -157,9 +161,9 @@ class Transport(RECOVERY.Recovery):
             return {"available": False, "error": type(error).__name__}
         return {"available": True, "fully_synced_height": status.get("fully_synced_height")}
 
-    def wait_process_confirmed(self, txid, height, identity=None, amount=None, memo=None, timeout=None):
-        """Wait for one confirmed, fully decrypted row, optionally pinning the wallet process."""
-        deadline = time.monotonic() + (timeout or self.args.wait_seconds)
+    def wait_process_confirmed(self, txid, height, outage_tip, identity=None):
+        """Wait for the decrypted payment and the wallet scan through the outage tip."""
+        deadline = time.monotonic() + self.args.wait_seconds
         last = None
         while time.monotonic() < deadline:
             if identity is not None:
@@ -173,10 +177,12 @@ class Transport(RECOVERY.Recovery):
                 rows = transaction_rows(snapshot, txid)
                 require(len(rows) <= 1, "Zallet returned duplicate transfer entries")
                 if len(rows) == 1 and rows[0]["height"] == height and not rows[0]["pending"]:
-                    if amount is None or (rows[0]["amount_zat"] == amount and memo in rows[0]["memos"]):
+                    if (scanned_through(snapshot["height"], outage_tip)
+                            and rows[0]["amount_zat"] == OUTBOUND and MEMO_OUTBOUND in rows[0]["memos"]):
                         return snapshot
                     last = {"amount_zat": rows[0]["amount_zat"],
-                            "expected_memo_present": None if memo is None else memo in rows[0]["memos"],
+                            "expected_memo_present": MEMO_OUTBOUND in rows[0]["memos"],
+                            "scanned_height": snapshot["height"], "outage_tip": outage_tip,
                             "height": rows[0]["height"]}
                 else:
                     last = {"rows": len(rows)}
@@ -249,8 +255,8 @@ class Transport(RECOVERY.Recovery):
                 "Zallet process exited before reconnecting")
         self.receipt["transport"]["restored"] = restored
         try:
-            same_process = self.wait_process_confirmed(txid, inclusion["height"], zallet_identity,
-                                                       amount=OUTBOUND, memo=MEMO_OUTBOUND)
+            same_process = self.wait_process_confirmed(
+                txid, inclusion["height"], down["node_tip"], identity=zallet_identity)
         except BaseException as error:
             changed = self.zallet._owned_identity() != zallet_identity
             self.receipt["same_process"] = {
@@ -259,7 +265,7 @@ class Transport(RECOVERY.Recovery):
                 "error": f"{type(error).__name__}: {error}",
             }
             self.receipt["assertions"]["same_process_reconnected_without_restart"] = False
-            self.receipt["restart_control"] = self.restart_control(txid, inclusion["height"])
+            self.receipt["restart_control"] = self.restart_control(txid, inclusion["height"], down["node_tip"])
             raise
         require(self.zallet._owned_identity() == zallet_identity,
                 "Zallet process changed before accounting")
@@ -345,10 +351,10 @@ class Transport(RECOVERY.Recovery):
         super().check_result()
         validate_receipt(self.receipt)
 
-    def restart_control(self, txid, height):
+    def restart_control(self, txid, height, outage_tip):
         try:
             self.zallet.restart()
-            self.wait_process_confirmed(txid, height, amount=OUTBOUND, memo=MEMO_OUTBOUND)
+            self.wait_process_confirmed(txid, height, outage_tip)
             return {"confirmed_after_restart": True, "height": height}
         except Exception as error:
             return {"confirmed_after_restart": False,
@@ -365,6 +371,10 @@ def validate_receipt(receipt):
     require(isinstance(receipt.get("assertions"), dict),
             "transport receipt assertions must be an object")
     if receipt["status"] == "passed":
+        scenario = receipt.get("scenario", {})
+        require(scanned_through(scenario.get("outbound", {}).get("fully_synced_height"),
+                                scenario.get("outage", {}).get("node_tip")),
+                "Zallet did not scan through the outage tip")
         require(receipt["assertions"], "a passed transport receipt has no assertions")
         require(all(value is True for value in receipt["assertions"].values()),
                 "a passed transport receipt has an unproven assertion")
