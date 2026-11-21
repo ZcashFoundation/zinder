@@ -87,7 +87,7 @@ def run(args):
         trace = args.evidence / f"{step}-{command}-{time.time_ns()}"
         argv = [sys.executable, str(args.trace_tool), "--endpoint-port", str(port),
                 "--output", str(trace), "--", str(args.engine), command, str(args.scratch),
-                endpoint, str(heights["37a5165b"]), revision]
+                endpoint, str(heights["37a5165b"]), revision, str(anchor_height), anchor_hash]
         with (args.evidence / f"{trace.name}.stderr").open("w") as errors:
             output = subprocess.run(argv, stdout=subprocess.PIPE, stderr=errors, text=True, check=True)
         observed = json.loads((trace / "report.json").read_text())

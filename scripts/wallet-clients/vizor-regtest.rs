@@ -3,27 +3,53 @@ use rust_lib_zcash_wallet::api::{simple, sync, wallet};
 use serde_json::{Value, json};
 use std::{env, fs, path::Path, time::Duration};
 use tonic::transport::Endpoint;
-use zcash_client_backend::proto::service::{
-    Empty, compact_tx_streamer_client::CompactTxStreamerClient,
+use zcash_client_backend::proto::{
+    compact_formats::CompactBlock,
+    service::{BlockId, Empty, compact_tx_streamer_client::CompactTxStreamerClient},
 };
+use zcash_primitives::block::BlockHash;
 
 const NETWORK: &str = "regtest";
 
-async fn verify_endpoint(url: &str, revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_anchor(
+    block: &CompactBlock,
+    height: u64,
+    display_hash: &str,
+) -> Result<(), &'static str> {
+    let hash =
+        BlockHash::try_from_slice(&block.hash).ok_or("invalid wallet endpoint block hash")?;
+    if block.height != height || hash.to_string() != display_hash {
+        return Err("wallet endpoint block differs from the immutable fixture anchor");
+    }
+    Ok(())
+}
+
+async fn verify_endpoint(
+    url: &str,
+    revision: &str,
+    height: u64,
+    display_hash: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(5);
     let channel = Endpoint::from_shared(url.to_owned())?
         .connect_timeout(timeout)
         .timeout(timeout)
         .connect()
         .await?;
-    let info = CompactTxStreamerClient::new(channel)
-        .get_lightd_info(Empty {})
-        .await?
-        .into_inner();
+    let mut client = CompactTxStreamerClient::new(channel);
+    let info = client.get_lightd_info(Empty {}).await?.into_inner();
     // Zinder uses the BIP70 chain name "test" for Regtest on the lightwalletd interface.
     if info.chain_name != "test" || info.git_commit != revision {
         return Err("live wallet endpoint identity differs from the selected fixture".into());
     }
+    let block = client
+        .get_block(BlockId {
+            height,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    verify_anchor(&block, height, display_hash)?;
     Ok(())
 }
 
@@ -58,9 +84,18 @@ fn snapshot(db: &str) -> Result<Value, String> {
 
 fn run() -> Result<Value, String> {
     let args: Vec<_> = env::args().skip(1).collect();
-    let [command, scratch, endpoint, activation, revision] = args.as_slice() else {
+    let [
+        command,
+        scratch,
+        endpoint,
+        activation,
+        revision,
+        anchor_height,
+        anchor_hash,
+    ] = args.as_slice()
+    else {
         return Err(
-            "usage: vizor-regtest COMMAND PRIVATE-DIRECTORY LOOPBACK-URL NU6.3-HEIGHT REVISION"
+            "usage: vizor-regtest COMMAND PRIVATE-DIRECTORY LOOPBACK-URL NU6.3-HEIGHT REVISION ANCHOR-HEIGHT ANCHOR-HASH"
                 .into(),
         );
     };
@@ -74,7 +109,12 @@ fn run() -> Result<Value, String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
-        .block_on(verify_endpoint(endpoint, revision))
+        .block_on(verify_endpoint(
+            endpoint,
+            revision,
+            anchor_height.parse::<u64>().map_err(|e| e.to_string())?,
+            anchor_hash,
+        ))
         .map_err(|e| e.to_string())?;
     simple::configure_regtest_ironwood_activation_height(
         activation.parse::<u32>().map_err(|e| e.to_string())?,
@@ -193,5 +233,35 @@ fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_block_must_match_the_regtest_fixture_at_height_400() -> Result<(), hex::FromHexError>
+    {
+        let fixture = "464c8e4936125e4cd5563013a368aa7c3ba36f080a3bcbc7e2ac6321df798579";
+        let other_regtest = "361a5946f62f99dc3766bc73fbeaa6acb476c37627900799d20f86c5d5ca0037";
+        let testnet_checkpoint = "000393fe014f5ff5de7c9f0aa669ee074c9a7743a6bdc1d1686149b4b36090d8";
+        for (display_hash, same_chain) in [
+            (fixture, true),
+            (other_regtest, false),
+            (testnet_checkpoint, false),
+        ] {
+            let mut hash = hex::decode(display_hash)?;
+            hash.reverse();
+            let block = CompactBlock {
+                height: 400,
+                hash,
+                ..Default::default()
+            };
+            assert_eq!(verify_anchor(&block, 400, fixture).is_ok(), same_chain);
+            assert!(verify_anchor(&block, 399, fixture).is_err());
+        }
+        assert!(verify_anchor(&CompactBlock::default(), 0, fixture).is_err());
+        Ok(())
     }
 }

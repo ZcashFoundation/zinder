@@ -43,7 +43,9 @@ For a candidate compatibility service on the same node, supply its readiness
 receipt with `--candidate` and choose fresh manifest, trace, and output paths.
 The receipt must identify the release revision, the candidate source and binary,
 the shared node, and a distinct wallet endpoint. The live service must report
-that revision through both `/healthz` and `GetLightdInfo` before wallet access.
+that revision through both `/healthz` and `GetLightdInfo`. Before opening a
+wallet, the driver also reads the fixture's anchor block through `GetBlock`
+and compares its height and hash with the immutable readiness receipt.
 For a locally built Zinder candidate, set `ZINDER_BUILD_GIT_COMMIT` to its full
 source commit when building the service.
 Inspect the ten steps and the restore, linked transaction, process restart,
