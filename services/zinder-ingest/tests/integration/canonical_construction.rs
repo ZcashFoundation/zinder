@@ -15,6 +15,10 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use zebra_chain::{
+    block::{Block as ZebraBlock, Height as ZebraHeight},
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
+};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
     CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
@@ -35,13 +39,14 @@ use zinder_store::{
     RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     TreeStateLookup,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{frontier_from_note_commitments, sample_regtest_upgrade_activations};
 
 use super::{
     canonical_block_context::{chained_source_block, pool_commitments, shielded_transactions},
     fixture_block::{
         fixture_ironwood_source_block, fixture_orchard_source_block, fixture_sapling_source_block,
-        fixture_source_block,
+        fixture_source_block, fixture_zakura_ironwood_source_block,
+        fixture_zakura_orchard_source_block,
     },
 };
 
@@ -1371,5 +1376,429 @@ async fn prior_sparse_store_reopens_under_every_block_default_without_rebuilding
             Some(TreeStateLookup::Replay(_))
         ));
     }
+    Ok(())
+}
+
+/// Multi-block Regtest source crossing NU6.3 (Ironwood) activation at height 603.
+///
+/// Uses captured Zebra and Zakura regtest blocks and derives expected
+/// checkpoints independently from raw consensus block bytes.
+#[derive(Clone)]
+struct IronwoodActivationConstructionSource {
+    blocks: Vec<SourceBlock>,
+    expected_checkpoints: Vec<CommitmentTreeCheckpoint>,
+}
+
+impl IronwoodActivationConstructionSource {
+    fn build(activations: &NetworkUpgradeActivations) -> Result<Self, Box<dyn std::error::Error>> {
+        let ironwood_603_fixture = fixture_ironwood_source_block()?;
+        let base_time = ironwood_603_fixture.block_time_seconds;
+        let predecessor_block_id =
+            BlockId::new(BlockHeight::new(601), BlockHash::from_bytes([0x61; 32]));
+        let predecessor_time = base_time.saturating_sub(20);
+
+        let block_602 = relink_captured_block(
+            fixture_zakura_orchard_source_block()?,
+            BlockHeight::new(602),
+            predecessor_block_id.hash,
+            base_time.saturating_sub(10),
+            Some((
+                &[0xff, 0xff, 0xff, 0xff, 0x29, 0x01, 0x6f],
+                &[0xff, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x5a, 0x02],
+            )),
+        )?;
+        let block_603 = relink_captured_block(
+            ironwood_603_fixture,
+            BlockHeight::new(603),
+            block_602.hash,
+            base_time,
+            None,
+        )?;
+        let block_604 = relink_captured_block(
+            fixture_zakura_ironwood_source_block()?,
+            BlockHeight::new(604),
+            block_603.hash,
+            base_time.saturating_add(10),
+            Some((
+                &[0xff, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x84, 0x00],
+                &[0xff, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x5c, 0x02],
+            )),
+        )?;
+        let template = fixture_zakura_orchard_source_block()?;
+        let block_605 = relink_captured_block(
+            coinbase_only_source_block(&template, 604)?,
+            BlockHeight::new(605),
+            block_604.hash,
+            base_time.saturating_add(20),
+            Some((
+                &[0xff, 0xff, 0xff, 0xff, 0x29, 0x01, 0x6f],
+                &[0xff, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x5d, 0x02],
+            )),
+        )?;
+        let block_606 = relink_captured_block(
+            coinbase_only_source_block(&template, 605)?,
+            BlockHeight::new(606),
+            block_605.hash,
+            base_time.saturating_add(30),
+            Some((
+                &[0xff, 0xff, 0xff, 0xff, 0x29, 0x01, 0x6f],
+                &[0xff, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x5e, 0x02],
+            )),
+        )?;
+
+        let blocks = vec![block_602, block_603, block_604, block_605, block_606];
+        let expected_checkpoints = derive_independent_checkpoints(
+            predecessor_block_id,
+            predecessor_time,
+            &blocks,
+            activations,
+        )?;
+        Ok(Self {
+            blocks,
+            expected_checkpoints,
+        })
+    }
+
+    fn expected_checkpoint_at(
+        &self,
+        height: u32,
+    ) -> Result<&CommitmentTreeCheckpoint, Box<dyn std::error::Error>> {
+        self.expected_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_id.height == BlockHeight::new(height))
+            .ok_or_else(|| {
+                format!("missing independent expected checkpoint at height {height}").into()
+            })
+    }
+}
+
+#[async_trait]
+impl NodeSource for IronwoodActivationConstructionSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        NodeCapabilities::default()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.blocks
+            .iter()
+            .find(|block| block.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "Ironwood activation test source has no block at the requested height"
+                    .to_owned(),
+            })
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        let next_height = limits
+            .cursor
+            .block_id()
+            .map_or(602, |cursor| cursor.height.value().saturating_add(1));
+        let max_blocks = usize::try_from(limits.max_connected_blocks.get()).unwrap_or(usize::MAX);
+        let segment = self
+            .blocks
+            .iter()
+            .filter(|block| block.height.value() >= next_height)
+            .take(max_blocks)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(SourceChainSegment::connected_blocks(segment))
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        let tip = self
+            .blocks
+            .last()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height: BlockHeight::new(606),
+                reason: "Ironwood activation test source has no blocks".to_owned(),
+            })?;
+        Ok(BlockId::new(tip.height, tip.hash))
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        _network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.expected_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_id.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "Ironwood activation test source has no checkpoint at the requested height"
+                    .to_owned(),
+            })
+    }
+}
+
+fn coinbase_only_source_block(
+    source_block: &SourceBlock,
+    lock_height: u32,
+) -> Result<SourceBlock, Box<dyn std::error::Error>> {
+    let mut parsed_block: ZebraBlock = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    let coinbase = parsed_block
+        .transactions
+        .first()
+        .ok_or("missing fixture coinbase")?;
+    let mut bytes = coinbase.zcash_serialize_to_vec()?;
+    // ZIP 244 excludes the coinbase input script from the txid. Use a distinct
+    // v5 lock height so the repeated transparent coinbase has a distinct txid.
+    assert_eq!(
+        bytes.get(..4),
+        Some(0x8000_0005_u32.to_le_bytes().as_slice())
+    );
+    bytes
+        .get_mut(12..16)
+        .ok_or("missing v5 lock time")?
+        .copy_from_slice(&lock_height.to_le_bytes());
+    parsed_block.transactions = vec![Arc::new(bytes.as_slice().zcash_deserialize_into()?)];
+    let raw_bytes = parsed_block.zcash_serialize_to_vec()?;
+    Ok(SourceBlock::from_raw_block_bytes(
+        Network::ZcashRegtest,
+        source_block.height,
+        raw_bytes,
+    )?)
+}
+
+fn relink_captured_block(
+    source_block: SourceBlock,
+    target_height: BlockHeight,
+    parent_hash: BlockHash,
+    block_time_seconds: u32,
+    coinbase_height_patch: Option<(&[u8], &[u8])>,
+) -> Result<SourceBlock, Box<dyn std::error::Error>> {
+    let mut raw_bytes = source_block.raw_block_bytes;
+    raw_bytes
+        .get_mut(4..36)
+        .ok_or("captured block is too short to rewrite parent hash")?
+        .copy_from_slice(&parent_hash.as_bytes());
+    raw_bytes
+        .get_mut(100..104)
+        .ok_or("captured block is too short to rewrite header timestamp")?
+        .copy_from_slice(&block_time_seconds.to_le_bytes());
+    if let Some((old_prefix, new_prefix)) = coinbase_height_patch {
+        let mut matches = raw_bytes
+            .windows(old_prefix.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == old_prefix).then_some(offset));
+        let offset = matches
+            .next()
+            .ok_or("captured block coinbase height prefix not found")?;
+        if matches.next().is_some() {
+            return Err("captured block coinbase height prefix was not unique".into());
+        }
+        raw_bytes.splice(
+            offset..offset.saturating_add(old_prefix.len()),
+            new_prefix.iter().copied(),
+        );
+    }
+    let parsed_block: ZebraBlock = raw_bytes.as_slice().zcash_deserialize_into()?;
+    if parsed_block.coinbase_height() != Some(ZebraHeight(target_height.value())) {
+        return Err(format!(
+            "relinked block coinbase height {:?} does not match target {}",
+            parsed_block.coinbase_height(),
+            target_height.value()
+        )
+        .into());
+    }
+    Ok(SourceBlock::from_raw_block_bytes(
+        Network::ZcashRegtest,
+        target_height,
+        raw_bytes,
+    )?)
+}
+
+/// Derives per-height expected checkpoints independently from consensus block
+/// bytes without invoking `prepare_canonical_block` or
+/// `CommitmentTreeAccumulator`.
+fn derive_independent_checkpoints(
+    predecessor_block_id: BlockId,
+    predecessor_time: u32,
+    blocks: &[SourceBlock],
+    activations: &NetworkUpgradeActivations,
+) -> Result<Vec<CommitmentTreeCheckpoint>, Box<dyn std::error::Error>> {
+    let ironwood_activation = activations
+        .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+        .ok_or("regtest activations must define Ironwood activation height")?;
+    let mut sapling_commitments = Vec::new();
+    let mut orchard_commitments = Vec::new();
+    let mut ironwood_commitments = Vec::new();
+
+    let predecessor_frontiers = CommitmentTreeFrontiers::from_validated_parts(
+        Some(frontier_from_note_commitments(
+            ShieldedProtocol::Sapling,
+            &sapling_commitments,
+        )?),
+        Some(frontier_from_note_commitments(
+            ShieldedProtocol::Orchard,
+            &orchard_commitments,
+        )?),
+        None,
+    )?;
+    let mut checkpoints = vec![CommitmentTreeCheckpoint::new(
+        predecessor_block_id,
+        predecessor_time,
+        predecessor_frontiers,
+    )];
+
+    for block in blocks {
+        let parsed_block: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
+        for transaction in &parsed_block.transactions {
+            for commitment in transaction.sapling_note_commitments() {
+                sapling_commitments.push(commitment.to_bytes());
+            }
+            for commitment in transaction.orchard_note_commitments() {
+                orchard_commitments.push(commitment.to_bytes());
+            }
+            for commitment in transaction.ironwood_note_commitments() {
+                ironwood_commitments.push(commitment.to_bytes());
+            }
+        }
+        let ironwood_frontier = if block.height >= ironwood_activation {
+            Some(frontier_from_note_commitments(
+                ShieldedProtocol::Ironwood,
+                &ironwood_commitments,
+            )?)
+        } else {
+            None
+        };
+        let frontiers = CommitmentTreeFrontiers::from_validated_parts(
+            Some(frontier_from_note_commitments(
+                ShieldedProtocol::Sapling,
+                &sapling_commitments,
+            )?),
+            Some(frontier_from_note_commitments(
+                ShieldedProtocol::Orchard,
+                &orchard_commitments,
+            )?),
+            ironwood_frontier,
+        )?;
+        checkpoints.push(CommitmentTreeCheckpoint::new(
+            BlockId::new(block.height, block.hash),
+            block.block_time_seconds,
+            frontiers,
+        ));
+    }
+    Ok(checkpoints)
+}
+
+fn assert_stored_checkpoint_matches(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+    expected: &CommitmentTreeCheckpoint,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(TreeStateLookup::Stored(served)) = store.tree_state_lookup(height, activations)?
+    else {
+        return Err(format!(
+            "dense construction crossing Ironwood activation must store checkpoint at height {}",
+            height.value()
+        )
+        .into());
+    };
+    assert_eq!(served.block_id(), expected.block_id);
+    assert_eq!(served.block_time_seconds(), expected.block_time_seconds);
+    assert_eq!(
+        served.final_state_bytes(ShieldedProtocol::Sapling),
+        expected
+            .frontiers
+            .sapling()
+            .map(CommitmentTreeFrontier::final_state_bytes)
+    );
+    assert_eq!(
+        served.final_state_bytes(ShieldedProtocol::Orchard),
+        expected
+            .frontiers
+            .orchard()
+            .map(CommitmentTreeFrontier::final_state_bytes)
+    );
+    assert_eq!(
+        served.final_state_bytes(ShieldedProtocol::Ironwood),
+        expected
+            .frontiers
+            .ironwood()
+            .map(CommitmentTreeFrontier::final_state_bytes)
+    );
+    let stored = store.tree_state_checkpoint_at(height, activations)?;
+    assert_eq!(stored.as_ref(), Some(expected));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_block_construction_stores_independent_checkpoints_across_ironwood_activation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source = IronwoodActivationConstructionSource::build(&activations)?;
+    let temporary = TempDir::new()?;
+    let mut config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    config.checkpoint_height = Some(BlockHeight::new(601));
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    assert_eq!(
+        store.history_bounds().first_available_height(),
+        BlockHeight::new(602)
+    );
+    assert_eq!(
+        store.event_fence().visible_tip().height,
+        BlockHeight::new(605)
+    );
+
+    for height in 601_u32..=605 {
+        let expected = source.expected_checkpoint_at(height)?;
+        assert_stored_checkpoint_matches(&store, BlockHeight::new(height), expected, &activations)?;
+    }
+
+    assert!(
+        source
+            .expected_checkpoint_at(602)?
+            .frontiers
+            .ironwood()
+            .is_none()
+    );
+    let activation_ironwood = source
+        .expected_checkpoint_at(603)?
+        .frontiers
+        .ironwood()
+        .ok_or("Ironwood frontier must be present at activation height 603")?;
+    let post_activation_ironwood = source
+        .expected_checkpoint_at(604)?
+        .frontiers
+        .ironwood()
+        .ok_or("Ironwood frontier must be present at post-activation height 604")?;
+    let tip_ironwood = source
+        .expected_checkpoint_at(605)?
+        .frontiers
+        .ironwood()
+        .ok_or("Ironwood frontier must be present at build tip height 605")?;
+    assert_eq!(activation_ironwood.tree_size(), 2);
+    assert_eq!(post_activation_ironwood.tree_size(), 5);
+    assert_eq!(tip_ironwood.tree_size(), 5);
+    assert_ne!(
+        activation_ironwood.final_root(),
+        post_activation_ironwood.final_root()
+    );
+    assert_eq!(post_activation_ironwood, tip_ironwood);
     Ok(())
 }
