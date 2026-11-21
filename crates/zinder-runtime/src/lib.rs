@@ -286,8 +286,8 @@ async fn await_terminating_signal() {
 /// this check.
 #[must_use]
 pub fn host_cpu_meets_compiled_baseline() -> bool {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if !host_has_avx_state() {
+    #[cfg(target_arch = "x86_64")]
+    if cfg!(target_feature = "avx2") && !host_has_avx_state() {
         tracing::error!(
             target: "zinder::runtime",
             event = "host_cpu_below_compiled_baseline",
@@ -356,7 +356,7 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         .collect()
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 fn host_has_avx_state() -> bool {
     raw_cpuid::CpuId::new()
         .get_feature_info()
@@ -368,7 +368,7 @@ fn host_has_avx_state() -> bool {
         })
 }
 
-#[cfg(all(target_arch = "x86_64", any(target_feature = "avx2", test)))]
+#[cfg(target_arch = "x86_64")]
 fn host_avx_enabled(
     can_read_avx_state: bool,
     read_xcr0: impl FnOnce() -> x86_64::registers::xcontrol::XCr0Flags,
