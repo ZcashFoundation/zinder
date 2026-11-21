@@ -274,3 +274,32 @@ fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn payload_length_bounds_include_the_exact_limit_and_native_length() {
+    assert!(validate_lengths(1, 0).is_err());
+    assert!(validate_lengths(1, 2).is_err());
+    assert!(validate_lengths(2, 1).is_ok());
+    assert!(validate_lengths(MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES).is_ok());
+    assert!(validate_lengths(MAX_PAYLOAD_BYTES + 1, MAX_PAYLOAD_BYTES + 1).is_err());
+}
+
+#[test]
+fn the_terminal_height_and_hash_end_the_segment() {
+    let segment = SegmentIdentity {
+        network: NETWORK,
+        start: id(1).height,
+        end: id(2),
+        sha256: [0; 32],
+    };
+    assert!(segment.check_block(id(1), hash(0), None).is_ok());
+    assert!(segment.check_block(id(2), hash(1), Some(id(1))).is_ok());
+    assert!(segment.check_block(id(2), hash(1), None).is_err());
+    assert!(segment.check_block(id(2), hash(0), Some(id(1))).is_err());
+    assert!(
+        segment
+            .check_block(BlockId::new(id(2).height, hash(3)), hash(1), Some(id(1)))
+            .is_err()
+    );
+    assert!(segment.check_block(id(3), hash(2), Some(id(2))).is_err());
+}
