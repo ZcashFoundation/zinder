@@ -31,18 +31,16 @@ def tx_digest(txid):
 
 
 def decode_memo(blob):
-    if not blob:
+    if blob is None:
         return None
-    raw = bytes(blob)
-    if len(raw) < 512:
+    # The SQLite view omits trailing zero padding, including on the ZIP 302 empty marker.
+    raw = bytes(blob).rstrip(b"\x00")
+    if raw == b"\xf6":
         return None
-    if raw[0] == 0xF6 and all(byte == 0 for byte in raw[1:]):
-        return None
-    if raw[0] == 0xFF:
-        return None
-    if raw[0] <= 0xF4:
-        return raw.rstrip(b"\x00").decode("utf-8")
-    return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"non_text": True}
 
 
 class Devtool:
@@ -205,7 +203,7 @@ class Devtool:
                                                      "value": row["value"],
                                                      "is_change": bool(row["is_change"]),
                                                      "memo": memo})
-                if memo:
+                if memo is not None:
                     memos.setdefault(txid, []).append(memo)
             rows = []
             for row in connection.execute(

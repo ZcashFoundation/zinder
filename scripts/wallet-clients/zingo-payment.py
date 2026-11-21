@@ -102,7 +102,7 @@ class Counterparty:
         return rows[0]
 
     def restart(self):
-        return self.snapshot()
+        return self.wallet.snapshot(online=False)
 
 
 def main():

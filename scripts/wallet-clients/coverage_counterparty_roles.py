@@ -62,8 +62,9 @@ unexercised. A label is never used without its digest binding.
 The producer records each leg's balances with the phase that measured them:
 `engine_pays.leg_observations.outbound`, and
 `engine_receives.leg_observations.inbound` / `.return`. Every nested block needs
-`engine_balance_after_zat`, `zingo_balance_after_zat`, and
-`observed_after_confirmations`. The inbound block also needs
+`engine_balance_after_zat`, `zingo_balance_after_zat`,
+`observed_after_confirmations`, `engine_height`, and `zingo_height`. Both wallet
+heights must equal the inclusion height plus nine. The inbound block also needs
 `before_return: true`. Nested balances must agree with the flat balances the
 receipt records; a conflict is rejected. The `outbound` and `return` blocks add
 the confirmation-phase assertion. Without them the flat balances remain usable
@@ -1026,7 +1027,7 @@ def ledger(result, engine, ready):
     }
 
 
-def nested_observations(result, engine):
+def nested_observations(result, engine, facts):
     """Read the producer's per-leg balances with the phase that measured them."""
     normalized = {}
     owners = (
@@ -1047,14 +1048,18 @@ def nested_observations(result, engine):
                     f"{engine}: {producer_leg} leg observation is duplicated")
             require(isinstance(entry, dict),
                     f"{engine}: {producer_leg} leg observation is not an object")
-            require(set(entry) <= NESTED_OBSERVATION_KEYS[producer_leg],
+            require(set(entry) <= NESTED_OBSERVATION_KEYS[producer_leg] | {"engine_height", "zingo_height"},
                     f"{engine}: {producer_leg} leg observation has unexpected fields")
             for key in BALANCE_KEYS:
                 require(type(entry.get(key)) is int and entry[key] >= 0,
                         f"{engine}: {producer_leg} {key} is not a balance")
             confirmations = entry.get("observed_after_confirmations")
-            require(type(confirmations) is int and confirmations >= 1,
+            require(type(confirmations) is int and confirmations == 10,
                     f"{engine}: {producer_leg} observation lacks its confirmation phase")
+            expected_height = facts[leg]["tx"]["mined_height"] + confirmations - 1
+            for key in ("engine_height", "zingo_height"):
+                require(type(entry.get(key)) is int and entry[key] == expected_height,
+                        f"{engine}: {leg} {key} does not match the ten-confirmation height")
             if producer_leg == "inbound":
                 require(entry.get("before_return") is True,
                         f"{engine}: inbound balance observation is not before the return")
@@ -1074,7 +1079,7 @@ def nested_observations(result, engine):
 def balance_observations(result, engine, facts):
     """Normalize per-leg history, pending, and balance observations."""
     raw = validate_leg_observations(result, engine)
-    nested = nested_observations(result, engine)
+    nested = nested_observations(result, engine, facts)
     out, inbound, back = facts["outbound"], facts["inbound"], facts["spendback"]
     out_obs, in_obs = raw.get("outbound", {}), raw.get("inbound", {})
     back_obs = raw.get("spendback", {})

@@ -87,10 +87,13 @@ def engine_required_inputs(engine, args):
     per_engine = {
         "vizor": ["vizor_engine", "vizor_source", "vizor_provenance"],
         "devtool": ["devtool", "devtool_source", "identity_probe_python", "identity_proto_dir"],
-        "zally": ["zally_source", "zally_binary", "native_probe_python", "native_proto_dir"],
+        "zally": ["zally_source", "native_probe_python", "native_proto_dir"],
     }
     names = common + per_engine[engine]
-    return [name for name in names if getattr(args, name, None) is None]
+    missing = [name for name in names if getattr(args, name, None) is None]
+    if engine == "zally" and not (args.zally_binary or getattr(args, "zally_build", None)):
+        missing.append("zally_binary or --zally-build")
+    return missing
 
 
 class Node:
@@ -278,6 +281,7 @@ def engine_receive(engine, snapshot, detail, txid, amount, memo):
         row = rows[0]
         require(row["value"] == amount, "Zally did not credit the exact payee amount")
         received = row["memo"]
+        require(received is None or received == memo, "Zally retained a different payee memo")
         return {"amount_zat": row["value"], "memo_verified": received == memo,
                 "memo_observed": received is not None, "pool": row["pool"],
                 "mined_height": row["mined_height"]}
@@ -288,8 +292,14 @@ def engine_receive(engine, snapshot, detail, txid, amount, memo):
     row = rows[0]
     credit = row["balance_delta"] if engine == "vizor" else row["amount_zat"]
     require(credit == amount, f"{engine} did not credit the exact payee amount")
-    received_memo = detail.get("memo") if engine == "vizor" else \
-        next((m for m in row["memos"] if m == memo), None)
+    if engine == "vizor":
+        received_memo = detail["memo"]
+    else:
+        outputs = [o for o in row["outputs"] if not o["is_change"] and o["value"] == amount]
+        require(len(outputs) == 1, "devtool payee output absent or ambiguous")
+        received_memo = outputs[0]["memo"]
+    require(received_memo is None or received_memo == memo,
+            f"{engine} retained a different payee memo")
     return {"amount_zat": credit, "memo_verified": received_memo == memo,
             "memo_observed": received_memo is not None, "pool": row.get("pool"),
             "mined_height": row.get("mined_height", row.get("height"))}
@@ -321,6 +331,29 @@ def inclusion(node, txid):
 def mining_wait(node, ready, count=1):
     node.mine(count)
     return wait_served(ready, node.tip())
+
+
+def settled_balances(node, ready, txid, wallet, zingo):
+    mined = inclusion(node, txid)["mined_height"]
+    target = mined + 9
+    tip = node.tip()
+    require(mined <= tip <= target, "payment is outside the ten-confirmation window")
+    if tip < target:
+        mining_wait(node, ready, target - tip)
+    engine_snapshot = wallet.sync()
+    zingo_snapshot = zingo.snapshot()
+    engine_height = engine_snapshot.get("scanned", engine_snapshot.get("height"))
+    zingo_height = zingo_snapshot["height"]
+    require(node.tip() == target == engine_height == zingo_height,
+            f"ten-confirmation height {target} differs from engine {engine_height} or Zingo {zingo_height}")
+    confirmed = node.transaction(txid)
+    require(confirmed["height"] == mined and confirmed["confirmations"] == 10,
+            "canonical payment does not have exactly ten confirmations")
+    observation = {"engine_balance_after_zat": engine_snapshot["total_zat"],
+                   "zingo_balance_after_zat": zingo_snapshot["total_zat"],
+                   "observed_after_confirmations": confirmed["confirmations"],
+                   "engine_height": engine_height, "zingo_height": zingo_height}
+    return engine_snapshot, zingo_snapshot, observation
 
 
 class ZingoCounterparty:
@@ -397,9 +430,7 @@ def run_engine_pays(engine, node, ready, evidence, zingo_recv, payer, amount, me
         change = [row for row in payer_after_send["receives"]
                   if row["txid"] == txid and row["is_change"]]
         send_persistence = "change row in receives" if len(change) == 1 else "not observed"
-    mining_wait(node, ready, 10)
-    payer_final = payer.sync()
-    payee_final = zingo_recv.snapshot()
+    payer_final, payee_final, outbound = settled_balances(node, ready, txid, payer, zingo_recv)
     paid = engine_payer(engine, payer, payee_address, amount, memo, txid, sent_report,
                         payer_before["total_zat"], payer_final["total_zat"], detail, delta)
     require(payee_final["total_zat"] == payee_before["total_zat"] + amount,
@@ -419,11 +450,7 @@ def run_engine_pays(engine, node, ready, evidence, zingo_recv, payer, amount, me
             "amount_zat": amount, "memo_verified_by_payee": True, "payer_fee": paid,
             "payee_balance_after_zat": payee_final["total_zat"],
             "payer_balance_after_zat": payer_final["total_zat"],
-            "leg_observations": {
-                "outbound": {"engine_balance_after_zat": payer_final["total_zat"],
-                             "zingo_balance_after_zat": payee_final["total_zat"],
-                             "observed_after_confirmations": 10},
-            },
+            "leg_observations": {"outbound": outbound},
             "pending": {"node_mempool": True, "observed_height": pending_height,
                         "engine_wallet": engine_pending,
                         "zingo_payee_wallet": zingo_pending},
@@ -473,9 +500,7 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
                    if entry["value"] == receive_amount and not entry["is_change"]]
         if len(matches) == 1:
             note["output_index"] = matches[0]["output_index"]
-    mining_wait(node, ready, 10)
-    funded = receiver.sync()
-    payer_confirmed = zingo_payer.snapshot()
+    funded, payer_confirmed, inbound = settled_balances(node, ready, receive_txid, receiver, zingo_payer)
     require(payer_before["total_zat"] - payer_confirmed["total_zat"] == receive_amount + zingo_fee,
             "Zingo payer debit does not reconcile its fee")
     require(funded["total_zat"] == payee_before["total_zat"] + receive_amount,
@@ -490,9 +515,7 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
     return_observed = receiver.sync()
     detail = receiver.detail(txid) if engine != "zally" else {}
     return_delta = ledger_delta(engine, return_observed, txid)
-    mining_wait(node, ready, 10)
-    return_after = receiver.sync()
-    zingo_after_return = zingo_payer.snapshot()
+    return_after, zingo_after_return, spendback = settled_balances(node, ready, txid, receiver, zingo_payer)
     returned = engine_payer(engine, receiver, zingo_address, return_amount, return_memo,
                             txid, sent_report, funded["total_zat"],
                             return_after["total_zat"], detail, return_delta)
@@ -522,7 +545,7 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
     unspent_after = []
     if engine == "zally":
         unspent_txids = {row["txid"] for row in return_after["unspent"]}
-        return_change = [row for row in return_observed["receives"]
+        return_change = [row for row in reopened_engine["receives"]
                         if row["txid"] == txid and row["is_change"]]
         require(len(return_change) == 1, "Zally did not record the return change row")
         require(receive_txid not in unspent_txids,
@@ -547,13 +570,8 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
                 else "sender recorded the memo; the receiving wallet stored no memo for the output",
             "zingo_payer_fee_zat": zingo_fee,
             "leg_observations": {
-                "inbound": {"engine_balance_after_zat": funded["total_zat"],
-                            "zingo_balance_after_zat": payer_confirmed["total_zat"],
-                            "observed_after_confirmations": 10,
-                            "before_return": True},
-                "return": {"engine_balance_after_zat": return_after["total_zat"],
-                           "zingo_balance_after_zat": zingo_after_return["total_zat"],
-                           "observed_after_confirmations": 10},
+                "inbound": {**inbound, "before_return": True},
+                "return": spendback,
             },
             "pending": {"node_mempool": True, "observed_height": pending_height,
                         "zingo_payer_wallet": zingo_pending,
@@ -866,10 +884,9 @@ def main():
         extra["vizor_engine"] = args.vizor_engine.resolve()
     elif engine == "devtool":
         extra["devtool"] = args.devtool.resolve()
-    else:
+    elif args.zally_binary is not None:
         extra["zally_binary"] = args.zally_binary.resolve()
-    if engine == "zally" and not extra["zally_binary"].is_file():
-        require(args.zally_build, "--zally-binary is missing; pass --zally-build to build the harness")
+    else:
         module = importlib.import_module("zally-payment")
         extra["zally_binary"] = module.build(args.zally_source, args.zally_build,
                                              HERE / "zally-payment.rs")
