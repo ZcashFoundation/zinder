@@ -40,6 +40,15 @@ Journal = RUNNER["Journal"]
 RoundTrip = RUNNER["RoundTrip"]
 wait_for = RUNNER["wait_for"]
 
+# The round-trip campaign already owns bounded stages and ownership-checked cleanup. Reuse those
+# helpers instead of inventing a second signal and readback protocol for supervised cases.
+SUPERVISOR = runpy.run_path(str(SCRIPTS / "run-wallet-roundtrip-regtest.py"))
+stop_group = SUPERVISOR["stop_group"]
+execute_owned = SUPERVISOR["execute"]
+close_owned_wallet = SUPERVISOR["close_owned_wallet"]
+owned_relay = SUPERVISOR["owned_relay"]
+stop_owned_relay = SUPERVISOR["stop_owned_relay"]
+
 OUTBOUND = RUNNER["OUTBOUND"]
 RETURN = RUNNER["RETURN"]
 TXID = re.compile(r"[a-f0-9]{64}")
@@ -51,11 +60,17 @@ CASES = ("disconnect", "rollback")
 DEFAULT_PORT_BASES = {"disconnect": 50000, "rollback": 50100}
 PORT_OFFSETS = (2, 5, 6, 7, 10, 32, 67, 82)
 LIGHTWALLETD_SCAN_METHODS = {"GetBlock", "GetBlockRange", "GetTransaction", "FindBlocks", "GetTreeState"}
+PROJECT_PREFIX = "zinder-fixture-payment-recovery-"
+PROJECT = re.compile(r"zinder-fixture-payment-recovery-(?:disconnect|rollback|transport)-[a-f0-9]{12}")
+DEFAULT_CASE_TIMEOUT = 7200
+DEFAULT_CASE_GRACE = 30
+CLEANUP_TIMEOUT = SUPERVISOR["CLEANUP_TIMEOUT"]
 HARNESS_SOURCES = (
     Path(__file__).resolve(),
     SCRIPTS / "regtest-fixture.py",
     SCRIPTS / "regtest-fixture-relay.py",
     SCRIPTS / "run-wallet-roundtrip.py",
+    SCRIPTS / "run-wallet-roundtrip-regtest.py",
     CLIENTS / "roundtrip_fixture.py",
     CLIENTS / "roundtrip_wallets.py",
     CLIENTS / "wallet_fixture.py",
@@ -78,6 +93,34 @@ def input_pins(wallets, sources):
         "wallets": {name: file_pin(path, name) for name, path in wallets},
         "harness": {Path(path).name: file_pin(path, Path(path).name) for path in sources},
     }
+
+
+def project_name(case):
+    require(case in (*CASES, "transport"), "unsupported recovery case")
+    return f"{PROJECT_PREFIX}{case}-{secrets.token_hex(6)}"
+
+
+def case_project(case, state_root, name=None):
+    """Resolve one fresh fixture identity that the case and its supervisor both know."""
+    name = project_name(case) if name is None else name
+    require(isinstance(name, str) and PROJECT.fullmatch(name), "invalid fixture project name")
+    require(name.startswith(f"{PROJECT_PREFIX}{case}-"),
+            "fixture project belongs to a different recovery case")
+    directory = Path(state_root) / name
+    require(not directory.exists(), "fixture project state already exists; refusing to reuse it")
+    return name, directory
+
+
+def project_resource_count(project):
+    """Read back only this Compose project's containers, networks, and volumes."""
+    require(isinstance(project, str) and project, "invalid project identity")
+    count = 0
+    for listing in (("ps", "-aq"), ("network", "ls", "-q"), ("volume", "ls", "-q")):
+        output = subprocess.check_output(
+            ["docker", *listing, "--filter", f"label=com.docker.compose.project={project}"],
+            text=True, timeout=60)
+        count += len(output.split())
+    return count
 
 
 def memo_evidence(memos, expected):
@@ -238,6 +281,9 @@ class Recovery:
             ],
         }
 
+        if getattr(args, "project", None):
+            self.receipt["supervised_project"] = args.project
+
     def rpc(self, method, *params):
         require(self.node is not None, "fixture is not ready")
         return node_rpc(self.node, method, *params)
@@ -278,9 +324,9 @@ class Recovery:
 
     def start(self):
         require(self.private.is_dir(), "private evidence directory is missing")
-        self.project = f"zinder-fixture-payment-recovery-{self.case}-{secrets.token_hex(6)}"
         state_root = self.private / "projects"
-        self.project_dir = state_root / self.project
+        self.project, self.project_dir = case_project(
+            self.case, state_root, getattr(self.args, "project", None))
         command = [sys.executable, "-B", str(SCRIPTS / "regtest-fixture.py"), "up",
                    "--project", self.project, "--state-root", str(state_root),
                    "--port-base", str(self.args.port_base), "--images", str(self.args.images),
@@ -342,14 +388,7 @@ class Recovery:
     def project_resources(self):
         if self.project is None:
             return 0
-        count = 0
-        for kind in ("container", "network", "volume"):
-            listing = subprocess.check_output(
-                ["docker", kind, "ls", "-q", "--filter",
-                 f"label=com.docker.compose.project={self.project}"],
-                text=True, timeout=30)
-            count += len(listing.split())
-        return count
+        return project_resource_count(self.project)
 
     def harness_sources(self):
         return HARNESS_SOURCES
@@ -981,12 +1020,193 @@ def case_command(case, args):
                  "--images", str(args.images), "--revision", args.revision,
                  "--zingo", str(args.zingo), "--zallet-backend", str(args.zallet_backend),
                  "--wait-seconds", str(args.wait_seconds)]
+    if getattr(args, "project", None):
+        arguments.extend(["--project", args.project])
     if args.bin_dir:
         arguments.extend(["--bin-dir", str(args.bin_dir)])
     return [sys.executable, "-B", str(Path(__file__).resolve()), *arguments]
 
 
+class SupervisionInterrupted(RuntimeError):
+    """Carry the failed outcome out of a case without losing the original interruption."""
+
+    def __init__(self, original, outcome):
+        super().__init__(f"campaign interrupted while supervising {outcome['case']}")
+        self.original = original
+        self.outcome = outcome
+
+
+def launch_case(command, log, timeout, grace):
+    """Run one bounded case in its own session so a hang cannot escape the watchdog."""
+    with log.open("x", encoding="utf-8") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            exit_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop_group(process, signal.SIGTERM, grace)
+            return {"exit_code": process.returncode, "timeout": True}
+        except BaseException:
+            stop_group(process, signal.SIGINT, grace)
+            raise
+    return {"exit_code": exit_code, "timeout": False}
+
+
+def recover_case(case, child, args):
+    """Recover only the exact wallet, relay, and Compose project this case was launched with."""
+    private = child.output / "private"
+    fixture = private / "projects" / child.project
+    recovery = {"wallet_stopped": False, "fixture_torn_down": False, "relay_stopped": False,
+                "resources_remaining": None, "problems": [], "repaired": False}
+
+    def attempt(label, action):
+        try:
+            return action()
+        except Exception as error:  # A cleanup failure must never mask the case outcome.
+            recovery["problems"].append(f"{label}: {type(error).__name__}: {error}")
+            return None
+
+    recovery["wallet_stopped"] = bool(attempt(
+        "owned wallet cleanup",
+        lambda: close_owned_wallet(private, child.port_base, args.zallet_backend, args.case_grace)))
+
+    def teardown_fixture():
+        if not (fixture / "state.json").is_file():
+            return False
+        if project_resource_count(child.project) == 0:
+            return False
+        execute_owned(SCRIPTS / "regtest-fixture.py",
+                      ["down", "--state-root", private / "projects", "--project", child.project],
+                      child.output / "recovery.log", CLEANUP_TIMEOUT, args.case_grace)
+        return True
+
+    recovery["fixture_torn_down"] = bool(attempt("fixture teardown", teardown_fixture))
+
+    def teardown_relay():
+        if owned_relay(fixture) is None:
+            return False
+        stop_owned_relay(fixture, args.case_grace)
+        return True
+
+    recovery["relay_stopped"] = bool(attempt("owned relay cleanup", teardown_relay))
+
+    remaining = attempt("owned resource readback", lambda: project_resource_count(child.project))
+    recovery["resources_remaining"] = remaining
+    if remaining:
+        recovery["problems"].append(f"owned Docker resources remain for {child.project}")
+    recovery["repaired"] = any((recovery["wallet_stopped"], recovery["fixture_torn_down"],
+                                recovery["relay_stopped"]))
+    return recovery
+
+
+def read_case_receipt(path):
+    if not path.is_file():
+        return None, "case did not publish a receipt"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except (OSError, ValueError) as error:
+        return None, f"case receipt is unreadable: {type(error).__name__}: {error}"
+
+
+def supervision_result(case, exit_code, timeout, interrupted, receipt, receipt_error, recovery):
+    if interrupted is not None:
+        return "failed", "interrupted", f"{type(interrupted).__name__}: {interrupted}"
+    if timeout:
+        return "failed", "timeout", "case exceeded its supervision timeout"
+    if exit_code != 0:
+        return "failed", "failed", f"case stopped with exit {exit_code}"
+    if receipt_error is not None:
+        return "failed", "failed", receipt_error
+    try:
+        validate_receipt(receipt, case)
+    except ValueError as error:
+        return "failed", "failed", f"receipt contract failed: {error}"
+    if receipt["status"] != "passed":
+        return "failed", "failed", receipt.get("error") or "case receipt reports failure"
+    if recovery["problems"] or recovery["resources_remaining"] != 0:
+        return "failed", "failed", "case cleanup is incomplete; parent recovery was required"
+    if recovery["repaired"]:
+        return "failed", "failed", "case left owned resources that parent recovery removed"
+    return "passed", "cooperative", None
+
+
+def supervision_record(case, outcome):
+    return {
+        "schema_version": 1, "case": case, "status": outcome["status"],
+        "project": outcome["project"],
+        "supervision": {"kind": outcome["supervision"], "exit_code": outcome["exit_code"],
+                        "case_timeout": outcome["case_timeout"],
+                        "case_grace": outcome["case_grace"]},
+        "receipt": {"status": outcome["receipt_status"],
+                    "sha256": outcome["receipt_sha256"]},
+        "cleanup": outcome["cleanup"], "error": outcome["error"],
+    }
+
+
+def supervision_failure_receipt(case, outcome):
+    remaining = outcome["cleanup"]["resources_remaining"]
+    return {
+        "schema_version": 1, "case": case, "status": "failed", "network": "zcash-regtest",
+        "source": "campaign-supervision", "assertions": {}, "project": outcome["project"],
+        "error": outcome["error"] or "case did not publish a passed receipt",
+        "supervision": {"kind": outcome["supervision"], "exit_code": outcome["exit_code"],
+                        "case_timeout": outcome["case_timeout"],
+                        "case_grace": outcome["case_grace"]},
+        "cleanup": {"fixture_removed": remaining == 0,
+                    "project_resources_remaining": remaining,
+                    "recovered": outcome["cleanup"]["repaired"],
+                    "problems": outcome["cleanup"]["problems"]},
+        "limits": ["Supervision receipt only; the case did not publish wallet evidence."],
+    }
+
+
+def supervise_case(case, child, args, root):
+    log = root / f"{case}.log"
+    timeout = False
+    interrupted = None
+    launch_error = None
+    exit_code = None
+    try:
+        launched = launch_case(case_command(case, child), log, args.case_timeout, args.case_grace)
+        exit_code, timeout = launched["exit_code"], launched["timeout"]
+    except (KeyboardInterrupt, SystemExit) as error:
+        interrupted = error
+        launch_error = f"{type(error).__name__}: {error}"
+    except BaseException as error:
+        launch_error = f"{type(error).__name__}: {error}"
+    cleanup = recover_case(case, child, args)
+    receipt_path = child.output / "receipt.json"
+    receipt, receipt_error = read_case_receipt(receipt_path)
+    status, kind, reason = supervision_result(case, exit_code, timeout, interrupted, receipt,
+                                              receipt_error, cleanup)
+    outcome = {
+        "case": case,
+        "project": child.project,
+        "exit_code": exit_code,
+        "status": status,
+        "supervision": kind,
+        "error": reason or launch_error,
+        "case_timeout": args.case_timeout,
+        "case_grace": args.case_grace,
+        "receipt_sha256": digest(receipt_path) if receipt_path.is_file() else None,
+        "receipt_status": receipt.get("status") if isinstance(receipt, dict) else None,
+        "cleanup": cleanup,
+        "log": log.name,
+    }
+    if status == "failed" and not receipt_path.exists():
+        child.output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(receipt_path, supervision_failure_receipt(case, outcome))
+        outcome["receipt_sha256"] = digest(receipt_path)
+        outcome["receipt_status"] = "failed"
+    child.output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_json(child.output / "supervision.json", supervision_record(case, outcome))
+    if interrupted is not None:
+        raise SupervisionInterrupted(interrupted, outcome)
+    return outcome
+
+
 def campaign(args):
+    require(args.case_timeout > 0 and args.case_grace > 0, "case timeout and grace must be positive")
     root = args.output.resolve()
     root.mkdir(mode=0o700, parents=True)
     require(not any(root.iterdir()), "campaign output directory must be new and empty")
@@ -994,21 +1214,39 @@ def campaign(args):
     require(len(bases) == 2 and bases[0] != bases[1], "supply two distinct port bases")
     check_ports(bases)
     results = {}
-    for case, base in zip(CASES, bases, strict=True):
-        child = argparse.Namespace(**vars(args))
-        child.output = root / case
-        child.port_base = base
-        command = case_command(case, child)
-        with (root / f"{case}.log").open("w", encoding="utf-8") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=7200)
-        receipt = json.loads((child.output / "receipt.json").read_text())
-        results[case] = {"exit_code": result.returncode, "status": receipt["status"],
-                         "receipt_sha256": digest(child.output / "receipt.json")}
-    summary = {"schema_version": 1, "release": args.revision, "port_bases": dict(zip(CASES, bases)),
-               "cases": results}
-    write_json(root / "summary.json", summary)
+    stopped = None
+    deferred = None
+    try:
+        for case, base in zip(CASES, bases, strict=True):
+            child = argparse.Namespace(**vars(args))
+            child.output = root / case
+            child.port_base = base
+            child.project = project_name(case)
+            require(not child.output.exists(), "case output already exists; refusing to reuse it")
+            try:
+                results[case] = supervise_case(case, child, args, root)
+            except SupervisionInterrupted as interrupted:
+                results[case] = interrupted.outcome
+                stopped, deferred = case, interrupted.original
+                break
+            if results[case]["supervision"] in {"timeout", "interrupted"}:
+                stopped = case
+                break
+    finally:
+        for case in CASES:
+            results.setdefault(case, {
+                "case": case, "exit_code": None, "status": "skipped", "supervision": "not-run",
+                "error": f"campaign stopped after {stopped}; this case was not launched",
+                "cleanup": {"resources_remaining": None, "problems": [], "repaired": False},
+            })
+        summary = {"schema_version": 1, "release": args.revision,
+                   "port_bases": dict(zip(CASES, bases)), "case_timeout": args.case_timeout,
+                   "case_grace": args.case_grace, "cases": results}
+        write_json(root / "summary.json", summary)
+    if deferred is not None:
+        raise deferred
     require(all(row["exit_code"] == 0 and row["status"] == "passed" for row in results.values()),
-            "one or more payment recovery cases failed; see the named receipts")
+            "one or more payment recovery cases failed; see the named receipts and supervision records")
     print(root)
 
 
@@ -1025,11 +1263,16 @@ def main():
         command.add_argument("--revision", required=True)
         command.add_argument("--zingo", type=Path, required=True)
         command.add_argument("--zallet-backend", type=Path, required=True)
+        command.add_argument("--project", help="supervisor-selected fixture project identity")
     campaign_parser = commands.add_parser("campaign", help="run both cases on separate fixtures in sequence")
     campaign_parser.add_argument("--output", type=Path, required=True)
     campaign_parser.add_argument("--port-bases", nargs=2, type=int,
                                  default=[DEFAULT_PORT_BASES[case] for case in CASES])
     campaign_parser.add_argument("--wait-seconds", type=int, default=2400)
+    campaign_parser.add_argument("--case-timeout", type=int, default=DEFAULT_CASE_TIMEOUT,
+                                 help="maximum seconds for one recovery case (default: %(default)s)")
+    campaign_parser.add_argument("--case-grace", type=int, default=DEFAULT_CASE_GRACE,
+                                 help="seconds to wait after each termination signal (default: %(default)s)")
     campaign_parser.add_argument("--images", type=Path, required=True)
     campaign_parser.add_argument("--bin-dir", type=Path, required=True)
     campaign_parser.add_argument("--revision", required=True)

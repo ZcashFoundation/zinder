@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """Check the payment recovery accounting, canonical, rollback, and receipt contracts."""
 import argparse
+import contextlib
+import io
 import json
 import runpy
+import signal
+import subprocess
+import sys
 import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 M = runpy.run_path(str(Path(__file__).resolve().with_name("payment-recovery.py")))
+GLOBALS = M["campaign"].__globals__
 TXID = "ab" * 32
 OTHER = "cd" * 32
 HASH_A = "11" * 32
@@ -407,9 +416,262 @@ class CommandConstruction(unittest.TestCase):
                                   wait_seconds=600, bin_dir=None)
         command = M["case_command"]("rollback", args)
         self.assertNotIn("--bin-dir", command)
+        self.assertNotIn("--project", command)
         self.assertEqual(command[command.index("--port-base") + 1], "50100")
         args.bin_dir = Path("/tmp/bin")
         self.assertIn("--bin-dir", M["case_command"]("rollback", args))
+
+    def test_case_command_carries_the_supervisor_project_identity(self):
+        project = M["project_name"]("rollback")
+        args = argparse.Namespace(output=Path("/tmp/evidence"), port_base=50100,
+                                  images=Path("/tmp/images.json"), revision="a" * 40,
+                                  zingo=Path("/tmp/zingo"), zallet_backend=Path("/tmp/zallet"),
+                                  wait_seconds=600, bin_dir=Path("/tmp/bin"), project=project)
+        command = M["case_command"]("rollback", args)
+        self.assertEqual(command[command.index("--project") + 1], project)
+
+
+class ProjectIdentity(unittest.TestCase):
+    def test_generated_identities_are_case_bound_and_unique(self):
+        disconnect = M["project_name"]("disconnect")
+        rollback = M["project_name"]("rollback")
+        self.assertRegex(disconnect, r"^zinder-fixture-payment-recovery-disconnect-[a-f0-9]{12}$")
+        self.assertRegex(rollback, r"^zinder-fixture-payment-recovery-rollback-[a-f0-9]{12}$")
+        self.assertNotEqual(disconnect, M["project_name"]("disconnect"))
+        name, path = M["case_project"]("transport", Path("/unused-test-projects"))
+        self.assertEqual(path.name, name)
+        self.assertTrue(name.startswith("zinder-fixture-payment-recovery-transport-"))
+        with self.assertRaisesRegex(ValueError, "unsupported recovery case"):
+            M["project_name"]("unrecognized")
+
+    def test_fresh_state_is_accepted_and_existing_state_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "projects"
+            state.mkdir()
+            name, path = M["case_project"]("disconnect", state)
+            self.assertEqual(path, state / name)
+            self.assertFalse(path.exists())
+            path.mkdir()
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                M["case_project"]("disconnect", state, name)
+
+    def test_foreign_or_malformed_projects_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "projects"
+            state.mkdir()
+            with self.assertRaisesRegex(ValueError, "different recovery case"):
+                M["case_project"]("rollback", state, M["project_name"]("disconnect"))
+            for name in ("zinder-fixture-payment-recovery-disconnect-xyz",
+                         "zinder-fixture-payment-recovery-disconnect-" + "a" * 11,
+                         "zinder-fixture-roundtrip-" + "a" * 12, ""):
+                with self.assertRaisesRegex(ValueError, "invalid fixture project"):
+                    M["case_project"]("disconnect", state, name)
+
+
+def campaign_args(output, **changes):
+    values = {"output": output, "port_bases": [50000, 50100], "case_timeout": 30,
+              "case_grace": 2, "wait_seconds": 60, "images": Path("/tmp/images.json"),
+              "bin_dir": Path("/tmp/bin"), "revision": "a" * 40, "zingo": Path("/tmp/zingo"),
+              "zallet_backend": Path("/tmp/zallet")}
+    values.update(changes)
+    return argparse.Namespace(**values)
+
+
+def process_alive(pid):
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
+        return False
+    return state != b"Z"
+
+
+class CampaignSupervision(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.scratch = Path(scratch.name)
+        self.root = self.scratch / "campaign"
+        self.args = campaign_args(self.root)
+        self.launched = []
+        self.recovered = []
+
+    def write_receipt(self, output, case, status="passed"):
+        output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        passed = status == "passed"
+        receipt = {"schema_version": 1, "case": case, "status": status,
+                   "network": "zcash-regtest", "assertions": {"canonical": True} if passed else {},
+                   "cleanup": {"fixture_removed": passed, "project_resources_remaining": 0}}
+        (output / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+
+    def launch(self, exit_code=0, timeout=False, status="passed", receipt=True, interrupted=None):
+        def run(command, log, timeout_value, grace):
+            case = command[3]
+            output = Path(command[command.index("--output") + 1])
+            self.launched.append((case, output, timeout_value, grace, command))
+            if interrupted is not None:
+                raise interrupted
+            if receipt:
+                self.write_receipt(output, case, status)
+            return {"exit_code": exit_code, "timeout": timeout}
+        return run
+
+    def recovery(self, **changes):
+        value = {"wallet_stopped": False, "fixture_torn_down": False, "relay_stopped": False,
+                 "resources_remaining": 0, "problems": [], "repaired": False}
+        value.update(changes)
+
+        def run(case, child, args):
+            self.recovered.append((case, child.project, child.output))
+            return dict(value)
+        return run
+
+    def campaign(self, launch, recovery, args=None):
+        with patch.dict(GLOBALS, {"launch_case": launch, "recover_case": recovery,
+                                  "check_ports": lambda bases: bases}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return M["campaign"](args or self.args)
+
+    def summary(self):
+        return json.loads((self.root / "summary.json").read_text(encoding="utf-8"))
+
+    def supervision(self, case):
+        return json.loads((self.root / case / "supervision.json").read_text(encoding="utf-8"))
+
+    def test_cooperative_children_pass_with_known_fresh_projects(self):
+        self.campaign(self.launch(), self.recovery())
+        self.assertEqual([row[0] for row in self.launched], list(M["CASES"]))
+        self.assertEqual([row[2] for row in self.launched], [30, 30])
+        self.assertEqual([row[3] for row in self.launched], [2, 2])
+        projects = [row[1] for row in self.recovered]
+        self.assertEqual(len(set(projects)), 2)
+        for case, project in zip(M["CASES"], projects, strict=True):
+            self.assertRegex(project, rf"^zinder-fixture-payment-recovery-{case}-[a-f0-9]{{12}}$")
+            self.assertEqual(self.supervision(case)["status"], "passed")
+            self.assertEqual(self.supervision(case)["supervision"]["kind"], "cooperative")
+            self.assertEqual(self.supervision(case)["project"], project)
+        summary = self.summary()
+        self.assertEqual({row["status"] for row in summary["cases"].values()}, {"passed"})
+        self.assertEqual((summary["case_timeout"], summary["case_grace"]), (30, 2))
+        self.assertEqual(summary["port_bases"], {"disconnect": 50000, "rollback": 50100})
+
+    def test_timed_out_child_never_counts_as_passed(self):
+        with self.assertRaisesRegex(ValueError, "cases failed"):
+            self.campaign(self.launch(exit_code=-9, timeout=True), self.recovery())
+        summary = self.summary()
+        failed = summary["cases"]["disconnect"]
+        self.assertEqual((failed["status"], failed["supervision"]), ("failed", "timeout"))
+        self.assertEqual(summary["cases"]["rollback"]["status"], "skipped")
+        self.assertEqual(summary["cases"]["rollback"]["supervision"], "not-run")
+        record = self.supervision("disconnect")
+        self.assertEqual((record["status"], record["supervision"]["kind"]), ("failed", "timeout"))
+        self.assertEqual(record["receipt"]["status"], "passed")  # child evidence is preserved, not rewritten
+        self.assertEqual(record["receipt"]["sha256"], M["digest"](self.root / "disconnect" / "receipt.json"))
+        self.assertEqual(len(self.recovered), 1)
+
+    def test_killed_child_without_a_receipt_publishes_a_failure_receipt(self):
+        recovery = self.recovery(wallet_stopped=True, fixture_torn_down=True, relay_stopped=True,
+                                 repaired=True)
+        with self.assertRaisesRegex(ValueError, "cases failed"):
+            self.campaign(self.launch(exit_code=-9, timeout=True, receipt=False), recovery)
+        receipt = json.loads((self.root / "disconnect" / "receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual((receipt["status"], receipt["source"]), ("failed", "campaign-supervision"))
+        self.assertEqual(receipt["cleanup"]["project_resources_remaining"], 0)
+        self.assertTrue(receipt["cleanup"]["recovered"])
+        self.assertIn("timeout", receipt["supervision"]["kind"])
+        M["validate_receipt"](receipt, "disconnect")
+        record = self.supervision("disconnect")
+        self.assertEqual(record["receipt"]["status"], "failed")
+        self.assertEqual(record["cleanup"]["wallet_stopped"], True)
+
+    def test_cleanup_failure_marks_an_otherwise_passing_case_failed(self):
+        recovery = self.recovery(problems=["owned Docker resources remain"], resources_remaining=2)
+        with self.assertRaisesRegex(ValueError, "cases failed"):
+            self.campaign(self.launch(), recovery)
+        failed = self.summary()["cases"]["disconnect"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("cleanup is incomplete", failed["error"])
+        self.assertEqual(self.supervision("disconnect")["cleanup"]["problems"],
+                         ["owned Docker resources remain"])
+
+    def test_resources_removed_by_parent_recovery_do_not_count_as_passed(self):
+        recovery = self.recovery(wallet_stopped=True, repaired=True)
+        with self.assertRaisesRegex(ValueError, "cases failed"):
+            self.campaign(self.launch(), recovery)
+        failed = self.summary()["cases"]["disconnect"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("parent recovery removed", failed["error"])
+
+    def test_interrupted_child_is_failed_and_the_summary_is_published(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.campaign(self.launch(interrupted=KeyboardInterrupt()), self.recovery())
+        summary = self.summary()
+        self.assertEqual(summary["cases"]["disconnect"]["status"], "failed")
+        self.assertEqual(summary["cases"]["disconnect"]["supervision"], "interrupted")
+        self.assertEqual(summary["cases"]["rollback"]["status"], "skipped")
+        receipt = json.loads((self.root / "disconnect" / "receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["supervision"]["kind"], "interrupted")
+        self.assertEqual(len(self.recovered), 1)
+
+    def test_existing_campaign_output_is_not_reused(self):
+        self.root.mkdir()
+        marker = self.root / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        with self.assertRaises(FileExistsError):
+            self.campaign(self.launch(), self.recovery())
+        self.assertEqual(self.launched, [])
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_nonpositive_case_bounds_fail_before_launching(self):
+        for field in ("case_timeout", "case_grace"):
+            with self.subTest(field=field):
+                scratch = tempfile.TemporaryDirectory()
+                self.addCleanup(scratch.cleanup)
+                args = campaign_args(Path(scratch.name) / "campaign", **{field: 0})
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    self.campaign(self.launch(), self.recovery(), args=args)
+                self.assertEqual(self.launched, [])
+
+    def test_hung_child_and_descendants_are_killed_after_its_timeout(self):
+        script = self.scratch / "hang.py"
+        pids_path = self.scratch / "hang.pids"
+        script.write_text(
+            "import os, signal, subprocess, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'])\n"
+            "with open(sys.argv[1], 'w') as out:\n"
+            "    out.write(f'{os.getpid()} {child.pid}')\n"
+            "time.sleep(60)\n", encoding="utf-8")
+        result = M["launch_case"]([sys.executable, str(script), str(pids_path)],
+                                  self.scratch / "hang.log", timeout=.5, grace=.2)
+        leader, descendant = map(int, pids_path.read_text(encoding="utf-8").split())
+        self.assertTrue(result["timeout"])
+        self.assertNotEqual(result["exit_code"], 0)
+        for pid in (leader, descendant):
+            deadline = time.monotonic() + 2
+            while process_alive(pid) and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertFalse(process_alive(pid))
+
+    def test_launch_case_stops_the_group_before_propagating_an_interruption(self):
+        stopped = []
+
+        class FakeProcess:
+            pid = 4242
+            returncode = None
+
+            def wait(self, timeout=None):
+                raise KeyboardInterrupt
+
+        fake = types.SimpleNamespace(Popen=lambda *args, **kwargs: FakeProcess(),
+                                     TimeoutExpired=subprocess.TimeoutExpired,
+                                     STDOUT=subprocess.STDOUT)
+        with patch.dict(GLOBALS, {"subprocess": fake,
+                                  "stop_group": lambda proc, sig, grace: stopped.append(sig)}):
+            with self.assertRaises(KeyboardInterrupt):
+                M["launch_case"](["fake"], self.scratch / "interrupt.log", 5, 1)
+        self.assertEqual(stopped, [signal.SIGINT])
 
 
 if __name__ == "__main__":

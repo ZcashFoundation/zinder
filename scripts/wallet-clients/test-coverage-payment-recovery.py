@@ -209,6 +209,31 @@ class RecoveryImport(unittest.TestCase):
     def rows(self, case):
         return list(recovery_actions(self.paths[case], RELEASE))
 
+    def test_supervised_case_requires_the_final_cooperative_result_for_this_receipt(self):
+        case = "disconnect"
+        doc = self.receipts[case]
+        doc["supervised_project"] = doc["fixture"]["project"] = "owned-project"
+        for pin in doc["pins"].values():
+            pin["harness"]["run-wallet-roundtrip-regtest.py"] = token("supervisor")
+        path = self.write(case, doc)
+        with self.assertRaisesRegex(ValueError, "missing final campaign"):
+            self.rows(case)
+        record = {"schema_version": 1, "status": "passed", "case": case, "project": "owned-project",
+                  "receipt": {"status": "passed", "sha256": digest(path)},
+                  "supervision": {"kind": "cooperative", "exit_code": 0},
+                  "cleanup": {"resources_remaining": 0, "problems": [], "repaired": False}}
+        sidecar = path.with_name("supervision.json")
+        sidecar.write_text(json.dumps(record))
+        self.assertEqual(len(self.rows(case)), 2)
+        for edit in ({"status": "failed"}, {"case": "rollback"}, {"project": "unrelated"},
+                     {"receipt": {"status": "passed", "sha256": "0" * 64}},
+                     {"supervision": {"kind": "timeout", "exit_code": 0}},
+                     {"cleanup": {"resources_remaining": 0, "problems": [], "repaired": True}}):
+            with self.subTest(edit=edit):
+                sidecar.write_text(json.dumps(record | edit))
+                with self.assertRaises(ValueError):
+                    self.rows(case)
+
     def test_incomplete_or_changed_input_pins_cannot_qualify(self):
         def remove_source(receipt):
             for snapshot in receipt["pins"].values():

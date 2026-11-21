@@ -89,6 +89,8 @@ def receipt(result, release, case):
     harness = pins["pre"]["harness"]
     required = {"payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
                 "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"}
+    if "supervised_project" in result:
+        required.add("run-wallet-roundtrip-regtest.py")
     if case == "transport":
         required.add("transport-payment.py")
     require(required <= harness.keys(), "incomplete recovery harness pins")
@@ -386,12 +388,31 @@ def row(result, receipt_sha, case, role, action, assertions, accounting):
     }
 
 
+def verify_case_supervision(path, result, receipt_sha):
+    project = result.get("supervised_project")
+    record_path = Path(path).with_name("supervision.json")
+    if project is None and not record_path.exists():
+        return
+    require(record_path.is_file(), "missing final campaign supervision record")
+    record = json.loads(record_path.read_bytes())
+    require(record.get("schema_version") == 1 and record.get("case") == result["case"]
+            and record.get("status") == "passed"
+            and (project is None or record.get("project") == project == result["fixture"].get("project"))
+            and record.get("receipt") == {"status": "passed", "sha256": receipt_sha},
+            "campaign supervision rejected this case or recorded a different receipt")
+    stage, cleanup = record["supervision"], record["cleanup"]
+    require(stage.get("kind") == "cooperative" and stage.get("exit_code") == 0
+            and cleanup.get("resources_remaining") == 0 and cleanup.get("problems") == []
+            and cleanup.get("repaired") is False, "campaign supervision or teardown failed")
+
+
 def recovery_actions(path, release):
     """Yield schema-1 rows from a disconnect, rollback, or transport receipt."""
     raw = Path(path).read_bytes()
     result = json.loads(raw)
     receipt_sha = hashlib.sha256(raw).hexdigest()
     case = result["case"]
+    verify_case_supervision(path, result, receipt_sha)
     receipt(result, release, case)
     outbound, accounting = ledger(result)
     if case == "disconnect":
