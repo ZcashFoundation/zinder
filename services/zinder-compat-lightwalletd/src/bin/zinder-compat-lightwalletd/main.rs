@@ -22,6 +22,9 @@ use zinder_runtime::{
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
 mod browser_transport;
+mod catalog_refresh;
+mod publish_history;
+use catalog_refresh::{CatalogRefresh, CatalogSource};
 mod compact_block_serving;
 mod config;
 mod supervision;
@@ -97,6 +100,8 @@ enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
+    /// Append complete settled segments to a signed wallet history catalog, then exit.
+    PublishShieldedHistory(publish_history::PublishHistory),
 }
 
 #[tokio::main]
@@ -145,9 +150,10 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     clippy::too_many_lines,
     reason = "lightwalletd bootstrap composes the readiness, ops, store, node broadcast, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
 )]
-async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
+async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
+    let command = cli.command.take();
     let lightwalletd_config = match config::load_lightwalletd_config(config_path, cli.into()) {
         Ok(cfg) => {
             load_config_phase.complete();
@@ -158,6 +164,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(error);
         }
     };
+    if let Some(Command::PublishShieldedHistory(args)) = command {
+        return args.publish(&lightwalletd_config);
+    }
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_config_resolved",
@@ -250,6 +259,12 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             &ingest_control,
         )
         .await?;
+    let catalog_refresh = match &lightwalletd_config.shielded_history {
+        Some(args) => Some(
+            CatalogRefresh::admit(args, CatalogSource::Wallet(serving_pair_slot.clone())).await?,
+        ),
+        None => None,
+    };
     let visible_height = Some(
         serving_pair_slot
             .capture()
@@ -282,6 +297,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
         .with_node_tip_witness(node_tip_witness)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
+    let grpc_adapter = match &catalog_refresh {
+        Some(refresh) => grpc_adapter.with_published_shielded_history(refresh.history.clone()),
+        None => grpc_adapter,
+    };
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -350,20 +369,23 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
+    let tasks = WalletServingTasks {
+        serving_pair_publisher: serving_pair_publisher_handle,
+        node_readiness_probe: node_readiness_handle,
+        ingest_control_readiness_probe: ingest_control_readiness_handle,
+        tip_change_publisher: tip_publisher_handle,
+        node_tip_witness: node_tip_witness_handle,
+        operations: ops_handle,
+    }
+    .supervised();
+    let tasks = CatalogRefresh::supervise(
+        catalog_refresh,
+        lightwalletd_config.storage.secondary_catchup_interval,
+        cancel,
+        tasks,
+    );
     let runtime_outcome = runtime
-        .supervise(
-            server,
-            WalletServingTasks {
-                serving_pair_publisher: serving_pair_publisher_handle,
-                node_readiness_probe: node_readiness_handle,
-                ingest_control_readiness_probe: ingest_control_readiness_handle,
-                tip_change_publisher: tip_publisher_handle,
-                node_tip_witness: node_tip_witness_handle,
-                operations: ops_handle,
-            }
-            .supervised(),
-            || serving_readiness.publish_shutting_down(),
-        )
+        .supervise(server, tasks, || serving_readiness.publish_shutting_down())
         .await;
 
     tracing::info!(
@@ -496,6 +518,12 @@ async fn run_canonical(
     )
     .await
     .map_err(LightwalletdConfigError::CompactServing)?;
+    let catalog_refresh = match &lightwalletd_config.shielded_history {
+        Some(args) => {
+            Some(CatalogRefresh::admit(args, CatalogSource::Compact(slot.clone())).await?)
+        }
+        None => None,
+    };
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
     let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
@@ -542,6 +570,10 @@ async fn run_canonical(
             .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
             .with_node_tip_witness(node_tip_witness)
             .with_ping(configured_ping(&lightwalletd_config, &cancel));
+            let adapter = match &catalog_refresh {
+                Some(refresh) => adapter.with_published_shielded_history(refresh.history.clone()),
+                None => adapter,
+            };
             let (adapter, tip_publisher) =
                 with_ingest_mempool(adapter, &lightwalletd_config, &cancel);
             let node_probe = adapter.spawn_node_readiness_probe(
@@ -577,6 +609,12 @@ async fn run_canonical(
                 .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
                 .with_node_tip_witness(node_tip_witness)
                 .with_ping(configured_ping(&lightwalletd_config, &cancel));
+            let grpc_adapter = match &catalog_refresh {
+                Some(refresh) => {
+                    grpc_adapter.with_published_shielded_history(refresh.history.clone())
+                }
+                None => grpc_adapter,
+            };
             (
                 browser_transport::serve(
                     &runtime,
@@ -605,6 +643,12 @@ async fn run_canonical(
             .map(|limit| limit.as_secs()),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
+    );
+    let tasks = CatalogRefresh::supervise(
+        catalog_refresh,
+        lightwalletd_config.storage.secondary_catchup_interval,
+        cancel,
+        tasks,
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();

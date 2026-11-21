@@ -4,6 +4,8 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+mod encoded_block_range;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let repository_root = arguments
@@ -46,6 +48,7 @@ fn generate(repository_root: &Path, output_dir: &Path) -> Result<(), Box<dyn Err
         .build_client(true)
         .file_descriptor_set_path(output_dir.join("lightwalletd_compat_descriptor.bin"))
         .compile_protos(&compat_files, std::slice::from_ref(&compat_root))?;
+    encoded_block_range::enable(&output_dir.join("cash.z.wallet.sdk.rpc.rs"))?;
     tonic_prost_build::configure()
         .out_dir(output_dir)
         .build_server(true)

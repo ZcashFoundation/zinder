@@ -3,6 +3,7 @@
 #[cfg(feature = "light-wallet-qualification")]
 pub(crate) mod qualification;
 
+use std::sync::Arc;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -147,6 +148,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     response_limits: LightwalletdResponseLimits,
     block_methods: BlockMethods,
+    published_history: Option<Arc<crate::PublishedShieldedHistory>>,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -167,11 +169,21 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
             .field("ping_enabled", &self.ping.is_enabled())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
+    /// Serves matching settled shielded ranges from the history admitted for each request.
+    #[must_use]
+    pub fn with_published_shielded_history(
+        mut self,
+        history: Arc<crate::PublishedShieldedHistory>,
+    ) -> Self {
+        self.published_history = Some(history);
+        self
+    }
+
     /// Creates a lightwalletd-compatible gRPC adapter.
     ///
     /// `GetLightdInfo` derives `consensusBranchId`, `upgradeName`,
@@ -201,6 +213,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             query_api,
             response_limits,
             block_methods: BlockMethods::default(),
+            published_history: None,
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -517,6 +530,17 @@ where
             .map_err(|error| status_from_query_error(&error))
     }
 
+    async fn block_hash_at(
+        &self,
+        view: &Self::View,
+        height: zinder_core::BlockHeight,
+    ) -> Result<zinder_core::BlockHash, Status> {
+        self.block_header_by_selector(BlockSelector::Height(height), Some(view.id))
+            .await
+            .map(|row| row.block_header.block_id.hash)
+            .map_err(|err| status_from_query_error(&err))
+    }
+
     async fn read_compact_block_chunk<Output, Convert>(
         &self,
         read: ChunkRead<ChainEpoch>,
@@ -787,10 +811,37 @@ fn lightwalletd_balance_value_zat(
 }
 
 #[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let range = self
+            .published_history
+            .as_ref()
+            .map(|history| history.catalog())
+            .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
+        self.block_methods
+            .published_block_range(&self.query_api, &request.into_inner(), range)
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
+    fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        self.published_history
+            .as_ref()
+            .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
+    }
+
     async fn get_latest_block(
         &self,
         _request: Request<lightwalletd::ChainSpec>,

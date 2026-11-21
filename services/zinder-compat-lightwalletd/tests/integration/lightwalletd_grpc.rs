@@ -4,6 +4,7 @@
 )]
 
 mod browser_streams;
+mod published_range;
 
 use async_trait::async_trait;
 use eyre::eyre;
@@ -758,7 +759,7 @@ async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes()
     )?;
     let canonical_primary_path = writer.canonical_primary_path().to_owned();
     let mut store_fixture = writer.into_serving_store_fixture()?;
-    delete_compact_block_row(&canonical_primary_path, damaged.height)?;
+    damage_compact_block_row(&canonical_primary_path, damaged.height, None)?;
     let (mut canonical, wallet) = store_fixture.take_readers()?;
     canonical.try_catch_up()?;
     let canonical = Arc::new(RocksDbCanonicalReader::new(canonical)?);
@@ -819,11 +820,11 @@ async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes()
     Ok(())
 }
 
-/// Deletes the compact block at `height` from a closed canonical primary,
-/// as store damage would.
-fn delete_compact_block_row(
+/// Removes or overwrites a compact-block row in a closed fixture primary.
+fn damage_compact_block_row(
     canonical_primary_path: &std::path::Path,
     height: BlockHeight,
+    replacement: Option<&[u8]>,
 ) -> eyre::Result<()> {
     let options = rust_rocksdb::Options::default();
     let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
@@ -831,7 +832,11 @@ fn delete_compact_block_row(
     let family = db
         .cf_handle("compact_block")
         .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
-    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    let key = encode_height_key_ascending(height);
+    match replacement {
+        Some(bytes) => db.put_cf(&family, key, bytes)?,
+        None => db.delete_cf(&family, key)?,
+    }
     db.flush_cf(&family)?;
     Ok(())
 }

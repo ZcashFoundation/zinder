@@ -25,6 +25,10 @@ http.workspace = true
 prost.workspace = true
 metrics.workspace = true
 serde = { workspace = true, features = ["derive"] }
+ring.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
@@ -46,7 +50,11 @@ zinder-source.workspace = true
 zinder-store.workspace = true
 zinder-wallet-rocksdb.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
+tonic-types.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 eyre.workspace = true
@@ -58,13 +66,9 @@ prost-types.workspace = true
 reqwest.workspace = true
 rust-rocksdb.workspace = true
 secrecy.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic-health.workspace = true
-tonic-types.workspace = true
 zcash_address = { workspace = true, features = ["std"] }
 zcash_protocol = { workspace = true, features = ["std"] }
 zinder-ingest.workspace = true

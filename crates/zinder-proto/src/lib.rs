@@ -4,6 +4,7 @@
 //! do not hand-write protocol-shaped payload structs.
 
 pub mod capabilities;
+mod encoded_block_range;
 pub mod error_policy;
 pub mod wire;
 pub use capabilities::{
@@ -151,6 +152,8 @@ pub mod compat {
             missing_docs,
             reason = "Generated protobuf code mirrors vendored schemas."
         )]
+
+        pub use crate::encoded_block_range::{EncodedBlockRange, EncodedBlockRangeStream};
 
         /// Upstream `lightwallet-protocol` commit served by this compatibility pin.
         pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = include_str!(concat!(

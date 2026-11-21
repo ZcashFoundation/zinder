@@ -18,6 +18,9 @@ mod mempool;
 mod network_tip_estimate;
 mod node_tip_witness;
 mod ping;
+mod published_range;
+mod sealed_history;
+pub use published_range::{PublishedShieldedHistory, ShieldedCatalogPublisher};
 mod request_limits;
 mod stale_tip;
 

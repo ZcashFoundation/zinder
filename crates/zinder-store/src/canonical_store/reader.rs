@@ -237,7 +237,7 @@ macro_rules! impl_canonical_typed_reads {
                 order: HeightOrder,
                 max_bytes: usize,
             ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
-                read_compact_blocks_up_to(self, range, order, max_bytes)
+                read_compact_blocks_up_to(self, range, order, max_bytes, |block, _| block)
             }
 
             /// Reads the canonical location of one transaction.
@@ -445,6 +445,29 @@ macro_rules! impl_canonical_typed_reads {
 impl_canonical_typed_reads!(RocksDbCanonicalStore);
 impl_canonical_typed_reads!(RocksDbCanonicalSecondary);
 
+impl RocksDbCanonicalSecondary {
+    /// Reads ascending blocks and their original stored lengths for a derived history segment.
+    /// The byte budget includes the first row even when that row alone exceeds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same retention, missing-row, and decoding errors as
+    /// [`Self::compact_blocks_in_range_up_to`].
+    pub fn compact_block_rows_with_lengths(
+        &self,
+        range: BlockHeightRange,
+        max_bytes: usize,
+    ) -> Result<Vec<(CompactBlockArtifact, usize)>, CanonicalStoreError> {
+        read_compact_blocks_up_to(
+            self,
+            range,
+            HeightOrder::Ascending,
+            max_bytes,
+            |block, len| (block, len),
+        )
+    }
+}
+
 fn read_chain_epoch(store: &impl CanonicalServingRead) -> Result<ChainEpoch, CanonicalStoreError> {
     read_chain_epoch_at(store, store.serving_ready_evidence().visible_epoch)
 }
@@ -556,12 +579,13 @@ pub enum HeightOrder {
 /// Most rows one batch of a byte-bounded compact-block read fetches.
 const BOUNDED_COMPACT_BLOCK_BATCH_SIZE: usize = 16;
 
-fn read_compact_blocks_up_to(
+fn read_compact_blocks_up_to<Row>(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
     order: HeightOrder,
     max_bytes: usize,
-) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+    project: impl Fn(CompactBlockArtifact, usize) -> Row,
+) -> Result<Vec<Row>, CanonicalStoreError> {
     require_retained_compact_blocks(store, range)?;
     let mut unread = range.start.value()..=range.end.value();
     let mut next_height = || {
@@ -574,9 +598,8 @@ fn read_compact_blocks_up_to(
     let mut blocks = Vec::new();
     let mut kept_bytes = 0_usize;
     let mut largest_row_bytes = 0_usize;
-    let is_budget_spent = |blocks: &[CompactBlockArtifact], kept_bytes: usize| {
-        !blocks.is_empty() && kept_bytes >= max_bytes
-    };
+    let is_budget_spent =
+        |blocks: &[Row], kept_bytes: usize| !blocks.is_empty() && kept_bytes >= max_bytes;
     'batches: while !is_budget_spent(&blocks, kept_bytes) {
         let batch_len = bounded_batch_len(max_bytes.saturating_sub(kept_bytes), largest_row_bytes);
         let batch = std::iter::from_fn(&mut next_height)
@@ -597,7 +620,10 @@ fn read_compact_blocks_up_to(
             }
             kept_bytes = kept_bytes.saturating_add(row_bytes);
             largest_row_bytes = largest_row_bytes.max(row_bytes);
-            blocks.push(decode_compact_block_row(height, &encoded_compact_block)?);
+            blocks.push(project(
+                decode_compact_block_row(height, &encoded_compact_block)?,
+                row_bytes,
+            ));
         }
     }
     if order == HeightOrder::Descending {

@@ -26,6 +26,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 8. **Generations are bounded and recycled.** The publisher uses a fixed number of secondary generations. It catches a drained generation up in place instead of opening a new one, and reuses drained generations in turn. A published pair is never modified. When a read reports its reader invalidated, as the `RocksDB` reader does when it finds a table file deleted by compaction, it marks its pair, the publisher replaces the pair at the writer's fence, and the read runs once more only on a pair that answers the same epoch.
 9. **Compatibility block ranges bind each chunk, not the stream.** A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, and the first at most 256 KiB, so a stream opens after a small read. A single block larger than its chunk's limit forms a chunk alone. The adapter holds at most two chunks of a stream: the one it hands to the gRPC server and the next, read meanwhile; blocks the gRPC server has taken can still wait in its send buffers. Each chunk is read at the current view and holds no pair while waiting for the client. A chunk continues the stream only if it links by hash to the last block sent. Otherwise the stream ends with `ABORTED`, or with `OUT_OF_RANGE` when the tip fell below a height still to send. These are the codes lightwalletd returns for the same cases.
 10. **Consumers own their requirements.** A native consumer reads `ServerInfo` and reports every missing capability before it touches wallet storage. Zinder's contract tests prove its own invariants. Real consumer binaries, not fixture parity tests, certify consumers.
+11. **The compatibility adapter owns signed settled history.** It can derive and serve the default shielded protobuf from an immutable projection while canonical storage remains authoritative for coverage and chain identity. A signed catalog binds each segment to its network, artifact schema, interval, terminal block, and content digest. The adapter authenticates the file it will read before trusting either its own payload digests or Linux fs-verity. The [serving contract](../reference/lightwalletd-compatibility.md#signed-settled-history) defines publication and admission.
 
 [Wallet data plane](../architecture/wallet-data-plane.md) describes pinning and pair publication. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) lists the block-range outcomes.
 
@@ -56,3 +57,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - **Hold one pair for a whole block-range stream, or pin each chunk.** The client sets the pace, so no retention window covers it. The hash link, not a pin, proves continuity.
 - **Send the new branch after a reorg below the stream position.** One `OK` stream would no longer be one chain.
 - **Compatibility aliases for removed names.** Zinder's native consumers move with it, and aliases keep obsolete names available for new code.
+
+## Revision history
+
+- 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.

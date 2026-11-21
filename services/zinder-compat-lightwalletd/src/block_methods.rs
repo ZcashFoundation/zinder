@@ -36,7 +36,7 @@ use zinder_store::HeightOrder;
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
     BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
-    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, RangeBlock,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::network_tip_estimate::estimated_network_height;
@@ -145,6 +145,18 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         view: &Self::View,
         block: RequestedBlock,
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
+
+    fn block_hash_at(
+        &self,
+        view: &Self::View,
+        height: BlockHeight,
+    ) -> impl Future<Output = Result<BlockHash, Status>> + Send {
+        async move {
+            self.read_compact_block(view, RequestedBlock::Height(height))
+                .await
+                .map(|block| block.block_hash())
+        }
+    }
 
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
     /// end `read.order` visits first, and runs `convert` on the blocking pool
@@ -316,33 +328,26 @@ impl BlockMethods {
         request: &lightwalletd::BlockRange,
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<BlockRangeResponse<Result<lightwalletd::CompactBlock, Status>>, Status> {
-        let (block_range, is_descending) = block_range_from_request(request)?;
-        let stream_slot = self.block_range_streams.open().await?;
-        let shape = select(&request.pool_types)?;
-        let view = reads.capture_view().await?;
-        reject_future_block_height(
-            block_range.end,
-            Reads::view_chain_epoch(&view).visible_tip_height,
-        )?;
+        let (range, is_descending) = block_range_from_request(request)?;
+        let slot = self.block_range_streams.open().await?;
         let conversion = ChunkConversion {
-            shape,
+            shape: select(&request.pool_types)?,
             is_descending,
         };
-        let (first_messages, later_chunks) = stream_slot
-            .hold_during(read_first_chunk(
-                reads.clone(),
-                view,
-                BlockRangeChunks::new(block_range, is_descending),
-                conversion,
-            ))
-            .await?;
-        let Some((chunks, continuity)) = later_chunks else {
-            return Ok(stream_slot.hold_for(first_messages));
-        };
-        let reads = reads.clone();
-        Ok(stream_slot.hold_with_reader(first_messages, |sink| {
-            stream_later_chunks(reads, chunks, continuity, conversion, sink)
-        }))
+        stream_range(reads, range, is_descending, slot, conversion).await
+    }
+
+    pub(crate) async fn published_block_range<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        request: &lightwalletd::BlockRange,
+        history: Arc<crate::published_range::PublishedShieldedCatalog>,
+    ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
+        let (range, is_descending) = block_range_from_request(request)?;
+        let slot = self.block_range_streams.open().await?;
+        let shape = CompactBlockShape::for_range(&request.pool_types)?;
+        let source = crate::published_range::PublishedRangeRead::new(history, shape, is_descending);
+        stream_range(reads, range, is_descending, slot, source).await
     }
 
     /// Captures the current view, reads the times of its tip for the tip call
@@ -376,6 +381,35 @@ impl BlockMethods {
             now_unix_seconds,
         })
     }
+}
+
+async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
+    reads: &Reads,
+    block_range: BlockHeightRange,
+    is_descending: bool,
+    stream_slot: crate::block_range::BlockRangeStreamSlot,
+    conversion: Source,
+) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
+    let view = reads.capture_view().await?;
+    reject_future_block_height(
+        block_range.end,
+        Reads::view_chain_epoch(&view).visible_tip_height,
+    )?;
+    let (first_messages, later_chunks) = stream_slot
+        .hold_during(read_first_chunk(
+            reads.clone(),
+            view,
+            BlockRangeChunks::new(block_range, is_descending),
+            conversion.clone(),
+        ))
+        .await?;
+    let Some((chunks, continuity)) = later_chunks else {
+        return Ok(stream_slot.hold_for(first_messages));
+    };
+    let reads = reads.clone();
+    Ok(stream_slot.hold_with_reader(first_messages, |sink| {
+        stream_later_chunks(reads, chunks, continuity, conversion, sink)
+    }))
 }
 
 /// Answers `GetBlock` or `GetBlockNullifiers` with the stored block `block_id`
@@ -542,12 +576,47 @@ struct ChunkConversion {
 
 /// The messages of one chunk, as the response stream yields them. Each is
 /// `Ok`, because a chunk that cannot be converted fails whole.
-type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
+pub(crate) type ChunkMessages<Message> = Vec<Result<Message, Status>>;
+
+pub(crate) trait RangeSource<Reads: CompactBlockReads>:
+    Clone + Send + Sync + 'static
+{
+    type Block: RangeBlock + Send + 'static;
+    type Message: Send + 'static;
+
+    fn messages(&self, blocks: Vec<Self::Block>) -> Result<ChunkMessages<Self::Message>, Status>;
+
+    fn read<Output, Convert>(
+        &self,
+        reads: &Reads,
+        read: ChunkRead<Reads::View>,
+        convert: Convert,
+    ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Vec<Self::Block>) -> Output + Send + 'static;
+}
 
 /// The chunks after the first, and the continuity the next must follow.
 type LaterChunks = Option<(BlockRangeChunks, BlockRangeContinuity)>;
 
-impl ChunkConversion {
+impl<Reads: CompactBlockReads> RangeSource<Reads> for ChunkConversion {
+    type Block = CompactBlockArtifact;
+    type Message = lightwalletd::CompactBlock;
+
+    fn read<Output, Convert>(
+        &self,
+        reads: &Reads,
+        read: ChunkRead<Reads::View>,
+        convert: Convert,
+    ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Vec<Self::Block>) -> Output + Send + 'static,
+    {
+        reads.read_compact_block_chunk(read, convert)
+    }
+
     /// Converts a chunk's blocks, in ascending height order, to the messages
     /// the stream sends, in its order.
     ///
@@ -555,7 +624,10 @@ impl ChunkConversion {
     ///
     /// Returns the status of the first block that cannot be converted, and
     /// no message, so a stream never sends part of a chunk.
-    fn messages(self, mut blocks: Vec<CompactBlockArtifact>) -> Result<ChunkMessages, Status> {
+    fn messages(
+        &self,
+        mut blocks: Vec<CompactBlockArtifact>,
+    ) -> Result<ChunkMessages<Self::Message>, Status> {
         if self.is_descending {
             blocks.reverse();
         }
@@ -609,12 +681,12 @@ impl ChunkTimings {
 /// under [`crate::block_range::BlockRangeStreamSlot::hold_during`], because
 /// the read and its conversion finish on the blocking pool even when the
 /// client cancels the request.
-async fn read_first_chunk<Reads: CompactBlockReads>(
+async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: Reads,
     view: Reads::View,
     mut chunks: BlockRangeChunks,
-    conversion: ChunkConversion,
-) -> Result<(ChunkMessages, LaterChunks), Status> {
+    conversion: Source,
+) -> Result<(ChunkMessages<Source::Message>, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
     };
@@ -624,22 +696,27 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
         max_bytes: BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
         view: ChunkView::Captured(view),
     };
-    read_chunk(&reads, read, move |read_at, blocks, timings| {
-        chunks.advance(blocks.len());
-        let later_chunks = chunks
-            .has_remaining()
-            .then(|| {
-                BlockRangeContinuity::after_first_chunk(
-                    &blocks,
-                    read_at.id,
-                    conversion.is_descending,
-                )
-                .map(|continuity| (chunks, continuity))
-            })
-            .transpose()?;
-        let messages = timings.time_convert(|| conversion.messages(blocks))?;
-        Ok((messages, later_chunks))
-    })
+    read_chunk(
+        &reads,
+        conversion.clone(),
+        read,
+        move |read_at, blocks, timings| {
+            chunks.advance(blocks.len());
+            let later_chunks = chunks
+                .has_remaining()
+                .then(|| {
+                    BlockRangeContinuity::after_first_chunk(
+                        &blocks,
+                        read_at.id,
+                        matches!(chunks.order(), HeightOrder::Descending),
+                    )
+                    .map(|continuity| (chunks, continuity))
+                })
+                .transpose()?;
+            let messages = timings.time_convert(|| conversion.messages(blocks))?;
+            Ok((messages, later_chunks))
+        },
+    )
     .await
     .map_err(|failure| match failure {
         ChunkReadFailure::TipBelowChunk(read_at) => {
@@ -666,12 +743,12 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 /// client has dropped the response, the task
 /// finishes the read in flight and starts no other, so it holds the stream's
 /// slot only while that read runs.
-async fn stream_later_chunks<Reads: CompactBlockReads>(
+async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    conversion: ChunkConversion,
-    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
+    conversion: Source,
+    sink: BlockRangeSink<Result<Source::Message, Status>>,
 ) {
     while let Some(chunk) = chunks.next_chunk() {
         let Some(room) = BlockRangeStage::Send
@@ -680,13 +757,21 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
         else {
             return;
         };
-        let mut outcome = read_later_chunk(&reads, chunk, chunks, continuity, conversion).await;
+        let mut outcome =
+            read_later_chunk(&reads, chunk, chunks, continuity, conversion.clone()).await;
         if let Err(status) = &outcome
             && status.code() == Code::NotFound
             && !sink.is_closed()
             && let Some((checked, only_checked)) = chunks.checked_heights()
         {
-            outcome = read_later_chunk(&reads, checked, only_checked, continuity, conversion).await;
+            outcome = read_later_chunk(
+                &reads,
+                checked,
+                only_checked,
+                continuity,
+                conversion.clone(),
+            )
+            .await;
         }
         match outcome {
             Ok((next_chunks, next_continuity, messages)) => {
@@ -710,13 +795,20 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
 /// where the chunk is read, and their outcome is recorded here, on the
 /// stream's task. Returns the plan and the continuity moved past the chunk,
 /// with its messages.
-async fn read_later_chunk<Reads: CompactBlockReads>(
+async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: &Reads,
     chunk: BlockHeightRange,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    conversion: ChunkConversion,
-) -> Result<(BlockRangeChunks, BlockRangeContinuity, ChunkMessages), Status> {
+    conversion: Source,
+) -> Result<
+    (
+        BlockRangeChunks,
+        BlockRangeContinuity,
+        ChunkMessages<Source::Message>,
+    ),
+    Status,
+> {
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
@@ -724,16 +816,21 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
         view: ChunkView::Current,
     };
     let sent = continuity;
-    let (link, kept_blocks, messages) = read_chunk(reads, read, move |read_at, blocks, timings| {
-        let link = sent.link(chunk, read_at.id, &blocks);
-        let kept_blocks = blocks.len();
-        let messages = if link.continues() {
-            timings.time_convert(|| conversion.messages(blocks))?
-        } else {
-            Vec::new()
-        };
-        Ok((link, kept_blocks, messages))
-    })
+    let (link, kept_blocks, messages) = read_chunk(
+        reads,
+        conversion.clone(),
+        read,
+        move |read_at, blocks, timings| {
+            let link = sent.link(chunk, read_at.id, &blocks);
+            let kept_blocks = blocks.len();
+            let messages = if link.continues() {
+                timings.time_convert(|| conversion.messages(blocks))?
+            } else {
+                Vec::new()
+            };
+            Ok((link, kept_blocks, messages))
+        },
+    )
     .await
     .map_err(|failure| match failure {
         ChunkReadFailure::TipBelowChunk(read_at) => continuity.end_below_tip(chunk, &read_at),
@@ -749,23 +846,21 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
 ///
 /// The read stage is the storage read the serving mode reports, and is
 /// recorded for a read that fails too.
-async fn read_chunk<Reads, Output>(
+async fn read_chunk<Reads, Source, Output>(
     reads: &Reads,
+    source: Source,
     read: ChunkRead<Reads::View>,
-    convert: impl FnOnce(
-        ChainEpoch,
-        Vec<CompactBlockArtifact>,
-        &mut ChunkTimings,
-    ) -> Result<Output, Status>
+    convert: impl FnOnce(ChainEpoch, Vec<Source::Block>, &mut ChunkTimings) -> Result<Output, Status>
     + Send
     + 'static,
 ) -> Result<Output, ChunkReadFailure>
 where
     Reads: CompactBlockReads,
+    Source: RangeSource<Reads>,
     Output: Send + 'static,
 {
-    let outcome = reads
-        .read_compact_block_chunk(read, move |read_at, blocks| {
+    let outcome = source
+        .read(reads, read, move |read_at, blocks| {
             let mut timings = ChunkTimings::default();
             let output = convert(read_at, blocks, &mut timings);
             (output, timings.convert)

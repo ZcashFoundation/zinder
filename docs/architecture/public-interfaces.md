@@ -251,6 +251,8 @@ crates never expose generated types in their public APIs.
 
 ## Wire conventions
 
+The generated lightwalletd server accepts an optional `EncodedBlockRange` implementation for `GetBlockRange`. Each stream element contains one complete `CompactBlock` protobuf payload. Tonic applies the configured compression, framing, and message limits. Existing server implementations and generated clients use their ordinary typed interfaces.
+
 These rules apply at every protocol boundary.
 [ADR-0002](../adrs/0002-serialization-and-byte-order.md) records why.
 
