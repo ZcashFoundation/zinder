@@ -1237,7 +1237,7 @@
       "interface": "native-wallet-query",
       "network": "zcash-regtest",
       "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
-      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, configuration bdeed5076a0232f4c33a4198516ff274eec35ec6be70f9e51af8dea1d3a0c973, runtime images df04869234a6d5715ae093b9b27e83a760e80afa129fc6dbd0c387e15e118b18, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
       "action": "Stop the daemon while a pending payment is mined, then reopen and recover the confirmed payment",
       "status": "pass",
       "method_scope": "none",
@@ -1273,7 +1273,8 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "44197bc37de40473eb566aa3ed6b18010c5119fec62b3b3330eca6e992c62859"
+        "sha256": "fa9fa6db40271daba6229d52aaa9fefff2af2ccfb920fdde04e3777111c6febd",
+        "release_binaries_sha256": "e15e34b69449a55160a75271a05c6a64e24c52a9011863ba007e1a8a9f0adfe5"
       }
     },
     {
@@ -1285,7 +1286,7 @@
       "interface": "lightwalletd",
       "network": "zcash-regtest",
       "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
-      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, all-block retention, peer zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, configuration bdeed5076a0232f4c33a4198516ff274eec35ec6be70f9e51af8dea1d3a0c973, runtime images df04869234a6d5715ae093b9b27e83a760e80afa129fc6dbd0c387e15e118b18, all-block retention, peer zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
       "action": "Remain an uninvoked one-shot CLI while a pending payment is mined, then rescan it",
       "status": "pass",
       "method_scope": "none",
@@ -1321,7 +1322,8 @@
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
-        "sha256": "44197bc37de40473eb566aa3ed6b18010c5119fec62b3b3330eca6e992c62859"
+        "sha256": "fa9fa6db40271daba6229d52aaa9fefff2af2ccfb920fdde04e3777111c6febd",
+        "release_binaries_sha256": "e15e34b69449a55160a75271a05c6a64e24c52a9011863ba007e1a8a9f0adfe5"
       }
     },
     {
@@ -1333,7 +1335,7 @@
       "interface": "native-wallet-query",
       "network": "zcash-regtest",
       "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
-      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, configuration bdeed5076a0232f4c33a4198516ff274eec35ec6be70f9e51af8dea1d3a0c973, runtime images df04869234a6d5715ae093b9b27e83a760e80afa129fc6dbd0c387e15e118b18, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
       "action": "Follow a shallow reorg that orphaned and remined the same signed payment",
       "status": "pass",
       "method_scope": "none",
@@ -1373,7 +1375,8 @@
       },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
-        "sha256": "801d83243bc70333ef9a2bdb03ffa8d9413e147b148984bae641bcdb8dee14b2"
+        "sha256": "469e321567b957d5972bcf9a8793fc1e0e976bb4cf6e3b34f693cc016da7247a",
+        "release_binaries_sha256": "e15e34b69449a55160a75271a05c6a64e24c52a9011863ba007e1a8a9f0adfe5"
       }
     },
     {
@@ -1385,7 +1388,7 @@
       "interface": "lightwalletd",
       "network": "zcash-regtest",
       "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
-      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, all-block retention, peer zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, configuration bdeed5076a0232f4c33a4198516ff274eec35ec6be70f9e51af8dea1d3a0c973, runtime images df04869234a6d5715ae093b9b27e83a760e80afa129fc6dbd0c387e15e118b18, all-block retention, peer zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
       "action": "Follow a shallow reorg that orphaned and remined the same signed payment",
       "status": "pass",
       "method_scope": "none",
@@ -1425,7 +1428,8 @@
       },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
-        "sha256": "801d83243bc70333ef9a2bdb03ffa8d9413e147b148984bae641bcdb8dee14b2"
+        "sha256": "469e321567b957d5972bcf9a8793fc1e0e976bb4cf6e3b34f693cc016da7247a",
+        "release_binaries_sha256": "e15e34b69449a55160a75271a05c6a64e24c52a9011863ba007e1a8a9f0adfe5"
       }
     },
     {
@@ -1437,7 +1441,7 @@
       "interface": "native-wallet-query",
       "network": "zcash-regtest",
       "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
-      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Regtest height 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, configuration bdeed5076a0232f4c33a4198516ff274eec35ec6be70f9e51af8dea1d3a0c973, runtime images df04869234a6d5715ae093b9b27e83a760e80afa129fc6dbd0c387e15e118b18, all-block retention, peer zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
       "action": "Reconnect the same Zallet process after its private native route was lost during a pending payment",
       "status": "pass",
       "method_scope": "none",
@@ -1476,7 +1480,8 @@
       },
       "evidence": {
         "description": "Transport wallet recovery / receipt.json",
-        "sha256": "1ffb681c11d331654e65c1d134b458bd1a54329d254ba452c2d3b5c61079d180",
+        "sha256": "950cc996c96b446e324ff63d2e2f520b26be09ab13c9f0cc0027add4eee6c22a",
+        "release_binaries_sha256": "e15e34b69449a55160a75271a05c6a64e24c52a9011863ba007e1a8a9f0adfe5",
         "local_status_rpc_during_outage": "wallet-rpc-error"
       }
     },

@@ -35,6 +35,45 @@ def balance(total, transactions=(), height=30, spendable=0):
             "transactions": list(transactions)}
 
 
+class FixtureConfiguration(unittest.TestCase):
+    def test_fresh_fixtures_compare_equal_and_effective_settings_change_the_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fixture(name, subnet, owner):
+                path = Path(tmp) / name
+                path.mkdir()
+                (path / "query.toml").write_text("setting = 1")
+                (path / "zebra.toml").write_text("test network")
+                model = {"name": name, "networks": {"node": {"internal": True,
+                         "ipam": {"config": [{"subnet": subnet}]}}}, "volumes": {},
+                         "services": {"node": {"volumes": [f"{path}/zebra.toml:/etc/zebrad/zebrad.toml:ro"]},
+                         "zinder-projector": {"environment": {"ZINDER_PROJECTOR__BUILD_OWNER_HEX": owner}},
+                         "zinder-query": {"image": "stable", "environment": {"ZINDER_NETWORK__NAME": "regtest"},
+                                          "volumes": [{"type": "bind", "source": str(path / "query.toml"),
+                                                       "target": "/etc/zinder/config.toml"}]}}}
+                for section in ("networks", "services"):
+                    for resource in model[section].values():
+                        resource["labels"] = {"io.zinder.fixture.owner": owner}
+                (path / "compose.json").write_text(json.dumps(model))
+                return path, model
+
+            first, _ = fixture("first", "172.22.0.0/24", "owner-one")
+            second, model = fixture("second", "172.23.0.0/24", "owner-two")
+            expected = M["fixture_configuration"](first)
+            self.assertEqual(M["fixture_configuration"](second), expected)
+            for target, key, value in ((model["services"]["zinder-query"], "image", "other-image"),
+                                       (model["services"]["zinder-query"]["environment"], "ZINDER_NETWORK__NAME", "other"),
+                                       (model["networks"]["node"]["ipam"]["config"][0], "subnet", "172.23.0.0/25")):
+                with self.subTest(key=key):
+                    initial = target[key]
+                    target[key] = value
+                    (second / "compose.json").write_text(json.dumps(model))
+                    self.assertNotEqual(M["fixture_configuration"](second), expected)
+                    target[key] = initial
+            (second / "compose.json").write_text(json.dumps(model))
+            (second / "query.toml").write_text("setting = 2")
+            self.assertNotEqual(M["fixture_configuration"](second), expected)
+
+
 class Fingerprints(unittest.TestCase):
     def test_addresses_and_transactions_use_separate_fingerprints(self):
         address = M["address_fingerprint"]("uregtest1example")

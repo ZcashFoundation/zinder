@@ -42,7 +42,7 @@ Import the three case receipts from the selected release. Each case records hash
   --recovery-result "$evidence/native-disconnect/receipt.json" --output "$evidence/recovery-matrix.json"
 ```
 
-Compare these five observations independently from the other lifecycle cases. A differing client or fixture is reported as incomparable. The comparison checks both payment directions, including the return fee, the payer’s debit, the recipient’s credit, and each wallet’s ending balance. It also reports previously passing wallet assertions lost in the candidate.
+Compare these five observations independently from the other lifecycle cases. A differing client or fixture is reported as incomparable. The fixture identity includes the four service images, rendered Compose settings, and contents of the mounted Zebra and Zinder configuration files. Fresh projects can use different credentials, owner IDs, host paths, and allocated subnets of the same size. For comparisons across releases, mount each release’s binaries into the same image set with `--bin-dir`. For repeats of one release commit, the four mounted executable hashes must also match. A receipt that predates the effective configuration digest needs a fresh run to qualify. The comparison checks both payment directions, including the return fee, the payer’s debit, the recipient’s credit, and each wallet’s ending balance. It also reports previously passing wallet assertions lost in the candidate.
 
 ```bash
 "$wallet_python" -B scripts/wallet-clients/coverage.py compare "$evidence/recovery-matrix.json" \

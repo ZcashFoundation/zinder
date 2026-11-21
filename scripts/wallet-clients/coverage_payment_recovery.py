@@ -60,6 +60,10 @@ def token(value, where):
     require(isinstance(value, str) and SHA256.fullmatch(value), f"{where}: missing sha256")
 
 
+def digest_map(values):
+    return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def receipt(result, release, case):
     """Check one passed Regtest receipt and bind its release, binaries, and fixture."""
     fixture, clients = result["fixture"], result["clients"]
@@ -73,6 +77,11 @@ def receipt(result, release, case):
     token(fixture["activation_schedule_sha256"], f"{case} schedule")
     token(fixture["ready_sha256"], f"{case} readiness")
     token(result["preflight"]["sha256"], f"{case} preflight")
+    token(fixture.get("configuration_sha256"), f"{case} effective fixture configuration")
+    images = fixture.get("image_ids")
+    require(isinstance(images, dict) and set(images) == set(BINARIES)
+            and all(isinstance(v, str) and IMAGE.fullmatch(v) for v in images.values()),
+            f"{case}: missing or invalid runtime image IDs")
     require(IMAGE.fullmatch(fixture["node_image"]), f"{case}: invalid node image")
     require(set(fixture["release_binary_sha256"]) == set(BINARIES), f"{case}: incomplete binary pins")
     for name in BINARIES:
@@ -390,11 +399,12 @@ def row(result, receipt_sha, case, role, action, assertions, accounting):
         "network": result["network"], "client_sha256": client_sha,
         "fixture": (f"Regtest height {fixture['anchor']['height']}, schedule "
                     f"{fixture['activation_schedule_sha256']}, {fixture['node_image']}, "
+                    f"configuration {fixture['configuration_sha256']}, runtime images {digest_map(fixture['image_ids'])}, "
                     f"all-block retention, peer {peer} {clients[f'{peer}_sha256']}"),
         "action": action, "status": "pass", "method_scope": "none", "methods": {},
         "assertions": assertions, **accounting[role],
         "evidence": {"description": f"{case.capitalize()} wallet recovery / receipt.json",
-                     "sha256": receipt_sha},
+                     "sha256": receipt_sha, "release_binaries_sha256": digest_map(fixture["release_binary_sha256"])},
     }
 
 

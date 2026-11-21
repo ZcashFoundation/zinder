@@ -12,6 +12,7 @@ import argparse
 from contextlib import ExitStack
 from hashlib import sha256
 from importlib import import_module
+from ipaddress import ip_network
 import json
 import os
 from pathlib import Path
@@ -118,6 +119,39 @@ def case_project(case, state_root, name=None):
     directory = Path(state_root) / name
     require(not directory.exists(), "fixture project state already exists; refusing to reuse it")
     return name, directory
+
+
+def fixture_configuration(directory):
+    """Hash the rendered Compose configuration and the files read by its services."""
+    model = json.loads((directory / "compose.json").read_bytes())
+    del model["name"]
+    for section in ("services", "networks", "volumes"):
+        for resource in model[section].values():
+            resource["labels"].pop("io.zinder.fixture.owner")
+    for network in model["networks"].values():
+        for subnet in network["ipam"]["config"]:
+            # The isolated fixture allocates a free IPv4 subnet for each run.
+            network_range = ip_network(subnet["subnet"])
+            subnet["subnet"] = f"IPv{network_range.version}/{network_range.prefixlen}"
+    del model["services"]["zinder-projector"]["environment"]["ZINDER_PROJECTOR__BUILD_OWNER_HEX"]
+    node_mounts = model["services"]["node"]["volumes"]
+    node_config = directory / "zebra.toml"
+    expected = f"{node_config}:/etc/zebrad/zebrad.toml:ro"
+    require(expected in node_mounts, "missing fixture node configuration mount")
+    node_mounts[node_mounts.index(expected)] = f"{digest(node_config)}:/etc/zebrad/zebrad.toml:ro"
+    for service in model["services"].values():
+        for mount in service.get("volumes", []):
+            if not isinstance(mount, dict) or mount.get("type") != "bind":
+                continue
+            source = Path(mount["source"])
+            if mount["target"] == "/etc/zinder/config.toml":
+                mount["source"] = digest(source)
+            elif source.parent in (directory / "tokens", directory / "binaries"):
+                # Credentials are ephemeral. Executable bytes have separate release pins.
+                mount["source"] = str(source.relative_to(directory))
+            else:
+                raise ValueError("unrecognized bind mount in recovery fixture")
+    return sha256(json.dumps(model, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def project_resource_count(project):
@@ -359,6 +393,7 @@ class Recovery:
             "ready_sha256": digest(self.private / "fixture-initial.json"),
             "node_image": ready["node_image"],
             "image_ids": ready["images"],
+            "configuration_sha256": fixture_configuration(self.project_dir),
             "release_binary_sha256": {name: binary["sha256"] for name, binary in ready["binaries"].items()},
             "activation_schedule_sha256": ready["activation_schedule_sha256"],
             "raw_blob_policy": ready["raw_blob_policy"],
@@ -402,6 +437,9 @@ class Recovery:
         require(self.pins is not None, "input pins were not recorded")
         current = input_pins(self.wallet_inputs(), self.harness_sources())
         self.receipt["pins"]["post"] = current
+        if self.ready is not None:
+            require(fixture_configuration(self.project_dir) == self.receipt["fixture"]["configuration_sha256"],
+                    "effective fixture configuration changed during the run")
         require(current == self.pins, "wallet executable or harness source changed during the run")
         return current
 

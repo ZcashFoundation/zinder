@@ -140,8 +140,12 @@ def validate(matrix):
             require("amount" in accounting and "balance_after" in accounting and
                     all(type(v) is int and v >= 0 for v in accounting.values()), f"{ident}: invalid wallet accounting")
         evidence = row["evidence"]
-        closed(evidence, {"description", "sha256", "related_sha256", "local_status_rpc_during_outage"},
+        closed(evidence, {"description", "sha256", "related_sha256", "local_status_rpc_during_outage", "release_binaries_sha256"},
                "evidence pointer")
+        if "release_binaries_sha256" in evidence:
+            require(isinstance(evidence["release_binaries_sha256"], str)
+                    and re.fullmatch(r"[0-9a-f]{64}", evidence["release_binaries_sha256"]),
+                    f"{ident}: invalid release binary set digest")
         if "local_status_rpc_during_outage" in evidence:
             require(evidence["local_status_rpc_during_outage"] in {"available", "unavailable", "wallet-rpc-error"},
                     f"{ident}: unknown local status RPC observation")
@@ -220,6 +224,12 @@ def compare(baseline, current, prefixes=()):
             changes.append(f"{ident}: missing scenario")
             continue
         mismatched = [k for k in (*IDENTITY, "client_sha256") if new.get(k) != old.get(k)]
+        old_build = old.get("evidence", {}).get("release_binaries_sha256")
+        if old_build is not None:
+            new_build = new["evidence"].get("release_binaries_sha256")
+            same_revision = baseline.get("release", {}).get("commit") == current.get("release", {}).get("commit")
+            if new_build is None or (same_revision and old_build != new_build):
+                mismatched.append("release binaries")
         if mismatched:
             changes.append(f"{ident}: incomparable " + ", ".join(mismatched))
             continue

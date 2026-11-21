@@ -47,7 +47,7 @@ def leg(txid_label, height, accounting, surface_height):
 
 def base(case):
     fixture = {"release_revision": RELEASE["commit"], "raw_blob_policy": "all",
-               "activation_schedule_sha256": SCHEDULE, "ready_sha256": token("ready"),
+               "configuration_sha256": token("configuration"), "activation_schedule_sha256": SCHEDULE, "ready_sha256": token("ready"),
                "node_image": NODE_IMAGE, "release_binary_sha256": dict.fromkeys(BINARIES, token("bin")),
                "anchor": {"height": 150, "hash": token("anchor")},
                "image_ids": dict.fromkeys(BINARIES, NODE_IMAGE), "project": f"disposable-{case}"}
@@ -212,6 +212,35 @@ class RecoveryImport(unittest.TestCase):
 
     def rows(self, case):
         return list(recovery_actions(self.paths[case], RELEASE))
+
+    def test_comparison_distinguishes_fixture_inputs_and_release_under_test(self):
+        case = "disconnect"
+        initial = self.receipts[case]
+
+        def matrix(doc, release=RELEASE):
+            return {"inventory": {}, "release": release,
+                    "scenarios": list(recovery_actions(self.write(case, doc), release))}
+
+        baseline = matrix(initial)
+        for key, changed in (("image_ids", dict(initial["fixture"]["image_ids"], query="sha256:" + token("other"))),
+                             ("configuration_sha256", token("different configuration")),
+                             ("release_binary_sha256", dict(initial["fixture"]["release_binary_sha256"], ingest=token("rebuilt")))):
+            with self.subTest(key=key):
+                other = copy.deepcopy(initial)
+                other["fixture"][key] = changed
+                self.assertEqual(len(cov.compare(baseline, matrix(other))), 2)
+                other["fixture"]["release_revision"] = "a" * 40
+                new_release = {"tag": "v1.1.0", "commit": "a" * 40}
+                self.assertEqual(bool(cov.compare(baseline, matrix(other, new_release))), key != "release_binary_sha256")
+        other = copy.deepcopy(initial)
+        other["fixture"]["project"] = "another-project"
+        other["fixture"]["ready_sha256"] = token("new readiness")
+        self.assertEqual(cov.compare(baseline, matrix(other)), [])
+        for key in ("configuration_sha256", "image_ids"):
+            other = copy.deepcopy(initial)
+            del other["fixture"][key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                matrix(other)
 
     def test_supervised_case_requires_the_final_cooperative_result_for_this_receipt(self):
         case = "disconnect"
