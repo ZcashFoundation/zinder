@@ -1455,6 +1455,8 @@ listener on IPv4 loopback. Each command verifies the running server commit and
 chain fence before starting. The public recovery vector has known historical
 activity in this window. Keep wallet databases and raw logs private.
 
+The reference Zkool engines have pinned executable digests. For a different build, pass `--client-version VERSION` from its source checkout to the interrupted-stream and reorg commands. Each receipt records the version alongside the executable digest.
+
 ```bash
 release_sha=$(git rev-parse "$release_tag^{commit}")
 export PYTHONPATH="$python_proto"

@@ -2,6 +2,7 @@
 """Compare a funded Zingo restore with two Sapling completion-hash wire encodings."""
 import argparse
 from collections import Counter
+from contextlib import suppress
 import hashlib
 import json
 import os
@@ -148,10 +149,11 @@ def command(argv, env, root, label, timeout=400, expected_sync_error=None):
         proc = subprocess.Popen(argv, env=env, stdout=out, stderr=err, start_new_session=True)
         try:
             status = proc.wait(timeout=timeout)
-        finally:
-            if proc.poll() is None:
+        except BaseException:
+            with suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+            proc.wait(timeout=5)
+            raise
     check(status == 0, f"{label} exited {status}. Inspect the private stderr file.")
     stderr = (root / (label + ".stderr")).read_bytes()
     if expected_sync_error is None:

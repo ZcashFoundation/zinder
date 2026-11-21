@@ -15,6 +15,7 @@ import time
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
+from coverage_evidence import zkool_version
 from wallet_fixture import binding, loopback, verify_node
 
 
@@ -100,7 +101,8 @@ class Scenario:
         return counts
 
     def wallet_command(self, phase, op, args, *, online=False):
-        argv = [str(self.args.engine), op, *map(str, args)]
+        # The pinned engine interpolates its wallet path into a SQLite URL.
+        argv = [str(self.args.engine), op, *(self.wallet.name if arg == self.wallet else str(arg) for arg in args)]
         trace = self.args.output / 'private' / phase
         if online:
             before = self.counters()
@@ -108,7 +110,7 @@ class Scenario:
                     '--endpoint-port', str(urlsplit(self.endpoint).port), '--output', str(trace), '--', *argv]
         stdout_path = self.args.output / 'private' / f'{phase}.stdout'
         with stdout_path.open('w') as stdout, stdout_path.with_suffix('.stderr').open('w') as stderr:
-            result = run_command(argv, stdout, stderr, timeout=120)
+            result = run_command(argv, stdout, stderr, timeout=120, cwd=self.wallet.parent)
         if online:
             after = self.counters()
             require(all(after[key] >= value for key, value in before.items()), 'server RPC counter reset')
@@ -130,7 +132,7 @@ class Scenario:
 
     def state(self, phase, txids):
         report = json.loads(self.wallet_command(phase, 'report', [self.wallet]))
-        with sqlite3.connect(f'file:{self.wallet / "zkool.db"}?mode=ro', uri=True) as db:
+        with sqlite3.connect((self.wallet / 'zkool.db').as_uri() + '?mode=ro', uri=True) as db:
             heights = [db.execute('SELECT height FROM transactions WHERE txid = ?',
                                   (bytes.fromhex(tx)[::-1],)).fetchall() for tx in txids]
         state = {'scanned_height': report['synced_height'], 'ironwood_balance': report['balance']['ironwood'],
@@ -206,6 +208,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=Path, required=True, help='Zkool v6.37.0 Regtest sync_eval executable')
     parser.add_argument('--engine-sha256', required=True)
+    parser.add_argument("--client-version", help="source version for a newly built Zkool engine")
     parser.add_argument('--images', type=Path, required=True, help='regtest-fixture image map')
     parser.add_argument('--revision', required=True, help='selected Zinder release commit')
     parser.add_argument('--bin-dir', type=Path, help='released binaries to overlay on the pinned images')
@@ -213,6 +216,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path, help='new private evidence directory')
     parser.add_argument('--port-base', type=int, default=48100)
     args = parser.parse_args()
+    version = zkool_version(args.engine_sha256, args.client_version)
     args.engine = args.engine.resolve()
     require(sha256(args.engine) == args.engine_sha256, 'client binary digest mismatch')
     sys.path.insert(0, str(args.proto_dir.resolve()))
@@ -226,14 +230,16 @@ def main():
     operator = [sys.executable, str(SCRIPTS / 'regtest-fixture.py')]
     scope = ['--project', name, '--state-root', str(root)]
     receipt = {'schema_version': 1, 'case': 'zkool-ironwood-coinbase-reorg', 'interface': 'lightwalletd',
-               'status': 'failed', 'runner_sha256': sha256(Path(__file__)),
+               'status': 'failed', 'fixture_teardown_completed': False, 'runner_sha256': sha256(Path(__file__)),
                'method_evidence': 'exclusive compat server completed RPC counter deltas per wallet invocation',
-               'client': {'name': 'zkool', 'version': '6.37.0', 'variant': 'internal-enabled',
-                                                'binary_sha256': args.engine_sha256}, 'actions': {}, 'wallet_states': {}}
+               'client': {'name': 'zkool', 'version': version, 'variant': 'internal-enabled',
+                          'version_source': 'operator' if args.client_version else 'pinned-binary',
+                          'binary_sha256': args.engine_sha256}, 'actions': {}, 'wallet_states': {}}
     up = operator + ['up', *scope, '--port-base', str(args.port_base), '--node-config', str(CONFIG),
                      '--tip', '260', '--revision', args.revision, '--images', str(args.images)]
     if args.bin_dir:
         up += ['--bin-dir', str(args.bin_dir)]
+    passed = False
     try:
         with (args.output / 'private' / 'up.log').open('w') as log:
             require(run_command(up, log, subprocess.STDOUT, timeout=400) == 0, 'fixture startup failed')
@@ -243,7 +249,7 @@ def main():
         finally:
             case.channel.close()
         require(sha256(args.engine) == args.engine_sha256, 'client binary changed during test')
-        receipt['status'] = 'passed'
+        passed = True
     finally:
         try:
             if (root / name / 'state.json').is_file():
@@ -252,7 +258,10 @@ def main():
                 receipt['fixture_teardown_completed'] = down == 0
                 require(down == 0, 'owned fixture teardown failed')
         finally:
+            if passed and receipt['fixture_teardown_completed']:
+                receipt['status'] = 'passed'
             campaign['write_json'](args.output / 'receipt.json', receipt)
+    require(receipt['status'] == 'passed', 'owned fixture teardown was not verified')
 
 
 if __name__ == '__main__':

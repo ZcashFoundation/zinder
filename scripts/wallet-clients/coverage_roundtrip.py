@@ -24,7 +24,8 @@ def check_receipt(receipt, revision):
             "missing pinned inputs or fixture recipe")
     require(set(recipe["release_binaries"]) == {"compat-lightwalletd", "ingest", "projector", "query"}
             and all(sha_token(v) for v in recipe["release_binaries"].values()), "invalid release binary pins")
-    require(receipt["invocation_harnesses"] and receipt["harness_sha256"]
+    wallet_sources = {"run-wallet-roundtrip.py", "roundtrip_wallets.py", "roundtrip_fixture.py", "wallet_fixture.py"}
+    require(receipt["invocation_harnesses"] and wallet_sources <= receipt["harness_sha256"].keys()
             and all(sha_token(v) for v in receipt["harness_sha256"].values()), "missing harness pins")
     require(set(receipt["legs"]) == {"outbound", "return"}, "expected two payment legs")
     out, back = receipt["legs"]["outbound"], receipt["legs"]["return"]

@@ -378,9 +378,12 @@ def main():
     require(re.fullmatch("[0-9a-f]{40}", args.revision) and args.wait_seconds > 0, "invalid revision or timeout")
     from roundtrip_fixture import verify, rpc
     from roundtrip_wallets import Zingo, Zallet
-    ready = json.loads(args.ready.read_text())
-    config = {"network":args.network,"revision":args.revision,"ready_sha256":digest(args.ready),
-              "zingo_sha256":digest(args.zingo),"zallet_sha256":digest(args.zallet_backend),
+    ready_bytes = args.ready.read_bytes()
+    ready = json.loads(ready_bytes)
+    client_files = {"zingo_sha256": args.zingo, "zallet_sha256": args.zallet_backend}
+    client_hashes = {key: digest(path) for key, path in client_files.items()}
+    config = {"network":args.network,"revision":args.revision,"ready_sha256":hashlib.sha256(ready_bytes).hexdigest(),
+              **client_hashes,
               "outbound_zat":OUTBOUND,"return_zat":RETURN}
     state = args.state.resolve()
     with locked(state):
@@ -412,7 +415,6 @@ def main():
         zallet = native_wallet()
         try:
             result = RoundTrip(args.network, ready, rpc, j, zingo, zallet, args.wait_seconds).run()
-            require(source_hashes == {p.name:digest(p) for p in sources}, "harness changed during run; rerun to verify")
             result["harness_sha256"] = source_hashes
             result["invocation_harnesses"] = j.data["invocation_harnesses"]
             result["fixture_recipe"] = {"network":args.network,"genesis":preflight["genesis"],
@@ -433,6 +435,10 @@ def main():
                 original_error.add_note(f"Zallet cleanup also failed: {cleanup_error}")
             finally:
                 zingo.close()
+        require(source_hashes == {p.name: digest(p) for p in sources}, "harness changed during run")
+        require(config["ready_sha256"] == digest(args.ready) and
+                client_hashes == {key: digest(path) for key, path in client_files.items()},
+                "wallet executable or fixture receipt changed during run")
         write_json(receipt, result)
         print(receipt)
 

@@ -20,6 +20,20 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def zkool_version(binary_sha256, reported=None):
+    # The original receipts predate version selection. These two builds have verified source pins.
+    baseline = binary_sha256 in {
+        "6a9f90adb7f53caa739a0274f7653096678d523244449b8f42bde6ca1cfc99eb",
+        "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+    }
+    if baseline:
+        require(reported in (None, "6.37.0"), "version conflicts with the pinned Zkool build")
+        return "6.37.0"
+    require(isinstance(reported, str) and re.fullmatch(r"[0-9][0-9A-Za-z.+_-]{0,63}", reported),
+            "specify --client-version for this Zkool build")
+    return reported
+
+
 def subtree_fixture(directory, report):
     """Prefer the fixture preserved with the run, and accept the pinned default for older runs."""
     preserved = directory / "fixture.json"
@@ -99,11 +113,20 @@ def subtree_actions(directory, release):
                    assertions={"invalid-sapling-root-rejected": "pass", "no-blocks-scanned": "pass"}, methods=methods)
 
 
+def observed_calls(calls, where):
+    require(isinstance(calls, list) and calls, f"{where}: missing observed calls")
+    require(all(isinstance(call, dict) and isinstance(call.get("method"), str) and call["method"]
+                and type(call.get("count")) is int and call["count"] > 0
+                and isinstance(call.get("grpc_code"), str) and call["grpc_code"] for call in calls),
+            f"{where}: invalid observed call")
+
+
 def reorg_actions(path, release):
     result = load(path)
     fixture, client = result["fixture"], result["client"]
     require(result["schema_version"] == 1 and result["case"] == "zkool-ironwood-coinbase-reorg"
             and result["interface"] == "lightwalletd" and result["status"] == "passed"
+            and result.get("fixture_teardown_completed") is True
             and fixture["release_revision"] == release["commit"] and
             fixture["release_version"] == release["tag"][1:], "reorg did not pass on selected release")
     checks = {
@@ -114,12 +137,18 @@ def reorg_actions(path, release):
                                "surviving_receipt_preserved"],
         "restart-and-advance": ["rollback_persisted_after_new_process_and_next_block"],
     }
+    require(set(result["assertions"]) == {"distinct_branch_hash_at_mined_height",
+                                          *(check for selected in checks.values() for check in selected)}
+            and all(passed is True for passed in result["assertions"].values()), "incomplete reorg assertions")
+    version = zkool_version(client["binary_sha256"], client["version"] if client.get("version_source") == "operator" else None)
+    require(client["version"] == version, "reorg client version differs from the selected build")
     reached_tip = result["first_reorg_sync_reached_tip"]
     expected_actions = set(checks) if reached_tip else {*checks, "resume-replacement"}
     require(isinstance(reached_tip, bool) and expected_actions == set(result["actions"]), "incomplete reorg actions")
     for phase, selected in checks.items():
         action = result["actions"][phase]
         require(action["client_connected_only_to_target"] is True, "unattributed reorg calls")
+        observed_calls(action["methods"], f"reorg {phase}")
         assertions = {"target-only-connections": "pass"}
         for check in selected:
             require(result["assertions"][check] is True, f"missing reorg assertion {check}")
@@ -137,6 +166,7 @@ def reorg_actions(path, release):
             if not reached_tip:
                 resume = result["actions"]["resume-replacement"]
                 require(resume["client_connected_only_to_target"] is True, "unattributed reorg catchup")
+                observed_calls(resume["methods"], "reorg resume-replacement")
                 calls.extend(resume["methods"])
             state = states["after-first-reorg-sync" if reached_tip else "after-reorg-catchup"]
             require(state["scanned_height"] == result["fork"]["new_tip"], "replacement chain tip not reached")
@@ -147,7 +177,7 @@ def reorg_actions(path, release):
             obs["calls"] += call["count"]
             code = call["grpc_code"]
             obs["outcomes"][code] = obs["outcomes"].get(code, 0) + call["count"]
-        yield dict(id=f"zkool-reorg-{phase}", wallet=client["name"], version=client["version"],
+        yield dict(id=f"zkool-reorg-{phase}", wallet=client["name"], version=version,
                    variant=client["variant"], implementation="engine", client_sha256=client["binary_sha256"],
                    interface=result["interface"], network=fixture["network"],
                    fixture=f"disposable-{fixture['network']}-{fixture['activation_schedule_sha256']}",
@@ -192,7 +222,8 @@ def interrupted_actions(path, release):
         if phase == "interrupted":
             require(methods["GetBlockRange"]["calls"] >= 2, "wallet never requested another range")
             checks.update(dict.fromkeys(("partial-range-failure", "fresh-process-resumes", "next-range-from-persisted-block", "matches-control"), "pass"))
-        yield dict(id=f"zkool-compact-stream-{phase}", wallet="zkool", version="6.37.0", variant="external-only",
+        yield dict(id=f"zkool-compact-stream-{phase}", wallet="zkool", version=zkool_version(result["client_sha256"], result.get("client_version")),
+                   variant="external-only",
                    implementation="engine", interface="lightwalletd", network="testnet", client_sha256=result["client_sha256"],
                    fixture=f"Testnet birthday {fixture['birthday']} through {fixture['tip']}/{fixture['tip_hash']}",
                    action="Restore through the frozen fence" if phase == "control" else
@@ -206,22 +237,41 @@ def native_expiry_actions(path, release):
     result = load(path)
     fixture, client = result["fixture"], result["client"]
     require(result["schema_version"] == 1 and result["status"] == "passed" and
-            result["case"] == "zallet-bounded-scan-expiry" and result["interface"] == "native-wallet-query" and
+            result["case"] == "zallet-bounded-scan-expiry" and result["interface"] == "native-wallet-query"
+            and result.get("fixture_teardown_completed") is True and
             fixture["release_revision"] == release["commit"] and fixture["release_version"] == release["tag"][1:] and
             fixture["raw_blob_policy"] == "all", "native expiry did not pass on selected all-retention release")
     require(re.fullmatch(r"[0-9a-f]{64}", client["driver_sha256"]) and
             re.fullmatch(r"[0-9a-f]{64}", client["backend_sha256"]),
             "native expiry requires driver and ordinary backend digests")
+    require(set(result["actions"]) == {"initialize", "acquire-and-pause", "stale-read-and-retry"},
+            "incomplete native expiry actions")
+    require(set(result["assertions"]) == {"expired_metadata_unchanged", "expired_scan_work_still_pending",
+                                          "complete_retry_on_new_epoch", "retry_hashes_match_canonical",
+                                          "retry_scan_work_completed"}
+            and all(passed is True for passed in result["assertions"].values()),
+            "incomplete native expiry assertions")
+    require(set(result["trace_sha256"]) == {"initialize", "scan"}
+            and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in result["trace_sha256"].values()),
+            "native expiry requires traced client connections")
     identity = dict(wallet="zallet", version="ZIT pinned driver", implementation="engine",
                     variant=f"{client['driver_feature']} driver {client['driver_sha256']}",
                     client_sha256=client["backend_sha256"])
-    first, retry = result["attempts"]
+    attempts = result["attempts"]
+    require(isinstance(attempts, list) and len(attempts) == 2, "native expiry requires two range attempts")
+    first, retry = attempts
+    anchor_height = fixture["anchor_height"]
+    require(first["requested_start_height_inclusive"] == anchor_height - 1 and
+            first["requested_end_height_inclusive"] == anchor_height and
+            retry["requested_end_height_inclusive"] == anchor_height + 1,
+            "native scan range differs from the fixture anchor")
     require(first["chain_epoch_id"] != retry["chain_epoch_id"] and
             first["requested_start_height_inclusive"] == retry["requested_start_height_inclusive"] and
             result["persisted_heights"] == list(range(retry["requested_start_height_inclusive"],
                                                      retry["requested_end_height_inclusive"] + 1)) and
             result["expired_source"] == "IndexerError::ChainEpochPinUnavailable", "native range retry mismatch")
     for phase, calls in result["actions"].items():
+        observed_calls(calls, f"native {phase}")
         methods = {}
         for call in calls:
             obs = methods.setdefault(call["method"], {"calls": 0, "outcomes": {}})

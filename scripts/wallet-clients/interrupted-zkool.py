@@ -17,6 +17,7 @@ import compact_formats_pb2
 import service_pb2 as pb
 
 from subtree_proxy import READ_METHODS, SERVICE, RawReader, serve
+from coverage_evidence import zkool_version
 from wallet_fixture import loopback
 
 
@@ -139,10 +140,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", type=Path, required=True)
     parser.add_argument("--client-sha256", required=True)
+    parser.add_argument("--client-version", help="source version for a newly built Zkool engine")
     parser.add_argument("--revision", required=True, help="full selected Zinder release commit")
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    version = zkool_version(args.client_sha256, args.client_version)
     args.client = args.client.resolve()
     endpoint = loopback(args.endpoint)
     require(len(args.revision) == 40 and all(c in "0123456789abcdef" for c in args.revision),
@@ -163,6 +166,7 @@ def main():
     require(control["wallet"] == interrupted["wallet"], "resumed wallet history, notes or balance differs from control")
     require(BENCH["sha256"](args.client) == args.client_sha256, "client executable changed")
     result = {"schema_version": 1, "status": "pass", "revision": args.revision, "client_sha256": args.client_sha256,
+              "client_version": version,
               "fixture_sha256": BENCH["sha256"](fixture_path), "birthday": fixture["birthday"], "tip": fixture["tip"],
               "tip_hash": fixture["tip_hash"], "control": control, "interrupted": interrupted}
     result["observed_methods"] = sorted(READ_METHODS)

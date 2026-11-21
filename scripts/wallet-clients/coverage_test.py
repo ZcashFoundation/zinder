@@ -11,6 +11,19 @@ from pathlib import Path
 import coverage as cov
 
 
+class ZkoolVersionTests(unittest.TestCase):
+    def test_only_the_pinned_builds_inherit_the_baseline_version(self):
+        from coverage_evidence import zkool_version
+
+        reference = "6a9f90adb7f53caa739a0274f7653096678d523244449b8f42bde6ca1cfc99eb"
+        self.assertEqual(zkool_version(reference), "6.37.0")
+        self.assertEqual(zkool_version("0" * 64, "6.38.1"), "6.38.1")
+        with self.assertRaises(ValueError):
+            zkool_version("0" * 64)
+        with self.assertRaises(ValueError):
+            zkool_version(reference, "6.38.1")
+
+
 def sample():
     return {"schema_version": 1, "release": {"tag": "v1.0.0", "commit": "a" * 40},
             "inventory": {"lightwalletd": ["GetSubtreeRoots", "GetBlock"], "native-wallet-query": ["SubtreeRoots"]},
@@ -36,7 +49,7 @@ def payment_receipt(ch):
                 "spendable_after_zat": payee, "tx_fingerprint": token(str(height)), "change_zat": change,
                 "mined_height": height, "pending": dict.fromkeys(("node_mempool", "payee", "payer"), True),
                 "memo_verified": True}
-    harness = {"run-wallet-roundtrip.py": "a" * 64}
+    harness = dict.fromkeys(("run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"), "a" * 64)
     return {"schema_version": 1, "status": "passed", "network": "regtest", "independent_wallets": True,
             "pending_certified": True, "reopen_ledger_verified": True, "harness_sha256": harness,
             "invocation_harnesses": [harness], "wallet_identity_sha256": [token("zingo"), token("zallet")],
@@ -129,12 +142,13 @@ class CoverageTests(unittest.TestCase):
         phases = ["bootstrap", "scan-surviving-receipt", "scan-orphan-candidate",
                   "follow-replacement", "restart-and-advance"]
         result = {"schema_version": 1, "case": "zkool-ironwood-coinbase-reorg",
-                  "status": "passed", "interface": "lightwalletd", "client": {
-                      "name": "zkool", "version": "6.37.0", "variant": "internal-enabled", "binary_sha256": "c" * 64},
+                  "status": "passed", "fixture_teardown_completed": True, "interface": "lightwalletd", "client": {
+                      "name": "zkool", "version": "6.37.0", "version_source": "operator",
+                      "variant": "internal-enabled", "binary_sha256": "c" * 64},
                   "fixture": {"network": "zcash-regtest", "release_revision": release["commit"],
                               "release_version": release["tag"][1:], "activation_schedule_sha256": "d" * 64},
                   "actions": dict.fromkeys(phases, action), "fork": {"new_tip": 266},
-                  "first_reorg_sync_reached_tip": True, "assertions": dict.fromkeys([
+                  "first_reorg_sync_reached_tip": True, "assertions": dict.fromkeys(["distinct_branch_hash_at_mined_height",
                       "orphan_removed_from_confirmed_history", "owned_note_and_balance_reverted",
                       "surviving_receipt_preserved", "rollback_persisted_after_new_process_and_next_block"], True),
                   "wallet_states": {"surviving-receipt": {"received_notes": 1, "ironwood_balance": 10},
@@ -154,6 +168,18 @@ class CoverageTests(unittest.TestCase):
             self.assertEqual([r["assertions"] for r in fast], [r["assertions"] for r in slow])
             self.assertEqual(slow[3]["methods"]["GetBlockRange"], {"calls": 2, "outcomes": {"ok": 2}})
 
+            for label, mutate in (
+                    ("absent cleanup", lambda r: r.pop("fixture_teardown_completed")),
+                    ("failed cleanup", lambda r: r.update(fixture_teardown_completed=False)),
+                    ("missing assertion", lambda r: r["assertions"].pop("distinct_branch_hash_at_mined_height")),
+                    ("missing phase", lambda r: r["actions"].pop("scan-surviving-receipt")),
+                    ("missing calls", lambda r: r["actions"]["resume-replacement"].update(methods=[]))):
+                changed = copy.deepcopy(result)
+                mutate(changed)
+                path.write_text(json.dumps(changed))
+                with self.subTest(label), self.assertRaises(ValueError):
+                    list(cov.reorg_actions(path, release))
+
     def test_interrupted_execution_cannot_use_a_replayed_prefix_as_resume_proof(self):
         from coverage_evidence import digest, interrupted_actions
         fixture_path = Path(cov.__file__).with_name("subtree-testnet.json")
@@ -164,7 +190,7 @@ class CoverageTests(unittest.TestCase):
                   "ledger_sha256": "a" * 64, "balance": {"total": 0}}
         def trace(exit_code):
             return {"connects": 1, "trace_sha256": "b" * 64, "exit": exit_code}
-        result = dict(schema_version=1, status="pass", revision=release["commit"], client_sha256="c" * 64,
+        result = dict(schema_version=1, status="pass", revision=release["commit"], client_sha256="c" * 64, client_version="6.37.0",
                       fixture_sha256=digest(fixture_path), birthday=fixture["birthday"], tip=end,
                       tip_hash=fixture["tip_hash"],
                       control={"fault": None, "methods": {"GetBlockRange": 1}, "wallet": wallet,
@@ -182,6 +208,14 @@ class CoverageTests(unittest.TestCase):
             path.write_text(json.dumps(result))
             with self.assertRaisesRegex(ValueError, "persisted last delivered block"):
                 list(interrupted_actions(path, release))
+
+    def test_matching_receipts_must_pin_all_wallet_harness_sources(self):
+        left, right = payment_receipt("a"), payment_receipt("b")
+        for receipt in (left, right):
+            del receipt["harness_sha256"]["roundtrip_wallets.py"]
+        with self.assertRaisesRegex(ValueError, "harness"):
+            from coverage_roundtrip import compare_runs
+            compare_runs(left, right)
 
     def test_standalone_compare_checks_wallet_observations(self):
         import runpy

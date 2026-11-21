@@ -28,6 +28,8 @@ Start the two-wallet repeat case with the fixture image map, release binaries, a
   --revision "$release_sha" --zingo "$zingo" --zallet-backend "$zallet_backend"
 ```
 
+Each stage has a 5,400-second deadline. Set `--stage-timeout SECONDS` for a slower host or a shorter test. On timeout or cancellation, the runner signals the stage process group and escalates after `--stage-grace SECONDS` (default 30). Each fixture teardown has its own 600-second budget. Check `cleanup.json` for both projects and the named stage log for the original failure.
+
 ### Operate the fixtures separately
 
 Choose a new private `state_root`, a unique `project` beginning with `zinder-fixture-`, an unused `port_base`, and a separate unused loopback `wallet_rpc_port`. Set `fixture_images` and `release_bin_dir` as described in the [fixture operator instructions](../../docs/runbooks/testing.md#disposable-wallet-regtest-fixtures). Start an empty chain for each independent run. The operator uses the same network upgrade schedule and all-block retention for both wallets.
@@ -56,7 +58,7 @@ python3 scripts/wallet-clients/audit-wallet-roundtrip.py --revision "$release_sh
 
 The comparison requires different wallet identities, fixture receipts, and transaction fingerprints. It checks the same release, client binaries, harness, fixture recipe, and wallet outcomes, including amounts, fees, pending observations, and balances. Wallet keys, transaction IDs, block hashes, and timing vary by design.
 
-The audit reads both private journals, checks each fixture’s genesis and anchor against its loopback control node, and verifies the four signed transactions in the active-chain blocks. It reconciles the payer and payee balances, then writes a compact report with receipt hashes and transaction fingerprints. It makes read-only node calls. After the audit succeeds, run `scripts/regtest-fixture.py down` with each fixture’s own project and state root. The output can be supplied to the coverage collector’s `--roundtrip-audit` option.
+The audit reads both private journals, checks each fixture’s genesis and anchor against its loopback control node, and verifies the four signed transactions in the active-chain blocks. It matches the reported service binary digests to the immutable fixture record and the wallet harness history to each private journal. Each wallet run rechecks the client executables, harness files, and fixture receipt after wallet shutdown. The audit reconciles the payer and payee balances and records the audit tool digests alongside the payment outcomes. It makes read-only node calls. After the audit succeeds, run `scripts/regtest-fixture.py down` with each fixture’s own project and state root. The output can be supplied to the coverage collector’s `--roundtrip-audit` option.
 
 ## Run one live Fauzec-funded Testnet case
 

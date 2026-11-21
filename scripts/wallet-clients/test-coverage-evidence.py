@@ -114,23 +114,33 @@ class EvidenceTests(unittest.TestCase):
                 list(subtree_actions(run, RELEASE))
 
     def native_receipt(self, backend="e" * 64, driver="f" * 64, feature="bounded-scan-certification"):
-        start, end = 149, 151
+        start, anchor = 149, 150
+
+        def call(method, count, code="ok", error_class="none"):
+            return {"method": method, "count": count, "grpc_code": code, "error_class": error_class}
+
         state = {"fixture": {"network": "zcash-regtest", "release_revision": RELEASE["commit"],
-                             "release_version": RELEASE["tag"][1:], "anchor_height": 150,
+                             "release_version": RELEASE["tag"][1:], "anchor_height": anchor,
                              "raw_blob_policy": "all"},
                  "client": {"name": "zallet", "driver_sha256": driver, "backend_sha256": backend,
                             "driver_feature": feature},
                  "attempts": [{"chain_epoch_id": "first", "requested_start_height_inclusive": start,
-                               "requested_end_height_inclusive": end},
+                               "requested_end_height_inclusive": anchor},
                               {"chain_epoch_id": "second", "requested_start_height_inclusive": start,
-                               "requested_end_height_inclusive": end + 1}],
-                 "persisted_heights": list(range(start, end + 2)),
+                               "requested_end_height_inclusive": anchor + 1}],
+                 "persisted_heights": list(range(start, anchor + 2)),
                  "expired_source": "IndexerError::ChainEpochPinUnavailable",
-                 "actions": {"stale-read-and-retry": [
-                     {"method": "FullBlocksInRange", "count": 1, "grpc_code": "failed_precondition",
-                      "error_class": "CHAIN_EPOCH_PIN_UNAVAILABLE"},
-                     {"method": "FullBlocksInRange", "count": 1, "grpc_code": "ok", "error_class": None}]},
-                 "assertions": {"typed_expired_view_error": True}}
+                 "actions": {"initialize": [call("FullBlocksInRange", 1)],
+                             "acquire-and-pause": [call("FullBlocksInRange", 1)],
+                             "stale-read-and-retry": [
+                                 call("FullBlocksInRange", 1, "failed_precondition",
+                                      "CHAIN_EPOCH_PIN_UNAVAILABLE"),
+                                 call("FullBlocksInRange", 1)]},
+                 "trace_sha256": {"initialize": "1" * 64, "scan": "2" * 64},
+                 "fixture_teardown_completed": True,
+                 "assertions": dict.fromkeys(("expired_metadata_unchanged", "expired_scan_work_still_pending",
+                                              "complete_retry_on_new_epoch", "retry_hashes_match_canonical",
+                                              "retry_scan_work_completed"), True)}
         return dict(schema_version=1, status="passed", case="zallet-bounded-scan-expiry",
                     interface="native-wallet-query", **state)
 
@@ -148,7 +158,9 @@ class EvidenceTests(unittest.TestCase):
 
     def test_native_identity_uses_the_ordinary_backend_and_driver(self):
         rows = self.collect_native(self.native_receipt())
-        self.assertEqual(len(rows), 1)
+        self.assertEqual([row["id"] for row in rows],
+                         ["zallet-bounded-initialize", "zallet-bounded-acquire-and-pause",
+                          "zallet-bounded-stale-read-and-retry"])
         self.assertEqual(rows[0]["client_sha256"], "e" * 64)
         self.assertIn("f" * 64, rows[0]["variant"])
         self.assertIn("bounded-scan-certification", rows[0]["variant"])
@@ -165,12 +177,35 @@ class EvidenceTests(unittest.TestCase):
                 after = self.matrix(self.collect_native(self.native_receipt(**change)))
                 self.assertIn("incomparable variant", "\n".join(cov.compare(before, after)))
 
+    def test_native_scan_range_must_match_the_referenced_fixture_anchor(self):
+        receipt = self.native_receipt()
+        receipt["fixture"]["anchor_height"] += 1
+        with self.assertRaisesRegex(ValueError, "anchor"):
+            self.collect_native(receipt)
+
     def test_native_receipt_requires_both_digests(self):
         receipt = self.native_receipt()
         del receipt["client"]["backend_sha256"]
         with self.assertRaises(KeyError):
             self.collect_native(receipt)
 
+    def test_native_receipt_requires_complete_actions_assertions_and_traces(self):
+        for label, mutate in (
+                ("incomplete cleanup", lambda receipt: receipt.update(fixture_teardown_completed=False)),
+                ("absent cleanup", lambda receipt: receipt.pop("fixture_teardown_completed")),
+                ("missing phase", lambda receipt: receipt["actions"].pop("acquire-and-pause")),
+                ("unexpected phase", lambda receipt: receipt["actions"].update(extra=[])),
+                ("empty calls", lambda receipt: receipt["actions"].__setitem__("initialize", [])),
+                ("zero count", lambda receipt: receipt["actions"]["initialize"][0].update(count=0)),
+                ("empty assertions", lambda receipt: receipt["assertions"].clear()),
+                ("missing assertion", lambda receipt: receipt["assertions"].pop("retry_scan_work_completed")),
+                ("false assertion", lambda receipt: receipt["assertions"].update(retry_scan_work_completed=False)),
+                ("missing trace", lambda receipt: receipt["trace_sha256"].pop("scan")),
+                ("one attempt", lambda receipt: receipt["attempts"].pop())):
+            receipt = self.native_receipt()
+            mutate(receipt)
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.collect_native(receipt)
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,8 @@
 """Canonical Regtest audit boundary tests."""
 import copy
 import hashlib
+import json
+import tempfile
 import importlib.util
 from pathlib import Path
 import unittest
@@ -58,6 +60,31 @@ class CanonicalAuditTests(unittest.TestCase):
         self.observation["fee_zat"] = 3
         with self.assertRaisesRegex(ValueError, "balance changes"):
             self.verify()
+
+    def test_ready_build_or_journal_harness_mismatch_stops_before_node_access(self):
+        from coverage_test import payment_receipt
+        for changed in ("binaries", "journal"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                receipt = payment_receipt("a")
+                recipe = receipt["fixture_recipe"]
+                recipe["genesis"] = audit.GENESIS["regtest"]
+                ready = {k: recipe[k] for k in ("activation_schedule_sha256", "raw_blob_policy", "node_image")}
+                ready.update(network="zcash-regtest", zinder_commit=receipt["inputs"]["revision"],
+                             binaries={k: {"sha256": v} for k, v in recipe["release_binaries"].items()})
+                if changed == "binaries":
+                    ready["binaries"]["query"]["sha256"] = "c" * 64
+                ready_path = root / "ready.json"
+                ready_path.write_text(json.dumps(ready))
+                receipt["inputs"]["ready_sha256"] = hashlib.sha256(ready_path.read_bytes()).hexdigest()
+                journal = dict(config=receipt["inputs"], wallets=receipt["wallet_identity_sha256"],
+                               birthday_anchor=recipe["starting_height"],
+                               invocation_harnesses=receipt["invocation_harnesses"] if changed != "journal" else [])
+                (root / "receipt.json").write_text(json.dumps(receipt))
+                (root / "run.json").write_text(json.dumps(journal))
+                with patch.object(audit, "rpc") as rpc, self.assertRaisesRegex(ValueError, "build|harness"):
+                    audit.verify_run(root, ready_path, receipt["inputs"]["revision"])
+                rpc.assert_not_called()
 
     def test_independent_canonical_heights_can_differ(self):
         leg = dict(self.leg, memo_verified=True, spendable_after_zat=15, change_zat=None)

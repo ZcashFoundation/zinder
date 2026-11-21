@@ -137,6 +137,27 @@ class RoundTripTests(unittest.TestCase):
                     self.assertRaisesRegex(TimeoutError, "legacy shutdown"):
                 M["main"]()
 
+    def test_changed_wallet_binary_during_shutdown_withholds_the_receipt(self):
+        import roundtrip_fixture
+        import roundtrip_wallets
+        self.addCleanup(os.umask, os.umask(0o077))
+        files = Path(self.directory.name)
+        state, ready, client = files / "wallets", files / "ready", files / "client"
+        ready.write_text(json.dumps(dict(native_wallet_query="native", lightwalletd="compat", node_rpc="node")))
+        client.write_bytes(b"initial client")
+        argv = ["roundtrip", "testnet", "--ready", str(ready), "--revision", "a"*40,
+                "--zingo", str(client), "--zallet-backend", str(ready), "--state", str(state),
+                "--wallet-rpc-port", "32082"]
+        native = Mock()
+        native.close.side_effect = lambda: client.write_bytes(b"replacement")
+        with patch.object(sys, "argv", argv), patch.object(roundtrip_fixture, "rpc", return_value=150), \
+                patch.object(roundtrip_fixture, "verify", return_value={"genesis":"anchor"}), \
+                patch.object(roundtrip_wallets, "Zingo"), patch.object(roundtrip_wallets, "Zallet", return_value=native), \
+                patch.object(RoundTrip, "run", lambda trip: {"inputs":trip.journal.data["config"]}), \
+                redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "changed during"):
+            M["main"]()
+        self.assertFalse((state / "receipt.json").exists())
+
     def test_corrupt_wallet_history(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             M["wallet_tx"]({"transactions":[{"txid":TXID}] * 2}, TXID)

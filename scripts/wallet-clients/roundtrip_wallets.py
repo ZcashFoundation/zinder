@@ -173,7 +173,7 @@ class Zallet:
             import toml
             example = subprocess.check_output([self.binary, "--datadir=" + str(self.directory), "example-config",
                                                "-o", "-", "--this-is-beta-code-and-you-will-need-to-recreate-the-example-later"],
-                                              text=True, stderr=subprocess.DEVNULL)
+                                              text=True, stderr=subprocess.DEVNULL, timeout=45)
             conf = tomllib.loads(example)
             conf["backend"] = "zinder"
             conf["zinder"] = {"wallet_query_endpoint": endpoint}
@@ -413,10 +413,10 @@ class Zallet:
         if identity is not None:
             try:
                 self._rpc("stop")
-            except WalletRpcError as error:
-                if error.code != -32601:
+            except (WalletRpcError, OSError) as error:
+                if isinstance(error, HTTPError) or (isinstance(error, WalletRpcError) and error.code != -32601):
                     raise
-                # stop is Regtest-only. The pidfd stays bound across PID reuse.
+                # An unavailable stop endpoint can still leave the exact local daemon running.
                 pid, _ = identity
                 try:
                     fd = os.pidfd_open(pid)

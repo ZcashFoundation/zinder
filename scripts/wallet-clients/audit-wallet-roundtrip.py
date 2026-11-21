@@ -9,6 +9,7 @@ import re
 import sys
 from tempfile import NamedTemporaryFile
 
+from coverage_evidence import digest
 from coverage_roundtrip import check_receipt, compare_runs, wallet_outcomes
 from roundtrip_fixture import GENESIS, anchor, require, rpc
 from wallet_fixture import loopback
@@ -48,6 +49,13 @@ def verify_run(state, ready_path, revision):
     journal = json.loads((state / "run.json").read_bytes())
     require(journal["config"] == receipt["inputs"] and journal["wallets"] == receipt["wallet_identity_sha256"],
             "private journal belongs to another run")
+    recipe = receipt["fixture_recipe"]
+    require(recipe["release_binaries"] == {k: v["sha256"] for k, v in ready["binaries"].items()} and
+            all(recipe[k] == ready[k] for k in ("activation_schedule_sha256", "raw_blob_policy", "node_image"))
+            and recipe["genesis"] == GENESIS["regtest"] and recipe["starting_height"] == journal["birthday_anchor"],
+            "receipt build or fixture configuration differs from the recorded inputs")
+    require(journal["invocation_harnesses"] == receipt["invocation_harnesses"],
+            "receipt harness history differs from the wallet journal")
     node = loopback(ready["node_rpc"])
     height, initial_hash = anchor(ready)
     require(rpc(node, "getblockhash", 0) == GENESIS["regtest"] and rpc(node, "getblockhash", height) == initial_hash,
@@ -87,7 +95,13 @@ def main():
     parser.add_argument("--revision", required=True, help="expected full Zinder release commit")
     parser.add_argument("--output", type=Path, required=True, help="new privacy-safe audit file")
     args = parser.parse_args()
+    sources = [Path(__file__).with_name(name) for name in
+               ("audit-wallet-roundtrip.py", "coverage_roundtrip.py", "coverage_evidence.py",
+                "roundtrip_fixture.py", "wallet_fixture.py")]
+    before = {p.name: digest(p) for p in sources}
     result = audit(args.run, args.revision)
+    require(before == {p.name: digest(p) for p in sources}, "canonical audit harness changed during verification")
+    result["matching_outcomes"]["audit_harness_sha256"] = before
     with NamedTemporaryFile(mode="w", dir=args.output.parent) as tmp:
         json.dump(result, tmp, indent=2)
         tmp.write("\n")

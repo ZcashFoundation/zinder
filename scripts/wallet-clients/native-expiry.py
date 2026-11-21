@@ -3,6 +3,7 @@
 
 import argparse
 from collections import Counter
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -137,7 +138,8 @@ def exercise(args, project, receipt):
                 receipt['actions']['stale-read-and-retry'] = delta(reset, native_counts(ops))
             finally:
                 if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
 
     for name in ('initialize', 'scan'):
@@ -198,7 +200,7 @@ def main():
     cli = [sys.executable, str(SCRIPTS / 'regtest-fixture.py')]
     scope = ['--project', project.name, '--state-root', str(project.parent)]
     receipt = {'schema_version': 1, 'case': 'zallet-bounded-scan-expiry', 'interface': 'native-wallet-query',
-               'status': 'failed', 'client': {'name': 'zallet', 'driver_sha256': args.driver_sha256,
+               'status': 'failed', 'fixture_teardown_completed': False, 'client': {'name': 'zallet', 'driver_sha256': args.driver_sha256,
                'backend_sha256': args.backend_sha256, 'driver_feature': 'bounded-scan-certification'},
                'runner_sha256': sha256(Path(__file__)), 'actions': {}, 'trace_sha256': {},
                'method_evidence': 'exclusive native query RPC counters, with a new baseline after query restart'}
@@ -206,12 +208,13 @@ def main():
                 '--raw-blob-policy', 'all', '--port-base', str(args.port_base), '--tip', '150']
     if args.bin_dir:
         up.extend(['--bin-dir', str(args.bin_dir)])
+    passed = False
     try:
         with (private / 'up.log').open('w') as log:
             require(bounded(up, log, subprocess.STDOUT, 400) == 0, 'fixture startup failed')
         exercise(args, project, receipt)
         require(all(sha256(p) == pin for p, pin in pins.items()), 'driver or backend changed')
-        receipt['status'] = 'passed'
+        passed = True
     finally:
         try:
             if (project / 'state.json').exists():
@@ -219,7 +222,10 @@ def main():
                     receipt['fixture_teardown_completed'] = bounded(cli + ['down', *scope], log, subprocess.STDOUT, 90) == 0
                 require(receipt['fixture_teardown_completed'], 'fixture teardown failed')
         finally:
+            if passed and receipt['fixture_teardown_completed']:
+                receipt['status'] = 'passed'
             campaign['write_json'](args.output / 'receipt.json', receipt)
+    require(receipt['status'] == 'passed', 'owned fixture teardown was not verified')
 
 
 if __name__ == '__main__':

@@ -169,16 +169,17 @@ class WalletObservations(unittest.TestCase):
             self.native.snapshot()
         self.assertIs(err.exception.__cause__, locked)
 
-    def test_unsupported_stop_signals_verified_pidfd(self):
-        self.native._rpc = Mock(side_effect=WalletRpcError("stop", {"code": -32601}))
+    def test_unavailable_stop_signals_verified_pidfd(self):
         identity = (1234, 5678)
-        self.native._owned_identity = Mock(side_effect=[identity, identity, None, None])
-        with patch("roundtrip_wallets.os.pidfd_open", return_value=42) as op, \
-             patch("roundtrip_wallets.os.close") as close, patch("roundtrip_wallets.signal.pidfd_send_signal") as send:
-            self.native.close()
-            op.assert_called_once_with(1234)
-            send.assert_called_once_with(42, signal.SIGTERM)
-            close.assert_called_once_with(42)
+        for error in (WalletRpcError("stop", {"code": -32601}), ConnectionRefusedError()):
+            self.native._rpc = Mock(side_effect=error)
+            self.native._owned_identity = Mock(side_effect=[identity, identity, None, None])
+            with patch("roundtrip_wallets.os.pidfd_open", return_value=42) as op, \
+                 patch("roundtrip_wallets.os.close") as close, patch("roundtrip_wallets.signal.pidfd_send_signal") as send:
+                self.native.close()
+                op.assert_called_once_with(1234)
+                send.assert_called_once_with(42, signal.SIGTERM)
+                close.assert_called_once_with(42)
         self.native._owned_identity = Mock(side_effect=[identity, (1234, 10000)])
         with patch("roundtrip_wallets.os.pidfd_open", return_value=42), patch("roundtrip_wallets.os.close"), \
              patch("roundtrip_wallets.signal.pidfd_send_signal") as send, self.assertRaisesRegex(RuntimeError, "changed"):
