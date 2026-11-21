@@ -24,7 +24,9 @@ python3 scripts/wallet-clients/build-vizor-regtest.py \
 
 Generate a manifest and run the shared gate from the Zinder checkout. The
 generator compares the engine binary and the checked-in Rust driver with
-the digests recorded by the build.
+the digests recorded by the build. The build hashes the copy of the driver
+passed to Cargo and checks it again before writing the receipt.
+Rebuild engines with an unversioned receipt to generate a version 2 receipt.
 
 ```bash
 python3 scripts/wallet-clients/vizor-manifest.py \
@@ -40,7 +42,12 @@ python3 scripts/run-wallet-lifecycle.py \
 For a candidate compatibility service on the same node, supply its readiness
 receipt with `--candidate` and choose fresh manifest, trace, and output paths.
 The receipt must identify the release revision, the candidate source and binary,
-the shared node, and a distinct wallet endpoint.
+the shared node, and a distinct wallet endpoint. The live service must report
+that revision through both `/healthz` and `GetLightdInfo`. Before opening a
+wallet, the driver also reads the fixture's anchor block through `GetBlock`
+and compares its height and hash with the immutable readiness receipt.
+For a locally built Zinder candidate, set `ZINDER_BUILD_GIT_COMMIT` to its full
+source commit when building the service.
 Inspect the ten steps and the restore, linked transaction, process restart,
 resume, and endpoint trace flags in `summary.json`. The process trace covers
 the wallet driver and its children. The Python fixture controller uses a

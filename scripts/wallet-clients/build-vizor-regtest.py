@@ -33,17 +33,20 @@ def main():
     root = output / ("vizor-wallet-" + SOURCE) / "rust"
     with (root / "Cargo.toml").open("a") as config:
         config.write("\n[workspace]\n")
-    driver = Path(__file__).with_name("vizor-regtest.rs")
-    shutil.copy2(driver, root / "examples/vizor-regtest.rs")
+    driver = root / "examples/vizor-regtest.rs"
+    shutil.copy2(Path(__file__).with_name("vizor-regtest.rs"), driver)
+    driver_digest = sha256(driver)
     lock = sha256(root / "Cargo.lock")
     target = output / "target"
     subprocess.run(["cargo", "build", "--locked", "--example", "vizor-regtest", "--jobs", "2",
                     "--manifest-path", str(root / "Cargo.toml"), "--target-dir", str(target)],
                    cwd=root, check=True)
+    if sha256(driver) != driver_digest:
+        parser.error("copied Vizor driver changed during compilation")
     binary = output / "vizor-regtest"
     shutil.copy2(target / "debug/examples/vizor-regtest", binary)
-    provenance = {"vizor_source": SOURCE, "vizor_release": "v0.0.65", "release_archive_sha256": ARCHIVE_SHA256,
-                  "driver_sha256": sha256(driver), "lock_sha256": lock, "engine_sha256": sha256(binary),
+    provenance = {"schema_version": 2, "vizor_source": SOURCE, "vizor_release": "v0.0.65", "release_archive_sha256": ARCHIVE_SHA256,
+                  "driver_sha256": driver_digest, "lock_sha256": lock, "engine_sha256": sha256(binary),
                   "rustc": subprocess.check_output(["rustc", "--version"], text=True, cwd=root).strip()}
     (output / "engine-source.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
