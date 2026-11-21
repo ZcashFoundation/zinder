@@ -80,10 +80,10 @@ impl PublishedRangeRead {
         }
     }
 
-    fn overlaps_selected_history(&self, chunk: BlockHeightRange) -> bool {
+    fn covers_selected_history(&self, chunk: BlockHeightRange) -> bool {
         let coverage = self.history.bounds();
-        chunk.start <= coverage.end
-            && coverage.start <= chunk.end
+        coverage.start <= chunk.start
+            && chunk.end <= coverage.end
             && CompactBlockShape::for_range(&[]).ok() == Some(self.shape)
     }
 }
@@ -148,7 +148,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
     {
-        if !self.overlaps_selected_history(read.chunk) {
+        if !self.covers_selected_history(read.chunk) {
             return native_chunk(reads, read, convert).await;
         }
         let view = match resolve_view(reads, read.view).await {
@@ -160,16 +160,9 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(epoch));
         }
         let started = Instant::now();
-        if let Err(status) = self.history.terminal().check_view(reads, &view).await {
-            return ChunkReadOutcome {
-                read_duration: Some(started.elapsed()),
-                converted: Err(ChunkReadFailure::Failed(status)),
-            };
-        }
-        // Only storage knows the original lengths and failure boundary of live rows.
-        // Keep a chunk that crosses either end under one canonical byte budget.
-        let coverage = self.history.bounds();
-        if read.chunk.start < coverage.start || read.chunk.end > coverage.end {
+        // The same settled tip may be served from a replacement with a higher floor.
+        // Let the native range return its precise error for an unavailable height.
+        if reads.block_hash_at(&view, read.chunk.start).await.is_err() {
             return native_chunk(
                 reads,
                 ChunkRead {
@@ -179,6 +172,12 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
                 convert,
             )
             .await;
+        }
+        if let Err(status) = self.history.terminal().check_view(reads, &view).await {
+            return ChunkReadOutcome {
+                read_duration: Some(started.elapsed()),
+                converted: Err(ChunkReadFailure::Failed(status)),
+            };
         }
         drop(view);
         let history = self.history.clone();

@@ -164,7 +164,7 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 #### Signed settled history
 
-Both serving modes can serve the default shielded `GetBlockRange` projection from a signed catalog. The operator publishes the lightwalletd protobuf once per settled block. Covered chunks skip the canonical compact-block read and conversion. Each stream keeps the catalog it opened. Chunks that cross either edge of coverage, live chunks, and other pool selections use the ordinary canonical read. The same byte budget, order, stream slots, and reorg checks apply in both directions.
+Both serving modes can serve the default shielded `GetBlockRange` projection from a signed catalog. The operator publishes the lightwalletd protobuf once per settled block. For a covered chunk, the reader checks that the current view still retains its lowest height, then skips the canonical compact-block read and conversion. Each stream keeps the catalog it opened. Chunks that cross either edge of coverage, live chunks, and other pool selections use the ordinary canonical read. The same byte budget, order, stream slots, and reorg checks apply in both directions.
 
 To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. Choose a first height within retained history. Keep the signing key outside the catalog directory.
 

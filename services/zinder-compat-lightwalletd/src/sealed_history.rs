@@ -193,17 +193,34 @@ struct WireBlockLink {
     prev_hash: Vec<u8>,
 }
 
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid("expected a regular shielded history file"));
+    }
+    Ok(file)
+}
+
 impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
         let header = expected.header()?;
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
+        let file = open_regular_file(path)?;
         let count = u64::from(expected.end.height.value() - expected.start.value()) + 1;
-        let file_len = metadata.len();
+        let file_len = file.metadata()?.len();
         // Each message contains two 32-byte hashes with one-byte tags and lengths.
         let minimum = HEADER_LEN as u64 + count * (LENGTHS_LEN as u64 + 68);
         let maximum = HEADER_LEN as u64 + count * (LENGTHS_LEN + MAX_PAYLOAD_BYTES) as u64;
-        if !metadata.is_file() || !(minimum..=maximum).contains(&file_len) {
+        if !(minimum..=maximum).contains(&file_len) {
             return Err(invalid(
                 "shielded segment file size does not fit its interval",
             ));

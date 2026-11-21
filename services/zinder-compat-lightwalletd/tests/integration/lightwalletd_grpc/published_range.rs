@@ -283,21 +283,95 @@ async fn a_published_range_on_a_different_branch_emits_no_displaced_block() -> e
         ),
     )
     .await?;
-    for first in [0, 1] {
-        match wallet
-            .client
-            .get_block_range(block_range_request(first, 6))
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(current.query.clone()).into_server()),
+    )
+    .await?;
+    for (first, last) in [(1, 3), (3, 1)] {
+        let status = wallet
+            .blocks(block_range_request(first, last))
             .await
-        {
-            Err(status) => assert_eq!(status.code(), Code::FailedPrecondition),
-            Ok(response) => {
-                let drained = drain_slowly(response.into_inner()).await;
-                assert_eq!(drained.blocks, [] as [lightwalletd::CompactBlock; 0]);
-                assert_stream_ended_with(drained.ending.as_ref(), Code::FailedPrecondition);
-            }
-        }
+            .err()
+            .ok_or_else(|| eyre!("displaced catalog served"))?
+            .downcast::<tonic::Status>()?;
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+    for (first, last) in [(1, 6), (6, 1)] {
+        let request = block_range_request(first, last);
+        assert_eq!(
+            wallet.blocks(request.clone()).await?,
+            stock.blocks(request).await?
+        );
     }
     assert_eq!(wallet.blocks(block_range_request(6, 6)).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn covered_chunks_respect_a_replacements_higher_floor_at_the_same_settled_tip()
+-> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(6);
+    let original = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
+    let history = original.publish(&dir.path().join("settled")).await?;
+    let checkpointed = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain)
+            .with_history_floor(BlockHeight::new(1))
+            .with_settled_tip(BlockHeight::new(SEALED_END)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let replacement = ReaderFixture::new(checkpointed.into_serving_store_fixture()?)?;
+    let slot = CanonicalReaderSlot::new(original.reader.clone());
+    let mut compact = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(slot.clone())
+                .with_published_shielded_history(history.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    assert_eq!(compact.blocks(block_range_request(1, 3)).await?.len(), 3);
+    assert!(Arc::ptr_eq(
+        &slot.publish(replacement.reader.clone()),
+        &original.reader
+    ));
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(replacement.query.clone())
+                .with_published_shielded_history(history)
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(replacement.query.clone()).into_server()),
+    )
+    .await?;
+    for (first, last) in [(1, 3), (3, 1)] {
+        let request = block_range_request(first, last);
+        let expected = stock
+            .blocks(request.clone())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("missing floor error"))?
+            .downcast::<tonic::Status>()?;
+        assert_eq!(expected.code(), Code::NotFound);
+        for endpoint in [&mut wallet, &mut compact] {
+            let status = endpoint
+                .blocks(request.clone())
+                .await
+                .err()
+                .ok_or_else(|| eyre!("served below floor"))?
+                .downcast::<tonic::Status>()?;
+            assert_eq!(
+                (status.code(), status.message()),
+                (expected.code(), expected.message())
+            );
+        }
+    }
+    assert_eq!(compact.blocks(block_range_request(2, 3)).await?.len(), 2);
     Ok(())
 }
 
@@ -460,6 +534,18 @@ async fn appending_above_a_published_range_keeps_the_original_request_linked() -
     assert_one_linked_chain(&received, 1, u64::from(REQUEST_END));
     let epochs = recorder.served_compact_block_epochs();
     assert!(epochs.len() > 1 && epochs.first() != epochs.last());
+    let received = endpoint
+        .blocks(block_range_request(u64::from(REQUEST_END), 1))
+        .await?;
+    assert_one_linked_chain(&received, u64::from(REQUEST_END), 1);
+    let final_offer = recorder
+        .offered_compact_block_ranges()
+        .last()
+        .copied()
+        .ok_or_else(|| eyre!("missing final live read"))?;
+    assert_eq!(final_offer.start, BlockHeight::new(1));
+    assert!(final_offer.end > BlockHeight::new(SEALED_END));
+    assert_eq!(recorder.recorded_epoch_ids().last(), Some(&None));
     Ok(())
 }
 

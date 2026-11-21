@@ -113,7 +113,9 @@ pub(super) fn segment_path(directory: &Path, digest: [u8; 32]) -> PathBuf {
 
 fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    crate::sealed_history::open_regular_file(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(invalid(
             "shielded range manifest or key exceeds its size limit",

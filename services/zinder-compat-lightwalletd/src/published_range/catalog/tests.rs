@@ -9,7 +9,8 @@ use tempfile::{TempDir, tempdir};
 use zinder_core::Network;
 use zinder_query::RocksDbCanonicalReader;
 use zinder_testkit::{
-    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 use super::*;
@@ -81,13 +82,14 @@ impl Fixture {
     }
 }
 
-fn reader(chain: &ChainFixture) -> Result<RocksDbCanonicalReader> {
+fn reader(chain: &ChainFixture) -> Result<(WalletServingStoreFixture, RocksDbCanonicalReader)> {
     let mut store = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(chain),
         &sample_regtest_upgrade_activations(),
     )?
     .into_serving_store_fixture()?;
-    Ok(RocksDbCanonicalReader::new(store.take_readers()?.0)?)
+    let canonical = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    Ok((store, canonical))
 }
 
 #[tokio::test]
@@ -139,7 +141,7 @@ async fn catching_up_the_secondary_extends_and_reuses_the_admitted_prefix() -> R
 fn publisher_recovers_the_signed_extension_after_interrupted_checkpoint_installation() -> Result<()>
 {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
-    let reader = reader(&chain)?;
+    let (_reader_files, reader) = reader(&chain)?;
     let f = Fixture::new()?;
     let mut publisher = f.publisher()?;
     assert!(publisher.publish_next(&reader)?);
@@ -173,7 +175,7 @@ fn publisher_recovers_the_signed_extension_after_interrupted_checkpoint_installa
 #[test]
 fn initial_publication_creates_and_reopens_nested_directories() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let canonical = reader(&chain)?;
+    let (_canonical_files, canonical) = reader(&chain)?;
     let fixture = Fixture::new()?;
     let nested = fixture.directory.path().join("artifacts/ranges");
     let first = BlockHeight::new(1);
@@ -194,7 +196,7 @@ fn initial_publication_creates_and_reopens_nested_directories() -> Result<()> {
 #[test]
 fn a_damaged_orphan_cannot_replace_the_last_good_pointer() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
-    let canonical = reader(&chain)?;
+    let (_canonical_files, canonical) = reader(&chain)?;
     let fixture = Fixture::new()?;
     let mut publisher = fixture.publisher()?;
     assert!(publisher.publish_next(&canonical)?);
@@ -218,8 +220,8 @@ async fn adjacent_signed_files_from_disconnected_chains_and_wrong_keys_are_rejec
 {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
     let fork = chain.fork_at(BlockHeight::new(2))?.extend_blocks(3);
-    let canonical = reader(&chain)?;
-    let other = reader(&fork)?;
+    let (_canonical_files, canonical) = reader(&chain)?;
+    let (_other_files, other) = reader(&fork)?;
     let f = Fixture::new()?;
     let mut publisher = f.publisher()?;
     assert!(publisher.publish_next(&canonical)?);
@@ -259,7 +261,7 @@ async fn adjacent_signed_files_from_disconnected_chains_and_wrong_keys_are_rejec
 #[test]
 fn missing_publisher_head_rejects_an_older_signed_pointer() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
-    let canonical = reader(&chain)?;
+    let (_canonical_files, canonical) = reader(&chain)?;
     let fixture = Fixture::new()?;
     let mut publisher = fixture.publisher()?;
     assert!(publisher.publish_next(&canonical)?);
@@ -276,7 +278,8 @@ fn missing_publisher_head_rejects_an_older_signed_pointer() -> Result<()> {
 #[test]
 fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
     let fixture = Fixture::new()?;
-    let canonical = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
+    let (_canonical_files, canonical) =
+        reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
     assert!(fixture.publisher()?.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
     assert!(PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None).is_err());
@@ -288,7 +291,8 @@ fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
 #[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
 fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<()> {
     let fixture = Fixture::new()?;
-    let canonical = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(4))?;
+    let (_canonical_files, canonical) =
+        reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(4))?;
     let mut publisher = fixture.publisher()?;
     assert!(publisher.publish_next(&canonical)?);
     assert!(publisher.publish_next(&canonical)?);
@@ -307,5 +311,41 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     }
     let catalog = open()?;
     assert_eq!(catalog.bounds().end, BlockHeight::new(4));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Result<()> {
+    let files = Fixture::new()?;
+    let pipe = files.directory.path().join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()?
+            .success()
+    );
+    assert_eq!(
+        verification_key_from(&pipe).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    assert_eq!(
+        manifest::signed_contents(&pipe, &[0; 32], CATALOG_LIMIT)
+            .err()
+            .map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    let (_paths, canonical) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
+    assert!(files.publisher()?.publish_next(&canonical)?);
+    let entry = files
+        .entries()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("missing segment"))?;
+    fs::rename(&pipe, segment_path(files.directory.path(), entry.sha256))?;
+    assert_eq!(
+        files.catalog(None).err().map(|err| err.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
     Ok(())
 }
