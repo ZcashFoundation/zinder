@@ -378,18 +378,24 @@ fn kernel_verifies_reads(file: &File) -> bool {
 
 #[cfg(target_os = "linux")]
 fn measured_verity(file: &File) -> io::Result<Option<[u8; 32]>> {
+    use composefs_ioctls::fsverity::{MeasureVerityError, fs_ioc_measure_verity};
+
     if !kernel_verifies_reads(file) {
         return Ok(None);
     }
-    let (algorithm, digest) = fs_verity::linux::fsverity_measure(std::os::fd::AsFd::as_fd(file))?;
-    if algorithm != fs_verity::InnerHashAlgorithm::Sha256 {
-        return Err(invalid("unsupported shielded segment fs-verity algorithm"));
-    }
-    digest
-        .as_ref()
-        .try_into()
+    fs_ioc_measure_verity(file, fs_verity::InnerHashAlgorithm::Sha256 as u8)
         .map(Some)
-        .map_err(|_| invalid("invalid shielded segment fs-verity digest"))
+        .map_err(|error| match error {
+            MeasureVerityError::Io(source) => source,
+            MeasureVerityError::FilesystemNotSupported => {
+                io::Error::new(io::ErrorKind::Unsupported, error)
+            }
+            MeasureVerityError::VerityMissing
+            | MeasureVerityError::InvalidDigestAlgorithm { .. }
+            | MeasureVerityError::InvalidDigestSize { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
+        })
 }
 
 #[cfg(not(target_os = "linux"))]
