@@ -44,6 +44,7 @@ wait_for = RUNNER["wait_for"]
 # helpers instead of inventing a second signal and readback protocol for supervised cases.
 SUPERVISOR = runpy.run_path(str(SCRIPTS / "run-wallet-roundtrip-regtest.py"))
 stop_group = SUPERVISOR["stop_group"]
+stop_owned_process = SUPERVISOR["stop_owned_process"]
 execute_owned = SUPERVISOR["execute"]
 close_owned_wallet = SUPERVISOR["close_owned_wallet"]
 owned_relay = SUPERVISOR["owned_relay"]
@@ -295,32 +296,29 @@ class Recovery:
             raise RuntimeError(f"{label}: timed out; private evidence is preserved") from error
 
     def close_wallets(self):
-        errors = []
-        for name, wallet in (("zallet", self.zallet), ("zingo", self.zingo)):
+        try:
+            wallet = self.zallet
             if wallet is None:
-                continue
+                return
+            identity = wallet._owned_identity()
             try:
                 wallet.close()
-            except Exception as error:
-                errors.append(f"{name}: {error}")
-                identity = wallet._owned_identity() if hasattr(wallet, "_owned_identity") else None
+            finally:
                 if identity is not None:
-                    try:
-                        fd = os.pidfd_open(identity[0])
-                    except ProcessLookupError:
-                        continue
-                    try:
-                        if wallet._owned_identity() == identity:
-                            try:
-                                signal.pidfd_send_signal(fd, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
-                    finally:
-                        os.close(fd)
-                    deadline = time.monotonic() + 45
-                    while wallet._owned_identity() == identity and time.monotonic() < deadline:
-                        time.sleep(.25)
-        require(not errors, "wallet cleanup failed: " + "; ".join(errors))
+                    pid = identity[0]
+
+                    def read_identity():
+                        return pid, wallet._process_start(pid)
+
+                    if read_identity() == identity:
+                        stop_owned_process(identity, read_identity, DEFAULT_CASE_GRACE)
+                        require(read_identity() != identity, "owned Zallet daemon is still running")
+                    if wallet.process is not None and wallet.process.pid == pid:
+                        wallet.process.wait(timeout=DEFAULT_CASE_GRACE)
+                        wallet.process = None
+        finally:
+            if self.zingo is not None:
+                self.zingo.close()
 
     def start(self):
         require(self.private.is_dir(), "private evidence directory is missing")
@@ -986,10 +984,12 @@ class Recovery:
         try:
             self.pins = self.pin_inputs()
             self.receipt["pins"] = {"pre": self.pins}
-            with ExitStack() as cleanup:
-                cleanup.callback(self.record_teardown)
-                cleanup.callback(self.close_wallets)
+            try:
                 exercise()
+            finally:
+                _, interrupted = finish_before_cancellation(self.teardown)
+                if interrupted is not None:
+                    raise interrupted
             self.verify_pins()
             self.check_result()
         except BaseException as error:
@@ -998,6 +998,12 @@ class Recovery:
             raise
         finally:
             write_json(self.output / "receipt.json", self.receipt)
+
+    def teardown(self):
+        try:
+            self.close_wallets()
+        finally:
+            self.record_teardown()
 
     def record_teardown(self):
         try:

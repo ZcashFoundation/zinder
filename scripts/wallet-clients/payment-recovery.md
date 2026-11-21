@@ -21,7 +21,7 @@ Prepare the [wallet executables, Python descriptors, and isolated fixture inputs
 
 To repeat one case, replace `campaign` with `disconnect` or `rollback`, supply one `--port-base`, and choose a new output directory. The runner retains a receipt for each case and a campaign summary.
 
-Fixture startup has a 600-second deadline and teardown has a 180-second deadline. If either expires, the runner stops the operator and its Compose subprocesses before continuing cleanup.
+Fixture startup has a 600-second deadline and teardown has a 180-second deadline. If either expires, the runner stops the operator and its Compose subprocesses before continuing cleanup. If Zallet fails to shut down, the runner verifies the daemon’s identity, sends it SIGTERM, and escalates to SIGKILL if it is still running. The case records a failure and finishes wallet cleanup before removing the fixture.
 
 The campaign gives each case 7,200 seconds by default. Set `--case-timeout` and `--case-grace` in seconds to change the deadline and the time allowed for graceful shutdown. On timeout the supervisor stops the case, checks its wallet, relay, and Docker project, and records the outcome in the case’s `supervision.json`. It skips the remaining case after a timeout or interruption. Keep that file beside a supervised `receipt.json` for coverage import. A passing campaign case requires cooperative exit, a matching receipt digest, and verified teardown.
 

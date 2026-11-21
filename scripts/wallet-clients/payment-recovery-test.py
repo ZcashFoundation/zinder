@@ -6,6 +6,7 @@ import io
 import json
 import os
 import runpy
+import select
 import signal
 import subprocess
 import sys
@@ -380,6 +381,72 @@ def passed(recovery):
 
 
 class ExecutionAndCleanup(unittest.TestCase):
+    def test_stubborn_owned_wallet_exits_before_standalone_teardown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recovery = FakeRecovery(root / "case")
+            wallet = M["Zallet"].__new__(M["Zallet"])
+            wallet.directory = root
+            wallet.binary = str(Path(sys.executable).resolve())
+            wallet.argv = [wallet.binary, "-c", "import signal; "
+                           "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                           "print('ready', flush=True); signal.pause()"]
+            wallet._rpc = Mock(side_effect=RuntimeError("stop RPC failed"))
+            recovery.zallet = wallet
+            recovery.close_wallets = M["Recovery"].close_wallets.__get__(recovery)
+            with subprocess.Popen([*wallet.argv, "start"], start_new_session=True,
+                                  stdout=subprocess.PIPE, text=True) as child:
+                try:
+                    self.assertTrue(select.select([child.stdout], [], [], 3)[0], "daemon failed to start")
+                    self.assertEqual(child.stdout.readline(), "ready\n")
+                    wallet.process = child
+                    wallet._record_identity(child.pid, wallet._process_start(child.pid))
+                    exits_at_teardown = []
+                    teardown = recovery.record_teardown
+
+                    def record_teardown():
+                        exits_at_teardown.append(child.poll())
+                        teardown()
+
+                    recovery.record_teardown = record_teardown
+                    with patch.dict(GLOBALS, {"DEFAULT_CASE_GRACE": .1}):
+                        with self.assertRaisesRegex(RuntimeError, "stop RPC failed"):
+                            recovery.execute(lambda: passed(recovery))
+                    self.assertEqual(exits_at_teardown, [-signal.SIGKILL])
+                    self.assertEqual(json.loads((recovery.output / "receipt.json").read_bytes())["status"], "failed")
+                finally:
+                    child.kill()
+                    child.wait(timeout=3)
+
+    def test_changed_process_identity_is_never_signalled_on_shutdown_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recovery = M["Recovery"]("disconnect", argparse.Namespace(output=Path(directory)))
+            wallet = recovery.zallet = Mock(process=None)
+            wallet._owned_identity.return_value = (1234, 42)
+            wallet._process_start.return_value = 43
+            wallet.close.side_effect = RuntimeError("stop RPC failed")
+            with patch.dict(GLOBALS, {"stop_owned_process": Mock()}) as helpers:
+                with self.assertRaisesRegex(RuntimeError, "stop RPC failed"):
+                    recovery.close_wallets()
+                helpers["stop_owned_process"].assert_not_called()
+
+    def test_standalone_cancellation_finishes_wallet_and_fixture_cleanup(self):
+        for sig, error in ((signal.SIGTERM, SystemExit), (signal.SIGINT, KeyboardInterrupt)):
+            with self.subTest(sig=sig), tempfile.TemporaryDirectory() as directory:
+                recovery = FakeRecovery(Path(directory) / "case")
+
+                def close():
+                    signal.raise_signal(sig)
+                    recovery.events.append("wallet stopped")
+
+                recovery.close_wallets = close
+                with self.assertRaises(error):
+                    recovery.execute(lambda: passed(recovery))
+                self.assertEqual(recovery.events, ["wallet stopped", "teardown"])
+                receipt = json.loads((recovery.output / "receipt.json").read_bytes())
+                self.assertEqual(receipt["status"], "failed")
+                self.assertTrue(receipt["cleanup"]["fixture_removed"])
+
     def test_successful_run_records_matching_pre_and_post_pins(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "evidence"
