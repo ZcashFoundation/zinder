@@ -63,7 +63,7 @@ class CanonicalAuditTests(unittest.TestCase):
         tx = {"canonical_txid_fingerprints": {"outbound": "a", "return": "b"}}
         for duplicate in [("a", "d", "e"), ("d", "b", "e"), ("d", "e", "c")]:
             with patch.object(audit, "verify_run", side_effect=[({}, f, tx), ({}, duplicate, tx)]), \
-                 patch.object(audit.runpy, "run_path", return_value={"compare_runs": lambda *_: None}):
+                 patch.object(audit, "compare_runs"):
                 with self.assertRaisesRegex(ValueError, "independently owned"):
                     audit.audit([("a", "b"), ("c", "d")], "a" * 40)
 

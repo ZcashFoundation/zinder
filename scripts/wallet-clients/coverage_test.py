@@ -26,6 +26,34 @@ def sample():
                            "evidence": {"description": "Synthetic contract example", "sha256": "b" * 64}}]}
 
 
+def payment_receipt(ch):
+    release = sample()["release"]
+    def token(s):
+        import hashlib
+        return hashlib.sha256((ch + s).encode()).hexdigest()
+    def leg(amount, fee, payer, payee, height, change):
+        return {"amount_zat": amount, "fee_zat": fee, "payer_after_zat": payer, "payee_after_zat": payee,
+                "spendable_after_zat": payee, "tx_fingerprint": token(str(height)), "change_zat": change,
+                "mined_height": height, "pending": dict.fromkeys(("node_mempool", "payee", "payer"), True),
+                "memo_verified": True}
+    harness = {"run-wallet-roundtrip.py": "a" * 64}
+    return {"schema_version": 1, "status": "passed", "network": "regtest", "independent_wallets": True,
+            "pending_certified": True, "reopen_ledger_verified": True, "harness_sha256": harness,
+            "invocation_harnesses": [harness], "wallet_identity_sha256": [token("zingo"), token("zallet")],
+            "inputs": {"revision": release["commit"], "network": "regtest", "zingo_sha256": "a" * 64,
+                       "zallet_sha256": "b" * 64, "ready_sha256": token("fixture"), "outbound_zat": 100,
+                       "return_zat": 40},
+            "fixture_recipe": {"network": "regtest", "genesis": "a" * 64, "raw_blob_policy": "all",
+                               "activation_schedule_sha256": "a" * 64, "starting_height": 150,
+                               "node_image": "sha256:" + "a" * 64,
+                               "release_binaries": dict.fromkeys(("compat-lightwalletd", "ingest",
+                                                                  "projector", "query"), "a" * 64)},
+            "funding": {"source": "regtest-coinbase-and-shield", "mined_height": 160,
+                        "spendable_after_zat": 500, "tx_fingerprint": token("funding")},
+            "legs": {"outbound": leg(100, 1, 399, 100, 161, None),
+                     "return": leg(40, 2, 58, 439, 163, 58)}}
+
+
 class CoverageTests(unittest.TestCase):
     def test_call_volume_alone_is_not_a_regression(self):
         old = sample()
@@ -155,36 +183,31 @@ class CoverageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "persisted last delivered block"):
                 list(interrupted_actions(path, release))
 
+    def test_standalone_compare_checks_wallet_observations(self):
+        import runpy
+        compare = runpy.run_path(str(Path(__file__).resolve().parents[1] / "run-wallet-roundtrip.py"))["compare_runs"]
+        left, right = payment_receipt("a"), payment_receipt("b")
+        self.assertTrue(compare(left, right)["same_wallet_outcomes"])
+        with self.assertRaisesRegex(ValueError, "same fixture"):
+            compare(left, left)
+        for r in (left, right):
+            r["legs"]["outbound"]["pending"]["payee"] = False
+        with self.assertRaisesRegex(ValueError, "pre-mining"):
+            compare(left, right)
+        left, right = payment_receipt("a"), payment_receipt("b")
+        right["legs"]["return"]["tx_fingerprint"] = left["legs"]["outbound"]["tx_fingerprint"]
+        with self.assertRaisesRegex(ValueError, "reused transfer"):
+            compare(left, right)
+        left, right = payment_receipt("a"), payment_receipt("b")
+        right["legs"]["return"]["fee_zat"] += 1
+        with self.assertRaisesRegex(ValueError, "balance or change"):
+            compare(left, right)
+
     def test_paired_signed_wallet_accounting(self):
         release = sample()["release"]
-        def receipt(ch):
-            def token(s):
-                import hashlib
-                return hashlib.sha256((ch + s).encode()).hexdigest()
-            def leg(amount, fee, payer, payee, height, change):
-                return {"amount_zat": amount, "fee_zat": fee, "payer_after_zat": payer, "payee_after_zat": payee,
-                        "spendable_after_zat": payee, "tx_fingerprint": token(str(height)), "change_zat": change,
-                        "mined_height": height, "pending": dict.fromkeys(("node_mempool", "payee", "payer"), True),
-                        "memo_verified": True}
-            harness = {"run-wallet-roundtrip.py": "a" * 64}
-            return {"schema_version": 1, "status": "passed", "network": "regtest", "independent_wallets": True,
-                    "pending_certified": True, "reopen_ledger_verified": True, "harness_sha256": harness,
-                    "invocation_harnesses": [harness], "wallet_identity_sha256": [token("zingo"), token("zallet")],
-                    "inputs": {"revision": release["commit"], "network": "regtest", "zingo_sha256": "a" * 64,
-                               "zallet_sha256": "b" * 64, "ready_sha256": token("fixture"), "outbound_zat": 100,
-                               "return_zat": 40},
-                    "fixture_recipe": {"network": "regtest", "genesis": "a" * 64, "raw_blob_policy": "all",
-                                       "activation_schedule_sha256": "a" * 64, "starting_height": 150,
-                                       "node_image": "sha256:" + "a" * 64,
-                                       "release_binaries": dict.fromkeys(("compat-lightwalletd", "ingest",
-                                                                          "projector", "query"), "a" * 64)},
-                    "funding": {"source": "regtest-coinbase-and-shield", "mined_height": 160,
-                                "spendable_after_zat": 500, "tx_fingerprint": token("funding")},
-                    "legs": {"outbound": leg(100, 1, 399, 100, 161, None),
-                             "return": leg(40, 2, 58, 439, 163, 58)}}
         with tempfile.TemporaryDirectory() as temp:
             paths = [Path(temp) / f"{s}.json" for s in ("first", "second")]
-            a, b = receipt("a"), receipt("b")
+            a, b = payment_receipt("a"), payment_receipt("b")
             def write_pair():
                 for path, r in zip(paths, (a, b)):
                     path.write_text(json.dumps(r))

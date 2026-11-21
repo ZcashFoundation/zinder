@@ -16,6 +16,8 @@ import uuid
 
 CLIENTS = Path(__file__).resolve().parent / "wallet-clients"
 sys.path.insert(0, str(CLIENTS))
+from coverage_roundtrip import compare_runs
+
 FAUCET = "https://fauzec.com/api/v1"
 OUTBOUND = 10_000_000
 RETURN = 4_000_000
@@ -233,7 +235,7 @@ class RoundTrip:
         height = self.node("getblockcount")
         if height < tip + 101:
             self.node("generate", tip + 101 - height)
-        self.zingo.snapshot()
+        self.wait("Zingo mature coinbase scan", lambda: self.zingo.snapshot()["height"] >= tip + 101)
         txid = j.once("shield", {"coinbase": coinbase["txid"]}, self.zingo.shield)
         self.confirm("shield", txid)
         return txid
@@ -353,30 +355,6 @@ class RoundTrip:
                              "tx_fingerprint":hashlib.sha256(bytes.fromhex(obs[leg]["txid"])).hexdigest(),
                              "mined_height":obs[leg]["block"]["height"], "pending":obs[leg+"-pending"]}
                         for leg in ("outbound", "return")}}
-
-
-def compare_runs(left, right):
-    for result in (left, right):
-        require(result["status"] == "passed" and result["network"] == "regtest" and
-                result["reopen_ledger_verified"] and result["independent_wallets"], "expected two completed Regtest receipts")
-    require(left["inputs"]["ready_sha256"] != right["inputs"]["ready_sha256"], "reuse of the same fixture receipt")
-    require(all(row["pending_certified"] for row in (left, right)), "pending observations missing on Regtest")
-    require(set(left["wallet_identity_sha256"]).isdisjoint(right["wallet_identity_sha256"]),
-            "wallet identity reused across fixtures")
-    for result in (left, right):
-        require(all(h == result["harness_sha256"] for h in result["invocation_harnesses"]),
-                "compared run spans different harness code")
-    for name in ("zingo_sha256", "zallet_sha256", "revision", "outbound_zat", "return_zat"):
-        require(left["inputs"][name] == right["inputs"][name], "incomparable " + name)
-    require(left["fixture_recipe"] == right["fixture_recipe"] and left["harness_sha256"] == right["harness_sha256"],
-            "paired fixture configuration or harness differs")
-    for name in ("outbound", "return"):
-        a, b = left["legs"][name], right["legs"][name]
-        require(a["tx_fingerprint"] != b["tx_fingerprint"], "same transaction reused across runs")
-        for field in ("amount_zat", "fee_zat", "memo_verified", "payer_after_zat", "payee_after_zat",
-                      "spendable_after_zat", "change_zat", "pending"):
-            require(a[field] == b[field], f"{name}: different {field}")
-    return {"status": "passed", "same_wallet_outcomes": True, "independent_fixtures": True}
 
 
 def main():

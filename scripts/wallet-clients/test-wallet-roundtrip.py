@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Check retry, identity, and comparability rules without contacting a faucet or wallet."""
-import copy
 from pathlib import Path
 import runpy
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 M = runpy.run_path(str(Path(__file__).resolve().parents[1] / "run-wallet-roundtrip.py"))
 Journal = M["Journal"]
@@ -80,27 +79,30 @@ class RoundTripTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires Regtest"):
             case.mine_to("other", 10)
 
-    def test_corrupt_wallet_history_and_comparison(self):
+    def test_shield_intent_waits_for_wallet_to_scan_mature_coinbase(self):
+        self.j.data["birthday_anchor"] = 150
+        wallet = Mock()
+        wallet.transparent_address.return_value = "tmFixture"
+        wallet.shield.return_value = TXID
+        wallet.snapshot.side_effect = [{"height": 250}, {"height": 251}]
+        block_tx = {"txid": TXID, "vout": [{"scriptPubKey": {"address": "tmFixture"}}]}
+        def node(_endpoint, method, *_args):
+            return {"getblockcount": 251, "getblockhash": "block", "getblock": {"tx": [TXID]},
+                    "getrawtransaction": block_tx}[method]
+        case = RoundTrip("regtest", {"node_rpc": "local"}, node, self.j, wallet, None, 10)
+        def poll(_label, ready):
+            self.assertFalse(ready())
+            self.assertNotIn("shield", self.j.data["operations"])
+            wallet.shield.assert_not_called()
+            self.assertTrue(ready())
+        with patch.object(case, "wait", side_effect=poll) as wait, patch.object(case, "confirm"):
+            self.assertEqual(case.fund_regtest(), TXID)
+        wait.assert_called_once()
+        wallet.shield.assert_called_once()
+
+    def test_corrupt_wallet_history(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             M["wallet_tx"]({"transactions":[{"txid":TXID}] * 2}, TXID)
-        leg = dict(tx_fingerprint="1"*64, amount_zat=5, fee_zat=1, memo_verified=True, payer_after_zat=4,
-                   payee_after_zat=5, spendable_after_zat=5, change_zat=None,
-                   pending={"node_mempool":True,"payer":True,"payee":True})
-        left = {"status":"passed","network":"regtest","independent_wallets":True,"reopen_ledger_verified":True,
-                "inputs":dict(zingo_sha256="x",zallet_sha256="y",revision="z",outbound_zat=5,return_zat=2,ready_sha256="r1"),
-                "harness_sha256":{"runner":"s"},"invocation_harnesses":[{"runner":"s"}],"pending_certified":True,
-                "wallet_identity_sha256":["x","y"],"fixture_recipe":{},"legs":{"outbound":leg,"return":dict(leg)}}
-        other = copy.deepcopy(left)
-        with self.assertRaisesRegex(ValueError, "same fixture"):
-            M["compare_runs"](left, other)
-        other["inputs"]["ready_sha256"] = "r2"
-        other["wallet_identity_sha256"] = ["c","d"]
-        for x in other["legs"].values():
-            x["tx_fingerprint"] = "2" * 64
-        self.assertTrue(M["compare_runs"](left, other)["same_wallet_outcomes"])
-        other["legs"]["return"]["fee_zat"] = 2
-        with self.assertRaisesRegex(ValueError, "fee_zat"):
-            M["compare_runs"](left, other)
 
 
 if __name__ == "__main__":

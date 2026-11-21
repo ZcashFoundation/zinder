@@ -59,9 +59,7 @@ def campaign(args):
             owned.append((label, project, fixture))
             up = ["up", *operator_args, "--project", project, "--port-base", base, "--images", args.images,
                   "--revision", args.revision, "--node-config", SCRIPTS.parent / "deploy/zebra/regtest-nu6-at-one.toml",
-                  "--raw-blob-policy", "all", "--tip", 150]
-            if args.bin_dir:
-                up.extend(["--bin-dir", args.bin_dir])
+                  "--raw-blob-policy", "all", "--tip", 150, "--bin-dir", args.bin_dir]
             execute(FIXTURE, up, state / f"{label}-up.log")
             ready = fixture / "ready.initial.json"
             wallet = state / label
@@ -96,7 +94,7 @@ def main():
     parser.add_argument("--state", type=Path, required=True, help="new private evidence directory")
     parser.add_argument("--port-bases", nargs=2, type=int, required=True, metavar=("FIRST", "SECOND"))
     parser.add_argument("--images", type=Path, required=True, help="fixture operator image map")
-    parser.add_argument("--bin-dir", type=Path, help="release binaries to mount over the image set")
+    parser.add_argument("--bin-dir", type=Path, required=True, help="release binaries to mount over the image set")
     parser.add_argument("--revision", required=True, help="expected full Zinder release commit")
     parser.add_argument("--zingo", type=Path, required=True)
     parser.add_argument("--zallet-backend", type=Path, required=True)

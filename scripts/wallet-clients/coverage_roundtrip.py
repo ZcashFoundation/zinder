@@ -1,7 +1,5 @@
 """Project a paired signed Regtest payment into payer and payee coverage rows."""
 import re
-import runpy
-from pathlib import Path
 
 from coverage_evidence import digest, load, require
 
@@ -51,6 +49,29 @@ def check_receipt(receipt, revision):
             0 <= back["spendable_after_zat"] <= back["payee_after_zat"], "round trip balance or change mismatch")
 
 
+def compare_runs(left, right):
+    for result in (left, right):
+        check_receipt(result, left["inputs"]["revision"])
+    require(left["inputs"]["ready_sha256"] != right["inputs"]["ready_sha256"], "reuse of the same fixture receipt")
+    require(len({r["legs"][k]["tx_fingerprint"] for r in (left, right) for k in ("outbound", "return")}) == 4,
+            "reused transfer across independent round trips")
+    require(set(left["wallet_identity_sha256"]).isdisjoint(right["wallet_identity_sha256"]),
+            "wallet identity reused across fixtures")
+    for result in (left, right):
+        require(all(h == result["harness_sha256"] for h in result["invocation_harnesses"]),
+                "compared run spans different harness code")
+    for name in ("zingo_sha256", "zallet_sha256", "revision", "outbound_zat", "return_zat"):
+        require(left["inputs"][name] == right["inputs"][name], "incomparable " + name)
+    require(left["fixture_recipe"] == right["fixture_recipe"] and left["harness_sha256"] == right["harness_sha256"],
+            "paired fixture configuration or harness differs")
+    for name in ("outbound", "return"):
+        a, b = left["legs"][name], right["legs"][name]
+        for field in ("amount_zat", "fee_zat", "memo_verified", "payer_after_zat", "payee_after_zat",
+                      "spendable_after_zat", "change_zat", "pending"):
+            require(a[field] == b[field], f"{name}: different {field}")
+    return {"status": "passed", "same_wallet_outcomes": True, "independent_fixtures": True}
+
+
 def audit_pair(audit, receipts):
     require(type(audit["schema_version"]) is int and audit["schema_version"] == 1 and audit["passed"] is True and
             (audit["independent_chains"], audit["distinct_wallet_identities"], audit["independent_transactions"])
@@ -69,12 +90,8 @@ def audit_pair(audit, receipts):
 
 def roundtrip_actions(paths, release, audit_path=None):
     two = [load(p) for p in paths]
-    for receipt in two:
-        check_receipt(receipt, release["commit"])
-    runner = runpy.run_path(str(Path(__file__).resolve().parents[1] / "run-wallet-roundtrip.py"))
-    runner["compare_runs"](*two)
-    require(len({r["legs"][k]["tx_fingerprint"] for r in two for k in ("outbound", "return")}) == 4,
-            "reused transfer across independent round trips")
+    require(two[0]["inputs"]["revision"] == release["commit"], "round trip release mismatch")
+    compare_runs(*two)
     hashes = [digest(p) for p in paths]
     sources = {"repeat-receipt": hashes[1]}
     if audit_path:

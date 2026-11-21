@@ -6,11 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
-import runpy
 import sys
 from tempfile import NamedTemporaryFile
 
-from coverage_roundtrip import check_receipt
+from coverage_roundtrip import check_receipt, compare_runs
 from roundtrip_fixture import GENESIS, anchor, require, rpc
 from wallet_fixture import loopback
 
@@ -69,8 +68,7 @@ def verify_run(state, ready_path, revision):
 def audit(runs, revision):
     require(re.fullmatch(r"[0-9a-f]{40}", revision) and len(runs) == 2, "two runs and full release commit required")
     first, second = [verify_run(state, ready, revision) for state, ready in runs]
-    runner = runpy.run_path(str(Path(__file__).resolve().parents[1] / "run-wallet-roundtrip.py"))
-    runner["compare_runs"](first[0], second[0])
+    compare_runs(first[0], second[0])
     require(all(a != b for a, b in zip(first[1], second[1])), "expected two independently owned chains and nodes")
     require(len({f for result in (first, second) for f in result[2]["canonical_txid_fingerprints"].values()}) == 4,
             "expected four independent canonical transfers")

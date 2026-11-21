@@ -4,6 +4,9 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import contextlib
+import io
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -53,6 +56,17 @@ class RepeatCommandTests(unittest.TestCase):
                           if p == tool.WALLET and args[0] == "regtest"], [32082, 32182])
         self.assertTrue((self.state / "paired.json").is_file())
         self.assertEqual(json.loads((self.state / "cleanup.json").read_bytes()), {"first": "removed", "second": "removed"})
+
+    def test_missing_binary_pins_fail_before_provisioning(self):
+        argv = [str(source), "--state", str(self.state), "--images", "images", "--port-bases", "32000", "32100",
+                "--revision", "a"*40, "--zingo", "zingo", "--zallet-backend", "zallet"]
+        with patch.object(sys, "argv", argv), patch.object(tool, "campaign") as campaign, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as stopped:
+            tool.main()
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn("required: --bin-dir", stderr.getvalue())
+        campaign.assert_not_called()
+        self.assertFalse(self.state.exists())
 
     def test_partial_second_fixture_startup_cleans_only_owned_projects(self):
         self.fail = "second-up.log"
