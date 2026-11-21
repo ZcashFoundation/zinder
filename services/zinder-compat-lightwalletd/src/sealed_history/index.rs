@@ -160,7 +160,8 @@ fn decode_index(
             native_bytes,
             offset,
             len,
-            sha256: frames.map(|_| sha256),
+            sha256,
+            validation: std::sync::OnceLock::new(),
         });
     }
     if next != trailer {
