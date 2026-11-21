@@ -132,7 +132,7 @@ impl PublishedRangeRead {
         use zinder_store::HeightOrder;
         let end = self.history.bounds().end;
         if span.end <= end {
-            return self.history.read_chunk(span, order, max_bytes);
+            return self.history.read_chunk(span, order, max_bytes, true);
         }
         let tail = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
         if span.start > end {
@@ -141,7 +141,10 @@ impl PublishedRangeRead {
         let prefix = BlockHeightRange::inclusive(span.start, end);
         let suffix = BlockHeightRange::inclusive(BlockHeight::new(end.value() + 1), span.end);
         let (mut first, first_span) = match order {
-            HeightOrder::Ascending => (self.history.read_chunk(prefix, order, max_bytes)?, prefix),
+            HeightOrder::Ascending => (
+                self.history.read_chunk(prefix, order, max_bytes, true)?,
+                prefix,
+            ),
             HeightOrder::Descending => (tail.select(suffix, order, max_bytes, true), suffix),
         };
         let room = first.iter().fold(max_bytes, |budget, row| {
@@ -156,10 +159,7 @@ impl PublishedRangeRead {
         match order {
             HeightOrder::Ascending => first.extend(tail.select(suffix, order, room, false)),
             HeightOrder::Descending => {
-                let mut earlier = self.history.read_chunk(prefix, order, room)?;
-                if earlier.last().is_some_and(|row| row.native_bytes > room) {
-                    earlier.clear();
-                }
+                let mut earlier = self.history.read_chunk(prefix, order, room, false)?;
                 earlier.append(&mut first);
                 first = earlier;
             }
