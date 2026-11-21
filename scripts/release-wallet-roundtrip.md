@@ -22,7 +22,7 @@ umask 077
   --port-bases 51500 51600
 ```
 
-Inspect `summary.json`, `comparison.json`, and `MANIFEST.json` in the evidence directory. A passed result requires both fixtures to have been removed. `blocked` indicates a required artifact is unavailable. A changed fee, missing observation, or changed wallet build requires investigation and a reviewed baseline update. Retain the raw state and wallet databases privately.
+Inspect `summary.json`, `comparison.json`, and `MANIFEST.json` in the evidence directory. A passed result requires both fixtures to have been removed. `blocked` indicates a required artifact is unavailable. A changed fee, missing observation, or changed wallet build requires investigation and a reviewed baseline update. A port collision during the initial bind check or fixture startup triggers one retry. Retain the raw state and wallet databases privately.
 
 ## Build the client bundle
 
@@ -73,6 +73,8 @@ Record the full client source commits and binary digests in the bundle. The runn
 Use [release-wallet-roundtrip](../.github/workflows/release-wallet-roundtrip.yml) with the tagged commit, the producing release workflow run ID, the x86_64-v3 build artifact, and the immutable HTTPS bundle URL and SHA-256. Enter `run-two-chain-gate` to dispatch. The selected tag must contain the gate. The workflow verifies the source workflow, repository, tag, and commit before downloading its artifact. Its read-only token needs `actions: read` to access that run.
 
 The action provisions Python and generated descriptors, verifies the archive's four executable digests against `BUILD-INFO.json`, and mounts those executables in pinned runtime images. Only aggregate receipts, canonical transaction fingerprints, outcome comparisons, and a manifest of their hashes are uploaded. Local results do not establish hosted runner or arm64 execution.
+
+Qualification evidence starts after the workflow verifies the candidate commit and downloads its release artifact. If the client bundle download or checksum check, Python setup, or descriptor generation then fails, the job exits unsuccessfully. The evidence artifact contains `summary.json`, `gate.json`, and their SHA-256 manifest. The summary identifies the failed stage. The candidate and wallets run only after setup succeeds.
 
 ## Activate the pre-publication gate
 

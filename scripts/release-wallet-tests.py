@@ -5,11 +5,15 @@ import copy
 import hashlib
 import importlib.util
 import io
+import subprocess
+import sys
 import json
 from pathlib import Path
+import socket
 import tempfile
 import tarfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("release_wallet", ROOT / "scripts/release-wallet-roundtrip.py")
@@ -298,11 +302,51 @@ class RoundTripGateTests(unittest.TestCase):
 
     def test_transient_port_collision_is_recognized_for_one_retry(self):
         campaign = self.root / "campaign-1"
+        outer = self.root / "campaign-1.log"
+        outer.write_text("[Errno 98] Address already in use\n")
+        self.assertTrue(gate.port_collision(campaign, outer))
+        outer.write_text("unrelated failure\n")
+        self.assertFalse(gate.port_collision(campaign, outer))
         campaign.mkdir()
         (campaign / "second-up.log").write_text("[Errno 98] Address already in use\n")
-        self.assertTrue(gate.port_collision(campaign))
+        self.assertTrue(gate.port_collision(campaign, outer))
         (campaign / "second-up.log").write_text("wallet mismatch\n")
-        self.assertFalse(gate.port_collision(campaign))
+        self.assertFalse(gate.port_collision(campaign, outer))
+
+    def test_occupied_loopback_port_retries_once_before_any_fixture_is_created(self):
+        state = self.root / "runs"
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            first = occupied.getsockname()[1] - 2
+            options = argparse.Namespace(state=state, images=self.root / "unused", port_bases=(first, 2048))
+            clients = {wallet: {"path": self.root / wallet} for wallet in ("zingo", "zallet")}
+            with patch.object(gate.time, "sleep") as backoff, self.assertRaises(gate.CampaignFailed) as failure:
+                gate.run_campaign(options, {"bin_dir": self.root, "commit": "a" * 40}, clients)
+        backoff.assert_called_once()
+        self.assertEqual(failure.exception.attempts,
+                         [{"attempt": i, "exit_code": 1, "port_collision": True} for i in (1, 2)])
+        for i in (1, 2):
+            self.assertFalse((state / f"campaign-{i}").exists())
+            self.assertIn("Address already in use", (state / f"campaign-{i}.log").read_text())
+
+    def test_provisioning_failures_publish_only_hashed_aggregates_and_stop_before_preflight(self):
+        for stage in ("client-bundle", "python-runtime", "protocol-descriptors", "operator-setup"):
+            with self.subTest(stage=stage):
+                state, evidence = self.root / "private", self.root / stage
+                command = [sys.executable, "-B", str(ROOT / "scripts/release-wallet-roundtrip.py"),
+                           "--provisioning-failure", stage, "--tag", "v0.22.0", "--commit", "a" * 40,
+                           "--candidate-archive", "absent", "--client-bundle", "absent",
+                           "--client-bundle-sha256", "", "--images", "absent", "--baseline-matrix", "absent",
+                           "--state", str(state), "--evidence", str(evidence)]
+                run = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertFalse(state.exists())
+                self.assertEqual({p.name for p in evidence.iterdir()}, {"summary.json", "gate.json", "MANIFEST.json"})
+                summary = gate.read_json(evidence / "summary.json")
+                self.assertEqual((summary["status"], summary["stage"]), ("blocked", stage))
+                self.assertEqual(gate.read_json(evidence / "gate.json")["status"], "blocked")
+                self.assertEqual(gate.read_json(evidence / "MANIFEST.json")["files"],
+                                 {f: digest(evidence / f) for f in ("summary.json", "gate.json")})
 
     def test_release_gate_stays_standalone_until_its_inputs_exist(self):
         import re
@@ -317,6 +361,12 @@ class RoundTripGateTests(unittest.TestCase):
         self.assertIn("--port-bases 51500 51600", action)
         self.assertIn("--baseline-matrix", action)
         self.assertIn('"$EVIDENCE"', action)
+        self.assertIn("if: ${{ !cancelled() }}", action)
+        self.assertIn('--provisioning-failure "$FAILED_STAGE"', action)
+        for step, stage in (("bundle", "client-bundle"), ("runtime", "python-runtime"),
+                            ("descriptors", "protocol-descriptors"), ("operator", "operator-setup")):
+            self.assertIn(f"id: {step}", action)
+            self.assertIn(f"steps.{step}.outcome == 'failure' && '{stage}'", action)
         self.assertIn("if: always()", action)
         workflow = (ROOT / ".github/workflows/release-wallet-roundtrip.yml").read_text()
         self.assertIn("  workflow_call:", workflow)

@@ -307,11 +307,12 @@ def preflight(options, workspace):
     return candidate, clients["clients"], baseline, gate
 
 
-def port_collision(campaign_state):
-    for log in sorted(Path(campaign_state).glob("*-up.log")):
+def port_collision(campaign_state, attempt_log):
+    for log in (attempt_log, *campaign_state.glob("*-up.log")):
         try:
-            if "Address already in use" in log.read_text(errors="replace"):
-                return True
+            with log.open(errors="replace") as lines:
+                if any("Address already in use" in line for line in lines):
+                    return True
         except OSError:
             continue
     return False
@@ -346,7 +347,7 @@ def run_campaign(options, candidate, clients):
                 proc.wait()
                 raise
         attempts.append({"attempt": attempt, "exit_code": code,
-                         "port_collision": port_collision(campaign_state)})
+                         "port_collision": port_collision(campaign_state, log)})
         if code == 0:
             cleanup = read_json(campaign_state / "cleanup.json")
             require(cleanup == {"first": "removed", "second": "removed"},
@@ -637,6 +638,8 @@ def main():
                         help="new directory for allowlisted aggregate evidence")
     parser.add_argument("--port-bases", type=int, nargs=2, default=list(DEFAULT_PORTS),
                         metavar=("FIRST", "SECOND"))
+    parser.add_argument("--provisioning-failure", choices=("client-bundle", "python-runtime", "protocol-descriptors", "operator-setup"),
+                        help="record the failed workflow setup stage and stop before running the candidate")
     options = parser.parse_args()
 
     def interrupt(*_):
@@ -657,6 +660,9 @@ def main():
     comparison = rows_document = campaign_state = None
     code = 1
     try:
+        if options.provisioning_failure:
+            summary["stage"] = options.provisioning_failure
+            raise GateBlocked(f"wallet qualification could not start because {options.provisioning_failure} failed")
         candidate, clients, baseline, gate = preflight(options, _workdir(options))
         summary["candidate"] = {key: candidate[key] for key in (
             "tag", "commit", "version", "archive_sha256", "archive_pin", "binaries")}

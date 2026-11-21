@@ -45,6 +45,7 @@ runs:
   using: composite
   steps:
     - name: Provision the pinned wallet client bundle
+      id: bundle
       if: inputs.client-bundle-url != ''
       shell: bash
       env:
@@ -64,6 +65,7 @@ runs:
         printf '%s  %s\n' "$BUNDLE_SHA256" clients/bundle.tar.gz | sha256sum --check --strict
 
     - name: Note the operator gate state
+      id: operator
       shell: bash
       env:
         BUNDLE_CONFIGURED: ${{ inputs.client-bundle-url != '' }}
@@ -83,6 +85,7 @@ runs:
         fi
 
     - name: Install the pinned wallet runtime
+      id: runtime
       if: inputs.client-bundle-url != ''
       shell: bash
       run: |
@@ -96,6 +99,7 @@ runs:
           mnemonic==0.21
 
     - name: Generate the wallet protocol descriptors
+      id: descriptors
       if: inputs.client-bundle-url != ''
       shell: bash
       run: |
@@ -113,8 +117,14 @@ runs:
           crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto
 
     - name: Qualify the candidate on two fresh chains
+      if: ${{ !cancelled() }}
       shell: bash
       env:
+        FAILED_STAGE: >-
+          ${{ steps.bundle.outcome == 'failure' && 'client-bundle' ||
+              steps.runtime.outcome == 'failure' && 'python-runtime' ||
+              steps.descriptors.outcome == 'failure' && 'protocol-descriptors' ||
+              steps.operator.outcome == 'failure' && 'operator-setup' || '' }}
         PYTHONPATH: ${{ github.workspace }}/python-proto
         TAG: ${{ inputs.tag }}
         COMMIT: ${{ inputs.commit }}
@@ -127,8 +137,13 @@ runs:
         EVIDENCE: ${{ inputs.evidence }}
       run: |
         set -euo pipefail
-        python=.wallet-venv/bin/python
-        [[ -x "$python" ]] || python=python3
+        python=python3
+        setup_args=()
+        if [[ -n "$FAILED_STAGE" ]]; then
+          setup_args+=(--provisioning-failure "$FAILED_STAGE")
+        elif [[ -x .wallet-venv/bin/python ]]; then
+          python=.wallet-venv/bin/python
+        fi
         "$python" -B scripts/release-wallet-roundtrip.py \
           --candidate-archive "$ARCHIVE" \
           --archive-sha256 "$ARCHIVE_SHA256" \
@@ -140,7 +155,7 @@ runs:
           --baseline-matrix "$BASELINE_MATRIX" \
           --state "$STATE" \
           --evidence "$EVIDENCE" \
-          --port-bases 51500 51600
+          --port-bases 51500 51600 "${setup_args[@]}"
 
     - name: Report the gate result
       if: always()
