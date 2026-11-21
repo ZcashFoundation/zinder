@@ -307,7 +307,7 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
     let extended = host_extended_features();
     let avx = basic
         .as_ref()
-        .is_some_and(|info| info.has_avx() && info.has_oxsave())
+        .is_some_and(|features| features.has_avx() && features.has_oxsave())
         && std::arch::is_x86_feature_detected!("avx");
     let required = [
         (
@@ -330,16 +330,18 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         ),
         (
             "fma",
-            avx && basic.as_ref().is_some_and(|info| info.has_fma()),
+            avx && basic.as_ref().is_some_and(raw_cpuid::FeatureInfo::has_fma),
         ),
         (
             "lzcnt",
             cpu.get_extended_processor_and_feature_identifiers()
-                .is_some_and(|info| info.has_lzcnt()),
+                .is_some_and(|features| features.has_lzcnt()),
         ),
         (
             "pclmulqdq",
-            basic.as_ref().is_some_and(|info| info.has_pclmulqdq()),
+            basic
+                .as_ref()
+                .is_some_and(raw_cpuid::FeatureInfo::has_pclmulqdq),
         ),
     ];
     required
