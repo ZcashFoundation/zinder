@@ -13,6 +13,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, Network,
     wire::{decode_internal_block_hash, encode_internal_block_hash},
 };
+use zinder_proto::compat::lightwalletd;
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
 use zinder_store::HeightOrder;
 
@@ -181,18 +182,6 @@ pub(crate) struct SealedBlock {
     pub(crate) payload: Bytes,
 }
 
-// Admission only needs the three identity fields from the vendored CompactBlock message.
-// The publisher uses the complete release projection to encode each payload.
-#[derive(Message)]
-struct WireBlockLink {
-    #[prost(uint64, tag = "2")]
-    height: u64,
-    #[prost(bytes, tag = "3")]
-    hash: Vec<u8>,
-    #[prost(bytes, tag = "4")]
-    prev_hash: Vec<u8>,
-}
-
 pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     let file = {
@@ -254,12 +243,12 @@ impl SealedHistory {
             payload.resize(len, 0);
             input.read_exact(&mut payload)?;
             digest.update(&payload);
-            let link = WireBlockLink::decode(payload.as_slice())?;
-            if link.height != u64::from(height.value()) {
+            let block = lightwalletd::CompactBlock::decode(payload.as_slice())?;
+            if block.height != u64::from(height.value()) {
                 return Err(invalid("wrong shielded segment payload height"));
             }
-            let id = BlockId::new(height, decode_hash(&link.hash)?);
-            let parent = decode_hash(&link.prev_hash)?;
+            let id = BlockId::new(height, decode_hash(&block.hash)?);
+            let parent = decode_hash(&block.prev_hash)?;
             expected.check_block(id, parent, prior)?;
             rows.push(IndexedBlock {
                 id,

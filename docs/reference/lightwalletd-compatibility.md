@@ -166,12 +166,12 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 Both serving modes can serve the default shielded `GetBlockRange` projection from a signed catalog. The operator publishes the lightwalletd protobuf once per settled block. For a covered chunk, the reader checks that the current view still retains its lowest height, then skips the canonical compact-block read and conversion. Each stream keeps the catalog it opened. Chunks that cross either edge of coverage, live chunks, and other pool selections use the ordinary canonical read. The same byte budget, order, stream slots, and reorg checks apply in both directions.
 
-To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. Choose a first height within retained history. Keep the signing key outside the catalog directory.
+To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. To publish all retained history, start at height 1 for a complete store. For a checkpointed store, start at its first retained height, one above the checkpoint. Keep the signing key outside the catalog directory.
 
 ```sh
 zinder-compat-lightwalletd --config reader.toml publish-shielded-history \
   --directory /srv/zinder/published-history --signing-key /etc/zinder/publisher.pk8 \
-  --first-height 0 --segment-blocks 4096
+  --first-height 1 --segment-blocks 4096
 ```
 
 The command opens a temporary canonical secondary, appends complete segments through its captured settled tip, and exits. Rerun it as settlement advances. One publisher holds the directory lock. On each restart it reads the existing segments to verify their contents and links before appending. Allow for that I/O when scheduling publication. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication. The shorter unsettled or incomplete suffix continues to use canonical reads.

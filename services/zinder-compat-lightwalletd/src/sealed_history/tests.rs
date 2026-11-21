@@ -4,7 +4,6 @@ use std::{
     io::{Seek, SeekFrom},
 };
 use zinder_core::CompactChainMetadata;
-use zinder_proto::compat::lightwalletd;
 
 const NETWORK: Network = Network::ZcashRegtest;
 
@@ -206,6 +205,29 @@ fn broken_payload_link_is_rejected_even_with_matching_digest() -> eyre::Result<(
     let mut message = lightwalletd::CompactBlock::decode(&*payload)?;
     message.prev_hash = encode_internal_block_hash(hash(0)).to_vec();
     payload.copy_from_slice(&message.encode_to_vec());
+    fs::write(&path, &bytes)?;
+    let altered = SegmentIdentity {
+        sha256: Sha256::digest(&bytes).into(),
+        ..identity
+    };
+    assert!(SealedHistory::open(&path, altered).is_err());
+    Ok(())
+}
+
+#[test]
+fn malformed_chain_metadata_fails_admission_even_with_matching_links_and_digest() -> eyre::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 1)?;
+    let mut bytes = fs::read(&path)?;
+    let message = lightwalletd::CompactBlock::decode(&bytes[HEADER_LEN + LENGTHS_LEN..])?;
+    let metadata = message
+        .chain_metadata
+        .ok_or_else(|| invalid("missing fixture metadata"))?;
+    assert!(bytes.ends_with(&metadata.encode_to_vec()));
+    // An unterminated varint lies inside the nested metadata, after all block links.
+    *bytes.last_mut().ok_or_else(|| invalid("empty segment"))? |= 0x80;
     fs::write(&path, &bytes)?;
     let altered = SegmentIdentity {
         sha256: Sha256::digest(&bytes).into(),

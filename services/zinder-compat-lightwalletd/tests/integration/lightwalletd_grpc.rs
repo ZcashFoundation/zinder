@@ -3001,7 +3001,7 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 ///
 /// The recorder can also change the chain view it serves while a handler
 /// runs. `visible_tip_block` and `compact_blocks_in_range` answer from view
-/// `n` once `n` compact-block range reads have completed, so view 0 answers
+/// `n` after `n` completed compact-block reads or explicit advances, so view 0 answers
 /// a block-range request and its first chunk, and view `n` answers the
 /// chunk after the `n`th. A pin on any other view's epoch is refused, which
 /// is stricter than production retention and needs no clock.
@@ -3018,7 +3018,7 @@ struct EpochPinRecorder<Inner> {
     synthetic_views: Option<Arc<[SyntheticView]>>,
     /// Real queries that replace `inner` as the served view, in order.
     later_views: Arc<[Inner]>,
-    completed_compact_block_reads: Arc<AtomicUsize>,
+    current_view_index: Arc<AtomicUsize>,
     completed_subtree_reads: Arc<AtomicUsize>,
     /// Epoch of the view that answered each successful compact-block range read.
     served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
@@ -3067,7 +3067,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             transparent_address_balance: None,
             synthetic_views: None,
             later_views: Arc::from(Vec::new()),
-            completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
+            current_view_index: Arc::new(AtomicUsize::new(0)),
             completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
@@ -3157,7 +3157,11 @@ impl<Inner> EpochPinRecorder<Inner> {
     }
 
     fn view_index(&self) -> usize {
-        self.completed_compact_block_reads.load(Ordering::SeqCst)
+        self.current_view_index.load(Ordering::SeqCst)
+    }
+
+    fn advance_view(&self) {
+        self.current_view_index.fetch_add(1, Ordering::SeqCst);
     }
 
     fn synthetic_view(&self, view_index: usize) -> Option<SyntheticView> {
@@ -3497,8 +3501,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         let view_index = self.view_index();
         let compact_block_range = if let Some(view) = self.synthetic_view(view_index) {
             let chain_epoch = self.visible_tip_block(at_epoch_id).await;
-            self.completed_compact_block_reads
-                .fetch_add(1, Ordering::SeqCst);
+            self.advance_view();
             match chain_epoch {
                 Ok(visible_tip_block) => view
                     .compact_blocks_up_to(block_range, order, max_bytes)
@@ -3514,8 +3517,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
                 .served_inner(view_index)
                 .compact_blocks_in_range_up_to(block_range, order, max_bytes, at_epoch_id)
                 .await;
-            self.completed_compact_block_reads
-                .fetch_add(1, Ordering::SeqCst);
+            self.advance_view();
             served
         };
         // Record the heights a read kept, or the requested ones when it failed.

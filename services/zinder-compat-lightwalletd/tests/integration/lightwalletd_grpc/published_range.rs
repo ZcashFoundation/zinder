@@ -34,6 +34,7 @@ use zinder_testkit::{
 
 const NETWORK: Network = Network::ZcashRegtest;
 const SEALED_END: u32 = 3;
+const PUBLISHED_CHUNK_END: u32 = 1_000;
 
 struct ReaderFixture {
     reader: Arc<RocksDbCanonicalReader>,
@@ -57,7 +58,11 @@ impl ReaderFixture {
         })
     }
 
-    async fn publish(&self, path: &Path) -> eyre::Result<Arc<PublishedShieldedHistory>> {
+    async fn publish(
+        &self,
+        path: &Path,
+        segment_blocks: u32,
+    ) -> eyre::Result<Arc<PublishedShieldedHistory>> {
         let (signer, key) = crate::common::shielded_catalog_keys(
             path.parent().ok_or_else(|| eyre!("missing fixture root"))?,
         )?;
@@ -65,7 +70,7 @@ impl ReaderFixture {
             path,
             &signer,
             BlockHeight::new(1),
-            SEALED_END.try_into()?,
+            segment_blocks.try_into()?,
         )?;
         assert!(publisher.publish_next(&self.reader)?);
         Ok(Arc::new(
@@ -168,7 +173,9 @@ async fn generated_wallet_clients_cross_the_published_boundary_in_both_direction
     let dir = tempfile::tempdir()?;
     let chain = wallet_chain(1)?;
     let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
-    let segment = store.publish(&dir.path().join("shielded")).await?;
+    let segment = store
+        .publish(&dir.path().join("shielded"), SEALED_END)
+        .await?;
     let recorder = EpochPinRecorder::new(store.query.clone());
     let mut wallet = Endpoint::start(
         Server::builder().add_service(
@@ -274,7 +281,9 @@ async fn a_published_range_on_a_different_branch_emits_no_displaced_block() -> e
     let branch = chain.fork_at(BlockHeight::new(2))?.extend_blocks(5);
     let old = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
     let current = ReaderFixture::new(writer(&branch)?.into_serving_store_fixture()?)?;
-    let segment = old.publish(&dir.path().join("displaced")).await?;
+    let segment = old
+        .publish(&dir.path().join("displaced"), SEALED_END)
+        .await?;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(
             LightwalletdGrpcAdapter::new(current.query.clone())
@@ -314,7 +323,9 @@ async fn covered_chunks_respect_a_replacements_higher_floor_at_the_same_settled_
     let dir = tempfile::tempdir()?;
     let chain = ChainFixture::new(NETWORK).extend_blocks(6);
     let original = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
-    let history = original.publish(&dir.path().join("settled")).await?;
+    let history = original
+        .publish(&dir.path().join("settled"), SEALED_END)
+        .await?;
     let checkpointed = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain)
             .with_history_floor(BlockHeight::new(1))
@@ -379,8 +390,8 @@ async fn crossing_a_replaced_live_suffix(
     replacement_tip: u32,
     expected_status: Code,
 ) -> eyre::Result<()> {
-    const TIP: u32 = 1_015;
-    const FORK: u32 = 998;
+    const TIP: u32 = 2_015;
+    const FORK: u32 = 1_998;
     let dir = tempfile::tempdir()?;
     let mut chain = ChainFixture::new(NETWORK)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -404,14 +415,16 @@ async fn crossing_a_replaced_live_suffix(
         &sample_regtest_upgrade_activations(),
     )?;
     let before = ReaderFixture::new(writer.serving_store_fixture()?)?;
-    let published = before.publish(&dir.path().join("settled")).await?;
+    let published = before
+        .publish(&dir.path().join("settled"), PUBLISHED_CHUNK_END)
+        .await?;
     writer.replace_live_blocks(&replacement, BlockHeight::new(FORK))?;
     let after = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
     let recorder =
         EpochPinRecorder::new(before.query.clone()).with_later_views(vec![after.query.clone()]);
     let mut endpoint = Endpoint::start(
         Server::builder().add_service(
-            LightwalletdGrpcAdapter::new(recorder)
+            LightwalletdGrpcAdapter::new(recorder.clone())
                 .with_published_shielded_history(published)
                 .into_server(),
         ),
@@ -429,7 +442,20 @@ async fn crossing_a_replaced_live_suffix(
         .last()
         .ok_or_else(|| eyre!("missing settled and original live prefix"))?
         .height;
-    assert!(last >= u64::from(FORK) && last < u64::from(TIP));
+    assert_eq!(last, 2_000);
+    let native = recorder.offered_compact_block_ranges();
+    assert_eq!(
+        native.first(),
+        Some(&BlockHeightRange::inclusive(
+            BlockHeight::new(1_001),
+            BlockHeight::new(2_000)
+        ))
+    );
+    assert!(
+        native
+            .iter()
+            .all(|chunk| chunk.start.value() > PUBLISHED_CHUNK_END)
+    );
     assert_one_linked_chain(&drained.blocks, 1, last);
     for returned in drained.blocks {
         let original = fixture_block(&chain, BlockHeight::new(u32::try_from(returned.height)?))?;
@@ -441,37 +467,130 @@ async fn crossing_a_replaced_live_suffix(
 #[tokio::test]
 async fn crossing_into_a_replaced_live_chunk_aborts_before_a_forked_block_is_sent()
 -> eyre::Result<()> {
-    crossing_a_replaced_live_suffix(1_015, Code::Aborted).await
+    crossing_a_replaced_live_suffix(2_015, Code::Aborted).await
 }
 
 #[tokio::test]
 async fn crossing_into_a_shorter_live_view_ends_out_of_range_before_the_missing_chunk()
 -> eyre::Result<()> {
-    crossing_a_replaced_live_suffix(1_005, Code::OutOfRange).await
+    crossing_a_replaced_live_suffix(2_005, Code::OutOfRange).await
+}
+
+async fn stream_published_prefix(
+    endpoint: &mut Endpoint,
+    recorder: &EpochPinRecorder<WalletServingQuery<()>>,
+    tip: u32,
+) -> eyre::Result<(
+    tonic::Streaming<lightwalletd::CompactBlock>,
+    Vec<lightwalletd::CompactBlock>,
+)> {
+    let mut stream = endpoint
+        .client
+        .get_block_range(block_range_request(1, u64::from(tip)))
+        .await?
+        .into_inner();
+    let mut prefix = Vec::new();
+    for _ in 0..PUBLISHED_CHUNK_END {
+        prefix.push(
+            stream
+                .message()
+                .await?
+                .ok_or_else(|| eyre!("range ended inside its published prefix"))?,
+        );
+    }
+    assert_one_linked_chain(&prefix, 1, u64::from(PUBLISHED_CHUNK_END));
+    super::later_chunk_read_at_gate(recorder).await?;
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        [] as [BlockHeightRange; 0]
+    );
+    Ok((stream, prefix))
+}
+
+fn handoff_writer(chain: &ChainFixture) -> eyre::Result<CanonicalWriterFixture> {
+    CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(chain).with_settled_tip(BlockHeight::new(PUBLISHED_CHUNK_END)),
+        &sample_regtest_upgrade_activations(),
+    )
+}
+
+#[tokio::test]
+async fn a_replaced_tail_must_link_to_the_last_published_block() -> eyre::Result<()> {
+    const TIP: u32 = 1_015;
+    let dir = tempfile::tempdir()?;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP);
+    let initial = ReaderFixture::new(handoff_writer(&chain)?.into_serving_store_fixture()?)?;
+    let published = initial
+        .publish(&dir.path().join("settled"), PUBLISHED_CHUNK_END)
+        .await?;
+
+    for fork in [PUBLISHED_CHUNK_END, PUBLISHED_CHUNK_END + 1] {
+        let branch = chain
+            .fork_at(BlockHeight::new(fork))?
+            .extend_blocks(TIP - fork + 1);
+        let replacement =
+            ReaderFixture::new(handoff_writer(&branch)?.into_serving_store_fixture()?)?;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let recorder = EpochPinRecorder::new(initial.query.clone())
+            .with_later_views(vec![replacement.query.clone()])
+            .with_later_chunk_gate(gate.clone());
+        let mut endpoint = Endpoint::start(
+            Server::builder().add_service(
+                LightwalletdGrpcAdapter::new(recorder.clone())
+                    .with_published_shielded_history(published.clone())
+                    .into_server(),
+            ),
+        )
+        .await?;
+        let (stream, mut prefix) = stream_published_prefix(&mut endpoint, &recorder, TIP).await?;
+        recorder.advance_view();
+        gate.add_permits(1);
+        let tail = drain_slowly(stream).await;
+        assert_eq!(
+            recorder.offered_compact_block_ranges(),
+            [BlockHeightRange::inclusive(
+                BlockHeight::new(PUBLISHED_CHUNK_END + 1),
+                BlockHeight::new(TIP)
+            )]
+        );
+        if fork == PUBLISHED_CHUNK_END {
+            assert_eq!(tail.blocks, [] as [lightwalletd::CompactBlock; 0]);
+            assert_stream_ended_with(tail.ending.as_ref(), Code::Aborted);
+        } else {
+            assert!(tail.ending.is_none());
+            for block in &tail.blocks {
+                let expected =
+                    fixture_block(&branch, BlockHeight::new(u32::try_from(block.height)?))?;
+                assert_eq!(block.hash, encode_internal_block_hash(expected.hash));
+            }
+            prefix.extend(tail.blocks);
+            assert_one_linked_chain(&prefix, 1, u64::from(TIP));
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]
 async fn cancelling_at_the_live_handoff_returns_the_only_stream_slot() -> eyre::Result<()> {
-    use super::{FirstChunkGate, REFUSAL_WAIT};
+    use super::REFUSAL_WAIT;
     use std::{num::NonZeroU32, time::Duration};
+    const TIP: u32 = 1_015;
     let dir = tempfile::tempdir()?;
-    let chain = wallet_chain(1)?;
-    let fixture = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
-    let published = fixture.publish(&dir.path().join("settled")).await?;
-    let gate = FirstChunkGate::closed();
-    let recorder = EpochPinRecorder::new(fixture.query.clone()).with_first_chunk_gate(gate.clone());
-    let adapter = LightwalletdGrpcAdapter::new(recorder)
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP);
+    let fixture = ReaderFixture::new(handoff_writer(&chain)?.into_serving_store_fixture()?)?;
+    let published = fixture
+        .publish(&dir.path().join("settled"), PUBLISHED_CHUNK_END)
+        .await?;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let recorder = EpochPinRecorder::new(fixture.query.clone()).with_later_chunk_gate(gate.clone());
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
         .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
         .with_block_range_admission_wait(REFUSAL_WAIT)
         .with_published_shielded_history(published);
     let mut endpoint =
         Endpoint::start(Server::builder().add_service(adapter.into_server())).await?;
-    let mut cancelling = endpoint.client.clone();
-    let pending =
-        tokio::spawn(async move { cancelling.get_block_range(block_range_request(1, 6)).await });
-    tokio::time::timeout(Duration::from_secs(5), gate.reached.notified()).await?;
-    pending.abort();
-    assert!(pending.await.is_err_and(|error| error.is_cancelled()));
+    let (stream, _) = stream_published_prefix(&mut endpoint, &recorder, TIP).await?;
+    drop(stream);
     let busy = endpoint
         .client
         .get_block_range(block_range_request(1, 1))
@@ -480,7 +599,7 @@ async fn cancelling_at_the_live_handoff_returns_the_only_stream_slot() -> eyre::
         busy.err().map(|status| status.code()),
         Some(Code::Unavailable)
     );
-    gate.release.add_permits(1);
+    gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match endpoint
@@ -500,6 +619,13 @@ async fn cancelling_at_the_live_handoff_returns_the_only_stream_slot() -> eyre::
         }
     })
     .await??;
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        [BlockHeightRange::inclusive(
+            BlockHeight::new(PUBLISHED_CHUNK_END + 1),
+            BlockHeight::new(TIP)
+        )]
+    );
     Ok(())
 }
 
@@ -515,7 +641,9 @@ async fn appending_above_a_published_range_keeps_the_original_request_linked() -
         &sample_regtest_upgrade_activations(),
     )?;
     let before = ReaderFixture::new(writer.serving_store_fixture()?)?;
-    let published = before.publish(&dir.path().join("settled")).await?;
+    let published = before
+        .publish(&dir.path().join("settled"), SEALED_END)
+        .await?;
     writer.append_live_block(&chain)?;
     let after = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
     let recorder =
@@ -579,7 +707,9 @@ async fn a_malformed_live_row_ends_after_the_same_delivered_prefix_as_the_stock_
             Some(&vec![0; damaged_length]),
         )?;
         let fixture = ReaderFixture::new(paths)?;
-        let published = fixture.publish(&files.path().join("settled")).await?;
+        let published = fixture
+            .publish(&files.path().join("settled"), SEALED_END)
+            .await?;
         let mut stock = Endpoint::start(
             Server::builder()
                 .add_service(LightwalletdGrpcAdapter::new(fixture.query.clone()).into_server()),
@@ -668,7 +798,7 @@ async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders
     let files = tempfile::tempdir()?;
     let fixture = ReaderFixture::new(writer(&wallet_chain(1)?)?.into_serving_store_fixture()?)?;
     let directory = files.path().join("catalog");
-    let history = fixture.publish(&directory).await?;
+    let history = fixture.publish(&directory, SEALED_END).await?;
     let segment = std::fs::read_dir(&directory)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
