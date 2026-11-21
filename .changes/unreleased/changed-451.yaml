@@ -1,0 +1,6 @@
+kind: changed
+body: "Fresh canonical construction now stores a tree-state checkpoint for every loaded block under the default `every-block` tree-state densification setting, so every constructed height through the build tip is a stored read at READY without a second commitment-replay pass afterward. Set `ingest.tree_state_densification.enabled = false` or select `commitment-budget` before the first sync to keep sparse construction."
+time: 2026-11-21T16:48:00.000000000Z
+custom:
+    Bump: minor
+    PR: "451"
