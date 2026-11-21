@@ -1358,7 +1358,9 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
     use prost::Message as _;
     use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
 
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(3);
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let (secondary, wallet) = store.take_readers()?;
@@ -1406,7 +1408,13 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
     assert!(adapter.encoded_block_range().is_none());
     assert!(publisher.publish_next(&canonical.canonical_reader)?);
     assert!(history.refresh(canonical.as_ref()).await?);
-    assert!(history.refresh_tail(canonical.as_ref()).await.is_err());
+    assert!(
+        history
+            .refresh_tail(canonical.as_ref())
+            .await
+            .is_err_and(|status| status.code() == Code::Unavailable
+                && status.message().contains("row lengths"))
+    );
     let encoded = adapter
         .encoded_block_range()
         .ok_or_else(|| eyre::eyre!("missing signed prefix"))?;
