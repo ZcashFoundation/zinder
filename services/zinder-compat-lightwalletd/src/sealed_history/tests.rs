@@ -229,11 +229,52 @@ fn malformed_chain_metadata_fails_admission_even_with_matching_links_and_digest(
     // An unterminated varint lies inside the nested metadata, after all block links.
     *bytes.last_mut().ok_or_else(|| invalid("empty segment"))? |= 0x80;
     fs::write(&path, &bytes)?;
+    let unauthenticated = SealedHistory::open(&path, identity)
+        .err()
+        .ok_or_else(|| invalid("admitted unsigned change"))?;
+    assert_eq!(
+        unauthenticated.to_string(),
+        "shielded segment length or SHA-256 mismatch"
+    );
     let altered = SegmentIdentity {
         sha256: Sha256::digest(&bytes).into(),
         ..identity
     };
     assert!(SealedHistory::open(&path, altered).is_err());
+    Ok(())
+}
+
+#[test]
+fn an_ordinary_file_must_match_its_authenticated_framing_and_payload_at_decode_time()
+-> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 2)?;
+    let original = fs::read(&path)?;
+    let file = open_regular_file(&path)?;
+    let mut input = BufReader::with_capacity(13, &file);
+    for (offset, reason) in [
+        (0, "shielded segment format, network, or interval mismatch"),
+        (
+            original.len() - 1,
+            "shielded segment payload SHA-256 mismatch",
+        ),
+        (
+            HEADER_LEN + 3,
+            "shielded segment row lengths changed after authentication",
+        ),
+    ] {
+        fs::write(&path, &original)?;
+        input.rewind()?;
+        let verified = authenticate_rows(&mut input, identity, file.metadata()?.len(), false)?;
+        let mut changed = original.clone();
+        changed[offset] ^= 1;
+        fs::write(&path, changed)?;
+        let error = index_rows(&mut input, identity, verified)
+            .err()
+            .ok_or_else(|| invalid("indexed changed file"))?;
+        assert_eq!(error.to_string(), reason);
+    }
     Ok(())
 }
 
