@@ -44,7 +44,7 @@ CARGO_TARGET_DIR="$build_root/devtool" \
 
 The Zally build uses the source checkout’s toolchain and Cargo cache. Fetch its locked dependencies before an offline run. The first build derives a standalone lockfile from the workspace lock. Each later build uses `--locked`. The runner checks dependency versions, sources, and checksums against the selected workspace and uses the executable reported by Cargo.
 
-Use a disposable Vizor source checkout for the example build. Its HID dependency requires `libudev-dev`.
+Use a disposable Vizor source checkout. The builder makes its Rust crate a standalone Cargo workspace and installs the payment driver as an example. An updated driver triggers a rebuild even when the source has an older timestamp. The HID dependency requires `libudev-dev`.
 
 ## Run a case
 

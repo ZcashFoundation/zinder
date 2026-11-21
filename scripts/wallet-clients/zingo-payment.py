@@ -93,7 +93,10 @@ class Counterparty:
 
     def send(self, address, amount_zat, memo):
         require(type(amount_zat) is int and amount_zat > 0, "invalid amount")
-        txid = self.wallet._broadcast("quicksend", address, str(amount_zat), memo)
+        args = ["quicksend", address, str(amount_zat)]
+        if memo is not None:
+            args.append(memo)
+        txid = self.wallet._broadcast(*args)
         return valid_txid(txid)
 
     def detail(self, txid):
@@ -124,7 +127,8 @@ def main():
         result = wallet.snapshot()
     elif args.command == "send":
         require(len(args.args) == 3, "send ADDRESS ATOMS MEMO-OR-DASH")
-        result = {"txid": wallet.send(args.args[0], int(args.args[1]), args.args[2])}
+        memo = None if args.args[2] == "-" else args.args[2]
+        result = {"txid": wallet.send(args.args[0], int(args.args[1]), memo)}
     else:
         require(len(args.args) == 1, "detail TXID")
         result = wallet.detail(args.args[0])

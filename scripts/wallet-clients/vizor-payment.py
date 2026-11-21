@@ -10,8 +10,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
+import tomllib
 
 
 def require(condition, message):
@@ -30,14 +30,25 @@ def build(source, build_dir, driver, jobs=8):
     require((root / "Cargo.toml").is_file() and (root / "examples").is_dir(),
             "Vizor source path does not contain the rust crate")
     (build_dir / "target").mkdir(mode=0o700, parents=True, exist_ok=True)
+    manifest = root / "Cargo.toml"
+    if "workspace" not in tomllib.loads(manifest.read_text()):
+        with manifest.open("a") as f:
+            f.write("\n[workspace]\n")
     target = root / "examples/vizor-payment.rs"
-    shutil.copy2(driver, target)
-    subprocess.run(["cargo", "build", "--locked", "--example", "vizor-payment",
-                    "--jobs", str(jobs), "--manifest-path", str(root / "Cargo.toml"),
-                    "--target-dir", str(build_dir / "target")], cwd=root, check=True)
-    binary = build_dir / "target/debug/examples/vizor-payment"
-    require(binary.is_file(), "Vizor payment driver build produced no binary")
-    return binary
+    contents = Path(driver).read_bytes()
+    if not target.is_file() or target.read_bytes() != contents:
+        target.write_bytes(contents)
+    result = subprocess.run(["cargo", "build", "--locked", "--example", "vizor-payment",
+                             "--message-format=json-render-diagnostics", "--jobs", str(jobs),
+                             "--manifest-path", str(manifest), "--target-dir", str(build_dir / "target")],
+                            cwd=root, check=True, stdout=subprocess.PIPE, text=True)
+    require(target.read_bytes() == contents == Path(driver).read_bytes(),
+            "Vizor payment driver changed during compilation")
+    executables = [Path(item["executable"]) for line in result.stdout.splitlines()
+                   if (item := json.loads(line))["reason"] == "compiler-artifact" and item.get("executable")
+                   and item["target"]["name"] == "vizor-payment" and "example" in item["target"]["kind"]]
+    require(len(executables) == 1 and executables[0].is_file(), "Vizor payment driver build produced no binary")
+    return executables[0]
 
 
 class Vizor:

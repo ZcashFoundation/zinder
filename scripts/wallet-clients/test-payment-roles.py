@@ -9,6 +9,8 @@ These tests exercise that logic without starting a fixture.
 """
 import importlib
 import json
+import os
+import subprocess
 import runpy
 import sys
 import tempfile
@@ -23,6 +25,42 @@ V0_22_0_COMMIT = "999d51ab835037a2466763ca1a1e7739a26b72c1"
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_nested_vizor_build_recompiles_changed_older_driver(self):
+        vizor = importlib.import_module("vizor-payment")
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            (parent / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+            root = parent / ".tmp/vizor/rust"
+            (root / "examples").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / "src/lib.rs").touch()
+            (root / "Cargo.toml").write_text('[package]\nname="pay"\nversion="0.1.0"\nedition="2021"\n')
+            (root / "Cargo.lock").write_text('version = 3\n[[package]]\nname="pay"\nversion="0.1.0"\n')
+            driver, build = parent / "driver.rs", parent / "out"
+            for version in ("first", "changed", "first"):
+                driver.write_text(f'fn main() {{ println!("{version}"); }}')
+                os.utime(driver, (1, 1))
+                exe = vizor.build(root, build, driver, jobs=1)
+                self.assertEqual(subprocess.check_output([exe], text=True).strip(), version)
+            self.assertEqual((root / "Cargo.toml").read_text().count("[workspace]"), 1)
+
+    def test_zingo_dash_omits_memo_from_quicksend(self):
+        zingo = importlib.import_module("zingo-payment")
+        counterparty = zingo.Counterparty.__new__(zingo.Counterparty)
+        counterparty.wallet = Mock()
+        counterparty.wallet._broadcast.return_value = "ab" * 32
+        for memo, expected in (("-", []), ("memo", ["memo"]), ("", [""])):
+            with self.subTest(memo=memo), patch.object(zingo, "Counterparty", return_value=counterparty), \
+                 patch("sys.argv", ["zingo-payment", "--client", "cli", "--wallet", "wallet",
+                                    "--node", "node", "--endpoint", "endpoint", "send", "address", "123", memo]), \
+                 patch("builtins.print"):
+                zingo.main()
+                counterparty.wallet._broadcast.assert_called_with("quicksend", "address", "123", *expected)
+        counterparty.send("address", 123, None)
+        counterparty.wallet._broadcast.assert_called_with("quicksend", "address", "123")
+        counterparty.send("address", 123, "-")
+        counterparty.wallet._broadcast.assert_called_with("quicksend", "address", "123", "-")
+
     def test_release_tag_resolves_to_commit(self):
         self.assertEqual(MODULE["resolve_tag"]("v0.22.0"), V0_22_0_COMMIT)
         with self.assertRaises(ValueError):
