@@ -19,6 +19,7 @@ async-trait.workspace = true
 arc-swap.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
+fs-verity.workspace = true
 futures-util = { workspace = true, optional = true }
 hex.workspace = true
 http.workspace = true

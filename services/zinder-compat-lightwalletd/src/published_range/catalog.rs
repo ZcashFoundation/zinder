@@ -100,6 +100,16 @@ impl PublishedShieldedCatalog {
                     "shielded catalog changed publisher or regressed its admitted prefix",
                 ));
             }
+            if require_fs_verity
+                && previous
+                    .segments
+                    .iter()
+                    .any(|range| !range.segment.kernel_verified)
+            {
+                return Err(invalid(
+                    "shielded history requires a signed fs-verity digest on every segment",
+                ));
+            }
             segments.extend(previous.segments.iter().cloned());
         }
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
