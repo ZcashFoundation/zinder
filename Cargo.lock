@@ -761,6 +761,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "composefs-ioctls"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1e1dbf64a4a2dda8db3cbdb3109d29274b0cbeedc1ee68fdc8ccfdefc17cb9"
+dependencies = [
+ "rustix",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "config"
 version = "0.15.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6253,6 +6263,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "clap",
+ "composefs-ioctls",
  "config",
  "eyre",
  "fs-verity",
