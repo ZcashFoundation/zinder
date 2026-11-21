@@ -1,0 +1,6 @@
+kind: changed
+body: Serving warm historical compact block ranges uses less listener CPU. Time to the first block can still vary by wallet workload.
+time: 2026-11-21T15:54:07.649720605Z
+custom:
+    Bump: patch
+    PR: "446"
