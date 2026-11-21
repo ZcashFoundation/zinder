@@ -81,6 +81,9 @@ jobs:
       - name: Test (unit + integration)
         run: cargo nextest run --profile=ci
 
+      - name: Test the assembly-enabled Pasta guard
+        run: cargo nextest run --locked --profile=ci -p zinder-runtime --features pasta_curves/asm -E 'test(/pasta_/)'
+
       - name: Check canonical store defaults across runtimes
         run: python3 scripts/test-canonical-storage-defaults.py
 

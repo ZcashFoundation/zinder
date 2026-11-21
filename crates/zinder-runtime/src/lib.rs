@@ -343,7 +343,7 @@ pub const fn pasta_backend() -> &'static str {
 /// when the host falls short.
 ///
 /// The `pasta_curves` x86-64 assembly backend uses BMI2 and ADX instructions
-/// and does not detect them at run time. Neither is part of the x86-64-v3
+/// and does not detect them at run time. ADX is outside the x86-64-v3
 /// release baseline, so a build that opted into `asm` must refuse to start on
 /// a host that lacks ADX rather than die with `SIGILL` inside commitment
 /// hashing. The portable backend, and the `AArch64` and `ARMv7E-M` backends,
@@ -372,37 +372,27 @@ pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
     false
 }
 
-/// The instruction-set features a Pasta backend requires beyond its baseline.
-///
-/// The x86-64 assembly backend uses BMI2 and ADX and does not detect them;
-/// every other backend, including the portable one, needs nothing extra.
 #[cfg(any(target_arch = "x86_64", test))]
-fn required_pasta_backend_features(backend: &str) -> &'static [&'static str] {
-    match backend {
-        "x86-64" => &["bmi2", "adx"],
-        _ => &[],
+fn missing_pasta_features(backend: &str, bmi2: bool, adx: bool) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if backend == "x86-64" {
+        if !bmi2 {
+            missing.push("bmi2");
+        }
+        if !adx {
+            missing.push("adx");
+        }
     }
+    missing
 }
 
 #[cfg(target_arch = "x86_64")]
 fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
-    required_pasta_backend_features(pasta_curves::BACKEND)
-        .iter()
-        .copied()
-        .filter(|feature| !host_has_x86_feature(feature))
-        .collect()
-}
-
-/// Reports whether the host provides the named x86-64 feature. `std::arch`
-/// detection needs a literal feature name, so the mapping lives here rather
-/// than in a data table.
-#[cfg(target_arch = "x86_64")]
-fn host_has_x86_feature(feature: &str) -> bool {
-    match feature {
-        "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
-        "adx" => std::arch::is_x86_feature_detected!("adx"),
-        _ => true,
-    }
+    missing_pasta_features(
+        pasta_backend(),
+        std::arch::is_x86_feature_detected!("bmi2"),
+        std::arch::is_x86_feature_detected!("adx"),
+    )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -412,9 +402,7 @@ fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        missing_pasta_backend_cpu_features, pasta_backend, required_pasta_backend_features,
-    };
+    use super::{missing_pasta_features, pasta_backend};
 
     #[test]
     fn pasta_backend_names_a_known_backend() {
@@ -426,29 +414,22 @@ mod tests {
     }
 
     #[test]
-    fn only_the_x86_64_backend_requires_bmi2_or_adx() {
-        let missing = missing_pasta_backend_cpu_features();
-        if pasta_backend() == "x86-64" {
-            for feature in &missing {
-                assert!(
-                    ["bmi2", "adx"].contains(feature),
-                    "unexpected required CPU feature: {feature}"
-                );
-            }
-        } else {
-            assert!(
-                missing.is_empty(),
-                "backend {} must not require CPU features",
-                pasta_backend()
+    fn pasta_guard_requires_both_x86_assembly_features() {
+        assert_eq!(
+            missing_pasta_features("x86-64", false, false),
+            ["bmi2", "adx"]
+        );
+        assert_eq!(missing_pasta_features("x86-64", true, false), ["adx"]);
+        assert_eq!(missing_pasta_features("x86-64", false, true), ["bmi2"]);
+        assert_eq!(
+            missing_pasta_features("x86-64", true, true),
+            [] as [&str; 0]
+        );
+        for backend in ["portable", "aarch64", "armv7em"] {
+            assert_eq!(
+                missing_pasta_features(backend, false, false),
+                [] as [&str; 0]
             );
         }
-    }
-
-    #[test]
-    fn required_features_match_the_upstream_x86_64_isa() {
-        assert_eq!(required_pasta_backend_features("x86-64"), ["bmi2", "adx"]);
-        assert_eq!(required_pasta_backend_features("portable"), &[] as &[&str]);
-        assert_eq!(required_pasta_backend_features("aarch64"), &[] as &[&str]);
-        assert_eq!(required_pasta_backend_features("armv7em"), &[] as &[&str]);
     }
 }
