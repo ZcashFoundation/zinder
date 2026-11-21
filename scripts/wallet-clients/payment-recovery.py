@@ -1177,7 +1177,17 @@ def supervise_case(case, child, args, root):
         launch_error = f"{type(error).__name__}: {error}"
     except BaseException as error:
         launch_error = f"{type(error).__name__}: {error}"
-    cleanup = recover_case(case, child, args)
+    def interrupt_after_cleanup(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = KeyboardInterrupt() if signum == signal.SIGINT else SystemExit("payment recovery interrupted")
+
+    # The child has stopped. Finish owned teardown before recording and propagating cancellation.
+    with ExitStack() as handlers:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous = signal.signal(signum, interrupt_after_cleanup)
+            handlers.callback(signal.signal, signum, previous)
+        cleanup = recover_case(case, child, args)
     receipt_path = child.output / "receipt.json"
     receipt, receipt_error = read_case_receipt(receipt_path)
     status, kind, reason = supervision_result(case, exit_code, timeout, interrupted, receipt,

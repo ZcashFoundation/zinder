@@ -659,6 +659,39 @@ class CampaignSupervision(unittest.TestCase):
         self.assertEqual(receipt["supervision"]["kind"], "interrupted")
         self.assertEqual(len(self.recovered), 1)
 
+    def interrupt_parent_cleanup(self, signum, error):
+        cleanup_finished = []
+
+        def interrupt(_signum, _frame):
+            raise error
+
+        def stop_wallet(*args):
+            signal.raise_signal(signum)
+            cleanup_finished.append("wallet")
+            return False
+
+        previous = signal.signal(signum, interrupt)
+        self.addCleanup(signal.signal, signum, previous)
+        with patch.dict(GLOBALS, {
+                "close_owned_wallet": stop_wallet, "owned_relay": lambda *args: None,
+                "project_resource_count": lambda project: cleanup_finished.append("readback") or 0}):
+            with self.assertRaises(type(error)):
+                self.campaign(self.launch(), M["recover_case"])
+        self.assertEqual(cleanup_finished, ["wallet", "readback"])
+        self.assertIs(signal.getsignal(signum), interrupt)
+        self.assertEqual(self.supervision("disconnect")["supervision"]["kind"], "interrupted")
+        cases = self.summary()["cases"]
+        self.assertEqual(cases["disconnect"]["status"], "failed")
+        self.assertEqual(cases["disconnect"]["cleanup"]["resources_remaining"], 0)
+        self.assertEqual(cases["rollback"]["status"], "skipped")
+        self.assertEqual(len(self.launched), 1)
+
+    def test_ctrl_c_during_parent_wallet_cleanup_finishes_teardown(self):
+        self.interrupt_parent_cleanup(signal.SIGINT, KeyboardInterrupt())
+
+    def test_sigterm_during_parent_wallet_cleanup_finishes_teardown(self):
+        self.interrupt_parent_cleanup(signal.SIGTERM, SystemExit("payment recovery interrupted"))
+
     def test_existing_campaign_output_is_not_reused(self):
         self.root.mkdir()
         marker = self.root / "keep.txt"
