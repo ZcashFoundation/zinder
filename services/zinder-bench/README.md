@@ -1063,8 +1063,10 @@ identity, the workload's constants, and, over all wallets:
   `chain_metadata_error` then holds its status.
   `chain_metadata_block_is_tip` is true only when that block has
   `tip_before`'s height and the same 32-byte hash; it is false when a hash is
-  missing or not 32 bytes, because the identity cannot be shown. A `hash_hex` is in RPC byte order, as block explorers show
-  it, or the bytes as sent when the server's hash is not 32 bytes.
+  missing or malformed. A complete `hash_hex` uses RPC byte order. Shorter
+  hashes preserve the bytes as sent. A hash longer than 32 bytes fails the
+  probe that returned it. An oversized `GetBlock` hash appears in
+  `chain_metadata_error` and leaves the tree sizes unknown.
 - `wallet_request_identity_sha256`: identifies how range, tree-state, and
   transaction requests were distributed among the simulated wallets. Each
   wallet contributes its own digest of full requests, counting retries and
