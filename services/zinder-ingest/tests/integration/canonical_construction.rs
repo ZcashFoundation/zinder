@@ -894,8 +894,7 @@ struct MultiBlockConstructionSource {
     genesis: SourceBlock,
     blocks: Vec<SourceBlock>,
     checkpoints: Vec<CommitmentTreeCheckpoint>,
-    hold_chain_segments: Arc<AtomicBool>,
-    chain_segment_held: Arc<Notify>,
+    hold_checkpoint: Option<(BlockHeight, Arc<Notify>)>,
     chain_segment_requests: Arc<AtomicUsize>,
     cancel_with_tip_checkpoint: Option<(BlockHeight, CancellationToken)>,
 }
@@ -967,20 +966,10 @@ impl MultiBlockConstructionSource {
             genesis,
             blocks,
             checkpoints,
-            hold_chain_segments: Arc::new(AtomicBool::new(false)),
-            chain_segment_held: Arc::new(Notify::new()),
+            hold_checkpoint: None,
             chain_segment_requests: Arc::new(AtomicUsize::new(0)),
             cancel_with_tip_checkpoint: None,
         })
-    }
-
-    fn holding_segments(self) -> Self {
-        self.hold_chain_segments.store(true, Ordering::SeqCst);
-        self
-    }
-
-    fn release_chain_segments(&self) {
-        self.hold_chain_segments.store(false, Ordering::SeqCst);
     }
 
     fn cancelling_at_checkpoint(mut self, height: BlockHeight, cancel: CancellationToken) -> Self {
@@ -1023,10 +1012,6 @@ impl NodeSource for MultiBlockConstructionSource {
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
         self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
-        if self.hold_chain_segments.load(Ordering::SeqCst) {
-            self.chain_segment_held.notify_one();
-            std::future::pending::<()>().await;
-        }
         let next_height = limits
             .cursor
             .block_id()
@@ -1068,6 +1053,12 @@ impl NodeSource for MultiBlockConstructionSource {
                 reason: "multi-block test source has no checkpoint at the requested height"
                     .to_owned(),
             })?;
+        if let Some((held_height, reached)) = &self.hold_checkpoint
+            && *held_height == height
+        {
+            reached.notify_one();
+            std::future::pending::<()>().await;
+        }
         if let Some((cancel_height, cancel)) = &self.cancel_with_tip_checkpoint
             && *cancel_height == height
         {
@@ -1219,7 +1210,10 @@ async fn every_block_construction_preserves_checkpointed_bounds()
 async fn interrupted_every_block_construction_discards_unpublished_staging_and_rebuilds_densely()
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = regtest_activations();
-    let source = MultiBlockConstructionSource::build(6, &activations)?.holding_segments();
+    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let reached = Arc::new(Notify::new());
+    let mut interrupted_source = source.clone();
+    interrupted_source.hold_checkpoint = Some((BlockHeight::new(5), Arc::clone(&reached)));
     let temporary = TempDir::new()?;
     let config = multi_block_writer_config(
         temporary.path().join("canonical"),
@@ -1230,7 +1224,7 @@ async fn interrupted_every_block_construction_discards_unpublished_staging_and_r
     let cancel = CancellationToken::new();
 
     let admission = admit_canonical_store(
-        &source,
+        &interrupted_source,
         Arc::clone(&activations),
         &config,
         &readiness,
@@ -1238,9 +1232,9 @@ async fn interrupted_every_block_construction_discards_unpublished_staging_and_r
     );
     tokio::pin!(admission);
     tokio::select! {
-        () = source.chain_segment_held.notified() => {}
+        () = reached.notified() => {}
         _ = &mut admission => {
-            return Err("construction finished before its block stream was held".into());
+            return Err("construction finished before the build-tip checkpoint request".into());
         }
     }
     cancel.cancel();
@@ -1249,9 +1243,21 @@ async fn interrupted_every_block_construction_discards_unpublished_staging_and_r
         .map_err(|_| "cancelled dense construction outlived its shutdown bound")?;
     assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
     assert!(!config.storage_path.exists());
-    assert!(temporary.path().join("canonical.building").exists());
-
-    source.release_chain_segments();
+    {
+        let staging = temporary.path().join("canonical.building");
+        let options = rust_rocksdb::Options::default();
+        let families = rust_rocksdb::DB::list_cf(&options, &staging)?;
+        let db = rust_rocksdb::DB::open_cf_for_read_only(&options, &staging, families, false)?;
+        let checkpoints = db
+            .cf_handle("tree_state_checkpoint")
+            .ok_or("missing checkpoint family")?;
+        let key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(2));
+        assert!(
+            db.get_cf(&checkpoints, key)?.is_some(),
+            "off-cadence checkpoint must survive cancellation in staging"
+        );
+    }
+    let requests_before_restart = source.chain_segment_requests.load(Ordering::SeqCst);
     let store = admit_canonical_store(
         &source,
         Arc::clone(&activations),
@@ -1264,11 +1270,18 @@ async fn interrupted_every_block_construction_discards_unpublished_staging_and_r
         store.event_fence().visible_tip().height,
         BlockHeight::new(5)
     );
+    assert!(source.chain_segment_requests.load(Ordering::SeqCst) > requests_before_restart);
     for height in 0_u32..=5 {
         assert!(matches!(
             store.tree_state_lookup(BlockHeight::new(height), &activations)?,
             Some(TreeStateLookup::Stored(_))
         ));
+        assert_eq!(
+            store
+                .tree_state_checkpoint_at(BlockHeight::new(height), &activations)?
+                .as_ref(),
+            Some(source.checkpoint_at(height)?),
+        );
     }
     Ok(())
 }
