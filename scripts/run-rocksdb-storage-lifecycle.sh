@@ -15,6 +15,7 @@ tip_height="${ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT:-}"
 cpu_limit_cores="${ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES:-10}"
 memory_limit_bytes="${ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES:-10737418240}"
 node_max_response_bytes="${ZINDER_NODE_MAX_RESPONSE_BYTES:-67108864}"
+canonical_publication_mode="${ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE:-trusted-fresh}"
 tree_state_checkpoint_coverage="${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-every-block}"
 
 fail() {
@@ -44,6 +45,8 @@ jq -en --argjson value "$cpu_limit_cores" '$value > 0' >/dev/null || fail \
   "ZINDER_NODE_MAX_RESPONSE_BYTES must be a positive integer"
 [[ "$tree_state_checkpoint_coverage" == "every-block" || "$tree_state_checkpoint_coverage" == "cadence-and-tip" ]] || fail \
   "ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE must be every-block or cadence-and-tip"
+[[ "$canonical_publication_mode" == "trusted-fresh" || "$canonical_publication_mode" == "cold-certified" ]] || fail \
+  "ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE must be trusted-fresh or cold-certified"
 docker_cpu_capacity="$(docker info --format '{{.NCPU}}')" || fail \
   "could not inspect Docker's CPU capacity"
 docker_memory_capacity_bytes="$(docker info --format '{{.MemTotal}}')" || fail \
@@ -121,6 +124,7 @@ export ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS="$storage_class"
 export ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES="$cpu_limit_cores"
 export ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES="$memory_limit_bytes"
 export ZINDER_NODE_MAX_RESPONSE_BYTES="$node_max_response_bytes"
+export ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE="$canonical_publication_mode"
 export ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE="$tree_state_checkpoint_coverage"
 export ZINDER_SOURCE_NETWORK_NAME="$source_network"
 export ZINDER_SOURCE_COOKIE_VOLUME_NAME="$source_cookie_volume"
@@ -138,6 +142,7 @@ jq -e \
   --argjson cpu_limit_cores "$cpu_limit_cores" \
   --arg memory_limit_bytes "$memory_limit_bytes" \
   --arg node_max_response_bytes "$node_max_response_bytes" \
+  --arg canonical_publication_mode "$canonical_publication_mode" \
   --arg tree_state_checkpoint_coverage "$tree_state_checkpoint_coverage" \
   --arg runner_id "$runner_id" \
   --arg storage_class "$storage_class" '
@@ -210,6 +215,7 @@ jq -e \
       and command_argument("--cpu-limit-cores") == $cpu_limit_cores_text
       and command_argument("--memory-limit-bytes") == $memory_limit_bytes
       and command_argument("--max-response-bytes") == $node_max_response_bytes
+      and command_argument("--canonical-publication-mode") == $canonical_publication_mode
       and command_argument("--tree-state-checkpoint-coverage") == $tree_state_checkpoint_coverage
       and command_argument("--runner-id") == $runner_id
       and command_argument("--storage-class") == $storage_class
@@ -262,7 +268,8 @@ find "$evidence_path" -mindepth 1 -maxdepth 1 -type f \
   "$memory_limit_bytes" \
   "$runner_id" \
   "$storage_class" \
-  "$tree_state_checkpoint_coverage"
+  "$tree_state_checkpoint_coverage" \
+  "$canonical_publication_mode"
 
 echo "RocksDB storage lifecycle passed"
 echo "report: $evidence_path/rocksdb-storage-lifecycle.json"

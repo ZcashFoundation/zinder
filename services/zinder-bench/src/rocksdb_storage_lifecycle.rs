@@ -12,9 +12,10 @@ use zinder_bench::{
     BenchError,
     report::{
         AcceptanceThresholds, BenchmarkReport, BenchmarkRunProvenance,
-        CanonicalBlockFactsSequenceDigestSummary, CanonicalStorageReadySummary, ReportProvenance,
-        RocksDbResourceBudgetSummary, RocksDbStorageLifecycleMeasurements, RunnerProvenance,
-        StorageLifecycleBlockId, StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
+        CanonicalBlockFactsSequenceDigestSummary, CanonicalPublicationMode,
+        CanonicalStorageReadySummary, ReportProvenance, RocksDbResourceBudgetSummary,
+        RocksDbStorageLifecycleMeasurements, RunnerProvenance, StorageLifecycleBlockId,
+        StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
         StorageLifecycleResourceLimits, StorageLifecycleSourceSummary, TreeStateCheckpointCoverage,
         WalletStorageConstructionEvidence, WalletStoragePhaseDurations, WalletStorageReadySummary,
         WalletStorageRowCounts, WalletStorageUtxoSummary, WalletVariableValueSortEvidence,
@@ -129,6 +130,9 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
         default_value_t = TreeStateCheckpointCoverage::EveryBlock
     )]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Canonical publication checks to include before READY.
+    #[arg(long, value_enum, default_value = "trusted-fresh")]
+    canonical_publication_mode: CanonicalPublicationMode,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -149,6 +153,7 @@ struct ValidatedLifecycleArgs {
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    canonical_publication_mode: CanonicalPublicationMode,
     canonical_storage_ready_thresholds: Option<AcceptanceThresholds>,
     wallet_storage_ready_thresholds: Option<AcceptanceThresholds>,
 }
@@ -268,13 +273,26 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let source_tip_checkpoint_authenticated =
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
-    let canonical_cold_validation_started = Instant::now();
-    let validated_canonical = canonical_load
-        .builder
-        .prepare_cold_certified_publication()?;
-    let canonical_cold_validation = canonical_cold_validation_started.elapsed();
-
-    let canonical_ready_publication_started = Instant::now();
+    let preparation_started = Instant::now();
+    let (validated_canonical, canonical_cold_validation, canonical_ready_publication_started) =
+        match validated.canonical_publication_mode {
+            CanonicalPublicationMode::TrustedFresh => (
+                canonical_load.builder.prepare_trusted_fresh_publication()?,
+                Duration::ZERO,
+                preparation_started,
+            ),
+            CanonicalPublicationMode::ColdCertified => {
+                let certified = canonical_load
+                    .builder
+                    .prepare_cold_certified_publication()?;
+                let publication_started = Instant::now();
+                (
+                    certified,
+                    publication_started - preparation_started,
+                    publication_started,
+                )
+            }
+        };
     let prepared_publication = validated_canonical.prepare_baseline(
         CanonicalBaselinePublication::new(settled_tip, UnixTimestampMillis::now()),
     )?;
@@ -427,6 +445,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
                 .get(),
             canonical_rocksdb: RocksDbResourceBudgetSummary::from(canonical_resource_budget),
             tree_state_checkpoint_coverage: actual_tree_state_checkpoint_coverage,
+            canonical_publication_mode: validated.canonical_publication_mode,
             wallet_rocksdb: RocksDbResourceBudgetSummary::from(wallet_resource_budget),
             supported_reorg_depth: validated.supported_reorg_depth,
             wallet_max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
@@ -533,6 +552,7 @@ impl RocksDbStorageLifecycleArgs {
             pipeline_limits,
             supported_reorg_depth: self.supported_reorg_depth,
             tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            canonical_publication_mode: self.canonical_publication_mode,
             canonical_storage_ready_thresholds: acceptance_thresholds(
                 self.canonical_storage_ready_target_seconds,
                 self.canonical_storage_ready_hard_limit_seconds,
@@ -937,6 +957,24 @@ mod tests {
         let mut invalid = required_args();
         invalid.extend(["--tree-state-checkpoint-coverage", "sparse"]);
         assert!(TestCli::try_parse_from(invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_publication_defaults_to_ingest_and_accepts_cold_certification()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(required_args())?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::TrustedFresh
+        );
+        let mut argv = required_args();
+        argv.extend(["--canonical-publication-mode", "cold-certified"]);
+        let cli = TestCli::try_parse_from(argv)?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::ColdCertified
+        );
         Ok(())
     }
 

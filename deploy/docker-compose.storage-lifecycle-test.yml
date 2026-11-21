@@ -101,6 +101,8 @@ services:
       - ${ZINDER_NODE_MAX_RESPONSE_BYTES:-67108864}
       - --supported-reorg-depth
       - ${ZINDER_SUPPORTED_REORG_DEPTH:-1000}
+      - --canonical-publication-mode
+      - ${ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE:-trusted-fresh}
       - --tree-state-checkpoint-coverage
       - ${ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE:-every-block}
       - --software-revision

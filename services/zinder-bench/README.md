@@ -184,6 +184,11 @@ still accepting archived v4 reports that omit both fields when no expected
 coverage is pinned). Diagnostic parameter sweeps belong to
 `rocksdb-canonical-fixture-replay`.
 
+By default, `--canonical-publication-mode trusted-fresh` uses the same
+prepublication checks as fresh ingest. Use `--canonical-publication-mode
+cold-certified` in a separate run to measure full certification. The report
+identifies the mode in `resource_limits.canonical_publication_mode`.
+
 The report exposes two independent acceptance measurements:
 
 - `canonical_storage_ready` covers source discovery, complete-history

@@ -1026,6 +1026,16 @@ pub struct StorageLifecycleContractSummary {
     pub wallet_value_encoding_version: u16,
 }
 
+/// Canonical publication checks included in the lifecycle measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum CanonicalPublicationMode {
+    /// Use the fresh writer's authenticated construction evidence, as ingest does.
+    TrustedFresh,
+    /// Independently certify the stored rows before publishing.
+    ColdCertified,
+}
+
 /// Exact source-pipeline and embedded-store ceilings used by one run.
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageLifecycleResourceLimits {
@@ -1049,6 +1059,8 @@ pub struct StorageLifecycleResourceLimits {
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
     /// Tree-state checkpoint coverage persisted during canonical construction.
     pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Publication path measured before canonical READY.
+    pub canonical_publication_mode: CanonicalPublicationMode,
     /// Wallet embedded-store resource budget.
     pub wallet_rocksdb: RocksDbResourceBudgetSummary,
     /// Retained wallet reorg depth.
@@ -1083,9 +1095,9 @@ pub struct StorageLifecyclePhaseDurations {
     pub canonical_store_initialization_seconds: f64,
     /// Canonical source fetch, preparation, SST ingestion, source-family load, and tip authentication.
     pub canonical_source_load_seconds: f64,
-    /// Canonical flush, cold reopen, and full semantic validation.
+    /// Canonical cold certification, including flush and reopen. Zero for trusted-fresh runs.
     pub canonical_cold_validation_seconds: f64,
-    /// Atomic epoch-1, event-1, and READY publication.
+    /// Atomic epoch-1, event-1, and READY publication, including any trusted-fresh preparation.
     pub canonical_ready_publication_seconds: f64,
     /// Independent cold admission before wallet construction.
     pub canonical_cold_reopen_seconds: f64,
@@ -1749,6 +1761,13 @@ impl RocksDbStorageLifecycleReport {
         {
             return Err(BenchError::report_format(
                 "storage lifecycle report contains an unowned acceptance boundary",
+            ));
+        }
+        if self.resource_limits.canonical_publication_mode == CanonicalPublicationMode::TrustedFresh
+            && self.phase_durations.canonical_cold_validation_seconds != 0.0
+        {
+            return Err(BenchError::report_format(
+                "trusted-fresh publication must report zero cold certification time",
             ));
         }
         let expected_checkpoint_count = self
@@ -2586,6 +2605,32 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
     }
 
     #[test]
+    fn trusted_fresh_lifecycle_rejects_cold_certification_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut measurements = rocksdb_storage_lifecycle_measurements(
+            super::TreeStateCheckpointCoverage::EveryBlock,
+            206,
+        );
+        measurements.resource_limits.canonical_publication_mode =
+            super::CanonicalPublicationMode::TrustedFresh;
+        assert!(
+            super::build_rocksdb_storage_lifecycle_report(measurements.clone())
+                .validate()
+                .is_err()
+        );
+        measurements
+            .phase_durations
+            .canonical_cold_validation_seconds = 0.0;
+        let report = super::build_rocksdb_storage_lifecycle_report(measurements);
+        report.validate()?;
+        assert_eq!(
+            serde_json::to_value(report)?["resource_limits"]["canonical_publication_mode"],
+            "trusted-fresh"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rocksdb_storage_lifecycle_report_validates_declared_coverage_and_rejects_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {
         let dense =
@@ -3185,6 +3230,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
                 canonical_rocksdb: budget,
                 tree_state_checkpoint_coverage,
+                canonical_publication_mode: super::CanonicalPublicationMode::ColdCertified,
                 wallet_rocksdb: budget,
                 supported_reorg_depth: 100,
                 wallet_max_outpoint_sort_memory_bytes: 4_096,

@@ -98,6 +98,14 @@ measure the sparse cadence-and-tip construction baseline instead. The chosen
 coverage is recorded in `resource_limits.tree_state_checkpoint_coverage` and
 cross-checked against `canonical_storage_ready.tree_state_checkpoint_count`.
 
+The default run publishes from the fresh writer's authenticated construction
+evidence, as ingest does. For a separate run that measures a full prepublication
+scan, set `ZINDER_STORAGE_LIFECYCLE_CANONICAL_PUBLICATION_MODE=cold-certified`.
+The report records this choice in `resource_limits.canonical_publication_mode`.
+For `trusted-fresh`, preparation counts toward `canonical_ready_publication_seconds`
+and `canonical_cold_validation_seconds` is zero. Both modes reopen the published
+store before the canonical storage-ready timer stops.
+
 ## State and cleanup
 
 Before each run, the runner checks the rendered Compose model. It refuses an
