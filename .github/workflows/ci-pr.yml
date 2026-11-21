@@ -208,6 +208,7 @@ jobs:
           python3 -B scripts/wallet-clients/test-audit-wallet-roundtrip.py
           python3 -B scripts/wallet-clients/test-roundtrip-regtest-command.py
           python3 -B scripts/wallet-clients/coverage_test.py
+          python3 -B scripts/wallet-clients/coverage.py check
 
       - name: Test storage benchmark contracts
         run: |
