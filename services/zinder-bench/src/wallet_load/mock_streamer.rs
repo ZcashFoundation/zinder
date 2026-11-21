@@ -124,6 +124,8 @@ pub(super) struct MockStreamer {
     /// `GetLatestBlock` calls, from the first, whose answer is one block
     /// above the previous call's, as if a block arrived between them.
     pub(super) tip_advancing_reads: u64,
+    /// Override the block hash or status after the first `GetLatestBlock` call.
+    pub(super) subsequent_tip: Option<Result<Vec<u8>, Code>>,
     /// `GetLatestBlock` calls answered so far.
     pub(super) latest_block_reads: Arc<AtomicU64>,
     /// Heights whose blocks include a compact Sapling output and advance the
@@ -188,6 +190,7 @@ impl MockStreamer {
             tip_height: 250,
             tip_advancing_reads: 0,
             latest_block_reads: Arc::default(),
+            subsequent_tip: None,
             shielded_heights: BTreeSet::new(),
             ironwood_heights: BTreeSet::new(),
             transparent_heights: BTreeSet::new(),
@@ -415,10 +418,12 @@ impl CompactTxStreamer for MockStreamer {
         self.requests.record_connection(&request);
         let reads = self.latest_block_reads.fetch_add(1, Ordering::Relaxed) + 1;
         let height = self.tip_height + reads.min(self.tip_advancing_reads);
-        Ok(Response::new(BlockId {
-            height,
-            hash: tip_hash(height),
-        }))
+        let hash = match (reads, &self.subsequent_tip) {
+            (1, _) | (_, None) => tip_hash(height),
+            (_, Some(Ok(hash))) => hash.clone(),
+            (_, Some(Err(code))) => return Err(Status::new(*code, "tip probe failed")),
+        };
+        Ok(Response::new(BlockId { height, hash }))
     }
 
     async fn get_block(&self, request: Request<BlockId>) -> Result<Response<CompactBlock>, Status> {

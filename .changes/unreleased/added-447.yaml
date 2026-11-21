@@ -1,5 +1,5 @@
 kind: added
-body: Wallet-load benchmark reports include a request identity digest so paired runs can verify that they fetched the same ranges, transactions, and tree states.
+body: Wallet-load benchmark reports record the tip before and after a run and a digest that preserves how reads were distributed across wallets. Operators can check the served tip and workload before comparing latency.
 time: 2026-11-21T16:24:50.550790954Z
 custom:
     Bump: minor

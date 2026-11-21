@@ -90,6 +90,40 @@ class BenchmarkCampaignTests(unittest.TestCase):
         self.assertEqual(self.read_json("failed/round-1/before/report.json"), {"blocks": 1})
         self.assertTrue((self.output / "failed/round-1/before/scratch").is_dir())
 
+    def test_each_arm_and_case_must_match_the_environment_at_both_boundaries(self):
+        self.campaign.update(repeats=1, environment={"hash": "pinned", "height": 42},
+                             expect_from_environment={"/start/hash": "hash", "/end/hash": "hash",
+                                                      "/start/height": "height", "/end/height": "height"})
+        tip = self.campaign["environment"]
+        for name, start, end in (
+            ("stable", tip, tip),
+            ("wrong-start", {**tip, "hash": "other"}, tip),
+            ("wrong-end", tip, {**tip, "hash": "other"}),
+            ("probe-error", tip, {"error": "unavailable"}),
+        ):
+            payload = json.dumps({"start": start, "end": end})
+            self.campaign["cases"][name] = {"command": [sys.executable, "-c", "import sys; print(sys.argv[1])", payload]}
+
+        self.run_campaign(1)
+        expected_problems = {
+            "stable": [],
+            "wrong-start": ["unexpected value at /start/hash"],
+            "wrong-end": ["unexpected value at /end/hash"],
+            "probe-error": ["report is missing /end/hash", "report is missing /end/height"],
+        }
+        for pair in self.read_json("summary.json"):
+            for run in pair["runs"].values():
+                self.assertEqual(run["problems"], expected_problems[pair["case"]])
+        self.assertEqual(self.read_json("provenance.json")["campaign"], self.campaign)
+
+    def test_case_cannot_override_an_unknown_or_conflicting_environment_binding(self):
+        self.campaign.update(environment={"hash": "pinned"}, expect_from_environment={"/tip": "missing"})
+        self.campaign["cases"]["range"] = {"command": [sys.executable, "-c", "pass"], "expect": {"/tip": "other"}}
+        self.assertIn("invalid environment expectation", self.run_campaign(2).stderr)
+        self.campaign["expect_from_environment"]["/tip"] = "hash"
+        self.assertIn("repeated expectations", self.run_campaign(2).stderr)
+        self.assertFalse(self.output.exists())
+
     def test_json_comparisons_distinguish_booleans_from_numbers(self):
         before = {"ready": True, "stats": {"calls": [False]}, "blocks": 1}
         after = {"ready": 1, "stats": {"calls": [0]}, "blocks": 1.0}
