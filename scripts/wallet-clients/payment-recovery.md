@@ -21,7 +21,7 @@ Prepare the [wallet executables, Python descriptors, and isolated fixture inputs
 
 To repeat one case, replace `campaign` with `disconnect` or `rollback`, supply one `--port-base`, and choose a new output directory. The runner retains a receipt for each case and a campaign summary.
 
-Fixture startup has a 600-second deadline and teardown has a 180-second deadline. If either expires, the runner stops the operator and its Compose subprocesses before continuing cleanup. If Zallet fails to shut down, the runner verifies the daemon’s identity, sends it SIGTERM, and escalates to SIGKILL if it is still running. The case records a failure and finishes wallet cleanup before removing the fixture.
+Fixture startup has a 600-second deadline and teardown has a 180-second deadline. If either expires, the runner stops the operator and its Compose subprocesses before continuing cleanup. When rollback requires a node restart, each Docker lookup used to rebuild the relay has a 10-second timeout. The operator verifies the relay’s owner and waits up to five seconds after each shutdown signal. If Zallet fails to shut down, the runner verifies the daemon’s identity, sends it SIGTERM, and escalates to SIGKILL if it is still running. The case records a failure and finishes wallet cleanup before removing the fixture.
 
 The campaign gives each case 7,200 seconds by default. Set `--case-timeout` and `--case-grace` in seconds to change the deadline and the time allowed for graceful shutdown. On timeout the supervisor stops the case, checks its wallet, relay, and Docker project, and records the outcome in the case’s `supervision.json`. It skips the remaining case after a timeout or interruption. Keep that file beside a supervised `receipt.json` for coverage import. A passing campaign case requires cooperative exit, a matching receipt digest, and verified teardown.
 
@@ -33,7 +33,7 @@ The receipt records fixture removal. Keep wallet state, node logs, and the signe
 
 ## Compare release coverage
 
-Import the three case receipts from the selected release. Each receipt must identify the wallet executables and harness files before the run and after teardown. Older experimental receipts without those checks remain available as raw observations. The collector projects a row for each affected wallet. For the transport outage it projects only Zallet, since Zingo kept its independent lightwalletd route.
+Import the three case receipts from the selected release. Each case records hashes before startup and after teardown for both wallet executables, the recovery scripts and their imported project modules, the fixture supervisor and relay, the Compose and activation configuration, and the four generated protocol modules used to verify the serving endpoints. Coverage import requires those hashes even for a standalone case and checks the activation configuration against the fixture receipt. Older experimental receipts without those checks remain available as raw observations. The collector projects a row for each affected wallet. For the transport outage it projects only Zallet, since Zingo kept its independent lightwalletd route.
 
 ```bash
 "$wallet_python" -B scripts/wallet-clients/coverage.py collect --release "$release_tag" \

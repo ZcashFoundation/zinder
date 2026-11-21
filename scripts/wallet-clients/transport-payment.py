@@ -336,13 +336,7 @@ class Transport(RECOVERY.Recovery):
 
     def close_wallets(self):
         try:
-            if self.direct_native is not None and self.route_process is None:
-                try:
-                    self.start_route()
-                finally:
-                    super().close_wallets()
-            else:
-                super().close_wallets()
+            super().close_wallets()
         finally:
             if self.route_process is not None:
                 self.stop_route()

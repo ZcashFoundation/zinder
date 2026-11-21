@@ -11,6 +11,7 @@ and persistence across wallet process restarts.
 import argparse
 from contextlib import ExitStack
 from hashlib import sha256
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -75,7 +76,13 @@ HARNESS_SOURCES = (
     CLIENTS / "roundtrip_fixture.py",
     CLIENTS / "roundtrip_wallets.py",
     CLIENTS / "wallet_fixture.py",
+    CLIENTS / "coverage_roundtrip.py",
+    CLIENTS / "coverage_evidence.py",
+    SCRIPTS.parent / "deploy/docker-compose.yml",
+    NODE_CONFIG,
 )
+PROTO_MODULES = ("compact_formats_pb2", "service_pb2", "zinder.v1.wallet.wallet_pb2",
+                 "zinder.v1.ops.server_info_pb2")
 
 
 require = RUNNER["require"]
@@ -382,7 +389,7 @@ class Recovery:
         return project_resource_count(self.project)
 
     def harness_sources(self):
-        return HARNESS_SOURCES
+        return (*HARNESS_SOURCES, *(Path(import_module(name).__file__) for name in PROTO_MODULES))
 
     def wallet_inputs(self):
         return (("zingo", self.args.zingo), ("zallet_backend", self.args.zallet_backend))

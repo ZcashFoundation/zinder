@@ -53,11 +53,15 @@ def base(case):
                "image_ids": dict.fromkeys(BINARIES, NODE_IMAGE), "project": f"disposable-{case}"}
     anchor = fixture["anchor"]
     sources = ["payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
-               "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"]
+               "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py",
+               "run-wallet-roundtrip-regtest.py", "coverage_roundtrip.py", "coverage_evidence.py",
+               "docker-compose.yml", "regtest-nu6-at-one.toml", "service_pb2.py", "compact_formats_pb2.py",
+               "wallet_pb2.py", "server_info_pb2.py"]
     if case == "transport":
         sources.append("transport-payment.py")
     pins = {"wallets": {"zingo": ZINGO, "zallet_backend": ZALLET},
             "harness": {name: token(name) for name in sources}}
+    pins["harness"]["regtest-nu6-at-one.toml"] = SCHEDULE
     return {
         "schema_version": 1, "case": case, "status": "passed", "network": "zcash-regtest",
         "fixture": fixture, "pins": {"pre": copy.deepcopy(pins), "post": pins},
@@ -233,6 +237,25 @@ class RecoveryImport(unittest.TestCase):
                 sidecar.write_text(json.dumps(record | edit))
                 with self.assertRaises(ValueError):
                     self.rows(case)
+
+    def test_standalone_receipts_require_every_shared_runtime_input(self):
+        for case, original in self.receipts.items():
+            for name in original["pins"]["pre"]["harness"]:
+                with self.subTest(case=case, name=name):
+                    receipt = copy.deepcopy(original)
+                    for snapshot in receipt["pins"].values():
+                        del snapshot["harness"][name]
+                    self.write(case, receipt)
+                    with self.assertRaisesRegex(ValueError, "incomplete recovery harness pins"):
+                        self.rows(case)
+
+    def test_pinned_config_must_match_the_fixture_schedule(self):
+        for case, receipt in self.receipts.items():
+            for snapshot in receipt["pins"].values():
+                snapshot["harness"]["regtest-nu6-at-one.toml"] = token("other schedule")
+            self.write(case, receipt)
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, "different activation schedule"):
+                self.rows(case)
 
     def test_incomplete_or_changed_input_pins_cannot_qualify(self):
         def remove_source(receipt):

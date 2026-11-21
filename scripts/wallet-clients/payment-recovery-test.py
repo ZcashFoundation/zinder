@@ -832,6 +832,54 @@ class CampaignSupervision(unittest.TestCase):
                 time.sleep(.02)
             self.assertFalse(process_alive(pid))
 
+    def test_relay_lookup_timeout_reaps_the_docker_process(self):
+        operator = runpy.run_path(str(M["SCRIPTS"] / "regtest-fixture.py"))
+        start = operator["start_relay"]
+        docker = self.scratch / "docker"
+        pidfile = self.scratch / "lookup.pid"
+        docker.write_text(f"#!{sys.executable}\n"
+                          "import os, time\nfrom pathlib import Path\n"
+                          f"Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                          "time.sleep(60)\n")
+        docker.chmod(0o700)
+        state = {"project": "fixture", "owner": "case", "port_base": 22000}
+        with patch.dict(os.environ, PATH=str(self.scratch)), patch.dict(
+                start.__globals__, RELAY_DOCKER_TIMEOUT=.4):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                start(self.scratch, state)
+        self.assertFalse(process_alive(int(pidfile.read_text())))
+        self.assertNotIn("relay_pid", state)
+
+    def test_fixture_relay_shutdown_escalates_only_for_the_exact_owner(self):
+        operator = runpy.run_path(str(M["SCRIPTS"] / "regtest-fixture.py"))
+        stop = operator["stop_relay"]
+        script = self.scratch / "scripts/regtest-fixture-relay.py"
+        script.parent.mkdir()
+        script.write_text("import signal, sys, time\nfrom pathlib import Path\n"
+                          "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                          "Path(sys.argv[1]).with_suffix('.' + sys.argv[2]).touch()\n"
+                          "time.sleep(60)\n")
+        route = self.scratch / "relay.json"
+        children = []
+        try:
+            for owner in ("case", "sibling"):
+                children.append(subprocess.Popen([sys.executable, str(script), str(route), owner]))
+                deadline = time.monotonic() + 5
+                while not route.with_suffix("." + owner).exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+            child, sibling = children
+            with patch.dict(stop.__globals__, RELAY_STOP_GRACE=.15):
+                stop(self.scratch, {"relay_pid": sibling.pid, "owner": "case"})
+                stop(self.scratch, {"relay_pid": child.pid, "owner": "case"})
+            self.assertFalse(process_alive(child.pid))
+            self.assertIsNone(sibling.poll())
+        finally:
+            for proc in children:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=2)
+
     def test_fixture_timeouts_stop_the_operator_and_its_compose_child(self):
         fixture = self.scratch / "regtest-fixture.py"
         fixture.write_text(

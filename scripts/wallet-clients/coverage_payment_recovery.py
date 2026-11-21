@@ -88,12 +88,15 @@ def receipt(result, release, case):
             "wallet pins differ from the receipt")
     harness = pins["pre"]["harness"]
     required = {"payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
-                "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"}
-    if "supervised_project" in result:
-        required.add("run-wallet-roundtrip-regtest.py")
+                "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py",
+                "run-wallet-roundtrip-regtest.py", "coverage_roundtrip.py", "coverage_evidence.py",
+                "docker-compose.yml", "regtest-nu6-at-one.toml", "compact_formats_pb2.py", "service_pb2.py",
+                "wallet_pb2.py", "server_info_pb2.py"}
     if case == "transport":
         required.add("transport-payment.py")
     require(required <= harness.keys(), "incomplete recovery harness pins")
+    require(harness["regtest-nu6-at-one.toml"] == fixture["activation_schedule_sha256"],
+            "recovery fixture used a different activation schedule")
     for name, value in harness.items():
         token(value, name)
     identities = clients["wallet_identity_sha256"]

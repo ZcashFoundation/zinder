@@ -39,9 +39,22 @@ class TransportMemoTests(unittest.TestCase):
             tool.memo_evidence(["arbitrary-decrypted-note"], tool.MEMO_OUTBOUND)
 
 
+class TransportCleanupTests(unittest.TestCase):
+    def test_offline_teardown_closes_wallet_without_restoring_route(self):
+        case = object.__new__(tool.Transport)
+        case.direct_native, case.route_process = "http://127.0.0.1:32002", None
+        with patch.object(case, "start_route", side_effect=AssertionError("unexpected relay startup")), \
+             patch.object(tool.RECOVERY.Recovery, "close_wallets") as close:
+            case.close_wallets()
+            close.assert_called_once_with()
+
+
 class TransportHarnessPinTests(unittest.TestCase):
     def test_transport_pins_both_recovery_and_transport_sources(self):
-        sources = object.__new__(tool.Transport).harness_sources()
+        def module(name):
+            return type("Module", (), {"__file__": name.split(".")[-1] + ".py"})
+        with patch.object(tool.RECOVERY, "import_module", side_effect=module):
+            sources = object.__new__(tool.Transport).harness_sources()
         names = {Path(source).name for source in sources}
         self.assertIn("payment-recovery.py", names)
         self.assertIn("transport-payment.py", names)
