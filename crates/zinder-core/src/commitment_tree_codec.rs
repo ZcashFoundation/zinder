@@ -1526,6 +1526,9 @@ mod tests {
 
     #[test]
     fn accumulator_appends_known_commitments_with_protocol_root_order() -> TestResult {
+        if let Some(expected) = std::env::var_os("ZINDER_TEST_EXPECT_PASTA_BACKEND") {
+            assert_eq!(expected, pasta_curves::BACKEND);
+        }
         let activations = pool_activations(1, 1, 1)?;
         let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
             BlockHeight::new(0),

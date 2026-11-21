@@ -24,6 +24,7 @@ hyper-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
+pasta_curves.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 secrecy.workspace = true
@@ -51,6 +52,10 @@ zinder-store.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["param"] }
 tikv-jemallocator.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid.workspace = true
+x86_64.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }

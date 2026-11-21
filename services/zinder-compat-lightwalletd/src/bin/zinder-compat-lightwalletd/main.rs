@@ -16,8 +16,9 @@ use zinder_compat_lightwalletd::{
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
-    TracingSubscriberError, install_metrics_recorder_for_service, install_tracing_subscriber,
-    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    TracingSubscriberError, host_cpu_meets_compiled_baseline,
+    host_cpu_meets_pasta_backend_baseline, install_metrics_recorder_for_service,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
@@ -107,6 +108,13 @@ async fn main() -> ExitCode {
     }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
+    }
+
+    if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+    if !host_cpu_meets_pasta_backend_baseline() {
+        return ExitCode::FAILURE;
     }
 
     if cli.print_config {

@@ -20,7 +20,8 @@ use zinder_runtime::{
     ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
     ReadinessInput, ReadinessState, RuntimeService, StartupPhase, SupervisedRuntime,
     SupervisedTasks, TracingSubscriberError, host_cpu_meets_compiled_baseline,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    host_cpu_meets_pasta_backend_baseline, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
@@ -100,6 +101,10 @@ async fn main() -> ExitCode {
     }
 
     if !host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+
+    if !host_cpu_meets_pasta_backend_baseline() {
         return ExitCode::FAILURE;
     }
 

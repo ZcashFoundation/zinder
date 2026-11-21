@@ -1,0 +1,6 @@
+kind: added
+body: Operators can opt in to a faster Pasta field-arithmetic backend at build time (`--build-arg ZINDER_PASTA_ASM=1`, or `--features pasta_curves/asm`). The x86-64 backend needs BMI2 and ADX and the binaries refuse to start on a host that lacks ADX instead of crashing; the default build keeps the portable backend.
+time: 2026-11-21T16:49:43.675300905Z
+custom:
+    Bump: minor
+    PR: "452"
