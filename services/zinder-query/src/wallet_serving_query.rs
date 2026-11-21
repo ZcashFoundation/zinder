@@ -662,6 +662,15 @@ where
     Broadcaster: TransactionBroadcaster + Clone,
     NativeIngest: Send + Sync + 'static,
 {
+    fn compact_block_fence(
+        &self,
+        epoch: ChainEpoch,
+    ) -> Option<(zinder_store::CanonicalEventFence, CanonicalHistoryBounds)> {
+        let pair = self.serving_pair_slot.capture_at(Some(epoch.id));
+        (pair.chain_epoch() == epoch)
+            .then(|| (pair.canonical_fence(), pair.canonical().history_bounds()))
+    }
+
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
     }

@@ -176,7 +176,8 @@ async fn generated_wallet_clients_cross_the_published_boundary_in_both_direction
     let segment = store
         .publish(&dir.path().join("shielded"), SEALED_END)
         .await?;
-    let recorder = EpochPinRecorder::new(store.query.clone());
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(
             LightwalletdGrpcAdapter::new(recorder.clone())
@@ -205,8 +206,10 @@ async fn generated_wallet_clients_cross_the_published_boundary_in_both_direction
         assert_eq!(wallet.blocks(req.clone()).await?, expected);
         assert_eq!(blocks_only.blocks(req).await?, expected);
     }
-    let suffix = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
-    assert_eq!(recorder.recorded_compact_block_ranges(), vec![suffix; 2]);
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        [] as [BlockHeightRange; 0]
+    );
 
     check_other_wallet_calls(&mut wallet, &mut stock, &mut blocks_only).await
 }

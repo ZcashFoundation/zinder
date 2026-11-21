@@ -349,3 +349,52 @@ fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Resul
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> Result<()> {
+    use zinder_store::HeightOrder;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let extension = chain.clone().extend_blocks(2);
+    let fork = extension.fork_at(BlockHeight::new(6))?.extend_blocks(3);
+    let fixture = Fixture::new()?;
+    let (_old, initial) = reader(&chain)?;
+    let (_new, extended) = reader(&extension)?;
+    let (_fork, replacement) = reader(&fork)?;
+    assert!(fixture.publisher()?.publish_next(&initial)?);
+    let catalog = fixture.catalog(None)?;
+    let mut retained = None;
+    for source in [&initial, &extended, &replacement] {
+        catalog.refresh_tail(source).await?;
+        let tail = catalog
+            .tail
+            .load_full()
+            .ok_or_else(|| eyre!("missing tail"))?;
+        let span = tail.bounds().ok_or_else(|| eyre!("empty tail"))?;
+        assert_eq!(span.start, BlockHeight::new(3));
+        assert_eq!(span.end, source.chain_epoch().visible_tip_height);
+        let rows = tail.select(span, HeightOrder::Ascending, usize::MAX, true);
+        for row in &rows {
+            let block = source
+                .compact_blocks_in_range(BlockHeightRange::inclusive(row.id.height, row.id.height))
+                .await?
+                .pop()
+                .ok_or_else(|| eyre!("missing canonical block"))?;
+            let canonical =
+                crate::compact_block_messages::CompactBlockShape::for_range(&[])?.message(block)?;
+            assert_eq!(
+                row.payload.as_ref(),
+                prost::Message::encode_to_vec(&canonical)
+            );
+        }
+        if let Some(prior) = &retained {
+            let prior: &prost::bytes::Bytes = prior;
+            assert_eq!(prior.as_ptr(), rows[0].payload.as_ptr());
+        }
+        retained = Some(rows[0].payload.clone());
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            assert_eq!(tail.select(span, order, 0, true).len(), 1);
+            assert!(tail.select(span, order, 0, false).is_empty());
+        }
+    }
+    Ok(())
+}

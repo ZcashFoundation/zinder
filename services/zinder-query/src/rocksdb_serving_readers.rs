@@ -212,6 +212,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
             .await
     }
 
+    async fn compact_block_rows_with_lengths(
+        &self,
+        range: BlockHeightRange,
+        max_bytes: usize,
+    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
+        self.read(move |secondary| secondary.compact_block_rows_with_lengths(range, max_bytes))
+            .await
+    }
+
     async fn block_blob_at(
         &self,
         height: BlockHeight,

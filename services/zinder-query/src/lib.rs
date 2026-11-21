@@ -102,6 +102,18 @@ pub use wallet_serving_query::WalletServingQuery;
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
+    /// Returns the canonical fence and retention bounds for a locally admitted epoch.
+    /// Adapters can use this identity to reuse derived compact-block bytes.
+    fn compact_block_fence(
+        &self,
+        _epoch: ChainEpoch,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;

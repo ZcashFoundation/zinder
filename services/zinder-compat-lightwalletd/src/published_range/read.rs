@@ -82,12 +82,107 @@ impl PublishedRangeRead {
         }
     }
 
+    fn encoded_span(
+        &self,
+        chunk: BlockHeightRange,
+        order: zinder_store::HeightOrder,
+        tail: &super::tail::EncodedTail,
+    ) -> (BlockHeightRange, bool) {
+        use zinder_store::HeightOrder;
+        let catalog = self.history.bounds();
+        let start = match order {
+            HeightOrder::Ascending => chunk.start,
+            HeightOrder::Descending => chunk.end,
+        };
+        let mut spans = vec![catalog];
+        if let Some(live) = tail.bounds() {
+            if catalog.end.next().is_some_and(|next| next >= live.start) {
+                spans[0].end = catalog.end.max(live.end);
+            } else {
+                spans.push(live);
+            }
+        }
+        let mut span = chunk;
+        for covered in spans {
+            if (covered.start..=covered.end).contains(&start) {
+                span.start = span.start.max(covered.start);
+                span.end = span.end.min(covered.end);
+                return (span, true);
+            }
+            match order {
+                HeightOrder::Ascending if covered.start > start => {
+                    span.end = span.end.min(BlockHeight::new(covered.start.value() - 1));
+                }
+                HeightOrder::Descending if covered.end < start => {
+                    span.start = span.start.max(BlockHeight::new(covered.end.value() + 1));
+                }
+                HeightOrder::Ascending | HeightOrder::Descending => {}
+            }
+        }
+        (span, false)
+    }
+
+    fn encoded_rows(
+        &self,
+        span: BlockHeightRange,
+        order: zinder_store::HeightOrder,
+        max_bytes: usize,
+        tail: Option<&super::tail::EncodedTail>,
+    ) -> std::io::Result<Vec<SealedBlock>> {
+        use zinder_store::HeightOrder;
+        let end = self.history.bounds().end;
+        if span.end <= end {
+            return self.history.read_chunk(span, order, max_bytes);
+        }
+        let tail = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
+        if span.start > end {
+            return Ok(tail.select(span, order, max_bytes, true));
+        }
+        let prefix = BlockHeightRange::inclusive(span.start, end);
+        let suffix = BlockHeightRange::inclusive(BlockHeight::new(end.value() + 1), span.end);
+        let (mut first, first_span) = match order {
+            HeightOrder::Ascending => (self.history.read_chunk(prefix, order, max_bytes)?, prefix),
+            HeightOrder::Descending => (tail.select(suffix, order, max_bytes, true), suffix),
+        };
+        let room = first.iter().fold(max_bytes, |budget, row| {
+            budget.saturating_sub(row.native_bytes)
+        });
+        if room == 0
+            || first.len() as u64
+                != u64::from(first_span.end.value() - first_span.start.value()) + 1
+        {
+            return Ok(first);
+        }
+        match order {
+            HeightOrder::Ascending => first.extend(tail.select(suffix, order, room, false)),
+            HeightOrder::Descending => {
+                let mut earlier = self.history.read_chunk(prefix, order, room)?;
+                if earlier.last().is_some_and(|row| row.native_bytes > room) {
+                    earlier.clear();
+                }
+                earlier.append(&mut first);
+                first = earlier;
+            }
+        }
+        Ok(first)
+    }
+
     fn covers_selected_history(&self, chunk: BlockHeightRange) -> bool {
         let coverage = self.history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
             && CompactBlockShape::for_range(&[]).ok() == Some(self.shape)
     }
+}
+
+fn pin_unavailable(status: &Status) -> bool {
+    status
+        .get_error_details()
+        .error_info()
+        .is_some_and(|detail| {
+            detail.domain == ZINDER_ERROR_DOMAIN
+                && detail.reason == ErrorReason::ChainEpochPinUnavailable.as_str_name()
+        })
 }
 
 fn task_failure(error: &tokio::task::JoinError) -> ChunkReadFailure {
@@ -133,17 +228,17 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     async fn read<Output, Convert>(
         &self,
         reads: &Reads,
-        read: ChunkRead<Reads::View>,
+        mut read: ChunkRead<Reads::View>,
         convert: Convert,
     ) -> ChunkReadOutcome<Output>
     where
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
     {
-        if !self.covers_selected_history(read.chunk) {
+        if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
             return native_chunk(reads, read, convert).await;
         }
-        let (epoch, started, anchor) = {
+        let (epoch, started, anchor, tail) = {
             let current;
             let view = match &read.view {
                 ChunkView::Captured(view) => view,
@@ -163,27 +258,32 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             }
             let started = Instant::now();
             // A replacement with the same settled tip can have a higher retention floor.
-            let anchor = if reads.block_hash_at(view, read.chunk.start).await.is_ok() {
+            let tail = self.history.tail.load_full().filter(|tail| {
+                tail.epoch == epoch
+                    && reads.range_fence(view) == Some(tail.fence)
+                    && read.chunk.start >= tail.fence.1.first_available_height()
+            });
+            let anchor = if let Some(live) = &tail {
+                let (span, encoded) = self.encoded_span(read.chunk, read.order, live);
+                read.chunk = span;
+                if !encoded {
+                    return native_chunk(reads, read, convert).await;
+                }
+                Some(Ok(()))
+            } else if self.covers_selected_history(read.chunk)
+                && reads.block_hash_at(view, read.chunk.start).await.is_ok()
+            {
                 Some(self.history.terminal().check_view(reads, view).await)
             } else {
                 None
             };
-            (epoch, started, anchor)
+            (epoch, started, anchor, tail)
         };
         match anchor {
             Some(Ok(())) => {}
             None => return native_chunk(reads, read, convert).await,
             Some(Err(status)) => {
-                if matches!(read.view, ChunkView::Current)
-                    && status
-                        .get_error_details()
-                        .error_info()
-                        .is_some_and(|detail| {
-                            detail.domain == ZINDER_ERROR_DOMAIN
-                                && detail.reason
-                                    == ErrorReason::ChainEpochPinUnavailable.as_str_name()
-                        })
-                {
+                if matches!(read.view, ChunkView::Current) && pin_unavailable(&status) {
                     return native_chunk(reads, read, convert).await;
                 }
                 return ChunkReadOutcome {
@@ -193,9 +293,9 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             }
         }
         drop(read.view);
-        let history = self.history.clone();
+        let source = self.clone();
         tokio::task::spawn_blocking(move || {
-            let rows = history.read_chunk(read.chunk, read.order, read.max_bytes);
+            let rows = source.encoded_rows(read.chunk, read.order, read.max_bytes, tail.as_deref());
             let read_duration = Some(started.elapsed());
             let converted = rows
                 .map(|rows| convert(epoch, rows.into_iter().map(Into::into).collect()))

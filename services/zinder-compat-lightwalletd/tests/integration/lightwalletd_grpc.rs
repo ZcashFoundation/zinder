@@ -3007,6 +3007,7 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 /// is stricter than production retention and needs no clock.
 #[derive(Clone)]
 struct EpochPinRecorder<Inner> {
+    expose_range_fence: bool,
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
@@ -3062,6 +3063,7 @@ impl<Inner> EpochPinRecorder<Inner> {
     fn new(inner: Inner) -> Self {
         Self {
             inner,
+            expose_range_fence: false,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             offered_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
@@ -3386,6 +3388,20 @@ impl SyntheticView {
 
 #[async_trait]
 impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
+    fn compact_block_fence(
+        &self,
+        epoch: zinder_core::ChainEpoch,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        if self.expose_range_fence {
+            self.inner.compact_block_fence(epoch)
+        } else {
+            None
+        }
+    }
+
     fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
         self.inner.native_endpoint_capabilities()
     }

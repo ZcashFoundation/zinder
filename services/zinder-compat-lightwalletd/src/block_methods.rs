@@ -127,6 +127,16 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// Returns the chain epoch `view` reads.
     fn view_chain_epoch(view: &Self::View) -> ChainEpoch;
 
+    fn range_fence(
+        &self,
+        _view: &Self::View,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        None
+    }
+
     /// Returns the network-upgrade activations the canonical writer admitted
     /// with `view` or with a newer view.
     fn view_activations(

@@ -47,12 +47,21 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         catalog.verify_source(source).await?;
+        if let Err(status) = catalog.refresh_tail(source).await {
+            tracing::warn!(%status, "serving the uncovered tail from canonical storage");
+        }
         Ok(Self {
             current: ArcSwap::from_pointee(catalog),
             manifest: manifest.to_owned(),
             key,
             require_fs_verity,
         })
+    }
+
+    /// Refreshes the default shielded live tail against a captured canonical view.
+    /// An incomplete or displaced refresh keeps the previous fence available.
+    pub async fn refresh_tail(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
+        self.catalog().refresh_tail(source).await
     }
 
     pub(crate) fn catalog(&self) -> Arc<PublishedShieldedCatalog> {
@@ -83,9 +92,11 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if candidate.segments().len() == current.segments().len() {
+            current.refresh_tail(source).await?;
             return Ok(false);
         }
         candidate.verify_source(source).await?;
+        candidate.refresh_tail(source).await?;
         let displaced = self.current.compare_and_swap(&current, Arc::new(candidate));
         Ok(Arc::ptr_eq(&current, &displaced))
     }
