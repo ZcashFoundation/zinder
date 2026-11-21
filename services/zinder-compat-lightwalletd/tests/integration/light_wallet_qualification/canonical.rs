@@ -716,7 +716,16 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
     // Handle::block_on drives the calls and RocksDB's blocking pool. Spawned replay
     // tasks wait for Runtime::block_on, keeping every admitted permit occupied.
     runtime.handle().block_on(async {
-        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(24);
+        let slots = std::thread::available_parallelism()?.get();
+        let heights = (17_u32..)
+            .filter(|height| !height.is_multiple_of(zinder_store::TREE_STATE_CHECKPOINT_STRIDE))
+            .take(slots + 1)
+            .collect::<Vec<_>>();
+        let tip = heights
+            .last()
+            .ok_or_else(|| eyre!("missing replay height"))?
+            + 1;
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(tip);
         let fixture = Fixture::from_chain(
             &chain,
             &sample_regtest_upgrade_activations(),
@@ -734,11 +743,11 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
             Duration::ZERO,
             NonZeroU32::MIN,
         );
-        let slots = std::thread::available_parallelism()?.get();
-        let mut calls = (0..=slots)
-            .map(|_| {
+        let mut calls = heights
+            .into_iter()
+            .map(|height| {
                 adapter.get_tree_state(Request::new(lightwalletd::BlockId {
-                    height: 17,
+                    height: u64::from(height),
                     hash: Vec::new(),
                 }))
             })
@@ -762,7 +771,7 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
             .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
             .await?
             .into_inner();
-        assert_eq!(latest.height, 24);
+        assert_eq!(latest.height, u64::from(tip));
         Ok(())
     })
 }

@@ -306,6 +306,24 @@ impl CanonicalReader for RocksDbCanonicalReader {
         .await
     }
 
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        let secondary = Arc::clone(&self.secondary);
+        off_reactor(move || {
+            secondary
+                .replay_tree_state_until_cancelled(
+                    &replay,
+                    admitted_activations(&secondary)?,
+                    || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .map_err(canonical_read_error)
+        })
+        .await
+    }
+
     async fn subtree_roots(
         &self,
         range: SubtreeRootRange,

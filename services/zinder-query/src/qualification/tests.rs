@@ -62,7 +62,9 @@ async fn queued_replay_releases_the_generation_and_rejects_a_replaced_block() ->
         }
     })
     .await?;
-    let refused = query.tree_state(Arc::clone(&old), Some(height)).await;
+    let refused = query
+        .tree_state(Arc::clone(&old), Some(BlockHeight::new(16)))
+        .await;
     assert!(
         matches!(refused, Err(QueryError::TreeStateReplayLimitReached { .. })),
         "{refused:?}"
@@ -126,7 +128,7 @@ async fn tree_state_metrics_count_each_height_read_from_its_served_outcome() -> 
         r#"zinder_query_tree_state_replayed_commitments_count{pool="orchard",height_band="0"} 3"#,
         r#"zinder_query_tree_state_replayed_commitments_count{pool="ironwood",height_band="0"} 3"#,
         r#"zinder_query_tree_state_replay_duration_seconds_count{height_band="0"} 1"#,
-        "zinder_query_tree_state_replay_admissions_total 2",
+        "zinder_query_tree_state_replay_admissions_total 1",
     ] {
         assert!(
             rendered.lines().any(|line| line == expected),

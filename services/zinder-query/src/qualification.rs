@@ -12,9 +12,7 @@ use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup};
 use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
-    tree_state_replay_limit::{
-        TreeStateReplayLimit, record_stored_tree_state_read, replay_holding_slot,
-    },
+    tree_state_replay_limit::{ReplayKey, TreeStateReplayLimit, record_stored_tree_state_read},
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
 
@@ -85,7 +83,7 @@ impl QualificationWalletQuery {
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
     pub async fn tree_state(
         &self,
-        reader: Arc<RocksDbCanonicalReader>,
+        mut reader: Arc<RocksDbCanonicalReader>,
         height: Option<BlockHeight>,
     ) -> Result<TreeState, QueryError> {
         let epoch = reader.chain_epoch();
@@ -100,36 +98,59 @@ impl QualificationWalletQuery {
                 })?;
             return Ok(tree_state_response(epoch, checkpoint));
         };
-        let lookup = reader
-            .tree_state_lookup(height)
-            .await
-            .map_err(QueryError::canonical_read)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let replay = match lookup {
-            TreeStateLookup::Stored(state) => {
-                record_stored_tree_state_read(height, &state);
-                return Ok(tree_state_response(epoch, state));
+        loop {
+            let epoch = reader.chain_epoch();
+            let key = ReplayKey::new(height, reader.as_ref());
+            let lookup = reader
+                .tree_state_lookup(height)
+                .await
+                .map_err(QueryError::canonical_read)?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            let replay = match lookup {
+                TreeStateLookup::Stored(state) => {
+                    record_stored_tree_state_read(height, &state);
+                    return Ok(tree_state_response(epoch, state));
+                }
+                TreeStateLookup::Replay(replay) => replay,
+            };
+            let block = reader
+                .block_header_at(height)
+                .await
+                .map_err(QueryError::canonical_read)?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            let expected = BlockId::new(height, block.block_hash);
+            drop(reader);
+            let flight = self.replays.flight(key);
+            if let Some(state) = flight.cached() {
+                let current = (self.capture)();
+                if !retains_block(&current, epoch, expected).await? {
+                    return Err(QueryError::BlockNotInBestChain);
+                }
+                if ReplayKey::new(height, current.as_ref()) == key {
+                    crate::tree_state_replay_limit::record_cached_tree_state_read(height, &state);
+                    return Ok(tree_state_response(epoch, state));
+                }
+                reader = current;
+                continue;
             }
-            TreeStateLookup::Replay(replay) => replay,
-        };
-        let block = reader
-            .block_header_at(height)
-            .await
-            .map_err(QueryError::canonical_read)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let expected = BlockId::new(height, block.block_hash);
-        drop(reader);
-        let replay_slot = Arc::new(self.replays.admit().await?);
-        let reader = (self.capture)();
-        let replay_epoch = reader.chain_epoch();
-        if !retains_block(&reader, epoch, expected).await? {
-            return Err(QueryError::BlockNotInBestChain);
+            let replay_slot = flight.admit(&self.replays).await?;
+            reader = (self.capture)();
+            let replay_epoch = reader.chain_epoch();
+            if !retains_block(&reader, epoch, expected).await? {
+                return Err(QueryError::BlockNotInBestChain);
+            }
+            if ReplayKey::new(height, reader.as_ref()) != key {
+                continue;
+            }
+            return flight
+                .replay(replay_slot, |cancelled| async move {
+                    reader
+                        .replay_tree_state_until_cancelled(replay, cancelled)
+                        .await
+                })
+                .await
+                .map(|state| tree_state_response(replay_epoch, state));
         }
-        replay_holding_slot(height, replay_slot, async move {
-            reader.replay_tree_state(replay).await
-        })
-        .await
-        .map(|state| tree_state_response(replay_epoch, state))
     }
 
     /// Returns the completed roots in one bounded page as of the captured epoch, while its tip remains canonical.

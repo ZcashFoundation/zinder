@@ -1,6 +1,9 @@
 //! Bound on concurrent tree-state reconstructions, and the metrics of every
 //! tree-state read.
 
+mod flights;
+pub(crate) use flights::ReplayKey;
+
 use std::{
     num::NonZeroU32,
     sync::{
@@ -11,7 +14,6 @@ use std::{
 };
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::Instrument as _;
 use zinder_core::{BlockHeight, ChainTipMetadata};
 use zinder_store::{ServedTreeState, TreeStateReplayOutcome};
 
@@ -84,6 +86,7 @@ pub const MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.s
 /// full. A waiter that is dropped gives up its place at once.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
+    flights: Arc<parking_lot::Mutex<flights::Flights>>,
     slots: Arc<Semaphore>,
     max_replays: NonZeroU32,
     waiters: Arc<AtomicU32>,
@@ -110,6 +113,7 @@ impl TreeStateReplayLimit {
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
         Self {
+            flights: Arc::default(),
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
             waiters: Arc::new(AtomicU32::new(0)),
@@ -225,50 +229,47 @@ impl Drop for WaitingPlace<'_> {
 
 pub(crate) fn record_stored_tree_state_read(height: BlockHeight, stored: &ServedTreeState) {
     let trees = stored.tip_metadata();
-    record_tree_state_read(height, 0, trees, trees);
+    record_tree_state_read(height, "stored", 0, trees, trees);
+}
+
+pub(crate) fn record_cached_tree_state_read(height: BlockHeight, state: &ServedTreeState) {
+    let trees = state.tip_metadata();
+    record_tree_state_read(height, "cached", 0, trees, trees);
 }
 
 /// Holds the slot on the replay task so cancelling the request cannot release
 /// capacity while its storage read is still running.
-pub(crate) async fn replay_holding_slot<Read>(
+async fn replay_holding_slot<Read>(
     height: BlockHeight,
-    replay_slot: Arc<OwnedSemaphorePermit>,
+    replay_slot: Arc<dyn Send + Sync>,
     read: Read,
-) -> Result<ServedTreeState, QueryError>
+) -> Result<Option<ServedTreeState>, StorageReadError>
 where
     Read:
         Future<Output = Result<Option<TreeStateReplayOutcome>, StorageReadError>> + Send + 'static,
 {
-    let (outcome, duration) = tokio::spawn(
-        async move {
-            let _replay_slot = replay_slot;
-            let started_at = Instant::now();
-            let outcome = read.await;
-            (outcome, started_at.elapsed())
-        }
-        .in_current_span(),
-    )
-    .await
-    .map_err(|join_error| QueryError::BlockingTaskFailed {
-        reason: join_error.to_string(),
-    })?;
-    match outcome
-        .map_err(QueryError::canonical_read)?
-        .ok_or(QueryError::BlockNotInBestChain)?
-    {
+    let started_at = Instant::now();
+    let outcome = read.await;
+    let duration = started_at.elapsed();
+    drop(replay_slot);
+    let Some(outcome) = outcome? else {
+        return Ok(None);
+    };
+    match outcome {
         TreeStateReplayOutcome::Stored(stored) => {
             record_stored_tree_state_read(height, &stored);
-            Ok(stored)
+            Ok(Some(stored))
         }
         TreeStateReplayOutcome::Replayed { replay, tree_state } => {
             record_replay_duration(height, duration);
             record_tree_state_read(
                 height,
+                "replayed",
                 replay.replayed_blocks(),
                 replay.seed().tip_metadata(),
                 tree_state.tip_metadata(),
             );
-            Ok(tree_state)
+            Ok(Some(tree_state))
         }
     }
 }
@@ -282,16 +283,12 @@ where
 /// replays at least one block and counts as `replayed`.
 fn record_tree_state_read(
     height: BlockHeight,
+    source: &'static str,
     replayed_blocks: u32,
     seed_trees: ChainTipMetadata,
     served_trees: ChainTipMetadata,
 ) {
     let band = height_band(height);
-    let source = if replayed_blocks == 0 {
-        "stored"
-    } else {
-        "replayed"
-    };
     metrics::counter!(TREE_STATE_READS_COUNTER, "source" => source, "height_band" => band.clone())
         .increment(1);
     metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM, "height_band" => band.clone())

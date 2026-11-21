@@ -51,8 +51,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, TreeStateReplayLimit, record_stored_tree_state_read,
-        replay_holding_slot,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, TreeStateReplayLimit,
+        record_stored_tree_state_read,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1271,47 +1271,58 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         serving_read::record("tree_state_at", None, async {
-            let (lookup_epoch, lookup) =
-                serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                    let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    if height > chain_epoch.visible_tip_height {
-                        return Err(QueryError::BlockNotInBestChain);
-                    }
-                    let lookup = pair
-                        .canonical()
-                        .tree_state_lookup(height)
-                        .await
-                        .map_err(QueryError::canonical_read)?
-                        .ok_or(QueryError::BlockNotInBestChain)?;
-                    Ok((chain_epoch, lookup))
-                })
-                .await?;
-            let replay = match lookup {
-                TreeStateLookup::Stored(stored) => {
-                    record_stored_tree_state_read(height, &stored);
-                    return Ok(tree_state_response(lookup_epoch, stored));
-                }
-                TreeStateLookup::Replay(replay) => replay,
-            };
-            // The slot is taken before the replay, so a request cancelled
-            // while it waits gives up its place, and no pair is held while it
-            // waits. Once taken, the replay runs on a task of its own that
-            // holds the slot, so a cancelled request frees it only when its
-            // replay ends. The replay captures the pair again; one showing a
-            // newer chain can answer from a checkpoint it stores or from its
-            // own seed, so the metrics record the outcome that read reports.
-            let replay_slot = Arc::new(self.tree_state_replays.admit().await?);
-            let (chain_epoch, tree_state) =
-                serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                    let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    let tree_state = replay_holding_slot(height, replay_slot, async move {
-                        pair.canonical().replay_tree_state(replay).await
+            loop {
+                let (lookup_epoch, key, lookup) =
+                    serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+                        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                        if height > chain_epoch.visible_tip_height {
+                            return Err(QueryError::BlockNotInBestChain);
+                        }
+                        let lookup = pair
+                            .canonical()
+                            .tree_state_lookup(height)
+                            .await
+                            .map_err(QueryError::canonical_read)?
+                            .ok_or(QueryError::BlockNotInBestChain)?;
+                        Ok((
+                            chain_epoch,
+                            ReplayKey::new(height, pair.canonical()),
+                            lookup,
+                        ))
                     })
                     .await?;
-                    Ok((chain_epoch, tree_state))
+                let replay = match lookup {
+                    TreeStateLookup::Stored(stored) => {
+                        record_stored_tree_state_read(height, &stored);
+                        return Ok(tree_state_response(lookup_epoch, stored));
+                    }
+                    TreeStateLookup::Replay(replay) => replay,
+                };
+                let flight = self.tree_state_replays.flight(key);
+                if let Some(state) = flight.cached() {
+                    crate::tree_state_replay_limit::record_cached_tree_state_read(height, &state);
+                    return Ok(tree_state_response(lookup_epoch, state));
+                }
+                let permit = flight.admit(&self.tree_state_replays).await?;
+                let answer = serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+                    let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                    if ReplayKey::new(height, pair.canonical()) != key {
+                        return Ok(None);
+                    }
+                    let state = flight
+                        .replay(permit, |cancelled| async move {
+                            pair.canonical()
+                                .replay_tree_state_until_cancelled(replay, cancelled)
+                                .await
+                        })
+                        .await?;
+                    Ok(Some(tree_state_response(epoch, state)))
                 })
                 .await?;
-            Ok(tree_state_response(chain_epoch, tree_state))
+                if let Some(answer) = answer {
+                    return Ok(answer);
+                }
+            }
         })
         .await
     }
@@ -1975,10 +1986,8 @@ mod tree_state_replay_limit_tests {
         tree_state_replay_limit::TreeStateReplayLimit,
     };
 
-    /// A request cancelled while its replay runs keeps the replay's slot
-    /// until the replay ends, because the storage read keeps running.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_cancelled_request_keeps_its_replay_slot_until_the_replay_ends()
+    async fn a_shared_replay_releases_its_slot_when_the_last_wallet_leaves()
     -> Result<(), Box<dyn Error>> {
         let activations = sample_regtest_upgrade_activations();
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
@@ -2000,36 +2009,43 @@ mod tree_state_replay_limit_tests {
             async move { query.tree_state_at(reconstructed, None).await }
         });
         replays.replay_started().await;
+        let second = tokio::spawn({
+            let query = query.clone();
+            async move { query.tree_state_at(reconstructed, None).await }
+        });
+        let pair = query.capture_pair();
+        let key = super::ReplayKey::new(reconstructed, pair.canonical());
+        let flight = query.tree_state_replays.flight(key);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&flight) < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(flight);
         cancelled.abort();
         assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
-
-        let refused = tokio::time::timeout(
-            Duration::from_secs(5),
-            query.tree_state_at(reconstructed, None),
-        )
-        .await
-        .map_err(|_| "a rebuild took the slot the cancelled request's replay still holds")?;
-        assert!(
-            matches!(refused, Err(QueryError::TreeStateReplayLimitReached { .. })),
-            "unexpected outcome {refused:?}"
-        );
-
-        replays.release();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match query.tree_state_at(reconstructed, None).await {
-                Ok(tree_state) => {
-                    assert_eq!(tree_state.height, reconstructed);
-                    return Ok(());
+        assert!(!second.is_finished());
+        assert!(query.tree_state_replays.admit().await.is_err());
+        second.abort();
+        assert!(second.await.is_err_and(|error| error.is_cancelled()));
+        let permit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(permit) = query.tree_state_replays.admit().await {
+                    break permit;
                 }
-                Err(QueryError::TreeStateReplayLimitReached { .. })
-                    if tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                Err(error) => return Err(error.into()),
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await?;
+        drop(permit);
+        assert_eq!(replays.runs.load(std::sync::atomic::Ordering::Relaxed), 1);
+        replays.release();
+        assert_eq!(
+            query.tree_state_at(reconstructed, None).await?.height,
+            reconstructed
+        );
+        Ok(())
     }
 
     /// A saturated limit refuses reconstructions but still serves a stored
@@ -2195,9 +2211,13 @@ mod tree_state_replay_limit_tests {
         query.tree_state_at(BlockHeight::new(3), None).await?;
         query.tree_state_at(BlockHeight::new(2), None).await?;
         let held_slot = query.tree_state_replays.admit().await?;
+        assert_eq!(
+            query.tree_state_at(BlockHeight::new(2), None).await?.height,
+            BlockHeight::new(2)
+        );
         assert!(
             query
-                .tree_state_at(BlockHeight::new(2), None)
+                .tree_state_at(BlockHeight::new(1), None)
                 .await
                 .is_err()
         );
@@ -2207,10 +2227,11 @@ mod tree_state_replay_limit_tests {
         for expected in [
             "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"0\"} 1",
             "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 1",
-            "zinder_query_tree_state_replayed_blocks_count{height_band=\"0\"} 2",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"sapling\",height_band=\"0\"} 2",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"orchard\",height_band=\"0\"} 2",
-            "zinder_query_tree_state_replayed_commitments_count{pool=\"ironwood\",height_band=\"0\"} 2",
+            "zinder_query_tree_state_reads_total{source=\"cached\",height_band=\"0\"} 1",
+            "zinder_query_tree_state_replayed_blocks_count{height_band=\"0\"} 3",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"sapling\",height_band=\"0\"} 3",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"orchard\",height_band=\"0\"} 3",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"ironwood\",height_band=\"0\"} 3",
             "zinder_query_tree_state_replay_duration_seconds_count{height_band=\"0\"} 1",
             "zinder_query_tree_state_replay_wait_duration_seconds_count 3",
             "zinder_query_tree_state_replay_admissions_total 2",

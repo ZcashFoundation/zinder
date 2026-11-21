@@ -353,9 +353,9 @@ collect the client's outcome as well.
 | `zinder_query_request_total` | counter | `operation`, `status`, `error_class` | Wallet reads. One protocol request can record several reads. |
 | `zinder_query_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of each read, including any tree-state rebuild and the node call of a broadcast. |
 | `zinder_query_compact_block_range_block_count` | histogram | `status` | Blocks each compact-block range read asked for. |
-| `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Served tree-state reads. `source` is `stored` for a height with a stored checkpoint and `replayed` for a rebuilt one. |
-| `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
-| `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) to answer each served tree-state read. A stored checkpoint records 0. |
+| `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Served tree-state reads. `source` is `stored` for a height with a stored checkpoint, `replayed` for the request that starts a reconstruction, `coalesced` for a wallet sharing the reconstruction, and `cached` for a settled cache hit. |
+| `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks replayed to answer each served tree-state read, from 0 to 99. Stored checkpoints, shared answers, and cache hits record 0. |
+| `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) to answer each served tree-state read. Stored checkpoints, shared answers, and cache hits record 0. |
 | `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
 | `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |

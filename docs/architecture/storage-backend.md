@@ -79,7 +79,7 @@ artifact, even when a row is stored for it.
 The read then fetches rows with batched point lookups (`MultiGet`):
 
 - An unbounded range read fetches up to 1,024 heights per batch.
-- The tree-state replay fetches up to 16 heights per batch.
+- The tree-state replay fetches up to 16 heights per batch and checks for cancellation after each block. Wallet queries at the same height and chain fence share a reconstruction. The last wallet to leave cancels the work. Each query runtime caches up to 256 settled answers, scoped to the epoch, sequence digest, and retained history.
 - A byte-bounded read fetches one row first. Each later batch holds as many
   rows as the budget left fits at the size of the largest row read so far,
   from 1 to 16.

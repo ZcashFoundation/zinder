@@ -240,6 +240,23 @@ pub(super) fn replay_tree_state(
     replay: &TreeStateReplay,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    replay_until_cancelled(store, replay, activations, || false)
+}
+
+pub(super) fn replay_until_cancelled(
+    store: &impl CanonicalServingRead,
+    replay: &TreeStateReplay,
+    activations: &NetworkUpgradeActivations,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    let check = || {
+        if cancelled() {
+            Err(CanonicalStoreError::ReplayCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     let replay = if replay.seed_read_at == Some(VisibleChain::of(store)) {
         refuse_unadmitted_activations(store, replay.height, activations)?;
         replay.clone()
@@ -253,7 +270,7 @@ pub(super) fn replay_tree_state(
         }
     };
     let mut trees =
-        replay_compact_blocks(store, &replay.seed, replay.height, activations, |_| Ok(()))?;
+        replay_compact_blocks(store, &replay.seed, replay.height, activations, |_| check())?;
     let block_time_seconds = trees.canonical_block_time(store)?;
     let tree_state = ServedTreeState::from_replayed_accumulator(
         trees.tip,

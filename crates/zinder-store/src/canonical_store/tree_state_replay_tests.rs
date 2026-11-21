@@ -26,6 +26,26 @@ use crate::{RawBlobRetention, RocksDbResourceBudget};
 const TIP_HEIGHT: u32 = 150;
 
 #[test]
+fn cancellation_stops_replay_between_compact_blocks() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let Some(TreeStateLookup::Replay(replay)) =
+        store.tree_state_lookup(BlockHeight::new(99), &activations)?
+    else {
+        return Err("missing sparse replay".into());
+    };
+    let checks = std::cell::Cell::new(0);
+    let outcome = store.replay_tree_state_until_cancelled(&replay, &activations, || {
+        checks.set(checks.get() + 1);
+        checks.get() == 4
+    });
+    assert!(matches!(outcome, Err(CanonicalStoreError::ReplayCancelled)));
+    assert_eq!(checks.get(), 4);
+    Ok(())
+}
+
+#[test]
 fn every_retained_height_reads_the_checkpoint_construction_would_store()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

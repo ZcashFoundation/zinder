@@ -38,6 +38,7 @@ pub(crate) struct ObservedCanonicalReader {
 pub(crate) struct ReplayGate {
     open: Semaphore,
     started: Notify,
+    pub(crate) runs: AtomicUsize,
 }
 
 impl ReplayGate {
@@ -58,6 +59,7 @@ impl ObservedCanonicalReader {
         let replays = ReplayGate {
             open: Semaphore::new(0),
             started: Notify::new(),
+            runs: AtomicUsize::new(0),
         };
         replays.release();
         Self {
@@ -73,6 +75,7 @@ impl ObservedCanonicalReader {
         let replays = Arc::new(ReplayGate {
             open: Semaphore::new(0),
             started: Notify::new(),
+            runs: AtomicUsize::new(0),
         });
         (
             Self {
@@ -226,6 +229,21 @@ impl CanonicalReader for ObservedCanonicalReader {
         // A released gate is closed, so it refuses the permit at once.
         let _released = self.replays.open.acquire().await;
         self.count().replay_tree_state(replay).await
+    }
+
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        self.replays.runs.fetch_add(1, Ordering::Relaxed);
+        self.replays.started.notify_one();
+        while !self.replays.open.is_closed() && !cancelled.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        self.count()
+            .replay_tree_state_until_cancelled(replay, cancelled)
+            .await
     }
 
     async fn subtree_roots(

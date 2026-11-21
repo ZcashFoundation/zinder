@@ -394,6 +394,22 @@ macro_rules! impl_canonical_typed_reads {
                 )
             }
 
+            /// Reconstructs a frontier while a caller still needs it. Checks for
+            /// cancellation before starting and after each replayed block.
+            pub fn replay_tree_state_until_cancelled(
+                &self,
+                replay: &TreeStateReplay,
+                activations: &zinder_core::NetworkUpgradeActivations,
+                cancelled: impl Fn() -> bool,
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+                super::tree_state_replay::replay_until_cancelled(
+                    self,
+                    replay,
+                    activations,
+                    cancelled,
+                )
+            }
+
             /// Batch-reads stored final note-commitment roots from
             /// `tree_state_checkpoint` rows across an inclusive height range.
             ///

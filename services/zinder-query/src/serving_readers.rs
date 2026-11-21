@@ -204,6 +204,16 @@ pub trait CanonicalReader: Send + Sync + 'static {
         replay: TreeStateReplay,
     ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError>;
 
+    /// Replays a frontier while the request group still has a reader.
+    /// Engines with a block replay loop should check the flag between blocks.
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        _cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        self.replay_tree_state(replay).await
+    }
+
     /// Reads a contiguous range of the subtree roots the visible chain has
     /// completed, which its chain epoch's tip metadata counts.
     ///
