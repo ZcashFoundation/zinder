@@ -4,6 +4,8 @@ Run Zingo and standalone Zkool against disposable local Regtest funds. These ada
 
 These are native engine checks. They do not qualify mobile applications, operating-system trust stores, physical devices, Cake's separate integration, or production capacity.
 
+For Android and iOS app builds, follow the [signed wallet qualification procedure](mobile-qualification.md).
+
 For other engines, use the [Vizor build and replay](vizor.md), [Cake build and replay](cake-regtest.md), or [zcash-devtool build and replay](../../docs/runbooks/testing.md#gate-a-real-wallet-lifecycle).
 
 ## Prerequisites
