@@ -1,0 +1,6 @@
+kind: changed
+body: Fresh wallet-serving stores with Explorer views disabled build historical tree-state checkpoints at every height by default. Explicit sparse, disabled, and commitment-budget policies remain available. Existing published stores retain their rows and resumable background coverage.
+time: 2026-11-21T22:20:18.845934649Z
+custom:
+    Bump: minor
+    PR: "460"
