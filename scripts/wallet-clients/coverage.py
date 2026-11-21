@@ -302,6 +302,8 @@ def main():
     collect.add_argument("--roundtrip-audit", type=Path, help="optional independent canonical audit of that pair")
     collect.add_argument("--native-expiry-result", type=Path, help="private native-expiry.py receipt.json")
     collect.add_argument("--reorg-result", type=Path, help="private reorg-zkool.py receipt.json")
+    collect.add_argument("--counterparty-result", type=Path, action="append", default=[], metavar="RECEIPT",
+                         help="payer and payee observations from a completed payment-roles.py run")
     collect.add_argument("--output", type=Path, required=True)
     check = commands.add_parser("check", help="validate a matrix and compare its inventory to its tagged protocols")
     check.add_argument("matrix", nargs="?", type=Path, default=BASELINE)
@@ -326,6 +328,10 @@ def main():
             rows.extend(native_expiry_actions(args.native_expiry_result, release))
         if args.reorg_result:
             rows.extend(reorg_actions(args.reorg_result, release))
+        if args.counterparty_result:
+            from coverage_counterparty_roles import counterparty_actions
+            for receipt in args.counterparty_result:
+                rows.extend(counterparty_actions(receipt, release, allow_provisional=False))
         for path in args.observations:
             part = load(path)
             require(part["schema_version"] == 1 and part["release"] == release,
