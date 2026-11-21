@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Check retry, identity, and comparability rules without contacting a faucet or wallet."""
+from contextlib import redirect_stdout
+import io
+import json
+import os
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -99,6 +104,38 @@ class RoundTripTests(unittest.TestCase):
             self.assertEqual(case.fund_regtest(), TXID)
         wait.assert_called_once()
         wallet.shield.assert_called_once()
+
+    def test_cleanup_failure_prevents_success_receipt_and_retries_safely(self):
+        import roundtrip_fixture
+        import roundtrip_wallets
+        self.addCleanup(os.umask, os.umask(0o077))
+        files = Path(self.directory.name)
+        state, ready = files / "wallets", files / "ready"
+        ready.write_text(json.dumps(dict(native_wallet_query="native", lightwalletd="compat", node_rpc="node")))
+        argv = ["roundtrip", "testnet", "--ready", str(ready), "--revision", "a" * 40,
+                "--zingo", str(ready), "--zallet-backend", str(ready), "--state", str(state),
+                "--wallet-rpc-port", "32082"]
+        wallet = Mock()
+        wallet.close.side_effect = [TimeoutError("shutdown"), None]
+        def run(trip):
+            return {"inputs": trip.journal.data["config"]}
+        with patch.object(sys, "argv", argv), patch.object(roundtrip_fixture, "rpc", return_value=150), \
+                patch.object(roundtrip_fixture, "verify", return_value={"genesis": "anchor"}), \
+                patch.object(roundtrip_wallets, "Zingo"), patch.object(roundtrip_wallets, "Zallet", return_value=wallet), \
+                patch.object(RoundTrip, "run", run), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(TimeoutError, "shutdown"):
+                M["main"]()
+            self.assertFalse((state / "receipt.json").exists())
+            self.assertEqual(output.getvalue(), "")
+            M["main"]()
+            self.assertTrue((state / "receipt.json").is_file())
+            self.assertEqual(wallet.close.call_count, 2)
+            (state / "zallet").mkdir(exist_ok=True)
+            (state / "zallet/daemon.pid").write_text("123")
+            wallet.close.side_effect = TimeoutError("legacy shutdown")
+            with patch.object(RoundTrip, "run", side_effect=AssertionError("payment replayed")), \
+                    self.assertRaisesRegex(TimeoutError, "legacy shutdown"):
+                M["main"]()
 
     def test_corrupt_wallet_history(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):

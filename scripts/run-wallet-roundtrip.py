@@ -385,9 +385,16 @@ def main():
     state = args.state.resolve()
     with locked(state):
         j = Journal(state / "run.json", config)
+        def native_wallet():
+            return Zallet(args.zallet_backend.resolve(), state / "zallet", args.network, ready["native_wallet_query"],
+                          j.data["birthday"], args.wallet_rpc_port, warmup_timeout=args.wait_seconds)
+
         receipt = state / "receipt.json"
         if receipt.exists():
             require(json.loads(receipt.read_text())["inputs"] == config, "completed receipt identity mismatch")
+            # Older runners could write a receipt before their daemon exited.
+            if (state / "zallet" / "daemon.pid").is_file():
+                native_wallet().close()
             print(receipt)
             return
         sources = [Path(__file__), CLIENTS/"roundtrip_wallets.py", CLIENTS/"roundtrip_fixture.py", CLIENTS/"wallet_fixture.py"]
@@ -402,8 +409,7 @@ def main():
             j.data["birthday"] = max(1, h - 10)
             j.save()
         zingo = Zingo(args.zingo.resolve(), state / "zingo", args.network, ready["lightwalletd"], j.data["birthday"])
-        zallet = Zallet(args.zallet_backend.resolve(), state / "zallet", args.network, ready["native_wallet_query"],
-                        j.data["birthday"], args.wallet_rpc_port, warmup_timeout=args.wait_seconds)
+        zallet = native_wallet()
         try:
             result = RoundTrip(args.network, ready, rpc, j, zingo, zallet, args.wait_seconds).run()
             require(source_hashes == {p.name:digest(p) for p in sources}, "harness changed during run; rerun to verify")
@@ -417,8 +423,6 @@ def main():
                 result["fixture_recipe"]["release_binaries"] = {
                     name: binary["sha256"] for name, binary in ready["binaries"].items()
                 }
-            write_json(receipt, result)
-            print(receipt)
         finally:
             original_error = sys.exception()
             try:
@@ -429,6 +433,8 @@ def main():
                 original_error.add_note(f"Zallet cleanup also failed: {cleanup_error}")
             finally:
                 zingo.close()
+        write_json(receipt, result)
+        print(receipt)
 
 
 if __name__ == "__main__":

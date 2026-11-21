@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Canonical Regtest audit boundary tests."""
+import copy
 import hashlib
 import importlib.util
 from pathlib import Path
@@ -57,6 +58,35 @@ class CanonicalAuditTests(unittest.TestCase):
         self.observation["fee_zat"] = 3
         with self.assertRaisesRegex(ValueError, "balance changes"):
             self.verify()
+
+    def test_independent_canonical_heights_can_differ(self):
+        leg = dict(self.leg, memo_verified=True, spendable_after_zat=15, change_zat=None)
+        legs = {"outbound": leg, "return": dict(leg, mined_height=173)}
+        def run(index):
+            values = copy.deepcopy(legs)
+            for leg in values.values():
+                leg["mined_height"] += index
+            sha = str(index) * 64
+            ids = {name: sha[:63] + str(i) for i, name in enumerate(values)}
+            for name, fingerprint in ids.items():
+                values[name]["tx_fingerprint"] = fingerprint
+            receipt = {"legs": values, "inputs": {"ready_sha256": sha}, "harness_sha256": {}}
+            return receipt, (sha, sha, sha), {"canonical_txid_fingerprints": ids,
+                    "receipt_sha256": sha, "ready_sha256": sha, "end_height": 180}
+        first, second = run(1), run(2)
+        with patch.object(audit, "verify_run", side_effect=[first, second]), patch.object(audit, "compare_runs"):
+            result = audit.audit([("a", "b"), ("c", "d")], "a" * 40)
+        from coverage_roundtrip import audit_pair
+        receipts = {r[2]["receipt_sha256"]: r[0] for r in (first, second)}
+        audit_pair(result, receipts)
+        previous_schema = copy.deepcopy(result)
+        shared_leg = previous_schema["matching_outcomes"]["leg_outcomes"]["outbound"]
+        shared_leg["mined_height"] = first[0]["legs"]["outbound"]["mined_height"]
+        with self.assertRaisesRegex(ValueError, "accounting"):
+            audit_pair(previous_schema, receipts)
+        result["matching_outcomes"]["leg_outcomes"]["outbound"]["fee_zat"] += 1
+        with self.assertRaisesRegex(ValueError, "accounting"):
+            audit_pair(result, receipts)
 
     def test_same_endpoint_or_owner_cannot_count_as_replication(self):
         f = ("a", "b", "c")

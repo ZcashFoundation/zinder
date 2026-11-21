@@ -9,7 +9,7 @@ import re
 import sys
 from tempfile import NamedTemporaryFile
 
-from coverage_roundtrip import check_receipt, compare_runs
+from coverage_roundtrip import check_receipt, compare_runs, wallet_outcomes
 from roundtrip_fixture import GENESIS, anchor, require, rpc
 from wallet_fixture import loopback
 
@@ -73,12 +73,9 @@ def audit(runs, revision):
     require(len({f for result in (first, second) for f in result[2]["canonical_txid_fingerprints"].values()}) == 4,
             "expected four independent canonical transfers")
     receipt = first[0]
-    outcomes = {k: {f: v for f, v in leg.items() if f != "tx_fingerprint"} for k, leg in receipt["legs"].items()}
-    require(outcomes == {k: {f: v for f, v in leg.items() if f != "tx_fingerprint"}
-                         for k, leg in second[0]["legs"].items()}, "independent wallet outcomes differ")
     return {"schema_version": 1, "passed": True, "independent_chains": 2, "distinct_wallet_identities": 4,
             "independent_transactions": 4, "runs": {"first": first[2], "second": second[2]},
-            "matching_outcomes": {"network": "regtest", "schema_version": 1, "leg_outcomes": outcomes,
+            "matching_outcomes": {"network": "regtest", "schema_version": 1, "leg_outcomes": wallet_outcomes(receipt["legs"]),
                                   "binaries": {k: v for k, v in receipt["inputs"].items() if k != "ready_sha256"},
                                   "harness_sha256": receipt["harness_sha256"]}}
 

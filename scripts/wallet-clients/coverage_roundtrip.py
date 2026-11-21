@@ -49,6 +49,12 @@ def check_receipt(receipt, revision):
             0 <= back["spendable_after_zat"] <= back["payee_after_zat"], "round trip balance or change mismatch")
 
 
+def wallet_outcomes(legs):
+    fields = ("amount_zat", "fee_zat", "memo_verified", "payer_after_zat", "payee_after_zat",
+              "spendable_after_zat", "change_zat", "pending")
+    return {name: {field: leg[field] for field in fields} for name, leg in legs.items()}
+
+
 def compare_runs(left, right):
     for result in (left, right):
         check_receipt(result, left["inputs"]["revision"])
@@ -64,11 +70,7 @@ def compare_runs(left, right):
         require(left["inputs"][name] == right["inputs"][name], "incomparable " + name)
     require(left["fixture_recipe"] == right["fixture_recipe"] and left["harness_sha256"] == right["harness_sha256"],
             "paired fixture configuration or harness differs")
-    for name in ("outbound", "return"):
-        a, b = left["legs"][name], right["legs"][name]
-        for field in ("amount_zat", "fee_zat", "memo_verified", "payer_after_zat", "payee_after_zat",
-                      "spendable_after_zat", "change_zat", "pending"):
-            require(a[field] == b[field], f"{name}: different {field}")
+    require(wallet_outcomes(left["legs"]) == wallet_outcomes(right["legs"]), "independent wallet outcomes differ")
     return {"status": "passed", "same_wallet_outcomes": True, "independent_fixtures": True}
 
 
@@ -84,8 +86,13 @@ def audit_pair(audit, receipts):
                 audit_run["end_height"] >= r["legs"]["return"]["mined_height"] and
                 audit_run["canonical_txid_fingerprints"] == {k: leg["tx_fingerprint"] for k, leg in r["legs"].items()},
                 "canonical audit disagrees with fixture or transfer identity")
-        outcomes = {k: {f: v for f, v in leg.items() if f != "tx_fingerprint"} for k, leg in r["legs"].items()}
-        require(audit["matching_outcomes"]["leg_outcomes"] == outcomes, "canonical audit accounting differs")
+        recorded = audit["matching_outcomes"]["leg_outcomes"]
+        expected = wallet_outcomes(r["legs"])
+        for name, values in expected.items():
+            # Earlier schema-v1 audits also carried a shared height for each leg.
+            if "mined_height" in recorded[name]:
+                values["mined_height"] = r["legs"][name]["mined_height"]
+        require(recorded == expected, "canonical audit accounting differs")
 
 
 def roundtrip_actions(paths, release, audit_path=None):
