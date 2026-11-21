@@ -1039,6 +1039,26 @@ class SupervisionInterrupted(RuntimeError):
         self.outcome = outcome
 
 
+def finish_before_cancellation(action, *args):
+    """Finish a bounded cleanup operation and return the first cancellation received."""
+    interrupted = None
+
+    def record(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            if signum == signal.SIGINT:
+                interrupted = KeyboardInterrupt()
+            else:
+                interrupted = SystemExit("payment recovery interrupted")
+
+    with ExitStack() as handlers:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous = signal.signal(signum, record)
+            handlers.callback(signal.signal, signum, previous)
+        result = action(*args)
+    return result, interrupted
+
+
 def launch_case(command, log, timeout, grace):
     """Run one bounded case in its own session so a hang cannot escape the watchdog."""
     with log.open("x", encoding="utf-8") as output:
@@ -1047,10 +1067,12 @@ def launch_case(command, log, timeout, grace):
         try:
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            stop_group(process, signal.SIGTERM, grace)
+            _, interrupted = finish_before_cancellation(stop_group, process, signal.SIGTERM, grace)
+            if interrupted is not None:
+                raise interrupted
             return {"exit_code": process.returncode, "timeout": True}
         except BaseException:
-            stop_group(process, signal.SIGINT, grace)
+            finish_before_cancellation(stop_group, process, signal.SIGINT, grace)
             raise
     return {"exit_code": exit_code, "timeout": False}
 
@@ -1177,17 +1199,9 @@ def supervise_case(case, child, args, root):
         launch_error = f"{type(error).__name__}: {error}"
     except BaseException as error:
         launch_error = f"{type(error).__name__}: {error}"
-    def interrupt_after_cleanup(signum, _frame):
-        nonlocal interrupted
-        if interrupted is None:
-            interrupted = KeyboardInterrupt() if signum == signal.SIGINT else SystemExit("payment recovery interrupted")
-
-    # The child has stopped. Finish owned teardown before recording and propagating cancellation.
-    with ExitStack() as handlers:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous = signal.signal(signum, interrupt_after_cleanup)
-            handlers.callback(signal.signal, signum, previous)
-        cleanup = recover_case(case, child, args)
+    cleanup, during_cleanup = finish_before_cancellation(recover_case, case, child, args)
+    if interrupted is None:
+        interrupted = during_cleanup
     receipt_path = child.output / "receipt.json"
     receipt, receipt_error = read_case_receipt(receipt_path)
     status, kind, reason = supervision_result(case, exit_code, timeout, interrupted, receipt,

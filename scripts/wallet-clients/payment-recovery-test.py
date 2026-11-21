@@ -733,6 +733,31 @@ class CampaignSupervision(unittest.TestCase):
                 time.sleep(.02)
             self.assertFalse(process_alive(pid))
 
+    def test_parent_cancellation_during_timeout_grace_waits_for_the_child_to_be_reaped(self):
+        child = ("import os, signal, sys, time\n"
+                 "signal.signal(signal.SIGTERM, lambda *_: os.kill(os.getppid(), int(sys.argv[1])))\n"
+                 "time.sleep(60)\n")
+        popen = subprocess.Popen
+        processes = []
+
+        def start(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            self.addCleanup(M["stop_group"], process, signal.SIGKILL, 1)
+            return process
+
+        def terminate(*_):
+            raise SystemExit("payment recovery interrupted")
+
+        previous = signal.signal(signal.SIGTERM, terminate)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        with patch.object(subprocess, "Popen", side_effect=start):
+            for sig, error in ((signal.SIGINT, KeyboardInterrupt), (signal.SIGTERM, SystemExit)):
+                with self.subTest(signal=sig), self.assertRaises(error):
+                    M["launch_case"]([sys.executable, "-c", child, str(int(sig))],
+                                     self.scratch / f"grace-{sig}.log", timeout=.75, grace=.25)
+                self.assertEqual(processes[-1].returncode, -signal.SIGKILL)
+
     def test_launch_case_stops_the_group_before_propagating_an_interruption(self):
         stopped = []
 
