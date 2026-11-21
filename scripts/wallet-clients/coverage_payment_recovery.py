@@ -11,9 +11,11 @@ Accounting in each row describes the wallet's role in the outbound payment.
 The return leg is validated and asserted separately.
 """
 import hashlib
+import json
+from pathlib import Path
 import re
 
-from coverage_evidence import digest, load, require
+from coverage_evidence import require
 
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -79,19 +81,19 @@ def receipt(result, release, case):
             f"{case}: unexpected wallet roles")
     for name in ("zingo_sha256", "zallet_sha256"):
         token(clients[name], f"{case} {name}")
-    if "pins" in result:
-        pins = result["pins"]
-        require(pins["pre"] == pins["post"], "inputs changed during the run")
-        require(pins["pre"]["wallets"] == {"zingo": clients["zingo_sha256"], "zallet_backend": clients["zallet_sha256"]},
-                "wallet pins differ from the receipt")
-        harness = pins["pre"]["harness"]
-        required = {"payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
-                    "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"}
-        if case == "transport":
-            required.add("transport-payment.py")
-        require(required <= harness.keys(), "incomplete recovery harness pins")
-        for name, value in harness.items():
-            token(value, name)
+    require("pins" in result, "missing pre-run and post-run wallet and harness pins")
+    pins = result["pins"]
+    require(pins["pre"] == pins["post"], "inputs changed during the run")
+    require(pins["pre"]["wallets"] == {"zingo": clients["zingo_sha256"], "zallet_backend": clients["zallet_sha256"]},
+            "wallet pins differ from the receipt")
+    harness = pins["pre"]["harness"]
+    required = {"payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
+                "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"}
+    if case == "transport":
+        required.add("transport-payment.py")
+    require(required <= harness.keys(), "incomplete recovery harness pins")
+    for name, value in harness.items():
+        token(value, name)
     identities = clients["wallet_identity_sha256"]
     require(len(identities) == 2 and len(set(identities)) == 2
             and all(isinstance(v, str) and SHA256.fullmatch(v) for v in identities),
@@ -345,12 +347,11 @@ def expected_names(case, remine=None):
     return names
 
 
-def row(result, case, role, action, assertions, accounting):
+def row(result, receipt_sha, case, role, action, assertions, accounting):
     fixture, clients = result["fixture"], result["clients"]
     peer = "zallet" if role == "zingo" else "zingo"
     interface, implementation, variant = WALLETS[role]
     client_sha = clients[f"{role}_sha256"]
-    receipt_sha = digest(result["path"])
     return {
         "id": f"payment-recovery-{case}-{role}",
         "wallet": role, "version": "binary " + client_sha[:12],
@@ -368,8 +369,9 @@ def row(result, case, role, action, assertions, accounting):
 
 def recovery_actions(path, release):
     """Yield schema-1 rows from a disconnect, rollback, or transport receipt."""
-    result = load(path)
-    result["path"] = path
+    raw = Path(path).read_bytes()
+    result = json.loads(raw)
+    receipt_sha = hashlib.sha256(raw).hexdigest()
     case = result["case"]
     receipt(result, release, case)
     outbound, _, first, second, spendable = ledger(result)
@@ -395,7 +397,7 @@ def recovery_actions(path, release):
             action = ("Remain an uninvoked one-shot CLI while a pending payment is mined, "
                       "then rescan it" if role == "zingo" else
                       "Stop the daemon while a pending payment is mined, then reopen and recover the confirmed payment")
-            yield row(result, case, role, action, assertions, accounting)
+            yield row(result, receipt_sha, case, role, action, assertions, accounting)
     elif case == "rollback":
         remine, orphan = rollback_evidence(result, outbound)
         checks = expected_assertions(result, case, remine)
@@ -416,7 +418,7 @@ def recovery_actions(path, release):
                            "balance_after": first["payer_after_zat"]} if role == "zingo" else
                           {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
                            "spendable_after": spendable})
-            yield row(result, case, role,
+            yield row(result, receipt_sha, case, role,
                       "Follow a shallow reorg that orphaned and remined the same signed payment",
                       assertions, accounting)
     elif case == "transport":
@@ -430,7 +432,7 @@ def recovery_actions(path, release):
         })
         accounting = {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
                       "spendable_after": spendable}
-        yield row(result, case, "zallet",
+        yield row(result, receipt_sha, case, "zallet",
                   "Reconnect the same Zallet process after its private native route was lost "
                   "during a pending payment", assertions, accounting)
     else:

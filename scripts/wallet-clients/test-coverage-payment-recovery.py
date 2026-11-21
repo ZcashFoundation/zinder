@@ -52,9 +52,15 @@ def base(case):
                "anchor": {"height": 150, "hash": token("anchor")},
                "image_ids": dict.fromkeys(BINARIES, NODE_IMAGE), "project": f"disposable-{case}"}
     anchor = fixture["anchor"]
+    sources = ["payment-recovery.py", "regtest-fixture.py", "regtest-fixture-relay.py",
+               "run-wallet-roundtrip.py", "roundtrip_fixture.py", "roundtrip_wallets.py", "wallet_fixture.py"]
+    if case == "transport":
+        sources.append("transport-payment.py")
+    pins = {"wallets": {"zingo": ZINGO, "zallet_backend": ZALLET},
+            "harness": {name: token(name) for name in sources}}
     return {
         "schema_version": 1, "case": case, "status": "passed", "network": "zcash-regtest",
-        "fixture": fixture,
+        "fixture": fixture, "pins": {"pre": copy.deepcopy(pins), "post": pins},
         "clients": {"payer": "zingo-cli", "payee": "zallet-zinder",
                     "zingo_sha256": ZINGO, "zallet_sha256": ZALLET,
                     "wallet_identity_sha256": [token("zingo-wallet"), token("zallet-wallet")]},
@@ -202,6 +208,30 @@ class RecoveryImport(unittest.TestCase):
 
     def rows(self, case):
         return list(recovery_actions(self.paths[case], RELEASE))
+
+    def test_incomplete_or_changed_input_pins_cannot_qualify(self):
+        def remove_source(receipt):
+            for snapshot in receipt["pins"].values():
+                del snapshot["harness"]["roundtrip_wallets.py"]
+
+        for case in self.receipts:
+            for mutate in (lambda r: r.pop("pins"),
+                           lambda r: r["pins"]["post"]["wallets"].update(zingo=token("changed")),
+                           remove_source):
+                r = copy.deepcopy(self.receipts[case])
+                mutate(r)
+                self.write(case, r)
+                with self.subTest(case=case), self.assertRaises(ValueError):
+                    self.rows(case)
+
+    def test_both_wallet_rows_fingerprint_the_bytes_actually_read(self):
+        path = self.paths["disconnect"]
+        original_sha = digest(path)
+        rows = recovery_actions(path, RELEASE)
+        first = next(rows)
+        path.write_text("{}")
+        second = next(rows)
+        self.assertEqual([r["evidence"]["sha256"] for r in (first, second)], [original_sha] * 2)
 
     def test_actor_rows_keep_scope_none_and_validate(self):
         disconnect, rollback, transport = (self.rows("disconnect"), self.rows("rollback"),

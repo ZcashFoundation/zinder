@@ -29,7 +29,7 @@ The receipt records fixture removal. Keep wallet state, node logs, and the signe
 
 ## Compare release coverage
 
-Import the three case receipts from the selected release. The collector projects a row for each affected wallet. For the transport outage it projects only Zallet, since Zingo kept its independent lightwalletd route.
+Import the three case receipts from the selected release. Each receipt must identify the wallet executables and harness files before the run and after teardown. Older experimental receipts without those checks remain available as raw observations. The collector projects a row for each affected wallet. For the transport outage it projects only Zallet, since Zingo kept its independent lightwalletd route.
 
 ```bash
 "$wallet_python" -B scripts/wallet-clients/coverage.py collect --release "$release_tag" \
