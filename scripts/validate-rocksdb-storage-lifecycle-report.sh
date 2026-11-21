@@ -8,11 +8,11 @@ fail() {
 
 usage() {
   echo >&2 \
-    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK EXPECTED_CPU_LIMIT_CORES EXPECTED_MEMORY_LIMIT_BYTES EXPECTED_RUNNER_ID EXPECTED_STORAGE_CLASS [EXPECTED_TREE_STATE_CHECKPOINT_COVERAGE]"
+    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK EXPECTED_CPU_LIMIT_CORES EXPECTED_MEMORY_LIMIT_BYTES EXPECTED_RUNNER_ID EXPECTED_STORAGE_CLASS [EXPECTED_TREE_STATE_CHECKPOINT_COVERAGE] [EXPECTED_CANONICAL_PUBLICATION_MODE]"
   exit 2
 }
 
-[[ "$#" -eq 11 || "$#" -eq 12 ]] || usage
+[[ "$#" -eq 11 || "$#" -eq 12 || "$#" -eq 13 ]] || usage
 
 report_path="$1"
 resource_evidence_path="$2"
@@ -26,6 +26,7 @@ expected_memory_limit_bytes="$9"
 expected_runner_id="${10}"
 expected_storage_class="${11}"
 expected_tree_state_checkpoint_coverage="${12:-}"
+expected_canonical_publication_mode="${13:-}"
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 for evidence_file in "$report_path" "$resource_evidence_path"; do
@@ -55,6 +56,11 @@ if [[ -n "$expected_tree_state_checkpoint_coverage" ]]; then
     || "$expected_tree_state_checkpoint_coverage" == "cadence-and-tip" ]] || fail \
     "expected tree-state checkpoint coverage must be every-block or cadence-and-tip"
 fi
+if [[ -n "$expected_canonical_publication_mode" ]]; then
+  [[ "$expected_canonical_publication_mode" == "trusted-fresh" \
+    || "$expected_canonical_publication_mode" == "cold-certified" ]] || fail \
+    "expected canonical publication mode must be trusted-fresh or cold-certified"
+fi
 
 jq -e \
   --slurpfile resources "$resource_evidence_path" \
@@ -67,7 +73,8 @@ jq -e \
   --argjson expected_memory_limit_bytes "$expected_memory_limit_bytes" \
   --arg expected_runner_id "$expected_runner_id" \
   --arg expected_storage_class "$expected_storage_class" \
-  --arg expected_tree_state_checkpoint_coverage "$expected_tree_state_checkpoint_coverage" '
+  --arg expected_tree_state_checkpoint_coverage "$expected_tree_state_checkpoint_coverage" \
+  --arg expected_canonical_publication_mode "$expected_canonical_publication_mode" '
   def exact_keys($expected): (keys | sort) == ($expected | sort);
   def expected_tree_state_checkpoint_count($coverage; $first_height; $tip_height):
     if $coverage == "every-block" then
@@ -279,7 +286,7 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and .report_format_version == 4
+    and (.report_format_version == 4 or .report_format_version == 5)
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
@@ -366,10 +373,14 @@ jq -e \
       and .wallet_store_schema_version == 1
       and .wallet_projection_schema_version == 1
       and .wallet_value_encoding_version == 2)
-    and (($report.resource_limits | has("tree_state_checkpoint_coverage")) as $has_coverage
-      | ($report.canonical_storage_ready | has("tree_state_checkpoint_count")) as $has_checkpoint_count
-      | $has_coverage == $has_checkpoint_count
-      and ($expected_tree_state_checkpoint_coverage == "" or $has_coverage)
+    and (($report.report_format_version == 5) as $is_v5
+      | (
+          $is_v5
+          or (
+            $expected_tree_state_checkpoint_coverage == ""
+            and $expected_canonical_publication_mode == ""
+          )
+        )
       and (.resource_limits
       | exact_keys(
           [
@@ -389,15 +400,21 @@ jq -e \
             "wallet_max_temporary_file_bytes_per_sorter",
             "wallet_rocksdb",
             "wallet_sst_target_logical_bytes"
-          ] + (if $has_coverage then ["tree_state_checkpoint_coverage"] else [] end)
+          ] + (if $is_v5 then ["canonical_publication_mode", "tree_state_checkpoint_coverage"] else [] end)
         )
       and (
-        if $has_coverage then
+        if $is_v5 then
           (.tree_state_checkpoint_coverage == "every-block"
             or .tree_state_checkpoint_coverage == "cadence-and-tip")
           and (
             $expected_tree_state_checkpoint_coverage == ""
             or .tree_state_checkpoint_coverage == $expected_tree_state_checkpoint_coverage
+          )
+          and (.canonical_publication_mode == "trusted-fresh"
+            or .canonical_publication_mode == "cold-certified")
+          and (
+            $expected_canonical_publication_mode == ""
+            or .canonical_publication_mode == $expected_canonical_publication_mode
           )
         else
           true
@@ -441,7 +458,15 @@ jq -e \
       | exact_keys(["canonical_storage_ready", "wallet_storage_ready"])
       and (.canonical_storage_ready | acceptance("canonical-storage-ready"))
       and (.wallet_storage_ready | acceptance("wallet-storage-ready")))
-    and (.phase_durations | report_phase_durations)
+    and (.phase_durations
+      | report_phase_durations
+      and (
+        if $is_v5 and $report.resource_limits.canonical_publication_mode == "trusted-fresh" then
+          .canonical_cold_validation_seconds == 0
+        else
+          true
+        end
+      ))
     and (.canonical_storage_ready
       | exact_keys(
           [
@@ -464,7 +489,7 @@ jq -e \
             "visible_event_sequence",
             "visible_tip",
             "workload"
-          ] + (if $has_checkpoint_count then ["tree_state_checkpoint_count"] else [] end)
+          ] + (if $is_v5 then ["tree_state_checkpoint_count"] else [] end)
         )
       and .scope == "canonical-storage-ready"
       and .workload == "wallet"
@@ -478,7 +503,7 @@ jq -e \
       and .block_count == .visible_tip.height
       and (.transaction_count | positive_integer)
       and (
-        if $has_checkpoint_count then
+        if $is_v5 then
           (.tree_state_checkpoint_count | positive_integer)
           and .tree_state_checkpoint_count == expected_tree_state_checkpoint_count(
             $report.resource_limits.tree_state_checkpoint_coverage;

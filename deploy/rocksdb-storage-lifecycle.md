@@ -94,9 +94,12 @@ Zebra shares the Docker engine and is not measured.
 Canonical construction uses `every-block` tree-state checkpoint coverage by
 default, matching fresh default `zinder-ingest` deployments. Set
 `ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=cadence-and-tip` to
-measure the sparse cadence-and-tip construction baseline instead. The chosen
-coverage is recorded in `resource_limits.tree_state_checkpoint_coverage` and
-cross-checked against `canonical_storage_ready.tree_state_checkpoint_count`.
+measure the sparse cadence-and-tip construction baseline instead. Report format
+version 5 records the chosen coverage in
+`resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
+in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
+`cold-certified`), and cross-checks coverage against
+`canonical_storage_ready.tree_state_checkpoint_count`.
 
 The default run publishes from the fresh writer's authenticated construction
 evidence, as ingest does. For a separate run that measures a full prepublication
@@ -131,10 +134,14 @@ independent of the Rust code and pins the exact report shape and contract
 versions. It rejects the evidence unless:
 
 - the store schema, replay, digest, and report versions match the values it
-  pins;
+  pins (report format version 5 for current evidence, with a separate exact
+  version 4 branch for archived reports when no version 5 expectation is
+  passed);
 - canonical `READY` covers heights 1 through the fixed tip, persists the exact
   tree-state checkpoint count required by
-  `resource_limits.tree_state_checkpoint_coverage`, and survives a cold reopen;
+  `resource_limits.tree_state_checkpoint_coverage` (and records zero
+  `canonical_cold_validation_seconds` under `trusted-fresh` publication in
+  version 5), and survives a cold reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,
   and transaction count, and both stores pass the final cold admission;
 - wallet row counts, projection digest, UTXO commitment, and undo depth are

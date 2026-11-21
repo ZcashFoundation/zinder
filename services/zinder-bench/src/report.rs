@@ -18,8 +18,12 @@ use crate::{
     rss::PeakRss,
 };
 
-/// Machine-readable report schema version.
+/// Machine-readable report schema version for `canonical-replay-storage` reports.
 pub const REPORT_FORMAT_VERSION: u32 = 4;
+/// Machine-readable report schema version for `rocksdb-canonical-fixture-replay` reports.
+pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 5;
+/// Machine-readable report schema version for `rocksdb-storage-lifecycle` reports.
+pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 5;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -1440,18 +1444,22 @@ impl BenchmarkReport {
     }
 
     fn validate_contract_identity(&self) -> Result<(), BenchError> {
-        let (contract_identity, report_format_version) = match self {
+        let (contract_identity, report_format_version, expected_report_format_version) = match self
+        {
             Self::CanonicalReplayStorage(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
+                REPORT_FORMAT_VERSION,
             ),
             Self::RocksDbCanonicalFixtureReplay(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
+                ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION,
             ),
             Self::RocksDbStorageLifecycle(report) => (
                 report.contract_identity.as_str(),
                 report.report_format_version,
+                ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION,
             ),
         };
         if contract_identity != REPORT_CONTRACT_IDENTITY {
@@ -1459,9 +1467,9 @@ impl BenchmarkReport {
                 "report contract identity {contract_identity:?} does not match {REPORT_CONTRACT_IDENTITY:?}"
             )));
         }
-        if report_format_version != REPORT_FORMAT_VERSION {
+        if report_format_version != expected_report_format_version {
             return Err(BenchError::report_format(format!(
-                "report format version {report_format_version} does not match {REPORT_FORMAT_VERSION}"
+                "report format version {report_format_version} does not match {expected_report_format_version}"
             )));
         }
         let fixture = match self {
@@ -1921,7 +1929,7 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
     };
     RocksDbCanonicalFixtureReplayReport {
         contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
-        report_format_version: REPORT_FORMAT_VERSION,
+        report_format_version: ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION,
         provenance: ReportProvenance {
             benchmark_version: env!("CARGO_PKG_VERSION"),
             software_revision: None,
@@ -1972,7 +1980,7 @@ pub fn build_rocksdb_storage_lifecycle_report(
 ) -> BenchmarkReport {
     RocksDbStorageLifecycleReport {
         contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
-        report_format_version: REPORT_FORMAT_VERSION,
+        report_format_version: ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION,
         provenance: measurements.provenance,
         storage_candidate: StorageCandidateIdentity::rocksdb_storage_lifecycle(),
         source: measurements.source,
@@ -2516,6 +2524,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
 
         report.validate()?;
         let encoded = serde_json::to_value(&report)?;
+        assert_eq!(encoded["report_format_version"], 5);
         assert_eq!(
             encoded["measurement_kind"],
             "rocksdb-canonical-fixture-replay"
@@ -2601,6 +2610,16 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             inner.source_load.tree_state_checkpoint_count = 11;
         }
         assert!(mismatched_sparse.validate().is_err());
+
+        let mut wrong_version = build_rocksdb_canonical_fixture_replay_report(
+            fixture_summary(),
+            rocksdb_canonical_fixture_measurements(),
+            Some(canonical_fixture_source_exposition()),
+        );
+        if let super::BenchmarkReport::RocksDbCanonicalFixtureReplay(inner) = &mut wrong_version {
+            inner.report_format_version = 4;
+        }
+        assert!(wrong_version.validate().is_err());
         Ok(())
     }
 
@@ -2640,6 +2659,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         dense.validate()?;
         let encoded = serde_json::to_value(&dense)?;
+        assert_eq!(encoded["report_format_version"], 5);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "every-block"
@@ -2656,6 +2676,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         sparse.validate()?;
         let encoded = serde_json::to_value(&sparse)?;
+        assert_eq!(encoded["report_format_version"], 5);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "cadence-and-tip"
@@ -2671,6 +2692,12 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
                 4,
             ));
         assert!(mismatched.validate().is_err());
+
+        let mut wrong_version = dense;
+        if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
+            inner.report_format_version = 4;
+        }
+        assert!(wrong_version.validate().is_err());
         Ok(())
     }
 
@@ -2867,10 +2894,8 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         assert!(AcceptanceThresholds::try_from_seconds(1.0, f64::INFINITY).is_err());
     }
 
-    #[test]
-    fn canonical_replay_storage_reports_semantic_replay_and_omits_unmeasured_contracts()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut report = build_canonical_replay_storage_report(
+    fn sample_canonical_replay_storage_report() -> super::BenchmarkReport {
+        build_canonical_replay_storage_report(
             fixture_summary(),
             CanonicalReplayStorageMeasurements {
                 block_prepare_concurrency: 8,
@@ -2926,12 +2951,19 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 storage_class: None,
                 image_reference: None,
             },
-        );
+        )
+    }
+
+    #[test]
+    fn canonical_replay_storage_reports_semantic_replay_and_omits_unmeasured_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut report = sample_canonical_replay_storage_report();
         report.validate()?;
         let json = serde_json::to_value(&report)?;
 
         assert_eq!(json["measurement_kind"], "canonical-replay-storage");
         assert_eq!(json["contract_identity"], "benchmark-report");
+        assert_eq!(json["report_format_version"], 4);
         assert_eq!(json["fixture"]["contract_identity"], "canonical-fixture");
         assert_eq!(
             json["storage_candidate"]["id"],
@@ -2944,8 +2976,13 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         for omitted_field in ["acceptance", "replay", "lifecycle", "store_reads"] {
             assert!(json.get(omitted_field).is_none(), "{omitted_field}");
         }
-        if let super::BenchmarkReport::CanonicalReplayStorage(replay_storage_report) = &mut report {
-            replay_storage_report.round_trip.replay_format_version = 99;
+        let mut wrong_version = report.clone();
+        if let super::BenchmarkReport::CanonicalReplayStorage(inner) = &mut wrong_version {
+            inner.report_format_version = 5;
+        }
+        assert!(wrong_version.validate().is_err());
+        if let super::BenchmarkReport::CanonicalReplayStorage(inner) = &mut report {
+            inner.round_trip.replay_format_version = 99;
         }
         assert!(report.validate().is_err());
         Ok(())

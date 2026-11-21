@@ -128,8 +128,9 @@ pipeline limits, tree-state checkpoint coverage (`every-block` by default, or
 workload, writer budget, and reader budget for both arms. It fails instead of
 reporting if their authenticated fixture, replay plan, logical replay,
 subtree-root load coverage and digest, fence, or effective-limit identities
-differ. The report records each retention
-contract, raw-blob counts, physical canonical bytes, replay throughput, and a
+differ. Report format version 3 records each retention
+contract, `effective_limits.tree_state_checkpoint_coverage`, raw-blob counts,
+physical canonical bytes, replay throughput, and a
 fresh secondary READY-admission timing. `authenticated_replay_lifecycle_seconds`
 and its throughput field cover the complete authenticated replay lifecycle:
 load, publication, cold reopen, and full-scan certification. They are not
@@ -175,13 +176,15 @@ declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
 independent pipeline tuning flags. Canonical construction defaults to
 `--tree-state-checkpoint-coverage every-block` to match fresh default
 `zinder-ingest` deployments, while `--tree-state-checkpoint-coverage
-cadence-and-tip` retains the sparse cadence-and-tip baseline. The report records
-the actual constructed coverage in
-`resource_limits.tree_state_checkpoint_coverage` and the persisted row count in
+cadence-and-tip` retains the sparse cadence-and-tip baseline. Report format
+version 5 records the actual constructed coverage in
+`resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
+in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
+`cold-certified`), and the persisted row count in
 `canonical_storage_ready.tree_state_checkpoint_count`. The report validator
-recomputes those limits and checkpoint counts before accepting evidence (while
-still accepting archived v4 reports that omit both fields when no expected
-coverage is pinned). Diagnostic parameter sweeps belong to
+recomputes those limits and checkpoint counts for version 5 reports while
+keeping an exact archived version 4 branch for earlier reports when no version 5
+expectation is pinned. Diagnostic parameter sweeps belong to
 `rocksdb-canonical-fixture-replay`.
 
 By default, `--canonical-publication-mode trusted-fresh` uses the same
@@ -1207,8 +1210,10 @@ PepperSync prioritizes. Wallets with history can trigger additional lookups.
 
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
-- `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 4.
+- `report_format_version`: machine-readable report contract version.
+  `canonical-replay-storage` reports use version 4;
+  `rocksdb-canonical-fixture-replay` and `rocksdb-storage-lifecycle` reports use
+  version 5.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1237,10 +1242,12 @@ PepperSync prioritizes. Wallets with history can trigger additional lookups.
   source-planner, admission, preparation, deterministic delay, and
   `tree_state_checkpoint_coverage` (`every-block` or `cadence-and-tip`)
   settings, and the canonical `RocksDB` budget used by the run.
-- Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage` and
-  `canonical_storage_ready.tree_state_checkpoint_count`: the actual construction
-  checkpoint coverage (`every-block` or `cadence-and-tip`) and persisted
-  checkpoint row count (including the predecessor checkpoint).
+- Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
+  `resource_limits.canonical_publication_mode`, and
+  `canonical_storage_ready.tree_state_checkpoint_count` (version 5): the actual
+  construction checkpoint coverage (`every-block` or `cadence-and-tip`), the
+  canonical publication mode (`trusted-fresh` or `cold-certified`), and the
+  persisted checkpoint row count (including the predecessor checkpoint).
 - Canonical-fixture `source_fetch_attribution` reports completed segment
   requests, request and payload rates over replay wall time, cumulative
   request-task seconds, density adjustments, and retained and discarded

@@ -478,7 +478,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["contract_identity"],
         "rocksdb-raw-blob-retention-comparison"
     );
-    assert_eq!(report["report_format_version"], 2);
+    assert_eq!(report["report_format_version"], 3);
     assert_eq!(
         report["arm_execution_order"],
         serde_json::json!(["transactions", "all"])
@@ -814,6 +814,7 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
     }
 
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    assert_eq!(report["report_format_version"], 5);
     assert_eq!(
         report["measurement_kind"],
         "rocksdb-canonical-fixture-replay"
@@ -1061,6 +1062,7 @@ async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_caden
         &output_directory.path().join("dense-report.json"),
         None,
     )?;
+    assert_eq!(dense_report["report_format_version"], 5);
     assert_eq!(
         dense_report["resource_limits"]["tree_state_checkpoint_coverage"],
         "every-block"
@@ -1097,6 +1099,7 @@ async fn canonical_fixture_replay_cli_defaults_to_every_block_and_supports_caden
         &output_directory.path().join("sparse-report.json"),
         Some("cadence-and-tip"),
     )?;
+    assert_eq!(sparse_report["report_format_version"], 5);
     assert_eq!(
         sparse_report["resource_limits"]["tree_state_checkpoint_coverage"],
         "cadence-and-tip"
