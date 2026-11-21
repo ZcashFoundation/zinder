@@ -916,6 +916,57 @@ RPC, storage, and wallet scanner results in their own units. Use the
 dedicated [storage campaign validator](../../deploy/storage-benchmark.md)
 for the PostgreSQL qualification contract.
 
+#### Compare first-block and whole-wallet latency
+
+The [Slipstream and Vizor campaign](../../scripts/compact-range-campaign.example.json)
+runs 16 simulated wallets per endpoint over Testnet heights 4,624,102 through
+4,644,091. Verify the frozen tip hash against the example before starting.
+For a stacked change, build the baseline from the preceding PR head and the
+candidate from the new head. Bind both listeners to the same four physical
+cores and use separate cores for the client and writers.
+Hold the store contents, serving settings (including the 256 KiB opening),
+and build flags constant. Run each profile once on each endpoint to warm
+the caches, and exclude those runs from the comparison.
+Copy the example to `compact-range-campaign.json` and record the server
+revisions, binary hashes, fixture identity, and CPU sets in its `environment`
+object. Put the shared `zinder-bench` binary on `PATH` and run the command on
+your reserved client cores (8–11 here).
+
+```sh
+taskset -c 8-11 python3 scripts/run-benchmark-campaign.py compact-range-campaign.json \
+  --output .tmp/compact-range
+```
+
+A successful run has eight pairs per profile, 319,840 blocks per endpoint
+in each pair, and matching delivered bytes. After the runner exits successfully,
+calculate each pair's change in `GetBlockRange` first-message p99 and whole-wallet sync p99 separately.
+A positive difference means the candidate took longer.
+
+```python
+import json
+from collections import defaultdict
+from pathlib import Path
+from statistics import median
+
+output = Path(".tmp/compact-range")
+
+
+def read_report(run):
+    return json.loads((output / run["path"] / "report.json").read_text())
+
+
+changes = defaultdict(list)
+for pair in json.loads((output / "summary.json").read_text()):
+    before = read_report(pair["runs"]["baseline"])
+    after = read_report(pair["runs"]["candidate"])
+    first = [r["rpcs"]["GetBlockRange"]["first_message_seconds"]["p99"] for r in (before, after)]
+    sync = [r["wallet_sync_seconds"]["p99"] for r in (before, after)]
+    for metric, (old, new) in (("range first", first), ("wallet sync", sync)):
+        changes[pair["case"], metric].append(1000 * (new - old))
+for (profile, metric), samples in changes.items():
+    print(f"{profile} {metric}: {median(samples):+.2f} ms")
+```
+
 ### Canonical runtime tracer
 
 This runs the real `zinder-ingest` image beside an existing Zebra Testnet
