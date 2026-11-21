@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 
 def require(condition, message):
@@ -25,11 +26,38 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build(source, build_dir, harness):
+def lockfile_covers_harness(lockfile):
+    lockfile = Path(lockfile)
+    if not lockfile.is_file():
+        return False
+    with lockfile.open("rb") as handle:
+        document = tomllib.load(handle)
+    packages = document.get("package", [])
+    return any(package.get("name") == "zally-payment-harness" for package in packages)
+
+
+def dependency_pins(lockfile):
+    with lockfile.open("rb") as handle:
+        return {(p["name"], p["version"], p.get("source"), p.get("checksum"))
+                for p in tomllib.load(handle)["package"] if p["name"] != "zally-payment-harness"}
+
+
+def copy_harness(harness, destination):
+    destination = Path(destination)
+    content = Path(harness).read_bytes()
+    # Preserving an older source mtime can hide a revert from Cargo.
+    if destination.is_file() and destination.read_bytes() == content:
+        return
+    destination.write_bytes(content)
+
+
+def build(source, build_dir, harness, jobs=2):
     source = Path(source).resolve()
     build_dir = Path(build_dir).resolve()
     require((source / "crates/zally-wallet/Cargo.toml").is_file(),
             "Zally source path does not contain crates/zally-wallet")
+    require((source / "Cargo.lock").is_file(),
+            "Zally source path does not contain Cargo.lock")
     build_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     (build_dir / "src").mkdir(exist_ok=True)
     manifest = build_dir / "Cargo.toml"
@@ -37,6 +65,7 @@ def build(source, build_dir, harness):
 name = "zally-payment-harness"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
 
 [workspace]
 
@@ -51,17 +80,26 @@ tokio-stream = "0.1"
 serde_json = "1.0"
 zcash_protocol = {{ version = "=0.11.0", features = ["local-consensus"] }}
 """)
-    if not (build_dir / "Cargo.lock").is_file():
-        shutil.copy2(source / "Cargo.lock", build_dir / "Cargo.lock")
-    shutil.copy2(harness, build_dir / "src/main.rs")
-    binary = build_dir / "target/debug/zally-payment-harness"
-    if not binary.is_file():
-        command = ["cargo", "build", "--locked", "--manifest-path", str(manifest)]
-        if (build_dir / "Cargo.lock").is_file():
-            command.insert(2, "--offline")
-        subprocess.run(command, cwd=build_dir, check=True)
-    require(binary.is_file(), "Zally payment harness build produced no binary")
-    return binary
+    copy_harness(harness, build_dir / "src/main.rs")
+    lockfile = build_dir / "Cargo.lock"
+    source_lock = source / "Cargo.lock"
+    pins = dependency_pins(source_lock)
+    command = ["cargo", "build", "--offline", "--jobs", str(jobs), "--message-format=json-render-diagnostics",
+               "--manifest-path", str(manifest), "--target-dir", str(build_dir / "target")]
+    if lockfile_covers_harness(lockfile):
+        require(dependency_pins(lockfile) <= pins, "standalone lockfile differs from Zally dependency pins")
+        command.append("--locked")
+    else:
+        shutil.copy2(source_lock, lockfile)
+    build_result = subprocess.run(command, cwd=source, check=True, stdout=subprocess.PIPE, text=True)
+    require(lockfile_covers_harness(lockfile), "Zally harness build produced no standalone lockfile")
+    require(dependency_pins(lockfile) <= pins, "standalone lockfile differs from Zally dependency pins")
+    executables = [Path(item["executable"]) for line in build_result.stdout.splitlines()
+                   if (item := json.loads(line))["reason"] == "compiler-artifact" and item.get("executable")
+                   and item["target"]["name"] == "zally-payment-harness" and "bin" in item["target"]["kind"]]
+    require(len(executables) == 1 and executables[0].is_file(), "Zally payment harness build produced no binary")
+    return executables[0]
+
 
 
 class Zally:

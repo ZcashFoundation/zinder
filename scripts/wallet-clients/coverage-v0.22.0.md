@@ -35,8 +35,8 @@ The private evidence files are `verified-r6/receipt.json` (SHA-256 `bdb21fdfc5e5
 On three independent Regtest chains, each engine paid a Zingo wallet, received a
 payment from a second Zingo wallet, and spent the received funds back. The 18
 rows capture what the payer and recipient could observe for each of the nine
-signed transfers. The ten-confirmation balances and reopened results matched
-the reference runs. [Reproduce and compare the payment roles](payment-roles.md)
+signed transfers. Both wallets recorded their balances at the ninth block after
+inclusion (ten confirmations). Zingo read back its balance and history offline. [Reproduce and compare the payment roles](payment-roles.md)
 
 | Engine | Evidence and limits |
 |---|---|

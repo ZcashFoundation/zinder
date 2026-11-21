@@ -3,9 +3,11 @@
 Run three signed payments between a wallet engine and independently keyed Zingo
 wallets on disposable Regtest. First the engine pays Zingo. A different Zingo
 wallet then pays a fresh engine wallet, which spends the received funds back.
-The receipt captures both wallets' balances at ten confirmations on each leg.
-After reopening each wallet, the harness checks the balance and the history
-entries its interface exposes.
+The runner counts the inclusion block as confirmation one, then mines to the
+ninth block after inclusion. It records each wallet’s height with its balance
+and checks both heights against the canonical transaction. Zingo reopens
+offline to read its persisted balance and history. Zally also reads back the
+return change note from its reopened database.
 
 The fixture operator publishes loopback endpoints. Choose an unused port base
 with `--base`. The defaults are 51000 for Vizor, 51100 for devtool, and 51200
@@ -39,6 +41,8 @@ python3 scripts/wallet-clients/zally-payment.py build \
 CARGO_TARGET_DIR="$build_root/devtool" \
   cargo build --locked --manifest-path "$devtool_source/Cargo.toml" --features regtest_support
 ```
+
+The Zally build uses the source checkout’s toolchain and Cargo cache. Fetch its locked dependencies before an offline run. The first build derives a standalone lockfile from the workspace lock. Each later build uses `--locked`. The runner checks dependency versions, sources, and checksums against the selected workspace and uses the executable reported by Cargo.
 
 Use a disposable Vizor source checkout for the example build. Its HID dependency requires `libudev-dev`.
 
@@ -76,6 +80,9 @@ python3 scripts/wallet-clients/payment-roles.py --engine zally --base 51200 \
   --native-probe-python "$wallet_python" --native-proto-dir "$python_proto" \
   --evidence "$output/zally"
 ```
+
+To compile the Zally driver during the run, supply `--zally-build "$build_root/zally"`
+in place of the binary argument.
 
 For devtool, install `strace` and generate the lightwalletd modules in the
 Python environment used for the live identity probe. The runner checks the
@@ -136,13 +143,14 @@ The sender recorded the inbound memo, but Zally did not retain it in the
 receive row.
 
 The devtool Sapling receiver credited an incoming transfer and spent it back.
-The incoming row contained no memo. Unified receiver use and inbound memo
+The incoming output had a SQL `NULL` memo. A retained memo with different
+contents fails the case. Unified receiver use and inbound memo
 decryption remain unexercised for this build. The connect trace identifies
 the wallet's destination. The probe measures the server's revision and block
 hash. Neither identifies the gRPC methods used by the wallet.
 
 Pending assertions describe the snapshot taken before mining. Across repeated
 Zally-to-Zingo payments, Zingo sometimes had a pending receive row at that
-instant. The ten-confirmation credit and reopened balance agreed across runs.
+instant. The receipt identifies the wallet height at which each settled credit was measured.
 The coverage rows describe tested wallet engines and interfaces. Mobile apps,
 hardware signing, and production capacity require separate evidence.
