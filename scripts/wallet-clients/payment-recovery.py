@@ -407,7 +407,8 @@ class Recovery:
         return current
 
     def prepare_wallets(self):
-        anchor = self.rpc("getblockcount")
+        anchor = self.receipt["fixture"]["anchor"]["height"]
+        require(self.rpc("getblockcount") == anchor, "fixture tip changed before wallet initialization")
         config = {"network": "regtest", "case": self.case, "revision": self.args.revision,
                   "ready_sha256": digest(self.private / "fixture-initial.json"),
                   "zingo_sha256": digest(self.args.zingo), "zallet_sha256": digest(self.args.zallet_backend)}
@@ -434,10 +435,9 @@ class Recovery:
         else:
             data["wallets"] = identities
             self.journal.save()
-        first = self.balances()
-        require(all(type(snapshot["height"]) is int and snapshot["height"] >= birthday
-                    for snapshot in (first["zingo"], first["zallet"])),
-                "a wallet has not indexed its starting height")
+        first = self.wait_height("initial wallet scan", anchor)
+        require(all(snapshot["height"] == anchor for snapshot in first.values()),
+                "initial wallet height differs from the frozen fixture anchor")
         self.receipt["clients"] = {
             "zingo_sha256": config["zingo_sha256"],
             "zallet_sha256": config["zallet_sha256"],
@@ -637,7 +637,10 @@ class Recovery:
         surfaces = self.wait_tip("return surfaces")
         confirmed = self.wait_confirmed(return_txid, inclusion["height"], "return confirmation")
         accounting = self.assert_return(after_outbound, confirmed, return_txid, inclusion["height"])
-        returned = self.wait_spendable(self.zingo, RETURN, "Zingo return spendability")
+        expected = accounting["payee_after_zat"]
+        returned = self.wait_spendable(self.zingo, expected, "Zingo return spendability")
+        require(returned["spendable_zat"] == expected,
+                "Zingo spendable funds differ from its reconciled post-return balance")
         legs["return"] = (return_txid, inclusion)
         return {"tx_fingerprint": tx_fingerprint(return_txid), "mined_height": inclusion["height"],
                 "block_hash": inclusion["block_hash"], "pending": pending,

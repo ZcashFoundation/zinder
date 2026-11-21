@@ -13,7 +13,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 M = runpy.run_path(str(Path(__file__).resolve().with_name("payment-recovery.py")))
 GLOBALS = M["campaign"].__globals__
@@ -69,6 +69,52 @@ class LedgerAccounting(unittest.TestCase):
             M["require_single_confirmed"](balance(0, [row(height=None, pending=True)]), TXID, 20)
         with self.assertRaisesRegex(ValueError, "exactly one"):
             M["require_single_confirmed"](balance(0, [row(), row()]), TXID, 20)
+
+
+class WalletSettlement(unittest.TestCase):
+    def test_startup_records_the_frozen_height_after_both_wallets_reach_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            private = Path(folder)
+            fixture = private / "fixture-initial.json"
+            fixture.write_text("{}")
+            args = argparse.Namespace(output=private, zingo=fixture, zallet_backend=fixture,
+                                      port_base=20000, revision="a" * 40, wait_seconds=5)
+            recovery = M["Recovery"]("disconnect", args)
+            recovery.private = private
+            recovery.ready = {"lightwalletd": "http://127.0.0.1:20067",
+                              "native_wallet_query": "http://127.0.0.1:20002"}
+            recovery.receipt["fixture"] = {"anchor": {"height": 150}}
+            recovery.rpc = Mock(return_value=150)
+            zingo, zallet = Mock(), Mock()
+            zingo.prepare.return_value, zallet.prepare.return_value = "payer", "payee"
+            zingo.snapshot.return_value = balance(0, height=150)
+            zallet.snapshot.side_effect = [balance(0, height=149), balance(0, height=150)]
+            with (patch.dict(GLOBALS, Zingo=Mock(return_value=zingo), Zallet=Mock(return_value=zallet),
+                             RoundTrip=Mock()), patch("time.sleep")):
+                recovery.prepare_wallets()
+            self.assertEqual(recovery.receipt["initial_wallet_heights"], {"zingo": 150, "zallet": 150})
+            self.assertEqual(zallet.snapshot.call_count, 2)
+
+    def test_preexisting_spendable_funds_cannot_satisfy_return_maturity(self):
+        recovery = M["Recovery"]("disconnect", argparse.Namespace(output=Path("."), wait_seconds=5))
+        existing, returned = 10_000_000, M["RETURN"]
+        total = existing + returned
+        recovery.zingo, recovery.zallet = Mock(), Mock()
+        recovery.zingo.snapshot.side_effect = [balance(total, spendable=existing),
+                                              balance(total, spendable=total)]
+        recovery.trip = Mock()
+        recovery.broadcast = Mock(return_value=TXID)
+        recovery.observe_pending = Mock(return_value={})
+        recovery.wait_tip = Mock(return_value={})
+        recovery.canonical = Mock(return_value={"height": 20, "block_hash": HASH_A})
+        recovery.wait_confirmed = Mock(return_value={
+            "zingo": balance(total, [row(amount=returned, memos=(M["MEMO_RETURN"],))]),
+            "zallet": balance(1_000_000, [row(fee=25_000)])})
+        before = {"zingo": balance(existing), "zallet": balance(1_000_000 + returned + 25_000)}
+        with patch("time.sleep"):
+            result = recovery.settle_return(before, {})
+        self.assertEqual(result["spendable_after_zat"], total)
+        self.assertEqual(recovery.zingo.snapshot.call_count, 2)
 
 
 class CanonicalInclusion(unittest.TestCase):
