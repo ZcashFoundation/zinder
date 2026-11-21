@@ -1429,3 +1429,110 @@ outside `{scratch}` and `{report}`. Review receipts before sharing them and reta
 the manifest privately to reproduce its digest. Historical sync-only evaluations
 and paired throughput campaigns remain separate evidence, using
 `scripts/run-zkool-restore.py` and `scripts/run-benchmark-campaign.py` respectively.
+
+## Compare wallet correctness across releases
+
+The [wallet coverage matrix](../../scripts/wallet-clients/coverage-v0.22.0.md)
+records each wallet build, interface, fixture, action, observed RPCs, and wallet
+assertions. A successful restore can prove persisted history even when its
+receipt identifies only the endpoint. Field handling requires a wallet
+observation or an inspection of the pinned consumer. Keep native WalletQuery and
+lightwalletd observations under their respective interfaces.
+
+Build the pinned Zingo CLI and Zkool example and generate the Python protobuf
+modules using the [client build instructions](../../scripts/wallet-clients/README.md#prerequisites).
+Use Linux with `strace`. Install the Python `toml` package in the same venv
+for the native ZIT driver and fixture commands. Set `release_tag` to the locally available selected
+release tag and `release_sha` to its peeled commit. Set `evidence` to a new
+private parent directory and `python_proto` to the generated modules.
+
+For the Testnet checks, serve an isolated, peerless copy of the Zebra, canonical,
+and wallet stores at the height and hash in the
+[fixture descriptor](../../scripts/wallet-clients/subtree-testnet.json).
+Use the selected release's ingest, projector, and lightwalletd binaries. Wait
+until all three report the fixture tip. Set `local_wallet_url` to that compat
+listener on IPv4 loopback. Each command verifies the running server commit and
+chain fence before starting. The public recovery vector has known historical
+activity in this window. Keep wallet databases and raw logs private.
+
+The reference Zkool engines have pinned executable digests. For a different build, pass `--client-version VERSION` from its source checkout to the interrupted-stream and reorg commands. Each receipt records the version alongside the executable digest.
+
+```bash
+release_sha=$(git rev-parse "$release_tag^{commit}")
+export PYTHONPATH="$python_proto"
+"$client_venv/bin/python" scripts/wallet-clients/subtree-ab.py \
+  --client "$zingo_cli" --endpoint "$local_wallet_url" \
+  --release-commit "$release_sha" --output "$evidence/subtree" \
+  --pagination --invalid-root-control
+"$client_venv/bin/python" scripts/wallet-clients/interrupted-zkool.py \
+  --client "$zkool_engine" --client-sha256 "$engine_sha256" \
+  --endpoint "$local_wallet_url" --revision "$release_sha" \
+  --output "$evidence/interrupted"
+```
+
+The first case restores the same wallet into fresh databases and changes only the
+completion block hash byte order. Separate controls exercise one-row pagination
+and the wallet's error path for an invalid Sapling root. The second case ends a
+compact-block stream after 64 delivered blocks, reopens the same Zkool database
+in a fresh process, and compares its final transaction history, notes, and pool
+balances with an uninterrupted restore. Both cases observe the wallet process's
+connections. The Zkool example exposes `testnet-read sync`, `resume`, and
+`report` for this check.
+
+To test wallet-visible rollback, use disposable Regtest images and matching
+release binaries. The runner creates an isolated fixture, mines an owned
+Ironwood coinbase on each side of the fork point, invalidates the later block,
+and follows the replacement chain through another process restart. It verifies
+the surviving transaction and the removal of the orphan's note and balance.
+
+```bash
+"$client_venv/bin/python" scripts/wallet-clients/reorg-zkool.py \
+  --engine "$zkool_engine" --engine-sha256 "$engine_sha256" \
+  --images "$fixture_images" --bin-dir "$release_bin_dir" \
+  --revision "$release_sha" --proto-dir "$python_proto" \
+  --port-base 48100 --output "$evidence/reorg"
+```
+
+For native stale-view recovery, build the ZIT external driver from
+`zcash/integration-tests` at `485e7616f75b176ace08ac359cfd56d40dab951c`
+against the selected Zallet checkout. The v0.22.0 baseline used Zallet
+`32488c5554e5e0275c3313b2fc06c00e6780746a`. Pin the resulting test executable
+and ordinary backend by SHA-256. The driver exposes a barrier before a native
+full-block read. The scenario changes the query epoch on its own disposable
+fixture, checks that the rejected read leaves scan work pending, then retries
+the entire range and verifies persisted canonical block hashes. The test
+harness triggers the retry.
+
+```bash
+zit_driver=$("$client_venv/bin/python" "$zit_root/qa/rpc-tests/build_zinder_driver.py" \
+  --zallet-root "$zallet_root" --build-dir "$zit_build")
+"$client_venv/bin/python" scripts/wallet-clients/native-expiry.py \
+  --driver "$zit_driver" --driver-sha256 "$zit_driver_sha256" \
+  --backend "$zallet_backend" --backend-sha256 "$zallet_backend_sha256" \
+  --images "$fixture_images" --bin-dir "$release_bin_dir" \
+  --revision "$release_sha" --port-base 48300 --output "$evidence/native-expiry"
+```
+
+Collect all eight schema-v2 lifecycle results using one `--lifecycle MANIFEST
+SUMMARY READY` argument per run. Supply fresh scenario receipts for the selected
+release. The comparator reports missing scenarios, lost calls, and lost wallet
+assertions. A focused rerun may legitimately report uncovered scenarios; review
+those lines before making a release-wide claim. To compare one family of
+scenarios, add `--scenario-prefix zkool-reorg-` to `compare`. Supply existing
+release-bound observations with repeated `--observations FILE` arguments.
+
+```bash
+python3 scripts/wallet-clients/coverage.py collect --release "$release_tag" \
+  --revision "$release_sha" "${lifecycle_args[@]}" \
+  --subtree-run "$evidence/subtree" --reorg-result "$evidence/reorg/receipt.json" \
+  --interrupted-result "$evidence/interrupted/receipt.json" \
+  --native-expiry-result "$evidence/native-expiry/receipt.json" \
+  --output "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py check "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py compare "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py render "$evidence/coverage.json" > "$evidence/coverage.md"
+```
+
+## Verify a two-wallet payment and return
+
+Use the [Zingo and Zallet round-trip procedure](../../scripts/wallet-clients/roundtrip.md) to verify a transfer through lightwalletd and native WalletQuery on the same chain. The disposable Regtest case controls mining and compares outcomes across independent runs. The live Testnet case can fund one payer through Fauzec and observe the payment through the selected release. Keep its private wallet state for interruption recovery.

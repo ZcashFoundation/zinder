@@ -1,0 +1,1826 @@
+{
+  "schema_version": 1,
+  "release": {
+    "tag": "v0.22.0",
+    "commit": "999d51ab835037a2466763ca1a1e7739a26b72c1"
+  },
+  "inventory": {
+    "lightwalletd": [
+      "GetAddressUtxos",
+      "GetAddressUtxosStream",
+      "GetBlock",
+      "GetBlockNullifiers",
+      "GetBlockRange",
+      "GetBlockRangeNullifiers",
+      "GetLatestBlock",
+      "GetLatestTreeState",
+      "GetLightdInfo",
+      "GetMempoolStream",
+      "GetMempoolTx",
+      "GetStandardFee",
+      "GetSubtreeRoots",
+      "GetTaddressBalance",
+      "GetTaddressBalanceStream",
+      "GetTaddressTransactions",
+      "GetTaddressTxids",
+      "GetTransaction",
+      "GetTreeState",
+      "Ping",
+      "SendTransaction"
+    ],
+    "native-wallet-query": [
+      "BlockHeaderBySelector",
+      "BlockIdBySelector",
+      "BroadcastTransaction",
+      "ChainEvents",
+      "ChainValuePoolsAtTip",
+      "CompactBlock",
+      "CompactBlocksInRange",
+      "FullBlock",
+      "FullBlocksInRange",
+      "LatestTreeStateCheckpoint",
+      "MempoolEvents",
+      "MempoolSnapshot",
+      "NetworkUpgradeActivations",
+      "ServerInfo",
+      "SettledTipBlock",
+      "SubtreeRoots",
+      "Transaction",
+      "TransparentAddressTxIdsInRange",
+      "TransparentAddressUnspentOutputs",
+      "TransparentOutpointSpendStatus",
+      "TreeStateAtHeight",
+      "VisibleTipBlock"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "cake-funded-lifecycle",
+      "wallet": "cake",
+      "version": "6.5.4-cb3e96f1",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "77dbfc893c93362e81220610b987fa8b76ce8d38cd2571da79bfcfa89f5b15ff",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "12646be51e8cdbb3f1fd6fde391c5579b4991767a3f3ceada88b5edbd2ac98ce"
+      }
+    },
+    {
+      "id": "devtool-funded-lifecycle",
+      "wallet": "zcash-devtool",
+      "version": "c8322f7e71ae46ab24801a721523ba83b27d911b",
+      "variant": "regtest-sapling",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "9dd332881b802fe5e11f41af7465addca7157bff6e2625bdde29be30074e1aaf",
+      "fixture": "disposable-zcash-regtest-95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "e097e1e7c0dc01beca5e0abcdeeb2b81681f2bd774bf37fa6f81c02fd83d81ee"
+      }
+    },
+    {
+      "id": "lightwalletd-testnet-contract",
+      "wallet": "Direct protobuf probe",
+      "version": "1",
+      "variant": "sparse-store",
+      "implementation": "contract",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "fixture": "Testnet frozen at 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Compare frozen lightwalletd tip, frontier and contiguous block range against references",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "tip-matches-node": "pass",
+        "three-pool-frontiers": "pass",
+        "contiguous-linked-blocks": "pass",
+        "range-wire-digest": "pass"
+      },
+      "methods": {
+        "GetLatestBlock": {
+          "calls": 1,
+          "fields": {
+            "BlockID.hash": {
+              "handling": "compared",
+              "assertion": "tip-matches-node"
+            }
+          }
+        },
+        "GetTreeState": {
+          "calls": 32,
+          "fields": {
+            "TreeState.saplingTree": {
+              "handling": "compared",
+              "assertion": "three-pool-frontiers"
+            },
+            "TreeState.orchardTree": {
+              "handling": "compared",
+              "assertion": "three-pool-frontiers"
+            },
+            "TreeState.ironwoodTree": {
+              "handling": "compared",
+              "assertion": "three-pool-frontiers"
+            }
+          }
+        },
+        "GetBlockRange": {
+          "calls": 3,
+          "fields": {
+            "CompactBlock.prevHash": {
+              "handling": "compared",
+              "assertion": "contiguous-linked-blocks"
+            }
+          }
+        }
+      },
+      "evidence": {
+        "description": "Frozen serving parity / 22-sparse/parity.json",
+        "sha256": "d08d68eb9d5cad3d6c6e355e59d092f8bbe1b8f61f98712e4ddce08404c13ca2"
+      }
+    },
+    {
+      "id": "native-regtest-identity-contract",
+      "wallet": "Direct WalletQuery probe",
+      "version": "1",
+      "variant": "server-info",
+      "implementation": "contract",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "fixture": "disposable-regtest-7f0eeed0ec92c635853baf0de36b9d54edb82d1d4d32136837597a0292fce70e",
+      "action": "Read native service identity and compare it to the selected release and fixture",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "native-release-and-network": "pass"
+      },
+      "methods": {
+        "ServerInfo": {
+          "calls": 1,
+          "fields": {
+            "info.common.buildGitCommit": {
+              "handling": "compared",
+              "assertion": "native-release-and-network"
+            }
+          }
+        }
+      },
+      "evidence": {
+        "description": "Funded Regtest / zally/ServerInfo.json",
+        "sha256": "ecda881df836d19f287c992471e4643a8fe7d8e3f274a515f9e8588822ec1b18"
+      }
+    },
+    {
+      "id": "native-regtest-visible-tip-contract",
+      "wallet": "Direct WalletQuery probe",
+      "version": "1",
+      "variant": "zebra-control",
+      "implementation": "contract",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "fixture": "disposable-regtest-7f0eeed0ec92c635853baf0de36b9d54edb82d1d4d32136837597a0292fce70e",
+      "action": "Read the native visible tip and compare its block ID to the private control node",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "native-tip-matches-node": "pass"
+      },
+      "methods": {
+        "VisibleTipBlock": {
+          "calls": 1,
+          "fields": {
+            "visibleTipBlock.height": {
+              "handling": "compared",
+              "assertion": "native-tip-matches-node"
+            },
+            "visibleTipBlock.blockHash": {
+              "handling": "compared",
+              "assertion": "native-tip-matches-node"
+            }
+          }
+        }
+      },
+      "evidence": {
+        "description": "Funded Regtest / zally/node-confirmation.json",
+        "sha256": "ad6e9ed83ae3ab826c800f6dfc10c333a3ad7005cf576f44ee90cbd4cc3e7e5a"
+      }
+    },
+    {
+      "id": "roundtrip-outbound-zallet-receive",
+      "wallet": "zallet",
+      "version": "binary 0851230a1971",
+      "interface": "native-wallet-query",
+      "implementation": "app",
+      "variant": "ordinary",
+      "network": "zcash-regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest 029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327 at 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "action": "Receive the outbound payment from Zingo",
+      "assertions": {
+        "independent-repeat": "pass",
+        "pending-wallet-state": "pass",
+        "node-mempool": "pass",
+        "wallet-confirmed-at-mined-height": "pass",
+        "persisted-transaction-and-balance": "pass",
+        "received-amount": "pass",
+        "decrypted-memo": "pass",
+        "recipient-credit": "pass",
+        "received-funds-spendable": "pass",
+        "independent-canonical-block-membership": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "balance_after": 10000000,
+        "spendable_after": 10000000
+      },
+      "evidence": {
+        "description": "Independent Regtest round trips / first receipt.json",
+        "sha256": "bdb21fdfc5e57498c5410371db98f773e42dc3a9203cba24377c2b6e4308420b",
+        "related_sha256": {
+          "repeat-receipt": "a9ef2384176bb5509073a6b4a4b740c4ef4e67201433f6167612faf95b1f0ef1",
+          "canonical-audit": "faaa579db3101aaf11edb191ea74aee4bdb332f6a0c9732cef2f5facfd4c4c50"
+        }
+      }
+    },
+    {
+      "id": "roundtrip-outbound-zingo-send",
+      "wallet": "zingo",
+      "version": "binary 0eb8c60c0970",
+      "interface": "lightwalletd",
+      "implementation": "engine",
+      "variant": "nakednet-cli",
+      "network": "zcash-regtest",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest 029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327 at 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "action": "Send the outbound payment to Zallet",
+      "assertions": {
+        "independent-repeat": "pass",
+        "pending-wallet-state": "pass",
+        "node-mempool": "pass",
+        "wallet-confirmed-at-mined-height": "pass",
+        "persisted-transaction-and-balance": "pass",
+        "signed-payment": "pass",
+        "sender-debit-includes-fee": "pass",
+        "independent-canonical-block-membership": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 10000,
+        "balance_after": 489975000
+      },
+      "evidence": {
+        "description": "Independent Regtest round trips / first receipt.json",
+        "sha256": "bdb21fdfc5e57498c5410371db98f773e42dc3a9203cba24377c2b6e4308420b",
+        "related_sha256": {
+          "repeat-receipt": "a9ef2384176bb5509073a6b4a4b740c4ef4e67201433f6167612faf95b1f0ef1",
+          "canonical-audit": "faaa579db3101aaf11edb191ea74aee4bdb332f6a0c9732cef2f5facfd4c4c50"
+        }
+      }
+    },
+    {
+      "id": "roundtrip-return-zallet-send",
+      "wallet": "zallet",
+      "version": "binary 0851230a1971",
+      "interface": "native-wallet-query",
+      "implementation": "app",
+      "variant": "ordinary",
+      "network": "zcash-regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest 029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327 at 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, zingo 0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "action": "Send the return payment to Zingo",
+      "assertions": {
+        "independent-repeat": "pass",
+        "pending-wallet-state": "pass",
+        "node-mempool": "pass",
+        "wallet-confirmed-at-mined-height": "pass",
+        "persisted-transaction-and-balance": "pass",
+        "signed-payment": "pass",
+        "sender-debit-includes-fee": "pass",
+        "spend-received-funds": "pass",
+        "change-reconciled": "pass",
+        "independent-canonical-block-membership": "pass"
+      },
+      "accounting_zat": {
+        "amount": 4000000,
+        "fee": 25000,
+        "balance_after": 5975000,
+        "change": 5975000
+      },
+      "evidence": {
+        "description": "Independent Regtest round trips / first receipt.json",
+        "sha256": "bdb21fdfc5e57498c5410371db98f773e42dc3a9203cba24377c2b6e4308420b",
+        "related_sha256": {
+          "repeat-receipt": "a9ef2384176bb5509073a6b4a4b740c4ef4e67201433f6167612faf95b1f0ef1",
+          "canonical-audit": "faaa579db3101aaf11edb191ea74aee4bdb332f6a0c9732cef2f5facfd4c4c50"
+        }
+      }
+    },
+    {
+      "id": "roundtrip-return-zingo-receive",
+      "wallet": "zingo",
+      "version": "binary 0eb8c60c0970",
+      "interface": "lightwalletd",
+      "implementation": "engine",
+      "variant": "nakednet-cli",
+      "network": "zcash-regtest",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest 029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327 at 150, schedule 95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c, sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "action": "Receive the return payment from Zallet",
+      "assertions": {
+        "independent-repeat": "pass",
+        "pending-wallet-state": "pass",
+        "node-mempool": "pass",
+        "wallet-confirmed-at-mined-height": "pass",
+        "persisted-transaction-and-balance": "pass",
+        "received-amount": "pass",
+        "decrypted-memo": "pass",
+        "recipient-credit": "pass",
+        "independent-canonical-block-membership": "pass"
+      },
+      "accounting_zat": {
+        "amount": 4000000,
+        "balance_after": 493975000,
+        "spendable_after": 493975000
+      },
+      "evidence": {
+        "description": "Independent Regtest round trips / first receipt.json",
+        "sha256": "bdb21fdfc5e57498c5410371db98f773e42dc3a9203cba24377c2b6e4308420b",
+        "related_sha256": {
+          "repeat-receipt": "a9ef2384176bb5509073a6b4a4b740c4ef4e67201433f6167612faf95b1f0ef1",
+          "canonical-audit": "faaa579db3101aaf11edb191ea74aee4bdb332f6a0c9732cef2f5facfd4c4c50"
+        }
+      }
+    },
+    {
+      "id": "vizor-funded-lifecycle",
+      "wallet": "vizor",
+      "version": "v0.0.65",
+      "variant": "rust-engine",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "ba0ae9632d7e84c64a8d23cc2444cbc31f4b55076721c596567e2362bfc35add",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "552e60904a953abaf581694995d26439305c2ab16f6097ee27a465640bda0621"
+      }
+    },
+    {
+      "id": "zallet-bounded-acquire-and-pause",
+      "wallet": "zallet",
+      "version": "ZIT pinned driver",
+      "implementation": "engine",
+      "variant": "bounded-scan-certification driver ed89c2f7840d615828d589a507d1b2934459d74f91ee5f1b3581baa96ff2d1ac",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "interface": "native-wallet-query",
+      "network": "zcash-regtest",
+      "fixture": "disposable native all-retention at height 150",
+      "action": "Acquire and pause during bounded native scan",
+      "status": "pass",
+      "method_scope": "partial",
+      "methods": {
+        "ServerInfo": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "TreeStateAtHeight": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "VisibleTipBlock": {
+          "calls": 4,
+          "outcomes": {
+            "ok": 4
+          }
+        }
+      },
+      "assertions": {
+        "target-only-connections": "pass"
+      },
+      "evidence": {
+        "description": "Native bounded-scan expiry / receipt.json",
+        "sha256": "35df43b9e92bce3d788e31adfb07910554d619887e141ef256f4f69e744fbea5"
+      }
+    },
+    {
+      "id": "zallet-bounded-initialize",
+      "wallet": "zallet",
+      "version": "ZIT pinned driver",
+      "implementation": "engine",
+      "variant": "bounded-scan-certification driver ed89c2f7840d615828d589a507d1b2934459d74f91ee5f1b3581baa96ff2d1ac",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "interface": "native-wallet-query",
+      "network": "zcash-regtest",
+      "fixture": "disposable native all-retention at height 150",
+      "action": "Initialize during bounded native scan",
+      "status": "pass",
+      "method_scope": "partial",
+      "methods": {
+        "ServerInfo": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "TreeStateAtHeight": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "VisibleTipBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "assertions": {
+        "target-only-connections": "pass"
+      },
+      "evidence": {
+        "description": "Native bounded-scan expiry / receipt.json",
+        "sha256": "35df43b9e92bce3d788e31adfb07910554d619887e141ef256f4f69e744fbea5"
+      }
+    },
+    {
+      "id": "zallet-bounded-stale-read-and-retry",
+      "wallet": "zallet",
+      "version": "ZIT pinned driver",
+      "implementation": "engine",
+      "variant": "bounded-scan-certification driver ed89c2f7840d615828d589a507d1b2934459d74f91ee5f1b3581baa96ff2d1ac",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "interface": "native-wallet-query",
+      "network": "zcash-regtest",
+      "fixture": "disposable native all-retention at height 150",
+      "action": "Stale read and retry during bounded native scan",
+      "status": "pass",
+      "method_scope": "partial",
+      "methods": {
+        "FullBlocksInRange": {
+          "calls": 2,
+          "outcomes": {
+            "failed_precondition": 1,
+            "ok": 1
+          }
+        },
+        "TreeStateAtHeight": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "VisibleTipBlock": {
+          "calls": 4,
+          "outcomes": {
+            "ok": 4
+          }
+        }
+      },
+      "assertions": {
+        "target-only-connections": "pass",
+        "expired-metadata-unchanged": "pass",
+        "expired-scan-work-still-pending": "pass",
+        "complete-retry-on-new-epoch": "pass",
+        "retry-hashes-match-canonical": "pass",
+        "retry-scan-work-completed": "pass",
+        "typed-expired-view-error": "pass"
+      },
+      "evidence": {
+        "description": "Native bounded-scan expiry / receipt.json",
+        "sha256": "35df43b9e92bce3d788e31adfb07910554d619887e141ef256f4f69e744fbea5"
+      }
+    },
+    {
+      "id": "zallet-native-funded-lifecycle",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "network": "zcash-regtest",
+      "interface": "native-wallet-query",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "fixture": "disposable-zcash-regtest-7f0eeed0ec92c635853baf0de36b9d54edb82d1d4d32136837597a0292fce70e",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "e48dd5d92b1738f6d512b03326630f501a368079ae4d58d0eb631e3eb20ea1d8"
+      }
+    },
+    {
+      "id": "zally-native-funded-lifecycle",
+      "wallet": "zally",
+      "version": "0.2.2-stack-upgrade-v2-guarded",
+      "variant": "typed-headless",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "native-wallet-query",
+      "client_sha256": "7133d3a43b9ef506abc7cfea005e536888fd04a6337c0b35eb68ddb8d2571683",
+      "fixture": "disposable-zcash-regtest-7f0eeed0ec92c635853baf0de36b9d54edb82d1d4d32136837597a0292fce70e",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "26491f014a8b24f308524f407ade8442a367907624351ea3b5449575ddc17682"
+      }
+    },
+    {
+      "id": "zingo-nakednet-cli-funded-lifecycle",
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "disposable-zcash-regtest-95308d95d681fc079401d389901b42ff53e4f4ee8a174e9c7738b605a6b75e6c",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "7cc031ca9a91239d4a87cfbba735b32218531e22869f26d112ed2f184f90a7d2"
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-invalid-root",
+      "action": "Restore with an invalid Sapling root encoding",
+      "assertions": {
+        "invalid-sapling-root-rejected": "pass",
+        "no-blocks-scanned": "pass"
+      },
+      "methods": {
+        "GetLatestBlock": {
+          "calls": 1
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6,
+          "fields": {
+            "SubtreeRoot.rootHash": {
+              "handling": "validated",
+              "assertion": "invalid-sapling-root-rejected"
+            }
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        },
+        "GetTreeState": {
+          "calls": 2
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-one-row-restart",
+      "action": "Restart with one-row Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "persisted-state-after-process-reopen": "pass"
+      },
+      "methods": {
+        "GetBlock": {
+          "calls": 1
+        },
+        "GetLatestBlock": {
+          "calls": 1
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-one-row-restore",
+      "action": "Restore with one-row Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "populated-sapling-pagination": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 2
+        },
+        "GetLatestBlock": {
+          "calls": 4
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 11
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        },
+        "GetTransaction": {
+          "calls": 3
+        },
+        "GetTreeState": {
+          "calls": 51
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-reference-restart",
+      "action": "Restart with reference Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "persisted-state-after-process-reopen": "pass"
+      },
+      "methods": {
+        "GetBlock": {
+          "calls": 1
+        },
+        "GetLatestBlock": {
+          "calls": 1
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-reference-restore",
+      "action": "Restore with reference Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "populated-sapling-pagination": "pass",
+        "hash-order-preserves-funded-restore": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 2
+        },
+        "GetLatestBlock": {
+          "calls": 3
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6,
+          "fields": {
+            "SubtreeRoot.completingBlockHash": {
+              "handling": "ignored",
+              "assertion": "hash-order-preserves-funded-restore"
+            }
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        },
+        "GetTransaction": {
+          "calls": 3
+        },
+        "GetTreeState": {
+          "calls": 51
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-reversed-restart",
+      "action": "Restart with reversed Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "persisted-state-after-process-reopen": "pass"
+      },
+      "methods": {
+        "GetBlock": {
+          "calls": 1
+        },
+        "GetLatestBlock": {
+          "calls": 1
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        }
+      }
+    },
+    {
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "method_scope": "partial",
+      "status": "pass",
+      "evidence": {
+        "description": "Frozen subtree A/B / summary.json",
+        "sha256": "f8600ac984ecfa0b9718670ab62d5310da9bbf7f77576a2736e3cadea5c9ab32"
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "id": "zingo-subtree-reversed-restore",
+      "action": "Restore with reversed Sapling rows",
+      "assertions": {
+        "history": "pass",
+        "confirmed-balances": "pass",
+        "spendable-funds": "pass",
+        "scan-range-and-outputs": "pass",
+        "target-only-connections": "pass",
+        "populated-sapling-pagination": "pass",
+        "hash-order-preserves-funded-restore": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 2
+        },
+        "GetLatestBlock": {
+          "calls": 3
+        },
+        "GetLightdInfo": {
+          "calls": 1
+        },
+        "GetMempoolStream": {
+          "calls": 1
+        },
+        "GetSubtreeRoots": {
+          "calls": 6,
+          "fields": {
+            "SubtreeRoot.completingBlockHash": {
+              "handling": "ignored",
+              "assertion": "hash-order-preserves-funded-restore"
+            }
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 22
+        },
+        "GetTransaction": {
+          "calls": 3
+        },
+        "GetTreeState": {
+          "calls": 51
+        }
+      }
+    },
+    {
+      "id": "zingo-testnet-restore",
+      "wallet": "zingo",
+      "version": "8.0.0",
+      "variant": "nakednet-cli",
+      "implementation": "engine",
+      "client_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Restore funded wallet through the frozen tip",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "frozen-tip": "pass",
+        "wallet-history": "pass",
+        "pool-balances": "pass",
+        "scan-range-and-outputs": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 3,
+          "outcomes": {
+            "ok": 3
+          }
+        },
+        "GetLightdInfo": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetMempoolStream": {
+          "calls": 1,
+          "outcomes": {
+            "cancelled": 1
+          }
+        },
+        "GetSubtreeRoots": {
+          "calls": 6,
+          "outcomes": {
+            "ok": 6
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 22,
+          "outcomes": {
+            "ok": 22
+          }
+        },
+        "GetTransaction": {
+          "calls": 3,
+          "outcomes": {
+            "ok": 3
+          }
+        },
+        "GetTreeState": {
+          "calls": 51,
+          "outcomes": {
+            "ok": 51
+          }
+        }
+      },
+      "evidence": {
+        "description": "wallet-performance.tar.gz / primary/primary-zingo-long-1-22.json",
+        "sha256": "04099e4e11ae1fad3912e7f1eb40c05f0d016c9be97b72776ce70f9e65312359"
+      }
+    },
+    {
+      "id": "zkool-compact-stream-control",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "6a9f90adb7f53caa739a0274f7653096678d523244449b8f42bde6ca1cfc99eb",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Restore through the frozen fence",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "persisted-wallet-ledger": "pass",
+        "history-and-notes": "pass",
+        "pool-balances": "pass",
+        "scanned-tip": "pass",
+        "target-only-connections": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1
+        },
+        "GetLatestBlock": {
+          "calls": 1
+        },
+        "GetTaddressTxids": {
+          "calls": 1
+        },
+        "GetTransaction": {
+          "calls": 2
+        },
+        "GetTreeState": {
+          "calls": 1
+        }
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "evidence": {
+        "description": "Compact stream interruption / receipt.json",
+        "sha256": "44bce68d7d8afad16fa659a688a121179f0974df06c512df309d2d4f7e7545dd"
+      }
+    },
+    {
+      "id": "zkool-compact-stream-interrupted",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "client_sha256": "6a9f90adb7f53caa739a0274f7653096678d523244449b8f42bde6ca1cfc99eb",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Interrupt a compact-block stream and resume the persisted wallet in a fresh process",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "persisted-wallet-ledger": "pass",
+        "history-and-notes": "pass",
+        "pool-balances": "pass",
+        "scanned-tip": "pass",
+        "target-only-connections": "pass",
+        "partial-range-failure": "pass",
+        "fresh-process-resumes": "pass",
+        "next-range-from-persisted-block": "pass",
+        "matches-control": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 2
+        },
+        "GetLatestBlock": {
+          "calls": 2
+        },
+        "GetTaddressTxids": {
+          "calls": 2
+        },
+        "GetTransaction": {
+          "calls": 2
+        },
+        "GetTreeState": {
+          "calls": 2
+        }
+      },
+      "observed_methods": [
+        "GetAddressUtxos",
+        "GetAddressUtxosStream",
+        "GetBlock",
+        "GetBlockNullifiers",
+        "GetBlockRange",
+        "GetBlockRangeNullifiers",
+        "GetLatestBlock",
+        "GetLatestTreeState",
+        "GetLightdInfo",
+        "GetMempoolStream",
+        "GetMempoolTx",
+        "GetStandardFee",
+        "GetSubtreeRoots",
+        "GetTaddressBalance",
+        "GetTaddressTransactions",
+        "GetTaddressTxids",
+        "GetTransaction",
+        "GetTreeState"
+      ],
+      "evidence": {
+        "description": "Compact stream interruption / receipt.json",
+        "sha256": "44bce68d7d8afad16fa659a688a121179f0974df06c512df309d2d4f7e7545dd"
+      }
+    },
+    {
+      "id": "zkool-ext-testnet-restore",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "client_sha256": "fc608359db12282af2279c611b383901a37bf4dfdc485b3fc6ba02e5bfcef228",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Restore funded wallet through the frozen tip",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "frozen-tip": "pass",
+        "wallet-history": "pass",
+        "pool-balances": "pass",
+        "scanned-height": "pass",
+        "received-note-count": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTransaction": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "wallet-performance.tar.gz / primary/primary-zkool-ext-long-1-22.json",
+        "sha256": "3ab798d8a868f97d3d080ccf4b9ddc23b4c3605064a02c4c5de3d451b84f0dff"
+      }
+    },
+    {
+      "id": "zkool-external-only-funded-lifecycle",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "9e835396282fd0762744d3e396f050f608809ce6ebd3cc81733bce1716e9c538",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "7db2337e02aecd5247408285ca63d3c94554dc47a9239ff9e7b2b13a68235e44"
+      }
+    },
+    {
+      "id": "zkool-int-testnet-restore",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "606e64d46b4c9cd22427c6412ef03161d1bf1b8c7a39c98e3e7cde90581f3642",
+      "interface": "lightwalletd",
+      "network": "testnet",
+      "fixture": "Testnet birthday 4624102 through 4644091/000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+      "action": "Restore funded wallet through the frozen tip",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "frozen-tip": "pass",
+        "wallet-history": "pass",
+        "pool-balances": "pass",
+        "scanned-height": "pass",
+        "received-note-count": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTransaction": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "wallet-performance.tar.gz / primary/primary-zkool-int-long-1-22.json",
+        "sha256": "69cb0d1ed5c0df2b09e81f926eac3db47f64e0321a805b178e07e6861d01f083"
+      }
+    },
+    {
+      "id": "zkool-internal-enabled-funded-lifecycle",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "network": "zcash-regtest",
+      "interface": "lightwalletd",
+      "client_sha256": "9e835396282fd0762744d3e396f050f608809ce6ebd3cc81733bce1716e9c538",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Funded restore, discovery, send, confirmation, restart and resume",
+      "status": "pass",
+      "method_scope": "none",
+      "methods": {},
+      "assertions": {
+        "bootstrap": "pass",
+        "restore": "pass",
+        "transparent-discovery": "pass",
+        "shielded-discovery": "pass",
+        "send": "pass",
+        "pending": "pass",
+        "mined": "pass",
+        "scanned": "pass",
+        "restart": "pass",
+        "resume": "pass",
+        "target-endpoint-certified": "pass",
+        "transaction-linkage-certified": "pass",
+        "restore-certified": "pass",
+        "process-restart-certified": "pass",
+        "resume-progress-certified": "pass"
+      },
+      "evidence": {
+        "description": "Pinned schema-v2 lifecycle summary",
+        "sha256": "c1a3501ca3130cb4b2471be15280d635bb3fdf45c2e8e6558824ca1c682e2577"
+      }
+    },
+    {
+      "id": "zkool-reorg-bootstrap",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+      "interface": "lightwalletd",
+      "network": "zcash-regtest",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Bootstrap on the private Ironwood fork",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "target-only-connections": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "Disposable Zkool reorg / receipt.json",
+        "sha256": "8f7ea4b88eb827b5de68f5b4506791d342ec027ee449ebd9554bf30b87f64dad"
+      }
+    },
+    {
+      "id": "zkool-reorg-follow-replacement",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+      "interface": "lightwalletd",
+      "network": "zcash-regtest",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Follow replacement on the private Ironwood fork",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "target-only-connections": "pass",
+        "orphan-removed-from-confirmed-history": "pass",
+        "owned-note-and-balance-reverted": "pass",
+        "surviving-receipt-preserved": "pass",
+        "replacement-tip-reached": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 3,
+          "outcomes": {
+            "ok": 3
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 4,
+          "outcomes": {
+            "ok": 4
+          }
+        },
+        "GetTreeState": {
+          "calls": 3,
+          "outcomes": {
+            "ok": 3
+          }
+        }
+      },
+      "evidence": {
+        "description": "Disposable Zkool reorg / receipt.json",
+        "sha256": "8f7ea4b88eb827b5de68f5b4506791d342ec027ee449ebd9554bf30b87f64dad"
+      }
+    },
+    {
+      "id": "zkool-reorg-restart-and-advance",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+      "interface": "lightwalletd",
+      "network": "zcash-regtest",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Restart and advance on the private Ironwood fork",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "target-only-connections": "pass",
+        "rollback-persisted-after-new-process-and-next-block": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "Disposable Zkool reorg / receipt.json",
+        "sha256": "8f7ea4b88eb827b5de68f5b4506791d342ec027ee449ebd9554bf30b87f64dad"
+      }
+    },
+    {
+      "id": "zkool-reorg-scan-orphan-candidate",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+      "interface": "lightwalletd",
+      "network": "zcash-regtest",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Scan orphan candidate on the private Ironwood fork",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "target-only-connections": "pass",
+        "second-owned-note-and-balance": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTransaction": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "Disposable Zkool reorg / receipt.json",
+        "sha256": "8f7ea4b88eb827b5de68f5b4506791d342ec027ee449ebd9554bf30b87f64dad"
+      }
+    },
+    {
+      "id": "zkool-reorg-scan-surviving-receipt",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "client_sha256": "9f76f2f20734dea90d8b56ba49f0f5d7b20881e88cf5be0f5843cfe3adbd186a",
+      "interface": "lightwalletd",
+      "network": "zcash-regtest",
+      "fixture": "disposable-zcash-regtest-ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817",
+      "action": "Scan surviving receipt on the private Ironwood fork",
+      "status": "pass",
+      "method_scope": "partial",
+      "assertions": {
+        "target-only-connections": "pass",
+        "first-owned-note-discovered": "pass"
+      },
+      "methods": {
+        "GetBlockRange": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetLatestBlock": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTaddressTxids": {
+          "calls": 2,
+          "outcomes": {
+            "ok": 2
+          }
+        },
+        "GetTransaction": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        },
+        "GetTreeState": {
+          "calls": 1,
+          "outcomes": {
+            "ok": 1
+          }
+        }
+      },
+      "evidence": {
+        "description": "Disposable Zkool reorg / receipt.json",
+        "sha256": "8f7ea4b88eb827b5de68f5b4506791d342ec027ee449ebd9554bf30b87f64dad"
+      }
+    }
+  ]
+}

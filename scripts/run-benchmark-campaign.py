@@ -142,9 +142,9 @@ def at_pointer(document, pointer):
     return document
 
 
-def run_command(command, stdout, stderr, timeout):
+def run_command(command, stdout, stderr, timeout, *, cwd=None):
     use_process_group = os.name == "posix"
-    with subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=use_process_group) as process:
+    with subprocess.Popen(command, stdout=stdout, stderr=stderr, cwd=cwd, start_new_session=use_process_group) as process:
         try:
             return process.wait(timeout=timeout)
         except (KeyboardInterrupt, subprocess.TimeoutExpired):
