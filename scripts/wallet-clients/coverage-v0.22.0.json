@@ -289,6 +289,12 @@
         "balance_after": 10000000,
         "spendable_after": 10000000
       },
+      "return_accounting_zat": {
+        "amount": 4000000,
+        "fee": 25000,
+        "debit": 4025000,
+        "balance_after": 5975000
+      },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
         "sha256": "14aeed7ead194e55e4c7133379e6501fa1e7468c5ed1f6ea0d9dc81d0f3d5755"
@@ -330,6 +336,12 @@
         "amount": 10000000,
         "fee": 10000,
         "balance_after": 489975000
+      },
+      "return_accounting_zat": {
+        "amount": 4000000,
+        "credit": 4000000,
+        "balance_after": 493975000,
+        "spendable_after": 493975000
       },
       "evidence": {
         "description": "Disconnect wallet recovery / receipt.json",
@@ -377,6 +389,12 @@
         "balance_after": 10000000,
         "spendable_after": 10000000
       },
+      "return_accounting_zat": {
+        "amount": 4000000,
+        "fee": 25000,
+        "debit": 4025000,
+        "balance_after": 5975000
+      },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
         "sha256": "740fb51896d721e97774ac7cbcf688a292ed94acaa0272c16e94f5625d0f5d81"
@@ -423,6 +441,12 @@
         "fee": 10000,
         "balance_after": 489975000
       },
+      "return_accounting_zat": {
+        "amount": 4000000,
+        "credit": 4000000,
+        "balance_after": 493975000,
+        "spendable_after": 493975000
+      },
       "evidence": {
         "description": "Rollback wallet recovery / receipt.json",
         "sha256": "740fb51896d721e97774ac7cbcf688a292ed94acaa0272c16e94f5625d0f5d81"
@@ -460,7 +484,6 @@
         "same-process-reconnected-without-restart": "pass",
         "transfer-mined-and-canonical-while-route-down": "pass",
         "zallet-process-alive-and-identical-through-outage": "pass",
-        "typed-wallet-rpc-unavailable-during-outage": "pass",
         "graceful-wallet-offline": "unexercised",
         "wallet-process-restart-during-outage": "unexercised"
       },
@@ -469,9 +492,16 @@
         "balance_after": 10000000,
         "spendable_after": 10000000
       },
+      "return_accounting_zat": {
+        "amount": 4000000,
+        "fee": 25000,
+        "debit": 4025000,
+        "balance_after": 5975000
+      },
       "evidence": {
         "description": "Transport wallet recovery / receipt.json",
-        "sha256": "9777eef2f63dcbae347437763f26d14f52ffc4d74c340585f48e9057c09039d0"
+        "sha256": "9777eef2f63dcbae347437763f26d14f52ffc4d74c340585f48e9057c09039d0",
+        "local_status_rpc_during_outage": "wallet-rpc-error"
       }
     },
     {

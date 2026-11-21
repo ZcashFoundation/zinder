@@ -38,7 +38,7 @@ Import the three case receipts from the selected release. Each receipt must iden
   --recovery-result "$evidence/native-disconnect/receipt.json" --output "$evidence/recovery-matrix.json"
 ```
 
-Compare these five observations independently from the other lifecycle cases. A differing client or fixture is reported as incomparable. A previously passing wallet assertion lost in the candidate is reported as a regression.
+Compare these five observations independently from the other lifecycle cases. A differing client or fixture is reported as incomparable. The comparison checks both payment directions, including the return fee, the payer’s debit, the recipient’s credit, and each wallet’s ending balance. It also reports previously passing wallet assertions lost in the candidate.
 
 ```bash
 "$wallet_python" -B scripts/wallet-clients/coverage.py compare "$evidence/recovery-matrix.json" \

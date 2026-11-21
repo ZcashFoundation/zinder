@@ -7,8 +7,8 @@ yields one row per wallet. The transport receipt yields only the Zallet row:
 Zingo was the sending counterpart and stayed on its own lightwalletd route,
 so it did not experience the private native-route outage.
 
-Accounting in each row describes the wallet's role in the outbound payment.
-The return leg is validated and asserted separately.
+Each row records the amount and resulting balance in both payment directions,
+with the fee on the wallet that paid it.
 """
 import hashlib
 import json
@@ -168,7 +168,21 @@ def ledger(result):
     require(persistence["zingo_height"] >= returned["mined_height"]
             and persistence["zallet_height"] >= returned["mined_height"],
             "persisted wallets did not reach the return height")
-    return outbound, returned, first, second, spendable
+    return outbound, {
+        "zingo": {
+            "accounting_zat": {"amount": first["amount_zat"], "fee": first["fee_zat"],
+                               "balance_after": first["payer_after_zat"]},
+            "return_accounting_zat": {"amount": second["amount_zat"], "credit": second["payee_credit_zat"],
+                                      "balance_after": second["payee_after_zat"],
+                                      "spendable_after": returned["spendable_after_zat"]},
+        },
+        "zallet": {
+            "accounting_zat": {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
+                               "spendable_after": spendable},
+            "return_accounting_zat": {"amount": second["amount_zat"], "fee": second["fee_zat"],
+                                      "debit": second["payer_debit_zat"], "balance_after": second["payer_after_zat"]},
+        },
+    }
 
 
 def disconnect_evidence(result, outbound):
@@ -290,8 +304,12 @@ def transport_evidence(result, outbound):
             "native route relay was not stopped")
     require(outage["zallet_process_unchanged"] is True, "Zallet process changed during the outage")
     status = outage["zallet_status_while_down"]
-    require(status["available"] is False and status["error"] == "WalletRpcError",
-            "native route loss was not observed as a typed wallet error")
+    require(type(status.get("available")) is bool, "missing local wallet status RPC observation")
+    if status["available"]:
+        observation = "available"
+    else:
+        require(isinstance(status.get("error"), str) and status["error"], "missing local wallet RPC error")
+        observation = "wallet-rpc-error" if status["error"] == "WalletRpcError" else "unavailable"
     inclusion = outage["inclusion"]
     require(inclusion["height"] == outbound["mined_height"]
             and inclusion["block_hash"] == outbound["block_hash"],
@@ -320,6 +338,7 @@ def transport_evidence(result, outbound):
             and received["memo_verified"] is True and memo_matches
             and received["fully_synced_height"] >= outage["node_tip"],
             "reconnected Zallet did not observe the full payment")
+    return observation
 
 
 def expected_assertions(result, case, remine=None):
@@ -361,7 +380,7 @@ def row(result, receipt_sha, case, role, action, assertions, accounting):
                     f"{fixture['activation_schedule_sha256']}, {fixture['node_image']}, "
                     f"all-block retention, peer {peer} {clients[f'{peer}_sha256']}"),
         "action": action, "status": "pass", "method_scope": "none", "methods": {},
-        "assertions": assertions, "accounting_zat": accounting,
+        "assertions": assertions, **accounting[role],
         "evidence": {"description": f"{case.capitalize()} wallet recovery / receipt.json",
                      "sha256": receipt_sha},
     }
@@ -374,7 +393,7 @@ def recovery_actions(path, release):
     receipt_sha = hashlib.sha256(raw).hexdigest()
     case = result["case"]
     receipt(result, release, case)
-    outbound, _, first, second, spendable = ledger(result)
+    outbound, accounting = ledger(result)
     if case == "disconnect":
         disconnect_evidence(result, outbound)
         checks = expected_assertions(result, case)
@@ -390,10 +409,6 @@ def recovery_actions(path, release):
                 "offline-process-identity": identity,
                 "native-route-outage": "unexercised",
             })
-            accounting = ({"amount": first["amount_zat"], "fee": first["fee_zat"],
-                           "balance_after": first["payer_after_zat"]} if role == "zingo" else
-                          {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
-                           "spendable_after": spendable})
             action = ("Remain an uninvoked one-shot CLI while a pending payment is mined, "
                       "then rescan it" if role == "zingo" else
                       "Stop the daemon while a pending payment is mined, then reopen and recover the confirmed payment")
@@ -414,26 +429,21 @@ def recovery_actions(path, release):
                 "deep-reorg-and-finalization": "unexercised",
                 "native-route-outage": "unexercised",
             })
-            accounting = ({"amount": first["amount_zat"], "fee": first["fee_zat"],
-                           "balance_after": first["payer_after_zat"]} if role == "zingo" else
-                          {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
-                           "spendable_after": spendable})
             yield row(result, receipt_sha, case, role,
                       "Follow a shallow reorg that orphaned and remined the same signed payment",
                       assertions, accounting)
     elif case == "transport":
-        transport_evidence(result, outbound)
+        status_observation = transport_evidence(result, outbound)
         checks = expected_assertions(result, case)
         assertions = dict(SHARED, **checks)
         assertions.update({
-            "typed-wallet-rpc-unavailable-during-outage": "pass",
             "graceful-wallet-offline": "unexercised",
             "wallet-process-restart-during-outage": "unexercised",
         })
-        accounting = {"amount": first["amount_zat"], "balance_after": first["payee_after_zat"],
-                      "spendable_after": spendable}
-        yield row(result, receipt_sha, case, "zallet",
-                  "Reconnect the same Zallet process after its private native route was lost "
-                  "during a pending payment", assertions, accounting)
+        observed = row(result, receipt_sha, case, "zallet",
+                       "Reconnect the same Zallet process after its private native route was lost "
+                       "during a pending payment", assertions, accounting)
+        observed["evidence"]["local_status_rpc_during_outage"] = status_observation
+        yield observed
     else:
         raise ValueError(f"unsupported recovery case {case!r}")

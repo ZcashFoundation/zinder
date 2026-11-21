@@ -254,6 +254,49 @@ class RecoveryImport(unittest.TestCase):
         self.assertEqual(len(cov.validate(matrix)["scenarios"]), 5)
         self.assertEqual(disconnect[0]["evidence"]["sha256"], digest(self.paths["disconnect"]))
 
+    def test_local_status_rpc_availability_is_diagnostic(self):
+        baseline = {"inventory": {}, "scenarios": self.rows("transport")}
+        for status, expected in (
+            ({"available": False, "error": "WalletRpcError"}, "wallet-rpc-error"),
+            ({"available": False, "error": "TimeoutError"}, "unavailable"),
+            ({"available": True, "fully_synced_height": 209}, "available"),
+        ):
+            with self.subTest(status=status):
+                receipt = copy.deepcopy(self.receipts["transport"])
+                for outage in (receipt["outage"], receipt["scenario"]["outage"]):
+                    outage["zallet_status_while_down"] = status
+                self.write("transport", receipt)
+                rows = self.rows("transport")
+                self.assertEqual(rows[0]["evidence"]["local_status_rpc_during_outage"], expected)
+                self.assertEqual(cov.compare(baseline, {"inventory": {}, "scenarios": rows}), [])
+                for outage in (receipt["outage"], receipt["scenario"]["outage"]):
+                    outage["native_route_reachable"] = True
+                self.write("transport", receipt)
+                with self.assertRaisesRegex(ValueError, "not isolated"):
+                    self.rows("transport")
+
+    def test_reconciled_return_fee_change_is_visible_for_every_case(self):
+        for case in CASES:
+            with self.subTest(case=case):
+                baseline = {"inventory": {}, "scenarios": self.rows(case)}
+                receipt = copy.deepcopy(self.receipts[case])
+                paid = receipt["scenario"]["return"]["accounting"]
+                paid["fee_zat"] += 5000
+                paid["payer_debit_zat"] += 5000
+                paid["payer_after_zat"] -= 5000
+                receipt["scenario"]["persistence"]["zallet_total_zat"] -= 5000
+                self.write(case, receipt)
+                current = {"inventory": {}, "scenarios": self.rows(case)}
+                changes = cov.compare(baseline, current)
+                for field in ("fee", "debit", "balance_after"):
+                    self.assertIn(f"payment-recovery-{case}-zallet: changed return accounting for {field}", changes)
+                self.assertEqual(next(row for row in current["scenarios"] if row["wallet"] == "zallet")
+                                 ["return_accounting_zat"]["fee"], 30_000)
+                for row in current["scenarios"]:
+                    if row["wallet"] == "zingo":
+                        self.assertEqual(row["return_accounting_zat"]["credit"], 4_000_000)
+                        self.assertNotIn("fee", row["return_accounting_zat"])
+
     def test_actor_mechanisms_are_not_interchanged(self):
         by_id = {r["id"]: r for r in self.rows("disconnect") + self.rows("rollback")
                  + self.rows("transport")}

@@ -83,7 +83,8 @@ def validate(matrix):
     require(isinstance(matrix["scenarios"], list) and matrix["scenarios"], "no scenarios")
     for row in matrix["scenarios"]:
         closed(row, {"id", *IDENTITY, "action", "status", "method_scope", "assertions",
-                     "methods", "evidence", "client_sha256", "observed_methods", "accounting_zat"}, "scenario")
+                     "methods", "evidence", "client_sha256", "observed_methods", "accounting_zat",
+                     "return_accounting_zat"}, "scenario")
         required_text(row, ("id", *IDENTITY, "action"), "scenario")
         ident = row["id"]
         require(re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", ident) and ident not in seen,
@@ -127,13 +128,23 @@ def validate(matrix):
                 require(re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", field)
                         and claim["handling"] in HANDLING and claim["assertion"] in checks,
                         f"{ident}: field claim requires a named check")
-        if "accounting_zat" in row:
-            accounting = row["accounting_zat"]
-            closed(accounting, {"amount", "fee", "change", "balance_after", "spendable_after"}, "wallet accounting")
+        for field in ("accounting_zat", "return_accounting_zat"):
+            if field not in row:
+                continue
+            accounting = row[field]
+            allowed = {"amount", "fee", "change", "balance_after", "spendable_after"}
+            if field == "return_accounting_zat":
+                require("accounting_zat" in row, f"{ident}: return payment without outbound accounting")
+                allowed.update(("debit", "credit"))
+            closed(accounting, allowed, "wallet accounting")
             require("amount" in accounting and "balance_after" in accounting and
                     all(type(v) is int and v >= 0 for v in accounting.values()), f"{ident}: invalid wallet accounting")
         evidence = row["evidence"]
-        closed(evidence, {"description", "sha256", "related_sha256"}, "evidence pointer")
+        closed(evidence, {"description", "sha256", "related_sha256", "local_status_rpc_during_outage"},
+               "evidence pointer")
+        if "local_status_rpc_during_outage" in evidence:
+            require(evidence["local_status_rpc_during_outage"] in {"available", "unavailable", "wallet-rpc-error"},
+                    f"{ident}: unknown local status RPC observation")
         if "related_sha256" in evidence:
             sources = evidence["related_sha256"]
             closed(sources, {"repeat-receipt", "canonical-audit"}, "related evidence")
@@ -219,9 +230,10 @@ def compare(baseline, current, prefixes=()):
         if new["method_scope"] != "complete":
             for lost in sorted(set(old.get("observed_methods", [])) - set(new.get("observed_methods", []))):
                 changes.append(f"{ident}: lost observation of {lost}")
-        for field, amount in old.get("accounting_zat", {}).items():
-            if new.get("accounting_zat", {}).get(field) != amount:
-                changes.append(f"{ident}: changed wallet accounting for {field}")
+        for key, direction in (("accounting_zat", "wallet"), ("return_accounting_zat", "return")):
+            for field, amount in old.get(key, {}).items():
+                if new.get(key, {}).get(field) != amount:
+                    changes.append(f"{ident}: changed {direction} accounting for {field}")
         for check, status in old["assertions"].items():
             if status == "pass" and new["assertions"].get(check) != "pass":
                 changes.append(f"{ident}: lost passing assertion {check}")
