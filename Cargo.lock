@@ -6187,6 +6187,7 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "parking_lot 0.13.0",
+ "pasta_curves",
  "prost",
  "sapling-crypto",
  "sha2 0.11.1",
