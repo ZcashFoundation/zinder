@@ -15,6 +15,41 @@ from urllib.parse import urlsplit
 from wallet_fixture import binding, verify_node
 
 
+def wait_for_scan(read_status, target):
+    for _ in range(10):
+        output = read_status()
+        try:
+            status = json.loads(output)
+            scanned = max((int(row['end_block']) for row in status.get('scan_ranges', [])
+                           if row['priority'] == 'Scanned'), default=0)
+            if scanned >= target:
+                return status
+        except ValueError:
+            pass
+        time.sleep(1)
+    raise RuntimeError(f'wallet did not scan through height {target}')
+
+
+def confirm_shielding_notes(txids, notes, previous_height, rpc):
+    if not isinstance(txids, list) or not txids or not all(
+        isinstance(txid, str) and re.fullmatch(r'[0-9a-f]{64}', txid) for txid in txids
+    ) or len(set(txids)) != len(txids):
+        raise ValueError('quickshield returned invalid transaction IDs')
+    observed = {(note['txid'], note['status']) for pool in ('ironwood_notes', 'orchard_notes', 'sapling_notes')
+                for note in notes[pool]['note_summaries'] if note['value'] > 0}
+    heights = {}
+    for txid in txids:
+        tx = rpc('getrawtransaction', [txid, 1])
+        height = tx['height']
+        if (tx['txid'] != txid or tx['confirmations'] < 1 or height <= previous_height
+                or tx['blockhash'] != rpc('getblockhash', [height])):
+            raise RuntimeError('new shielding transaction has no canonical confirmation')
+        if (txid, f'confirmed at block height {height}') not in observed:
+            raise RuntimeError('wallet did not discover a confirmed note from the new shielding transaction')
+        heights[txid] = height
+    return heights
+
+
 def main():
     if not __debug__:
         raise RuntimeError('optimized Python disables required wallet assertions')
@@ -103,18 +138,7 @@ def main():
         wait_published(rpc('getblockcount', []))
         state['scan_fence_height'] = target
         state['guard_blocks'] = state.get('guard_blocks', 0) + 1
-        last = None
-        for _ in range(10):
-            try:
-                last = json.loads(cli(['sync', 'status'], wallet=wallet, online=True))
-                tip = target
-                scanned = max((int(row['end_block']) for row in last.get('scan_ranges', []) if row['priority'] == 'Scanned'), default=0)
-                if scanned >= tip:
-                    return last
-            except (RuntimeError, ValueError) as error:
-                last = str(error)
-            time.sleep(1)
-        raise RuntimeError(f'scan did not complete: {last}')
+        return wait_for_scan(lambda: cli(['sync', 'status'], wallet=wallet, online=True), target)
 
     def mine():
         rpc('generate', [1])
@@ -175,12 +199,12 @@ def main():
         domain['coins'] = len(coins)
     elif step == 'shielded-discovery':
         sync()
+        previous_height = rpc('getblockcount', [])
         shield = json.loads(cli(['quickshield'], online=True))
         state['shield_tx'] = shield
         mine()
         notes = json.loads(cli(['notes']))
-        if not any((notes.get(pool) for pool in ('ironwood_notes', 'orchard_notes', 'sapling_notes'))):
-            raise RuntimeError('wallet evidence check failed')
+        domain['confirmed_heights'] = confirm_shielding_notes(shield['txids'], notes, previous_height, rpc)
         domain['funding_shield'] = shield
     elif step == 'send':
         rpc('generate', [2])

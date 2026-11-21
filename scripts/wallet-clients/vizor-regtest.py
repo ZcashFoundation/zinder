@@ -12,6 +12,7 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
+from wallet_fixture import binding
 
 
 def require(condition, message):
@@ -47,13 +48,12 @@ def serving_at_tip(opener, ops, tip):
 
 
 def run(args):
-    ready = json.loads(args.fixture.read_text())
-    endpoint = args.endpoint
-    node = ready["node_rpc"]
+    endpoint, node, anchor_height, anchor_hash = binding(args.fixture, args.candidate, args.endpoint)
+    service = json.loads((args.candidate or args.fixture).read_text())
+    ops = service["ops_endpoint" if args.candidate else "compat_ops"]
     port = loopback(endpoint)
-    loopback(node)
+    loopback(ops)
     opener = build_opener(ProxyHandler({}))
-    require(ready["network"] == "zcash-regtest", "Regtest fixture required")
 
     def rpc(method, *params):
         message = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -68,19 +68,7 @@ def run(args):
     earlier = "5ba81b19 76b809bb 2bb40e60 f5b9230b e9ff75a6 c2d6d0b4 c8e71055 4dec4df0 5437f330".split()
     require(all(heights.get(key) == 1 for key in earlier), "early upgrade schedule mismatch")
     require("77190ad9" not in heights and heights["37a5165b"] >= 2, "NU6.3/NU7 schedule mismatch")
-    anchor_height = ready.get("initial_tip", ready.get("current_tip"))
-    anchor_hash = ready.get("initial_hash", ready.get("current_hash"))
-    require(type(anchor_height) is int and anchor_hash, "fixture chain anchor missing")
     require(rpc("getblockhash", anchor_height) == anchor_hash, "fixture hash mismatch")
-    selected = ready["lightwalletd"]
-    ops = ready["compat_ops"]
-    if args.candidate:
-        candidate = json.loads(args.candidate.read_text())
-        require(candidate["network"] == "zcash-regtest" and candidate["node_rpc"] == node, "candidate node mismatch")
-        selected = candidate["client_endpoint"]
-        ops = candidate["ops_endpoint"]
-    require(endpoint == selected, "fixture endpoint mismatch")
-    loopback(ops)
     args.scratch.mkdir(mode=0o700, exist_ok=True)
     args.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
     step = args.step

@@ -90,6 +90,8 @@ Publisher retention can delay an accelerated Regtest chain. `wait-serving-fence.
 
 The Zingo adapter mines a guard block before a scan and requires the wallet to scan the preceding target fence. Its receipt does not claim zero-block lag at the newest chain tip. This also prevents a partially scanned newest block from being mistaken for complete known-activity recovery. Pending observation occurs before any confirmation or guard mining for the submitted transfer.
 
+During Zingo shielded discovery, each transaction returned by `quickshield` must create a positive wallet note at the height reported by the canonical node. Notes recovered during restore cannot satisfy this step. A client or connection-trace failure ends the scan immediately.
+
 Restart process IDs identify completed CLI invocation supervisors, each of which waits for its wallet process tree to exit. Zkool's offline report invocations directly identify native engine processes. Resume requires actual persisted wallet height growth after a new private block is mined. Endpoint connection traces are retained for online invocations; offline wallet reads do not create a new connection trace.
 
 A partial gate remains partial. Preserve failed attempts, source identities, client logs, and the exact missing condition. Do not transfer evidence between engines, scanning variants, application platforms, transports, or server revisions.

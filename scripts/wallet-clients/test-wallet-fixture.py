@@ -97,6 +97,97 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 403)
         raised.exception.close()
 
+    def vizor_manifest(self, driver_digest):
+        engine = self.root / 'engine'
+        engine.write_bytes(b'fixture build')
+        provenance = {'vizor_release': 'v0.0.65', 'vizor_source': 'd0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6',
+                      'engine_sha256': hashlib.sha256(engine.read_bytes()).hexdigest()}
+        if driver_digest is not None:
+            provenance['driver_sha256'] = driver_digest
+        (self.root / 'build.json').write_text(json.dumps(provenance))
+        return subprocess.run([sys.executable, '-O', str(SCRIPTS / 'vizor-manifest.py'),
+                               '--engine', 'engine', '--engine-provenance', 'build.json',
+                               '--fixture', str(self.ready), '--candidate', str(self.candidate),
+                               '--trace-tool', sys.executable, '--evidence', 'evidence', '--output', 'manifest'],
+                              cwd=self.root, capture_output=True, text=True)
+
+    def test_vizor_manifest_requires_build_time_driver_digest(self):
+        manifest = self.root / 'manifest'
+        driver = SCRIPTS / 'vizor-regtest.rs'
+        digest = hashlib.sha256(driver.read_bytes()).hexdigest()
+        for invalid in [None, '0' * 64]:
+            with self.subTest(digest=invalid):
+                result = self.vizor_manifest(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('driver differs from its build provenance', result.stderr)
+                self.assertFalse(manifest.exists())
+        self.vizor_manifest(digest).check_returncode()
+        case = json.loads(manifest.read_text())['cases']['vizor']
+        self.assertEqual(case['endpoint'], self.overlay['client_endpoint'])
+        self.assertEqual(case['inputs'][str(driver)], digest)
+        helper = SCRIPTS / 'wallet_fixture.py'
+        self.assertEqual(case['inputs'][str(helper)], hashlib.sha256(helper.read_bytes()).hexdigest())
+
+    def test_vizor_rejects_unbound_candidate_before_wallet_or_node_access(self):
+        run = runpy.run_path(str(SCRIPTS / 'vizor-regtest.py'))['run']
+        digest = hashlib.sha256((SCRIPTS / 'vizor-regtest.rs').read_bytes()).hexdigest()
+        for override in ({'shared_release_dependencies': 'f' * 40}, {'source_commit': ''},
+                         {'binary_sha256': ''}, {'client_endpoint': self.release['lightwalletd']}):
+            with self.subTest(override=override):
+                candidate = dict(self.overlay, **override)
+                self.candidate.write_text(json.dumps(candidate))
+                result = self.vizor_manifest(digest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('candidate', result.stderr)
+                self.assertFalse((self.root / 'manifest').exists())
+                args = SimpleNamespace(fixture=self.ready, candidate=self.candidate,
+                                       endpoint=candidate['client_endpoint'])
+                with self.assertRaises(ValueError):
+                    run(args)
+
+    def test_zingo_retries_incomplete_scan_but_propagates_client_and_trace_failures(self):
+        wait = runpy.run_path(str(SCRIPTS / 'zingo-regtest.py'))['wait_for_scan']
+        ready = {'scan_ranges': [{'priority': 'Scanned', 'end_block': 8}]}
+        for failure in (RuntimeError('client sync error'), RuntimeError('rejected endpoint trace'),
+                        ValueError('invalid trace JSON')):
+            with self.subTest(error=str(failure)):
+                read = Mock(side_effect=[failure, json.dumps(ready)])
+                with self.assertRaises(type(failure)) as error:
+                    wait(read, 8)
+                self.assertIs(error.exception, failure)
+                read.assert_called_once_with()
+        read = Mock(side_effect=['', '{"scan_ranges":[]}', json.dumps(ready)])
+        with patch.object(time, 'sleep'):
+            self.assertEqual(wait(read, 8), ready)
+        self.assertEqual(read.call_count, 3)
+
+    def test_zingo_requires_confirmed_notes_for_every_new_shielding_transaction(self):
+        confirm = runpy.run_path(str(SCRIPTS / 'zingo-regtest.py'))['confirm_shielding_notes']
+        old, first, second = ('a' * 64, 'b' * 64, 'c' * 64)
+        tx_heights = {old: 10, first: 12, second: 13}
+
+        def rpc(method, params):
+            if method == 'getblockhash':
+                return f'{params[0]:064x}'
+            self.assertEqual(method, 'getrawtransaction')
+            txid, verbose = params
+            self.assertEqual(verbose, 1)
+            height = tx_heights[txid]
+            return {'txid': txid, 'height': height, 'blockhash': f'{height:064x}', 'confirmations': 1}
+
+        def notes(*items):
+            rows = [{'txid': txid, 'status': f'confirmed at block height {height}', 'value': 1}
+                    for txid, height in items]
+            return {'ironwood_notes': {'note_summaries': rows}, 'orchard_notes': {'note_summaries': []},
+                    'sapling_notes': {'note_summaries': []}}
+
+        for ids, rows in (([first], [(old, 10)]), ([first], [(first, 13)]),
+                          ([old], [(old, 10)]), ([first, second], [(first, 12)])):
+            with self.subTest(ids=ids, rows=rows), self.assertRaises(RuntimeError):
+                confirm(ids, notes(*rows), 11, rpc)
+        self.assertEqual(confirm([first, second], notes(*tx_heights.items()), 11, rpc),
+                         {first: 12, second: 13})
+
     def test_wallet_children_remain_in_the_lifecycle_process_group(self):
         for wallet in ('zingo', 'zkool'):
             with self.subTest(wallet=wallet):
