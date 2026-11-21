@@ -1,16 +1,20 @@
 //! Background densification of settled tree-state checkpoints.
 //!
-//! Construction checkpoints the commitment trees every 100 blocks, so a
-//! tree-state read between two checkpoints replays stored blocks. This pass
-//! fills each settled stride with the checkpoints its selection picks, so
-//! those reads become stored-checkpoint reads. A canonical secondary replays
-//! the stride on a bounded number of blocking threads, and the writer commits
-//! the rows through its command queue between live commits. The pass runs only
-//! while historical work may run. It records its progress as a watermark in
-//! [`TREE_STATE_DENSIFICATION_WATERMARK_FILE`] in the canonical store
-//! directory, bound to the store's construction manifest and the selection. A
-//! restart resumes at that watermark once the stride ending there still
-//! satisfies the selection, and otherwise scans from the first stride. A
+//! Under the default `every-block` selection, fresh construction stores a
+//! tree-state checkpoint for every loaded block; when densification is
+//! disabled or `commitment-budget` is selected, construction checkpoints the
+//! commitment trees every 100 blocks and at the build tip. This pass fills
+//! each settled stride of an existing sparse store or `commitment-budget`
+//! build with the checkpoints its selection picks, and verifies and watermarks
+//! settled strides on a freshly constructed dense store (committing zero rows
+//! when every stride is already satisfied). A canonical secondary replays
+//! incomplete strides on a bounded number of blocking threads, and the writer
+//! commits the rows through its command queue between live commits. The pass
+//! runs only while historical work may run. It records its progress as a
+//! watermark in [`TREE_STATE_DENSIFICATION_WATERMARK_FILE`] in the canonical
+//! store directory, bound to the store's construction manifest and the
+//! selection. A restart resumes at that watermark once the stride ending there
+//! still satisfies the selection, and otherwise scans from the first stride. A
 //! stride skipped as an integrity failure holds the watermark below it, so the
 //! next run examines it again.
 
@@ -96,6 +100,16 @@ pub struct TreeStateDensificationConfig {
     /// Ceiling on stored blocks replayed per second, which bounds the pass's
     /// reads and writes.
     pub max_blocks_per_second: NonZeroU32,
+}
+
+impl TreeStateDensificationConfig {
+    /// Returns whether fresh canonical construction stores a tree-state
+    /// checkpoint for every loaded block instead of only on the 100-block
+    /// cadence and at the build tip.
+    #[must_use]
+    pub fn stores_checkpoints_during_construction(&self) -> bool {
+        self.enabled && self.selection == TreeStateCheckpointSelection::EveryBlock
+    }
 }
 
 impl Default for TreeStateDensificationConfig {

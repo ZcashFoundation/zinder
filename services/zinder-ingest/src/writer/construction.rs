@@ -434,12 +434,14 @@ where
         config,
         raw_blob_policy_for_retention(builder.raw_blob_retention()),
     );
+    let every_block_tree_state_checkpoints = builder.stores_every_block_tree_state_checkpoints();
     let outcome = drive_block_loader(
         builder,
         prepared_blocks,
         BlockLoaderSettings {
             block_queue_capacity,
             network_upgrade_activations: Arc::clone(&config.network_upgrade_activations),
+            every_block_tree_state_checkpoints,
             cancel: cancel.clone(),
         },
     )
@@ -835,6 +837,7 @@ struct QueuedPreparedBlock {
 struct BlockLoaderSettings {
     block_queue_capacity: usize,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    every_block_tree_state_checkpoints: bool,
     cancel: CancellationToken,
 }
 
@@ -849,6 +852,7 @@ where
     let BlockLoaderSettings {
         block_queue_capacity,
         network_upgrade_activations,
+        every_block_tree_state_checkpoints,
         cancel,
     } = settings;
     let predecessor = builder.build_plan().history_predecessor();
@@ -876,6 +880,7 @@ where
             derived_subtree_roots: Vec::new(),
             workload,
             build_tip_height,
+            every_block_tree_state_checkpoints,
             cancel: loader_cancel,
             stage_timers: BlockLoaderStageTimers::register(workload),
         };
@@ -939,6 +944,7 @@ struct CanonicalBuildBlockReceiver {
     derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
     workload: CanonicalStoreWorkload,
     build_tip_height: BlockHeight,
+    every_block_tree_state_checkpoints: bool,
     cancel: CancellationToken,
     stage_timers: BlockLoaderStageTimers,
 }
@@ -1039,7 +1045,8 @@ impl CanonicalBuildBlockReceiver {
         self.stage_timers
             .position
             .record(positioned_at.duration_since(tree_appended_at));
-        let checkpoint_required = height == self.build_tip_height
+        let checkpoint_required = self.every_block_tree_state_checkpoints
+            || height == self.build_tip_height
             || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
         // Only the build-tip checkpoint is later compared with the node's tree
         // state, so each checkpoint cross-checks its encoding here.

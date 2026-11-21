@@ -16,9 +16,9 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
@@ -33,10 +33,17 @@ use zinder_source::{
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    TreeStateLookup,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use super::fixture_block::{fixture_ironwood_source_block, fixture_source_block};
+use super::{
+    canonical_block_context::{chained_source_block, pool_commitments, shielded_transactions},
+    fixture_block::{
+        fixture_ironwood_source_block, fixture_orchard_source_block, fixture_sapling_source_block,
+        fixture_source_block,
+    },
+};
 
 #[derive(Clone)]
 struct SingleBlockSource {
@@ -681,6 +688,7 @@ fn held_construction_writer_config(
         checkpoint_height: None,
         raw_blob_retention: RawBlobRetention::Transactions,
         reorg_window_blocks: 100,
+        every_block_tree_state_checkpoints: true,
         follow: CanonicalFollowConfig {
             request_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(10),
@@ -870,6 +878,498 @@ async fn construction_times_each_phase_and_serial_loader_stage()
             sample_count(&series).is_some_and(|count| count >= 1),
             "missing {series}"
         );
+    }
+    Ok(())
+}
+
+/// Multi-block Regtest source with exact per-height checkpoints and optional
+/// cancellation hooks for construction lifecycle tests.
+#[derive(Clone)]
+struct MultiBlockConstructionSource {
+    genesis: SourceBlock,
+    blocks: Vec<SourceBlock>,
+    checkpoints: Vec<CommitmentTreeCheckpoint>,
+    hold_chain_segments: Arc<AtomicBool>,
+    chain_segment_held: Arc<Notify>,
+    chain_segment_requests: Arc<AtomicUsize>,
+    cancel_with_tip_checkpoint: Option<(BlockHeight, CancellationToken)>,
+}
+
+impl MultiBlockConstructionSource {
+    fn build(
+        height_count: u32,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let block_one = fixture_source_block()?;
+        let genesis = SourceBlock::new(
+            SourceBlockHeader {
+                network: Network::ZcashRegtest,
+                height: BlockHeight::new(0),
+                hash: block_one.parent_hash,
+                parent_hash: block_one.parent_hash,
+                block_time_seconds: block_one.block_time_seconds.saturating_sub(1),
+            },
+            Vec::new(),
+        );
+        let sapling_shielded = shielded_transactions(&fixture_sapling_source_block()?)?;
+        let orchard_shielded = shielded_transactions(&fixture_orchard_source_block()?)?;
+        let mut blocks = Vec::with_capacity(usize::try_from(height_count)?);
+        let mut parent_hash = genesis.hash;
+        for height_num in 1..=height_count {
+            let block = if height_num == 1 {
+                block_one.clone()
+            } else {
+                let extra = match height_num {
+                    2 => sapling_shielded.clone(),
+                    4 => orchard_shielded.clone(),
+                    _ => Vec::new(),
+                };
+                chained_source_block(
+                    BlockHeight::new(height_num),
+                    parent_hash,
+                    u8::try_from(height_num)?,
+                    extra,
+                )?
+            };
+            parent_hash = block.hash;
+            blocks.push(block);
+        }
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            activations,
+        )?;
+        let mut checkpoints = vec![CommitmentTreeCheckpoint::new(
+            BlockId::new(genesis.height, genesis.hash),
+            genesis.block_time_seconds,
+            accumulator.cross_checked_frontiers()?,
+        )];
+        for block in &blocks {
+            let commitments = pool_commitments(block)?;
+            accumulator.append_block_commitments(
+                block.height,
+                &commitments.sapling,
+                &commitments.orchard,
+                &commitments.ironwood,
+            )?;
+            checkpoints.push(CommitmentTreeCheckpoint::new(
+                BlockId::new(block.height, block.hash),
+                block.block_time_seconds,
+                accumulator.cross_checked_frontiers()?,
+            ));
+        }
+        Ok(Self {
+            genesis,
+            blocks,
+            checkpoints,
+            hold_chain_segments: Arc::new(AtomicBool::new(false)),
+            chain_segment_held: Arc::new(Notify::new()),
+            chain_segment_requests: Arc::new(AtomicUsize::new(0)),
+            cancel_with_tip_checkpoint: None,
+        })
+    }
+
+    fn holding_segments(self) -> Self {
+        self.hold_chain_segments.store(true, Ordering::SeqCst);
+        self
+    }
+
+    fn release_chain_segments(&self) {
+        self.hold_chain_segments.store(false, Ordering::SeqCst);
+    }
+
+    fn cancelling_at_checkpoint(mut self, height: BlockHeight, cancel: CancellationToken) -> Self {
+        self.cancel_with_tip_checkpoint = Some((height, cancel));
+        self
+    }
+
+    fn checkpoint_at(
+        &self,
+        height: u32,
+    ) -> Result<&CommitmentTreeCheckpoint, Box<dyn std::error::Error>> {
+        self.checkpoints
+            .get(usize::try_from(height)?)
+            .ok_or_else(|| format!("missing checkpoint at height {height}").into())
+    }
+}
+
+#[async_trait]
+impl NodeSource for MultiBlockConstructionSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        NodeCapabilities::default()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        if height == BlockHeight::new(0) {
+            return Ok(self.genesis.clone());
+        }
+        self.blocks
+            .iter()
+            .find(|block| block.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "multi-block test source has no block at the requested height".to_owned(),
+            })
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
+        if self.hold_chain_segments.load(Ordering::SeqCst) {
+            self.chain_segment_held.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let next_height = limits
+            .cursor
+            .block_id()
+            .map_or(1, |cursor| cursor.height.value().saturating_add(1));
+        let max_blocks = usize::try_from(limits.max_connected_blocks.get()).unwrap_or(usize::MAX);
+        let segment = self
+            .blocks
+            .iter()
+            .filter(|block| block.height.value() >= next_height)
+            .take(max_blocks)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(SourceChainSegment::connected_blocks(segment))
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        let tip = self
+            .blocks
+            .last()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height: BlockHeight::new(1),
+                reason: "multi-block test source has no blocks".to_owned(),
+            })?;
+        Ok(BlockId::new(tip.height, tip.hash))
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        _network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let checkpoint = self
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.block_id.height == height)
+            .cloned()
+            .ok_or_else(|| SourceError::BlockUnavailable {
+                height,
+                reason: "multi-block test source has no checkpoint at the requested height"
+                    .to_owned(),
+            })?;
+        if let Some((cancel_height, cancel)) = &self.cancel_with_tip_checkpoint
+            && *cancel_height == height
+        {
+            cancel.cancel();
+        }
+        Ok(checkpoint)
+    }
+}
+
+fn multi_block_writer_config(
+    storage_path: std::path::PathBuf,
+    activations: Arc<NetworkUpgradeActivations>,
+    every_block_tree_state_checkpoints: bool,
+) -> CanonicalWriterConfig {
+    CanonicalWriterConfig {
+        reorg_window_blocks: 1,
+        every_block_tree_state_checkpoints,
+        ..held_construction_writer_config(storage_path, activations)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_block_construction_stores_every_height_while_sparse_construction_keeps_cadence_and_tip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    // 6-block source with reorg_window_blocks = 1 fixes the build tip at 5.
+    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let dense_dir = TempDir::new()?;
+    let dense_config = multi_block_writer_config(
+        dense_dir.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    let dense_store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &dense_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        dense_store.event_fence().visible_tip().height,
+        BlockHeight::new(5)
+    );
+    for height in 0_u32..=5 {
+        let lookup = dense_store.tree_state_lookup(BlockHeight::new(height), &activations)?;
+        assert!(
+            matches!(lookup, Some(TreeStateLookup::Stored(_))),
+            "dense construction must store checkpoint at height {height}"
+        );
+        let stored =
+            dense_store.tree_state_checkpoint_at(BlockHeight::new(height), &activations)?;
+        assert_eq!(stored.as_ref(), Some(source.checkpoint_at(height)?));
+    }
+
+    let sparse_dir = TempDir::new()?;
+    let sparse_config = multi_block_writer_config(
+        sparse_dir.path().join("canonical"),
+        Arc::clone(&activations),
+        false,
+    );
+    let sparse_store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &sparse_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        sparse_store.event_fence().visible_tip().height,
+        BlockHeight::new(5)
+    );
+    for height in [0_u32, 5] {
+        assert!(matches!(
+            sparse_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+            Some(TreeStateLookup::Stored(_))
+        ));
+    }
+    for height in 1_u32..=4 {
+        assert!(
+            matches!(
+                sparse_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+                Some(TreeStateLookup::Replay(_))
+            ),
+            "sparse construction must keep off-cadence height {height} unstored"
+        );
+        let replayed =
+            sparse_store.tree_state_checkpoint_at(BlockHeight::new(height), &activations)?;
+        assert_eq!(replayed.as_ref(), Some(source.checkpoint_at(height)?));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_block_construction_preserves_checkpointed_bounds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let temporary = TempDir::new()?;
+    let mut config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    config.checkpoint_height = Some(BlockHeight::new(2));
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    assert_eq!(
+        store.history_bounds().first_available_height(),
+        BlockHeight::new(3)
+    );
+    assert_eq!(
+        store.event_fence().visible_tip().height,
+        BlockHeight::new(5)
+    );
+    assert!(
+        store
+            .tree_state_lookup(BlockHeight::new(1), &activations)?
+            .is_none()
+    );
+    for height in 2_u32..=5 {
+        assert!(
+            matches!(
+                store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+                Some(TreeStateLookup::Stored(_))
+            ),
+            "checkpointed dense construction must store height {height}"
+        );
+        let stored = store.tree_state_checkpoint_at(BlockHeight::new(height), &activations)?;
+        assert_eq!(stored.as_ref(), Some(source.checkpoint_at(height)?));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_every_block_construction_discards_unpublished_staging_and_rebuilds_densely()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source = MultiBlockConstructionSource::build(6, &activations)?.holding_segments();
+    let temporary = TempDir::new()?;
+    let config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+
+    let admission = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &config,
+        &readiness,
+        &cancel,
+    );
+    tokio::pin!(admission);
+    tokio::select! {
+        () = source.chain_segment_held.notified() => {}
+        _ = &mut admission => {
+            return Err("construction finished before its block stream was held".into());
+        }
+    }
+    cancel.cancel();
+    let stopped = tokio::time::timeout(CANCELLED_CONSTRUCTION_STOP_BOUND, admission)
+        .await
+        .map_err(|_| "cancelled dense construction outlived its shutdown bound")?;
+    assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
+    assert!(!config.storage_path.exists());
+    assert!(temporary.path().join("canonical.building").exists());
+
+    source.release_chain_segments();
+    let store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        store.event_fence().visible_tip().height,
+        BlockHeight::new(5)
+    );
+    for height in 0_u32..=5 {
+        assert!(matches!(
+            store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+            Some(TreeStateLookup::Stored(_))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_ready_dense_store_installs_on_restart_even_if_config_switches_to_sparse()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let cancel = CancellationToken::new();
+    let source = MultiBlockConstructionSource::build(6, &activations)?
+        .cancelling_at_checkpoint(BlockHeight::new(5), cancel.clone());
+    let temporary = TempDir::new()?;
+    let dense_config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let stopped = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &dense_config,
+        &readiness,
+        &cancel,
+    )
+    .await;
+    assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
+    assert!(!dense_config.storage_path.exists());
+    assert!(temporary.path().join("canonical.building").exists());
+    let segment_requests_before_restart = source.chain_segment_requests.load(Ordering::SeqCst);
+
+    let sparse_config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        false,
+    );
+    let store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &sparse_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        segment_requests_before_restart
+    );
+    for height in 0_u32..=5 {
+        assert!(matches!(
+            store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+            Some(TreeStateLookup::Stored(_))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_sparse_store_reopens_under_every_block_default_without_rebuilding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let temporary = TempDir::new()?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let sparse_config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        false,
+    );
+    let sparse_store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &sparse_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let expected_fence = sparse_store.event_fence();
+    drop(sparse_store);
+    let segment_requests_after_build = source.chain_segment_requests.load(Ordering::SeqCst);
+
+    let dense_config = multi_block_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        true,
+    );
+    let reopened = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &dense_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(reopened.event_fence(), expected_fence);
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        segment_requests_after_build
+    );
+    for height in 1_u32..=4 {
+        assert!(matches!(
+            reopened.tree_state_lookup(BlockHeight::new(height), &activations)?,
+            Some(TreeStateLookup::Replay(_))
+        ));
     }
     Ok(())
 }

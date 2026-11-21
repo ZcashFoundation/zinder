@@ -73,6 +73,54 @@ async fn every_block_pass_stores_the_tree_state_of_every_settled_height() -> eyr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_densely_constructed_store_commits_nothing_and_serves_even_the_partial_tail_as_stored()
+-> eyre::Result<()> {
+    let harness = Harness::new_dense()?;
+
+    harness.with_primary(|primary| {
+        for height in 0..=BASELINE_TIP {
+            eyre::ensure!(
+                stored_checkpoint_heights(primary, height, height)?.len() == 1,
+                "densely constructed height {height} has no stored checkpoint"
+            );
+        }
+        Ok(())
+    })?;
+    harness.assert_reads_match_the_chain(1..=BASELINE_TIP)?;
+
+    let commits = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        commits.is_empty(),
+        "a densely constructed store should need zero densification commits, got {commits:?}"
+    );
+    let watermark = harness.watermark()?;
+    eyre::ensure!(
+        watermark["selection"] == "every-block"
+            && watermark["through_height"] == DENSIFIED_THROUGH
+            && watermark["construction_manifest_sha256"] == harness.manifest_sha256()?,
+        "unexpected watermark {watermark}"
+    );
+    let resumed = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    eyre::ensure!(resumed.is_empty(), "a resumed pass committed {resumed:?}");
+
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(1_024).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let budgeted = harness
+        .run_pass_to_completion(budget, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        budgeted.is_empty(),
+        "switching a densely constructed store to commitment-budget should commit nothing, got {budgeted:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commitment_budget_pass_stores_a_checkpoint_where_each_budget_fills() -> eyre::Result<()> {
     let harness = Harness::new()?;
     let budget = 20_u64;
@@ -908,6 +956,14 @@ impl Harness {
         Self::with_chain(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP))
     }
 
+    fn new_dense() -> eyre::Result<Self> {
+        Self::publish_with_coverage(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP),
+            None,
+            true,
+        )
+    }
+
     /// Publishes `chain`, with note commitments added, through the baseline tip.
     fn with_chain(chain: &ChainFixture) -> eyre::Result<Self> {
         Self::publish(chain, None)
@@ -923,6 +979,14 @@ impl Harness {
     }
 
     fn publish(chain: &ChainFixture, history_floor: Option<BlockHeight>) -> eyre::Result<Self> {
+        Self::publish_with_coverage(chain, history_floor, false)
+    }
+
+    fn publish_with_coverage(
+        chain: &ChainFixture,
+        history_floor: Option<BlockHeight>,
+        every_block_tree_state_checkpoints: bool,
+    ) -> eyre::Result<Self> {
         let activations = sample_regtest_upgrade_activations();
         let chain = with_note_commitments(chain, &activations)?;
         let heights = (1..=CHAIN_TIP).map(BlockHeight::new).collect::<Vec<_>>();
@@ -931,6 +995,11 @@ impl Harness {
         let baseline = match history_floor {
             Some(floor) => baseline.with_history_floor(floor),
             None => baseline,
+        };
+        let baseline = if every_block_tree_state_checkpoints {
+            baseline.with_every_block_tree_state_checkpoints()
+        } else {
+            baseline
         };
         let fixture = CanonicalWriterFixture::publish(&baseline, &activations)?;
         Ok(Self {

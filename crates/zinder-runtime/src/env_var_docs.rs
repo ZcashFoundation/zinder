@@ -1654,10 +1654,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Whether ingest fills settled history built by a first sync with stored \
-                      tree-state checkpoints in the background, so a tree-state read there \
-                      needs no replay. Runs only with `ingest_control.listen_addr` set. \
-                      Defaults to `true`.",
+        description: "Whether ingest stores dense historical tree-state checkpoints: during fresh \
+                      construction when `selection = \"every-block\"`, and through the background \
+                      pass for existing sparse stores or `commitment-budget` selections. The \
+                      background pass runs only with `ingest_control.listen_addr` set; fresh \
+                      construction applies `every-block` whenever enabled. Setting `false` keeps \
+                      fresh construction on the 100-block cadence and disables the background \
+                      pass. Defaults to `true`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
@@ -1665,19 +1668,24 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Which settled blocks receive a stored tree-state checkpoint: \
-                      `every-block` stores one for every block, so no tree-state read in a \
-                      completed stride replays (heights in the stride the settled tip has not \
-                      yet passed still do), and `commitment-budget` stores one each time \
-                      `commitment_budget` note commitments have accumulated. Defaults to \
-                      `every-block`, or to `commitment-budget` when only `commitment_budget` \
-                      is set. An operator who wants `commitment-budget` selects it before the \
-                      first start of a version that defaults to `every-block`; switching later \
-                      keeps every stored row, because a dense stride already satisfies the \
-                      looser budget and the pass only inserts missing rows, and only changes \
-                      the work still outstanding. The `every-block` cost on Mainnet is an \
-                      estimate pending measurement: about 2.4 GB of rows before compression \
-                      and 4 to 5 CPU-hours for the one-time pass.",
+        description: "Which historical blocks receive a stored tree-state checkpoint: \
+                      `every-block` stores one for every loaded block during fresh construction \
+                      (so every constructed height through the build tip is a stored read at \
+                      READY) and fills existing sparse stores in the background, while \
+                      `commitment-budget` keeps fresh construction on the 100-block cadence and \
+                      stores one in the background each time `commitment_budget` note commitments \
+                      have accumulated. Defaults to `every-block`, or to `commitment-budget` when \
+                      only `commitment_budget` is set. An operator who wants sparse construction \
+                      or `commitment-budget` selects `enabled = false` or `commitment-budget` \
+                      before the first sync or first upgraded start; switching later keeps every \
+                      stored row, because a dense stride already satisfies the looser budget and \
+                      the pass only inserts missing rows, and only changes the work still \
+                      outstanding. Under `every-block`, writing checkpoints during construction \
+                      moves frontier cross-checking before READY publication and avoids a second \
+                      commitment-replay pass afterward; full Mainnet construction cost and disk \
+                      growth (estimated at about 2.4 GB of rows before compression, or 4 to 5 \
+                      CPU-hours to backfill an existing sparse store) await heavy-workload \
+                      qualification.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",
