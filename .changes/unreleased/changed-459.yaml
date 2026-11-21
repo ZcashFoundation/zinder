@@ -1,5 +1,8 @@
 kind: changed
-body: Listeners bound concurrent published-history chunk reads and share the range byte budget under load. Wallets waiting for a chunk keep their place in arrival order and release it on disconnect.
+body: >-
+    Listeners bound concurrent published-history chunk reads and share the range byte budget under load.
+    Wallets waiting for a chunk keep their place in arrival order and release it on disconnect.
+    `GetTreeState` returns `INVALID_ARGUMENT` for the genesis hash even when the store starts at a later checkpoint.
 time: 2026-11-21T22:18:48.427752597Z
 custom:
     Bump: patch

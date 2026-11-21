@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use prost::Message as _;
 use tonic::Status;
@@ -22,6 +22,20 @@ pub(super) struct EncodedTail {
 }
 
 impl EncodedTail {
+    pub(super) fn after_published(self: Arc<Self>, end: BlockHeight) -> Arc<Self> {
+        let covered = self.rows.partition_point(|row| row.id.height <= end);
+        if covered == 0 {
+            return self;
+        }
+        let rows: VecDeque<_> = self.rows.range(covered..).cloned().collect();
+        Arc::new(Self {
+            epoch: self.epoch,
+            fence: self.fence,
+            bytes: rows.iter().map(|row| row.payload.len()).sum(),
+            rows,
+        })
+    }
+
     pub(super) fn bounds(&self) -> Option<BlockHeightRange> {
         Some(BlockHeightRange::inclusive(
             self.rows.front()?.id.height,

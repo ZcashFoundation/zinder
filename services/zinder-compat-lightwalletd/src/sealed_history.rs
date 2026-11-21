@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use prost::{Message, bytes::Bytes};
@@ -13,7 +14,6 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, Network,
     wire::{decode_internal_block_hash, encode_internal_block_hash},
 };
-#[cfg(test)]
 use zinder_proto::compat::lightwalletd;
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
 use zinder_store::HeightOrder;
@@ -214,7 +214,48 @@ struct IndexedBlock {
     native_bytes: usize,
     offset: u64,
     len: usize,
-    sha256: Option<[u8; 32]>,
+    sha256: [u8; 32],
+    validation: OnceLock<Result<(), PayloadError>>,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+enum PayloadError {
+    #[error("shielded segment payload SHA-256 mismatch")]
+    Digest,
+    #[error("malformed shielded segment CompactBlock protobuf")]
+    Protobuf,
+    #[error("shielded segment payload height, hash, or parent differs from its index")]
+    Identity,
+}
+
+impl IndexedBlock {
+    fn check_digest(&self, payload: &[u8]) -> Result<(), PayloadError> {
+        if <[u8; 32]>::from(Sha256::digest(payload)) != self.sha256 {
+            return Err(PayloadError::Digest);
+        }
+        Ok(())
+    }
+
+    fn verify_payload(&self, payload: &Bytes, kernel_verified: bool) -> Result<(), PayloadError> {
+        // Portable files can change between reads. Only authenticated bytes share a verdict.
+        if !kernel_verified {
+            self.check_digest(payload)?;
+        }
+        *self.validation.get_or_init(|| {
+            if kernel_verified {
+                self.check_digest(payload)?;
+            }
+            let block = lightwalletd::CompactBlock::decode(payload.clone())
+                .map_err(|_| PayloadError::Protobuf)?;
+            if block.height != u64::from(self.id.height.value())
+                || block.hash != encode_internal_block_hash(self.id.hash)
+                || block.prev_hash != encode_internal_block_hash(self.parent)
+            {
+                return Err(PayloadError::Identity);
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -241,13 +282,6 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
         return Err(invalid("expected a regular shielded history file"));
     }
     Ok(file)
-}
-
-fn verify_payload(payload: &[u8], expected: Option<[u8; 32]>) -> io::Result<()> {
-    if expected.is_some_and(|hash| <[u8; 32]>::from(Sha256::digest(payload)) != hash) {
-        return Err(invalid("shielded segment payload SHA-256 mismatch"));
-    }
-    Ok(())
 }
 
 impl SealedHistory {
@@ -333,22 +367,32 @@ impl SealedHistory {
         let last = selected
             .last()
             .ok_or_else(|| invalid("empty shielded chunk"))?;
+        let first_frame = first.offset - LENGTHS_LEN as u64;
         let relative = |row: &IndexedBlock| {
-            usize::try_from(row.offset - first.offset)
+            usize::try_from(row.offset - first_frame)
                 .map_err(|_| invalid("shielded chunk exceeds address space"))
         };
         let len = relative(last)?
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
         let mut packed = vec![0; len];
-        read_exact_at(&self.file, &mut packed, first.offset)?;
+        read_exact_at(&self.file, &mut packed, first_frame)?;
         let packed = Bytes::from(packed);
         selected
             .iter()
             .map(|row| {
                 let start = relative(row)?;
+                let lengths = packed[..start]
+                    .last_chunk()
+                    .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
+                if decode_lengths(*lengths)? != (row.native_bytes, row.len) {
+                    return Err(invalid(
+                        "shielded segment frame lengths differ from its index",
+                    ));
+                }
                 let payload = packed.slice(start..start + row.len);
-                verify_payload(&payload, row.sha256)?;
+                row.verify_payload(&payload, self.kernel_verified)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 Ok(SealedBlock {
                     id: row.id,
                     parent: row.parent,
