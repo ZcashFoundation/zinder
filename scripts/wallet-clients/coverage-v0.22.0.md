@@ -1,6 +1,6 @@
 # Wallet correctness coverage for v0.22.0
 
-Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 58 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
+Zinder release `999d51ab835037a2466763ca1a1e7739a26b72c1` passed the funded Regtest lifecycle with eight client configurations. A frozen Testnet fixture and disposable Regtest forks supplied additional method and field evidence. The JSON records 82 action-level observations, their input identities, assertions, RPC counts where measured, and private receipt digests. [Machine-readable baseline](coverage-v0.22.0.json)
 
 ## What the funded lifecycle established
 
@@ -46,6 +46,12 @@ inclusion (ten confirmations). Zingo read back its balance and history offline. 
 
 On one repeat, Zingo showed the incoming Zally payment before mining. On other
 repeats it first appeared after mining. The settled credit agreed in every run.
+
+## Spending a note received from another wallet
+
+Two independent campaigns each exercised Zkool 6.37.0 with internal addresses enabled and disabled, and Cake Wallet’s 6.5.4 software Zcash engine. Each ran against ordinary Zallet on its own Regtest chain. The engine paid Zallet, swept its funding change, received 6,000,000 zatoshis from Zallet, and spent 3,000,000 from that incoming note. The histories, confirmed balances, and spendable balances of both parties matched after restart. Each campaign produced 12 distinct canonical payments. The matrix records 24 observations, one for each payer and recipient on each leg. [Repeat the three-chain campaign](zkool-payment.md)
+
+The two Zkool configurations paid 2,000 zatoshis per sending transaction. Cake paid 10,000, and Zallet paid 20,000 on its return payment in each case. The node and Zallet observed all four pending transactions in every case. Zkool and Cake exposed each confirmed payment, but their own pending state stayed unobserved during the sampled intervals. The endpoint traces cover Zkool’s online commands and Cake’s engine sessions. The Zallet evidence records its configured native endpoint. These runs used rebuilt engine binaries, with separate digests from the earlier lifecycle clients. Signed mobile applications and hardware signing remain untested.
 
 ## Public Testnet payment
 

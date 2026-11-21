@@ -2488,6 +2488,828 @@
       }
     },
     {
+      "id": "zkool-cake-cake-inbound-payer",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty cake 13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263, engine profile cake-engine-internal-enabled",
+      "action": "Send the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 20000,
+        "balance_after": 492970000,
+        "spendable_after": 492970000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-inbound-recipient",
+      "wallet": "cake",
+      "version": "6.5.4-cb3e96f1",
+      "variant": "cake-engine-internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile cake-engine-internal-enabled",
+      "action": "Receive the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "incoming-note-spendable": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 0,
+        "balance_after": 6990000,
+        "spendable_after": 6990000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-outbound-payer",
+      "wallet": "cake",
+      "version": "6.5.4-cb3e96f1",
+      "variant": "cake-engine-internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile cake-engine-internal-enabled",
+      "action": "Send the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 10000,
+        "balance_after": 489990000,
+        "spendable_after": 489990000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-outbound-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty cake 13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263, engine profile cake-engine-internal-enabled",
+      "action": "Receive the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 0,
+        "balance_after": 10000000,
+        "spendable_after": 10000000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-spendback-payer",
+      "wallet": "cake",
+      "version": "6.5.4-cb3e96f1",
+      "variant": "cake-engine-internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile cake-engine-internal-enabled",
+      "action": "Send the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "spent-identified-incoming-note": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 10000,
+        "balance_after": 3980000,
+        "spendable_after": 3980000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-spendback-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty cake 13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263, engine profile cake-engine-internal-enabled",
+      "action": "Receive the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 0,
+        "balance_after": 495970000,
+        "spendable_after": 492970000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-sweep-payer",
+      "wallet": "cake",
+      "version": "6.5.4-cb3e96f1",
+      "variant": "cake-engine-internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile cake-engine-internal-enabled",
+      "action": "Send the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488990000,
+        "fee": 10000,
+        "balance_after": 990000,
+        "spendable_after": 990000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-cake-sweep-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty cake 13749e919020c9430792004287139480690918774cbc7fadfe594a658994a263, engine profile cake-engine-internal-enabled",
+      "action": "Receive the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488990000,
+        "fee": 0,
+        "balance_after": 498990000,
+        "spendable_after": 498990000
+      },
+      "evidence": {
+        "description": "cake/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "0cf53698560249fd5e9c8fd73db534b8cd8bc00aa2e89cb31e33aba3e2296af7"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-inbound-payer",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile external-only",
+      "action": "Send the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 20000,
+        "balance_after": 492978000,
+        "spendable_after": 492978000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-inbound-recipient",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile external-only",
+      "action": "Receive the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "incoming-note-spendable": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 0,
+        "balance_after": 6998000,
+        "spendable_after": 6998000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-outbound-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile external-only",
+      "action": "Send the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 2000,
+        "balance_after": 489998000,
+        "spendable_after": 489998000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-outbound-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile external-only",
+      "action": "Receive the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 0,
+        "balance_after": 10000000,
+        "spendable_after": 10000000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-spendback-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile external-only",
+      "action": "Send the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "spent-identified-incoming-note": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 2000,
+        "balance_after": 3996000,
+        "spendable_after": 3996000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-spendback-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile external-only",
+      "action": "Receive the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 0,
+        "balance_after": 495978000,
+        "spendable_after": 495978000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-sweep-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "external-only",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile external-only",
+      "action": "Send the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488998000,
+        "fee": 2000,
+        "balance_after": 998000,
+        "spendable_after": 998000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-external-sweep-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile external-only",
+      "action": "Receive the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488998000,
+        "fee": 0,
+        "balance_after": 498998000,
+        "spendable_after": 498998000
+      },
+      "evidence": {
+        "description": "zkool-external/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "2ee385cfbc2c353dd8e4e7add7fc53145e3a9c34552f53d21942176915260abc"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-inbound-payer",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile internal-enabled",
+      "action": "Send the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 20000,
+        "balance_after": 492978000,
+        "spendable_after": 492978000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-inbound-recipient",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile internal-enabled",
+      "action": "Receive the inbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "incoming-note-spendable": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 6000000,
+        "fee": 0,
+        "balance_after": 6998000,
+        "spendable_after": 6998000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the inbound payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-outbound-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile internal-enabled",
+      "action": "Send the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 2000,
+        "balance_after": 489998000,
+        "spendable_after": 489998000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-outbound-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile internal-enabled",
+      "action": "Receive the outbound payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 10000000,
+        "fee": 0,
+        "balance_after": 10000000,
+        "spendable_after": 10000000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the outbound payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-spendback-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile internal-enabled",
+      "action": "Send the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "spent-identified-incoming-note": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 2000,
+        "balance_after": 3996000,
+        "spendable_after": 3996000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-spendback-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile internal-enabled",
+      "action": "Receive the spendback payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 3000000,
+        "fee": 0,
+        "balance_after": 495978000,
+        "spendable_after": 495978000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the spendback payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-sweep-payer",
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "network": "regtest",
+      "client_sha256": "98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zallet 0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508, engine profile internal-enabled",
+      "action": "Send the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "unexercised",
+        "node-observed-pending": "pass",
+        "signed-and-broadcast": "pass",
+        "debit-includes-reported-fee": "pass",
+        "target-only-online-connection-trace": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488998000,
+        "fee": 2000,
+        "balance_after": 998000,
+        "spendable_after": 998000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
+      "id": "zkool-cake-zkool-internal-sweep-recipient",
+      "wallet": "zallet",
+      "version": "32488c5554e5e0275c3313b2fc06c00e6780746a",
+      "variant": "ordinary",
+      "implementation": "app",
+      "interface": "native-wallet-query",
+      "network": "regtest",
+      "client_sha256": "0851230a1971b6f3c12c9b42141b4d1c289384d78176dee67d2c87ed4a1d1508",
+      "method_scope": "none",
+      "methods": {},
+      "status": "pass",
+      "fixture": "Regtest anchor height 260, node sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba, schedule ea05059f6c1aafac88f17b55c156fde16cabda7e5c4c7e8bf10234e0a3aed817, all-block retention, counterparty zkool 98a03216d9975b4e1a485c1c2cf08ab9bc3a46e7b0716d83a2ad742ded74cafb, engine profile internal-enabled",
+      "action": "Receive the sweep payment and verify its persisted ledger entry",
+      "assertions": {
+        "confirmed-in-wallet-history": "pass",
+        "retained-confirmation-after-restart": "pass",
+        "own-pending-observed": "pass",
+        "node-observed-pending": "pass",
+        "credited-received-amount": "pass",
+        "decrypted-received-memo": "pass",
+        "native-wallet-query-config-verified": "pass"
+      },
+      "accounting_zat": {
+        "amount": 488998000,
+        "fee": 0,
+        "balance_after": 498998000,
+        "spendable_after": 498998000
+      },
+      "evidence": {
+        "description": "zkool-internal/receipt.json includes both wallet records for the sweep payment",
+        "sha256": "879b1c4ea6bf0a0975a438bfcb92125161509ec839adc6aaaaf1b60c6fd4904a"
+      }
+    },
+    {
       "id": "zkool-compact-stream-control",
       "wallet": "zkool",
       "version": "6.37.0",
