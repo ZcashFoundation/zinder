@@ -40,7 +40,7 @@ inclusion (ten confirmations). Zingo read back its balance and history offline. 
 
 | Engine | Evidence and limits |
 |---|---|
-| Vizor | The engine reported proposal fees of 25,000 and 10,000 zatoshis for its outbound and return payments. Its Regtest fixture activated NU6.3 at height 2. |
+| Vizor | The confirmed outbound and return transactions reported fees of 25,000 and 10,000 zatoshis, matching both proposals. Its Regtest fixture activated NU6.3 at height 2. |
 | zcash-devtool | The Sapling receiver credited the payment and spent it back. Its inbound row retained no memo. The server returned the release revision and anchor before and after use. All 16 online commands connected only to the selected endpoint. |
 | Zally | The observed balance changes imply fees of 10,000 zatoshis for each engine payment. The wallet API exposes balances on reopen. Its sent history, pending state, and fee accessor remain unexercised. |
 

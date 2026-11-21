@@ -17,6 +17,7 @@ from unittest import mock
 import coverage as cov
 from coverage_evidence import digest
 
+import counterparty_builds
 import coverage_counterparty_roles as roles
 
 
@@ -117,7 +118,7 @@ def provenance(engine, sources, engine_sha=None):
     record = {"engine_binary_sha256": (engine_sha or ENGINE_SHA)[engine],
               "rustc": "rustc 1.100.0",
               "source": f"/private/source/{engine}", "label": LABELS[engine],
-              "label_verified": True,
+              "label_verified": (engine_sha or ENGINE_SHA)[engine] == ENGINE_SHA[engine],
               "build_command": "cargo build --locked"}
     if engine == "vizor":
         record.update({"source_commit": VIZOR_COMMIT,
@@ -137,7 +138,7 @@ def provenance(engine, sources, engine_sha=None):
 
 def zingo_provenance(zingo_sha=ZINGO_SHA):
     return {"sha256": zingo_sha, "version": ZINGO_VERSION, "source": ZINGO_COMMIT,
-            "label": "Zingo CLI from Zingolib 81d7997", "label_verified": True}
+            "label": "Zingo CLI from Zingolib 81d7997", "label_verified": zingo_sha == ZINGO_SHA}
 
 
 def endpoint(engine, commit=RELEASE["commit"], anchor=None):
@@ -268,14 +269,14 @@ def receipt(engine, ready_path, ready_data, sources, release=RELEASE,
     in_txid, in_height = TREES["inbound"]
     back_txid, back_height = TREES["spendback"]
     if engine == "zally":
-        out_value, out_source = 10_000, roles.DERIVED_FEE_SOURCE
-        back_value, back_source = 10_000, roles.DERIVED_FEE_SOURCE
+        out_value, out_source = 10_000, roles.FEE_SOURCES["zally"]
+        back_value, back_source = 10_000, roles.FEE_SOURCES["zally"]
     elif engine == "devtool":
         out_value, out_source = 25_000, "wallet transaction fee_paid"
         back_value, back_source = 10_000, "wallet transaction fee_paid"
     else:
-        out_value, out_source = 25_000, "wallet proposal fee"
-        back_value, back_source = 10_000, "wallet proposal fee"
+        out_value, out_source = 25_000, "wallet confirmed network fee"
+        back_value, back_source = 10_000, "wallet confirmed network fee"
     out_fee = fee(engine, AMOUNTS["engine_pays"], out_value, out_source)
     back_fee = fee(engine, AMOUNTS["engine_returns"], back_value, back_source)
     payer_balance = 500_000_000 - out_fee["debit_zat"]
@@ -309,7 +310,7 @@ def receipt(engine, ready_path, ready_data, sources, release=RELEASE,
                     "remaining_resources": {"container": 0, "network": 0, "volume": 0}},
         "provenance": {"engine": provenance(engine, sources, engine_hashes),
                        "zingo": zingo_provenance(zingo_hash)},
-        "labels_verified": True,
+        "labels_verified": engine_hashes[engine] == ENGINE_SHA[engine] and zingo_hash == ZINGO_SHA,
         "endpoint_evidence": endpoint(engine, release["commit"],
                                       ready_data["current_hash"]),
         "fixture_isolation": ready_data["isolation"],
@@ -486,14 +487,43 @@ class Campaign:
         self.mutate(engine, change)
 
 
-class CounterpartyRows(unittest.TestCase):
+class CounterpartyCase(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        registry = {}
+        for engine in ENGINES:
+            block = provenance(engine, roles.local_sources(engine))
+            keys = ("label", "commit", "lock_sha256")
+            if engine == "vizor":
+                keys = ("label", "source_commit", "archive_sha256", "driver_sha256", "lock_sha256")
+            record = {key: block[key] for key in keys}
+            if engine == "zally":
+                record["harness_sha256"] = block["harness_sha256"]
+            registry[ENGINE_SHA[engine]] = dict(record, engine=engine)
+        zingo = zingo_provenance()
+        registry[ZINGO_SHA] = {key: zingo[key] for key in ("label", "source", "version")}
+        registry[ZINGO_SHA]["engine"] = "zingo"
+        self.enterContext(mock.patch.dict(counterparty_builds.REGISTERED_BUILDS, registry))
         self.campaign = Campaign(self.root)
         self.addCleanup(self.campaign.stop)
 
+    def second_campaign(self, **settings):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        campaign = Campaign(Path(temporary.name), **settings)
+        self.addCleanup(campaign.stop)
+        return campaign
+
+    def reject(self, engine, change):
+        self.campaign.reset()
+        self.campaign.mutate(engine, change)
+        with self.assertRaises(ValueError):
+            roles.counterparty_actions(self.campaign.receipt_path(engine), RELEASE)
+
+
+class CounterpartyRows(CounterpartyCase):
     def rows(self, engine):
         return roles.counterparty_actions(self.campaign.receipt_path(engine), RELEASE)
 
@@ -505,13 +535,6 @@ class CounterpartyRows(unittest.TestCase):
 
     def validate(self, rows):
         return cov.validate(self.matrix(rows))["scenarios"]
-
-    def second_campaign(self, **settings):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        campaign = Campaign(Path(temporary.name), **settings)
-        self.addCleanup(campaign.stop)
-        return campaign
 
     def test_each_leg_and_actor_is_a_separate_row(self):
         rows = self.rows("vizor")
@@ -790,6 +813,8 @@ class CounterpartyRows(unittest.TestCase):
             "receipt records no live server identity",
             "receipt records no portable client input pins",
             "teardown verification is not measured",
+            "zally: executable source version is unverified",
+            "zingo: executable source version is unverified",
         ])
         for row in part["rows"]:
             self.assertEqual(row["status"], "unexercised")
@@ -915,22 +940,60 @@ class CounterpartyRows(unittest.TestCase):
         rows = self.rows("zally")
         self.assertEqual(rows[1]["version"], "binary " + ZINGO_SHA[:12])
 
-    def test_registered_build_replaces_binary_only_version(self):
-        roles.KNOWN_BUILDS[ENGINE_SHA["vizor"]] = {
-            "engine": "vizor", "version": "v0.0.65", "commit": "a" * 40}
-        try:
-            row = self.rows("vizor")[0]
-            self.assertEqual(row["version"], "v0.0.65")
-            self.assertEqual(row["assertions"]["source-version-registered"], "pass")
-        finally:
-            roles.KNOWN_BUILDS.pop(ENGINE_SHA["vizor"])
-        roles.KNOWN_BUILDS[ENGINE_SHA["vizor"]] = {
-            "engine": "zally", "version": "v0.0.65", "commit": "a" * 40}
-        try:
-            with self.assertRaises(ValueError):
-                self.rows("vizor")
-        finally:
-            roles.KNOWN_BUILDS.pop(ENGINE_SHA["vizor"])
+    def test_verified_labels_require_an_independently_registered_executable_and_source(self):
+        for engine in ENGINES:
+            for field in ("label", "source_commit" if engine == "vizor" else "commit", "lock_sha256"):
+                with self.subTest(engine=engine, field=field):
+                    self.reject(engine, lambda r: r["provenance"]["engine"].update({field: token("other")}))
+            changed = self.second_campaign(engine_sha=ENGINE_SHA | {engine: token("unregistered")})
+            rows = roles.counterparty_actions(changed.receipt_path(engine), RELEASE)
+            self.assertEqual(rows[0]["version"], "binary " + token("unregistered")[:12])
+            changed.mutate(engine, lambda r: r["provenance"]["engine"].update(label_verified=True))
+            with self.assertRaisesRegex(ValueError, "registered executable"):
+                roles.counterparty_actions(changed.receipt_path(engine), RELEASE)
+        self.reject("vizor", lambda r: r["provenance"]["zingo"].update(source="f" * 40))
+
+    def test_local_zally_build_record_binds_compiler_output_and_inputs(self):
+        engine = "zally"
+        sha = token("new local build")
+        run = self.second_campaign(engine_sha=ENGINE_SHA | {engine: sha})
+        path = run.receipt_path(engine)
+        receipt = roles.load(path)
+        block = receipt["provenance"]["engine"]
+        pins = receipt["pins"]["client_inputs_sha256"]
+        build = {"target": "zally-payment-harness", "engine_binary_sha256": sha,
+                 "commit": block["commit"], "lock_sha256": block["lock_sha256"],
+                 "harness_sha256": block["harness_sha256"],
+                 "builder_sha256": roles.pin_value(pins, ("zally-payment.py",))}
+        sidecar = path.with_name("zally-build.json")
+
+        def record(data):
+            sidecar.write_text(json.dumps(data))
+            pins[sidecar.name] = block["local_build_sha256"] = roles.digest(sidecar)
+            receipt["client_inputs_sha256_after"] = dict(pins)
+            receipt["labels_verified"] = block["label_verified"] = True
+            run.write_receipt(engine, receipt)
+
+        record(build)
+        rows = roles.counterparty_import(path, RELEASE, allow_provisional=False)["rows"]
+        self.assertEqual(rows[0]["version"], LABELS[engine])
+        for key in build:
+            record(build | {key: token("wrong")})
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "local build"):
+                roles.counterparty_actions(path, RELEASE)
+        record(build)
+        sidecar.unlink()
+        with self.assertRaisesRegex(ValueError, "missing or changed"):
+            roles.counterparty_actions(path, RELEASE)
+
+    def test_fees_require_the_correct_actor_source_and_consistent_proposal(self):
+        for engine in ENGINES:
+            for field in ("engine_pays", "engine_receives"):
+                key = "payer_fee" if field == "engine_pays" else "engine_return_fee"
+                for other in ENGINES:
+                    if other != engine:
+                        self.reject(engine, lambda r: r[field][key].update(fee_source=roles.FEE_SOURCES[other]))
+                self.reject(engine, lambda r: r[field][key].update(proposal_fee_zat=1))
 
     def test_import_evidence_counts_excluded_engines_and_identical_rows(self):
         self.campaign.receipt_path("devtool").unlink()
@@ -971,20 +1034,7 @@ class CounterpartyRows(unittest.TestCase):
         self.assertFalse(any(isinstance(node, ast.Assert) for node in ast.walk(tree)))
 
 
-class NegativeControls(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.campaign = Campaign(self.root)
-        self.addCleanup(self.campaign.stop)
-
-    def reject(self, engine, change):
-        self.campaign.reset()
-        self.campaign.mutate(engine, change)
-        with self.assertRaises(ValueError):
-            roles.counterparty_actions(self.campaign.receipt_path(engine), RELEASE)
-
+class NegativeControls(CounterpartyCase):
     def reject_ready(self, engine, change):
         self.campaign.reset()
         self.campaign.mutate_ready(engine, change)
@@ -1101,7 +1151,7 @@ class NegativeControls(unittest.TestCase):
                         engine_history_entries_after_reopen=1))
         self.reject("zally",
                     lambda r: r["engine_pays"]["payer_fee"].update(
-                        fee_source="wallet proposal fee"))
+                        fee_source="wallet confirmed network fee"))
         self.reject("zally",
                     lambda r: r["engine_receives"]["engine_return_fee"].update(
                         fee_source="wallet transaction fee_paid"))

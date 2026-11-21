@@ -25,6 +25,35 @@ V0_22_0_COMMIT = "999d51ab835037a2466763ca1a1e7739a26b72c1"
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_local_build_refuses_a_dirty_checkout_before_cargo(self):
+        with tempfile.TemporaryDirectory() as work:
+            folder = Path(work)
+            (folder / "Cargo.lock").write_text("edited lock")
+            build = MODULE["build_zally_for_run"]
+            builder = Mock()
+            with patch.dict(build.__globals__, git_state=lambda _: {"clean": False}), \
+                 patch("importlib.import_module", return_value=builder):
+                with self.assertRaisesRegex(ValueError, "clean checkout"):
+                    build(folder, folder / "target", folder / "zally-build.json")
+            builder.build.assert_not_called()
+
+    def test_confirmed_fees_cannot_be_replaced_by_a_proposal_or_balance_residual(self):
+        payer = MODULE["engine_payer"]
+        for engine, field in (("vizor", "network_fee"), ("devtool", "fee_zat")):
+            for amount in (None, 0, -1, "10", True, 11):
+                with self.subTest(engine=engine, amount=amount), self.assertRaises(ValueError):
+                    payer(engine, 100, {"fee_zatoshi": 10}, 500, 390, {field: amount}, -110)
+        for proposed in (-1, True, "10", 11):
+            with self.assertRaisesRegex(ValueError, "proposal"):
+                payer("vizor", 100, {"fee_zatoshi": proposed}, 500, 390, {"network_fee": 10}, -110)
+        for sent in ({}, {"fee_zatoshi": 10}):
+            f = payer("vizor", 100, sent, 500, 390, {"network_fee": 10}, -110)
+            self.assertEqual(f["fee_source"], "wallet confirmed network fee")
+            self.assertEqual(f.get("proposal_fee_zat"), sent.get("fee_zatoshi"))
+        residual = payer("zally", 100, {}, 500, 390, {}, None)
+        self.assertEqual(residual["fee_zat"], 10)
+        self.assertIn("derived", residual["fee_source"])
+
     def test_nested_vizor_build_recompiles_changed_older_driver(self):
         vizor = importlib.import_module("vizor-payment")
         with tempfile.TemporaryDirectory() as temp:
@@ -140,16 +169,20 @@ class ReproducibilityTests(unittest.TestCase):
         zally = importlib.import_module("zally-payment")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "Cargo.lock").write_text("lock")
             flags = ["payment-roles", "--engine", "zally", "--release-tag", "v0.22.0",
                      "--images", "images.json", "--bin-dir", "bin", "--zingo", "zingo",
-                     "--evidence", str(root / "new"), "--zally-source", "source",
+                     "--evidence", str(root / "new"), "--zally-source", str(source),
                      "--zally-build", "build", "--native-probe-python", "python",
                      "--native-proto-dir", "proto"]
             with patch.object(sys, "argv", flags), patch("os.umask"), \
+                    patch.dict(MODULE["main"].__globals__, git_state=lambda _: {"clean": True}), \
                     patch.object(zally, "build", side_effect=RuntimeError("builder reached")) as build:
                 with self.assertRaisesRegex(RuntimeError, "builder reached"):
                     MODULE["main"]()
-            build.assert_called_once_with(Path("source"), Path("build"), SCRIPTS / "zally-payment.rs")
+            build.assert_called_once_with(source, Path("build"), SCRIPTS / "zally-payment.rs")
 
     def test_devtool_reads_truncated_and_padded_sqlite_memos(self):
         decode = importlib.import_module("devtool-payment").decode_memo

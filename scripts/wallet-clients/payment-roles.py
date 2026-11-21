@@ -23,6 +23,8 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from counterparty_builds import matches_build, matches_local_zally_build
+
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 NODE_CONFIG = ROOT / "deploy/zebra/regtest-nu6-at-one.toml"
@@ -249,29 +251,32 @@ def ledger_delta(engine, snapshot, txid):
     return None
 
 
-def engine_payer(engine, wallet, address, amount, memo, txid, sent, before, after, detail,
-                 delta=None):
-    fee, fee_source = None, None
+def engine_payer(engine, amount, sent, before, after, detail, delta):
+    proposal = None
     if engine == "vizor":
-        detail = detail or {}
-        fee = sent.get("fee_zatoshi")
-        if fee is None:
-            fee = detail.get("network_fee")
-        fee_source = "wallet proposal fee" if fee is not None else None
+        fee = detail.get("network_fee")
+        fee_source = "wallet confirmed network fee"
+        proposal = sent.get("fee_zatoshi")
+        if proposal is not None:
+            require(type(proposal) is int and proposal > 0 and proposal == fee,
+                    "Vizor proposal fee differs from the confirmed transaction fee")
     elif engine == "devtool":
-        detail = detail or {}
         fee = detail.get("fee_zat")
-        fee_source = "wallet transaction fee_paid" if fee is not None else None
-    if not isinstance(fee, int) or fee <= 0:
+        fee_source = "wallet transaction fee_paid"
+    else:
+        require(engine == "zally", "unknown payer fee source")
         fee = before - after - amount
         fee_source = "derived from persisted balance delta minus payment amount"
-    require(isinstance(fee, int) and fee > 0, "payer fee evidence missing")
+    require(type(fee) is int and fee > 0, "payer fee evidence missing or invalid")
     require(before - after == amount + fee, "payer debit does not reconcile payer fee")
-    if isinstance(delta, int):
-        require(-delta == amount + fee, "payer ledger delta does not reconcile payer fee")
-    return {"fee_zat": fee, "fee_source": fee_source,
-            "debit_zat": before - after, "amount_zat": amount,
-            "ledger_delta_zat": delta}
+    if delta is not None:
+        require(type(delta) is int and -delta == amount + fee,
+                "payer ledger delta does not reconcile payer fee")
+    record = {"fee_zat": fee, "fee_source": fee_source,
+              "debit_zat": before - after, "amount_zat": amount, "ledger_delta_zat": delta}
+    if proposal is not None:
+        record["proposal_fee_zat"] = proposal
+    return record
 
 
 def engine_receive(engine, snapshot, detail, txid, amount, memo):
@@ -431,7 +436,7 @@ def run_engine_pays(engine, node, ready, evidence, zingo_recv, payer, amount, me
                   if row["txid"] == txid and row["is_change"]]
         send_persistence = "change row in receives" if len(change) == 1 else "not observed"
     payer_final, payee_final, outbound = settled_balances(node, ready, txid, payer, zingo_recv)
-    paid = engine_payer(engine, payer, payee_address, amount, memo, txid, sent_report,
+    paid = engine_payer(engine, amount, sent_report,
                         payer_before["total_zat"], payer_final["total_zat"], detail, delta)
     require(payee_final["total_zat"] == payee_before["total_zat"] + amount,
             "Zingo payee balance did not rise by the exact amount")
@@ -484,7 +489,7 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
     received = engine_receive(engine, payee_after, detail, receive_txid, receive_amount, receive_memo)
     payer_row = zingo_payer.detail(receive_txid)
     zingo_fee = payer_row.get("fee_zat")
-    require(isinstance(zingo_fee, int) and zingo_fee > 0, "Zingo payer fee evidence missing")
+    require(type(zingo_fee) is int and zingo_fee > 0, "Zingo payer fee evidence missing")
     require(receive_memo in payer_row["memos"], "Zingo sender did not record the memo it sent")
     require(received["mined_height"] == node.transaction(receive_txid)["height"],
             "engine payee height differs from node")
@@ -516,8 +521,7 @@ def run_engine_receives(engine, node, ready, zingo_payer, receiver, receive_amou
     detail = receiver.detail(txid) if engine != "zally" else {}
     return_delta = ledger_delta(engine, return_observed, txid)
     return_after, zingo_after_return, spendback = settled_balances(node, ready, txid, receiver, zingo_payer)
-    returned = engine_payer(engine, receiver, zingo_address, return_amount, return_memo,
-                            txid, sent_report, funded["total_zat"],
+    returned = engine_payer(engine, return_amount, sent_report, funded["total_zat"],
                             return_after["total_zat"], detail, return_delta)
     returned_credit = payee_credit_zingo(zingo_after_return, txid, return_amount, return_memo)
     require(zingo_after_return["total_zat"] == payer_confirmed["total_zat"] + return_amount,
@@ -635,7 +639,27 @@ def rust_version():
     return subprocess.check_output(["rustc", "--version"], text=True).strip()
 
 
-def provenance(engine, args, engine_binary):
+def build_zally_for_run(source, directory, evidence):
+    module = importlib.import_module("zally-payment")
+    harness = HERE / "zally-payment.rs"
+
+    def inputs():
+        return {"source": git_state(source), "lock_sha256": digest(source / "Cargo.lock"),
+                "harness_sha256": digest(harness), "builder_sha256": digest(HERE / "zally-payment.py")}
+
+    before = inputs()
+    require(before["source"].get("clean") is True, "Zally source verification requires a clean checkout")
+    binary = module.build(source, directory, harness)
+    require(before == inputs() and before["harness_sha256"] == digest(directory / "src/main.rs"),
+            "Zally build inputs changed during compilation")
+    record = {"target": "zally-payment-harness", "builder_sha256": before["builder_sha256"],
+              "commit": before["source"].get("commit"), "lock_sha256": before["lock_sha256"],
+              "harness_sha256": before["harness_sha256"], "engine_binary_sha256": digest(binary)}
+    write_json(evidence, record)
+    return binary
+
+
+def provenance(engine, args, engine_binary, local_build=None):
     record = {"engine_binary_sha256": digest(engine_binary), "rustc": rust_version()}
     if engine == "devtool":
         state = git_state(args.devtool_source)
@@ -644,8 +668,6 @@ def provenance(engine, args, engine_binary):
                        if (Path(args.devtool_source) / "Cargo.lock").is_file() else None,
                        "build_command": "cargo build --locked --features regtest_support"})
         record["label"] = "zcash-devtool c8322f7e"
-        record["label_verified"] = state.get("commit") == "c8322f7e71ae46ab24801a721523ba83b27d911b" \
-            and state.get("clean") is True
     elif engine == "zally":
         state = git_state(args.zally_source)
         record.update({"source": str(args.zally_source), **state,
@@ -654,8 +676,6 @@ def provenance(engine, args, engine_binary):
                        "harness_sha256": digest(HERE / "zally-payment.rs"),
                        "build_command": "cargo build --locked (out-of-tree harness, --features zinder)"})
         record["label"] = "Zally 31ee6c3a"
-        record["label_verified"] = state.get("commit") == "31ee6c3ae09e109d189c6dcd691b192fb4c5b29e" \
-            and state.get("clean") is True
     else:
         provenance_path = args.vizor_provenance
         source = json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
@@ -671,19 +691,28 @@ def provenance(engine, args, engine_binary):
             "build_command": "cargo build --locked --example vizor-payment",
         })
         record["label"] = "Vizor v0.0.65"
-        record["label_verified"] = (
-            source.get("vizor_source") == "d0edb5b13890dd33d9bb93b5c4e50fd9973fa4e6"
-            and source.get("release_archive_sha256")
-            == "0641e4f5ad8a37250dde1f90bd4faf36b981ed4bf07ff9048966d94ea5667d0c")
+    record["label_verified"] = (matches_build(engine, record["engine_binary_sha256"], record)
+                                and (engine == "vizor" or record.get("clean") is True))
+    if engine == "zally" and local_build is not None:
+        build = json.loads(local_build.read_bytes())
+        record["local_build_sha256"] = digest(local_build)
+        record["label_verified"] = matches_local_zally_build(record, build, digest(HERE / "zally-payment.py"))
+    if not record["label_verified"]:
+        record["label"] = "binary " + record["engine_binary_sha256"][:12]
+        record["reference_build_command"] = record.pop("build_command")
     return record
 
 
 def zingo_provenance(zingo):
-    expected = "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a"
     version = subprocess.check_output([str(zingo), "--version"], text=True).strip()
     observed = digest(zingo)
-    return {"sha256": observed, "version": version, "source": "81d799775f11e882896e8710e8af12d6d4d29a41",
-            "label": "Zingo CLI from Zingolib 81d7997", "label_verified": observed == expected}
+    record = {"sha256": observed, "version": version, "source": "81d799775f11e882896e8710e8af12d6d4d29a41",
+            "label": "Zingo CLI from Zingolib 81d7997"}
+    record["label_verified"] = matches_build("zingo", observed, record)
+    if not record["label_verified"]:
+        record["label"] = "binary " + observed[:12]
+        del record["source"]
+    return record
 
 
 def native_probe(args, ready, revision):
@@ -880,6 +909,7 @@ def main():
     images_name = images_filename(args.release_tag)
     node_config_default = args.node_config.resolve() if args.node_config else NODE_CONFIG
     extra = {}
+    local_build = None
     if engine == "vizor":
         extra["vizor_engine"] = args.vizor_engine.resolve()
     elif engine == "devtool":
@@ -887,13 +917,12 @@ def main():
     elif args.zally_binary is not None:
         extra["zally_binary"] = args.zally_binary.resolve()
     else:
-        module = importlib.import_module("zally-payment")
-        extra["zally_binary"] = module.build(args.zally_source, args.zally_build,
-                                             HERE / "zally-payment.rs")
+        local_build = evidence / "zally-build.json"
+        extra["zally_binary"] = build_zally_for_run(args.zally_source, args.zally_build, local_build)
     engine_binary = extra["zally_binary"] if engine == "zally" else \
         extra["vizor_engine"] if engine == "vizor" else extra["devtool"]
     require(Path(engine_binary).is_file(), "engine binary is missing: " + str(engine_binary))
-    input_paths = [engine_binary, zingo, HERE / "payment-roles.py",
+    input_paths = [engine_binary, zingo, HERE / "payment-roles.py", HERE / "counterparty_builds.py",
                    HERE / f"{engine}-payment.py", ROOT / "scripts/regtest-fixture.py",
                    ROOT / "scripts/wallet-clients/wallet_fixture.py",
                    ROOT / "scripts/wallet-clients/roundtrip_wallets.py",
@@ -916,6 +945,8 @@ def main():
                             Path(args.zally_source) / "Cargo.lock",
                             args.native_proto_dir / "zinder/v1/wallet/wallet_pb2.py",
                             args.native_proto_dir / "zinder/v1/ops/server_info_pb2.py"])
+    if local_build is not None:
+        input_paths.append(local_build)
     if images_path:
         input_paths.append(images_path)
     if bin_dir:
@@ -982,7 +1013,7 @@ def main():
             require_identity(before, ready, revision, "before admission")
             live = {"before": before, "endpoint": ready["lightwalletd"],
                     "negative_controls": lightwalletd_negatives(args, ready, node, revision)}
-        template = provenance(engine, args, engine_binary)
+        template = provenance(engine, args, engine_binary, local_build)
         zingo_record = zingo_provenance(zingo)
         pins = {"release": args.release_tag, "release_commit": revision,
                 "fixture_ready_sha256": digest(ready_path), "node_image": ready.get("node_image"),
@@ -1110,8 +1141,6 @@ def main():
         elif not inputs_stable:
             receipt["status"] = "failed"
             receipt["role_error"] = "a bound client, image, or source input changed during the run"
-        elif not labels_verified:
-            receipt["status"] = "unverified-inputs"
         elif args.roles != "both":
             receipt["status"] = "partial"
         elif owned and args.keep:
@@ -1121,6 +1150,8 @@ def main():
             receipt["role_error"] = "fixture cleanup is missing or unverified"
         elif not owned:
             receipt["status"] = "roles-passed-fixture-retained"
+        elif not labels_verified:
+            receipt["status"] = "unverified-inputs"
         else:
             receipt["status"] = "passed"
         write_json(evidence / "receipt.json", receipt)

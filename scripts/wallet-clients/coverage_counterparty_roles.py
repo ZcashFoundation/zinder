@@ -54,10 +54,9 @@ The producer records these fields, which this importer consumes:
     cleanup.verified         measured removal and remaining project resources
     pins.client_inputs_sha256 and client_inputs_sha256_after
 
-A version is claimed only when `label_verified` is true and the label's binary,
-driver, lock, provenance, or archive digests match the pinned inputs. Otherwise
-the row states `binary <digest prefix>` and leaves the source version
-unexercised. A label is never used without its digest binding.
+A verified version requires a registered executable digest and matching source
+inputs, or a Zally Cargo build record binding those inputs to the output binary.
+Strict collection checks this evidence independently for each wallet.
 
 The producer records each leg's balances with the phase that measured them:
 `engine_pays.leg_observations.outbound`, and
@@ -110,6 +109,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from counterparty_builds import matches_build, matches_local_zally_build
 from coverage_evidence import digest, load, require
 
 
@@ -182,17 +182,11 @@ ZINGO = {
     "wallet": "zingo", "interface": "lightwalletd", "implementation": "engine",
     "variant": "nakednet-cli", "binary": ("zingo-cli", "zingo-binary"),
 }
-# A version is claimed only for a digest registered with its documented build
-# identity. The producer's verified `provenance` block is preferred; entries
-# here are the fallback for a digest documented outside a receipt.
-KNOWN_BUILDS = {}
-
-EXPOSED_FEE_SOURCES = {
-    "wallet proposal fee",
-    "wallet transaction fee_paid",
+FEE_SOURCES = {
+    "vizor": "wallet confirmed network fee",
+    "devtool": "wallet transaction fee_paid",
+    "zally": "derived from persisted balance delta minus payment amount",
 }
-DERIVED_FEE_SOURCE = "derived from persisted balance delta minus payment amount"
-FEE_SOURCES = EXPOSED_FEE_SOURCES | {DERIVED_FEE_SOURCE}
 
 
 def token(value, where):
@@ -241,6 +235,7 @@ def loopback(value, where):
 def local_sources(engine):
     """Names and local copies of the client sources the producer pins."""
     documents = [("payment-roles.py", HERE / "payment-roles.py"),
+                 ("counterparty_builds.py", HERE / "counterparty_builds.py"),
                  (f"{engine}-payment.py", HERE / f"{engine}-payment.py"),
                  ("zingo-payment.py", HERE / "zingo-payment.py"),
                  ("roundtrip_wallets.py", HERE / "roundtrip_wallets.py"),
@@ -841,12 +836,13 @@ def fee_claim(engine, value, amount, where):
     require(delta is None or (type(delta) is int and delta == -value["debit_zat"]),
             f"{where}: payer ledger delta does not reconcile the debit")
     source = value.get("fee_source")
-    require(source in FEE_SOURCES, f"{where}: unknown payer fee source")
-    if engine == "zally":
-        require(source == DERIVED_FEE_SOURCE,
-                f"{where}: Zally receipt claims a wallet-exposed fee")
+    require(source == FEE_SOURCES[engine], f"{where}: wrong fee source for {engine}")
+    if "proposal_fee_zat" in value:
+        proposal = value["proposal_fee_zat"]
+        require(engine == "vizor" and type(proposal) is int and proposal == value["fee_zat"],
+                f"{where}: proposal and confirmed fees differ")
     return {"amount": amount, "fee": value["fee_zat"],
-            "exposed": source in EXPOSED_FEE_SOURCES, "ledger": delta is not None}
+            "exposed": engine != "zally", "ledger": delta is not None}
 
 
 def inclusion(value, where):
@@ -1259,35 +1255,36 @@ def binary_version(sha):
     return "binary " + sha[:12]
 
 
-def version_claim(result, engine, pins, inputs):
+def version_claim(result, engine, pins, inputs, receipt_dir):
     """Bind the engine's version label to its pinned build identity."""
     fallback = {"version": binary_version(pins["engine_binary_sha256"]),
                 "binary-only-version-claim": "pass",
                 "source-version-registered": "unexercised",
                 "source-version-binding-verified": "unexercised"}
-    known = KNOWN_BUILDS.get(pins["engine_binary_sha256"])
-    if known is not None:
-        require(known.get("engine") == engine,
-                f"{engine}: build identity belongs to another client")
-        require(isinstance(known.get("version"), str) and known["version"],
-                f"{engine}: registered build has no version")
-        commit(known.get("commit"), f"{engine} registered build")
-        return dict(fallback, version=known["version"],
-                    **{"binary-only-version-claim": "unexercised",
-                       "source-version-registered": "pass",
-                       "source-version-binding-verified": "pass"})
     provenance = result.get("provenance")
     if provenance is None:
         return fallback
     require(isinstance(provenance, dict) and set(provenance) <= {"engine", "zingo"},
             f"{engine}: unexpected provenance fields")
     block = provenance.get("engine")
-    if not isinstance(block, dict) or block.get("label_verified") is not True:
-        return fallback
-    if inputs is None:
+    if not isinstance(block, dict):
         return fallback
     require(block.get("engine_binary_sha256") == pins["engine_binary_sha256"],
             f"{engine}: provenance binary differs from the pinned engine")
+    if block.get("label_verified") is not True:
+        return fallback
+    if inputs is None:
+        return fallback
+    if "local_build_sha256" in block:
+        build_path = receipt_dir / "zally-build.json"
+        require(engine == "zally" and build_path.is_file()
+                and block["local_build_sha256"] == pin_value(inputs, ("zally-build.json",)) == digest(build_path),
+                f"{engine}: local build evidence missing or changed")
+        require(matches_local_zally_build(block, load(build_path), pin_value(inputs, ("zally-payment.py",))),
+                f"{engine}: local build does not match the executable and source")
+    else:
+        require(matches_build(engine, pins["engine_binary_sha256"], block),
+                f"{engine}: verified label does not match a registered executable and source")
     label = block.get("label")
     require(isinstance(label, str) and label.strip(), f"{engine}: verified label is empty")
     for key in ("rustc", "build_command"):
@@ -1329,10 +1326,14 @@ def zingo_version_claim(result, pins):
     if not isinstance(provenance, dict):
         return fallback
     block = provenance.get("zingo")
-    if not isinstance(block, dict) or block.get("label_verified") is not True:
+    if not isinstance(block, dict):
         return fallback
     require(block.get("sha256") == pins["zingo_sha256"],
             "zingo: provenance digest differs from the pinned client")
+    if block.get("label_verified") is not True:
+        return fallback
+    require(matches_build("zingo", pins["zingo_sha256"], block),
+            "zingo: verified label does not match a registered executable and source")
     commit(block.get("source"), "zingo source")
     require(isinstance(block.get("version"), str) and block["version"].strip(),
             "zingo: verified label has no binary version")
@@ -1463,7 +1464,7 @@ def counterparty_import(path, release, allow_provisional=True):
         {server["reason"]} if server["status"] != "pass" else set()))
     receipt_sha = digest(path)
     engine_version = version_claim(result, engine, pins,
-                                   pins.get("client_inputs_sha256"))
+                                   pins.get("client_inputs_sha256"), path.parent)
     zingo_version = zingo_version_claim(result, pins)
     labels = result.get("labels_verified")
     if labels is not None:
@@ -1477,13 +1478,12 @@ def counterparty_import(path, release, allow_provisional=True):
 
     rows = []
     exclusions = []
-    common_unexercised = [proofs[key]["reason"] for key in proofs
-                          if proofs[key]["status"] != "pass"]
-    if server["status"] != "pass":
-        common_unexercised.append(server["reason"])
+    for actor, version in ((engine, engine_version), ("zingo", zingo_version)):
+        if version["source-version-binding-verified"] != "pass":
+            reasons.append(f"{actor}: executable source version is unverified")
 
     def emit(actor, leg, action, accounting, checks, version):
-        status = "pass" if not common_unexercised else "unexercised"
+        status = "unexercised" if reasons else "pass"
         sha = pins["engine_binary_sha256"] if actor == "engine" else pins["zingo_sha256"]
         rows.append(build_row(
             engine, actor, leg, action, accounting, checks,

@@ -28,8 +28,10 @@ for Zally.
 | Zally | `31ee6c3ae09e109d189c6dcd691b192fb4c5b29e`, typed headless wallet, `zinder` feature |
 
 The receipt pins the executed binaries, harness inputs, and node schedule by
-SHA-256 before and after use. The versioned matrix compares the binary digest
-and the fixture recipe. A different client build needs its own baseline.
+SHA-256 before and after use. The matrix compares the binary digest and the
+fixture recipe. A supplied binary must match a registered build to qualify.
+Debug builds from a different directory can have a different digest even at
+the same source commit. A different client build needs its own baseline.
 
 ## Build the engine harnesses
 
@@ -126,13 +128,28 @@ python3 scripts/wallet-clients/coverage.py compare "$output/roles.json" \
   --scenario-prefix counterparty-
 ```
 
+The producer and collector check both the executable digest and its source
+inputs before assigning a version. A supplied executable with an unregistered
+digest produces an `unverified-inputs` receipt. To register a new build, retain
+the source revision, lockfile, driver, build log, and digest of the executable
+reported by Cargo. Review those inputs before adding the digest and its source
+record to the registry. [Registered wallet builds](counterparty_builds.py)
+
+For a Zally driver compiled by the runner, keep `zally-build.json` beside the
+receipt. It binds the executable selected by Cargo to the measured source
+commit, lockfile, driver, and builder.
+
 A change in the wallet build, fixture schedule, or counterpart build makes a
 row incomparable. A lost wallet assertion or a change in recorded accounting
 fails the comparison.
 
 ## What these runs establish
 
-Vizor's engine exposes its proposal fee and outgoing pending row. Its incoming
+Vizor’s confirmed transaction supplies the network fee. If the proposal supplies
+a fee, the two must agree. Devtool supplies its persisted transaction fee. A
+missing, nonpositive, or inconsistent confirmed fee fails those payer cases.
+
+Vizor also exposes its outgoing pending row. Its incoming
 row was absent during the mempool observation. Its Regtest fixture activates
 NU6.3 at height 2, before any tested wallet's birthday.
 
