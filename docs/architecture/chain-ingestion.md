@@ -393,9 +393,11 @@ two kinds of damage:
 - An Orchard frontier stored in the Ironwood position with its own root, or
   the reverse, because both pools hash alike.
 
-The write-time checks prevent those. Live following compares each row with
-the node's tree state, and densification replays each stride before it writes
-rows.
+Construction derives checkpoints from the loaded blocks and compares the build-tip
+tree state with the node. Live following compares each new checkpoint with the
+node's tree state. Densification compares existing checkpoints with replayed
+values only when a stride needs more checkpoints. A stride that already meets
+the selection passes the coverage check without that comparison.
 
 ## Node endpoint failover
 
