@@ -1,6 +1,0 @@
-kind: fixed
-body: Tree-state requests before Sapling activation now return INVALID_ARGUMENT, matching Go lightwalletd, including latest-state requests on a pre-Sapling chain. Native WalletQuery continues to return pre-activation states with inactive pools absent.
-time: 2026-11-20T20:55:51.264353826Z
-custom:
-    Bump: patch
-    PR: "436"

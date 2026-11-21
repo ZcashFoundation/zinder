@@ -1,6 +1,0 @@
-kind: added
-body: Wallet integrators can verify funded recovery, transaction confirmation, and process restart against an isolated Regtest stack with wallet-specific activation schedules.
-time: 2026-11-20T21:00:36.859601284Z
-custom:
-    Bump: minor
-    PR: "437"
