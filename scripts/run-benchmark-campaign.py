@@ -75,6 +75,21 @@ def is_pointer(pointer):
     return isinstance(pointer, str) and pointer.startswith("/")
 
 
+def environment_expectations(campaign):
+    bindings = campaign.get("expect_from_environment", {})
+    if not isinstance(bindings, dict):
+        raise ValueError("expect_from_environment must map report pointers to environment keys")
+    environment = campaign.get("environment", {})
+    if bindings and not isinstance(environment, dict):
+        raise ValueError("expect_from_environment requires an environment object")
+    expected = {}
+    for pointer, key in bindings.items():
+        if not is_pointer(pointer) or not isinstance(key, str) or key not in environment:
+            raise ValueError(f"invalid environment expectation: {pointer!r} -> {key!r}")
+        expected[pointer] = environment[key]
+    return expected
+
+
 def read_campaign(path):
     campaign = read_json(path)
     repeats = campaign.get("repeats", 4)
@@ -217,6 +232,11 @@ def main():
     args = parser.parse_args()
     try:
         campaign, repeats, timeout, commands, executables, inputs = read_campaign(args.campaign)
+        shared = environment_expectations(campaign)
+        for name, case in campaign["cases"].items():
+            duplicate = shared.keys() & case.get("expect", {}).keys()
+            if duplicate:
+                raise ValueError(f"{name}: repeated expectations for {sorted(duplicate)}")
         output = args.output.resolve()
         output.mkdir(mode=0o700, parents=True)
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
@@ -235,13 +255,14 @@ def main():
 
     summary = []
     for name, case in campaign["cases"].items():
+        checked_case = {**case, "expect": {**shared, **case.get("expect", {})}}
         for repetition in range(1, repeats + 1):
             order = arms if repetition % 4 in (0, 1) else arms[::-1]
             pair = {"case": name, "repetition": repetition, "order": order, "runs": {}}
             for arm in order:
                 run_path = Path(name) / f"round-{repetition}" / arm
                 print(f"{name} round {repetition} {arm}", file=sys.stderr, flush=True)
-                observation = run_case(commands[name, arm], output / run_path, timeout, case)
+                observation = run_case(commands[name, arm], output / run_path, timeout, checked_case)
                 pair["runs"][arm] = {"path": str(run_path), "problems": observation["problems"]}
                 pair["runs"][arm]["matched_fields"] = observation["matched_fields"]
             first, second = (pair["runs"][arm]["matched_fields"] for arm in arms)

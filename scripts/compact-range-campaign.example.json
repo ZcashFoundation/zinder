@@ -1,0 +1,68 @@
+{
+  "environment": {"network": "zcash-testnet", "tip_height": 4644091, "tip_hash": "000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df"},
+  "expect_from_environment": {
+    "/tip_before/height": "tip_height",
+    "/tip_before/hash_hex": "tip_hash",
+    "/tip_after/height": "tip_height",
+    "/tip_after/hash_hex": "tip_hash"
+  },
+  "arms": {
+    "baseline": {"endpoint": "http://127.0.0.1:49367"},
+    "candidate": {"endpoint": "http://127.0.0.1:49368"}
+  },
+  "repeats": 8,
+  "cases": {
+    "slipstream": {
+      "command": ["zinder-bench", "lightwalletd-wallet-load", "--endpoint", "{endpoint}", "--workload", "slipstream", "--wallets", "16", "--from-height", "4624102", "--to-height", "4644091", "--report", "{report}"],
+      "expect": {
+        "/contract_identity": "lightwalletd-wallet-load",
+        "/report_format_version": 1,
+        "/workload": "slipstream",
+        "/server/chain_name": "test",
+        "/server/block_height": 4644091,
+        "/server/latest_block_height": 4644091,
+        "/from_height": 4624102,
+        "/to_height": 4644091,
+        "/wallets_completed": 16,
+        "/wallets_failed": 0,
+        "/incomplete_streams": 0,
+        "/retries": 0,
+        "/blocks_received": 319840,
+        "/wallet_sync_seconds/count": 16,
+        "/rpcs/GetBlockRange/first_message_seconds/count": 48,
+        "/rpcs/GetBlockRange/statuses": {"ok": 48},
+        "/rpcs/GetLatestBlock/statuses": {"ok": 1},
+        "/rpcs/GetLightdInfo/statuses": {"ok": 1},
+        "/rpcs/GetTransaction/statuses": {"ok": 256},
+        "/rpcs/GetTreeState/statuses": {"ok": 80}
+      },
+      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights", "/wallet_request_identity_sha256", "/rpcs/connect/statuses"]
+    },
+    "vizor": {
+      "command": ["zinder-bench", "lightwalletd-wallet-load", "--endpoint", "{endpoint}", "--workload", "vizor", "--wallets", "16", "--from-height", "4624102", "--to-height", "4644091", "--report", "{report}"],
+      "expect": {
+        "/contract_identity": "lightwalletd-wallet-load",
+        "/report_format_version": 1,
+        "/workload": "vizor",
+        "/server/chain_name": "test",
+        "/server/block_height": 4644091,
+        "/server/latest_block_height": 4644091,
+        "/from_height": 4624102,
+        "/to_height": 4644091,
+        "/wallets_completed": 16,
+        "/wallets_failed": 0,
+        "/incomplete_streams": 0,
+        "/retries": 0,
+        "/blocks_received": 319840,
+        "/wallet_sync_seconds/count": 16,
+        "/rpcs/GetBlockRange/first_message_seconds/count": 336,
+        "/rpcs/GetBlockRange/statuses": {"ok": 336},
+        "/rpcs/GetLatestBlock/statuses": {"ok": 1},
+        "/rpcs/GetLightdInfo/statuses": {"ok": 1},
+        "/rpcs/GetTreeState/statuses": {"ok": 336},
+        "/rpcs/connect/statuses": {"ok": 17}
+      },
+      "match": ["/parameters", "/bytes_received", "/total_rpc_bytes", "/tree_state_heights", "/wallet_request_identity_sha256"]
+    }
+  }
+}

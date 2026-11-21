@@ -5,7 +5,8 @@ set -euo pipefail
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 cargo metadata --locked --format-version=1 > "$scratch/cargo.json"
-cargo nextest list --locked --workspace --list-type=binaries-only --message-format=json > "$scratch/binaries.json"
+cargo nextest list --locked --workspace --features zinder-compat-lightwalletd/light-wallet-qualification \
+  --list-type=binaries-only --message-format=json > "$scratch/binaries.json"
 
 check_selectors() {
   local source=$1

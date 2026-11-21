@@ -6151,6 +6151,7 @@ dependencies = [
 name = "zinder-core"
 version = "0.22.0"
 dependencies = [
+ "base16ct",
  "blake2b_simd",
  "eyre",
  "hex",
