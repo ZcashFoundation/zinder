@@ -457,7 +457,13 @@ impl CanonicalWriterFixture {
         )
     }
 
-    fn take_canonical_primary(&mut self) -> eyre::Result<RocksDbCanonicalStore> {
+    /// Transfers the primary to a writer loop. Keep the fixture alive while
+    /// the loop uses its temporary directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture no longer owns the primary.
+    pub fn take_canonical_primary(&mut self) -> eyre::Result<RocksDbCanonicalStore> {
         self.canonical_primary
             .take()
             .ok_or_else(|| eyre!("an earlier canonical transition failed and closed the primary"))

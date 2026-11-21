@@ -46,6 +46,7 @@ mod config;
 mod following_readiness;
 mod parked_following;
 mod projector_control;
+mod recovery;
 
 use canonical_writer_control::{
     CanonicalRetentionLease, CanonicalWriterControlClient, CanonicalWriterControlError,
@@ -60,9 +61,10 @@ use projector_control::{
 };
 use zinder_projector::PROJECTOR_SERVICE_NAME;
 use zinder_projector::state_bundle::{
-    CanonicalCheckpointAdmissionEvidence, complete_state_bundle_capture,
+    CanonicalCheckpointAdmissionEvidence, StateBundleError, complete_state_bundle_capture,
     prepare_state_bundle_capture,
 };
+use zinder_proto::v1::ingest::{CreateStateBundleCaptureRequest, CreateStateBundleCaptureResponse};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -139,6 +141,8 @@ enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
+    #[command(flatten)]
+    Recovery(recovery::RecoveryCommand),
 }
 
 impl From<Cli> for ProjectorConfigOverrides {
@@ -164,10 +168,14 @@ impl From<Cli> for ProjectorConfigOverrides {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
-        return run_healthcheck(healthcheck, cli.config_path.as_deref());
-    }
+    let mut cli = Cli::parse();
+    let recovery = match cli.command.take() {
+        Some(Command::Healthcheck(healthcheck)) => {
+            return run_healthcheck(&healthcheck, cli.config_path.as_deref());
+        }
+        Some(Command::Recovery(command)) => Some(command),
+        None => None,
+    };
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
     }
@@ -176,6 +184,9 @@ async fn main() -> ExitCode {
     }
     if cli.print_config {
         return print_config(cli);
+    }
+    if let Some(command) = recovery {
+        return command.run(cli).await;
     }
     match Box::pin(run_projector(cli)).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -956,10 +967,7 @@ async fn apply_projector_control_command(
     command: ProjectorControlCommand,
 ) {
     match command {
-        ProjectorControlCommand::CreateStateBundleCapture {
-            candidate_id,
-            reply,
-        } => {
+        ProjectorControlCommand::CreateStateBundleCapture { request, reply } => {
             readiness.set(ReadinessState::syncing(
                 None,
                 None,
@@ -970,7 +978,7 @@ async fn apply_projector_control_command(
                 canonical_control,
                 wallet,
                 canonical_lease,
-                candidate_id,
+                request,
                 expected_fence,
             )
             .await;
@@ -988,23 +996,35 @@ async fn capture_state_bundle(
     canonical_control: &mut CanonicalWriterControlClient,
     wallet: &mut RocksDbWalletFollowingStore,
     canonical_lease: &mut CanonicalRetentionLease,
-    candidate_id: String,
+    request: CreateStateBundleCaptureRequest,
     expected_fence: CanonicalEventFence,
-) -> Result<zinder_proto::v1::ingest::CreateStateBundleCaptureResponse, tonic::Status> {
+) -> Result<CreateStateBundleCaptureResponse, tonic::Status> {
     let renewed_until = lease_expiry(UnixTimestampMillis::now(), config.lease_duration);
     let renewal = canonical_lease.renewed(renewed_until);
     *canonical_lease = canonical_control
         .renew(renewal)
         .await
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
-    let paths = prepare_state_bundle_capture(
+    let paths = match prepare_state_bundle_capture(
         &config.projector_control.checkpoint_staging_root,
-        &candidate_id,
-    )
-    .map_err(|error| state_bundle_status(&error))?;
+        &request.candidate_id,
+    ) {
+        Ok(paths) => paths,
+        Err(StateBundleError::TargetExists { path }) if request.reuse_completed => {
+            return projector_control::read_capture_receipt(
+                &path,
+                &request.candidate_id,
+                config.network,
+                None,
+            )
+            .map(|(receipt, _)| receipt)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()));
+        }
+        Err(error) => return Err(state_bundle_status(&error)),
+    };
     let response = canonical_control
         .create_owner_checkpoint(
-            candidate_id,
+            request.candidate_id,
             paths.staging_root_binding().to_vec(),
             expected_writer_fence(expected_fence),
         )
@@ -1034,19 +1054,14 @@ async fn capture_state_bundle(
     let manifest =
         complete_state_bundle_capture(&paths, &evidence, wallet, config.wallet_rocksdb_budget)
             .map_err(|error| state_bundle_status(&error))?;
-    let network = manifest
-        .network()
-        .map_err(|error| state_bundle_status(&error))?;
-    Ok(zinder_proto::v1::ingest::CreateStateBundleCaptureResponse {
-        candidate_id: manifest.candidate_id().to_owned(),
-        state_bundle_identity: manifest.identity().to_owned(),
-        state_bundle_format_version: u32::from(manifest.format_version()),
-        topology: manifest.topology().to_owned(),
-        network_name: encode_zinder_native_chain_name(network).to_owned(),
-        chain_epoch_id: manifest.fence().chain_epoch_id(),
-        chain_event_sequence: manifest.fence().chain_event_sequence(),
-        visible_tip_height: manifest.fence().visible_tip_height(),
-    })
+    projector_control::read_capture_receipt(
+        paths.root(),
+        paths.candidate_id(),
+        config.network,
+        Some(&manifest),
+    )
+    .map(|(receipt, _)| receipt)
+    .map_err(|error| tonic::Status::failed_precondition(error.to_string()))
 }
 
 fn state_bundle_status(error: &zinder_projector::state_bundle::StateBundleError) -> tonic::Status {

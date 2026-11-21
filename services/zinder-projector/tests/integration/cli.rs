@@ -1,6 +1,16 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use tempfile::tempdir;
+use tonic::{Request, Response, Status};
+use zinder_proto::v1::ingest::{
+    CreateStateBundleCaptureRequest, CreateStateBundleCaptureResponse,
+    projector_control_server::ProjectorControl,
+};
 
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
@@ -12,6 +22,203 @@ fn version_reports_the_product_version() -> eyre::Result<()> {
         format!("zinder-projector {}\n", env!("CARGO_PKG_VERSION"))
     );
 
+    Ok(())
+}
+
+#[test]
+fn private_backup_requires_authenticated_owner_control() -> eyre::Result<()> {
+    let directory = tempdir()?;
+    let config = directory.path().join("projector.toml");
+    fs::write(&config, "[network]\nname = \"zcash-regtest\"\n")?;
+    let archive = directory.path().join("wallet-backup");
+    let output = projector_command()
+        .arg("--config")
+        .arg(config)
+        .args(["backup", "--archive"])
+        .arg(&archive)
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("projector_control.listen_addr"), "{stderr}");
+    assert!(!archive.try_exists()?);
+    Ok(())
+}
+
+#[derive(Default)]
+struct StalledCaptureOwner {
+    received_capture: AtomicBool,
+}
+#[tonic::async_trait]
+impl ProjectorControl for StalledCaptureOwner {
+    async fn create_state_bundle_capture(
+        &self,
+        request: Request<CreateStateBundleCaptureRequest>,
+    ) -> Result<Response<CreateStateBundleCaptureResponse>, Status> {
+        let request = request.into_inner();
+        if request.candidate_id != "wallet-backup" || !request.reuse_completed {
+            return Err(Status::invalid_argument("unexpected capture request"));
+        }
+        if !self.received_capture.swap(true, Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        Err(Status::failed_precondition("incomplete capture"))
+    }
+}
+
+#[tokio::test]
+async fn backup_times_out_waiting_for_the_owner_and_retries_the_named_candidate() -> eyre::Result<()>
+{
+    use std::{str::FromStr as _, time::Duration};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use zinder_proto::v1::ingest::projector_control_server::ProjectorControlServer;
+    use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
+
+    const TOKEN: &str = "fixture-projector-token";
+    let directory = tempdir()?;
+    let token_path = directory.path().join("owner-token");
+    fs::write(&token_path, TOKEN)?;
+    let staging = directory.path().join("staging");
+    fs::create_dir(&staging)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let config = directory.path().join("projector.toml");
+    fs::write(
+        &config,
+        format!(
+            "[network]\nname = \"zcash-regtest\"\n[projector_control]\nlisten_addr = \"{address}\"\nbearer_token_path = {:?}\ncheckpoint_staging_root = {:?}\n",
+            path_str(&token_path)?,
+            path_str(&staging)?
+        ),
+    )?;
+    let owner = ProjectorControlServer::with_interceptor(
+        StalledCaptureOwner::default(),
+        BearerTokenServerInterceptor::new(Some(BearerToken::from_str(TOKEN)?)),
+    );
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(owner)
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let archive = directory.path().join("wallet-backup");
+    let mut invocation = tokio::process::Command::from(projector_command());
+    invocation
+        .kill_on_drop(true)
+        .arg("--config")
+        .arg(config)
+        .args(["backup", "--capture-timeout-seconds", "1", "--archive"])
+        .arg(&archive);
+    let timeout = tokio::time::timeout(Duration::from_secs(15), invocation.output()).await??;
+    assert!(!timeout.status.success());
+    let stderr = String::from_utf8(timeout.stderr)?;
+    assert!(stderr.contains("timed out after 1s"), "{stderr}");
+    assert!(stderr.contains("wallet-backup"), "{stderr}");
+    assert!(stderr.contains("Retry with the same --archive"), "{stderr}");
+    assert!(!stderr.contains(TOKEN));
+    assert_eq!(timeout.stdout, b"");
+    assert!(!archive.try_exists()?);
+
+    let output = tokio::time::timeout(Duration::from_secs(15), invocation.output()).await??;
+    server.abort();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("incomplete capture"), "{stderr}");
+    assert!(!stderr.contains(TOKEN));
+    assert_eq!(output.stdout, b"");
+    assert!(!archive.try_exists()?);
+    Ok(())
+}
+
+#[test]
+fn backup_rejects_a_zero_capture_timeout() -> eyre::Result<()> {
+    let output = projector_command()
+        .args([
+            "backup",
+            "--capture-timeout-seconds",
+            "0",
+            "--archive",
+            "test",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("invalid value '0'"), "{stderr}");
+    assert!(stderr.contains("--capture-timeout-seconds"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn backup_reports_unknown_projector_control_environment_settings() -> eyre::Result<()> {
+    let directory = tempdir()?;
+    let archive = directory.path().join("backup");
+    let output = projector_command()
+        .env("ZINDER_PROJECTOR_CONTROL__UNKNOWN_OPTION", "true")
+        .args(["backup", "--archive"])
+        .arg(&archive)
+        .output()?;
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr)?;
+    assert!(
+        error.contains("unknown_option") && error.contains("projector_control"),
+        "{error}"
+    );
+    assert!(!archive.exists());
+    Ok(())
+}
+
+#[test]
+fn offline_backup_commands_require_an_explicit_network_and_digest() -> eyre::Result<()> {
+    for command in ["verify", "restore"] {
+        let mut invocation = projector_command();
+        invocation.args([command, "--archive", "/unused/backup"]);
+        if command == "restore" {
+            invocation.args(["--into", "/unused/replacement"]);
+        }
+        let missing = invocation.output()?;
+        assert!(!missing.status.success());
+        let stderr = String::from_utf8(missing.stderr)?;
+        assert!(
+            stderr.contains("--network") && stderr.contains("--sha256"),
+            "{stderr}"
+        );
+
+        let malformed = invocation
+            .args(["--network", "zcash-regtest", "--sha256", "f0"])
+            .output()?;
+        assert!(!malformed.status.success());
+        let stderr = String::from_utf8(malformed.stderr)?;
+        assert!(
+            stderr.contains("invalid value") && stderr.contains("--sha256"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn offline_backup_failure_leaves_the_destination_absent_without_writer_config() -> eyre::Result<()>
+{
+    let directory = tempdir()?;
+    let archive = directory.path().join("missing-archive");
+    let destination = directory.path().join("replacement");
+    for command in ["verify", "restore"] {
+        let mut invocation = projector_command();
+        invocation
+            .arg("--config")
+            .arg(directory.path().join("missing-projector.toml"))
+            .env("ZINDER_NODE__JSON_RPC_ADDR", "invalid")
+            .args([command, "--archive"])
+            .arg(&archive)
+            .args(["--network", "zcash-regtest", "--sha256", &"00".repeat(32)]);
+        if command == "restore" {
+            invocation.arg("--into").arg(&destination);
+        }
+        let output = invocation.output()?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("missing-archive"), "{stderr}");
+        assert_eq!(output.stdout, b"");
+        assert!(!destination.try_exists()?);
+    }
     Ok(())
 }
 

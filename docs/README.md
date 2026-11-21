@@ -34,6 +34,7 @@ Look up:
 - [Readiness](reference/readiness.md): `/healthz`, `/readyz`, gRPC health, and
   every readiness cause
 - [Metrics](reference/metrics.md): metric names, alert signals, and log fields
+- [Private backups](runbooks/private-backups.md) for capture, verification, and restoring on a fresh host
 - [Service operations](architecture/service-operations.md): security boundary,
   recovery, and supported deployments
 

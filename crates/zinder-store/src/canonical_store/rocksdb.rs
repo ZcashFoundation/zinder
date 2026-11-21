@@ -820,6 +820,82 @@ impl RocksDbCanonicalStore {
         })
     }
 
+    /// Reads the READY evidence of a private wallet-serving checkpoint without
+    /// opening a writer. The caller compares the evidence against its trusted manifest.
+    pub fn cold_admit_recovery_checkpoint(
+        target: &Path,
+        network: Network,
+        retention: RawBlobRetention,
+        reorg_policy: super::CanonicalReorgPolicy,
+    ) -> Result<CanonicalOwnerCheckpointEvidence, CanonicalStoreError> {
+        let budget = RocksDbResourceBudget::read_only_probe_defaults();
+        let opened = open_canonical_admission_probe(target, budget)?;
+        let expectation = CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
+            network,
+            CanonicalStoreWorkload::Wallet,
+            retention,
+            reorg_policy,
+        );
+        let (database_identity, control, _) = admit_open_store(target, &opened.db, &expectation)?;
+        let CanonicalStoreBuildState::Ready(ready_evidence) = control.build_state else {
+            return Err(CanonicalStoreError::StoreNotReady {
+                path: target.to_path_buf(),
+            });
+        };
+        validate_ready_publication(
+            &opened.db,
+            &control.build_plan,
+            reorg_policy,
+            &ready_evidence,
+        )?;
+        let activation_schedule = read_admitted_schedule(&opened.db, target, &control)?;
+        Ok(CanonicalOwnerCheckpointEvidence {
+            database_identity,
+            store_identity: CANONICAL_STORE_IDENTITY,
+            schema_version: CANONICAL_STORE_SCHEMA_VERSION,
+            workload: control.workload,
+            build_plan: control.build_plan,
+            ready_evidence,
+            reorg_policy,
+            activation_schedule,
+        })
+    }
+
+    /// Releases the source projector's retention leases on an exclusively owned,
+    /// inactive private restore. The next owner acquires a fresh generation.
+    /// The caller must supply the cold evidence for this exact copy.
+    pub fn release_restored_projection_leases(
+        target: &Path,
+        checkpoint: &CanonicalOwnerCheckpointEvidence,
+    ) -> Result<(), CanonicalStoreError> {
+        let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
+            &checkpoint.build_plan,
+            checkpoint.workload,
+            checkpoint.reorg_policy,
+        );
+        let store = Self::open_ready_with_expectation(
+            target,
+            &expectation,
+            RocksDbResourceBudget::read_only_probe_defaults(),
+        )?;
+        let identity = store.bounded_open.db.get_db_identity().map_err(|source| {
+            CanonicalStoreError::CheckpointFailed {
+                path: target.to_path_buf(),
+                source,
+            }
+        })?;
+        if identity != checkpoint.database_identity
+            || store.ready_evidence != checkpoint.ready_evidence
+            || store.activation_schedule != checkpoint.activation_schedule
+        {
+            return Err(CanonicalStoreError::admission(
+                target,
+                "private restore checkpoint changed before releasing its source leases",
+            ));
+        }
+        store.clear_restored_retention_leases()
+    }
+
     /// Reads the immutable construction-manifest identity without opening a
     /// `RocksDB` primary. Archive packagers use this narrow descriptor to bind
     /// a physical checkpoint to the first READY construction proof.
@@ -1135,17 +1211,35 @@ pub(super) fn admit_existing_store(
     ),
     CanonicalStoreError,
 > {
+    let opened = open_canonical_admission_probe(path, resource_budget)?;
+    admit_open_store(path, &opened.db, expectation)
+}
+
+fn open_canonical_admission_probe(
+    path: &Path,
+    resource_budget: RocksDbResourceBudget,
+) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
     let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
     })?;
     validate_exact_column_families(path, &column_families)?;
-    let bounded_open =
-        open_bounded_rocksdb_read_only_probe(path, &column_families, resource_budget).map_err(
-            |source| {
-                CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
-            },
-        )?;
-    let db = &bounded_open.db;
+    open_bounded_rocksdb_read_only_probe(path, &column_families, resource_budget).map_err(
+        |source| CanonicalStoreError::admission(path, format!("read-only open failed: {source}")),
+    )
+}
+
+fn admit_open_store(
+    path: &Path,
+    db: &DB,
+    expectation: &CanonicalStoreAdmissionExpectation,
+) -> Result<
+    (
+        Vec<u8>,
+        DecodedStoreControl,
+        Option<CanonicalSubtreeRootLoadCoverage>,
+    ),
+    CanonicalStoreError,
+> {
     let control = validate_open_store_control(db, path, expectation)?;
     let subtree_root_coverage = match control.build_state {
         CanonicalStoreBuildState::Ready(ready) => Some(validate_ready_construction_manifest(

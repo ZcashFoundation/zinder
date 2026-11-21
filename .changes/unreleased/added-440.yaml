@@ -1,0 +1,6 @@
+kind: added
+body: Operators can use zinder-projector to back up the canonical and wallet stores together, verify the backup offline, and restore both stores into a fresh directory while preserving cursor history. Keep the archive private and retain its manifest digest separately for recovery.
+time: 2026-11-20T22:36:02.10388418Z
+custom:
+    Bump: minor
+    PR: "440"

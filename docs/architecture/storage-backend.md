@@ -326,9 +326,9 @@ When a store fails admission, build a fresh store. A materialized-view store wit
 ## Checkpoints
 
 A state bundle binds a canonical and a wallet checkpoint at one chain event,
-because independently timed copies are not coherent. Recovery rebuilds the
-stores rather than restoring a bundle; see
-[Service operations](service-operations.md#restore-by-rebuilding).
+because independently timed copies can describe different chain states.
+A private recovery archive binds every payload file to that bundle.
+[Private backups](../runbooks/private-backups.md) describes how to verify and restore it.
 
 ## PostgreSQL benchmark arm
 

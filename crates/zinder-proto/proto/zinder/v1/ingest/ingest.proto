@@ -372,6 +372,9 @@ service CanonicalControl {
 // filesystem path by the service.
 message CreateStateBundleCaptureRequest {
   string candidate_id = 1;
+  // Return the original receipt when this candidate already has a complete
+  // manifest. The default requires a fresh candidate.
+  bool reuse_completed = 2;
 }
 
 // Identifies a state bundle that was fully captured and whose manifest was
@@ -386,6 +389,8 @@ message CreateStateBundleCaptureResponse {
   uint64 chain_epoch_id = 6;
   uint64 chain_event_sequence = 7;
   uint32 visible_tip_height = 8;
+  // SHA-256 of the exact state-bundle.json bytes published by the owner.
+  bytes state_bundle_manifest_sha256 = 9;
 }
 
 // Private, loopback-only owner control plane for the running wallet

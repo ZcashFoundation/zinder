@@ -453,6 +453,10 @@ pub struct ReadmitCanonicalOwnerCheckpointRequest {
 pub struct CreateStateBundleCaptureRequest {
     #[prost(string, tag = "1")]
     pub candidate_id: ::prost::alloc::string::String,
+    /// Return the original receipt when this candidate already has a complete
+    /// manifest. The default requires a fresh candidate.
+    #[prost(bool, tag = "2")]
+    pub reuse_completed: bool,
 }
 /// Identifies a state bundle that was fully captured and whose manifest was
 /// published last. Archive, restore, and serving-lane activation are outside
@@ -476,6 +480,9 @@ pub struct CreateStateBundleCaptureResponse {
     pub chain_event_sequence: u64,
     #[prost(uint32, tag = "8")]
     pub visible_tip_height: u32,
+    /// SHA-256 of the exact state-bundle.json bytes published by the owner.
+    #[prost(bytes = "vec", tag = "9")]
+    pub state_bundle_manifest_sha256: ::prost::alloc::vec::Vec<u8>,
 }
 /// Current phase of the phase-driven ingest loop. Orthogonal to readiness
 /// `cause`: a writer in `WRITER_PHASE_BULK_CATCHUP` may report `syncing`
