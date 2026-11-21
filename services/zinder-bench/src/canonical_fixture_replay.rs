@@ -40,6 +40,8 @@ use crate::{
     fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
 
+pub use crate::report::TreeStateCheckpointCoverage;
+
 /// Digest-bound checkpoint sidecar written beside a format-3 fixture manifest.
 pub const CANONICAL_FIXTURE_REPLAY_PLAN_FILE_NAME: &str = "canonical-replay-plan.json";
 const CANONICAL_FIXTURE_REPLAY_PLAN_TEMP_FILE_NAME: &str = "canonical-replay-plan.json.tmp";
@@ -239,6 +241,8 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
     pub supported_reorg_depth: u32,
     /// Optional fixed delay applied once per outer fixture segment response.
     pub source_segment_delay: Duration,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
 }
 
 /// Exact load, publication, and cold-reopen evidence from canonical replay.
@@ -248,6 +252,8 @@ pub struct CanonicalFixtureRocksDbReplayOutcome {
     pub fixture_manifest_digest_sha256: String,
     /// Stable digest of the exact replay plan admitted before source work.
     pub replay_plan_digest_sha256: String,
+    /// Actual tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Block-family evidence accepted by the real canonical loader.
     pub block_load_evidence: CanonicalBlockLoadEvidence,
     /// Exact completed-subtree evidence accepted by the canonical loader.
@@ -466,6 +472,11 @@ fn admit_canonical_fixture_replay(
         build_plan,
         config.resource_budget,
     )?;
+    let builder = if config.tree_state_checkpoint_coverage.stores_every_block() {
+        builder.with_every_block_tree_state_checkpoints()?
+    } else {
+        builder
+    };
     Ok(AdmittedCanonicalFixtureReplay {
         manifest,
         fixture_manifest_digest_sha256,
@@ -496,6 +507,22 @@ fn authenticate_canonical_fixture_load(
         return Err(BenchError::fixture_format(
             "canonical fixture replay load tip differs from the admitted source checkpoint",
         ));
+    }
+    let actual_coverage = TreeStateCheckpointCoverage::from_every_block(
+        canonical_load
+            .builder
+            .stores_every_block_tree_state_checkpoints(),
+    );
+    let expected_checkpoint_count = actual_coverage.expected_checkpoint_count(
+        canonical_load.block_evidence.first_height.value(),
+        canonical_load.block_evidence.tip_height.value(),
+    );
+    if Some(canonical_load.block_evidence.tree_state_checkpoint_count) != expected_checkpoint_count
+    {
+        return Err(BenchError::fixture_format(format!(
+            "canonical fixture replay persisted {} tree-state checkpoints for {actual_coverage} coverage, expected {expected_checkpoint_count:?}",
+            canonical_load.block_evidence.tree_state_checkpoint_count
+        )));
     }
     validate_block_load_evidence(&canonical_load.block_evidence, manifest)
 }
@@ -685,6 +712,11 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         &admitted.manifest,
         &admitted.source_tip_checkpoint,
     )?;
+    let tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::from_every_block(
+        canonical_load
+            .builder
+            .stores_every_block_tree_state_checkpoints(),
+    );
     let block_load_evidence = canonical_load.block_evidence;
     let subtree_root_load_evidence = canonical_load.subtree_root_evidence;
     let settled_tip = derive_settled_tip(
@@ -711,6 +743,7 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
     Ok(CanonicalFixtureRocksDbReplayOutcome {
         fixture_manifest_digest_sha256: admitted.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: admitted.replay_plan_digest_sha256,
+        tree_state_checkpoint_coverage,
         block_load_evidence,
         subtree_root_load_evidence,
         source_tip_checkpoint_authenticated: true,

@@ -12,10 +12,11 @@ use zinder_bench::{
     BenchError,
     report::{
         AcceptanceThresholds, BenchmarkReport, BenchmarkRunProvenance,
-        CanonicalBlockFactsSequenceDigestSummary, CanonicalStorageReadySummary, ReportProvenance,
-        RocksDbResourceBudgetSummary, RocksDbStorageLifecycleMeasurements, RunnerProvenance,
-        StorageLifecycleBlockId, StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
-        StorageLifecycleResourceLimits, StorageLifecycleSourceSummary,
+        CanonicalBlockFactsSequenceDigestSummary, CanonicalPublicationMode,
+        CanonicalStorageReadySummary, ReportProvenance, RocksDbResourceBudgetSummary,
+        RocksDbStorageLifecycleMeasurements, RunnerProvenance, StorageLifecycleBlockId,
+        StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
+        StorageLifecycleResourceLimits, StorageLifecycleSourceSummary, TreeStateCheckpointCoverage,
         WalletStorageConstructionEvidence, WalletStoragePhaseDurations, WalletStorageReadySummary,
         WalletStorageRowCounts, WalletStorageUtxoSummary, WalletVariableValueSortEvidence,
         build_rocksdb_storage_lifecycle_report, is_immutable_image_reference,
@@ -122,6 +123,12 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     /// Maximum accepted wallet derivation and storage-ready time after canonical readiness.
     #[arg(long = "wallet-storage-ready-hard-limit-secs")]
     wallet_storage_ready_hard_limit_seconds: Option<f64>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Canonical publication checks to include before READY.
+    #[arg(long, value_enum, default_value = "trusted-fresh")]
+    canonical_publication_mode: CanonicalPublicationMode,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -141,6 +148,8 @@ struct ValidatedLifecycleArgs {
     request_timeout: Duration,
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    canonical_publication_mode: CanonicalPublicationMode,
     canonical_storage_ready_thresholds: Option<AcceptanceThresholds>,
     wallet_storage_ready_thresholds: Option<AcceptanceThresholds>,
 }
@@ -226,6 +235,14 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         build_plan,
         canonical_resource_budget,
     )?;
+    let builder = if validated
+        .tree_state_checkpoint_coverage
+        .stores_every_block()
+    {
+        builder.with_every_block_tree_state_checkpoints()?
+    } else {
+        builder
+    };
     let database_io_mode = builder.io_mode().as_str().to_owned();
     let canonical_store_initialization = canonical_store_initialization_started.elapsed();
 
@@ -244,16 +261,34 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let source_tip_after_canonical_load = source.tip_id().await?;
     let canonical_block_evidence = canonical_load.block_evidence;
     let canonical_subtree_evidence = canonical_load.subtree_root_evidence;
+    let actual_tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::from_every_block(
+        canonical_load
+            .builder
+            .stores_every_block_tree_state_checkpoints(),
+    );
     let source_tip_checkpoint_authenticated =
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
-    let canonical_cold_validation_started = Instant::now();
-    let validated_canonical = canonical_load
-        .builder
-        .prepare_cold_certified_publication()?;
-    let canonical_cold_validation = canonical_cold_validation_started.elapsed();
-
-    let canonical_ready_publication_started = Instant::now();
+    let preparation_started = Instant::now();
+    let (validated_canonical, canonical_cold_validation, canonical_ready_publication_started) =
+        match validated.canonical_publication_mode {
+            CanonicalPublicationMode::TrustedFresh => (
+                canonical_load.builder.prepare_trusted_fresh_publication()?,
+                Duration::ZERO,
+                preparation_started,
+            ),
+            CanonicalPublicationMode::ColdCertified => {
+                let certified = canonical_load
+                    .builder
+                    .prepare_cold_certified_publication()?;
+                let publication_started = Instant::now();
+                (
+                    certified,
+                    publication_started - preparation_started,
+                    publication_started,
+                )
+            }
+        };
     let prepared_publication = validated_canonical.prepare_baseline(
         CanonicalBaselinePublication::new(settled_tip, UnixTimestampMillis::now()),
     )?;
@@ -405,6 +440,8 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
                 .block_prepare_memory_watermark_bytes
                 .get(),
             canonical_rocksdb: RocksDbResourceBudgetSummary::from(canonical_resource_budget),
+            tree_state_checkpoint_coverage: actual_tree_state_checkpoint_coverage,
+            canonical_publication_mode: validated.canonical_publication_mode,
             wallet_rocksdb: RocksDbResourceBudgetSummary::from(wallet_resource_budget),
             supported_reorg_depth: validated.supported_reorg_depth,
             wallet_max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
@@ -510,6 +547,8 @@ impl RocksDbStorageLifecycleArgs {
             ),
             pipeline_limits,
             supported_reorg_depth: self.supported_reorg_depth,
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            canonical_publication_mode: self.canonical_publication_mode,
             canonical_storage_ready_thresholds: acceptance_thresholds(
                 self.canonical_storage_ready_target_seconds,
                 self.canonical_storage_ready_hard_limit_seconds,
@@ -593,6 +632,7 @@ fn canonical_ready_summary(
         visible_event_sequence: ready.visible_event_sequence,
         block_count: ready.visible_block_count,
         transaction_count: block_load.transaction_count,
+        tree_state_checkpoint_count: block_load.tree_state_checkpoint_count,
         subtree_root_count: subtree_load.subtree_root_count,
         replay_format_version: ready.replay_format_version.value(),
         sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
@@ -891,6 +931,45 @@ mod tests {
         assert_eq!(
             validated.pipeline_limits.block_prepare_concurrency.get(),
             10
+        );
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let mut argv = required_args();
+        argv.extend(["--tree-state-checkpoint-coverage", "every-block"]);
+        let cli = TestCli::try_parse_from(argv)?;
+        assert_eq!(
+            cli.args.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
+
+        let mut invalid = required_args();
+        invalid.extend(["--tree-state-checkpoint-coverage", "sparse"]);
+        assert!(TestCli::try_parse_from(invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_publication_defaults_to_ingest_and_accepts_cold_certification()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(required_args())?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::TrustedFresh
+        );
+        let mut argv = required_args();
+        argv.extend(["--canonical-publication-mode", "cold-certified"]);
+        let cli = TestCli::try_parse_from(argv)?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::ColdCertified
         );
         Ok(())
     }

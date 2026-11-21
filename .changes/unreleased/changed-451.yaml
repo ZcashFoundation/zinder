@@ -1,0 +1,18 @@
+kind: changed
+body: >-
+    Fresh canonical construction keeps its sparse checkpoint cadence by default. To serve every
+    constructed height directly at READY, set `ingest.tree_state_densification.during_construction = true`
+    before the first sync with densification enabled and `selection = "every-block"`. This moves
+    hashing and storage ahead of READY. Full Mainnet startup time and disk growth await qualification.
+    Benchmark report consumers should select their parser by
+    report kind and format version. RocksDB storage lifecycle and canonical fixture replay now emit
+    v5, and raw-blob retention comparison emits v3. Point-reads v2 replaces
+    `stored_checkpoint_height` and `replay_height` with `on_cadence_height` and
+    `off_cadence_height` and updates the matching request labels. Use the `source` label on
+    `zinder_query_tree_state_reads_total` to measure stored versus replayed reads. For READY-time
+    comparisons with archived cold-certified lifecycle runs, select `--canonical-publication-mode
+    cold-certified`. New runs default to `trusted-fresh`.
+time: 2026-11-21T16:48:00.000000000Z
+custom:
+    Bump: minor
+    PR: "451"

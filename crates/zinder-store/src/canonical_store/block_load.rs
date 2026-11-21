@@ -47,6 +47,35 @@ use super::{
     },
 };
 
+/// Required tree-state checkpoint coverage for a fresh canonical build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TreeStateCheckpointCoverage {
+    /// Store checkpoints on the global cadence and at the build tip.
+    CadenceAndTip,
+    /// Store a checkpoint for every loaded block.
+    EveryBlock,
+}
+
+impl TreeStateCheckpointCoverage {
+    pub(super) fn requires_checkpoint(
+        self,
+        height: BlockHeight,
+        build_tip_height: BlockHeight,
+    ) -> bool {
+        match self {
+            Self::CadenceAndTip => tree_state_checkpoint_required(height, build_tip_height),
+            Self::EveryBlock => true,
+        }
+    }
+
+    const fn max_persisted_gap(self) -> u32 {
+        match self {
+            Self::CadenceAndTip => TREE_STATE_CHECKPOINT_STRIDE,
+            Self::EveryBlock => 1,
+        }
+    }
+}
+
 pub(super) const CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const REVERSE_INDEX_SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
@@ -68,7 +97,8 @@ pub struct CanonicalBuildBlock {
     pub compact_block: CompactBlockArtifact,
     /// Commitment-tree positions after applying this block.
     pub tip_metadata: ChainTipMetadata,
-    /// Typed commitment-tree state at the global checkpoint cadence or exact transition tip.
+    /// Typed commitment-tree state when required by the build's checkpoint coverage,
+    /// or for every live block.
     pub tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
     /// Per-block final roots retained only by the explorer workload.
     pub block_final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
@@ -182,6 +212,7 @@ pub(super) struct CanonicalBlockSstConfig<'options> {
     /// The activation table the build plan fingerprints, which decides the
     /// pools each checkpoint carries a frontier for.
     pub(super) network_upgrade_activations: &'options NetworkUpgradeActivations,
+    pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     pub(super) sst_target_logical_bytes: u64,
     pub(super) reverse_index_sort_memory_bytes: usize,
 }
@@ -307,6 +338,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
             self.config.workload,
             self.config.build_plan,
             self.config.network_upgrade_activations,
+            self.config.tree_state_checkpoint_coverage,
             &block,
         )?;
         let validated_at = Instant::now();
@@ -676,9 +708,15 @@ pub(super) fn validate_persisted_commitment_tree_families(
     db: &DB,
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
-    validate_persisted_tree_state_checkpoints(db, build_plan, evidence)?;
+    validate_persisted_tree_state_checkpoints(
+        db,
+        build_plan,
+        tree_state_checkpoint_coverage,
+        evidence,
+    )?;
     validate_persisted_block_final_note_commitment_roots(db, workload, build_plan, evidence)
 }
 
@@ -797,6 +835,7 @@ pub(super) fn read_persisted_tip_checkpoint(
 fn validate_persisted_tree_state_checkpoints(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
+    coverage: TreeStateCheckpointCoverage,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let family = db
@@ -837,29 +876,12 @@ fn validate_persisted_tree_state_checkpoints(
                     "first persisted tree-state checkpoint does not match the history predecessor",
                 ));
             }
-            Some(previous) => {
-                let gap = height
-                    .value()
-                    .checked_sub(previous.value())
-                    .ok_or_else(|| {
-                        CanonicalStoreError::block_load_sequence(
-                            "persisted tree-state checkpoint heights do not increase",
-                        )
-                    })?;
-                if gap == 0 || gap > TREE_STATE_CHECKPOINT_STRIDE {
-                    return Err(CanonicalStoreError::block_load_sequence(format!(
-                        "persisted tree-state checkpoint gap {gap} exceeds {TREE_STATE_CHECKPOINT_STRIDE} blocks"
-                    )));
-                }
-                let checkpoint_expected =
-                    tree_state_checkpoint_required(height, build_plan.build_tip().height);
-                if !checkpoint_expected {
-                    return Err(CanonicalStoreError::block_load_sequence(format!(
-                        "persisted tree-state checkpoint at height {} is outside the global cadence and build tip",
-                        height.value()
-                    )));
-                }
-            }
+            Some(previous) => validate_persisted_checkpoint_step(
+                coverage,
+                previous,
+                height,
+                build_plan.build_tip().height,
+            )?,
             None => {}
         }
         if height == build_plan.build_tip().height {
@@ -879,6 +901,35 @@ fn validate_persisted_tree_state_checkpoints(
         build_plan,
         evidence,
     )
+}
+
+fn validate_persisted_checkpoint_step(
+    coverage: TreeStateCheckpointCoverage,
+    previous: BlockHeight,
+    height: BlockHeight,
+    build_tip_height: BlockHeight,
+) -> Result<(), CanonicalStoreError> {
+    let gap = height
+        .value()
+        .checked_sub(previous.value())
+        .ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(
+                "persisted tree-state checkpoint heights do not increase",
+            )
+        })?;
+    let max_gap = coverage.max_persisted_gap();
+    if gap == 0 || gap > max_gap {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "persisted tree-state checkpoint gap {gap} exceeds {max_gap} blocks"
+        )));
+    }
+    if height > build_tip_height || !coverage.requires_checkpoint(height, build_tip_height) {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "persisted tree-state checkpoint at height {} is outside the selected construction coverage",
+            height.value()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_tree_state_checkpoint_readback(
@@ -958,15 +1009,16 @@ pub(super) fn validate_build_block(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     network_upgrade_activations: &NetworkUpgradeActivations,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
-    validate_block(
-        workload,
-        build_plan.raw_blob_retention(),
-        block,
+    validate_block(workload, build_plan.raw_blob_retention(), block)?;
+    validate_tree_state_checkpoint_pools(network_upgrade_activations, block)?;
+    validate_tree_state_checkpoint(
         build_plan.build_tip().height,
-    )?;
-    validate_tree_state_checkpoint_pools(network_upgrade_activations, block)
+        tree_state_checkpoint_coverage,
+        block,
+    )
 }
 
 /// Requires a loaded checkpoint to carry a frontier for exactly the pools
@@ -1001,11 +1053,11 @@ pub(super) fn validate_live_block(
     raw_blob_retention: RawBlobRetention,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
-    validate_block(
-        workload,
-        raw_blob_retention,
-        block,
+    validate_block(workload, raw_blob_retention, block)?;
+    validate_tree_state_checkpoint(
         block.facts.block_header.height,
+        TreeStateCheckpointCoverage::EveryBlock,
+        block,
     )
 }
 
@@ -1013,7 +1065,6 @@ fn validate_block(
     workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     block: &CanonicalBuildBlock,
-    transition_tip_height: BlockHeight,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
@@ -1048,7 +1099,6 @@ fn validate_block(
     validate_compact_block_payload(block)?;
     validate_transaction_blobs(raw_blob_retention, block)?;
     validate_block_blob(raw_blob_retention, block)?;
-    validate_tree_state_checkpoint(transition_tip_height, block)?;
     validate_block_final_note_commitment_roots(workload, block)
 }
 
@@ -1196,11 +1246,12 @@ fn validate_block_blob(
 
 fn validate_tree_state_checkpoint(
     transition_tip_height: BlockHeight,
+    coverage: TreeStateCheckpointCoverage,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
-    let checkpoint_required = tree_state_checkpoint_required(height, transition_tip_height);
+    let checkpoint_required = coverage.requires_checkpoint(height, transition_tip_height);
     match (checkpoint_required, &block.tree_state_checkpoint) {
         (true, None) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
@@ -1210,7 +1261,7 @@ fn validate_tree_state_checkpoint(
         }
         (false, Some(_)) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "block {} has a tree-state checkpoint outside the global cadence and transition tip",
+                "block {} has a tree-state checkpoint outside the selected construction coverage",
                 height.value()
             )));
         }

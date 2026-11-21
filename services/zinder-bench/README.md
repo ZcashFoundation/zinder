@@ -86,11 +86,16 @@ zinder-bench rocksdb-canonical-fixture-replay \
 ```
 
 The canonical store path must be fresh and disjoint from the fixture. Defaults
-are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile and
-use the canonical writer resource budget. Every `CanonicalPipelineLimits`
-field has an explicit positive override for controlled source-admission
-experiments, and `--source-segment-delay-millis` injects a fixed delay into each
-outer fixture segment response.
+are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile, use
+the canonical writer resource budget, and persist checkpoints at the predecessor,
+every 100 blocks, and at the build tip. This matches fresh ingest defaults.
+Pass `--tree-state-checkpoint-coverage every-block` to measure dense construction.
+The report records the constructed coverage in
+`resource_limits.tree_state_checkpoint_coverage` and verifies
+`source_load.tree_state_checkpoint_count` against it. Every
+`CanonicalPipelineLimits` field has an explicit positive override for controlled
+source-admission experiments, and `--source-segment-delay-millis` injects a
+fixed delay into each outer fixture segment response.
 
 This command certifies the exact captured bytes, the complete index-zero
 subtree-root prefixes through the fixed tip, replay-plan checkpoints, canonical
@@ -117,11 +122,14 @@ zinder-bench rocksdb-raw-blob-retention-comparison \
 
 All four store paths must be absent, have existing parents, and be pairwise
 disjoint from each other and the fixture. The command uses the same fixture,
-pipeline limits, reorg policy, wallet workload, writer budget, and reader
-budget for both arms. It fails instead of reporting if their authenticated
-fixture, replay plan, logical replay, subtree-root load coverage and digest,
-fence, or effective-limit identities differ. The report records each retention
-contract, raw-blob counts, physical canonical bytes, replay throughput, and a
+pipeline limits, tree-state checkpoint coverage (`cadence-and-tip` by default, or
+`every-block` via `--tree-state-checkpoint-coverage`), reorg policy, wallet
+workload, writer budget, and reader budget for both arms. It fails instead of
+reporting if their authenticated fixture, replay plan, logical replay,
+subtree-root load coverage and digest, fence, or effective-limit identities
+differ. Report format version 3 records each retention
+contract, `effective_limits.tree_state_checkpoint_coverage`, raw-blob counts,
+physical canonical bytes, replay throughput, and a
 fresh secondary READY-admission timing. `authenticated_replay_lifecycle_seconds`
 and its throughput field cover the complete authenticated replay lifecycle:
 load, publication, cold reopen, and full-scan certification. They are not
@@ -164,9 +172,24 @@ zinder-bench rocksdb-storage-lifecycle \
 
 The closed lifecycle derives its source and block-preparation limits from the
 declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
-independent pipeline tuning flags. The report validator recomputes those limits
-before accepting evidence. Diagnostic parameter sweeps belong to
+independent pipeline tuning flags. Canonical construction defaults to
+`--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest defaults.
+Pass `--tree-state-checkpoint-coverage every-block` to measure the opt-in cost of
+writing dense checkpoints before READY. Report format
+version 5 records the actual constructed coverage in
+`resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
+in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
+`cold-certified`), and the persisted row count in
+`canonical_storage_ready.tree_state_checkpoint_count`. The report validator
+recomputes those limits and checkpoint counts for version 5 reports while
+keeping an exact archived version 4 branch for earlier reports when no version 5
+expectation is pinned. Diagnostic parameter sweeps belong to
 `rocksdb-canonical-fixture-replay`.
+
+By default, `--canonical-publication-mode trusted-fresh` uses the same
+prepublication checks as fresh ingest. Use `--canonical-publication-mode
+cold-certified` in a separate run to measure full certification. The report
+identifies the mode in `resource_limits.canonical_publication_mode`.
 
 The report exposes two independent acceptance measurements:
 
@@ -639,11 +662,12 @@ rebuild a wallet from the kept canonical store with `rocksdb-wallet-rebuild`.
 
 `TreeStateAtHeight` and lightwalletd `GetTreeState` answer a height without a
 stored checkpoint by replaying stored compact blocks from the checkpoint below
-it. Construction checkpoints every 100 blocks, and a wallet that scans in
-100-block rounds anchors one block below each boundary, at `k * 100 - 1`, so
-every such request replays the full 99-block stride. Measure that case on a
-READY canonical store, such as one built with
-`rocksdb-canonical-fixture-replay`:
+it. Sparse construction (`--tree-state-checkpoint-coverage cadence-and-tip`)
+checkpoints every 100 blocks, and a wallet that scans in 100-block rounds
+anchors one block below each boundary, at `k * 100 - 1`, so every such request
+replays the full 99-block stride. Measure that case on a READY canonical store,
+such as one built with
+`rocksdb-canonical-fixture-replay --tree-state-checkpoint-coverage cadence-and-tip`:
 
 ```bash
 zinder-bench rocksdb-tree-state-replay \
@@ -853,14 +877,18 @@ source:
   connection downloads serial 1,000-block batches (100 where a batch touches
   heights 1,710,000 to 2,050,000), each after the tree state below its first
   block, with an empty pool filter. Each call gets 5 attempts.
-- `point-reads`: no block downloads. Each wallet repeats `--rounds` rounds
-  of `GetLightdInfo`, `GetLatestBlock`, a tree state at a stored checkpoint
-  and one at the height below it, which Zinder rebuilds by replaying 99
-  blocks, and, for each `--transparent-address`, `GetTaddressTxids` over the
-  range plus one `GetAddressUtxosStream` for all of them. The two tree states
-  are reported as `GetTreeState(stored checkpoint)` and
-  `GetTreeState(replay)`. Calls are not retried. The settings below add
-  further reads and are off unless set.
+- `point-reads`: each wallet repeats `--rounds` rounds of `GetLightdInfo`,
+  `GetLatestBlock`, and two tree-state reads at a 100-block cadence boundary
+  and the preceding height. For each `--transparent-address` it also calls
+  `GetTaddressTxids` over the range, then calls `GetAddressUtxosStream` once
+  for all addresses. Each call gets one attempt.
+
+Point-read report format 2 labels the requests `GetTreeState(on cadence)` and
+`GetTreeState(off cadence)` and records `on_cadence_height` and
+`off_cadence_height`. A dense store can serve both heights directly.
+Format 1 called these requests `stored checkpoint` and `replay` based on
+height alone. To measure how Zinder served them, use the `source` label on
+`zinder_query_tree_state_reads_total`.
 
 The `point-reads` settings below, and the setup they run, apply only to that
 workload. `--workload` values that download blocks refuse them. Setup calls
@@ -1183,8 +1211,10 @@ PepperSync prioritizes. Wallets with history can trigger additional lookups.
 
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
-- `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 4.
+- `report_format_version`: machine-readable report contract version.
+  `canonical-replay-storage` reports use version 4;
+  `rocksdb-canonical-fixture-replay` and `rocksdb-storage-lifecycle` reports use
+  version 5.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1210,8 +1240,15 @@ PepperSync prioritizes. Wallets with history can trigger additional lookups.
 - Canonical-fixture `total_seconds` and `blocks_per_second`: the complete
   measured lifecycle and its end-to-end loaded-block rate.
 - Canonical-fixture `resource_limits`: the CPU and memory envelope, the exact
-  source-planner, admission, preparation, and deterministic delay settings, and
-  the canonical `RocksDB` budget used by the run.
+  source-planner, admission, preparation, deterministic delay, and
+  `tree_state_checkpoint_coverage` (`every-block` or `cadence-and-tip`)
+  settings, and the canonical `RocksDB` budget used by the run.
+- Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
+  `resource_limits.canonical_publication_mode`, and
+  `canonical_storage_ready.tree_state_checkpoint_count` (version 5): the actual
+  construction checkpoint coverage (`every-block` or `cadence-and-tip`), the
+  canonical publication mode (`trusted-fresh` or `cold-certified`), and the
+  persisted checkpoint row count (including the predecessor checkpoint).
 - Canonical-fixture `source_fetch_attribution` reports completed segment
   requests, request and payload rates over replay wall time, cumulative
   request-task seconds, density adjustments, and retained and discarded

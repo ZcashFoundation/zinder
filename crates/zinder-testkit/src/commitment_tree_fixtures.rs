@@ -77,6 +77,41 @@ pub fn frontier_of_size(
     frontier_from_parts(protocol, position, leaf, MerkleHashOrchard::to_bytes)
 }
 
+/// Derives a canonical `protocol` frontier independently by appending raw
+/// 32-byte note commitments directly into an `incrementalmerkletree::Frontier`.
+///
+/// This bypasses `CommitmentTreeAccumulator` so tests can verify stored
+/// checkpoints against an independent commitment-tree derivation.
+pub fn frontier_from_note_commitments(
+    protocol: ShieldedProtocol,
+    commitments: &[[u8; 32]],
+) -> Result<CommitmentTreeFrontier> {
+    if protocol == ShieldedProtocol::Sapling {
+        let mut frontier = Frontier::<SaplingNode, 32>::empty();
+        for bytes in commitments {
+            let leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(*bytes))
+                .ok_or_else(|| eyre!("note commitment is not a canonical Sapling node"))?;
+            if !frontier.append(leaf) {
+                return Err(eyre!("Sapling commitment tree capacity exceeded"));
+            }
+        }
+        return encode_frontier(protocol, &frontier, |root| {
+            let mut root_bytes = root.to_bytes();
+            root_bytes.reverse();
+            root_bytes
+        });
+    }
+    let mut frontier = Frontier::<MerkleHashOrchard, 32>::empty();
+    for bytes in commitments {
+        let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(bytes))
+            .ok_or_else(|| eyre!("note commitment is not a canonical {protocol:?} node"))?;
+        if !frontier.append(leaf) {
+            return Err(eyre!("{protocol:?} commitment tree capacity exceeded"));
+        }
+    }
+    encode_frontier(protocol, &frontier, MerkleHashOrchard::to_bytes)
+}
+
 /// Builds a frontier whose every ommer equals `leaf`, then validates it
 /// through the production frontier codec.
 fn frontier_from_parts<Node>(
@@ -92,7 +127,18 @@ where
     let frontier: Frontier<Node, 32> =
         Frontier::from_parts(position, leaf.clone(), vec![leaf; ommer_count])
             .map_err(|error| eyre!("valid {protocol:?} frontier fixture rejected: {error:?}"))?;
-    let tree = CommitmentTree::from_frontier(&frontier);
+    encode_frontier(protocol, &frontier, root_bytes_in_rpc_order)
+}
+
+fn encode_frontier<Node>(
+    protocol: ShieldedProtocol,
+    frontier: &Frontier<Node, 32>,
+    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+) -> Result<CommitmentTreeFrontier>
+where
+    Node: Clone + incrementalmerkletree::Hashable + HashSer,
+{
+    let tree = CommitmentTree::from_frontier(frontier);
     let mut final_state_bytes = Vec::new();
     write_commitment_tree(&tree, &mut final_state_bytes)?;
     Ok(CommitmentTreeFrontier::from_canonical_final_state(
@@ -117,6 +163,14 @@ mod tests {
             assert_eq!(
                 completed_subtree_frontier(protocol)?.tree_size(),
                 SUBTREE_LEAF_COUNT
+            );
+            assert_eq!(
+                frontier_from_note_commitments(protocol, &[])?,
+                CommitmentTreeFrontier::empty(protocol)
+            );
+            assert_eq!(
+                frontier_from_note_commitments(protocol, &[FIXTURE_NOTE_COMMITMENT])?,
+                one_leaf_frontier(protocol)?
             );
         }
         Ok(())

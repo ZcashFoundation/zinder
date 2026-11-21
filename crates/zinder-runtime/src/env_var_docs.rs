@@ -1654,10 +1654,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Whether ingest fills settled history built by a first sync with stored \
-                      tree-state checkpoints in the background, so a tree-state read there \
-                      needs no replay. Runs only with `ingest_control.listen_addr` set. \
-                      Defaults to `true`.",
+        description: "Enables tree-state densification. The background pass requires `ingest_control.listen_addr`. Defaults to `true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION",
+        toml_path: "ingest.tree_state_densification.during_construction",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to store every block before READY when densification is enabled and the selection is `every-block`. Full Mainnet time to READY and disk growth for this mode are unqualified. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
@@ -1665,19 +1670,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Which settled blocks receive a stored tree-state checkpoint: \
-                      `every-block` stores one for every block, so no tree-state read in a \
-                      completed stride replays (heights in the stride the settled tip has not \
-                      yet passed still do), and `commitment-budget` stores one each time \
-                      `commitment_budget` note commitments have accumulated. Defaults to \
-                      `every-block`, or to `commitment-budget` when only `commitment_budget` \
-                      is set. An operator who wants `commitment-budget` selects it before the \
-                      first start of a version that defaults to `every-block`; switching later \
-                      keeps every stored row, because a dense stride already satisfies the \
-                      looser budget and the pass only inserts missing rows, and only changes \
-                      the work still outstanding. The `every-block` cost on Mainnet is an \
-                      estimate pending measurement: about 2.4 GB of rows before compression \
-                      and 4 to 5 CPU-hours for the one-time pass.",
+        description: "Which settled checkpoints the background pass adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint each time `commitment_budget` commitments accumulate and is the default when only that budget is set. Changing selection retains existing rows.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",

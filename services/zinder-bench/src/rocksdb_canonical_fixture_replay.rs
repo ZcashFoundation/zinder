@@ -12,7 +12,8 @@ use zinder_bench::{
     BenchError,
     canonical_fixture_replay::{
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        replay_canonical_fixture_into_rocksdb, replay_canonical_fixture_transport_into_rocksdb,
+        TreeStateCheckpointCoverage, replay_canonical_fixture_into_rocksdb,
+        replay_canonical_fixture_transport_into_rocksdb,
     },
     fixture::FixtureManifest,
     recorder::install_recorder,
@@ -110,6 +111,9 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Aggregate canonical preparation memory watermark.
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -128,6 +132,7 @@ struct ValidatedReplayArgs {
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     block_source: CanonicalFixtureBlockSource,
     json_rpc_addr: Option<String>,
     indexer_grpc_addr: Option<String>,
@@ -170,6 +175,7 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
         raw_blob_retention: RawBlobRetention::Transactions,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
+        tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
     };
     let outcome = replay_with_block_source(&validated, &manifest, replay_config).await?;
     let total_seconds = replay_started.elapsed().as_secs_f64();
@@ -242,6 +248,7 @@ impl RocksDbCanonicalFixtureReplayArgs {
             pipeline_limits,
             supported_reorg_depth: supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
             block_source: self.block_source,
             json_rpc_addr: block_source_args.json_rpc_addr,
             indexer_grpc_addr: block_source_args.indexer_grpc_addr,
@@ -420,7 +427,11 @@ fn replay_measurements(
     RocksDbCanonicalFixtureReplayMeasurements {
         replay_plan_fixture_manifest_sha256: measured.outcome.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: measured.outcome.replay_plan_digest_sha256,
-        resource_limits: resource_limits(validated, measured.resource_budget),
+        resource_limits: resource_limits(
+            validated,
+            measured.outcome.tree_state_checkpoint_coverage,
+            measured.resource_budget,
+        ),
         publication_proof_provenance: "trusted-fresh-writer",
         total_seconds: measured.total_seconds,
         source_load,
@@ -434,6 +445,7 @@ fn replay_measurements(
 
 fn resource_limits(
     validated: &ValidatedReplayArgs,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     resource_budget: RocksDbResourceBudget,
 ) -> RocksDbCanonicalFixtureReplayResourceLimits {
     RocksDbCanonicalFixtureReplayResourceLimits {
@@ -467,6 +479,7 @@ fn resource_limits(
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay_millis: u64::try_from(validated.source_segment_delay.as_millis())
             .unwrap_or(u64::MAX),
+        tree_state_checkpoint_coverage,
         canonical_rocksdb: resource_budget.into(),
     }
 }
@@ -663,6 +676,28 @@ mod tests {
                 .block_prepare_memory_watermark_bytes
                 .get(),
             CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES / 64
+        );
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(arguments(&[
+            "--tree-state-checkpoint-coverage",
+            "every-block",
+        ]))?;
+        assert_eq!(
+            cli.replay.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
+        assert!(
+            TestCli::try_parse_from(arguments(&["--tree-state-checkpoint-coverage", "sparse"]))
+                .is_err()
         );
         Ok(())
     }

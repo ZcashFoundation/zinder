@@ -171,6 +171,15 @@ pub(crate) enum WalletWorkload {
     PointReads,
 }
 
+impl WalletWorkload {
+    const fn report_format_version(self) -> u16 {
+        match self {
+            Self::PointReads => 2,
+            Self::ClassicSdk | Self::Slipstream | Self::Vizor => 1,
+        }
+    }
+}
+
 /// Report and optional output path produced by one load run.
 pub(crate) struct LightwalletdWalletLoadOutput {
     pub(crate) report: LightwalletdWalletLoadReport,
@@ -779,7 +788,7 @@ impl LightwalletdWalletLoadReport {
         };
         Self {
             contract_identity: "lightwalletd-wallet-load",
-            report_format_version: 1,
+            report_format_version: args.workload.report_format_version(),
             workload: args.workload,
             endpoint: args.endpoint.clone(),
             target_label: args.target_label.clone(),
@@ -1097,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_reads_separate_stored_checkpoints_from_replays() -> TestResult {
+    async fn point_reads_report_requested_heights_by_cadence() -> TestResult {
         let server = CompatServer::start().await?;
         let mut args = server.args(WalletWorkload::PointReads, 1);
         args.rounds = 2;
@@ -1109,14 +1118,13 @@ mod tests {
         // The probe adds one GetLightdInfo and one GetLatestBlock.
         assert_eq!(status(&report, "GetLightdInfo", "ok")?, 3);
         assert_eq!(status(&report, "GetLatestBlock", "ok")?, 3);
-        // Below the tip of 250, the checkpoint at 100 and the height 99,
-        // which replays from the checkpoint at 0.
-        assert_eq!(count(&report, "/parameters/stored_checkpoint_height")?, 100);
-        assert_eq!(count(&report, "/parameters/replay_height")?, 99);
+        assert_eq!(count(&report, "/report_format_version")?, 2);
+        assert_eq!(count(&report, "/parameters/on_cadence_height")?, 100);
+        assert_eq!(count(&report, "/parameters/off_cadence_height")?, 99);
         assert_eq!(
-            status(&report, "GetTreeState(stored checkpoint)", "ok")?
-                + status(&report, "GetTreeState(replay)", "ok")?
-                + status(&report, "GetTreeState(replay)", "unavailable")?,
+            status(&report, "GetTreeState(on cadence)", "ok")?
+                + status(&report, "GetTreeState(off cadence)", "ok")?
+                + status(&report, "GetTreeState(off cadence)", "unavailable")?,
             4
         );
         // An address with no history streams nothing, successfully.
