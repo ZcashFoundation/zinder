@@ -1251,9 +1251,9 @@ fn canonical_writer_config(
             .checkpoint_height,
         raw_blob_retention: command_config.runtime_config.raw_blob_policy.to_retention(),
         reorg_window_blocks: command_config.runtime_config.reorg_window_blocks,
-        every_block_tree_state_checkpoints: command_config
+        tree_state_checkpoint_selection: command_config
             .tree_state_densification
-            .stores_checkpoints_during_construction(),
+            .construction_selection(),
         follow: CanonicalFollowConfig {
             request_timeout: command_config.runtime_config.longest_node_request_timeout(),
             poll_interval: command_config.runtime_config.follow.poll_interval,
@@ -1295,7 +1295,7 @@ fn log_canonical_writer_start(
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
         raw_blob_retention = %writer_config.raw_blob_retention,
         reorg_window_blocks = writer_config.reorg_window_blocks,
-        every_block_tree_state_checkpoints = writer_config.every_block_tree_state_checkpoints,
+        tree_state_checkpoint_selection = ?writer_config.tree_state_checkpoint_selection,
         checkpoint_height = ?writer_config.checkpoint_height.map(BlockHeight::value),
         target_height = ?writer_config.follow.target_height.map(BlockHeight::value),
         historical_prevout_reads = 0_u64,
@@ -1887,46 +1887,33 @@ source = "zebra-json-rpc"
             writer_config.construction.request_timeout,
             Duration::from_secs(30)
         );
-        assert!(!writer_config.every_block_tree_state_checkpoints);
+        assert_eq!(writer_config.tree_state_checkpoint_selection, None);
         Ok(())
     }
 
     #[test]
     fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_densification_config()
     -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_store::TreeStateCheckpointSelection::{CommitmentBudget, EveryBlock};
+
         let cases = [
-            ("", false),
+            ("", None),
+            ("during_construction = true", Some(EveryBlock)),
             (
-                "[ingest.tree_state_densification]\nenabled = true\nselection = \"every-block\"\n",
-                false,
+                "during_construction = true
+enabled = false",
+                None,
+            ),
+            ("selection = \"commitment-budget\"", None),
+            (
+                "during_construction = true
+selection = \"commitment-budget\"",
+                std::num::NonZeroU32::new(1_024).map(CommitmentBudget),
             ),
             (
-                "[ingest.tree_state_densification]\nduring_construction = true\n",
-                true,
-            ),
-            (
-                "[ingest.tree_state_densification]\nduring_construction = true\nenabled = false\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nenabled = false\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nenabled = false\nselection = \"every-block\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\nselection = \"commitment-budget\"\n",
-                false,
-            ),
-            (
-                "[ingest.tree_state_densification]\ncommitment_budget = 512\n",
-                false,
+                "during_construction = true
+commitment_budget = 256",
+                std::num::NonZeroU32::new(256).map(CommitmentBudget),
             ),
         ];
         for (section, expected) in cases {
@@ -1947,6 +1934,7 @@ path = "{}"
 [ingest]
 source = "zebra-json-rpc"
 
+[ingest.tree_state_densification]
 {section}"#,
                     temporary.path().join("store").display()
                 ),
@@ -1960,7 +1948,7 @@ source = "zebra-json-rpc"
                 Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
             );
             assert_eq!(
-                writer_config.every_block_tree_state_checkpoints, expected,
+                writer_config.tree_state_checkpoint_selection, expected,
                 "unexpected construction checkpoint setting for section:\n{section}"
             );
         }

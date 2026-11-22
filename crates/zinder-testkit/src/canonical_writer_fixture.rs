@@ -33,6 +33,7 @@ use zinder_store::{
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
     CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
     RocksDbCanonicalStore, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
+    TreeStateCheckpointSelection,
 };
 
 use crate::{ChainFixture, FixtureBlock, FixtureTransactionRows, WalletServingStoreFixture};
@@ -51,7 +52,7 @@ pub struct CanonicalBaseline<'chain> {
     history_floor: Option<BlockHeight>,
     settled_tip_height: Option<BlockHeight>,
     subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
-    every_block_tree_state_checkpoints: bool,
+    tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
 }
 
 impl<'chain> CanonicalBaseline<'chain> {
@@ -64,7 +65,7 @@ impl<'chain> CanonicalBaseline<'chain> {
             history_floor: None,
             settled_tip_height: None,
             subtree_roots: Vec::new(),
-            every_block_tree_state_checkpoints: false,
+            tree_state_checkpoint_selection: None,
         }
     }
 
@@ -108,8 +109,17 @@ impl<'chain> CanonicalBaseline<'chain> {
     /// Publishes a tree-state checkpoint for every constructed block instead
     /// of only on the global cadence and at the build tip.
     #[must_use]
-    pub const fn with_every_block_tree_state_checkpoints(mut self) -> Self {
-        self.every_block_tree_state_checkpoints = true;
+    pub const fn with_every_block_tree_state_checkpoints(self) -> Self {
+        self.with_tree_state_checkpoint_selection(TreeStateCheckpointSelection::EveryBlock)
+    }
+
+    /// Adds construction checkpoints under `selection` alongside the cadence and tip.
+    #[must_use]
+    pub const fn with_tree_state_checkpoint_selection(
+        mut self,
+        selection: TreeStateCheckpointSelection,
+    ) -> Self {
+        self.tree_state_checkpoint_selection = Some(selection);
         self
     }
 
@@ -202,8 +212,8 @@ impl CanonicalWriterFixture {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let mut builder = if baseline.every_block_tree_state_checkpoints {
-            builder.with_every_block_tree_state_checkpoints()?
+        let mut builder = if let Some(selection) = baseline.tree_state_checkpoint_selection {
+            builder.with_tree_state_checkpoint_selection(selection)?
         } else {
             builder
         };
@@ -214,7 +224,7 @@ impl CanonicalWriterFixture {
                 first_height: first_retained_height,
                 tip_height,
             },
-            baseline.every_block_tree_state_checkpoints,
+            baseline.tree_state_checkpoint_selection,
         )?;
         let tip_checkpoint = blocks
             .last()
@@ -546,17 +556,23 @@ fn baseline_blocks(
     artifacts: &FixtureChainArtifacts,
     trees: &mut FixtureCommitmentTrees<'_>,
     range: BaselineRange,
-    every_block_tree_state_checkpoints: bool,
+    tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
 ) -> eyre::Result<Vec<CanonicalBuildBlock>> {
     let mut blocks = Vec::new();
+    let mut checkpoint_tree_sizes = trees.accumulator.tip_metadata();
     for height in range.first_height.value()..=range.tip_height.value() {
         let height = BlockHeight::new(height);
         let tip_metadata =
             trees.apply_cold(&artifacts.chain, height, artifacts.compact_block(height)?)?;
-        let checkpoint_required = every_block_tree_state_checkpoints
-            || height == range.tip_height
-            || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+        let checkpoint_required = height == range.tip_height
+            || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
+            || tree_state_checkpoint_selection.is_some_and(|selection| {
+                selection.requires_checkpoint_since(checkpoint_tree_sizes, tip_metadata)
+            });
         let checkpoint_frontiers = checkpoint_required.then(|| trees.frontiers()).transpose()?;
+        if checkpoint_required {
+            checkpoint_tree_sizes = tip_metadata;
+        }
         blocks.push(artifacts.build_block(height, tip_metadata, checkpoint_frontiers)?);
     }
     Ok(blocks)

@@ -65,9 +65,9 @@ once in the reply. A short reply or a repeated ID causes ingest to report
 
 Ingest rebuilds the note commitment trees from the blocks and stores
 tree-state checkpoints every 100 blocks and at the build tip by default.
-To store one at each height before publication, enable
-`ingest.tree_state_densification.during_construction` with the enabled
-`every-block` selection. The loader
+To apply the selected densification policy before publication, set
+`ingest.tree_state_densification.during_construction = true` with densification
+enabled. The loader
 refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
 tree is still empty.
@@ -172,16 +172,19 @@ construction checkpoint coverage and the background densification pass:
   the first sync with the enabled `every-block` selection. Ingest then
   cross-checks and stores each frontier on the serial loader. Completed
   strides already satisfy the background pass, avoiding a second replay of
-  their commitments. Full Mainnet time to READY and disk growth await
-  qualification. The rows are estimated at about 2.4 GB before compression.
-- `commitment-budget` keeps fresh construction sparse (every 100 blocks and at
-  the build tip), and the background pass stores one each time
-  `commitment_budget` note commitments (1,024 by default) have accumulated
-  since the previous checkpoint, so a read between two of them replays fewer
-  than that many commitments. On Mainnet this adds an estimated 0.13 GB.
-  Setting `commitment_budget` without a `selection` chooses it.
+  their commitments. The rows are estimated at about 2.4 GB before compression.
+- The `commitment-budget` selection stores a checkpoint once at least
+  `commitment_budget` note commitments across all pools have accumulated since
+  the previous checkpoint. The budget defaults to 1,024. Setting the budget
+  without a `selection` chooses this policy. With `during_construction = true`,
+  the rule applies during fresh construction alongside the 100-block cadence
+  and build tip. A read between checkpoints replays fewer commitments than
+  the budget and at most 99 blocks. Each cadence checkpoint resets the count.
 - Setting `enabled = false` keeps fresh construction sparse (every 100 blocks
   and at the build tip) and disables the background pass.
+
+Full Mainnet time to READY and disk growth await qualification for both
+construction selections.
 
 Live following already stores one checkpoint per block. Once ingest follows
 the tip, and Explorer views have caught up when they are enabled, the

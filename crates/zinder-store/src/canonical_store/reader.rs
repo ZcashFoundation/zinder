@@ -3,7 +3,7 @@
 use std::mem::size_of;
 
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
-use rust_rocksdb::{Direction, IteratorMode};
+use rust_rocksdb::{DB, Direction, IteratorMode};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
@@ -191,7 +191,7 @@ macro_rules! impl_canonical_typed_reads {
                 &self,
                 height: BlockHeight,
             ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-                read_compact_block_at(self, height)
+                read_compact_block_at(&self.bounded_open.db, height)
             }
 
             /// Reads an inclusive compact-block range in ascending height order.
@@ -584,17 +584,17 @@ fn read_block_hash_lookup(
 }
 
 pub(super) fn read_compact_block_at(
-    store: &impl CanonicalServingRead,
+    db: &DB,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-    read_optional(
-        store,
-        COMPACT_BLOCK_COLUMN_FAMILY,
-        &encode_block_position(height),
-        "compact block read",
-    )?
-    .map(|encoded_compact_block| decode_compact_block_row(height, &encoded_compact_block))
-    .transpose()
+    let family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    db.get_cf(&family, encode_block_position(height))
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "compact block read",
+            source,
+        })?
+        .map(|encoded_compact_block| decode_compact_block_row(height, &encoded_compact_block))
+        .transpose()
 }
 
 fn read_compact_blocks_in_range(

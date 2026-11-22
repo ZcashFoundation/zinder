@@ -1694,7 +1694,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to store every block before READY when densification is enabled and the selection is `every-block`. Full Mainnet time to READY and disk growth for this mode are unqualified. Changing this setting leaves stored checkpoints in place.",
+        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to also apply the enabled densification selection before READY. Full Mainnet time to READY and disk growth are unqualified for the `every-block` and `commitment-budget` construction selections. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
@@ -1702,7 +1702,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Which settled checkpoints the background pass adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint each time `commitment_budget` commitments accumulate and is the default when only that budget is set. Changing selection retains existing rows.",
+        description: "Which checkpoints densification adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint when at least `commitment_budget` note commitments have accumulated since the previous checkpoint. Setting only the budget selects this policy. Changing selection retains existing rows.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",

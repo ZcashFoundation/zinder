@@ -969,6 +969,7 @@ struct IngestTreeStateVerificationToml {
 #[derive(Serialize)]
 struct IngestTreeStateDensificationToml {
     enabled: bool,
+    during_construction: bool,
     selection: TreeStateSelectionName,
     #[serde(skip_serializing_if = "Option::is_none")]
     commitment_budget: Option<u32>,
@@ -988,6 +989,7 @@ impl IngestTreeStateDensificationToml {
         };
         Self {
             enabled: config.enabled,
+            during_construction: config.during_construction,
             selection,
             commitment_budget,
             workers: config.workers.get(),
