@@ -159,6 +159,42 @@ if [[ -n "$compose_contract" ]]; then
   }
 
   jq -e '
+    .services["zinder-compat-lightwalletd"].ulimits.nofile
+    | [.soft, .hard] | all(type == "number" and . >= 65536)
+  ' "$compose_contract" >/dev/null || {
+    echo "release admission rejected: the signed-history reader profile requires soft and hard open-file limits of at least 65536" >&2
+    exit 1
+  }
+
+  jq -e '
+    .services as $services
+    | $services["zinder-history-publisher"] as $publisher
+    | $services["zinder-compat-lightwalletd"] as $reader
+    | "/var/lib/zinder-history" as $catalog
+    | "/run/zinder-history/publisher.pub" as $public_key
+    | "/run/zinder-history/publisher.pk8" as $private_key
+    | ($publisher.volumes[]? | select(.target == $private_key) | .source | rtrimstr("/publisher.pk8")) as $generation
+    | def binds($source; $target; $readonly):
+        any(.volumes[]?; .type == "bind" and .source == $source and .target == $target
+          and ((.read_only // false) == $readonly) and (.bind.create_host_path == false));
+      $publisher.network_mode == "none" and $publisher.image == $reader.image
+      and ($publisher.command | index("publish-shielded-history") != null and index("--follow-interval-secs") != null)
+      and ($publisher | any(.volumes[]?; .type == "volume" and .source == "data" and .target == "/var/lib/zinder" and .read_only))
+      and ($publisher | binds($generation + "/publisher.pk8"; $private_key; true))
+      and ($publisher | binds($generation + "/catalog"; $catalog; false))
+      and ($reader | binds($generation + "/publisher.pub"; $public_key; true))
+      and ($reader | binds($generation + "/catalog"; $catalog; true))
+      and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY == $catalog
+      and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY == $public_key
+      and all($services | del(.["zinder-history-publisher"]) | .[].volumes[]? | select(.type == "bind");
+        .source as $source | $source != ($generation + "/publisher.pk8")
+        and (($generation + "/publisher.pk8") | startswith(($source | rtrimstr("/")) + "/") | not))
+  ' "$compose_contract" >/dev/null || {
+    echo "release admission rejected: invalid signed wallet history publication or reader mounts" >&2
+    exit 1
+  }
+
+  jq -e '
     .services as $services
     |
     def exact_healthcheck($binary; $start_period):
