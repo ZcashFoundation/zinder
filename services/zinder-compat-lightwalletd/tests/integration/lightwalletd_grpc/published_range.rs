@@ -1335,6 +1335,67 @@ async fn standalone_adapters_serve_and_coalesce_on_demand_shielded_live_tail() -
 }
 
 #[tokio::test]
+async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog() -> eyre::Result<()>
+{
+    let chain = wallet_chain(1)?;
+    let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
+    let dir = tempfile::tempdir()?;
+    let directory = dir.path().join("catalog");
+    let (signer, key) = crate::common::shielded_catalog_keys(dir.path())?;
+    let mut publisher =
+        ShieldedCatalogPublisher::open(&directory, &signer, BlockHeight::new(1), 2.try_into()?)?;
+    let history = Arc::new(
+        PublishedShieldedHistory::follow_publisher(&directory, &key, false, store.reader.as_ref())
+            .await?,
+    );
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(history.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(store.reader.clone()))
+                .with_published_shielded_history(history.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(store.query.clone()).into_server()),
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+    let ranges = [(1, 6), (6, 1)];
+
+    assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(1, 6)]
+    );
+
+    assert!(publisher.publish_next(&store.reader)?);
+    assert!(history.refresh(store.reader.as_ref()).await?);
+    assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(1, 6)]
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        Vec::<BlockHeightRange>::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn query_api_rows_with_lengths_preserves_exact_stored_compact_bytes() -> eyre::Result<()> {
     use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
     let chain = wallet_chain(8)?;

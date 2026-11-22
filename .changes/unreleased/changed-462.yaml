@@ -1,0 +1,6 @@
+kind: changed
+body: Single-host wallet Compose installations serve canonical shielded ranges during bootstrap and automatically adopt signed segments as they become available. Compose sets the wallet reader’s open-file limit to 65,536. Provision a durable publisher key and its trusted public key before upgrading.
+time: 2026-11-21T22:41:06.84046219Z
+custom:
+    Bump: minor
+    PR: "462"

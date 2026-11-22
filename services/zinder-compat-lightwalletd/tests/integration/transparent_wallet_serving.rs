@@ -1352,6 +1352,88 @@ async fn production_pair_get_block_range_outside_retained_history_keeps_lightwal
     }
 }
 
+#[tokio::test]
+async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavailable()
+-> eyre::Result<()> {
+    use prost::Message as _;
+    use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
+
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(3);
+    let mut store =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let (secondary, wallet) = store.take_readers()?;
+    let canonical = Arc::new(InstrumentedCanonicalReader::new(secondary)?);
+    let keys = tempfile::tempdir()?;
+    let (private, public) = crate::common::shielded_catalog_keys(keys.path())?;
+    let directory = tempfile::tempdir()?;
+    let mut publisher = ShieldedCatalogPublisher::open(
+        directory.path(),
+        &private,
+        BlockHeight::new(1),
+        NonZeroU32::MIN,
+    )?;
+    let history = Arc::new(
+        PublishedShieldedHistory::follow_publisher(
+            directory.path(),
+            &public,
+            false,
+            canonical.as_ref(),
+        )
+        .await?,
+    );
+    let adapter = build_wallet_serving_adapter_from_readers(
+        canonical.clone(),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?
+    .with_published_shielded_history(history.clone());
+    let first = Some(lightwalletd::BlockId {
+        height: 1,
+        hash: Vec::new(),
+    });
+    let request = lightwalletd::BlockRange {
+        start: first.clone(),
+        end: first,
+        pool_types: Vec::new(),
+    };
+    let expected = adapter
+        .get_block_range(Request::new(request.clone()))
+        .await?
+        .into_inner()
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| eyre::eyre!("missing canonical block"))?;
+    let expected = expected.encode_to_vec();
+    let encoded_rows = || async {
+        let encoded = adapter
+            .encoded_block_range()
+            .ok_or_else(|| eyre::eyre!("missing encoded block range"))?;
+        let mut rows = encoded
+            .get_encoded_block_range(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        let mut received = Vec::new();
+        while let Some(row) = rows.next().await.transpose()? {
+            received.push(row.to_vec());
+        }
+        Ok::<_, eyre::Report>(received)
+    };
+    assert_eq!(encoded_rows().await?, vec![expected.clone()]);
+    assert!(publisher.publish_next(&canonical.canonical_reader)?);
+    assert!(history.refresh(canonical.as_ref()).await?);
+    assert!(
+        history
+            .refresh_tail(canonical.as_ref())
+            .await
+            .is_err_and(|status| status.code() == Code::Unavailable
+                && status.message().contains("row lengths"))
+    );
+    assert_eq!(encoded_rows().await?, vec![expected]);
+    Ok(())
+}
+
 async fn first_block_range_status(
     adapter: &WalletServingAdapter,
     start_height: u64,

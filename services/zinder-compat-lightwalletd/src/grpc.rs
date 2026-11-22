@@ -875,11 +875,7 @@ where
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
-            |history| {
-                let catalog = history.catalog();
-                let tail = catalog.tail();
-                (Some(catalog), tail)
-            },
+            |history| history.encoded_range(),
         );
         self.block_methods
             .published_block_range(&self.query_api, &request.into_inner(), range)

@@ -21,12 +21,32 @@ use super::{
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PublisherHead {
+pub(in crate::published_range) struct PublisherHead {
     count: usize,
     digest: [u8; 32],
 }
 
 impl PublisherHead {
+    pub(in crate::published_range) fn read(directory: &Path, key: &[u8]) -> io::Result<Self> {
+        let path = directory.join(".publisher-head.json");
+        Ok(serde_json::from_str(&signed_contents(&path, key, 2048)?)?)
+    }
+
+    pub(in crate::published_range) fn verify(
+        &self,
+        entries: &[ShieldedRangeIdentity],
+    ) -> io::Result<()> {
+        let prefix = entries.get(..self.count).ok_or_else(|| {
+            invalid("signed shielded catalog rolled back below publisher checkpoint")
+        })?;
+        if Self::of(prefix)?.digest != self.digest {
+            return Err(invalid(
+                "signed shielded catalog changed the publisher checkpoint",
+            ));
+        }
+        Ok(())
+    }
+
     fn of(entries: &[ShieldedRangeIdentity]) -> io::Result<Self> {
         Ok(Self {
             count: entries.len(),
@@ -79,19 +99,7 @@ impl ShieldedCatalogPublisher {
         }
         let head_path = directory.join(".publisher-head.json");
         if head_path.try_exists()? {
-            let head: PublisherHead = serde_json::from_str(&signed_contents(
-                &head_path,
-                key.public_key().as_ref(),
-                2048,
-            )?)?;
-            let prefix = entries.get(..head.count).ok_or_else(|| {
-                invalid("signed shielded catalog rolled back below publisher checkpoint")
-            })?;
-            if PublisherHead::of(prefix)?.digest != head.digest {
-                return Err(invalid(
-                    "signed shielded catalog changed the publisher checkpoint",
-                ));
-            }
+            PublisherHead::read(directory, key.public_key().as_ref())?.verify(&entries)?;
         } else if !entries.is_empty() {
             return Err(invalid(
                 "missing durable checkpoint for existing shielded catalog",

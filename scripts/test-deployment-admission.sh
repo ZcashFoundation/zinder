@@ -121,30 +121,25 @@ history_dir="$temporary_directory/history"
 history_compose="$temporary_directory/history-compose.json"
 ZINDER_HISTORY_DIR="$history_dir" ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose --env-file "$repository_root/deploy/.env.testnet" \
-  -f "$repository_root/deploy/docker-compose.yml" \
-  -f "$repository_root/deploy/docker-compose.shielded-history.yml" \
-  config --format json > "$history_compose"
+  -f "$repository_root/deploy/docker-compose.yml" config --format json > "$history_compose"
 bash "$validator" --compose-contract "$history_compose"
 jq -e --arg generation "$history_dir" '
-  .services["zinder-history-publisher"] as $publisher
-  | .services["zinder-compat-lightwalletd"] as $reader
-  | def mounts($source; $target; $readonly):
-      any(.volumes[]; .source == $source and .target == $target and (.read_only // false) == $readonly);
-    $publisher.network_mode == "none"
-    and $publisher.image == $reader.image
-    and ($publisher.command | index("--follow-interval-secs") != null)
-    and ($publisher | mounts("data"; "/var/lib/zinder"; true))
-    and ($publisher | mounts($generation + "/catalog"; "/var/lib/zinder-history"; false))
-    and ($publisher | mounts($generation + "/publisher.pk8"; "/run/zinder-history/publisher.pk8"; true))
-    and ($reader | mounts($generation + "/catalog"; "/var/lib/zinder-history"; true))
-    and ($reader | mounts($generation + "/publisher.pub"; $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY; true))
-    and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST == "/var/lib/zinder-history/current.json"
-    and ([.services | del(.["zinder-history-publisher"]) | .[].volumes[]?.source]
-      | all(. != $generation and . != ($generation + "/publisher.pk8")))
-' "$history_compose" >/dev/null || fail "the signed history overlay lost publisher or reader isolation"
-jq -e '(.services | has("zinder-history-publisher") | not)
-  and (.services["zinder-compat-lightwalletd"].environment | has("ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST") | not)
-' "$resolved_compose" >/dev/null || fail "the base deployment requires signed history during bootstrap"
+  any(.services["zinder-history-publisher"].volumes[]; .source == ($generation + "/publisher.pk8"))
+' "$history_compose" >/dev/null || fail "the publisher ignored the selected generation"
+
+invalid_history_compose="$temporary_directory/invalid-history-compose.json"
+jq '.services["zinder-query"].volumes += [
+  (.services["zinder-history-publisher"].volumes[] | select(.target == "/run/zinder-history/publisher.pk8"))]
+' "$history_compose" > "$invalid_history_compose"
+expect_rejected "a query process with access to the publisher signing key" --compose-contract "$invalid_history_compose"
+jq '(.services["zinder-compat-lightwalletd"].volumes[] | select(.target == "/var/lib/zinder-history")).read_only = false' \
+  "$history_compose" > "$invalid_history_compose"
+expect_rejected "a writer-capable catalog mount in a reader" --compose-contract "$invalid_history_compose"
+jq 'del(.services["zinder-compat-lightwalletd"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
+expect_rejected "a wallet reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
+jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \
+  "$history_compose" > "$invalid_history_compose"
+expect_rejected "a wallet reader using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
 
 indexer_tls_directory="$temporary_directory/indexer-tls"
 mkdir -p "$indexer_tls_directory"
@@ -320,6 +315,9 @@ for deployment_env in "${deployment_env_names[@]}"; do
     --profile observability \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
+  jq -e '.services["zinder-compat-lightwalletd"].ulimits.nofile == {"soft":65536,"hard":65536}' \
+    "$resolved_env_compose" >/dev/null \
+    || fail "the $deployment_env wallet reader does not have the expected soft and hard open-file limits"
   resolved_env_explorer_compose="$temporary_directory/resolved-$deployment_env-explorer-compose.json"
   ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose \
@@ -338,6 +336,8 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and .volumes["node-cookie"].external == true
     and .volumes["node-cookie"].name == $cookie_volume
     and .volumes.data.name == "zinder-\($deploy_network)-data"
+    and any(.services["zinder-history-publisher"].volumes[];
+      .source == "/srv/zinder-history/\($deploy_network)/key-1/publisher.pk8")
     and .services["zinder-ingest"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == ""
     and $json_rpc_addr != ""
     and (.services as $services
