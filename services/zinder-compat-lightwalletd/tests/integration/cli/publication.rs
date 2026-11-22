@@ -91,7 +91,8 @@ async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Resu
 #[tokio::test]
 async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> Result<()> {
     let files = tempfile::tempdir()?;
-    let (private, _) = shielded_catalog_keys(files.path())?;
+    let (private, public) = shielded_catalog_keys(files.path())?;
+    let key = fs::read(public)?;
     let catalog = files.path().join("catalog");
     let scratch = files.path().join("secondary");
     let manifest = catalog.join("current.json");
@@ -120,6 +121,13 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
             .await?
             .success()
     );
+    let paused = signed_segments(&manifest, &key)?;
+    // With more than 77 untouched table files, this generation must read a
+    // retired file during publication, before it can finish and catch up.
+    eyre::ensure!(
+        paused.len() <= 24,
+        "publisher advanced too far before suspension"
+    );
     let generation = fs::read_dir(&scratch)?
         .next()
         .transpose()?
@@ -146,11 +154,38 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
             .try_lock()
             .is_err()
     );
-    let last_good = fs::read(&manifest)?;
-    wait_for_change(&manifest, &last_good).await?;
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let observed = signed_segments(&manifest, &key)?;
+            if observed.last().and_then(|entry| entry["last"].as_u64()) == Some(128) {
+                return Ok::<_, eyre::Report>(observed);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert!(completed.starts_with(&paused));
     assert!(process.try_wait()?.is_none());
     process.kill().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn signed_segments(manifest: &Path, key: &[u8]) -> Result<Vec<serde_json::Value>> {
+    #[derive(serde::Deserialize)]
+    struct SignedCatalog {
+        manifest: String,
+        signature: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Catalog {
+        segments: Vec<serde_json::Value>,
+    }
+    let signed: SignedCatalog = serde_json::from_slice(&fs::read(manifest)?)?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(signed.manifest.as_bytes(), &hex::decode(signed.signature)?)
+        .map_err(|_| eyre::eyre!("invalid publisher signature"))?;
+    Ok(serde_json::from_str::<Catalog>(&signed.manifest)?.segments)
 }
 
 #[cfg(unix)]
