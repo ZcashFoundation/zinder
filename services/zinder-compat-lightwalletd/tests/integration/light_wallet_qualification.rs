@@ -1122,6 +1122,29 @@ async fn a_reread_that_drops_outputs_at_the_cutoff_height_is_unavailable() -> Re
 }
 
 #[tokio::test]
+async fn a_reread_that_changes_an_output_value_is_unavailable() -> Result<()> {
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    // The reread repeats both outpoints at height 2 but values one of them
+    // differently.
+    let mut changed = [(2_u32, "03"), (2, "02")]
+        .map(|(height, id)| address_output(&id.repeat(32), height, &script));
+    changed[1]["satoshis"] = json!(7);
+    let fixture = utxo_cutoff_fixture(utxos_at(served_tip(2)?, &json!(changed)))?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(two_utxos())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted contradictory output values"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_continuation_page_without_chain_info_is_refused() -> Result<()> {
     let fixture = utxo_cutoff_fixture(RpcReply::result(json!([])))?;
     let status = fixture

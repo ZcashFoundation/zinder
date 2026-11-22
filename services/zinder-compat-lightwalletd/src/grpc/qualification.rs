@@ -445,11 +445,7 @@ async fn wallet_ordered_utxos(
     }
     let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
     let mut at_cutoff = rows.len() - before_cutoff;
-    let first_read: Vec<_> = rows[before_cutoff..]
-        .iter()
-        .map(|row| row.outpoint)
-        .collect();
-    rows.truncate(before_cutoff);
+    let first_read = rows.split_off(before_cutoff);
     let mut tail_limit = limit;
     let mut tail = loop {
         if at_cutoff == u32_to_usize(TransparentAddressRowLimit::MAX.get()) {
@@ -471,12 +467,8 @@ async fn wallet_ordered_utxos(
     };
     tail.truncate(tail.partition_point(|row| row.block_height == cutoff));
     // Both reads answer at the served tip, so the reread must repeat the
-    // outputs the first read returned at the cutoff height.
-    let repeats_first_read = tail.len() >= first_read.len()
-        && tail
-            .iter()
-            .zip(&first_read)
-            .all(|(row, outpoint)| row.outpoint == *outpoint);
+    // outputs the first read returned at the cutoff height, value and all.
+    let repeats_first_read = tail.starts_with(&first_read);
     rows.append(&mut tail);
     let distinct = rows
         .iter()
