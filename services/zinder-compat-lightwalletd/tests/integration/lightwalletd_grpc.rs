@@ -4,6 +4,7 @@
 )]
 
 mod browser_streams;
+mod published_range;
 
 use async_trait::async_trait;
 use eyre::eyre;
@@ -758,7 +759,7 @@ async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes()
     )?;
     let canonical_primary_path = writer.canonical_primary_path().to_owned();
     let mut store_fixture = writer.into_serving_store_fixture()?;
-    delete_compact_block_row(&canonical_primary_path, damaged.height)?;
+    damage_compact_block_row(&canonical_primary_path, damaged.height, None)?;
     let (mut canonical, wallet) = store_fixture.take_readers()?;
     canonical.try_catch_up()?;
     let canonical = Arc::new(RocksDbCanonicalReader::new(canonical)?);
@@ -819,11 +820,11 @@ async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes()
     Ok(())
 }
 
-/// Deletes the compact block at `height` from a closed canonical primary,
-/// as store damage would.
-fn delete_compact_block_row(
+/// Removes or overwrites a compact-block row in a closed fixture primary.
+fn damage_compact_block_row(
     canonical_primary_path: &std::path::Path,
     height: BlockHeight,
+    replacement: Option<&[u8]>,
 ) -> eyre::Result<()> {
     let options = rust_rocksdb::Options::default();
     let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
@@ -831,7 +832,11 @@ fn delete_compact_block_row(
     let family = db
         .cf_handle("compact_block")
         .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
-    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    let key = encode_height_key_ascending(height);
+    match replacement {
+        Some(bytes) => db.put_cf(&family, key, bytes)?,
+        None => db.delete_cf(&family, key)?,
+    }
     db.flush_cf(&family)?;
     Ok(())
 }
@@ -2996,7 +3001,7 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 ///
 /// The recorder can also change the chain view it serves while a handler
 /// runs. `visible_tip_block` and `compact_blocks_in_range` answer from view
-/// `n` once `n` compact-block range reads have completed, so view 0 answers
+/// `n` after `n` completed compact-block reads or explicit advances, so view 0 answers
 /// a block-range request and its first chunk, and view `n` answers the
 /// chunk after the `n`th. A pin on any other view's epoch is refused, which
 /// is stricter than production retention and needs no clock.
@@ -3013,7 +3018,8 @@ struct EpochPinRecorder<Inner> {
     synthetic_views: Option<Arc<[SyntheticView]>>,
     /// Real queries that replace `inner` as the served view, in order.
     later_views: Arc<[Inner]>,
-    completed_compact_block_reads: Arc<AtomicUsize>,
+    current_view_index: Arc<AtomicUsize>,
+    replace_before_header: Option<(usize, BlockHeight)>,
     completed_subtree_reads: Arc<AtomicUsize>,
     /// Epoch of the view that answered each successful compact-block range read.
     served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
@@ -3062,7 +3068,8 @@ impl<Inner> EpochPinRecorder<Inner> {
             transparent_address_balance: None,
             synthetic_views: None,
             later_views: Arc::from(Vec::new()),
-            completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
+            current_view_index: Arc::new(AtomicUsize::new(0)),
+            replace_before_header: None,
             completed_subtree_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
@@ -3152,7 +3159,11 @@ impl<Inner> EpochPinRecorder<Inner> {
     }
 
     fn view_index(&self) -> usize {
-        self.completed_compact_block_reads.load(Ordering::SeqCst)
+        self.current_view_index.load(Ordering::SeqCst)
+    }
+
+    fn advance_view(&self) {
+        self.current_view_index.fetch_add(1, Ordering::SeqCst);
     }
 
     fn synthetic_view(&self, view_index: usize) -> Option<SyntheticView> {
@@ -3431,6 +3442,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
         self.record(at_epoch_id);
+        if let BlockSelector::Height(height) = selector
+            && self.replace_before_header == Some((self.view_index(), height))
+        {
+            self.advance_view();
+        }
         let mut header = self
             .served_inner(self.view_index())
             .block_header_by_selector(selector, at_epoch_id)
@@ -3492,8 +3508,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         let view_index = self.view_index();
         let compact_block_range = if let Some(view) = self.synthetic_view(view_index) {
             let chain_epoch = self.visible_tip_block(at_epoch_id).await;
-            self.completed_compact_block_reads
-                .fetch_add(1, Ordering::SeqCst);
+            self.advance_view();
             match chain_epoch {
                 Ok(visible_tip_block) => view
                     .compact_blocks_up_to(block_range, order, max_bytes)
@@ -3509,8 +3524,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
                 .served_inner(view_index)
                 .compact_blocks_in_range_up_to(block_range, order, max_bytes, at_epoch_id)
                 .await;
-            self.completed_compact_block_reads
-                .fetch_add(1, Ordering::SeqCst);
+            self.advance_view();
             served
         };
         // Record the heights a read kept, or the requested ones when it failed.

@@ -66,6 +66,7 @@ impl CompatServing {
 pub(crate) struct LightwalletdConfig {
     pub(crate) network: Network,
     pub(crate) serving: CompatServing,
+    pub(crate) shielded_history: Option<ShieldedHistorySection>,
     pub(crate) storage: ResolvedCanonicalSecondaryStorage,
     pub(crate) wallet_primary_path: Option<PathBuf>,
     pub(crate) wallet_secondary_root: Option<PathBuf>,
@@ -121,6 +122,9 @@ pub(crate) struct LightwalletdConfigOverrides {
 /// Error returned while resolving lightwalletd compat config or running its gRPC server.
 #[derive(Debug, Error)]
 pub(crate) enum LightwalletdConfigError {
+    #[error("shielded history publication failed: {0}")]
+    ShieldedHistory(#[from] std::io::Error),
+
     #[error(transparent)]
     Config(#[from] ConfigError),
 
@@ -250,6 +254,7 @@ struct LightwalletdRawConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CompatSection {
+    shielded_history: Option<ShieldedHistorySection>,
     listen_addr: Option<String>,
     #[serde(deserialize_with = "deserialize_browser_origins")]
     browser_origins: Vec<HeaderValue>,
@@ -262,6 +267,15 @@ struct CompatSection {
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
     trust_proxy_client_address: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShieldedHistorySection {
+    pub(crate) manifest: PathBuf,
+    pub(crate) publisher_key: PathBuf,
+    #[serde(default)]
+    pub(crate) require_fs_verity: bool,
 }
 
 fn deserialize_browser_origins<'de, D>(deserializer: D) -> Result<Vec<HeaderValue>, D::Error>
@@ -384,6 +398,7 @@ fn resolve_lightwalletd_config(
         ingest_control_bearer_token,
         listen_addr,
         browser_origins: config.compat.browser_origins,
+        shielded_history: config.compat.shielded_history,
         ops_listen_addr,
         allow_public_bind,
         client_address_source: ClientAddressSource::from_trust_proxy_client_address(
@@ -506,6 +521,7 @@ impl LightwalletdConfigToml {
                 config.ingest_control_bearer_token_path.as_deref(),
             ),
             compat: CompatToml {
+                shielded_history: config.shielded_history.clone(),
                 listen_addr: config.listen_addr.to_string(),
                 browser_origins: config
                     .browser_origins
@@ -538,6 +554,8 @@ impl LightwalletdConfigToml {
 
 #[derive(Serialize)]
 struct CompatToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shielded_history: Option<ShieldedHistorySection>,
     listen_addr: String,
     browser_origins: Vec<String>,
     reorg_window_blocks: u32,

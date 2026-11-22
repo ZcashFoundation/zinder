@@ -162,6 +162,35 @@ The adapter holds at most two chunks of a stream: the one it is handing to the g
 
 The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd v0.6.2 limits block-range requests with `--max-concurrent-blockrange`, 200 by default.
 
+#### Signed settled history
+
+Both serving modes can serve the default shielded `GetBlockRange` projection from a signed catalog. The operator publishes the lightwalletd protobuf once per settled block. For a covered chunk, the reader checks that the current view still retains its lowest height, then skips the canonical compact-block read and conversion. Each stream keeps the catalog it opened. Chunks that cross either edge of coverage, live chunks, and other pool selections use the ordinary canonical read. The same byte budget, order, stream slots, and reorg checks apply in both directions.
+
+To publish, use a reader configuration that matches the READY canonical store and an Ed25519 private key in DER PKCS#8 format. To publish all retained history, start at height 1 for a complete store. For a checkpointed store, start at its first retained height, one above the checkpoint. Keep the signing key outside the catalog directory.
+
+```sh
+zinder-compat-lightwalletd --config reader.toml publish-shielded-history \
+  --directory /srv/zinder/published-history --signing-key /etc/zinder/publisher.pk8 \
+  --first-height 1 --segment-blocks 4096
+```
+
+The command opens a temporary canonical secondary, appends complete segments through its captured settled tip, and exits. Rerun it as settlement advances. One publisher holds the directory lock. On each restart it reads the existing segments to verify their contents and links before appending. Allow for that I/O when scheduling publication. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication. The shorter unsettled or incomplete suffix continues to use canonical reads.
+
+Install the raw 32-byte Ed25519 public key on the reader through a trusted channel. Copy the referenced `segment-*.bin` files to the reader before atomically installing their signed `current.json`. The reader process needs read access to these files. Enable the catalog in the listener's configuration:
+
+```toml
+[compat.shielded_history]
+manifest = "/srv/zinder/wallet-history/current.json"
+publisher_key = "/etc/zinder/publisher.pub"
+require_fs_verity = false
+```
+
+Before binding the listener, the reader authenticates the catalog and reads each segment twice on the same file descriptor. The first pass verifies the signed SHA-256. It records the row lengths and, for ordinary files, a SHA-256 digest for each payload. The second pass checks the row lengths again. Before decoding each block and validating its links, the reader verifies the digest of the payload buffer or relies on fs-verity to verify the read. The reader then checks retained coverage and the settled anchor against the canonical reader. After admission it keeps an offset index and one open file per segment.
+
+A running reader checks for changes at the secondary catch-up interval. It reuses the verified prefix and admits new segments only after their files and chain anchor validate. A rejected update leaves the previous catalog active and is retried. A restarted reader accepts any correctly signed catalog that matches its retained settled chain. An older valid catalog gives it less coverage. Restart the listener to change the trusted key.
+
+By default, each read of an ordinary file checks the selected payloads against the digests captured during admission. To require kernel-verified reads, use a verity-enabled ext4, F2FS, or Btrfs filesystem on Linux. Run `fsverity enable` on each destination segment before publishing the manifest, then set `require_fs_verity = true`. A regular copy loses the verity attribute. The reader checks the attribute on the same descriptor used for the signed digest scan and later reads. An unprotected segment fails strict admission. A payload digest mismatch or a protected page read failure ends the affected covered stream with `DATA_LOSS`. [Linux fs-verity](https://docs.kernel.org/filesystems/fsverity.html)
+
 ### `GetTreeState` and `GetLatestTreeState`
 
 `GetTreeState` answers retained heights at or after Sapling activation from Zinder's store, where lightwalletd asks its node. Before activation it returns `INVALID_ARGUMENT`, matching Go lightwalletd v0.6.2, for both height and hash requests. Native WalletQuery tree-state reads still return pre-activation states with inactive pools absent. A positive `height` takes precedence and ignores `hash`. With `height = 0`, send the 32 bytes obtained by hex-decoding `TreeState.hash` in RPC byte order. A wallet starting from `CompactBlock.prevHash` reverses those bytes once to request the predecessor’s tree state. A hash outside the best chain and a height above the visible tip both return `INVALID_ARGUMENT`, matching lightwalletd's status for a failed `z_gettreestate` lookup. A refused rebuild returns `UNAVAILABLE`. Other height lookup statuses follow [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots).

@@ -126,6 +126,18 @@ impl CompactBlockReads for CanonicalReaderSlot {
         }
     }
 
+    async fn block_hash_at(
+        &self,
+        view: &Self::View,
+        height: zinder_core::BlockHeight,
+    ) -> Result<zinder_core::BlockHash, Status> {
+        view.block_header_at(height)
+            .await
+            .map_err(storage_status)?
+            .map(|row| row.block_hash)
+            .ok_or_else(|| Status::failed_precondition("missing settled shielded range anchor"))
+    }
+
     async fn read_compact_block_chunk<Output, Convert>(
         &self,
         read: ChunkRead<Arc<RocksDbCanonicalReader>>,
@@ -205,10 +217,21 @@ fn storage_status(error: StorageReadError) -> Status {
 pub struct CompactBlocksGrpcAdapter {
     slot: CanonicalReaderSlot,
     block_methods: BlockMethods,
+    published_history: Option<Arc<crate::PublishedShieldedHistory>>,
     ping: LightwalletdPing,
 }
 
 impl CompactBlocksGrpcAdapter {
+    /// Serves matching settled shielded ranges from the history admitted for each request.
+    #[must_use]
+    pub fn with_published_shielded_history(
+        mut self,
+        history: Arc<crate::PublishedShieldedHistory>,
+    ) -> Self {
+        self.published_history = Some(history);
+        self
+    }
+
     /// Creates an adapter that serves the reader `slot` serves at each
     /// request.
     #[must_use]
@@ -216,6 +239,7 @@ impl CompactBlocksGrpcAdapter {
         Self {
             slot,
             block_methods: BlockMethods::default(),
+            published_history: None,
             ping: LightwalletdPing::default(),
         }
     }
@@ -293,7 +317,31 @@ fn unsupported(method: &'static str) -> Status {
 }
 
 #[tonic::async_trait]
+impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let range = self
+            .published_history
+            .as_ref()
+            .map(|history| history.catalog())
+            .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
+        self.block_methods
+            .published_block_range(&self.slot, &request.into_inner(), range)
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter {
+    fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        self.published_history
+            .as_ref()
+            .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
+    }
+
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
     type GetBlockRangeNullifiersStream = GrpcStream<lightwalletd::CompactBlock>;
     type GetTaddressTxidsStream = GrpcStream<lightwalletd::RawTransaction>;

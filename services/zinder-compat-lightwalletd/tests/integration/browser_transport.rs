@@ -1,3 +1,5 @@
+mod published_range;
+
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -295,8 +297,9 @@ struct CompatProcess {
     addr: SocketAddr,
     _child: tokio::process::Child,
     control: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
-    _storage: tempfile::TempDir,
-    _writer: CanonicalWriterFixture,
+    storage: tempfile::TempDir,
+    writer: CanonicalWriterFixture,
+    writer_control: MutableCanonicalControl,
 }
 
 impl Drop for CompatProcess {
@@ -307,6 +310,14 @@ impl Drop for CompatProcess {
 
 impl CompatProcess {
     async fn start(serving: &str, origin: Option<&str>) -> Result<Self> {
+        Self::start_with_history(serving, origin, "").await
+    }
+
+    async fn start_with_history(
+        serving: &str,
+        origin: Option<&str>,
+        history: &str,
+    ) -> Result<Self> {
         let network = Network::ZcashRegtest;
         let storage = tempfile::tempdir()?;
         let chain = ChainFixture::new(network)
@@ -329,14 +340,16 @@ impl CompatProcess {
         );
         let control_listener = TcpListener::bind("127.0.0.1:0").await?;
         let control_addr = control_listener.local_addr()?;
+        let control_service = MutableCanonicalControl {
+            status: Arc::new(Mutex::new(status)),
+        };
+        let writer_control = control_service.clone();
         let control = tokio::spawn(async move {
             Server::builder()
                 .add_service(IngestControlServer::new(IngestControlFixtureService::new(
                     network,
                 )))
-                .add_service(CanonicalControlServer::new(MutableCanonicalControl {
-                    status: Arc::new(Mutex::new(status)),
-                }))
+                .add_service(CanonicalControlServer::new(control_service))
                 .serve_with_incoming(TcpListenerStream::new(control_listener))
                 .await
         });
@@ -364,6 +377,7 @@ listen_addr = "127.0.0.1:0"
 reorg_window_blocks = 100
 stale_tip_limit_ms = 0
 {origin_setting}
+{history}
 "#,
                 writer.canonical_primary_path().display(),
                 storage.path().join("canonical-reader").display(),
@@ -376,8 +390,9 @@ stale_tip_limit_ms = 0
             addr,
             _child: child,
             control,
-            _storage: storage,
-            _writer: writer,
+            storage,
+            writer,
+            writer_control,
         })
     }
 
@@ -386,7 +401,15 @@ stale_tip_limit_ms = 0
     }
 
     async fn native_client(&self) -> Result<CompactTxStreamerClient<Channel>> {
-        Ok(CompactTxStreamerClient::connect(format!("http://{}", self.addr)).await?)
+        CompactTxStreamerClient::connect(format!("http://{}", self.addr))
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "compat listener for {} failed to connect: {}",
+                    self.writer.canonical_primary_path().display(),
+                    fs::read_to_string(self.storage.path().join("compat.log")).unwrap_or_default()
+                )
+            })
     }
 
     async fn post(&self, http: &Client, method: &str, message: impl Message) -> Result<Response> {

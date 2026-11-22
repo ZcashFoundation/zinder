@@ -767,6 +767,24 @@ impl ReorgEndingCause {
     }
 }
 
+pub(crate) trait RangeBlock {
+    fn height(&self) -> BlockHeight;
+    fn block_hash(&self) -> BlockHash;
+    fn previous_block_hash(&self) -> BlockHash;
+}
+
+impl RangeBlock for CompactBlockArtifact {
+    fn height(&self) -> BlockHeight {
+        self.height()
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash()
+    }
+    fn previous_block_hash(&self) -> BlockHash {
+        self.previous_block_hash()
+    }
+}
+
 impl BlockRangeContinuity {
     /// Returns the continuity after the stream's first chunk.
     ///
@@ -781,7 +799,7 @@ impl BlockRangeContinuity {
     /// least one block or fails, so an empty chunk means the store broke that
     /// contract.
     pub(crate) fn after_first_chunk(
-        blocks: &[CompactBlockArtifact],
+        blocks: &[impl RangeBlock],
         chain_epoch_id: ChainEpochId,
         is_descending: bool,
     ) -> Result<Self, Status> {
@@ -832,7 +850,7 @@ impl BlockRangeContinuity {
         &self,
         next_chunk: BlockHeightRange,
         read_at: ChainEpochId,
-        blocks: &[CompactBlockArtifact],
+        blocks: &[impl RangeBlock],
     ) -> ChunkLink {
         let continued = if self.is_continued_by(blocks) {
             Self::after_first_chunk(blocks, read_at, self.is_descending).ok()
@@ -879,7 +897,7 @@ impl BlockRangeContinuity {
         Ok(())
     }
 
-    fn is_continued_by(&self, blocks: &[CompactBlockArtifact]) -> bool {
+    fn is_continued_by(&self, blocks: &[impl RangeBlock]) -> bool {
         if self.is_descending {
             blocks.last().is_some_and(|next| {
                 next.height().next() == Some(self.last_sent_height)
@@ -1158,7 +1176,11 @@ mod tests {
 
     #[test]
     fn an_empty_first_chunk_is_unavailable() {
-        let outcome = BlockRangeContinuity::after_first_chunk(&[], SENT_EPOCH, false);
+        let outcome = BlockRangeContinuity::after_first_chunk(
+            &[] as &[CompactBlockArtifact],
+            SENT_EPOCH,
+            false,
+        );
         assert_eq!(
             outcome.err().map(|status| status.code()),
             Some(Code::Unavailable)
