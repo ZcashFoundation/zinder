@@ -67,9 +67,9 @@ own address index. The light-wallet qualification build uses these lookups.
 | --- | --- | --- |
 | `fetch_transparent_address_balance` | `getaddressbalance` | Unspent balance and total received |
 | `fetch_transparent_address_transaction_ids` | `getaddresstxids` | Transaction ids in a height range, in chain order |
-| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order |
+| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order, and the tip the node answered at |
 | `fetch_transparent_address_utxo_prefix` | `getaddressutxos` | The first `max_rows` unspent outputs at or above a height, in chain order |
-| `fetch_transparent_address_utxo_page` | `getaddressutxos` | A chain-ordered prefix, including extra rows the node supplied, and whether it covers every match |
+| `fetch_transparent_address_utxo_page` | `getaddressutxos` | A chain-ordered prefix, including extra rows the node supplied, whether it covers every match, and the tip the node answered at |
 
 Every method takes a `TransparentAddressLookup`: 1 to 10,000 distinct
 addresses of the source's network. TEX addresses are refused, because the
@@ -107,6 +107,10 @@ differently, and the source gives both the same result:
   prefix. The page method retains extra matching rows up to the same
   100,000-row cap, so callers can use rows Zakura has already sent. A page
   that reaches the local cap with more matching rows is incomplete.
+- **Answer tip.** Every `getaddressutxos` request sets `chainInfo`, and both
+  nodes then return the hash and height of the tip the outputs describe. The
+  source returns that tip with the outputs, so a caller can bind the answer
+  to a chain view. `getaddressbalance` has no such field on either node.
 - **Response size.** An answer above `node.max_response_bytes` is reported as
   `SourceResponseTooLarge`. Zakura's unspent-output answer counts in full,
   even for a prefix or a high start height. Either node answers JSON-RPC error

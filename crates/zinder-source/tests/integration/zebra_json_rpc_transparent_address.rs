@@ -9,7 +9,10 @@ use eyre::eyre;
 use serde_json::{Value, json};
 use zebra_chain::parameters::NetworkKind as ZebraNetworkKind;
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
-use zinder_core::{BlockHeight, Network, TransactionId, TransparentOutPoint};
+use zinder_core::{
+    BlockHeight, BlockId, Network, TransactionId, TransparentOutPoint,
+    wire::decode_rpc_block_hash_hex,
+};
 use zinder_source::{
     CookieSource, NodeAuth, SourceError, SourceFailureClass, SourceTransparentAddressBalance,
     TransparentAddressLookup, TransparentAddressRowLimit, ZebraJsonRpcSource,
@@ -85,6 +88,11 @@ fn p2pkh_script_hex() -> String {
 const NODE_MISC_ERROR_CODE: i64 = -1;
 
 const NODE_RESPONSE_TOO_LARGE_CODE: i64 = -32_008;
+
+/// Wraps `rows` in the `getaddressutxos` reply both nodes give for `chainInfo`.
+fn utxos_at_tip(rows: &Value) -> Value {
+    json!({"utxos": rows, "hash": "ab".repeat(32), "height": 9})
+}
 
 fn utxo_row(height: u32, txid_byte: u8, output_index: u32) -> Value {
     json!({
@@ -386,7 +394,7 @@ async fn transparent_address_utxos_ask_for_the_complete_set_and_refuse_a_capped_
                 "more than 100000 unspent outputs match; page with startHeight and maxEntries",
             )
         } else {
-            RpcReply::result(json!([utxo_row(4, 6, 0), utxo_row(7, 7, 1)]))
+            RpcReply::result(utxos_at_tip(&json!([utxo_row(4, 6, 0), utxo_row(7, 7, 1)])))
         }
     })])?;
     let source = regtest_source(server.url())?;
@@ -409,30 +417,32 @@ async fn transparent_address_utxos_ask_for_the_complete_set_and_refuse_a_capped_
     );
     assert_eq!(
         server.requests_for("getaddressutxos")?[0].params,
-        json!([{ "addresses": sorted_addresses(), "startHeight": 4, "maxEntries": 0 }])
+        json!([{ "addresses": sorted_addresses(), "startHeight": 4, "maxEntries": 0, "chainInfo": true }])
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn transparent_address_utxos_return_every_output_at_or_above_the_start_height()
+async fn transparent_address_utxos_return_every_output_at_or_above_the_start_height_and_their_tip()
 -> eyre::Result<()> {
     // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
     // unspent output in chain order.
-    let server =
-        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
+        utxos_at_tip(&json!([
             utxo_row(2, 1, 0),
             utxo_row(5, 2, 0),
             utxo_row(5, 2, 1),
             utxo_row(6, 3, 0),
-        ])))])?;
+        ])),
+    ))])?;
     let source = regtest_source(server.url())?;
 
     let utxos = source
         .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(5))
         .await?;
 
-    let outpoints: Vec<TransparentOutPoint> = utxos.iter().map(|output| output.outpoint).collect();
+    let outpoints: Vec<TransparentOutPoint> =
+        utxos.outputs.iter().map(|output| output.outpoint).collect();
     assert_eq!(
         outpoints,
         [
@@ -441,17 +451,22 @@ async fn transparent_address_utxos_return_every_output_at_or_above_the_start_hei
             TransparentOutPoint::new(transaction_id(3), 0),
         ]
     );
+    assert_eq!(
+        utxos.tip,
+        BlockId::new(
+            BlockHeight::new(9),
+            decode_rpc_block_hash_hex(&"ab".repeat(32))?
+        )
+    );
     assert_eq!(utxo_requests_max_entries(&server)?, [json!(0)]);
     Ok(())
 }
 
 #[tokio::test]
 async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
-            utxo_row(4, 6, 0),
-            utxo_row(7, 7, 1)
-        ])))])?;
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
+        utxos_at_tip(&json!([utxo_row(4, 6, 0), utxo_row(7, 7, 1)])),
+    ))])?;
     let source = regtest_source(server.url())?;
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
@@ -461,7 +476,7 @@ async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> 
 
     assert_eq!(
         server.requests_for("getaddressutxos")?[0].params,
-        json!([{ "addresses": sorted_addresses(), "startHeight": 4, "maxEntries": 2 }])
+        json!([{ "addresses": sorted_addresses(), "startHeight": 4, "maxEntries": 2, "chainInfo": true }])
     );
     assert_eq!(utxos.len(), 2);
     let first = utxos.first().ok_or_else(|| eyre!("expected an output"))?;
@@ -480,13 +495,14 @@ async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> 
 async fn transparent_address_utxo_prefix_bounds_a_node_that_ignores_paging() -> eyre::Result<()> {
     // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
     // unspent output in chain order.
-    let server =
-        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
+        utxos_at_tip(&json!([
             utxo_row(2, 1, 0),
             utxo_row(5, 2, 0),
             utxo_row(5, 2, 1),
             utxo_row(6, 3, 0),
-        ])))])?;
+        ])),
+    ))])?;
     let source = regtest_source(server.url())?;
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
@@ -510,8 +526,12 @@ async fn transparent_address_utxos_refuse_an_output_of_an_address_outside_the_lo
 -> eyre::Result<()> {
     let mut foreign_row = utxo_row(6, 3, 0);
     foreign_row["address"] = json!(testnet_address(9).to_string());
-    let server = JsonRpcTestServer::start([method("getaddressutxos")
-        .reply_with(move |_| RpcReply::result(json!([utxo_row(5, 2, 0), foreign_row.clone()])))])?;
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply_with(move |_| {
+        RpcReply::result(utxos_at_tip(&json!([
+            utxo_row(5, 2, 0),
+            foreign_row.clone()
+        ])))
+    })])?;
     let source = regtest_source(server.url())?;
     let lookup = regtest_lookup()?;
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
@@ -771,7 +791,7 @@ async fn transparent_address_utxos_refuse_a_script_that_does_not_pay_the_row_add
 
     for row in [op_return_row, other_recipient_row] {
         let server = JsonRpcTestServer::start([
-            method("getaddressutxos").reply(RpcReply::result(json!([row])))
+            method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([row]))))
         ])?;
         let error = regtest_source(server.url())?
             .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
@@ -794,11 +814,9 @@ async fn transparent_address_utxos_refuse_a_script_that_does_not_pay_the_row_add
 
 #[tokio::test]
 async fn transparent_address_utxos_refuse_a_repeated_outpoint() -> eyre::Result<()> {
-    let server =
-        JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(json!([
-            utxo_row(5, 2, 0),
-            utxo_row(5, 2, 0)
-        ])))])?;
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
+        utxos_at_tip(&json!([utxo_row(5, 2, 0), utxo_row(5, 2, 0)])),
+    ))])?;
     let source = regtest_source(server.url())?;
 
     let error = source
@@ -825,7 +843,8 @@ async fn transparent_address_answers_of_another_shape_are_protocol_mismatches() 
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddressbalance").reply(RpcReply::result(json!({ "balance": 7 }))),
         method("getaddresstxids").reply(RpcReply::result(json!({ "txids": [] }))),
-        method("getaddressutxos").reply(RpcReply::result(json!([row_without_script]))),
+        method("getaddressutxos")
+            .reply(RpcReply::result(utxos_at_tip(&json!([row_without_script])))),
     ])?;
     let source = regtest_source(server.url())?;
     let lookup = regtest_lookup()?;
@@ -873,10 +892,9 @@ async fn transparent_address_utxos_reject_a_positional_row() -> eyre::Result<()>
         1_005,
         5
     ]);
-    let server =
-        JsonRpcTestServer::start(
-            [method("getaddressutxos").reply(RpcReply::result(json!([row])))],
-        )?;
+    let server = JsonRpcTestServer::start([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([row]))))
+    ])?;
     let outputs = regtest_source(server.url())?
         .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
         .await;

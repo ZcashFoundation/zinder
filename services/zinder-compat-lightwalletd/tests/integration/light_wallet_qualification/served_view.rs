@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use eyre::{Result, eyre};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request, Status};
 use tonic_types::StatusExt as _;
@@ -22,54 +22,54 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_testkit::{ChainFixture, FixtureTransactionRows, JsonRpcStub, RpcReply, method};
 
-use super::{ADDRESS, Fixture, balance_request, history_request};
+use super::{ADDRESS, Fixture, address_output, balance_request, history_request, utxos_at};
 
 /// Served by the reader at height 1.
 const SERVED: TransactionId = TransactionId::from_bytes([0x55; 32]);
-/// Mined only in the node's block above the served tip.
+/// Mined only in the node's block 3, above the served tip.
 const ABOVE: TransactionId = TransactionId::from_bytes([0x66; 32]);
+const ABOVE_TIP: BlockId = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([0x33; 32]));
 
 /// The node's best chain and the address activity it indexes on it: block 1
-/// pays [`ADDRESS`] in [`SERVED`] and, while `touched` is set, block 3 pays
-/// it in [`ABOVE`].
+/// pays [`ADDRESS`] in [`SERVED`], and block 3, held while `ahead` is set,
+/// pays it in [`ABOVE`].
 struct NodeChain {
-    blocks: Vec<BlockId>,
-    touched: Arc<AtomicBool>,
+    served: Vec<BlockId>,
+    ahead: AtomicBool,
 }
 
 impl NodeChain {
+    fn blocks(&self) -> Vec<BlockId> {
+        let mut blocks = self.served.clone();
+        if self.ahead.load(Ordering::Acquire) {
+            blocks.push(ABOVE_TIP);
+        }
+        blocks
+    }
+
+    fn tip(&self) -> BlockId {
+        self.blocks().last().copied().unwrap_or(ABOVE_TIP)
+    }
+
     fn hash_at(&self, height: u64) -> Option<BlockHash> {
-        self.blocks
-            .iter()
+        self.blocks()
+            .into_iter()
             .find(|block| u64::from(block.height.value()) == height)
             .map(|block| block.hash)
     }
 
-    fn mined_height(&self, id: &Value) -> Option<u32> {
+    fn indexed(&self) -> Vec<(TransactionId, u32)> {
         [(SERVED, 1), (ABOVE, 3)]
             .into_iter()
-            .find(|(txid, _)| *id == encode_rpc_transaction_id_hex(*txid))
-            .map(|(_, height)| height)
-            .filter(|height| self.hash_at(u64::from(*height)).is_some())
+            .filter(|(_, height)| self.hash_at(u64::from(*height)).is_some())
+            .collect()
     }
 
-    fn indexed(&self) -> Vec<(TransactionId, u64)> {
-        let mut rows = vec![(SERVED, 1)];
-        if self.touched.load(Ordering::Acquire) && self.hash_at(3).is_some() {
-            rows.push((ABOVE, 3));
-        }
-        rows
-    }
-
-    fn chain_stubs(self: &Arc<Self>) -> Result<[JsonRpcStub; 3]> {
-        let tip = self
-            .blocks
-            .last()
-            .copied()
-            .ok_or_else(|| eyre!("empty node chain"))?;
-        let (hashes, transactions) = (Arc::clone(self), Arc::clone(self));
-        Ok([
+    fn chain_stubs(self: &Arc<Self>) -> [JsonRpcStub; 3] {
+        let (tips, hashes, transactions) = (Arc::clone(self), Arc::clone(self), Arc::clone(self));
+        [
             method("getbestblockheightandhash").reply_with(move |_| {
+                let tip = tips.tip();
                 RpcReply::result(json!({"height": tip.height.value(), "hash": tip.hash.as_bytes()}))
             }),
             method("getblockhash").reply_with(move |params| {
@@ -82,7 +82,11 @@ impl NodeChain {
                     )
             }),
             method("getrawtransaction").reply_with(move |params| {
-                let Some(height) = transactions.mined_height(&params[0]) else {
+                let mined = transactions
+                    .indexed()
+                    .into_iter()
+                    .find(|(txid, _)| params[0] == encode_rpc_transaction_id_hex(*txid));
+                let Some((_, height)) = mined else {
                     return RpcReply::error_with_code(
                         -5,
                         "No such mempool or main chain transaction",
@@ -101,31 +105,26 @@ impl NodeChain {
                     "blockhash": encode_rpc_block_hash_hex(hash),
                 }))
             }),
-        ])
+        ]
     }
 
-    fn address_stubs(self: &Arc<Self>) -> Result<[JsonRpcStub; 3]> {
+    fn address_stubs(self: &Arc<Self>) -> Result<[JsonRpcStub; 2]> {
         let script = hex::encode(
             zinder_source::parse_transparent_address(ADDRESS)?
                 .script()
                 .as_raw_bytes(),
         );
-        let (balance, utxos, history) = (Arc::clone(self), Arc::clone(self), Arc::clone(self));
+        let (utxos, history) = (Arc::clone(self), Arc::clone(self));
         Ok([
-            method("getaddressbalance").reply_with(move |_| {
-                let zatoshis = balance.indexed().len();
-                RpcReply::result(json!({"balance": zatoshis, "received": zatoshis}))
-            }),
             method("getaddressutxos").reply_with(move |_| {
                 let rows: Vec<_> = utxos
                     .indexed()
                     .into_iter()
                     .map(|(txid, height)| {
-                        json!({"address": ADDRESS, "txid": encode_rpc_transaction_id_hex(txid),
-                        "outputIndex": 0, "script": script, "satoshis": 1, "height": height})
+                        address_output(&encode_rpc_transaction_id_hex(txid), height, &script)
                     })
                     .collect();
-                RpcReply::result(json!(rows))
+                utxos_at(utxos.tip(), &json!(rows))
             }),
             method("getaddresstxids").reply_with(move |params| {
                 let start = params[0]["start"].as_u64().unwrap_or_default();
@@ -133,7 +132,7 @@ impl NodeChain {
                 let ids: Vec<_> = history
                     .indexed()
                     .into_iter()
-                    .filter(|(_, height)| (start..=end).contains(height))
+                    .filter(|(_, height)| (start..=end).contains(&u64::from(*height)))
                     .map(|(txid, _)| encode_rpc_transaction_id_hex(txid))
                     .collect();
                 RpcReply::result(json!(ids))
@@ -142,34 +141,42 @@ impl NodeChain {
     }
 }
 
-/// Serves a two-block chain whose block 1 mines [`SERVED`], with a node whose
-/// best chain `node_chain` derives from the served blocks.
+/// Serves a two-block chain whose block 1 mines [`SERVED`]. The node holds
+/// the served blocks after `fork` rewrites them, plus [`ABOVE_TIP`] while
+/// `ahead` is set. `overrides` replace the node's scripted replies.
 fn served_view_fixture(
-    node_chain: impl FnOnce(Vec<BlockId>) -> Vec<BlockId>,
-    touched: Arc<AtomicBool>,
-) -> Result<Fixture> {
+    fork: impl FnOnce(&mut Vec<BlockId>),
+    ahead: bool,
+    overrides: impl IntoIterator<Item = JsonRpcStub>,
+) -> Result<(Fixture, Arc<NodeChain>)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let first = chain
         .blocks()
         .first()
         .ok_or_else(|| eyre!("missing block"))?;
     let rows = FixtureTransactionRows::coinbase(SERVED, first.height, first.hash, vec![0x55]);
-    let served = chain
+    let mut served = chain
         .blocks()
         .iter()
         .map(|block| BlockId::new(block.height, block.hash))
         .collect();
+    fork(&mut served);
     let node = Arc::new(NodeChain {
-        blocks: node_chain(served),
-        touched,
+        served,
+        ahead: AtomicBool::new(ahead),
     });
-    let replies = node.chain_stubs()?.into_iter().chain(node.address_stubs()?);
-    Fixture::from_chain(
+    let replies = node
+        .chain_stubs()
+        .into_iter()
+        .chain(node.address_stubs()?)
+        .chain(overrides);
+    let fixture = Fixture::from_chain(
         &chain.with_transaction_rows(rows),
         &super::one_upgrade_per_height()?,
         replies,
         std::time::Duration::from_secs(2),
-    )
+    )?;
+    Ok((fixture, node))
 }
 
 fn transaction(id: TransactionId) -> Request<lightwalletd::TxFilter> {
@@ -239,19 +246,25 @@ async fn utxo_heights(fixture: &Fixture) -> Result<(Vec<u64>, Vec<u64>)> {
     Ok((unary, streamed))
 }
 
+async fn address_state_unavailable(fixture: &Fixture) -> Result<()> {
+    node_unavailable(
+        fixture
+            .adapter
+            .get_taddress_balance(balance_request())
+            .await,
+    )?;
+    node_unavailable(fixture.adapter.get_address_utxos(utxo_request()).await)?;
+    node_unavailable(
+        fixture
+            .adapter
+            .get_address_utxos_stream(utxo_request())
+            .await,
+    )
+}
+
 #[tokio::test]
 async fn a_node_one_block_ahead_answers_only_for_the_served_tip() -> Result<()> {
-    let touched = Arc::new(AtomicBool::new(true));
-    let fixture = served_view_fixture(
-        |mut served| {
-            served.push(BlockId::new(
-                BlockHeight::new(3),
-                BlockHash::from_bytes([0x33; 32]),
-            ));
-            served
-        },
-        Arc::clone(&touched),
-    )?;
+    let (fixture, node) = served_view_fixture(|_| {}, true, [])?;
 
     // The full-wallet control serves the view at height 2: SERVED is mined at
     // height 1, ABOVE is not mined, and ADDRESS holds one output at height 1.
@@ -272,25 +285,11 @@ async fn a_node_one_block_ahead_answers_only_for_the_served_tip() -> Result<()> 
         assert_eq!(history_heights(&fixture, txids).await?, [1]);
     }
 
-    // Block 3 pays ADDRESS, so the node's balance and outputs describe a later
-    // chain state than the view.
-    node_unavailable(
-        fixture
-            .adapter
-            .get_taddress_balance(balance_request())
-            .await,
-    )?;
-    node_unavailable(fixture.adapter.get_address_utxos(utxo_request()).await)?;
-    node_unavailable(
-        fixture
-            .adapter
-            .get_address_utxos_stream(utxo_request())
-            .await,
-    )?;
+    // The node answers address state at its own tip, which the view lacks.
+    address_state_unavailable(&fixture).await?;
 
-    // Once no block above the view touches ADDRESS, the node's answer is the
-    // view's answer.
-    touched.store(false, Ordering::Release);
+    // Once the node's tip is the served tip, its answers are the view's.
+    node.ahead.store(false, Ordering::Release);
     assert_eq!(
         fixture
             .adapter
@@ -312,33 +311,40 @@ async fn a_node_one_block_ahead_answers_only_for_the_served_tip() -> Result<()> 
 }
 
 #[tokio::test]
+async fn address_state_from_a_tip_the_node_left_and_regained_is_unavailable() -> Result<()> {
+    // Tip reads keep reporting the served tip, but the node answers address
+    // lookups at block 3, as it would when it moved there and back.
+    let served_tip = super::served_tip(2)?;
+    let (fixture, _) = served_view_fixture(
+        |_| {},
+        true,
+        [method("getbestblockheightandhash").reply_with(move |_| {
+            RpcReply::result(
+                json!({"height": served_tip.height.value(), "hash": served_tip.hash.as_bytes()}),
+            )
+        })],
+    )?;
+    address_state_unavailable(&fixture).await?;
+    assert!(fixture.node.requests_for("getaddressbalance")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_node_on_another_chain_at_the_served_height_is_unavailable() -> Result<()> {
-    let fixture = served_view_fixture(
-        |mut served| {
+    let (fixture, _) = served_view_fixture(
+        |served| {
             if let Some(tip) = served.last_mut() {
                 tip.hash = BlockHash::from_bytes([0xdd; 32]);
             }
-            served
         },
-        Arc::new(AtomicBool::new(false)),
+        false,
+        [],
     )?;
     let missing = TransactionId::from_bytes([3; 32]);
     for id in [SERVED, ABOVE, missing] {
         node_unavailable(fixture.adapter.get_transaction(transaction(id)).await)?;
     }
-    node_unavailable(
-        fixture
-            .adapter
-            .get_taddress_balance(balance_request())
-            .await,
-    )?;
-    node_unavailable(fixture.adapter.get_address_utxos(utxo_request()).await)?;
-    node_unavailable(
-        fixture
-            .adapter
-            .get_address_utxos_stream(utxo_request())
-            .await,
-    )?;
+    address_state_unavailable(&fixture).await?;
     node_unavailable(
         fixture
             .adapter

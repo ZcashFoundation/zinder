@@ -15,7 +15,7 @@ use zebra_chain::amount::Amount;
 use zebra_chain::transparent::{
     Address as ZebraTransparentAddress, Output as ZebraTransparentOutput, Script as ZebraScript,
 };
-use zinder_core::{BlockHeight, Network, TransactionId, TransparentOutPoint};
+use zinder_core::{BlockHeight, BlockId, Network, TransactionId, TransparentOutPoint};
 
 use crate::source_block::wire_error_to_transaction_id_error;
 use crate::{SourceError, parse_transparent_address, transparent_address_matches_network};
@@ -248,6 +248,14 @@ pub struct SourceTransparentUtxoPage {
     /// True when the reply proves these are all matches at or above the requested height.
     /// A prefix that fills the node's requested limit can leave completeness unknown.
     pub complete: bool,
+    /// The best-chain tip the node reports answering at.
+    pub tip: BlockId,
+}
+
+/// Decoded `getaddressutxos` rows, before the reply's tip is attached.
+pub(crate) struct DecodedUtxos {
+    pub(crate) outputs: Vec<SourceTransparentUnspentOutput>,
+    pub(crate) complete: bool,
 }
 
 /// Decodes the `getaddressutxos` rows of `lookup` at or above `start_height`.
@@ -271,7 +279,7 @@ pub(crate) fn decode_address_utxos(
     lookup: &TransparentAddressLookup,
     start_height: BlockHeight,
     bound: UtxoRowBound,
-) -> Result<SourceTransparentUtxoPage, SourceError> {
+) -> Result<DecodedUtxos, SourceError> {
     // The rows of one address repeat its text and script, so each distinct
     // pair is checked once.
     let mut checked_payees: HashMap<(&str, &str), ZebraTransparentAddress> = HashMap::new();
@@ -313,7 +321,7 @@ pub(crate) fn decode_address_utxos(
         });
     }
     outputs.shrink_to_fit();
-    Ok(SourceTransparentUtxoPage { outputs, complete })
+    Ok(DecodedUtxos { outputs, complete })
 }
 
 /// Returns the address a row names after checking that `lookup` holds it

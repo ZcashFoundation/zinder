@@ -18,7 +18,7 @@ use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
 };
-use zinder_core::{BlockHash, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{BlockHash, BlockHeight, BlockId, Network, wire::encode_rpc_block_hash_hex};
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as _,
 };
@@ -99,6 +99,30 @@ impl Fixture {
             _store: store,
         })
     }
+}
+
+/// The tip of the `blocks`-block chain a [`Fixture`] serves.
+fn served_tip(blocks: u32) -> Result<BlockId> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(blocks);
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?;
+    Ok(BlockId::new(tip.height, tip.hash))
+}
+
+/// A `getaddressutxos` reply for `chainInfo` that answers at `tip`.
+fn utxos_at(tip: BlockId, rows: &Value) -> RpcReply {
+    RpcReply::result(json!({
+        "utxos": rows,
+        "hash": encode_rpc_block_hash_hex(tip.hash),
+        "height": tip.height.value(),
+    }))
+}
+
+fn address_output(txid: &str, height: impl Into<u64>, script: &str) -> Value {
+    json!({"address": ADDRESS, "txid": txid, "outputIndex": 0, "script": script,
+        "satoshis": 1, "height": height.into()})
 }
 
 fn balance_request() -> Request<lightwalletd::AddressList> {
@@ -193,9 +217,10 @@ fn verbose_reply(txid: &Value, height: u32, bytes: &str) -> RpcReply {
 
 #[tokio::test]
 async fn history_aliases_share_admission_until_the_stream_drains_or_is_dropped() -> Result<()> {
+    let tip = served_tip(4)?;
     let (fixture, _) = history_fixture([
         method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01")),
-        method("getaddressutxos").reply_with(|_| RpcReply::result(json!([]))),
+        method("getaddressutxos").reply_with(move |_| utxos_at(tip, &json!([]))),
     ])?;
     let concurrent = fixture.adapter.clone();
     for drain in [true, false] {
@@ -471,11 +496,11 @@ async fn one_oversized_history_height_preserves_the_node_refusal() -> Result<()>
 #[tokio::test]
 async fn address_index_refusal_and_concurrent_commit_have_distinct_statuses() -> Result<()> {
     let fixture = Fixture::new([
-        method("getaddressbalance").reply(RpcReply::error_with_code(
+        method("getaddressutxos").reply(RpcReply::error_with_code(
             -1,
             "transparent address and spender indexes are unavailable",
         )),
-        method("getaddressbalance").reply(RpcReply::error_with_code(
+        method("getaddressutxos").reply(RpcReply::error_with_code(
             -1,
             "state was committing a block",
         )),
@@ -501,9 +526,16 @@ async fn address_index_refusal_and_concurrent_commit_have_distinct_statuses() ->
 
 #[tokio::test]
 async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> {
-    let fixture = Fixture::new([
-        method("getaddressbalance").reply(RpcReply::result(json!({"balance":1,"received":1})))
-    ])?;
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let output = address_output(&"01".repeat(32), 1_u32, &script);
+    let fixture =
+        Fixture::new(
+            [method("getaddressutxos").reply(utxos_at(served_tip(1)?, &json!([output])))],
+        )?;
     assert_eq!(
         fixture
             .adapter
@@ -595,35 +627,30 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
         .last()
         .ok_or_else(|| eyre!("missing fixture tip"))?
         .hash;
-    let tip = |hash: BlockHash| {
-        method("getbestblockheightandhash").reply(RpcReply::result(
-            json!({"height": 2, "hash": hash.as_bytes()}),
-        ))
-    };
-    let moved = BlockHash::from_bytes([1; 32]);
-    let replies = [
-        tip(served),
-        tip(served),
-        tip(served),
-        tip(moved),
-        method("getaddressutxos").reply_with(move |params| {
-            let requested = params[0]["maxEntries"]
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(0);
-            let start = params[0]["startHeight"].as_u64().unwrap_or(0);
-            let rows: Vec<_> = [(1, "04"), (2, "03"), (2, "02"), (2, "01")]
-                .into_iter()
-                .filter(|(height, _)| *height >= start)
-                .take(requested)
-                .map(|(height, id)| {
-                    json!({"address": ADDRESS, "txid": id.repeat(32),
-                    "outputIndex":0, "script":script, "satoshis": 1, "height": height})
-                })
-                .collect();
-            RpcReply::result(json!(rows))
-        }),
-    ];
+    let moved = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([1; 32]));
+    let served = BlockId::new(BlockHeight::new(2), served);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replies = [method("getaddressutxos").reply_with(move |params| {
+        // Each request reads two pages; the second request's last page
+        // is answered after the node moved.
+        let tip = if calls.fetch_add(1, Ordering::AcqRel) < 3 {
+            served
+        } else {
+            moved
+        };
+        let requested = params[0]["maxEntries"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        let start = params[0]["startHeight"].as_u64().unwrap_or(0);
+        let rows: Vec<_> = [(1, "04"), (2, "03"), (2, "02"), (2, "01")]
+            .into_iter()
+            .filter(|(height, _)| *height >= start)
+            .take(requested)
+            .map(|(height, id)| address_output(&id.repeat(32), height, &script))
+            .collect();
+        utxos_at(tip, &json!(rows))
+    })];
     let fixture = Fixture::from_chain(
         &chain,
         &one_upgrade_per_height()?,
@@ -684,9 +711,10 @@ async fn balance_address_limit_is_checked_before_contacting_the_node() -> Result
 
 #[tokio::test]
 async fn maximum_utxo_prefix_uses_a_bounded_node_lookup() -> Result<()> {
-    let fixture = Fixture::new([method("getaddressutxos").reply_with(|params| {
+    let tip = served_tip(1)?;
+    let fixture = Fixture::new([method("getaddressutxos").reply_with(move |params| {
         if params[0]["maxEntries"] == 100_000 {
-            RpcReply::result(json!([]))
+            utxos_at(tip, &json!([]))
         } else {
             RpcReply::error_with_code(-1, "expected an explicit 100,000-row prefix")
         }
@@ -735,6 +763,7 @@ fn populated_utxo_fixture(
         (5, last_id, 1),
         (6, "03".repeat(32), next_height_rows),
     ];
+    let tip = served_tip(6)?;
     Fixture::with_node_timeout(
         6,
         [method("getaddressutxos").reply_with(move |params| {
@@ -766,11 +795,11 @@ fn populated_utxo_fixture(
                             "script": script, "satoshis": 1, "height": height}),
                     );
                     if u64::try_from(rows.len()) == Ok(limit) {
-                        return RpcReply::result(Value::Array(rows));
+                        return utxos_at(tip, &Value::Array(rows));
                     }
                 }
             }
-            RpcReply::result(Value::Array(rows))
+            utxos_at(tip, &Value::Array(rows))
         })],
         Duration::from_secs(30),
     )
@@ -915,12 +944,13 @@ async fn utxo_admission_is_shared_until_the_stream_drains_or_is_dropped() -> Res
 
 #[tokio::test]
 async fn cancelling_a_pending_unary_utxo_read_frees_admission() -> Result<()> {
+    let tip = served_tip(1)?;
     let fixture = Fixture::new([
         method("getaddressutxos").reply(RpcReply::delayed(
             Duration::from_millis(200),
-            RpcReply::result(json!([])),
+            utxos_at(tip, &json!([])),
         )),
-        method("getaddressutxos").reply(RpcReply::result(json!([]))),
+        method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
     ])?;
     let mut pending = Box::pin(fixture.adapter.get_address_utxos(utxo_request(0)));
     tokio::select! {

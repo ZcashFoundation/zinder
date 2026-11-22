@@ -1128,7 +1128,9 @@ impl ZebraJsonRpcSource {
     /// [`TransparentAddressRowLimit::MAX`] outputs is refused on both nodes,
     /// never truncated. Zakura ignores `startHeight` and returns every
     /// unspent output of the addresses, so the whole answer counts toward
-    /// `node.max_response_bytes` and the node's own response limit.
+    /// `node.max_response_bytes` and the node's own response limit. The page
+    /// names the best-chain tip the node reports answering at, which both
+    /// nodes return for `chainInfo`.
     ///
     /// # Errors
     ///
@@ -1144,10 +1146,9 @@ impl ZebraJsonRpcSource {
         &self,
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
-    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
         self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Complete)
             .await
-            .map(|page| page.outputs)
     }
 
     /// Fetches the first `max_rows` unspent outputs of `lookup`'s addresses
@@ -1205,20 +1206,30 @@ impl ZebraJsonRpcSource {
         bound: UtxoRowBound,
     ) -> Result<SourceTransparentUtxoPage, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
-        let rows: Vec<JsonObject<ZebraAddressUtxo>> = self
+        let JsonObject(reply): JsonObject<ZebraAddressUtxosAtTip> = self
             .call_with_result_shape(
                 "getaddressutxos",
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
                     "startHeight": start_height.value(),
                     "maxEntries": bound.rpc_max_entries(),
+                    "chainInfo": true,
                 })])?,
                 |error| transparent_address_call_error("getaddressutxos", error),
-                "getaddressutxos returned a result that is not a list of unspent outputs",
+                "getaddressutxos returned a result without unspent outputs and the tip they describe",
             )
             .await?;
-        let rows: Vec<_> = rows.into_iter().map(|JsonObject(row)| row).collect();
-        decode_address_utxos(&rows, lookup, start_height, bound)
+        let tip = BlockId::new(
+            BlockHeight::new(reply.height),
+            decode_rpc_block_hash(&reply.hash)?,
+        );
+        let rows: Vec<_> = reply.utxos.into_iter().map(|JsonObject(row)| row).collect();
+        let decoded = decode_address_utxos(&rows, lookup, start_height, bound)?;
+        Ok(SourceTransparentUtxoPage {
+            outputs: decoded.outputs,
+            complete: decoded.complete,
+            tip,
+        })
     }
 
     fn check_transparent_address_lookup(
@@ -2789,6 +2800,15 @@ where
     {
         Members::deserialize(MapAccessDeserializer::new(map)).map(JsonObject)
     }
+}
+
+/// Reply of `getaddressutxos` with `chainInfo`: the outputs and the tip they
+/// describe.
+#[derive(Deserialize)]
+struct ZebraAddressUtxosAtTip {
+    utxos: Vec<JsonObject<ZebraAddressUtxo>>,
+    hash: String,
+    height: u32,
 }
 
 /// Reply of the `getstandardfee` RPC.

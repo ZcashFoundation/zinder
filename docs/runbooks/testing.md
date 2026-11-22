@@ -485,14 +485,14 @@ requires fresh discovery. If discovery fails, concurrent callers waiting for it
 return the refusal or a retryable error. The next request can retry immediately.
 
 Every forwarded answer describes the served tip captured for the request, or
-the call returns `UNAVAILABLE`. A node on another chain
-fails the tip check. The node answers balance and UTXO lookups at its own tip,
-so qualification reads the node tip before and after each lookup and requires
-both reads to match. When that tip equals the served tip, the answer is exact.
-When the node is ahead on the same chain, the answer is kept only if the
-node's address history lists no transaction for the addresses above the
-served tip. Otherwise the lookup fails, and a retry succeeds once ingest
-serves the newer blocks.
+the call returns `UNAVAILABLE`. A node on another chain fails the tip check.
+The node answers UTXO lookups at its own tip and reports that tip, so
+qualification keeps an answer only when every page names the served tip. The
+balance is the sum of the unspent outputs the node reports at the served tip,
+because `getaddressbalance` does not report the tip it answered at. While the
+node is ahead of the served tip, balance and UTXO calls fail, and a retry
+succeeds once ingest serves the newer blocks. A balance over more than
+100,000 unspent outputs returns `RESOURCE_EXHAUSTED`.
 
 The node orders UTXOs within a block by position. Qualification needs every
 matching output in the last block of a wallet's request to sort them by wallet

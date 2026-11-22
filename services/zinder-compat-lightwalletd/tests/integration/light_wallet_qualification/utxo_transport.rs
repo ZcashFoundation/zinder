@@ -9,13 +9,13 @@ use tonic::{
     Code,
     transport::{Channel, Server},
 };
-use zinder_core::{Network, TransactionId, wire::encode_rpc_transaction_id_hex};
+use zinder_core::{BlockId, Network, TransactionId, wire::encode_rpc_transaction_id_hex};
 use zinder_proto::compat::lightwalletd::{
     GetAddressUtxosArg, GetAddressUtxosReply, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_testkit::{ChainFixture, RpcReply, method};
 
-use super::{ADDRESS, Fixture, one_upgrade_per_height};
+use super::{ADDRESS, Fixture, one_upgrade_per_height, utxos_at};
 
 const HEIGHTS: u8 = 100;
 const OUTPUTS_PER_TX: i32 = 500;
@@ -30,7 +30,7 @@ fn wallet_txid(height: u8, rank: u8) -> [u8; 32] {
     bytes
 }
 
-fn utxo_page(params: &Value, script_hex: &str) -> RpcReply {
+fn utxo_page(params: &Value, script_hex: &str, tip: BlockId) -> RpcReply {
     let start = params[0]["startHeight"].as_u64().unwrap_or_default();
     let limit = params[0]["maxEntries"].as_u64().unwrap_or_default();
     let mut rows = Vec::new();
@@ -45,29 +45,26 @@ fn utxo_page(params: &Value, script_hex: &str) -> RpcReply {
                     "script": script_hex, "satoshis": index + 1, "height": height}),
                 );
                 if u64::try_from(rows.len()) == Ok(limit) {
-                    return RpcReply::result(Value::Array(rows));
+                    return utxos_at(tip, &Value::Array(rows));
                 }
             }
         }
     }
-    RpcReply::result(Value::Array(rows))
+    utxos_at(tip, &Value::Array(rows))
 }
 
 fn fixture(script: &[u8]) -> Result<Fixture> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(u32::from(HEIGHTS));
     let tip = chain
-        .tip_hash()
+        .blocks()
+        .last()
+        .map(|block| BlockId::new(block.height, block.hash))
         .ok_or_else(|| eyre!("missing fixture tip"))?;
     let script_hex = hex::encode(script);
     Fixture::from_chain(
         &chain,
         &one_upgrade_per_height()?,
-        [
-            method("getbestblockheightandhash").reply_with(move |_| {
-                RpcReply::result(json!({"height": HEIGHTS, "hash": tip.as_bytes()}))
-            }),
-            method("getaddressutxos").reply_with(move |params| utxo_page(params, &script_hex)),
-        ],
+        [method("getaddressutxos").reply_with(move |params| utxo_page(params, &script_hex, tip))],
         Duration::from_secs(30),
     )
 }

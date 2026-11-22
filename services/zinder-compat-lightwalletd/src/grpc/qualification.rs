@@ -1,8 +1,6 @@
 //! gRPC routes for canonical and node-backed light-wallet qualification.
 
-use std::{
-    collections::HashSet, future::Future, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter,
-};
+use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter};
 
 use futures_util::{TryStreamExt as _, stream::try_unfold};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -23,9 +21,9 @@ use zinder_query::{
     parse_receivable_transparent_address, status_from_query_error,
 };
 use zinder_source::{
-    NodeSource as _, SourceError, SourceTransparentUnspentOutput, TransactionBroadcaster as _,
-    TransparentAddressLookup, TransparentAddressRowLimit, ZebraJsonRpcSource,
-    parse_transparent_address, transparent_address_matches_network,
+    SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
+    TransactionBroadcaster as _, TransparentAddressLookup, TransparentAddressRowLimit,
+    ZebraJsonRpcSource, parse_transparent_address, transparent_address_matches_network,
 };
 use zinder_store::{ArtifactFamily, BlockHashLookup};
 
@@ -176,16 +174,18 @@ impl QualificationWallet {
         }
         let lookup = TransparentAddressLookup::new(network, distinct)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // The node's balance RPC does not report the tip it answered at, so
+        // the balance is summed from outputs the node attests at the served tip.
         let node = self.node().await?;
-        let balance = at_served_tip(node, view.tip, &lookup, "getaddressbalance", async {
-            node.fetch_transparent_address_balance(&lookup)
-                .await
-                .map_err(node_status)
-        })
-        .await?;
+        let unspent = served_utxo_page(node, &lookup, BlockHeight::new(0), None, view.tip).await?;
+        let exceeds = || Status::out_of_range("transparent address balance exceeds i64");
+        let balance_zat = unspent
+            .outputs
+            .iter()
+            .try_fold(0_u64, |sum, output| sum.checked_add(output.value_zat))
+            .ok_or_else(exceeds)?;
         Ok(lightwalletd::Balance {
-            value_zat: i64::try_from(balance.balance_zat)
-                .map_err(|_| Status::out_of_range("transparent address balance exceeds i64"))?,
+            value_zat: i64::try_from(balance_zat).map_err(|_| exceeds())?,
         })
     }
 
@@ -221,14 +221,8 @@ impl QualificationWallet {
                 )
             })?;
         let node = self.node().await?;
-        let mut rows = at_served_tip(
-            node,
-            view.tip,
-            &lookup,
-            "getaddressutxos",
-            wallet_ordered_utxos(node, &lookup, height, request.max_entries),
-        )
-        .await?;
+        let mut rows =
+            wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?;
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         if count == 0 {
             return Ok(Box::pin(stream::empty()));
@@ -341,6 +335,34 @@ fn indexed_address(text: &str, network: Network) -> Result<Address, Status> {
     Ok(address)
 }
 
+/// Reads one `getaddressutxos` page and keeps it only when the node reports
+/// answering at the served tip.
+///
+/// A complete page is read when `limit` is unset.
+async fn served_utxo_page(
+    node: &ZebraJsonRpcSource,
+    lookup: &TransparentAddressLookup,
+    height: BlockHeight,
+    limit: Option<TransparentAddressRowLimit>,
+    served: BlockId,
+) -> Result<SourceTransparentUtxoPage, Status> {
+    let page = match limit {
+        None => node.fetch_transparent_address_utxos(lookup, height).await,
+        Some(limit) => {
+            node.fetch_transparent_address_utxo_page(lookup, height, limit)
+                .await
+        }
+    }
+    .map_err(node_status)?;
+    if page.tip == served {
+        Ok(page)
+    } else {
+        Err(outside_served_view(
+            "node answered at another tip than the served tip",
+        ))
+    }
+}
+
 /// The node orders same-height outputs by block position, the wallet by txid.
 ///
 /// Complete the last height before sorting a bounded prefix. A second lookup
@@ -350,19 +372,16 @@ async fn wallet_ordered_utxos(
     lookup: &TransparentAddressLookup,
     height: BlockHeight,
     max_entries: u32,
+    served: BlockId,
 ) -> Result<Vec<SourceTransparentUnspentOutput>, Status> {
     let Some(requested) = TransparentAddressRowLimit::new(max_entries) else {
-        return node
-            .fetch_transparent_address_utxos(lookup, height)
-            .await
-            .map_err(node_status);
+        return Ok(served_utxo_page(node, lookup, height, None, served)
+            .await?
+            .outputs);
     };
     let limit = TransparentAddressRowLimit::new(requested.get() + 1)
         .unwrap_or(TransparentAddressRowLimit::MAX);
-    let page = node
-        .fetch_transparent_address_utxo_page(lookup, height, limit)
-        .await
-        .map_err(node_status)?;
+    let page = served_utxo_page(node, lookup, height, Some(limit), served).await?;
     let mut rows = page.outputs;
     if rows.len() < u32_to_usize(requested.get()) {
         return Ok(rows);
@@ -381,17 +400,13 @@ async fn wallet_ordered_utxos(
         if at_cutoff == u32_to_usize(TransparentAddressRowLimit::MAX.get()) {
             // The RPC has no end height. Later outputs can push this read over
             // the node limit and leave the cutoff block's final order unknown.
-            break node
-                .fetch_transparent_address_utxos(lookup, cutoff)
-                .await
-                .map_err(node_status)?;
+            break served_utxo_page(node, lookup, cutoff, None, served)
+                .await?
+                .outputs;
         }
         tail_limit = TransparentAddressRowLimit::new(tail_limit.get() * 2)
             .unwrap_or(TransparentAddressRowLimit::MAX);
-        let page = node
-            .fetch_transparent_address_utxo_page(lookup, cutoff, tail_limit)
-            .await
-            .map_err(node_status)?;
+        let page = served_utxo_page(node, lookup, cutoff, Some(tail_limit), served).await?;
         at_cutoff = page
             .outputs
             .partition_point(|row| row.block_height == cutoff);
@@ -552,62 +567,6 @@ fn outside_served_view(reason: &str) -> Status {
     status_from_query_error(&QueryError::Node(SourceError::NodeUnavailable {
         reason: format!("{reason}; retry with backoff"),
     }))
-}
-
-/// Keeps a node answer only when it describes `view`, the served tip
-/// captured for the request.
-///
-/// The node answers balance and UTXO lookups at its own tip, with no height
-/// parameter. Equal tip reads around the lookup fix that tip. A tip above the
-/// view on the same chain gives the view's answer only when the node's
-/// address history, which lists paying and spending transactions, is empty
-/// above the view. Otherwise the lookup fails closed.
-async fn at_served_tip<T>(
-    node: &ZebraJsonRpcSource,
-    view: BlockId,
-    lookup: &TransparentAddressLookup,
-    operation: &'static str,
-    read: impl Future<Output = Result<T, Status>>,
-) -> Result<T, Status> {
-    let tip = node.tip_id().await.map_err(node_status)?;
-    let answer = read.await?;
-    if tip != view {
-        let above_view = view.height.next().filter(|start| *start <= tip.height);
-        let Some(start) = above_view else {
-            return Err(outside_served_view(
-                "node best chain does not extend the served tip",
-            ));
-        };
-        if node
-            .fetch_block_hash(view.height)
-            .await
-            .map_err(node_status)?
-            != view.hash
-        {
-            return Err(outside_served_view(
-                "node best chain holds another block at the served tip height",
-            ));
-        }
-        match node
-            .fetch_transparent_address_transaction_ids(lookup, start, tip.height)
-            .await
-        {
-            Ok(ids) if ids.is_empty() => {}
-            Ok(_) | Err(SourceError::TransparentAddressRowLimitExceeded { .. }) => {
-                return Err(outside_served_view(
-                    "blocks above the served tip change these addresses",
-                ));
-            }
-            Err(error) => return Err(node_status(error)),
-        }
-    }
-    if node.tip_id().await.map_err(node_status)? != tip {
-        return Err(node_status(SourceError::ChainTipChangedDuringFetch {
-            operation,
-            attempts: 1,
-        }));
-    }
-    Ok(answer)
 }
 
 #[allow(

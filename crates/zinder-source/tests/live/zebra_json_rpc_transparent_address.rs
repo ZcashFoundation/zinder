@@ -61,11 +61,13 @@ async fn transparent_address_lookups_agree_on_a_mined_coinbase_output() -> Resul
         mined.block_height.value()
     );
     let first = utxos
+        .outputs
         .first()
         .ok_or_else(|| eyre!("getaddressutxos omits the coinbase output"))?;
     assert_eq!(first.outpoint, mined.outpoint);
     assert_eq!(first.value_zat, mined.value_zat);
-    for output in &utxos {
+    assert!(utxos.tip.height >= mined.block_height);
+    for output in &utxos.outputs {
         assert_eq!(output.address, mined.address);
         assert!(output.block_height >= mined.block_height);
     }
