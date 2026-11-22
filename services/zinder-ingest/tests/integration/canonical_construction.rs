@@ -1184,22 +1184,18 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
 
     let activations = regtest_activations();
     let sapling = fixture_sapling_source_block()?;
-    let per_block = u32::try_from(
-        shielded_transactions(&sapling)?
-            .iter()
-            .map(|transaction| transaction.sapling_outputs().count())
-            .sum::<usize>(),
-    )?;
-    let budget = NonZeroU32::new(per_block.checked_mul(2).ok_or("fixture budget overflow")?)
-        .ok_or("fixture has no Sapling commitments")?;
+    let orchard = fixture_orchard_source_block()?;
+    // The Sapling fixture appends one commitment and the Orchard fixture appends two.
+    let budget = NonZeroU32::new(3).ok_or("zero commitment budget")?;
     let source =
         MultiBlockConstructionSource::build_with_transactions(105, &activations, |height| {
-            if matches!(height, 97..=99 | 101 | 102) {
-                // Distinct lock times give repeated shielded bundles distinct transaction IDs.
-                shielded_transactions_with_lock_time(&sapling, Some(height))
-            } else {
-                Ok(Vec::new())
-            }
+            let fixture = match height {
+                97 | 99 | 102 => &sapling,
+                98 | 101 => &orchard,
+                _ => return Ok(Vec::new()),
+            };
+            // Distinct lock times give repeated shielded bundles distinct transaction IDs.
+            shielded_transactions_with_lock_time(fixture, Some(height))
         })?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let directory = TempDir::new()?;
@@ -1242,11 +1238,19 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
             .tree_state_checkpoint_at(at, &activations)?
             .ok_or("every-block checkpoint absent")?;
         if let Some(TreeStateLookup::Replay(replay)) = lookup {
-            let start = replay.seed().tip_metadata().sapling_commitment_tree_size;
-            let end = expected.tip_metadata().sapling_commitment_tree_size;
+            let start = replay.seed().tip_metadata();
+            let end = expected.tip_metadata();
+            let replayed =
+                u64::from(end.sapling_commitment_tree_size - start.sapling_commitment_tree_size)
+                    + u64::from(
+                        end.orchard_commitment_tree_size - start.orchard_commitment_tree_size,
+                    )
+                    + u64::from(
+                        end.ironwood_commitment_tree_size - start.ironwood_commitment_tree_size,
+                    );
             assert!(
-                end - start < budget.get(),
-                "replay at height {height} reached the budget"
+                replayed < u64::from(budget.get()),
+                "replay at height {height} reached the shared budget"
             );
         }
         assert_eq!(
