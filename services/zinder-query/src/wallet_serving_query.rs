@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
     NetworkUpgradeActivations, RawTransactionBytes, StandardFee, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
@@ -855,6 +855,28 @@ where
                     block_range,
                     compact_blocks,
                 })
+            })
+            .await
+        })
+        .await
+    }
+
+    async fn compact_block_rows_with_lengths(
+        &self,
+        block_range: BlockHeightRange,
+        max_bytes: usize,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        let requested_blocks = Some(block_range.into_iter().len());
+        serving_read::record("compact_block_rows_with_lengths", requested_blocks, async {
+            validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+                let _ = Self::chain_epoch(&pair, at_epoch_id)?;
+                pair.canonical()
+                    .compact_block_rows_with_lengths(block_range, max_bytes)
+                    .await
+                    .map(Some)
+                    .map_err(QueryError::canonical_read)
             })
             .await
         })

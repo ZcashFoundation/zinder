@@ -180,6 +180,17 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Reads ascending compact blocks with their original stored lengths up to `max_bytes`.
+    fn read_compact_block_rows_with_lengths(
+        &self,
+        _view: &Self::View,
+        _range: BlockHeightRange,
+        _max_bytes: usize,
+    ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
+    {
+        std::future::ready(Ok(None))
+    }
+
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
     /// end `read.order` visits first, and runs `convert` on the blocking pool
     /// with the chain epoch they were read at and the blocks in ascending
@@ -363,13 +374,17 @@ impl BlockMethods {
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        history: Arc<crate::published_range::PublishedShieldedCatalog>,
+        (history, live_tail): (
+            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
+            crate::published_range::ShieldedTailBuffer,
+        ),
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let slot = self.block_range_streams.open().await?;
         let shape = CompactBlockShape::for_range(&request.pool_types)?;
         let source = crate::published_range::PublishedRangeRead::new(
             history,
+            live_tail,
             shape,
             is_descending,
             self.block_range_streams.clone(),

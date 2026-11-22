@@ -230,6 +230,21 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
 
+    /// Reads ascending compact blocks with their original stored byte lengths
+    /// up to `max_bytes`.
+    ///
+    /// Local canonical query implementations override this to supply exact
+    /// stored byte lengths for live-tail caching; implementations without
+    /// stored-length metadata may keep the default `Ok(None)`.
+    async fn compact_block_rows_with_lengths(
+        &self,
+        _block_range: BlockHeightRange,
+        _max_bytes: usize,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        Ok(None)
+    }
+
     /// Reads one full serialized block at a given height.
     ///
     /// Served from the stored block blob, present only when the writer

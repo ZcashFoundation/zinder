@@ -1228,3 +1228,127 @@ async fn paced_dense_ranges_complete_and_cancelled_readers_release_capacity() ->
     }
     Ok(())
 }
+
+async fn assert_adapters_match_stock(
+    wallet: &mut Endpoint,
+    blocks_only: &mut Endpoint,
+    stock: &mut Endpoint,
+    ranges: &[(u64, u64)],
+) -> eyre::Result<()> {
+    for &(first, last) in ranges {
+        let expected = stock.blocks(block_range_request(first, last)).await?;
+        assert_one_linked_chain(&expected, first, last);
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?,
+            expected
+        );
+        assert_eq!(
+            blocks_only.blocks(block_range_request(first, last)).await?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn standalone_adapters_serve_and_coalesce_on_demand_shielded_live_tail() -> eyre::Result<()> {
+    const TIP: u32 = 12;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP + 1);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let initial = ReaderFixture::new(writer.serving_store_fixture()?)?;
+    writer.append_live_block(&chain)?;
+    let advanced = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+
+    let mut recorder =
+        EpochPinRecorder::new(initial.query.clone()).with_later_views(vec![advanced.query.clone()]);
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(initial.reader.clone()))
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(initial.query.clone()).into_server()),
+    )
+    .await?;
+
+    let mut warm_clients = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let mut client = wallet.client.clone();
+        warm_clients.spawn(async move {
+            let stream = client
+                .get_block_range(block_range_request(8, 12))
+                .await?
+                .into_inner();
+            let drained = drain_slowly(stream).await;
+            eyre::ensure!(drained.ending.is_none());
+            Ok::<_, eyre::Report>(drained.blocks)
+        });
+    }
+    let expected_hot = stock.blocks(block_range_request(8, 12)).await?;
+    while let Some(joined) = warm_clients.join_next().await {
+        assert_eq!(joined??, expected_hot);
+    }
+    assert_adapters_match_stock(
+        &mut wallet,
+        &mut blocks_only,
+        &mut stock,
+        &[(4, 12), (12, 1), (1, 12)],
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(8, 12), span(4, 7), span(1, 3)]
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        Vec::<BlockHeightRange>::new()
+    );
+
+    let mut explicit = block_range_request(2, 4);
+    explicit.pool_types = vec![lightwalletd::PoolType::Transparent as i32];
+    assert_eq!(
+        wallet.blocks(explicit.clone()).await?,
+        stock.blocks(explicit).await?
+    );
+    assert_eq!(recorder.recorded_compact_block_ranges().len(), 1);
+
+    let updated = wallet.blocks(block_range_request(1, 13)).await?;
+    assert_one_linked_chain(&updated, 1, 13);
+    assert_eq!(
+        recorder.recorded_rows_with_lengths.lock().last().copied(),
+        Some(span(13, 13))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_api_rows_with_lengths_preserves_exact_stored_compact_bytes() -> eyre::Result<()> {
+    use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
+    let chain = wallet_chain(8)?;
+    let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+    let expected = store
+        .reader
+        .compact_block_rows_with_lengths(range, usize::MAX)
+        .await?;
+    let queried = store
+        .query
+        .compact_block_rows_with_lengths(range, usize::MAX, None)
+        .await?
+        .ok_or_else(|| eyre!("expected query lengths"))?;
+    assert_eq!(queried, expected);
+    Ok(())
+}

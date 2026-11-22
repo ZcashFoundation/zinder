@@ -76,7 +76,7 @@ fn check_parent(
 #[derive(Clone)]
 pub(crate) struct PublishedShieldedCatalog {
     segments: Vec<Arc<PublishedShieldedRange>>,
-    pub(super) tail: Arc<arc_swap::ArcSwapOption<super::tail::EncodedTail>>,
+    pub(super) tail: super::tail::ShieldedTailBuffer,
 }
 
 impl PublishedShieldedCatalog {
@@ -124,13 +124,11 @@ impl PublishedShieldedCatalog {
             segments.push(Arc::new(segment));
         }
         let tail = previous
-            .and_then(|catalog| catalog.tail.load_full())
             .zip(entries.last())
-            .map(|(tail, segment)| tail.after_published(BlockHeight::new(segment.last)));
-        Ok(Self {
-            segments,
-            tail: Arc::new(arc_swap::ArcSwapOption::from(tail)),
-        })
+            .map_or_default(|(catalog, segment)| {
+                catalog.tail.after_published(BlockHeight::new(segment.last))
+            });
+        Ok(Self { segments, tail })
     }
 
     /// All admitted segments in ascending height order.
@@ -148,6 +146,10 @@ impl PublishedShieldedCatalog {
             BlockHeight::new(self.segments[0].identity.first),
             BlockHeight::new(self.terminal().identity.last),
         )
+    }
+
+    pub(crate) fn tail(&self) -> super::tail::ShieldedTailBuffer {
+        self.tail.clone()
     }
 
     /// Verifies the linked catalog's terminal against a captured canonical reader.

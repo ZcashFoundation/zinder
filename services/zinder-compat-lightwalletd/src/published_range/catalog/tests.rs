@@ -558,7 +558,8 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
         .set_len(0)?;
 
     let range = PublishedRangeRead::new(
-        catalog,
+        Some(catalog.clone()),
+        catalog.tail(),
         CompactBlockShape::for_range(&[])?,
         true,
         crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
@@ -927,7 +928,8 @@ async fn catalog_chunk_uses_range_fence_without_hash_probe_and_falls_back_below_
     )?);
     let reads = ObservedRangeReads::new(floored_reader);
     let range = crate::published_range::PublishedRangeRead::new(
-        catalog,
+        Some(catalog.clone()),
+        catalog.tail(),
         crate::compact_block_messages::CompactBlockShape::for_range(&[])?,
         false,
         crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
@@ -999,7 +1001,8 @@ async fn precancelled_published_chunk_read_returns_cancelled_without_storage_io(
     let catalog = Arc::new(fixture.catalog(None)?);
     let reads = ObservedRangeReads::new(Arc::new(source));
     let range = crate::published_range::PublishedRangeRead::new(
-        catalog,
+        Some(catalog.clone()),
+        catalog.tail(),
         crate::compact_block_messages::CompactBlockShape::for_range(&[])?,
         false,
         crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),

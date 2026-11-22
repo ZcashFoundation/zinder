@@ -8,8 +8,12 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact,
 };
 use zinder_proto::{ZINDER_ERROR_DOMAIN, v1::ops::ErrorReason};
+use zinder_store::HeightOrder;
 
-use super::PublishedShieldedCatalog;
+use super::{
+    PublishedShieldedCatalog,
+    tail::{EncodedTail, Fence, ShieldedTailBuffer},
+};
 use crate::{
     block_methods::{
         ChunkMessages, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
@@ -22,7 +26,8 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct PublishedRangeRead {
-    history: Arc<PublishedShieldedCatalog>,
+    history: Option<Arc<PublishedShieldedCatalog>>,
+    tail: ShieldedTailBuffer,
     limits: crate::block_range::BlockRangeStreamLimit,
     shape: CompactBlockShape,
     is_descending: bool,
@@ -71,41 +76,56 @@ impl RangeBlock for ReadBlock {
     }
 }
 
+enum AnchorPlan {
+    UseEncoded(Option<Arc<EncodedTail>>),
+    FallbackNative,
+    Failed(Status),
+}
+
 impl PublishedRangeRead {
     pub(crate) fn new(
-        history: Arc<PublishedShieldedCatalog>,
+        history: Option<Arc<PublishedShieldedCatalog>>,
+        tail: ShieldedTailBuffer,
         shape: CompactBlockShape,
         is_descending: bool,
         limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
         Self {
             history,
+            tail,
             limits,
             shape,
             is_descending,
         }
     }
 
+    fn order(&self) -> HeightOrder {
+        if self.is_descending {
+            HeightOrder::Descending
+        } else {
+            HeightOrder::Ascending
+        }
+    }
+
     fn encoded_span(
         &self,
         chunk: BlockHeightRange,
-        order: zinder_store::HeightOrder,
-        tail: &super::tail::EncodedTail,
+        order: HeightOrder,
+        tail: &EncodedTail,
     ) -> Option<BlockHeightRange> {
-        use zinder_store::HeightOrder;
         let first = match order {
             HeightOrder::Ascending => chunk.start,
             HeightOrder::Descending => chunk.end,
         };
-        let mut catalog = self.history.bounds();
+        let mut catalog = self.history.as_ref().map(|catalog| catalog.bounds());
         let mut live = tail.bounds();
-        if let Some(suffix) = live
-            && catalog.end.next().is_some_and(|next| next >= suffix.start)
+        if let (Some(prefix), Some(suffix)) = (&mut catalog, live)
+            && prefix.end.next().is_some_and(|next| next >= suffix.start)
         {
-            catalog.end = catalog.end.max(suffix.end);
+            prefix.end = prefix.end.max(suffix.end);
             live = None;
         }
-        [Some(catalog), live]
+        [catalog, live]
             .into_iter()
             .flatten()
             .find(|covered| (covered.start..=covered.end).contains(&first))
@@ -120,36 +140,36 @@ impl PublishedRangeRead {
     fn encoded_rows(
         &self,
         span: BlockHeightRange,
-        order: zinder_store::HeightOrder,
+        order: HeightOrder,
         max_bytes: usize,
-        (tail, cancel): (Option<&super::tail::EncodedTail>, &CancellationToken),
+        (tail, cancel): (Option<&EncodedTail>, &CancellationToken),
     ) -> std::io::Result<Vec<SealedBlock>> {
-        use zinder_store::HeightOrder;
         if cancel.is_cancelled() {
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
                 "block-range stream cancelled",
             ));
         }
-        let end = self.history.bounds().end;
+        let Some(history) = &self.history else {
+            let live = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
+            return Ok(live.select(span, order, max_bytes, true));
+        };
+        let end = history.bounds().end;
         if span.end <= end {
-            return self
-                .history
-                .read_chunk(span, order, max_bytes, (true, cancel));
+            return history.read_chunk(span, order, max_bytes, (true, cancel));
         }
-        let tail = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
+        let live = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
         if span.start > end {
-            return Ok(tail.select(span, order, max_bytes, true));
+            return Ok(live.select(span, order, max_bytes, true));
         }
         let prefix = BlockHeightRange::inclusive(span.start, end);
         let suffix = BlockHeightRange::inclusive(BlockHeight::new(end.value() + 1), span.end);
         let (mut first, first_span) = match order {
             HeightOrder::Ascending => (
-                self.history
-                    .read_chunk(prefix, order, max_bytes, (true, cancel))?,
+                history.read_chunk(prefix, order, max_bytes, (true, cancel))?,
                 prefix,
             ),
-            HeightOrder::Descending => (tail.select(suffix, order, max_bytes, true), suffix),
+            HeightOrder::Descending => (live.select(suffix, order, max_bytes, true), suffix),
         };
         let room = first.iter().fold(max_bytes, |budget, row| {
             budget.saturating_sub(row.native_bytes)
@@ -161,11 +181,9 @@ impl PublishedRangeRead {
             return Ok(first);
         }
         match order {
-            HeightOrder::Ascending => first.extend(tail.select(suffix, order, room, false)),
+            HeightOrder::Ascending => first.extend(live.select(suffix, order, room, false)),
             HeightOrder::Descending => {
-                let mut earlier = self
-                    .history
-                    .read_chunk(prefix, order, room, (false, cancel))?;
+                let mut earlier = history.read_chunk(prefix, order, room, (false, cancel))?;
                 earlier.append(&mut first);
                 first = earlier;
             }
@@ -174,10 +192,116 @@ impl PublishedRangeRead {
     }
 
     fn covers_selected_history(&self, chunk: BlockHeightRange) -> bool {
-        let coverage = self.history.bounds();
+        let Some(history) = &self.history else {
+            return false;
+        };
+        let coverage = history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
             && CompactBlockShape::for_range(&[]).ok() == Some(self.shape)
+    }
+
+    async fn resolve_plan<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        (view, epoch, fence, cancel): (&Reads::View, ChainEpoch, Option<Fence>, &CancellationToken),
+        chunk: &mut BlockHeightRange,
+    ) -> AnchorPlan {
+        let Some(fence) = fence else {
+            if !self.covers_selected_history(*chunk) {
+                return AnchorPlan::FallbackNative;
+            }
+            if reads.block_hash_at(view, chunk.start).await.is_err() {
+                return AnchorPlan::FallbackNative;
+            }
+            let Some(history) = &self.history else {
+                return AnchorPlan::FallbackNative;
+            };
+            return match history.terminal().check_view(reads, view, cancel).await {
+                Ok(()) => AnchorPlan::UseEncoded(None),
+                Err(status) => AnchorPlan::Failed(status),
+            };
+        };
+        if chunk.start < fence.1.first_available_height() {
+            return AnchorPlan::FallbackNative;
+        }
+        if let Some(history) = &self.history {
+            let covered = self.covers_selected_history(*chunk);
+            if chunk.end <= history.bounds().end {
+                if !covered {
+                    return AnchorPlan::FallbackNative;
+                }
+                return match history.terminal().check_view(reads, view, cancel).await {
+                    Ok(()) => AnchorPlan::UseEncoded(None),
+                    Err(status) => AnchorPlan::Failed(status),
+                };
+            }
+            match history.terminal().check_view(reads, view, cancel).await {
+                Ok(()) => {}
+                Err(status) if status.code() == tonic::Code::Cancelled => {
+                    return AnchorPlan::Failed(status);
+                }
+                Err(_) => return AnchorPlan::FallbackNative,
+            }
+            let catalog_end = (
+                history.bounds().end,
+                history.terminal().segment.identity().end,
+            );
+            return self
+                .plan_with_tail(
+                    reads,
+                    (view, epoch, fence, cancel),
+                    chunk,
+                    Some(catalog_end),
+                )
+                .await;
+        }
+        self.plan_with_tail(reads, (view, epoch, fence, cancel), chunk, None)
+            .await
+    }
+
+    async fn plan_with_tail<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        (view, epoch, fence, cancel): (&Reads::View, ChainEpoch, Fence, &CancellationToken),
+        chunk: &mut BlockHeightRange,
+        catalog_end: Option<(BlockHeight, BlockId)>,
+    ) -> AnchorPlan {
+        let Some(window_floor) =
+            ShieldedTailBuffer::window_floor(epoch, fence.1, catalog_end.map(|(end, _)| end))
+        else {
+            return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
+                AnchorPlan::UseEncoded(None)
+            } else {
+                AnchorPlan::FallbackNative
+            };
+        };
+        if chunk.end < window_floor {
+            return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
+                AnchorPlan::UseEncoded(None)
+            } else {
+                AnchorPlan::FallbackNative
+            };
+        }
+        match self
+            .tail
+            .load_or_refresh((reads, view, fence, cancel), catalog_end, *chunk)
+            .await
+        {
+            Ok(Some(live)) => self.encoded_span(*chunk, self.order(), &live).map_or_else(
+                || AnchorPlan::FallbackNative,
+                |span| {
+                    *chunk = span;
+                    AnchorPlan::UseEncoded(Some(live))
+                },
+            ),
+            Ok(None) => AnchorPlan::FallbackNative,
+            Err(status) if status.code() == tonic::Code::Cancelled => AnchorPlan::Failed(status),
+            Err(status) => {
+                tracing::warn!(%status, "serving the uncovered tail from canonical storage");
+                AnchorPlan::FallbackNative
+            }
+        }
     }
 }
 
@@ -217,7 +341,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Message = Bytes;
 
     fn published_read_limit(&self) -> Option<&crate::block_range::BlockRangeStreamLimit> {
-        Some(&self.limits)
+        self.history.as_ref().map(|_| &self.limits)
     }
 
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {
@@ -248,11 +372,13 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
+        if self.history.is_some() {
+            read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
+        }
         if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
             return native_chunk(reads, read, convert).await;
         }
-        let (epoch, started, anchor, tail) = {
+        let (epoch, started, plan) = {
             let current;
             let view = match &read.view {
                 ChunkView::Captured(view) => view,
@@ -272,26 +398,15 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             }
             let started = Instant::now();
             let fence = reads.range_fence(view);
-            // A replacement with the same settled tip can have a higher retention floor.
-            let tail = self.history.tail.load_full().filter(|tail| {
-                tail.epoch == epoch
-                    && fence == Some(tail.fence)
-                    && read.chunk.start >= tail.fence.1.first_available_height()
-            });
-            let anchor = self
-                .resolve_anchor(
-                    reads,
-                    (view, fence, &read.cancel),
-                    &mut read.chunk,
-                    tail.as_deref(),
-                )
+            let plan = self
+                .resolve_plan(reads, (view, epoch, fence, &read.cancel), &mut read.chunk)
                 .await;
-            (epoch, started, anchor, tail)
+            (epoch, started, plan)
         };
-        match anchor {
-            Some(Ok(())) => {}
-            None => return native_chunk(reads, read, convert).await,
-            Some(Err(status)) => {
+        let tail = match plan {
+            AnchorPlan::UseEncoded(tail) => tail,
+            AnchorPlan::FallbackNative => return native_chunk(reads, read, convert).await,
+            AnchorPlan::Failed(status) => {
                 if matches!(read.view, ChunkView::Current) && pin_unavailable(&status) {
                     return native_chunk(reads, read, convert).await;
                 }
@@ -300,9 +415,9 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
                     converted: Err(ChunkReadFailure::Failed(status)),
                 };
             }
-        }
+        };
         drop(read.view);
-        self.spawn_encoded_read(
+        self.finish_encoded_read(
             (epoch, started),
             (read.chunk, read.order, read.max_bytes, read.cancel),
             tail,
@@ -313,55 +428,16 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
 }
 
 impl PublishedRangeRead {
-    async fn resolve_anchor<Reads: CompactBlockReads>(
-        &self,
-        reads: &Reads,
-        (view, fence, cancel): (&Reads::View, Option<super::tail::Fence>, &CancellationToken),
-        chunk: &mut BlockHeightRange,
-        tail: Option<&super::tail::EncodedTail>,
-    ) -> Option<Result<(), Status>> {
-        if let Some(live) = tail {
-            let span = self.encoded_span(
-                *chunk,
-                if self.is_descending {
-                    zinder_store::HeightOrder::Descending
-                } else {
-                    zinder_store::HeightOrder::Ascending
-                },
-                live,
-            )?;
-            *chunk = span;
-            return Some(Ok(()));
-        }
-        if !self.covers_selected_history(*chunk) {
-            return None;
-        }
-        let retained = match fence {
-            Some((_, bounds)) => chunk.start >= bounds.first_available_height(),
-            None => reads.block_hash_at(view, chunk.start).await.is_ok(),
-        };
-        if retained {
-            Some(
-                self.history
-                    .terminal()
-                    .check_view(reads, view, cancel)
-                    .await,
-            )
-        } else {
-            None
-        }
-    }
-
-    async fn spawn_encoded_read<Output, Convert>(
+    async fn finish_encoded_read<Output, Convert>(
         &self,
         (epoch, started): (ChainEpoch, Instant),
         (chunk, order, max_bytes, cancel): (
             BlockHeightRange,
-            zinder_store::HeightOrder,
+            HeightOrder,
             usize,
             CancellationToken,
         ),
-        tail: Option<Arc<super::tail::EncodedTail>>,
+        tail: Option<Arc<EncodedTail>>,
         convert: Convert,
     ) -> ChunkReadOutcome<Output>
     where
@@ -370,6 +446,14 @@ impl PublishedRangeRead {
     {
         if cancel.is_cancelled() {
             return cancelled_outcome(Some(started.elapsed()));
+        }
+        let touches_disk = self
+            .history
+            .as_ref()
+            .is_some_and(|catalog| chunk.start <= catalog.bounds().end);
+        if !touches_disk && let Some(live) = tail.as_deref() {
+            let rows = live.select(chunk, order, max_bytes, true);
+            return finish_encoded_rows(epoch, Some(started.elapsed()), Ok(rows), &cancel, convert);
         }
         let source = self.clone();
         tokio::task::spawn_blocking(move || {
