@@ -245,6 +245,7 @@ impl ShieldedTailBuffer {
         if !fills(existing.as_deref(), source, requested) {
             return Ok(None);
         }
+        drop(existing);
         // A stale view must not spend the refresh lock building rows it may
         // not install.
         if !source.is_current().await {
@@ -660,11 +661,15 @@ async fn encode_range<Source: TailSource>(
     })
     .await
     .map_err(|error| Status::internal(error.to_string()))??;
+    #[cfg(test)]
+    let rows = tests::replacement_budget::track_chunk(rows);
     Ok(Some(rows))
 }
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod replacement_budget;
+
     use std::{
         num::NonZeroU32,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
