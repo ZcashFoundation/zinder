@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{Block as ZebraBlock, Height as ZebraHeight},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
+    transaction::Transaction as ZebraTransaction,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
@@ -42,7 +44,10 @@ use zinder_store::{
 use zinder_testkit::{frontier_from_note_commitments, sample_regtest_upgrade_activations};
 
 use super::{
-    canonical_block_context::{chained_source_block, pool_commitments, shielded_transactions},
+    canonical_block_context::{
+        chained_source_block, pool_commitments, shielded_transactions,
+        shielded_transactions_with_lock_time,
+    },
     fixture_block::{
         fixture_ironwood_source_block, fixture_orchard_source_block, fixture_sapling_source_block,
         fixture_source_block, fixture_zakura_ironwood_source_block,
@@ -904,6 +909,25 @@ impl MultiBlockConstructionSource {
         height_count: u32,
         activations: &NetworkUpgradeActivations,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let sapling_shielded = shielded_transactions(&fixture_sapling_source_block()?)?;
+        let orchard_shielded = shielded_transactions(&fixture_orchard_source_block()?)?;
+        Self::build_with_transactions(height_count, activations, |height| {
+            Ok(match height {
+                2 => sapling_shielded.clone(),
+                4 => orchard_shielded.clone(),
+                _ => Vec::new(),
+            })
+        })
+    }
+
+    fn build_with_transactions(
+        height_count: u32,
+        activations: &NetworkUpgradeActivations,
+        extra_transactions: impl Fn(
+            u32,
+        )
+            -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn std::error::Error>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let block_one = fixture_source_block()?;
         let genesis = SourceBlock::new(
             SourceBlockHeader {
@@ -915,24 +939,17 @@ impl MultiBlockConstructionSource {
             },
             Vec::new(),
         );
-        let sapling_shielded = shielded_transactions(&fixture_sapling_source_block()?)?;
-        let orchard_shielded = shielded_transactions(&fixture_orchard_source_block()?)?;
         let mut blocks = Vec::with_capacity(usize::try_from(height_count)?);
         let mut parent_hash = genesis.hash;
         for height_num in 1..=height_count {
             let block = if height_num == 1 {
                 block_one.clone()
             } else {
-                let extra = match height_num {
-                    2 => sapling_shielded.clone(),
-                    4 => orchard_shielded.clone(),
-                    _ => Vec::new(),
-                };
                 chained_source_block(
                     BlockHeight::new(height_num),
                     parent_hash,
                     u8::try_from(height_num)?,
-                    extra,
+                    extra_transactions(height_num)?,
                 )?
             };
             parent_hash = block.hash;
@@ -1012,15 +1029,18 @@ impl NodeSource for MultiBlockConstructionSource {
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
         self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
-        let next_height = limits
-            .cursor
-            .block_id()
-            .map_or(1, |cursor| cursor.height.value().saturating_add(1));
+        let next_height =
+            limits
+                .cursor
+                .next_connected_height()
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "multi-block construction test cursor has no next height",
+                })?;
         let max_blocks = usize::try_from(limits.max_connected_blocks.get()).unwrap_or(usize::MAX);
         let segment = self
             .blocks
             .iter()
-            .filter(|block| block.height.value() >= next_height)
+            .filter(|block| block.height >= next_height)
             .take(max_blocks)
             .cloned()
             .collect::<Vec<_>>();
@@ -1163,7 +1183,24 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
     use zinder_store::TreeStateCheckpointSelection::CommitmentBudget;
 
     let activations = regtest_activations();
-    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let sapling = fixture_sapling_source_block()?;
+    let per_block = u32::try_from(
+        shielded_transactions(&sapling)?
+            .iter()
+            .map(|transaction| transaction.sapling_outputs().count())
+            .sum::<usize>(),
+    )?;
+    let budget = NonZeroU32::new(per_block.checked_mul(2).ok_or("fixture budget overflow")?)
+        .ok_or("fixture has no Sapling commitments")?;
+    let source =
+        MultiBlockConstructionSource::build_with_transactions(105, &activations, |height| {
+            if matches!(height, 97..=99 | 101 | 102) {
+                // Distinct lock times give repeated shielded bundles distinct transaction IDs.
+                shielded_transactions_with_lock_time(&sapling, Some(height))
+            } else {
+                Ok(Vec::new())
+            }
+        })?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let directory = TempDir::new()?;
     let dense = multi_block_writer_config(
@@ -1173,7 +1210,7 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
     );
     let budgeted = CanonicalWriterConfig {
         storage_path: directory.path().join("commitment-budget"),
-        tree_state_checkpoint_selection: Some(CommitmentBudget(std::num::NonZeroU32::MIN)),
+        tree_state_checkpoint_selection: Some(CommitmentBudget(budget)),
         ..dense.clone()
     };
     let cancel = CancellationToken::new();
@@ -1193,17 +1230,30 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
         &cancel,
     )
     .await?;
-    for height in 0..=5 {
+    for height in 0..=104 {
         let at = BlockHeight::new(height);
         let lookup = budgeted.tree_state_lookup(at, &activations)?;
         assert_eq!(
             matches!(lookup, Some(TreeStateLookup::Stored(_))),
-            matches!(height, 0 | 2 | 4 | 5),
+            matches!(height, 0 | 98 | 100 | 102 | 104),
             "unexpected checkpoint coverage at height {height}"
         );
+        let expected = dense
+            .tree_state_checkpoint_at(at, &activations)?
+            .ok_or("every-block checkpoint absent")?;
+        if let Some(TreeStateLookup::Replay(replay)) = lookup {
+            let start = replay.seed().tip_metadata().sapling_commitment_tree_size;
+            let end = expected.tip_metadata().sapling_commitment_tree_size;
+            assert!(
+                end - start < budget.get(),
+                "replay at height {height} reached the budget"
+            );
+        }
         assert_eq!(
-            budgeted.tree_state_checkpoint_at(at, &activations)?,
-            dense.tree_state_checkpoint_at(at, &activations)?,
+            budgeted
+                .tree_state_checkpoint_at(at, &activations)?
+                .as_ref(),
+            Some(&expected),
         );
     }
     Ok(())

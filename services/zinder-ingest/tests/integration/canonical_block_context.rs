@@ -75,7 +75,8 @@ use super::tree_state_densification::following_tip_gate;
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
 const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
-const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
+const COINBASE_SCRIPT_LENGTH_OFFSET: usize = 1_533;
+const COINBASE_HEIGHT_OPCODE_OFFSET: usize = COINBASE_SCRIPT_LENGTH_OFFSET + 1;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const SAPLING_BLOCK_HEIGHT: u32 = 2;
 const SPENDING_BLOCK_HEIGHT: u32 = 3;
@@ -1646,6 +1647,13 @@ fn shielded_transactions_at(height: u32) -> Result<Vec<Arc<ZebraTransaction>>, B
 pub(super) fn shielded_transactions(
     fixture: &SourceBlock,
 ) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
+    shielded_transactions_with_lock_time(fixture, None)
+}
+
+pub(super) fn shielded_transactions_with_lock_time(
+    fixture: &SourceBlock,
+    lock_time: Option<u32>,
+) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
     let block: ZebraBlock = fixture
         .raw_block_bytes
         .as_slice()
@@ -1654,7 +1662,7 @@ pub(super) fn shielded_transactions(
         .transactions
         .iter()
         .filter(|transaction| !transaction.is_coinbase() && creates_note_commitments(transaction))
-        .map(|transaction| without_transparent_inputs(transaction).map(Arc::new))
+        .map(|transaction| without_transparent_inputs(transaction, lock_time).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
     if transactions.is_empty() {
         return Err("fixture must carry a note-commitment-bearing transaction".into());
@@ -1668,6 +1676,7 @@ fn creates_note_commitments(transaction: &ZebraTransaction) -> bool {
 
 fn without_transparent_inputs(
     transaction: &ZebraTransaction,
+    lock_time: Option<u32>,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
     let mut bytes = Vec::new();
     transaction.zcash_serialize(&mut bytes)?;
@@ -1690,7 +1699,7 @@ fn without_transparent_inputs(
     let rebuilt = TransactionData::<Authorized>::from_parts(
         transaction_data.version(),
         transaction_data.consensus_branch_id(),
-        transaction_data.lock_time(),
+        lock_time.unwrap_or_else(|| transaction_data.lock_time()),
         transaction_data.expiry_height(),
         transparent_bundle,
         transaction_data.sprout_bundle().cloned(),
@@ -1719,10 +1728,26 @@ pub(super) fn chained_source_block(
         .get_mut(SERIALIZED_HEADER_TIME_OFFSET)
         .ok_or("fixture block is too short to carry a block time")?;
     *block_time = block_time.wrapping_add(time_nonce);
+    let height_byte = u8::try_from(height.value())?;
     let coinbase_height_opcode = raw_block_bytes
         .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
         .ok_or("fixture block is too short to carry a coinbase height")?;
-    *coinbase_height_opcode = 0x50_u8.saturating_add(u8::try_from(height.value())?);
+    if height_byte <= 16 {
+        *coinbase_height_opcode = 0x50_u8.saturating_add(height_byte);
+    } else {
+        assert!(
+            height_byte <= 127,
+            "fixture needs a one-byte positive script integer"
+        );
+        *coinbase_height_opcode = 1;
+        raw_block_bytes.insert(COINBASE_HEIGHT_OPCODE_OFFSET + 1, height_byte);
+        let script_length = raw_block_bytes
+            .get_mut(COINBASE_SCRIPT_LENGTH_OFFSET)
+            .ok_or("fixture block is too short to carry a coinbase script length")?;
+        *script_length = script_length
+            .checked_add(1)
+            .ok_or("fixture coinbase script is too long")?;
+    }
     let mut block: ZebraBlock = raw_block_bytes.as_slice().zcash_deserialize_into()?;
     block.transactions.extend(extra_transactions);
     let raw_block_bytes = block.zcash_serialize_to_vec()?;
