@@ -486,19 +486,24 @@ mod tests {
 
     use super::*;
     use crate::canonical_store::{
-        block_load::{canonical_block_families_are_empty, validate_compact_block_payload},
+        block_load::{
+            canonical_block_families_are_empty, encode_block_position,
+            encode_tree_state_checkpoint, validate_compact_block_payload,
+        },
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
         control::{decode_store_control, encode_ready_store_control},
         displaced_archive::{
             encode_test_archive_record, encode_test_archive_state, encode_test_event_context,
             encode_test_hash_pointer_rows, encode_test_order_key,
         },
+        live_replacement_tests::replacement_block,
+        note_commitment_trees_tests::NoteCommitmentTrees,
         publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
             BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
             CANONICAL_DATA_COLUMN_FAMILIES, CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
             COMPACT_BLOCK_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
-            TRANSACTION_LOCATION_COLUMN_FAMILY,
+            TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         },
     };
     use crate::{
@@ -739,6 +744,107 @@ mod tests {
             CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
                 if reason.contains("gap 2 exceeds 1 blocks")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn commitment_budget_rejects_missing_and_unexpected_input_checkpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = testnet_activations()?;
+        let tip = BlockHeight::new(3);
+        // Sapling contributes two commitments at activation height 2.
+        for (budget, heights, expected) in [
+            (
+                2,
+                &[3][..],
+                "block 2 is missing its required tree-state checkpoint",
+            ),
+            (
+                3,
+                &[2, 3][..],
+                "block 2 has a tree-state checkpoint outside the selected construction coverage",
+            ),
+        ] {
+            let temporary = TempDir::new()?;
+            let mut builder = building_store_through(&temporary.path().join("canonical"), tip)?
+                .with_tree_state_checkpoint_selection(
+                    TreeStateCheckpointSelection::CommitmentBudget(
+                        NonZeroU32::new(budget).ok_or("budget must be positive")?,
+                    ),
+                )?;
+            let blocks = shielded_chain_with_checkpoints(&activations, tip, heights)?;
+            let error = builder
+                .bulk_load_blocks(&activations, blocks)
+                .err()
+                .ok_or("the loader must reject invalid commitment-budget coverage")?;
+            assert!(
+                matches!(
+                    error,
+                    CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { ref reason })
+                        if reason == expected
+                ),
+                "{error}"
+            );
+            assert!(canonical_block_families_are_empty(
+                &builder.bounded_open.db
+            )?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn commitment_budget_cold_readback_rejects_a_skipped_cadence_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = testnet_activations()?;
+        let tip = BlockHeight::new(102);
+        let mut builder = building_store_through(&temporary.path().join("canonical"), tip)?
+            .with_tree_state_checkpoint_selection(
+                TreeStateCheckpointSelection::CommitmentBudget(
+                    NonZeroU32::new(203).ok_or("budget must be positive")?,
+                ),
+            )?;
+        // The budget is reached at 85. Capture height 101's frontier for the
+        // replacement row and omit it from the initial load.
+        let mut blocks = shielded_chain_with_checkpoints(&activations, tip, &[85, 100, 101, 102])?;
+        let replacement = blocks
+            .get_mut(100)
+            .and_then(|block| block.as_mut().ok())
+            .and_then(|block| block.tree_state_checkpoint.take())
+            .ok_or("missing height 101 test frontier")?;
+        let source_tip = blocks
+            .last()
+            .and_then(|block| block.as_ref().ok())
+            .and_then(|block| block.tree_state_checkpoint.clone())
+            .ok_or("missing tip checkpoint")?;
+        let evidence = builder.bulk_load_blocks(&activations, blocks)?;
+        assert_eq!(evidence.tree_state_checkpoint_count, 4);
+        builder.load_subtree_roots(std::iter::empty())?;
+        builder.confirm_source_tip_checkpoint(&source_tip)?;
+        let db = &builder.bounded_open.db;
+        let family = db
+            .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+            .ok_or("tree-state checkpoint family must exist")?;
+        db.delete_cf(&family, encode_block_position(BlockHeight::new(100)))?;
+        db.put_cf(
+            &family,
+            encode_block_position(replacement.block_id.height),
+            encode_tree_state_checkpoint(replacement.block_time_seconds, &replacement.frontiers),
+        )?;
+        drop(family);
+
+        let error = builder
+            .prepare_cold_certified_publication()
+            .err()
+            .ok_or("cold readback must reject a skipped cadence checkpoint")?;
+        assert!(
+            matches!(
+                error,
+                CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
+                    if reason == "persisted tree-state checkpoint at height 101 is outside the selected construction coverage"
+            ),
+            "{error}"
+        );
         Ok(())
     }
 
@@ -4713,6 +4819,30 @@ mod tests {
         Ok(crate::canonical_store::test_network_upgrade_activations(
             Network::ZcashTestnet,
         )?)
+    }
+
+    fn shielded_chain_with_checkpoints(
+        activations: &NetworkUpgradeActivations,
+        tip: BlockHeight,
+        checkpoint_heights: &[u32],
+    ) -> Result<Vec<Result<crate::CanonicalBuildBlock, std::io::Error>>, Box<dyn std::error::Error>>
+    {
+        let mut trees = NoteCommitmentTrees::new(activations)?;
+        let mut blocks = Vec::new();
+        let mut parent = Network::ZcashTestnet.genesis_hash().as_bytes();
+        for height in 1..=tip.value() {
+            let tag = u8::try_from(height)?;
+            let hash = [tag; 32];
+            let mut block = replacement_block(BlockHeight::new(height), hash, parent, tag)?;
+            trees.append_block(&mut block)?;
+            block.tree_state_checkpoint = checkpoint_heights
+                .contains(&height)
+                .then(|| trees.checkpoint(&block))
+                .transpose()?;
+            blocks.push(Ok(block));
+            parent = hash;
+        }
+        Ok(blocks)
     }
 
     fn add_tree_state_checkpoint(
