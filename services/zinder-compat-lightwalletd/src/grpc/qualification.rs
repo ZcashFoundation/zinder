@@ -444,42 +444,45 @@ async fn wallet_ordered_utxos(
         return Ok(rows);
     }
     let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
-    let mut at_cutoff = rows.len() - before_cutoff;
-    let first_read = rows.split_off(before_cutoff);
+    // Every reread answers at the served tip, so it must agree with every
+    // earlier page: it repeats, in order, the longest run of cutoff-height
+    // outputs seen so far, and names no output an earlier page placed below
+    // the cutoff.
+    let mut verified = rows.split_off(before_cutoff);
+    let earlier: HashSet<_> = rows.iter().map(|row| row.outpoint).collect();
     let mut tail_limit = limit;
-    let mut tail = loop {
-        if at_cutoff == u32_to_usize(TransparentAddressRowLimit::MAX.get()) {
-            // The RPC has no end height. Later outputs can push this read over
-            // the node limit and leave the cutoff block's final order unknown.
-            break served_utxo_page(node, lookup, cutoff, None, served)
-                .await?
-                .outputs;
-        }
-        tail_limit = TransparentAddressRowLimit::new(tail_limit.get() * 2)
-            .unwrap_or(TransparentAddressRowLimit::MAX);
-        let page = served_utxo_page(node, lookup, cutoff, Some(tail_limit), served).await?;
-        at_cutoff = page
+    loop {
+        // The RPC has no end height. Later outputs can push a bounded read
+        // over the node limit and leave the cutoff block's final order unknown.
+        let unbounded = verified.len() == u32_to_usize(TransparentAddressRowLimit::MAX.get());
+        let page = if unbounded {
+            served_utxo_page(node, lookup, cutoff, None, served).await?
+        } else {
+            tail_limit = TransparentAddressRowLimit::new(tail_limit.get() * 2)
+                .unwrap_or(TransparentAddressRowLimit::MAX);
+            served_utxo_page(node, lookup, cutoff, Some(tail_limit), served).await?
+        };
+        let at_cutoff = page
             .outputs
             .partition_point(|row| row.block_height == cutoff);
-        if page.complete || at_cutoff < page.outputs.len() {
-            break page.outputs;
+        let agrees = page.outputs[..at_cutoff].starts_with(&verified)
+            && !page
+                .outputs
+                .iter()
+                .any(|row| earlier.contains(&row.outpoint));
+        if !agrees {
+            return Err(outside_served_view(
+                "node UTXO pages at the served tip disagree",
+            ));
         }
-    };
-    tail.truncate(tail.partition_point(|row| row.block_height == cutoff));
-    // Both reads answer at the served tip, so the reread must repeat the
-    // outputs the first read returned at the cutoff height, value and all.
-    let repeats_first_read = tail.starts_with(&first_read);
-    rows.append(&mut tail);
-    let distinct = rows
-        .iter()
-        .map(|row| row.outpoint)
-        .collect::<HashSet<_>>()
-        .len();
-    if !repeats_first_read || distinct != rows.len() {
-        return Err(outside_served_view(
-            "node UTXO pages at the served tip disagree",
-        ));
+        let finished = unbounded || page.complete || at_cutoff < page.outputs.len();
+        verified = page.outputs;
+        verified.truncate(at_cutoff);
+        if finished {
+            break;
+        }
     }
+    rows.append(&mut verified);
     Ok(rows)
 }
 

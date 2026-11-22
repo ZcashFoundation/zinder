@@ -1156,3 +1156,79 @@ async fn a_continuation_page_without_chain_info_is_refused() -> Result<()> {
     assert_eq!(status.code(), Code::DataLoss);
     Ok(())
 }
+
+/// A node serving `blocks` blocks that answers successive `getaddressutxos`
+/// reads with `pages`, each naming the served tip. A page lists
+/// `(height, repeated txid byte)` outputs.
+fn utxo_pages_fixture(blocks: u32, pages: &[&[(u32, &str)]]) -> Result<Fixture> {
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let tip = served_tip(blocks)?;
+    let replies: Vec<_> = pages
+        .iter()
+        .map(|page| {
+            let rows: Vec<_> = page
+                .iter()
+                .map(|(height, id)| address_output(&id.repeat(32), *height, &script))
+                .collect();
+            method("getaddressutxos").reply(utxos_at(tip, &json!(rows)))
+        })
+        .collect();
+    Fixture::with_node_timeout(blocks, replies, Duration::from_secs(2))
+}
+
+fn bounded_utxos(max_entries: u32) -> Request<lightwalletd::GetAddressUtxosArg> {
+    Request::new(lightwalletd::GetAddressUtxosArg {
+        addresses: vec![ADDRESS.to_owned()],
+        start_height: 1,
+        max_entries,
+    })
+}
+
+#[tokio::test]
+async fn a_later_reread_that_drops_outputs_an_earlier_reread_showed_is_unavailable() -> Result<()> {
+    // maxEntries 1: the first read shows two outputs at the cutoff height, the
+    // four-row reread repeats both and adds two, and the final reread returns
+    // only the original two.
+    let fixture = utxo_pages_fixture(
+        2,
+        &[
+            &[(2, "05"), (2, "06")],
+            &[(2, "05"), (2, "06"), (2, "01"), (2, "02")],
+            &[(2, "05"), (2, "06")],
+        ],
+    )?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(bounded_utxos(1))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("dropped outputs an earlier reread showed"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reread_that_moves_an_earlier_output_above_the_cutoff_is_unavailable() -> Result<()> {
+    // The first read places 04 below the cutoff height 2; the reread from 2
+    // places the same output at height 3, above it.
+    let fixture = utxo_pages_fixture(
+        3,
+        &[
+            &[(1, "04"), (2, "03"), (2, "02")],
+            &[(2, "03"), (2, "02"), (3, "04")],
+        ],
+    )?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(bounded_utxos(2))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted an output at two heights"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    Ok(())
+}
