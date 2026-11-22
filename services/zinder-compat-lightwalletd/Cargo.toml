@@ -23,6 +23,7 @@ fs-verity.workspace = true
 futures-util = { workspace = true, optional = true }
 hex.workspace = true
 http.workspace = true
+parking_lot.workspace = true
 prost.workspace = true
 metrics.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -65,7 +66,6 @@ eyre.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 metrics-exporter-prometheus.workspace = true
-parking_lot.workspace = true
 prost-types.workspace = true
 reqwest.workspace = true
 rust-rocksdb.workspace = true

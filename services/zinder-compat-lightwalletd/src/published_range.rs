@@ -11,9 +11,11 @@ pub use catalog::ShieldedCatalogPublisher;
 pub use history::PublishedShieldedHistory;
 pub(crate) use read::PublishedRangeRead;
 
-use std::{io, path::Path, sync::Arc};
+use std::{collections::VecDeque, io, path::Path};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, Network};
 use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
@@ -37,11 +39,14 @@ struct ShieldedRangeIdentity {
     fs_verity_sha256: Option<[u8; 32]>,
 }
 
+const MAX_VERIFIED_SETTLED_TIPS: usize = 16;
+
 /// A settled, read-only projection of the default shielded range format.
 struct PublishedShieldedRange {
     identity: ShieldedRangeIdentity,
     segment: SealedHistory,
-    verified_settled_tip: arc_swap::ArcSwapOption<BlockId>,
+    verified_settled_tips: Mutex<VecDeque<BlockId>>,
+    anchor_check_lock: tokio::sync::Mutex<()>,
 }
 
 impl PublishedShieldedRange {
@@ -147,8 +152,38 @@ impl PublishedShieldedRange {
         Ok(Self {
             identity,
             segment,
-            verified_settled_tip: arc_swap::ArcSwapOption::empty(),
+            verified_settled_tips: Mutex::new(VecDeque::with_capacity(MAX_VERIFIED_SETTLED_TIPS)),
+            anchor_check_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    fn is_settled_tip_verified(&self, settled: BlockId) -> bool {
+        let mut tips = self.verified_settled_tips.lock();
+        let Some(pos) = tips.iter().position(|cached| *cached == settled) else {
+            return false;
+        };
+        if pos + 1 != tips.len()
+            && let Some(hit) = tips.remove(pos)
+        {
+            tips.push_back(hit);
+        }
+        true
+    }
+
+    fn record_verified_settled_tip(&self, settled: BlockId) {
+        let mut tips = self.verified_settled_tips.lock();
+        if let Some(pos) = tips.iter().position(|cached| *cached == settled) {
+            if pos + 1 != tips.len()
+                && let Some(hit) = tips.remove(pos)
+            {
+                tips.push_back(hit);
+            }
+            return;
+        }
+        if tips.len() == MAX_VERIFIED_SETTLED_TIPS {
+            tips.pop_front();
+        }
+        tips.push_back(settled);
     }
 
     /// The authenticated value a replacement reader needs to admit the same projection.
@@ -161,9 +196,11 @@ impl PublishedShieldedRange {
         &self,
         reads: &Reads,
         view: &Reads::View,
+        cancel: &CancellationToken,
     ) -> Result<(), Status> {
         self.check_anchor(
             Reads::view_chain_epoch(view),
+            cancel,
             reads.block_hash_at(view, self.segment.identity().end.height),
         )
         .await
@@ -176,7 +213,7 @@ impl PublishedShieldedRange {
     /// Rejects a differently settled chain, an incompatible artifact schema, or unavailable canonical data.
     async fn verify_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
         let end = self.segment.identity().end.height;
-        self.check_anchor(source.chain_epoch(), async {
+        self.check_anchor(source.chain_epoch(), &CancellationToken::new(), async {
             source
                 .block_header_at(end)
                 .await
@@ -190,6 +227,7 @@ impl PublishedShieldedRange {
     async fn check_anchor(
         &self,
         chain: ChainEpoch,
+        cancel: &CancellationToken,
         terminal: impl Future<Output = Result<BlockHash, Status>> + Send,
     ) -> Result<(), Status> {
         let segment = self.segment.identity();
@@ -203,7 +241,21 @@ impl PublishedShieldedRange {
         }
         let settled = BlockId::new(chain.settled_tip_height, chain.settled_tip_hash);
         // A settled tip hash commits to its ancestry, including the authenticated segment end.
-        if self.verified_settled_tip.load().as_deref() == Some(&settled) {
+        if self.is_settled_tip_verified(settled) {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err(Status::cancelled("block-range stream cancelled"));
+        }
+        let _anchor_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(Status::cancelled("block-range stream cancelled")),
+            guard = self.anchor_check_lock.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return Err(Status::cancelled("block-range stream cancelled"));
+        }
+        if self.is_settled_tip_verified(settled) {
             return Ok(());
         }
         let anchor = if segment.end.height == chain.settled_tip_height {
@@ -216,7 +268,7 @@ impl PublishedShieldedRange {
                 "shielded range terminal block differs from the settled chain",
             ));
         }
-        self.verified_settled_tip.store(Some(Arc::new(settled)));
+        self.record_verified_settled_tip(settled);
         Ok(())
     }
 }

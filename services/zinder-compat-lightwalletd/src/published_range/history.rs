@@ -5,6 +5,7 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::BlockHeightRange;
 use zinder_query::CanonicalReader;
@@ -213,8 +214,14 @@ impl PublishedShieldedCatalog {
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
-        allow_oversized: bool,
+        (allow_oversized, cancel): (bool, &CancellationToken),
     ) -> io::Result<Vec<SealedBlock>> {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "block-range stream cancelled",
+            ));
+        }
         let segments = self.segments();
         let start =
             segments.partition_point(|part| part.segment.identity().end.height < range.start);
@@ -240,6 +247,12 @@ impl PublishedShieldedCatalog {
             HeightOrder::Ascending => parts.next(),
             HeightOrder::Descending => parts.next_back(),
         } {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "block-range stream cancelled",
+                ));
+            }
             let identity = part.segment.identity();
             let span = BlockHeightRange::inclusive(
                 range.start.max(identity.start),

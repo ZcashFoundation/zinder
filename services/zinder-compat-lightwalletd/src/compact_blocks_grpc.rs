@@ -190,7 +190,13 @@ fn read_chunk_on_this_thread<Output>(
         order,
         max_bytes,
         view,
+        cancel,
     } = read;
+    if cancel.is_cancelled() {
+        return ChunkReadOutcome::unread(ChunkReadFailure::Failed(Status::cancelled(
+            "block-range stream cancelled",
+        )));
+    }
     let reader = match view {
         ChunkView::Captured(reader) => reader,
         ChunkView::Current => slot.capture(),
@@ -204,6 +210,14 @@ fn read_chunk_on_this_thread<Output>(
         read_on_blocking_thread(reader.compact_blocks_in_range_up_to(chunk, order, max_bytes));
     let read_duration = started_at.elapsed();
     drop(reader);
+    if cancel.is_cancelled() {
+        return ChunkReadOutcome {
+            read_duration: Some(read_duration),
+            converted: Err(ChunkReadFailure::Failed(Status::cancelled(
+                "block-range stream cancelled",
+            ))),
+        };
+    }
     ChunkReadOutcome {
         read_duration: Some(read_duration),
         converted: blocks
