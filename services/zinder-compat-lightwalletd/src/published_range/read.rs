@@ -296,7 +296,9 @@ impl PublishedRangeRead {
                 },
             ),
             Ok(None) => AnchorPlan::FallbackNative,
-            Err(status) if status.code() == tonic::Code::Cancelled => AnchorPlan::Failed(status),
+            Err(status) if status.code() == tonic::Code::Cancelled || pin_unavailable(&status) => {
+                AnchorPlan::Failed(status)
+            }
             Err(status) => {
                 tracing::warn!(%status, "serving the uncovered tail from canonical storage");
                 AnchorPlan::FallbackNative
@@ -305,7 +307,7 @@ impl PublishedRangeRead {
     }
 }
 
-fn pin_unavailable(status: &Status) -> bool {
+pub(super) fn pin_unavailable(status: &Status) -> bool {
     status
         .get_error_details()
         .error_info()

@@ -43,6 +43,11 @@ pub(super) struct EncodedTail {
 trait TailSource: Sync {
     fn epoch_and_fence(&self) -> (ChainEpoch, Fence);
 
+    fn cancel(&self) -> &CancellationToken;
+
+    /// Returns whether this source still reads the view current now.
+    fn is_current(&self) -> impl Future<Output = bool> + Send;
+
     fn block_hash_at(
         &self,
         height: BlockHeight,
@@ -57,6 +62,7 @@ trait TailSource: Sync {
 
 struct CanonicalTailSource<'a> {
     reader: &'a dyn CanonicalReader,
+    cancel: CancellationToken,
 }
 
 impl TailSource for CanonicalTailSource<'_> {
@@ -65,6 +71,14 @@ impl TailSource for CanonicalTailSource<'_> {
             self.reader.chain_epoch(),
             (self.reader.event_fence(), self.reader.history_bounds()),
         )
+    }
+
+    fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    fn is_current(&self) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 
     async fn block_hash_at(&self, height: BlockHeight) -> Result<Option<BlockHash>, Status> {
@@ -92,6 +106,7 @@ struct ReadsTailSource<'a, Reads: CompactBlockReads> {
     reads: &'a Reads,
     view: &'a Reads::View,
     fence: Fence,
+    cancel: &'a CancellationToken,
 }
 
 impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
@@ -99,9 +114,21 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
         (Reads::view_chain_epoch(self.view), self.fence)
     }
 
+    fn cancel(&self) -> &CancellationToken {
+        self.cancel
+    }
+
+    async fn is_current(&self) -> bool {
+        self.reads.capture_view().await.is_ok_and(|current| {
+            Reads::view_chain_epoch(&current) == Reads::view_chain_epoch(self.view)
+                && self.reads.range_fence(&current) == Some(self.fence)
+        })
+    }
+
     async fn block_hash_at(&self, height: BlockHeight) -> Result<Option<BlockHash>, Status> {
         match self.reads.block_hash_at(self.view, height).await {
             Ok(hash) => Ok(Some(hash)),
+            Err(status) if super::read::pin_unavailable(&status) => Err(status),
             Err(status)
                 if matches!(
                     status.code(),
@@ -117,15 +144,35 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
         }
     }
 
-    fn read_rows(
+    async fn read_rows(
         &self,
         range: BlockHeightRange,
         max_bytes: usize,
-    ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
-    {
-        self.reads
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
+        let rows = self
+            .reads
             .read_compact_block_rows_with_lengths(self.view, range, max_bytes)
+            .await?;
+        // Epoch pins match by identifier, and a republished pair keeps it.
+        // Cached rows must come from the pair that still answers this fence.
+        if rows.is_some() && self.reads.range_fence(self.view) != Some(self.fence) {
+            return Err(Status::aborted(
+                "the canonical view changed during the live-tail read",
+            ));
+        }
+        Ok(rows)
     }
+}
+
+fn cancelled() -> Status {
+    Status::cancelled("block-range stream cancelled")
+}
+
+fn check_cancel(source: &impl TailSource) -> Result<(), Status> {
+    if source.cancel().is_cancelled() {
+        return Err(cancelled());
+    }
+    Ok(())
 }
 
 impl ShieldedTailBuffer {
@@ -166,31 +213,35 @@ impl ShieldedTailBuffer {
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
-        let source = ReadsTailSource { reads, view, fence };
-        self.refresh_with_limit(&source, catalog, (Some(requested), TAIL_BYTES, cancel))
+        let source = ReadsTailSource {
+            reads,
+            view,
+            fence,
+            cancel,
+        };
+        self.refresh_with_limit(&source, catalog, (Some(requested), TAIL_BYTES))
             .await
     }
 
-    async fn refresh_with_source<Source: TailSource>(
-        &self,
+    /// Returns whether `source` would replace a tail built for another view
+    /// although a newer view is current, so its rows must not be installed.
+    async fn displaces_current<Source: TailSource>(
         source: &Source,
-        catalog: Option<(BlockHeight, BlockId)>,
-        requested: Option<BlockHeightRange>,
-    ) -> Result<Option<Arc<EncodedTail>>, Status> {
-        let no_cancel = CancellationToken::new();
-        self.refresh_with_limit(source, catalog, (requested, TAIL_BYTES, &no_cancel))
-            .await
+        tail: Option<&EncodedTail>,
+    ) -> bool {
+        let (epoch, fence) = source.epoch_and_fence();
+        tail.is_some_and(|tail| tail.epoch != epoch || tail.fence != fence)
+            && !source.is_current().await
     }
 
     async fn refresh_with_limit<Source: TailSource>(
         &self,
         source: &Source,
         catalog: Option<(BlockHeight, BlockId)>,
-        (requested, max_tail_bytes, cancel): (Option<BlockHeightRange>, usize, &CancellationToken),
+        (requested, max_tail_bytes): (Option<BlockHeightRange>, usize),
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
-        if cancel.is_cancelled() {
-            return Err(Status::cancelled("block-range stream cancelled"));
-        }
+        let cancel = source.cancel();
+        check_cancel(source)?;
         let (epoch, fence) = source.epoch_and_fence();
         let Some(window_floor) = Self::window_floor(epoch, fence.1, catalog.map(|(end, _)| end))
         else {
@@ -201,28 +252,33 @@ impl ShieldedTailBuffer {
             Some(chunk) => chunk.start.max(window_floor),
             None => window_floor,
         };
-        if let Some(existing) = self
-            .load_full()
+        let existing = self.load_full();
+        if let Some(existing) = existing
+            .as_ref()
             .filter(|tail| tail.satisfies(epoch, fence, requested_floor))
         {
-            return Ok(Some(existing));
+            return Ok(Some(existing.clone()));
         }
-        if cancel.is_cancelled() {
-            return Err(Status::cancelled("block-range stream cancelled"));
+        if Self::displaces_current(source, existing.as_deref()).await {
+            return Ok(None);
         }
+        check_cancel(source)?;
         let _guard = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(Status::cancelled("block-range stream cancelled")),
+            () = cancel.cancelled() => return Err(cancelled()),
             guard = self.0.refresh_lock.lock() => guard,
         };
-        if cancel.is_cancelled() {
-            return Err(Status::cancelled("block-range stream cancelled"));
-        }
+        check_cancel(source)?;
         let previous = self.load_full();
         if let Some(existing) = &previous
             && existing.satisfies(epoch, fence, requested_floor)
         {
             return Ok(Some(existing.clone()));
+        }
+        if !option_ptr_eq(existing.as_ref(), previous.as_ref())
+            && Self::displaces_current(source, previous.as_deref()).await
+        {
+            return Ok(None);
         }
         let updated = match &previous {
             Some(existing) if existing.epoch == epoch && existing.fence == fence => {
@@ -246,6 +302,10 @@ impl ShieldedTailBuffer {
         }
         Ok(None)
     }
+}
+
+fn option_ptr_eq<T>(left: Option<&Arc<T>>, right: Option<&Arc<T>>) -> bool {
+    left.map(Arc::as_ptr) == right.map(Arc::as_ptr)
 }
 
 impl EncodedTail {
@@ -331,6 +391,7 @@ impl EncodedTail {
             .partition_point(|row| row.id.height <= epoch.visible_tip_height);
         let mut lo = left.min(hi);
         while lo < hi {
+            check_cancel(source)?;
             let mid = if hi == self.rows.len() && lo == left {
                 hi - 1
             } else {
@@ -376,6 +437,12 @@ async fn build_or_extend<Source: TailSource>(
         Some(prior) => prior.retained_prefix(source, window_floor).await?,
         None => VecDeque::new(),
     };
+    // A retained capped front keeps the cap, so a floor below it does not
+    // re-encode a batch that cannot fit.
+    let byte_capped = previous.is_some_and(|prior| {
+        prior.byte_capped
+            && retained.front().map(|row| row.id) == prior.rows.front().map(|row| row.id)
+    });
     let mut start_floor = requested_floor;
     if let Some((catalog_end, _)) = catalog
         && previous.is_none()
@@ -394,7 +461,7 @@ async fn build_or_extend<Source: TailSource>(
         epoch,
         fence,
         bytes: retained.iter().map(|row| row.payload.len()).sum(),
-        byte_capped: false,
+        byte_capped,
         rows: retained,
     };
     if let Some(first) = next
@@ -477,6 +544,7 @@ async fn read_prepend_batches<Source: TailSource>(
     let mut byte_capped =
         existing.byte_capped || (remaining_bytes == 0 && cursor >= target_floor.value());
     while cursor >= target_floor.value() && remaining_bytes > 0 {
+        check_cancel(source)?;
         let batch_start = cursor
             .saturating_sub(ENCODE_BATCH_BLOCKS - 1)
             .max(target_floor.value());
@@ -539,6 +607,7 @@ async fn encode_span<Source: TailSource>(
         Vec::with_capacity(usize::try_from(span.end.value() - span.start.value() + 1).unwrap_or(0));
     let mut next = Some(span.start);
     while let Some(height) = next.filter(|height| *height <= span.end) {
+        check_cancel(source)?;
         let last =
             BlockHeight::new(height.value().saturating_add(ENCODE_BATCH_BLOCKS - 1)).min(span.end);
         let Some(rows) = encode_range(source, BlockHeightRange::inclusive(height, last)).await?
@@ -563,11 +632,14 @@ async fn encode_span<Source: TailSource>(
 impl PublishedShieldedCatalog {
     pub(super) async fn refresh_tail(&self, reader: &dyn CanonicalReader) -> Result<(), Status> {
         self.verify_source(reader).await?;
-        let source = CanonicalTailSource { reader };
+        let source = CanonicalTailSource {
+            reader,
+            cancel: CancellationToken::new(),
+        };
         let terminal = (self.bounds().end, self.terminal().segment.identity().end);
         let _ = self
             .tail
-            .refresh_with_source(&source, Some(terminal), None)
+            .refresh_with_limit(&source, Some(terminal), (None, TAIL_BYTES))
             .await?;
         Ok(())
     }
@@ -622,6 +694,9 @@ mod tests {
         blocks: Vec<CompactBlockArtifact>,
         reads: Mutex<Vec<BlockHeightRange>>,
         unsupported: bool,
+        current: bool,
+        cancel: CancellationToken,
+        cancel_on_read: bool,
     }
 
     fn mock_hash(height: u32, branch: u8) -> BlockHash {
@@ -677,12 +752,23 @@ mod tests {
             blocks,
             reads: Mutex::new(Vec::new()),
             unsupported: false,
+            current: true,
+            cancel: CancellationToken::new(),
+            cancel_on_read: false,
         }
     }
 
     impl TailSource for MockTailSource {
         fn epoch_and_fence(&self) -> (ChainEpoch, Fence) {
             (self.epoch, self.fence)
+        }
+
+        fn cancel(&self) -> &CancellationToken {
+            &self.cancel
+        }
+
+        fn is_current(&self) -> impl Future<Output = bool> + Send {
+            std::future::ready(self.current)
         }
 
         fn block_hash_at(
@@ -703,6 +789,9 @@ mod tests {
         ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
         {
             self.reads.lock().push(range);
+            if self.cancel_on_read {
+                self.cancel.cancel();
+            }
             if self.unsupported {
                 return std::future::ready(Ok(None));
             }
@@ -724,24 +813,23 @@ mod tests {
         let buffer = ShieldedTailBuffer::default();
         let source = build_source(10, 1);
         let span = |s, e| BlockHeightRange::inclusive(BlockHeight::new(s), BlockHeight::new(e));
-        let no_cancel = CancellationToken::new();
 
         let first = buffer
-            .refresh_with_limit(&source, None, (Some(span(8, 10)), TAIL_BYTES, &no_cancel))
+            .refresh_with_limit(&source, None, (Some(span(8, 10)), TAIL_BYTES))
             .await?
             .ok_or_else(|| eyre::eyre!("expected cold tail"))?;
         assert_eq!(first.bounds(), Some(span(8, 10)));
         assert_eq!(*source.reads.lock(), vec![span(8, 10)]);
 
         let repeat = buffer
-            .refresh_with_limit(&source, None, (Some(span(9, 10)), TAIL_BYTES, &no_cancel))
+            .refresh_with_limit(&source, None, (Some(span(9, 10)), TAIL_BYTES))
             .await?
             .ok_or_else(|| eyre::eyre!("expected hit"))?;
         assert!(Arc::ptr_eq(&first, &repeat));
         assert_eq!(source.reads.lock().len(), 1);
 
         let expanded = buffer
-            .refresh_with_limit(&source, None, (Some(span(5, 10)), TAIL_BYTES, &no_cancel))
+            .refresh_with_limit(&source, None, (Some(span(5, 10)), TAIL_BYTES))
             .await?
             .ok_or_else(|| eyre::eyre!("expected backward prepend"))?;
         assert_eq!(expanded.bounds(), Some(span(5, 10)));
@@ -754,25 +842,17 @@ mod tests {
         let single_row_bytes = first.rows[0].payload.len();
         let capped_budget = expanded.bytes + single_row_bytes;
         let capped = buffer
-            .refresh_with_limit(
-                &source,
-                None,
-                (Some(span(1, 10)), capped_budget, &no_cancel),
-            )
+            .refresh_with_limit(&source, None, (Some(span(1, 10)), capped_budget))
             .await?
             .ok_or_else(|| eyre::eyre!("expected byte-capped tail"))?;
         assert_eq!(capped.bounds(), Some(span(4, 10)));
         assert!(capped.byte_capped);
         assert!(capped.satisfies(source.epoch, source.fence, BlockHeight::new(1)));
 
-        let precancelled = CancellationToken::new();
-        precancelled.cancel();
+        let precancelled = build_source(10, 1);
+        precancelled.cancel.cancel();
         let cancelled = buffer
-            .refresh_with_limit(
-                &source,
-                None,
-                (Some(span(1, 10)), TAIL_BYTES, &precancelled),
-            )
+            .refresh_with_limit(&precancelled, None, (Some(span(1, 10)), TAIL_BYTES))
             .await;
         assert!(matches!(cancelled, Err(status) if status.code() == Code::Cancelled));
         Ok(())
@@ -784,26 +864,21 @@ mod tests {
         let mut no_lengths = build_source(5, 1);
         no_lengths.unsupported = true;
         let span = |s, e| BlockHeightRange::inclusive(BlockHeight::new(s), BlockHeight::new(e));
-        let no_cancel = CancellationToken::new();
         assert!(
             buffer
-                .refresh_with_limit(
-                    &no_lengths,
-                    None,
-                    (Some(span(3, 5)), TAIL_BYTES, &no_cancel)
-                )
+                .refresh_with_limit(&no_lengths, None, (Some(span(3, 5)), TAIL_BYTES))
                 .await?
                 .is_none()
         );
 
         let initial = build_source(5, 1);
         let tail_one = buffer
-            .refresh_with_limit(&initial, None, (Some(span(3, 5)), TAIL_BYTES, &no_cancel))
+            .refresh_with_limit(&initial, None, (Some(span(3, 5)), TAIL_BYTES))
             .await?
             .ok_or_else(|| eyre::eyre!("expected initial tail"))?;
         let extended = build_source(6, 1);
         let tail_two = buffer
-            .refresh_with_limit(&extended, None, (Some(span(3, 6)), TAIL_BYTES, &no_cancel))
+            .refresh_with_limit(&extended, None, (Some(span(3, 6)), TAIL_BYTES))
             .await?
             .ok_or_else(|| eyre::eyre!("expected extended tail"))?;
         assert_eq!(tail_two.bounds(), Some(span(3, 6)));
@@ -812,6 +887,254 @@ mod tests {
             tail_two.rows[0].payload.as_ptr(),
             tail_one.rows[0].payload.as_ptr()
         );
+        Ok(())
+    }
+
+    fn span(first: u32, last: u32) -> BlockHeightRange {
+        BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last))
+    }
+
+    #[tokio::test]
+    async fn a_stale_view_does_not_displace_the_current_tail() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let advanced = build_source(6, 1);
+        let current = buffer
+            .refresh_with_limit(&advanced, None, (Some(span(3, 6)), TAIL_BYTES))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected current tail"))?;
+
+        let mut stale = build_source(5, 1);
+        stale.current = false;
+        assert!(
+            buffer
+                .refresh_with_limit(&stale, None, (Some(span(3, 5)), TAIL_BYTES))
+                .await?
+                .is_none()
+        );
+        assert!(stale.reads.lock().is_empty());
+        assert!(
+            buffer
+                .load_full()
+                .is_some_and(|tail| Arc::ptr_eq(&tail, &current))
+        );
+
+        let reorged = build_source(6, 2);
+        let replaced = buffer
+            .refresh_with_limit(&reorged, None, (Some(span(3, 6)), TAIL_BYTES))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected replacement tail"))?;
+        assert_eq!(replaced.epoch, reorged.epoch);
+        assert!(
+            buffer
+                .load_full()
+                .is_some_and(|tail| Arc::ptr_eq(&tail, &replaced))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_tail_builds_and_prepends_between_batches() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let mut source = build_source(2_500, 1);
+        source.cancel_on_read = true;
+        let built = buffer
+            .refresh_with_limit(&source, None, (Some(span(1, 2_500)), TAIL_BYTES))
+            .await;
+        assert!(matches!(built, Err(status) if status.code() == Code::Cancelled));
+        assert_eq!(*source.reads.lock(), vec![span(1, 1_000)]);
+        assert!(buffer.load_full().is_none());
+
+        let mut source = build_source(2_500, 1);
+        buffer
+            .refresh_with_limit(&source, None, (Some(span(2_000, 2_500)), TAIL_BYTES))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected suffix tail"))?;
+        source.cancel_on_read = true;
+        let prepended = buffer
+            .refresh_with_limit(&source, None, (Some(span(1, 2_500)), TAIL_BYTES))
+            .await;
+        assert!(matches!(prepended, Err(status) if status.code() == Code::Cancelled));
+        assert_eq!(
+            *source.reads.lock(),
+            vec![span(2_000, 2_500), span(1_000, 1_999)]
+        );
+        assert_eq!(
+            buffer.load_full().and_then(|tail| tail.bounds()),
+            Some(span(2_000, 2_500))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tip_extension_keeps_the_byte_cap_of_its_retained_front() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let source = build_source(10, 1);
+        let suffix = buffer
+            .refresh_with_limit(&source, None, (Some(span(5, 10)), TAIL_BYTES))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected suffix tail"))?;
+        let row = suffix.rows[0].payload.len();
+        let capped = buffer
+            .refresh_with_limit(&source, None, (Some(span(1, 10)), suffix.bytes + row / 2))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected capped tail"))?;
+        assert!(capped.byte_capped);
+        assert_eq!(capped.bounds(), Some(span(5, 10)));
+
+        let advanced = build_source(11, 1);
+        let extended = buffer
+            .refresh_with_limit(
+                &advanced,
+                None,
+                (Some(span(1, 11)), suffix.bytes + row + row / 2),
+            )
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected extended tail"))?;
+        assert_eq!(extended.bounds(), Some(span(5, 11)));
+        assert!(extended.byte_capped);
+        assert_eq!(*advanced.reads.lock(), vec![span(11, 11)]);
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct FencedReads {
+        source: Arc<MockTailSource>,
+        fence: Arc<Mutex<Option<Fence>>>,
+        republished: Option<Fence>,
+        pin_lost: bool,
+    }
+
+    impl FencedReads {
+        fn new(source: MockTailSource) -> Self {
+            Self {
+                fence: Arc::new(Mutex::new(Some(source.fence))),
+                source: Arc::new(source),
+                republished: None,
+                pin_lost: false,
+            }
+        }
+    }
+
+    impl CompactBlockReads for FencedReads {
+        type View = ChainEpoch;
+
+        fn capture_view(&self) -> impl Future<Output = Result<ChainEpoch, Status>> + Send {
+            std::future::ready(Ok(self.source.epoch))
+        }
+
+        fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {
+            *view
+        }
+
+        fn range_fence(&self, _view: &ChainEpoch) -> Option<Fence> {
+            *self.fence.lock()
+        }
+
+        fn view_activations(
+            &self,
+            _view: &ChainEpoch,
+        ) -> impl Future<Output = Result<zinder_core::NetworkUpgradeActivations, Status>> + Send
+        {
+            std::future::ready(Ok(zinder_testkit::sample_regtest_upgrade_activations()))
+        }
+
+        fn tip_block_time(
+            &self,
+            _view: &ChainEpoch,
+        ) -> impl Future<Output = Result<i64, Status>> + Send {
+            std::future::ready(Ok(0))
+        }
+
+        fn read_compact_block(
+            &self,
+            _view: &ChainEpoch,
+            _block: crate::block_methods::RequestedBlock,
+        ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send {
+            std::future::ready(Err(Status::unimplemented("the test serves no block")))
+        }
+
+        async fn block_hash_at(
+            &self,
+            view: &ChainEpoch,
+            height: BlockHeight,
+        ) -> Result<BlockHash, Status> {
+            if self.pin_lost {
+                return Err(zinder_query::status_from_query_error(
+                    &zinder_query::QueryError::ChainEpochPinUnavailable {
+                        chain_epoch_id: view.id,
+                    },
+                ));
+            }
+            self.source
+                .block_hash_at(height)
+                .await?
+                .ok_or_else(|| Status::not_found("missing fixture block"))
+        }
+
+        async fn read_compact_block_rows_with_lengths(
+            &self,
+            _view: &ChainEpoch,
+            range: BlockHeightRange,
+            max_bytes: usize,
+        ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
+            let rows = self.source.read_rows(range, max_bytes).await;
+            if let Some(republished) = self.republished {
+                *self.fence.lock() = Some(republished);
+            }
+            rows
+        }
+
+        fn read_compact_block_chunk<Output, Convert>(
+            &self,
+            _read: crate::block_methods::ChunkRead<ChainEpoch>,
+            _convert: Convert,
+        ) -> impl Future<Output = crate::block_methods::ChunkReadOutcome<Output>> + Send
+        where
+            Output: Send + 'static,
+            Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
+        {
+            std::future::ready(crate::block_methods::ChunkReadOutcome::unread(
+                crate::block_methods::ChunkReadFailure::Failed(Status::unimplemented(
+                    "the test serves no block range",
+                )),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_republished_pair_during_a_tail_read_installs_no_rows() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let mut reads = FencedReads::new(build_source(6, 1));
+        reads.republished = Some(build_source(6, 2).fence);
+        let (epoch, fence) = reads.source.epoch_and_fence();
+        let cancel = CancellationToken::new();
+        let refreshed = buffer
+            .load_or_refresh((&reads, &epoch, fence, &cancel), None, span(3, 6))
+            .await;
+        assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
+        assert!(buffer.load_full().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_expired_pin_is_not_read_as_a_reorg() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let reads = FencedReads::new(build_source(6, 1));
+        let (epoch, fence) = reads.source.epoch_and_fence();
+        let cancel = CancellationToken::new();
+        buffer
+            .load_or_refresh((&reads, &epoch, fence, &cancel), None, span(3, 6))
+            .await?
+            .ok_or_else(|| eyre::eyre!("expected initial tail"))?;
+
+        let mut advanced = FencedReads::new(build_source(7, 1));
+        advanced.pin_lost = true;
+        let (epoch, fence) = advanced.source.epoch_and_fence();
+        let refreshed = buffer
+            .load_or_refresh((&advanced, &epoch, fence, &cancel), None, span(3, 7))
+            .await;
+        assert!(matches!(refreshed, Err(status) if super::super::read::pin_unavailable(&status)));
+        assert!(advanced.source.reads.lock().is_empty());
         Ok(())
     }
 }
