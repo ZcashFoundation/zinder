@@ -187,8 +187,13 @@ if [[ -n "$compose_contract" ]]; then
       and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY == $catalog
       and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY == $public_key
       and all($services | del(.["zinder-history-publisher"]) | .[].volumes[]? | select(.type == "bind");
-        .source as $source | $source != ($generation + "/publisher.pk8")
-        and (($generation + "/publisher.pk8") | startswith(($source | rtrimstr("/")) + "/") | not))
+        (.source | rtrimstr("/")) as $source
+        | $source != ($generation + "/publisher.pk8")
+          and (($generation + "/publisher.pk8") | startswith($source + "/") | not)
+          and (if $source == ($generation + "/publisher.pub")
+                or $source == ($generation + "/catalog")
+                or ($source | startswith($generation + "/catalog/"))
+               then .read_only == true else true end))
   ' "$compose_contract" >/dev/null || {
     echo "release admission rejected: invalid signed wallet history publication or reader mounts" >&2
     exit 1

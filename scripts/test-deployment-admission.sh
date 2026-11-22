@@ -135,6 +135,21 @@ expect_rejected "a query process with access to the publisher signing key" --com
 jq '(.services["zinder-compat-lightwalletd"].volumes[] | select(.target == "/var/lib/zinder-history")).read_only = false' \
   "$history_compose" > "$invalid_history_compose"
 expect_rejected "a writer-capable catalog mount in a reader" --compose-contract "$invalid_history_compose"
+for history_source in catalog catalog/segment.bin publisher.pub; do
+  for read_only in true false; do
+    jq --arg source "$history_dir/$history_source" --argjson readonly "$read_only" '
+      .services["zinder-query"].volumes += [
+        {type: "bind", source: $source, target: "/run/history-input", read_only: $readonly,
+         bind: {create_host_path: false}}]
+    ' "$history_compose" > "$invalid_history_compose"
+    if [[ "$read_only" == true ]]; then
+      bash "$validator" --compose-contract "$invalid_history_compose"
+    else
+      expect_rejected "writable signed-history input $history_source outside the publisher" \
+        --compose-contract "$invalid_history_compose"
+    fi
+  done
+done
 jq 'del(.services["zinder-compat-lightwalletd"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
 expect_rejected "a wallet reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
 jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \
