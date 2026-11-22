@@ -223,7 +223,13 @@ fn history_ranges(node: &JsonRpcTestServer) -> Result<Vec<(Value, Value)>> {
 
 /// The served history transactions: their repeated ID byte, which is also
 /// their one-byte body, and their height and block position.
-const HISTORY: [(u8, u32, u32); 4] = [(0x03, 1, 0), (0x02, 1, 1), (0x04, 3, 0), (0x01, 4, 0)];
+const HISTORY: [(u8, u32, u32); 5] = [
+    (0x03, 1, 0),
+    (0x02, 1, 1),
+    (0x04, 3, 0),
+    (0x01, 4, 0),
+    (0x05, 4, 1),
+];
 
 /// The hash of block `height` of the four-block chain [`history_fixture`] serves.
 fn history_block(height: u32) -> BlockHash {
@@ -427,7 +433,9 @@ async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<(
                 if start != end {
                     RpcReply::error("more than 100000 transactions match; narrow the height range")
                 } else if start == 4 {
-                    RpcReply::result(json!(["01".repeat(32), "02".repeat(32)]))
+                    // Both are served at height 4, so only the replacement
+                    // can refuse the second row.
+                    RpcReply::result(json!(["01".repeat(32), "05".repeat(32)]))
                 } else {
                     RpcReply::result(json!([]))
                 }
