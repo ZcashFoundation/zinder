@@ -81,6 +81,7 @@ pub(crate) struct SegmentWriter {
 impl SegmentWriter {
     pub(crate) fn create(
         path: &Path,
+        staged: NamedTempFile,
         network: Network,
         start: BlockHeight,
         end: BlockId,
@@ -95,7 +96,7 @@ impl SegmentWriter {
         let header = identity.header()?;
         let mut verity = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
         verity.write_all(&header)?;
-        let mut staged = BufWriter::new(NamedTempFile::new_in(parent_directory(path))?);
+        let mut staged = BufWriter::new(staged);
         staged.write_all(&header)?;
         Ok(Self {
             identity,

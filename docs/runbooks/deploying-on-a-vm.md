@@ -271,6 +271,92 @@ Ingest exits with a configuration error when a file is missing or holds no
 certificate or key, or when the URL is not `https://`. It rereads the files on
 each indexer reconnect, so you can replace them without a restart.
 
+## Publish signed wallet history
+
+The optional Compose publisher builds settled shielded ranges from a read-only
+canonical secondary. Wallets keep using the existing lightwalletd endpoint.
+Start with the [base deployment](#install) serving wallets. Allow disk space for
+the segments and memory for the publisher and reader. The publisher's container
+memory limit defaults to the compatibility reader's limit. Set
+`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` in the env file to size it separately.
+Full Mainnet publication size, admission time, and file descriptor use have
+not been qualified.
+
+1. Create a generation on a durable host filesystem outside the Docker data
+   volume. Use a root-owned parent directory specific to this network. Run
+   the remaining commands from the release checkout.
+
+   ```bash
+   sudo install -d -m 0700 /srv/zinder-history/testnet
+   export ZINDER_HISTORY_DIR=/srv/zinder-history/testnet/key-1
+   sudo scripts/prepare-shielded-history.sh "$ZINDER_HISTORY_DIR"
+   ```
+
+   The command creates an Ed25519 key pair and a writable `catalog/`
+   directory. It refuses to overwrite an existing generation. Compose mounts
+   the private key only in the publisher. The reader gets a separate
+   read-only mount of the trusted public key and a read-only catalog mount.
+
+2. Start only the publisher. Include any other overlays already in use in
+   these commands. If you customized the canonical store's retention or
+   reorg window, match them in `deploy/config/history-publisher.toml`.
+
+   ```bash
+   base=(docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml)
+   history=("${base[@]}" -f deploy/docker-compose.shielded-history.yml)
+   "${history[@]}" up -d --no-build --no-deps zinder-history-publisher
+   "${history[@]}" logs --tail 20 zinder-history-publisher
+   sudo test -s "$ZINDER_HISTORY_DIR/catalog/current.json"
+   ```
+
+   Wait for the final check to succeed. Publication starts at the first
+   retained block and needs 4,096 settled blocks for its first segment.
+   The base reader continues serving from canonical storage during that wait.
+   The publisher checks for new settlement every 60 seconds and keeps its
+   checkpoint in `catalog/.publisher-head.json`.
+
+3. Recreate the compatibility reader with the new mounts. Check its
+   readiness on the port from your env file (19107 on Testnet).
+
+   ```bash
+   "${history[@]}" up -d --no-build --no-deps --force-recreate zinder-compat-lightwalletd
+   curl -fsS http://127.0.0.1:19107/readyz
+   ```
+
+   The reader verifies the signature, segments, and settled anchor before
+   binding. It admits later extensions while running. A default shielded range
+   can cross from signed history into the encoded tail when the tail matches
+   the reader’s chain view. Uncovered heights use canonical storage. The overlay
+   uses per-payload digest verification. Strict fs-verity requires separate
+   segment staging as described in [signed settled history](../reference/lightwalletd-compatibility.md#signed-settled-history).
+
+4. Save `ZINDER_HISTORY_DIR` in `/etc/zinder/env` and add the history overlay
+   to every [systemd Compose command](#6-supervise-with-systemd) for subsequent
+   starts. Reuse this directory on restart. For a backup, stop the publisher,
+   copy the private key, the independently trusted public key, and the entire
+   catalog including hidden files, then start the publisher. Restore them together.
+   A missing checkpoint beside an existing catalog stops the publisher.
+
+**Rotate the publisher key.** Create a fresh generation at a new path in
+step 1. Select it with `ZINDER_HISTORY_DIR`, then repeat steps 2 and 3 in
+order. Compose recreates the publisher with the new private key and an empty
+catalog. The running reader keeps its old mounts until you recreate it.
+After the new reader passes readiness, persist the new path in step 4 and
+retire the old generation according to your key retention policy.
+
+**Return to canonical reads.** If a key is compromised, a generation cannot
+be restored, or reader admission fails, use the base configuration to
+recreate the compatibility reader and stop the publisher.
+
+```bash
+"${base[@]}" up -d --no-build --no-deps --force-recreate zinder-compat-lightwalletd
+"${history[@]}" stop zinder-history-publisher
+```
+
+Remove the history overlay from your systemd commands for subsequent starts.
+Provision a fresh trusted generation before enabling signed history again
+after a key compromise.
+
 ## Add the Explorer
 
 Merge the Explorer overlay. It turns on Explorer views in ingest and starts

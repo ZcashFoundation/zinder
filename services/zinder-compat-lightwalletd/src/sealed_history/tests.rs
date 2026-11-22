@@ -35,7 +35,8 @@ fn range(start: u32, end: u32) -> BlockHeightRange {
 }
 
 fn publish(path: &Path, start: u32, end: u32) -> eyre::Result<SegmentIdentity> {
-    let mut writer = SegmentWriter::create(path, NETWORK, id(start).height, id(end))?;
+    let staged = NamedTempFile::new_in(parent_directory(path))?;
+    let mut writer = SegmentWriter::create(path, staged, NETWORK, id(start).height, id(end))?;
     for height in start..=end {
         let block = block(height);
         let native_bytes = zinder_store::encode_compact_block_artifact(&block).len();
@@ -96,7 +97,8 @@ fn reopened_segment_uses_native_row_budgets_in_each_direction() -> eyre::Result<
 fn unfinished_or_competing_writers_never_replace_published_bytes() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("shielded");
-    let mut writer = SegmentWriter::create(&path, NETWORK, id(1).height, id(2))?;
+    let staged = NamedTempFile::new_in(dir.path())?;
+    let mut writer = SegmentWriter::create(&path, staged, NETWORK, id(1).height, id(2))?;
     writer.push(block(1), 300)?;
     assert!(!path.exists());
     assert!(writer.finish().is_err());

@@ -55,6 +55,7 @@ impl PublishedShieldedRange {
     fn build(
         reader: &RocksDbCanonicalReader,
         path: &Path,
+        staged: tempfile::NamedTempFile,
         range: BlockHeightRange,
     ) -> io::Result<Self> {
         let view = reader.chain_epoch();
@@ -74,6 +75,7 @@ impl PublishedShieldedRange {
             })?;
         let mut writer = SegmentWriter::create(
             path,
+            staged,
             network,
             range.start,
             BlockId::new(range.end, end.block_hash),

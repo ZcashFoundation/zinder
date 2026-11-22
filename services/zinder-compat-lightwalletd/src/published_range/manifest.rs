@@ -6,7 +6,7 @@ use std::{
 
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use tempfile::{NamedTempFile, tempdir_in};
+use tempfile::{Builder, NamedTempFile, TempPath};
 use zinder_core::BlockHeightRange;
 use zinder_query::RocksDbCanonicalReader;
 
@@ -17,6 +17,16 @@ use super::PublishedShieldedRange;
 struct SignedManifest {
     manifest: String,
     signature: String,
+}
+
+const STAGED_WRITE: &str = ".publisher-write.tmp";
+const STAGED_SEGMENT: &str = ".publisher-segment.tmp";
+
+fn staged_write(directory: &Path) -> io::Result<NamedTempFile> {
+    Builder::new()
+        .prefix(STAGED_WRITE)
+        .rand_bytes(0)
+        .tempfile_in(directory)
 }
 
 pub(super) fn lock_directory(directory: &Path) -> io::Result<File> {
@@ -41,6 +51,14 @@ pub(super) fn lock_directory(directory: &Path) -> io::Result<File> {
         .truncate(false)
         .open(directory.join(".publisher.lock"))?;
     file.try_lock()?;
+    // A killed publisher can leave either name before the next atomic installation.
+    for name in [STAGED_WRITE, STAGED_SEGMENT] {
+        if let Err(error) = fs::remove_file(directory.join(name))
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+    }
     Ok(file)
 }
 
@@ -49,9 +67,8 @@ pub(super) fn publish_segment(
     directory: &Path,
     range: BlockHeightRange,
 ) -> io::Result<PublishedShieldedRange> {
-    let staged = tempdir_in(directory)?;
-    let segment = staged.path().join("segment.bin");
-    let history = PublishedShieldedRange::build(reader, &segment, range)?;
+    let segment = TempPath::try_from_path(directory.join(STAGED_SEGMENT))?;
+    let history = PublishedShieldedRange::build(reader, &segment, staged_write(directory)?, range)?;
     let destination = segment_path(directory, history.identity.sha256);
     let published = match fs::hard_link(&segment, &destination) {
         Ok(()) => history,
@@ -74,7 +91,7 @@ pub(super) fn install_signed(
         signature: hex::encode(key.sign(manifest.as_bytes()).as_ref()),
         manifest,
     };
-    let mut output = NamedTempFile::new_in(directory)?;
+    let mut output = staged_write(directory)?;
     serde_json::to_writer(&mut output, &signed)?;
     output.flush()?;
     if output.as_file().metadata()?.len() > super::catalog::CATALOG_LIMIT {

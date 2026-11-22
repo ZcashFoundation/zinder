@@ -173,6 +173,43 @@ fn publisher_recovers_the_signed_extension_after_interrupted_checkpoint_installa
 }
 
 #[test]
+fn publisher_recovers_its_staging_files_after_an_interrupted_write() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut first = fixture.publisher()?;
+    assert!(first.publish_next(&canonical)?);
+    let dir = fixture.directory.path();
+    let head = dir.join(".publisher-head.json");
+    let checkpoint = fs::read(&head)?;
+    let current = fs::read(fixture.current())?;
+    let installed = segment_path(dir, fixture.entries()?[0].sha256);
+    let retained = fs::read(&installed)?;
+    let partial = dir.join(".publisher-write.tmp");
+    let staged_segment = dir.join(".publisher-segment.tmp");
+    fs::write(&partial, b"interrupted write")?;
+    fs::hard_link(&installed, &staged_segment)?;
+    let operator_file = dir.join(".operator-backup");
+    fs::write(&operator_file, b"private backup")?;
+
+    assert!(fixture.publisher().is_err());
+    assert!(partial.exists());
+    assert!(staged_segment.exists());
+    drop(first);
+
+    let mut resumed = fixture.publisher()?;
+    assert!(!partial.exists());
+    assert!(!staged_segment.exists());
+    assert_eq!(fs::read(operator_file)?, b"private backup");
+    assert_eq!(fs::read(installed)?, retained);
+    assert_eq!(fs::read(head)?, checkpoint);
+    assert_eq!(fs::read(fixture.current())?, current);
+    assert!(resumed.publish_next(&canonical)?);
+    assert_eq!(fixture.catalog(None)?.bounds().end, BlockHeight::new(4));
+    Ok(())
+}
+
+#[test]
 fn initial_publication_creates_and_reopens_nested_directories() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let (_canonical_files, canonical) = reader(&chain)?;

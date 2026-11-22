@@ -117,6 +117,35 @@ docker compose \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
 
+history_dir="$temporary_directory/history"
+history_compose="$temporary_directory/history-compose.json"
+ZINDER_HISTORY_DIR="$history_dir" ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+  docker compose --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.shielded-history.yml" \
+  config --format json > "$history_compose"
+bash "$validator" --compose-contract "$history_compose"
+jq -e --arg generation "$history_dir" '
+  .services["zinder-history-publisher"] as $publisher
+  | .services["zinder-compat-lightwalletd"] as $reader
+  | def mounts($source; $target; $readonly):
+      any(.volumes[]; .source == $source and .target == $target and (.read_only // false) == $readonly);
+    $publisher.network_mode == "none"
+    and $publisher.image == $reader.image
+    and ($publisher.command | index("--follow-interval-secs") != null)
+    and ($publisher | mounts("data"; "/var/lib/zinder"; true))
+    and ($publisher | mounts($generation + "/catalog"; "/var/lib/zinder-history"; false))
+    and ($publisher | mounts($generation + "/publisher.pk8"; "/run/zinder-history/publisher.pk8"; true))
+    and ($reader | mounts($generation + "/catalog"; "/var/lib/zinder-history"; true))
+    and ($reader | mounts($generation + "/publisher.pub"; $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY; true))
+    and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST == "/var/lib/zinder-history/current.json"
+    and ([.services | del(.["zinder-history-publisher"]) | .[].volumes[]?.source]
+      | all(. != $generation and . != ($generation + "/publisher.pk8")))
+' "$history_compose" >/dev/null || fail "the signed history overlay lost publisher or reader isolation"
+jq -e '(.services | has("zinder-history-publisher") | not)
+  and (.services["zinder-compat-lightwalletd"].environment | has("ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST") | not)
+' "$resolved_compose" >/dev/null || fail "the base deployment requires signed history during bootstrap"
+
 indexer_tls_directory="$temporary_directory/indexer-tls"
 mkdir -p "$indexer_tls_directory"
 resolve_indexer_tls_compose() {

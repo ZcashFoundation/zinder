@@ -1,0 +1,57 @@
+# Start the publisher first while the base wallet endpoint serves. Enable the
+# reader after the first complete segment, as in deploying-on-a-vm.md.
+services:
+  zinder-history-publisher:
+    image: ${ZINDER_COMPAT_IMAGE:-ghcr.io/zcashfoundation/zinder-compat-lightwalletd:${ZINDER_VERSION:-local}}
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-${ZINDER_COMPAT_MEMORY_LIMIT:-4g}}
+    network_mode: none
+    restart: unless-stopped
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    command:
+      - --config
+      - /etc/zinder/publisher.toml
+      - publish-shielded-history
+      - --directory
+      - /var/lib/zinder-history
+      - --signing-key
+      - /run/zinder-history/publisher.pk8
+      - --follow-interval-secs
+      - "60"
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+    volumes:
+      - data:/var/lib/zinder:ro
+      - ./config/history-publisher.toml:/etc/zinder/publisher.toml:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:?set the host history generation directory}/publisher.pk8
+        target: /run/zinder-history/publisher.pk8
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:?set the host history generation directory}/catalog
+        target: /var/lib/zinder-history
+        bind:
+          create_host_path: false
+
+  zinder-compat-lightwalletd:
+    environment:
+      ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST: /var/lib/zinder-history/current.json
+      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
+    volumes:
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:?set the host history generation directory}/publisher.pub
+        target: /run/zinder-history/publisher.pub
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:?set the host history generation directory}/catalog
+        target: /var/lib/zinder-history
+        read_only: true
+        bind:
+          create_host_path: false
