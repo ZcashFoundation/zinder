@@ -112,12 +112,13 @@ impl QualificationWalletQuery {
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
             let (generation, cache_generation) = self.live_generation(&reader);
-            let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
-            let (selected, expected) = match self
-                .replays
-                .ready_state(&key, &cache_generation, &canonical_reader, request_deadline)
-                .await?
-            {
+            let ready = {
+                let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
+                self.replays
+                    .ready_state(&key, &cache_generation, &canonical_reader, request_deadline)
+                    .await?
+            };
+            let (selected, expected) = match ready {
                 Some(ready @ ReadyState::Stored(_)) => {
                     return Ok(tree_state_response(epoch, ready.serve()));
                 }
