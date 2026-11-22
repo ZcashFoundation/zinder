@@ -167,6 +167,13 @@ pub enum BenchError {
         /// Status label and message of the failed probe call.
         reason: String,
     },
+    /// A raw range probe could not run or found a response that differs from
+    /// its oracle.
+    #[error("raw range probe failed: {reason}")]
+    RawRangeProbe {
+        /// What failed.
+        reason: String,
+    },
     /// A read through the canonical reader that `zinder-query` serves from
     /// failed.
     #[error("canonical reader read failed: {reason}")]
@@ -339,6 +346,14 @@ impl BenchError {
     #[must_use]
     pub fn wallet_load_endpoint(reason: impl Into<String>) -> Self {
         Self::WalletLoadEndpoint {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a raw range probe error.
+    #[must_use]
+    pub fn raw_range_probe(reason: impl Into<String>) -> Self {
+        Self::RawRangeProbe {
             reason: reason.into(),
         }
     }
