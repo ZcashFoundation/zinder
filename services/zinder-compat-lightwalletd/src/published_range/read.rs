@@ -99,6 +99,15 @@ impl PublishedRangeRead {
         }
     }
 
+    /// Returns whether reading `chunk` can open signed segment files: it
+    /// starts at or below the catalog's last height. A chunk above the catalog
+    /// reads the live tail or canonical storage, as a standalone listener does.
+    fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
+        self.history
+            .as_ref()
+            .is_some_and(|catalog| chunk.start <= catalog.bounds().end)
+    }
+
     fn order(&self) -> HeightOrder {
         if self.is_descending {
             HeightOrder::Descending
@@ -346,8 +355,11 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Block = ReadBlock;
     type Message = Bytes;
 
-    fn published_read_limit(&self) -> Option<&crate::block_range::BlockRangeStreamLimit> {
-        self.history.as_ref().map(|_| &self.limits)
+    fn published_read_limit(
+        &self,
+        chunk: BlockHeightRange,
+    ) -> Option<&crate::block_range::BlockRangeStreamLimit> {
+        self.reads_published_files(chunk).then_some(&self.limits)
     }
 
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {
@@ -378,7 +390,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        if self.history.is_some() {
+        if self.reads_published_files(read.chunk) {
             read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         }
         if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {

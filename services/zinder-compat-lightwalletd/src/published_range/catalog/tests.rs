@@ -1303,3 +1303,117 @@ async fn blocks_only_reads_only_the_requested_rows_around_a_cached_frontier() ->
     assert_eq!(reads.native.lock().len(), 2);
     Ok(())
 }
+
+/// Streams `first..=last` as an adapter with `catalog` attached does, through
+/// `methods`, and returns how many frames it sent.
+async fn stream_published(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    catalog: &Arc<PublishedShieldedCatalog>,
+    (first, last, pool_types): (u64, u64, Vec<i32>),
+) -> Result<usize> {
+    use tokio_stream::StreamExt as _;
+    let block = |height| {
+        Some(zinder_proto::compat::lightwalletd::BlockId {
+            height,
+            hash: Vec::new(),
+        })
+    };
+    let request = zinder_proto::compat::lightwalletd::BlockRange {
+        start: block(first),
+        end: block(last),
+        pool_types,
+    };
+    let mut stream = methods
+        .published_block_range(reads, &request, (Some(catalog.clone()), catalog.tail()))
+        .await?;
+    let mut frames = 0;
+    while let Some(frame) = stream.next().await {
+        frame?;
+        frames += 1;
+    }
+    Ok(frames)
+}
+
+#[tokio::test]
+async fn a_warm_tail_above_the_catalog_streams_while_every_published_read_permit_is_held()
+-> Result<()> {
+    use std::time::Duration;
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
+    let (_store, reader) = reader(&chain)?;
+    let reader = Arc::new(reader);
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    for _ in 0..3 {
+        assert!(publisher.publish_next(&reader)?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds().end, BlockHeight::new(6));
+    let reads = RecordedSlot {
+        slot: crate::CanonicalReaderSlot::new(reader),
+        rows: Arc::default(),
+        native: Arc::default(),
+    };
+    let methods = crate::block_methods::BlockMethods::default();
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+    let default_shape = |first, last| (first, last, Vec::new());
+
+    assert_eq!(
+        stream_published(&methods, &reads, &catalog, default_shape(2_100, 1_000)).await?,
+        1_101
+    );
+    assert_eq!(
+        *reads.rows.lock(),
+        vec![span(1_101, 2_100), span(1_000, 1_100)]
+    );
+
+    let limit = methods.block_range_streams();
+    let held: Vec<_> = std::iter::from_fn(|| limit.try_published_read_permit()).collect();
+    assert_eq!(held.len(), 16);
+    let prompt = Duration::from_secs(10);
+    for range in [default_shape(1_000, 2_100), default_shape(2_100, 1_000)] {
+        let frames =
+            tokio::time::timeout(prompt, stream_published(&methods, &reads, &catalog, range))
+                .await??;
+        assert_eq!(frames, 1_101);
+    }
+    let transparent = vec![zinder_proto::compat::lightwalletd::PoolType::Transparent as i32];
+    let frames = tokio::time::timeout(
+        prompt,
+        stream_published(&methods, &reads, &catalog, (1_000, 1_015, transparent)),
+    )
+    .await??;
+    assert_eq!(frames, 16);
+    assert_eq!(
+        *reads.rows.lock(),
+        vec![span(1_101, 2_100), span(1_000, 1_100)]
+    );
+    assert_eq!(*reads.native.lock(), vec![span(1_000, 1_015)]);
+
+    let queued = Duration::from_millis(200);
+    for range in [
+        default_shape(1, 6),
+        default_shape(5, 20),
+        default_shape(20, 5),
+    ] {
+        assert!(
+            tokio::time::timeout(queued, stream_published(&methods, &reads, &catalog, range))
+                .await
+                .is_err()
+        );
+    }
+    drop(held);
+    for (range, expected) in [
+        (default_shape(1, 6), 6),
+        (default_shape(5, 20), 16),
+        (default_shape(20, 5), 16),
+    ] {
+        let frames =
+            tokio::time::timeout(prompt, stream_published(&methods, &reads, &catalog, range))
+                .await??;
+        assert_eq!(frames, expected);
+    }
+    Ok(())
+}
