@@ -310,6 +310,9 @@ for deployment_env in "${deployment_env_names[@]}"; do
     --profile observability \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
+  jq -e '.services["zinder-compat-lightwalletd"].ulimits.nofile == {"soft":65536,"hard":65536}' \
+    "$resolved_env_compose" >/dev/null \
+    || fail "the $deployment_env wallet reader does not have the expected soft and hard open-file limits"
   resolved_env_explorer_compose="$temporary_directory/resolved-$deployment_env-explorer-compose.json"
   ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose \

@@ -230,6 +230,10 @@ services:
   zinder-compat-lightwalletd:
     <<: *compat-image
     mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: on-failure
     network_mode: "service:zinder-ingest"
     # Same dependency rule as zinder-query.

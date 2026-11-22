@@ -307,7 +307,9 @@ for coverage, tail reads, and fs-verity requirements.
 If you customize canonical retention or the reorg window, match those settings
 in `deploy/config/history-publisher.toml`. The publisher inherits the compatibility
 reader's memory limit. Set `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` to size its
-container separately.
+container separately. The wallet reader keeps one file open per admitted
+segment alongside its database files and sockets. Compose sets its soft and
+hard open-file limits to 65,536.
 
 **Back up and restore.** Stop `zinder-history-publisher`, copy both keys and
 all of `catalog/`, including its hidden publisher checkpoint, then restart
