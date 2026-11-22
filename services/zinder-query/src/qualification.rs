@@ -96,6 +96,16 @@ impl QualificationWalletQuery {
         (generation, cache_generation)
     }
 
+    fn cached_on_current_reader(
+        &self,
+        key: &ReplayKey,
+        reader: &Arc<RocksDbCanonicalReader>,
+    ) -> Option<ReadyState> {
+        self.replays
+            .cached_for_reader(key, reader)
+            .filter(|_| Arc::ptr_eq(reader, &(self.capture)()))
+    }
+
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
     pub async fn tree_state(
         &self,
@@ -111,6 +121,9 @@ impl QualificationWalletQuery {
             let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
+            if let Some(ready) = self.cached_on_current_reader(&key, &reader) {
+                return Ok(tree_state_response(epoch, ready.serve()));
+            }
             let (generation, cache_generation) = self.live_generation(&reader);
             let ready = {
                 let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;

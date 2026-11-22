@@ -173,11 +173,7 @@ impl SettledStates {
             return;
         }
         let addr = generation.as_ptr().addr();
-        if self
-            .anchor_generations
-            .iter()
-            .all(|existing| existing.as_ptr().addr() != addr)
-        {
+        if !self.tracks_generation(addr) {
             self.anchor_generations.push(generation.clone());
         }
     }
@@ -293,6 +289,12 @@ impl SettledStates {
             self.adopt_generation(&generation.weak);
         }
         self.get_touching(height)
+    }
+
+    pub(super) fn tracks_generation(&self, addr: usize) -> bool {
+        self.anchor_generations
+            .iter()
+            .any(|generation| generation.as_ptr().addr() == addr)
     }
 
     pub(super) fn cached_at_anchor(

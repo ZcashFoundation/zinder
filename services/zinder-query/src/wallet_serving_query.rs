@@ -1286,27 +1286,40 @@ where
             loop {
                 let request_deadline =
                     *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
-                let (epoch, key, generation, cache_generation, ready) =
-                    serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
-                        let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                        let key = ReplayKey::new(height, pair.canonical());
-                        let generation = Arc::downgrade(&pair);
-                        let slot = self.serving_pair_slot.clone();
-                        let weak_for_check = generation.clone();
-                        let cache_generation = ReaderGeneration::live(&generation, move || {
-                            slot.is_current_weak(&weak_for_check)
-                        });
-                        let reader = pair.canonical_arc();
-                        let ready = self
-                            .tree_state_replays
-                            .ready_state(&key, &cache_generation, &reader, request_deadline)
-                            .await?;
-                        Ok((epoch, key, generation, cache_generation, ready))
-                    })
-                    .await?;
-                if let Some(state) = ready {
-                    return Ok(tree_state_response(epoch, state.serve()));
-                }
+                let selected = serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
+                    let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                    let key = ReplayKey::new(height, pair.canonical());
+                    if let Some(ready) = self.tree_state_replays.cached_for_reader(&key, &pair) {
+                        return Ok(ControlFlow::Break((epoch, ready)));
+                    }
+                    let generation = Arc::downgrade(&pair);
+                    let slot = self.serving_pair_slot.clone();
+                    let weak_for_check = generation.clone();
+                    let cache_generation = ReaderGeneration::live(&generation, move || {
+                        slot.is_current_weak(&weak_for_check)
+                    });
+                    let reader = pair.canonical_arc();
+                    if let Some(ready) = self
+                        .tree_state_replays
+                        .ready_state(&key, &cache_generation, &reader, request_deadline)
+                        .await?
+                    {
+                        return Ok(ControlFlow::Break((epoch, ready)));
+                    }
+                    Ok(ControlFlow::Continue((
+                        epoch,
+                        key,
+                        generation,
+                        cache_generation,
+                    )))
+                })
+                .await?;
+                let (epoch, key, generation, cache_generation) = match selected {
+                    ControlFlow::Break((epoch, ready)) => {
+                        return Ok(tree_state_response(epoch, ready.serve()));
+                    }
+                    ControlFlow::Continue(missing) => missing,
+                };
                 let subscription = match self.tree_state_replays.select(
                     &key,
                     &cache_generation,

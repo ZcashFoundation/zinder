@@ -340,6 +340,25 @@ impl TreeStateReplayLimit {
         }
     }
 
+    pub(crate) fn cached_for_reader<T>(
+        &self,
+        key: &ReplayKey,
+        reader: &Arc<T>,
+    ) -> Option<ReadyState> {
+        let mut flights = self.flights.lock();
+        if key.height > key.epoch.visible_tip_height
+            || !flights
+                .settled
+                .tracks_generation(Arc::as_ptr(reader).addr())
+        {
+            return None;
+        }
+        flights
+            .settled
+            .cached_at_anchor(key.settled_anchor(), key.height)
+            .map(ReadyState::Cached)
+    }
+
     pub(crate) async fn ready_state(
         &self,
         key: &ReplayKey,

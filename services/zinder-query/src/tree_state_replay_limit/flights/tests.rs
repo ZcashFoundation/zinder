@@ -565,7 +565,13 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     let height = BlockHeight::new(1);
     let expected = replay_and_cache(&limit, &first, height).await?;
 
+    let old_key = ReplayKey::new(height, first.as_ref());
+    assert!(
+        matches!(limit.cached_for_reader(&old_key, &first), Some(ReadyState::Cached(ref state)) if *state == expected)
+    );
+    assert!(limit.cached_for_reader(&old_key, &extended).is_none());
     let key = ReplayKey::new(height, extended.as_ref());
+    assert!(limit.cached_for_reader(&key, &first).is_none());
     let gen_ext = ReaderGeneration::static_for_test(&Arc::downgrade(&extended), true);
     let dyn_extended = Arc::clone(&extended) as Arc<dyn CanonicalReader>;
     let mut joins = Vec::new();
@@ -589,6 +595,10 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
         Some(ReadyState::Cached(ref s)) if *s == expected
     ));
     assert_eq!(extended.reads(), 1);
+    assert!(limit.cached_for_reader(&old_key, &first).is_none());
+    assert!(
+        matches!(limit.cached_for_reader(&key, &extended), Some(ReadyState::Cached(ref state)) if *state == expected)
+    );
     Ok(())
 }
 
