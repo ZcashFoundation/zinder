@@ -270,12 +270,56 @@ struct CompatSection {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ShieldedHistoryConfig")]
 pub(crate) struct ShieldedHistorySection {
-    pub(crate) manifest: PathBuf,
+    #[serde(flatten)]
+    pub(crate) location: HistoryLocation,
     pub(crate) publisher_key: PathBuf,
     #[serde(default)]
     pub(crate) require_fs_verity: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShieldedHistoryConfig {
+    directory: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+    publisher_key: PathBuf,
+    #[serde(default)]
+    require_fs_verity: bool,
+}
+
+impl TryFrom<ShieldedHistoryConfig> for ShieldedHistorySection {
+    type Error = &'static str;
+
+    fn try_from(config: ShieldedHistoryConfig) -> Result<Self, Self::Error> {
+        let location = match (config.directory, config.manifest) {
+            (Some(path), None) => HistoryLocation::Directory(path),
+            (None, Some(path)) => HistoryLocation::Manifest(path),
+            _ => return Err("shielded history requires exactly one directory or manifest"),
+        };
+        Ok(Self {
+            location,
+            publisher_key: config.publisher_key,
+            require_fs_verity: config.require_fs_verity,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HistoryLocation {
+    Manifest(PathBuf),
+    Directory(PathBuf),
+}
+
+impl HistoryLocation {
+    pub(super) fn manifest(&self) -> PathBuf {
+        match self {
+            Self::Manifest(path) => path.clone(),
+            Self::Directory(path) => path.join("current.json"),
+        }
+    }
 }
 
 fn deserialize_browser_origins<'de, D>(deserializer: D) -> Result<Vec<HeaderValue>, D::Error>

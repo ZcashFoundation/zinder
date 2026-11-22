@@ -19,6 +19,40 @@ use zinder_testkit::{
 
 use crate::common::shielded_catalog_keys;
 
+#[test]
+fn history_configuration_requires_one_location_and_an_independent_key() -> Result<()> {
+    let base =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/history-publisher.toml");
+    let render = |location: &[(&str, &str)]| {
+        super::zinder_compat_command()
+            .args(["--print-config", "--config"])
+            .arg(&base)
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env(
+                "ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY",
+                "/trusted/key",
+            )
+            .envs(location.iter().copied())
+            .output()
+    };
+    let directory = ("ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY", "/published");
+    let manifest = (
+        "ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST",
+        "/published/current.json",
+    );
+    for (setting, expected) in [
+        (directory, "directory = \"/published\""),
+        (manifest, "manifest = \"/published/current.json\""),
+    ] {
+        let output = render(&[setting])?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stdout)?.contains(expected));
+    }
+    assert!(!render(&[directory, manifest])?.status.success());
+    assert!(!render(&[])?.status.success());
+    Ok(())
+}
+
 #[tokio::test]
 async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Result<()> {
     let files = tempfile::tempdir()?;

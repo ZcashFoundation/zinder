@@ -842,7 +842,7 @@ where
         let range = self
             .published_history
             .as_ref()
-            .map(|history| history.catalog())
+            .and_then(|history| history.catalog())
             .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
         self.block_methods
             .published_block_range(&self.query_api, &request.into_inner(), range)
@@ -859,6 +859,7 @@ where
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         self.published_history
             .as_ref()
+            .filter(|history| history.has_catalog())
             .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
     }
 

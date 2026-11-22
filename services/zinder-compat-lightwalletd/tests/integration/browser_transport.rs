@@ -318,8 +318,16 @@ impl CompatProcess {
         origin: Option<&str>,
         history: &str,
     ) -> Result<Self> {
+        Self::start_with_history_in(serving, origin, history, tempfile::tempdir()?).await
+    }
+
+    async fn start_with_history_in(
+        serving: &str,
+        origin: Option<&str>,
+        history: &str,
+        storage: tempfile::TempDir,
+    ) -> Result<Self> {
         let network = Network::ZcashRegtest;
-        let storage = tempfile::tempdir()?;
         let chain = ChainFixture::new(network)
             .extend_blocks(3)
             .with_raw_blob_retention(RawBlobRetention::Transactions);
