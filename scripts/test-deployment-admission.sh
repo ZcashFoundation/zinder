@@ -150,6 +150,35 @@ for history_source in catalog catalog/segment.bin publisher.pub; do
     fi
   done
 done
+
+# These cases exercise only the resolved JSON contract. Both declarations name
+# the same Docker volume, and the mount selects a directory inside its backing.
+check_named_history_input() {
+  local subpath="$1" read_only="$2" expected="$3"
+  jq --arg backing "$temporary_directory" --arg subpath "$subpath" --argjson readonly "$read_only" '
+    .volumes.fixture = {name: "fixture", driver: "local", driver_opts: {device: $backing, o: "bind"}}
+    | .volumes.fixture_view = {name: "fixture", external: true}
+    | .services["zinder-query"].volumes += [{
+        type: "volume", source: "fixture_view", target: "/run/fixture",
+        volume: {subpath: $subpath}
+      } + (if $readonly == null then {} else {read_only: $readonly} end)]
+  ' "$history_compose" > "$invalid_history_compose"
+  if [[ "$expected" == accept ]]; then
+    bash "$validator" --compose-contract "$invalid_history_compose"
+  else
+    expect_rejected_because "named volume with history input $subpath" \
+      "invalid signed wallet history publication or reader mounts" --compose-contract "$invalid_history_compose"
+  fi
+}
+check_named_history_input unrelated false accept
+check_named_history_input history/catalog true accept
+check_named_history_input history/publisher.pub true accept
+check_named_history_input history/catalog null reject
+check_named_history_input history/catalog/segment.bin false reject
+check_named_history_input history/publisher.pub false reject
+check_named_history_input history/publisher.pk8 true reject
+check_named_history_input history true reject
+
 jq 'del(.services["zinder-compat-lightwalletd"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
 expect_rejected "a wallet reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
 jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \

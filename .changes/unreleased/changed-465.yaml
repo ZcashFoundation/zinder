@@ -1,5 +1,5 @@
 kind: changed
-body: Published shielded range chunks now group dense multi-block payloads into slabs targeting 64 KiB, cache up to 16 verified settled tips with single-flight anchor checks, use range_fence retention checks without redundant block-hash reads, and propagate cooperative cancellation to queued blocking reads. Compose admission requires read-only access to signed catalog files and the trusted public key outside the publisher.
+body: Published shielded range chunks now group dense multi-block payloads into slabs targeting 64 KiB, cache up to 16 verified settled tips with single-flight anchor checks, use range_fence retention checks without redundant block-hash reads, and propagate cooperative cancellation to queued blocking reads. Compose admission checks read-only access to signed catalog files and the trusted public key on direct host mounts and declared host-backed local volumes outside the publisher.
 time: 2026-11-22T10:45:00.000000000Z
 custom:
     Bump: patch
