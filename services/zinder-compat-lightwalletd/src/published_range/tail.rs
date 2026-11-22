@@ -20,6 +20,11 @@ const TAIL_BLOCKS: u32 = 5_096;
 const TAIL_BYTES: usize = 64 * 1024 * 1024;
 const ENCODE_BATCH_BLOCKS: u32 = 1_000;
 
+pub(super) struct TailReadLimits {
+    pub(super) ascending_bytes: Option<usize>,
+    pub(super) refresh_wait: Duration,
+}
+
 pub(super) type Fence = (CanonicalEventFence, CanonicalHistoryBounds);
 
 #[derive(Clone, Default)]
@@ -78,6 +83,10 @@ trait TailSource: Sync {
 
     fn cancel(&self) -> &CancellationToken;
 
+    /// Returns the stored-byte budget of a request that sends from its lowest
+    /// height, which caps the rows a cold fill reads for it.
+    fn ascending_budget(&self) -> Option<usize>;
+
     /// Returns whether this source still reads the view current now.
     fn is_current(&self) -> impl Future<Output = bool> + Send;
 
@@ -94,6 +103,7 @@ struct ReadsTailSource<'a, Reads: CompactBlockReads> {
     fence: Fence,
     source: CompactBlockSource,
     cancel: &'a CancellationToken,
+    ascending_budget: Option<usize>,
 }
 
 impl<Reads: CompactBlockReads> ReadsTailSource<'_, Reads> {
@@ -117,6 +127,10 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
 
     fn cancel(&self) -> &CancellationToken {
         self.cancel
+    }
+
+    fn ascending_budget(&self) -> Option<usize> {
+        self.ascending_budget
     }
 
     async fn is_current(&self) -> bool {
@@ -198,7 +212,7 @@ impl ShieldedTailBuffer {
         (reads, view, cancel): (&Reads, &Reads::View, &CancellationToken),
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
-        max_wait: Duration,
+        limits: TailReadLimits,
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
         let Some(CompactBlockFence {
             event_fence,
@@ -214,9 +228,15 @@ impl ShieldedTailBuffer {
             fence: (event_fence, history_bounds),
             source,
             cancel,
+            ascending_budget: limits.ascending_bytes,
         };
-        self.refresh(&source, catalog, (requested, TAIL_BYTES), max_wait)
-            .await
+        self.refresh(
+            &source,
+            catalog,
+            (requested, TAIL_BYTES),
+            limits.refresh_wait,
+        )
+        .await
     }
 
     async fn refresh<Source: TailSource>(
@@ -299,9 +319,13 @@ impl ShieldedTailBuffer {
         let Some(next_tail) = updated else {
             return Ok(None);
         };
-        // Rows built for a view that stopped being current during the build
-        // serve this request only.
-        if source.is_current().await {
+        // Rows that stop below the tip, or were built for a view that stopped
+        // being current during the build, serve this request only.
+        if next_tail
+            .bounds()
+            .is_some_and(|bounds| bounds.end == epoch.visible_tip_height)
+            && source.is_current().await
+        {
             self.0
                 .current
                 .compare_and_swap(&previous, Some(next_tail.clone()));
@@ -455,7 +479,10 @@ async fn build<Source: TailSource>(
                 tail.push_with_limit(row, max_tail_bytes);
             }
         };
-        match encode_span(source, span, prior, &mut keep).await? {
+        // A request that sends from its lowest height takes only the rows its
+        // own budget reads, so a dense span never fills past the rows it sends.
+        let budget = source.ascending_budget();
+        match encode_span(source, span, prior, (&mut keep, budget)).await? {
             SpanEnd::Unsupported => return Ok(None),
             SpanEnd::Through(last) => prior = last.or(prior),
         }
@@ -557,7 +584,7 @@ async fn read_prepend_batches<Source: TailSource>(
             }
         };
         if matches!(
-            encode_span(source, span, None, &mut keep).await?,
+            encode_span(source, span, None, (&mut keep, None)).await?,
             SpanEnd::Unsupported
         ) {
             return Ok(None);
@@ -606,18 +633,23 @@ enum SpanEnd {
 ///
 /// Each chunk is capped at [`crate::BLOCK_RANGE_CHUNK_MAX_BYTES`] of stored
 /// bytes, except that a single row larger than the cap is read alone.
+///
+/// With `budget`, the span is read once with that stored-byte budget, which
+/// keeps the first row even when it alone exceeds it, as a chunk read does.
 async fn encode_span<Source: TailSource>(
     source: &Source,
     span: BlockHeightRange,
     mut prior: Option<BlockId>,
-    keep: &mut impl FnMut(Vec<SealedBlock>),
+    (keep, budget): (&mut impl FnMut(Vec<SealedBlock>), Option<usize>),
 ) -> Result<SpanEnd, Status> {
     let mut next = Some(span.start);
     while let Some(height) = next.filter(|height| *height <= span.end) {
         check_cancel(source)?;
         let last =
             BlockHeight::new(height.value().saturating_add(ENCODE_BATCH_BLOCKS - 1)).min(span.end);
-        let Some(rows) = encode_range(source, BlockHeightRange::inclusive(height, last)).await?
+        let max_bytes = budget.unwrap_or(crate::BLOCK_RANGE_CHUNK_MAX_BYTES);
+        let Some(rows) =
+            encode_range(source, BlockHeightRange::inclusive(height, last), max_bytes).await?
         else {
             return Ok(SpanEnd::Unsupported);
         };
@@ -632,6 +664,9 @@ async fn encode_span<Source: TailSource>(
             next = row.id.height.next();
         }
         keep(rows);
+        if budget.is_some() {
+            break;
+        }
     }
     Ok(SpanEnd::Through(prior))
 }
@@ -639,11 +674,9 @@ async fn encode_span<Source: TailSource>(
 async fn encode_range<Source: TailSource>(
     source: &Source,
     range: BlockHeightRange,
+    max_bytes: usize,
 ) -> Result<Option<Vec<SealedBlock>>, Status> {
-    let Some(blocks) = source
-        .read_rows(range, crate::BLOCK_RANGE_CHUNK_MAX_BYTES)
-        .await?
-    else {
+    let Some(blocks) = source.read_rows(range, max_bytes).await? else {
         return Ok(None);
     };
     check_cancel(source)?;
@@ -709,6 +742,9 @@ mod tests {
         current: Arc<AtomicBool>,
         cancel: CancellationToken,
         cancel_on_read: bool,
+        ascending_budget: Option<usize>,
+        /// Stored rows every tail read has returned.
+        rows_read: AtomicUsize,
         read_gate: Option<Arc<tokio::sync::Notify>>,
         /// Marks the view stale when a read starts.
         stale_on_read: bool,
@@ -776,6 +812,8 @@ mod tests {
             current: Arc::new(AtomicBool::new(true)),
             cancel: CancellationToken::new(),
             cancel_on_read: false,
+            ascending_budget: None,
+            rows_read: AtomicUsize::new(0),
             read_gate: None,
             stale_on_read: false,
             native_row_bytes: 64,
@@ -829,6 +867,10 @@ mod tests {
             &self.cancel
         }
 
+        fn ascending_budget(&self) -> Option<usize> {
+            self.ascending_budget
+        }
+
         fn is_current(&self) -> impl Future<Output = bool> + Send {
             std::future::ready(self.current.load(Ordering::SeqCst))
         }
@@ -851,7 +893,9 @@ mod tests {
             if self.unsupported {
                 return Ok(None);
             }
-            Ok(Some(self.stored_rows(range, max_bytes)))
+            let rows = self.stored_rows(range, max_bytes);
+            self.rows_read.fetch_add(rows.len(), Ordering::SeqCst);
+            Ok(Some(rows))
         }
     }
 
@@ -1090,7 +1134,11 @@ mod tests {
 
                 let mut disconnected = build_source(5, 1);
                 disconnected.cancel_on_read = true;
-                let read = encode_range(&disconnected, span(1, 5));
+                let read = encode_range(
+                    &disconnected,
+                    span(1, 5),
+                    crate::BLOCK_RANGE_CHUNK_MAX_BYTES,
+                );
                 tokio::pin!(read);
                 assert!(matches!(
                     poll_once(read.as_mut()),
@@ -1098,7 +1146,8 @@ mod tests {
                 ));
 
                 let queued = build_source(5, 1);
-                let conversion = encode_range(&queued, span(1, 5));
+                let conversion =
+                    encode_range(&queued, span(1, 5), crate::BLOCK_RANGE_CHUNK_MAX_BYTES);
                 tokio::pin!(conversion);
                 assert!(poll_once(conversion.as_mut()).is_pending());
                 queued.cancel.cancel();
@@ -1462,7 +1511,10 @@ mod tests {
                 (&reads, &epoch, &cancel),
                 None,
                 span(3, 6),
-                crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+                TailReadLimits {
+                    ascending_bytes: None,
+                    refresh_wait: crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+                },
             )
             .await;
         assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
@@ -1475,7 +1527,10 @@ mod tests {
                 (&same_fence, &epoch, &cancel),
                 None,
                 span(3, 6),
-                crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+                TailReadLimits {
+                    ascending_bytes: None,
+                    refresh_wait: crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+                },
             )
             .await;
         assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
@@ -1647,6 +1702,136 @@ mod tests {
             }
         }
         Ok((frames, None))
+    }
+
+    /// Counts the stored rows the tail reads before `request` responds.
+    ///
+    /// Streams `request` over `source` with and without the tail, asserts both
+    /// send the same frames and end the same way, and returns the count with
+    /// the tail buffer the stream left.
+    async fn tail_rows_before_response(
+        source: MockTailSource,
+        request: lightwalletd::BlockRange,
+    ) -> eyre::Result<(usize, ShieldedTailBuffer)> {
+        let with_tail = FencedReads::new(source);
+        let mut without_tail = with_tail.clone();
+        without_tail.tail_enabled = false;
+        let drain = |stream: Result<lightwalletd::EncodedBlockRangeStream, Status>| async move {
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(status) => return (Vec::new(), Some(status.code())),
+            };
+            let mut frames = Vec::new();
+            while let Some(frame) = stream.next().await {
+                match frame {
+                    Ok(frame) => frames.push(frame),
+                    Err(status) => return (frames, Some(status.code())),
+                }
+            }
+            (frames, None)
+        };
+        let methods = BlockMethods::default();
+        let native = drain(
+            methods
+                .published_block_range(
+                    &without_tail,
+                    &request,
+                    (None, ShieldedTailBuffer::default()),
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(with_tail.source.rows_read.load(Ordering::SeqCst), 0);
+        let buffer = ShieldedTailBuffer::default();
+        let opened = methods
+            .published_block_range(&with_tail, &request, (None, buffer.clone()))
+            .await;
+        let before_response = with_tail.source.rows_read.load(Ordering::SeqCst);
+        assert_eq!(drain(opened).await, native);
+        assert!(native.1.is_none());
+        Ok((before_response, buffer))
+    }
+
+    fn sized_rows(tip: u32, native_row_bytes: usize) -> MockTailSource {
+        let mut source = build_source(tip, 1);
+        source.native_row_bytes = native_row_bytes;
+        source
+    }
+
+    fn range_request(first: u64, last: u64, pool_types: Vec<i32>) -> lightwalletd::BlockRange {
+        let block = |height| {
+            Some(lightwalletd::BlockId {
+                height,
+                hash: Vec::new(),
+            })
+        };
+        lightwalletd::BlockRange {
+            start: block(first),
+            end: block(last),
+            pool_types,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_ascending_dense_tip_span_reads_only_its_first_chunk_before_responding()
+    -> eyre::Result<()> {
+        // 100 KiB rows: the 256 KiB first chunk holds two.
+        let (read, buffer) =
+            tail_rows_before_response(sized_rows(60, 100 * 1024), range_request(1, 60, Vec::new()))
+                .await?;
+        assert_eq!(read, 2);
+        // Only the last chunk, 43..=60, reads its rows to the tip within its
+        // 2 MiB budget, so only it installs a tail.
+        assert_eq!(
+            buffer.load_full().and_then(|tail| tail.bounds()),
+            Some(span(43, 60))
+        );
+
+        // A 300 KiB row exceeds the first chunk alone and is still sent.
+        let (read, _) =
+            tail_rows_before_response(sized_rows(60, 300 * 1024), range_request(1, 60, Vec::new()))
+                .await?;
+        assert_eq!(read, 1);
+
+        let transparent = vec![lightwalletd::PoolType::Transparent as i32];
+        let (read, buffer) = tail_rows_before_response(
+            sized_rows(60, 100 * 1024),
+            range_request(1, 60, transparent),
+        )
+        .await?;
+        assert_eq!(read, 0);
+        assert!(buffer.load_full().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tip_span_that_fits_its_chunk_warms_the_tail_in_either_order() -> eyre::Result<()> {
+        for request in [
+            range_request(1, 60, Vec::new()),
+            range_request(60, 1, Vec::new()),
+        ] {
+            let (read, buffer) = tail_rows_before_response(sized_rows(60, 64), request).await?;
+            assert_eq!(read, 60);
+            assert_eq!(
+                buffer.load_full().and_then(|tail| tail.bounds()),
+                Some(span(1, 60))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cold_descending_dense_tip_span_still_warms_the_top_of_the_tail() -> eyre::Result<()>
+    {
+        let (read, buffer) =
+            tail_rows_before_response(sized_rows(60, 100 * 1024), range_request(60, 1, Vec::new()))
+                .await?;
+        assert_eq!(read, 60);
+        assert_eq!(
+            buffer.load_full().and_then(|tail| tail.bounds()),
+            Some(span(1, 60))
+        );
+        Ok(())
     }
 
     /// Streams `1..=60` over `faulty` with and without the tail, asserts both

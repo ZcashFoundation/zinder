@@ -477,15 +477,17 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     stream_slot: crate::block_range::BlockRangeStreamSlot,
     conversion: Source,
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
-    let first_chunk = BlockRangeChunks::new(block_range, is_descending).next_chunk();
-    let published_limit = first_chunk.and_then(|chunk| conversion.published_read_limit(chunk));
+    let chunks = BlockRangeChunks::new(block_range, is_descending);
+    let published_limit = chunks
+        .next_chunk()
+        .and_then(|chunk| conversion.published_read_limit(chunk));
     let (view, read_permit) = first_chunk_view(reads, block_range.end, published_limit).await?;
     let first_cancel = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
     let first_read = read_first_chunk(
         reads.clone(),
         view,
-        BlockRangeChunks::new(block_range, is_descending),
+        chunks,
         conversion.clone(),
         first_cancel,
     );

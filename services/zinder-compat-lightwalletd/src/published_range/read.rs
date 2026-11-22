@@ -12,7 +12,7 @@ use zinder_store::HeightOrder;
 
 use super::{
     PublishedShieldedCatalog,
-    tail::{EncodedTail, Fence, ShieldedTailBuffer},
+    tail::{EncodedTail, Fence, ShieldedTailBuffer, TailReadLimits},
 };
 use crate::{
     block_methods::{
@@ -214,7 +214,7 @@ impl PublishedRangeRead {
         &self,
         reads: &Reads,
         (view, epoch, fence, cancel): (&Reads::View, ChainEpoch, Option<Fence>, &CancellationToken),
-        chunk: &mut BlockHeightRange,
+        (chunk, max_bytes): (&mut BlockHeightRange, usize),
     ) -> AnchorPlan {
         let Some(fence) = fence else {
             if !self.covers_selected_history(*chunk) {
@@ -260,20 +260,25 @@ impl PublishedRangeRead {
                 .plan_with_tail(
                     reads,
                     (view, epoch, fence, cancel),
-                    chunk,
+                    (chunk, max_bytes),
                     Some(catalog_end),
                 )
                 .await;
         }
-        self.plan_with_tail(reads, (view, epoch, fence, cancel), chunk, None)
-            .await
+        self.plan_with_tail(
+            reads,
+            (view, epoch, fence, cancel),
+            (chunk, max_bytes),
+            None,
+        )
+        .await
     }
 
     async fn plan_with_tail<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
         (view, epoch, fence, cancel): (&Reads::View, ChainEpoch, Fence, &CancellationToken),
-        chunk: &mut BlockHeightRange,
+        (chunk, max_bytes): (&mut BlockHeightRange, usize),
         catalog_end: Option<(BlockHeight, BlockId)>,
     ) -> AnchorPlan {
         let Some(window_floor) =
@@ -298,7 +303,10 @@ impl PublishedRangeRead {
                 (reads, view, cancel),
                 catalog_end,
                 *chunk,
-                self.limits.max_wait(),
+                TailReadLimits {
+                    ascending_bytes: (self.order() == HeightOrder::Ascending).then_some(max_bytes),
+                    refresh_wait: self.limits.max_wait(),
+                },
             )
             .await
         {
@@ -422,7 +430,11 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             let started = Instant::now();
             let fence = reads.range_fence(view);
             let plan = self
-                .resolve_plan(reads, (view, epoch, fence, &read.cancel), &mut read.chunk)
+                .resolve_plan(
+                    reads,
+                    (view, epoch, fence, &read.cancel),
+                    (&mut read.chunk, read.max_bytes),
+                )
                 .await;
             (epoch, started, plan)
         };

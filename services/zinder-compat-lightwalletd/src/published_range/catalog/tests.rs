@@ -110,7 +110,10 @@ async fn fill_tail(
             (&slot, reader, &tokio_util::sync::CancellationToken::new()),
             Some(terminal),
             requested,
-            crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            super::super::tail::TailReadLimits {
+                ascending_bytes: None,
+                refresh_wait: crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            },
         )
         .await?
         .ok_or_else(|| eyre!("missing tail"))
