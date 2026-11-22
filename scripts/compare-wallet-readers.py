@@ -156,7 +156,8 @@ def run(args):
     client_cpus = allowed[:workers]
     reader_list = ",".join(map(str, reader_cpus))
     client_list = ",".join(map(str, client_cpus))
-    environment = {**os.environ, "TOKIO_WORKER_THREADS": str(workers), "RAYON_NUM_THREADS": str(workers)}
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("ZINDER_")}
+    environment.update(TOKIO_WORKER_THREADS=str(workers), RAYON_NUM_THREADS=str(workers))
     with tempfile.TemporaryDirectory(prefix="wallet-reader-") as tmp, ExitStack() as children:
         scratch = Path(tmp)
         environment["TMPDIR"] = tmp

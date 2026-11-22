@@ -2,6 +2,7 @@
 """Exercise the complete local comparison using one reader binary as both arms."""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -28,7 +29,8 @@ def main():
                    "--writer", args.writer, "--output", str(output), "--policy", str(policy),
                    "--blocks", "32", "--width", "4", "--pairs", "2", "--clients", "2",
                    "--repetitions", "4"]
-        result = subprocess.run(command, stdout=subprocess.DEVNULL, check=False)
+        environment = {**os.environ, "ZINDER_NETWORK": "invalid-inherited-network"}
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, env=environment, check=False)
         if result.returncode:
             for log in sorted(output.rglob("*.log")):
                 if log.stat().st_size:
