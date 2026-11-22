@@ -46,13 +46,19 @@ impl PublishedShieldedHistory {
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        catalog.verify_source(source).await?;
+        catalog.admit_source(source).await?;
         Ok(Self {
             current: ArcSwap::from_pointee(catalog),
             manifest: manifest.to_owned(),
             key,
             require_fs_verity,
         })
+    }
+
+    /// Refreshes the default shielded live tail against a captured canonical view.
+    /// An incomplete or displaced refresh keeps the previous fence available.
+    pub async fn refresh_tail(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
+        self.catalog().refresh_tail(source).await
     }
 
     pub(crate) fn catalog(&self) -> Arc<PublishedShieldedCatalog> {
@@ -83,20 +89,30 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if candidate.segments().len() == current.segments().len() {
+            current.refresh_tail(source).await?;
             return Ok(false);
         }
-        candidate.verify_source(source).await?;
+        candidate.admit_source(source).await?;
         let displaced = self.current.compare_and_swap(&current, Arc::new(candidate));
         Ok(Arc::ptr_eq(&current, &displaced))
     }
 }
 
 impl PublishedShieldedCatalog {
+    async fn admit_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
+        self.verify_source(source).await?;
+        if let Err(status) = self.refresh_tail(source).await {
+            tracing::warn!(%status, "serving the uncovered tail from canonical storage");
+        }
+        Ok(())
+    }
+
     pub(super) fn read_chunk(
         &self,
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
+        allow_oversized: bool,
     ) -> io::Result<Vec<SealedBlock>> {
         let segments = self.segments();
         let start =
@@ -112,7 +128,9 @@ impl PublishedShieldedCatalog {
                 )
             })?;
         if let [part] = selected {
-            return part.segment.bounded_rows(range, order, max_bytes, true);
+            return part
+                .segment
+                .bounded_rows(range, order, max_bytes, allow_oversized);
         }
         let mut output = Vec::new();
         let mut remaining = max_bytes;
@@ -126,7 +144,7 @@ impl PublishedShieldedCatalog {
                 range.start.max(identity.start),
                 range.end.min(identity.end.height),
             );
-            let allow_oversized = output.is_empty();
+            let allow_oversized = allow_oversized && output.is_empty();
             let mut rows = part
                 .segment
                 .bounded_rows(span, order, remaining, allow_oversized)?;

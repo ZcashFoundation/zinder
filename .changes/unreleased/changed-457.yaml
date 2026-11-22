@@ -1,0 +1,6 @@
+kind: changed
+body: Wallet listeners with published history reuse a bounded suffix of encoded shielded blocks at the current chain view. Uncovered chunks, other pool selections, and a changed chain view retain their canonical read behavior.
+time: 2026-11-21T22:17:35.414415327Z
+custom:
+    Bump: patch
+    PR: "457"

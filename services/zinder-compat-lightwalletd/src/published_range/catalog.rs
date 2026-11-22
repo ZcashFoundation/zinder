@@ -76,6 +76,7 @@ fn check_parent(
 #[derive(Clone)]
 pub(crate) struct PublishedShieldedCatalog {
     segments: Vec<Arc<PublishedShieldedRange>>,
+    pub(super) tail: Arc<arc_swap::ArcSwapOption<super::tail::EncodedTail>>,
 }
 
 impl PublishedShieldedCatalog {
@@ -112,7 +113,14 @@ impl PublishedShieldedCatalog {
             }
             segments.push(Arc::new(segment));
         }
-        Ok(Self { segments })
+        let tail = previous
+            .and_then(|catalog| catalog.tail.load_full())
+            .zip(entries.last())
+            .map(|(tail, segment)| tail.after_published(BlockHeight::new(segment.last)));
+        Ok(Self {
+            segments,
+            tail: Arc::new(arc_swap::ArcSwapOption::from(tail)),
+        })
     }
 
     /// All admitted segments in ascending height order.

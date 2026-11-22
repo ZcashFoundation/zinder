@@ -493,6 +493,16 @@ where
             .map_err(|error| status_from_query_error(&error))
     }
 
+    fn range_fence(
+        &self,
+        view: &Self::View,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        self.compact_block_fence(*view)
+    }
+
     fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {
         *view
     }

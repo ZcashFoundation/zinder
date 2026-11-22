@@ -137,6 +137,19 @@ pub trait CanonicalReader: Send + Sync + 'static {
         max_bytes: usize,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError>;
 
+    /// Reads ascending compact blocks with their original stored lengths, within the
+    /// same byte budget as a wallet range. Readers that cannot supply exact lengths
+    /// leave the optional encoded tail to canonical range serving.
+    async fn compact_block_rows_with_lengths(
+        &self,
+        _range: BlockHeightRange,
+        _max_bytes: usize,
+    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
+        Err(StorageReadError::Unavailable {
+            source: "canonical row lengths are unavailable".into(),
+        })
+    }
+
     /// Reads the retained raw block at `height`, or `None` when the store
     /// does not hold it.
     async fn block_blob_at(

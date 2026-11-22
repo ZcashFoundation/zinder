@@ -39,6 +39,13 @@ impl CatalogSource {
         }
     }
 
+    async fn refresh_tail(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
+        match self {
+            Self::Wallet(slot) => history.refresh_tail(slot.capture().canonical()).await,
+            Self::Compact(slot) => history.refresh_tail(slot.capture().as_ref()).await,
+        }
+    }
+
     async fn refresh(&self, history: &PublishedShieldedHistory) -> Result<bool, tonic::Status> {
         match self {
             Self::Wallet(slot) => history.refresh(slot.capture().canonical()).await,
@@ -146,7 +153,11 @@ impl CatalogRefresh {
             .await
             .map_err(|error| error.to_string())?;
         if self.applied.as_ref() == Some(&stamp) {
-            return Ok(());
+            return self
+                .source
+                .refresh_tail(&self.history)
+                .await
+                .map_err(|status| status.message().to_owned());
         }
         let changed = self
             .source

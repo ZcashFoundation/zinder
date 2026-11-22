@@ -4,6 +4,7 @@ mod catalog;
 mod history;
 mod manifest;
 mod read;
+mod tail;
 
 pub(crate) use catalog::PublishedShieldedCatalog;
 pub use catalog::ShieldedCatalogPublisher;

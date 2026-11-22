@@ -74,6 +74,16 @@ impl CompactBlockReads for CanonicalReaderSlot {
         std::future::ready(Ok(self.capture()))
     }
 
+    fn range_fence(
+        &self,
+        view: &Self::View,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        Some((view.event_fence(), view.history_bounds()))
+    }
+
     fn view_chain_epoch(view: &Arc<RocksDbCanonicalReader>) -> ChainEpoch {
         view.chain_epoch()
     }

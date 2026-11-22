@@ -349,3 +349,163 @@ fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Resul
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> Result<()> {
+    use zinder_store::HeightOrder;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let extension = chain.clone().extend_blocks(2);
+    let fork = extension.fork_at(BlockHeight::new(6))?.extend_blocks(3);
+    let fixture = Fixture::new()?;
+    let (_old, initial) = reader(&chain)?;
+    let (_new, extended) = reader(&extension)?;
+    let (_fork, replacement) = reader(&fork)?;
+    assert!(fixture.publisher()?.publish_next(&initial)?);
+    let catalog = fixture.catalog(None)?;
+    let mut retained = None;
+    for source in [&initial, &extended, &replacement] {
+        catalog.refresh_tail(source).await?;
+        let tail = catalog
+            .tail
+            .load_full()
+            .ok_or_else(|| eyre!("missing tail"))?;
+        let span = tail.bounds().ok_or_else(|| eyre!("empty tail"))?;
+        assert_eq!(span.start, BlockHeight::new(3));
+        assert_eq!(span.end, source.chain_epoch().visible_tip_height);
+        let rows = tail.select(span, HeightOrder::Ascending, usize::MAX, true);
+        for row in &rows {
+            let block = source
+                .compact_blocks_in_range(BlockHeightRange::inclusive(row.id.height, row.id.height))
+                .await?
+                .pop()
+                .ok_or_else(|| eyre!("missing canonical block"))?;
+            let canonical =
+                crate::compact_block_messages::CompactBlockShape::for_range(&[])?.message(block)?;
+            assert_eq!(
+                row.payload.as_ref(),
+                prost::Message::encode_to_vec(&canonical)
+            );
+        }
+        if let Some(prior) = &retained {
+            let prior: &prost::bytes::Bytes = prior;
+            assert_eq!(prior.as_ptr(), rows[0].payload.as_ptr());
+        }
+        retained = Some(rows[0].payload.clone());
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            assert_eq!(tail.select(span, order, 0, true).len(), 1);
+            assert!(tail.select(span, order, 0, false).is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Result<()> {
+    use zinder_store::HeightOrder;
+    let fixture = Fixture::new()?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    let first = fixture.catalog(None)?;
+    first.refresh_tail(&source).await?;
+    let original = first
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+
+    assert!(publisher.publish_next(&source)?);
+    let extension = fixture.catalog(Some(&first))?;
+    extension.refresh_tail(&source).await?;
+    let retained = extension
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+    let suffix = BlockHeightRange::inclusive(BlockHeight::new(5), BlockHeight::new(6));
+    assert_eq!(retained.bounds(), Some(suffix));
+    assert_eq!(
+        original.bounds().map(|span| span.start),
+        Some(BlockHeight::new(3))
+    );
+    let reused = retained.select(suffix, HeightOrder::Ascending, usize::MAX, true);
+    let previous = original.select(suffix, HeightOrder::Ascending, usize::MAX, true);
+    assert_eq!(reused.len(), 2);
+    assert!(
+        previous
+            .iter()
+            .zip(reused)
+            .all(|(old, row)| old.payload.as_ptr() == row.payload.as_ptr())
+    );
+
+    assert!(publisher.publish_next(&source)?);
+    let complete = fixture.catalog(Some(&extension))?;
+    assert_eq!(
+        complete.tail.load_full().and_then(|tail| tail.bounds()),
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_read() -> Result<()> {
+    use crate::{
+        CanonicalReaderSlot,
+        block_methods::{ChunkRead, ChunkReadFailure, ChunkView, RangeSource as _},
+        block_range::RangeBlock as _,
+        compact_block_messages::CompactBlockShape,
+        published_range::PublishedRangeRead,
+    };
+    use zinder_store::HeightOrder;
+    let fixture = Fixture::new()?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    assert!(publisher.publish_next(&source)?);
+    let catalog = Arc::new(fixture.catalog(None)?);
+    catalog.refresh_tail(&source).await?;
+    let fifth = BlockHeight::new(5);
+    let tail = catalog
+        .tail
+        .load_full()
+        .ok_or_else(|| eyre!("missing tail"))?;
+    let row = tail
+        .select(
+            BlockHeightRange::inclusive(fifth, fifth),
+            HeightOrder::Descending,
+            0,
+            true,
+        )
+        .pop()
+        .ok_or_else(|| eyre!("missing tail row at height 5"))?;
+    let segment = segment_path(
+        fixture.directory.path(),
+        catalog.terminal().identity().sha256,
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(segment)?
+        .set_len(0)?;
+
+    let range = PublishedRangeRead::new(catalog, CompactBlockShape::for_range(&[])?, true);
+    let slot = CanonicalReaderSlot::new(Arc::new(source));
+    let read = |first, last, max_bytes| {
+        range.read(
+            &slot,
+            ChunkRead {
+                chunk: BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last)),
+                order: HeightOrder::Descending,
+                max_bytes,
+                view: ChunkView::Current,
+            },
+            |_, rows| rows.into_iter().map(|row| row.height()).collect::<Vec<_>>(),
+        )
+    };
+    for first in [1, 4] {
+        let answer = read(first, 5, row.native_bytes + 1).await;
+        assert!(matches!(answer.converted, Ok(heights) if heights == [fifth]));
+    }
+    let damaged = read(4, 4, 1).await;
+    assert!(
+        matches!(damaged.converted, Err(ChunkReadFailure::Failed(status)) if status.code() == tonic::Code::DataLoss)
+    );
+    Ok(())
+}

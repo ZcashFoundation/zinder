@@ -175,6 +175,7 @@ struct IndexedBlock {
     sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone)]
 pub(crate) struct SealedBlock {
     pub(crate) id: BlockId,
     pub(crate) parent: BlockHash,
