@@ -736,7 +736,7 @@ async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_during_parallel_tree_hashing_stops_promptly_and_the_next_start_rebuilds()
+async fn shutdown_with_idle_tree_hashing_workers_stops_promptly_and_the_next_start_rebuilds()
 -> Result<(), Box<dyn std::error::Error>> {
     Box::pin(assert_shutdown_during_construction_stops_promptly(4)).await
 }
