@@ -179,6 +179,52 @@ check_named_history_input history/publisher.pub false reject
 check_named_history_input history/publisher.pk8 true reject
 check_named_history_input history true reject
 
+reject_history_contract() {
+  expect_rejected_because "$1" "invalid signed wallet history publication or reader mounts" \
+    --compose-contract "$invalid_history_compose"
+}
+
+# Only declarations are inspected. The fixture paths need no files or Docker volumes.
+for options in '{"type":"fixture-fs"}' '{"o":"fixture-option"}' '{"device":"relative","o":"bind"}'; do
+  jq --argjson options "$options" '.volumes.data.driver_opts = $options' \
+    "$history_compose" > "$invalid_history_compose"
+  reject_history_contract "an unresolved local volume backing"
+done
+jq '.volumes.data.driver = "fixture-driver"' "$history_compose" > "$invalid_history_compose"
+reject_history_contract "a named volume using an unverified driver"
+jq --arg device "$temporary_directory/unrelated" '
+  .volumes.data.driver_opts = {type: "none", device: $device, o: "rbind,ro,nodev"}
+' "$history_compose" > "$invalid_history_compose"
+bash "$validator" --compose-contract "$invalid_history_compose"
+
+for resource in configs secrets; do
+  for file in publisher.pub publisher.pk8; do
+    jq --arg resource "$resource" --arg file "$history_dir/$file" '
+      .[$resource].fixture = {file: $file}
+      | .services["zinder-query"][$resource] = [{source: "fixture", target: "fixture-input"}]
+    ' "$history_compose" > "$invalid_history_compose"
+    if [[ "$file" == publisher.pub ]]; then
+      bash "$validator" --compose-contract "$invalid_history_compose"
+    else
+      reject_history_contract "a $resource grant from the publisher signing key"
+    fi
+  done
+  jq --arg resource "$resource" '
+    .[$resource].fixture = {external: true}
+    | .services["zinder-query"][$resource] = ["fixture"]
+  ' "$history_compose" > "$invalid_history_compose"
+  reject_history_contract "a $resource grant with an external, unverified source"
+done
+
+jq '.services["zinder-query"].volumes_from = ["state-init:ro"]' \
+  "$history_compose" > "$invalid_history_compose"
+reject_history_contract "a non-publisher service inheriting mounts"
+jq --arg source "$history_dir/" '
+  (.services[].volumes[] | select(.type == "bind" and (.source | startswith($source))) | .source)
+  |= ("/./" + ltrimstr($source))
+' "$history_compose" > "$invalid_history_compose"
+reject_history_contract "a history generation whose normalized path is root"
+
 jq 'del(.services["zinder-compat-lightwalletd"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
 expect_rejected "a wallet reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
 jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \
