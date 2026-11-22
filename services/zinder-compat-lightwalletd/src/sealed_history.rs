@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use prost::{Message, bytes::Bytes};
@@ -19,10 +20,12 @@ use zinder_store::HeightOrder;
 
 use crate::compact_block_messages::CompactBlockShape;
 
-// The magic binds version 1 to the default shielded range projection. All integers are big-endian.
-const MAGIC: &[u8; 8] = b"ZSHRNG01";
+// The magic binds version 2 to the default shielded range projection. All integers are big-endian.
+const MAGIC: &[u8; 8] = b"ZSHRNG02";
 const HEADER_LEN: usize = 52;
 const LENGTHS_LEN: usize = 8;
+const INDEX_LEN: usize = 112;
+mod index;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -32,6 +35,7 @@ pub(crate) struct SegmentIdentity {
     pub(crate) start: BlockHeight,
     pub(crate) end: BlockId,
     pub(crate) sha256: [u8; 32],
+    pub(crate) verity: Option<[u8; 32]>,
 }
 
 impl SegmentIdentity {
@@ -68,6 +72,9 @@ pub(crate) struct SegmentWriter {
     target: PathBuf,
     staged: Option<BufWriter<NamedTempFile>>,
     digest: Sha256,
+    verity: Box<dyn fs_verity::DynFsVerityDigest + 'static>,
+    index: Vec<[u8; INDEX_LEN]>,
+    offset: u64,
     prior: Option<BlockId>,
 }
 
@@ -83,8 +90,11 @@ impl SegmentWriter {
             start,
             end,
             sha256: [0; 32],
+            verity: None,
         };
         let header = identity.header()?;
+        let mut verity = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
+        verity.write_all(&header)?;
         let mut staged = BufWriter::new(NamedTempFile::new_in(parent_directory(path))?);
         staged.write_all(&header)?;
         Ok(Self {
@@ -92,6 +102,9 @@ impl SegmentWriter {
             target: path.to_owned(),
             staged: Some(staged),
             digest: Sha256::new_with_prefix(header),
+            verity,
+            index: Vec::new(),
+            offset: HEADER_LEN as u64,
             prior: None,
         })
     }
@@ -104,6 +117,7 @@ impl SegmentWriter {
         let id = BlockId::new(block.height(), block.block_hash());
         self.identity
             .check_block(id, block.previous_block_hash(), self.prior)?;
+        let parent = block.previous_block_hash();
         let message = CompactBlockShape::for_range(&[])
             .and_then(|shape| shape.message(block))
             .map_err(|status| io::Error::new(io::ErrorKind::InvalidData, status))?;
@@ -120,25 +134,50 @@ impl SegmentWriter {
             .ok_or_else(|| invalid("failed shielded segment write"))?;
         staged.write_all(&lengths)?;
         staged.write_all(&payload)?;
-        self.staged = Some(staged);
+        self.verity.write_all(&lengths)?;
+        self.verity.write_all(&payload)?;
         self.digest.update(lengths);
-        self.digest.update(payload);
+        self.digest.update(&payload);
+        let offset = self.offset + LENGTHS_LEN as u64;
+        self.index.push(index::encode(
+            offset,
+            lengths,
+            id.hash,
+            parent,
+            Sha256::digest(&payload).into(),
+        ));
+        self.offset = offset + payload.len() as u64;
+        self.staged = Some(staged);
         self.prior = Some(id);
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> io::Result<SegmentIdentity> {
+    pub(crate) fn finish(mut self) -> io::Result<SegmentIdentity> {
         if self.prior != Some(self.identity.end) {
             return Err(invalid("incomplete shielded segment"));
         }
-        let staged = self
+        let mut staged = self
             .staged
-            .ok_or_else(|| invalid("failed shielded segment write"))?
+            .take()
+            .ok_or_else(|| invalid("failed shielded segment write"))?;
+        for entry in self.index {
+            staged.write_all(&entry)?;
+            self.digest.update(entry);
+            self.verity.write_all(&entry)?;
+        }
+        let staged = staged
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
         staged.as_file().sync_all()?;
         let identity = SegmentIdentity {
             sha256: self.digest.finalize().into(),
+            verity: Some(
+                self.verity
+                    .finalize()
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| invalid("invalid fs-verity digest length"))?,
+            ),
             ..self.identity
         };
         if let Err(failure) = staged.persist_noclobber(&self.target) {
@@ -172,7 +211,48 @@ struct IndexedBlock {
     native_bytes: usize,
     offset: u64,
     len: usize,
-    sha256: Option<[u8; 32]>,
+    sha256: [u8; 32],
+    validation: OnceLock<Result<(), PayloadError>>,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+enum PayloadError {
+    #[error("shielded segment payload SHA-256 mismatch")]
+    Digest,
+    #[error("malformed shielded segment CompactBlock protobuf")]
+    Protobuf,
+    #[error("shielded segment payload height, hash, or parent differs from its index")]
+    Identity,
+}
+
+impl IndexedBlock {
+    fn check_digest(&self, payload: &[u8]) -> Result<(), PayloadError> {
+        if <[u8; 32]>::from(Sha256::digest(payload)) != self.sha256 {
+            return Err(PayloadError::Digest);
+        }
+        Ok(())
+    }
+
+    fn verify_payload(&self, payload: &Bytes, kernel_verified: bool) -> Result<(), PayloadError> {
+        // Portable files can change between reads. Only authenticated bytes share a verdict.
+        if !kernel_verified {
+            self.check_digest(payload)?;
+        }
+        *self.validation.get_or_init(|| {
+            if kernel_verified {
+                self.check_digest(payload)?;
+            }
+            let block = lightwalletd::CompactBlock::decode(payload.clone())
+                .map_err(|_| PayloadError::Protobuf)?;
+            if block.height != u64::from(self.id.height.value())
+                || block.hash != encode_internal_block_hash(self.id.hash)
+                || block.prev_hash != encode_internal_block_hash(self.parent)
+            {
+                return Err(PayloadError::Identity);
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -201,151 +281,12 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-struct AuthenticatedRow {
-    lengths: [u8; LENGTHS_LEN],
-    sha256: Option<[u8; 32]>,
-}
-
-fn read_segment_header(
-    input: &mut impl Read,
-    expected: SegmentIdentity,
-) -> io::Result<[u8; HEADER_LEN]> {
-    let mut header = [0; HEADER_LEN];
-    input.read_exact(&mut header)?;
-    if header != expected.header()? {
-        return Err(invalid(
-            "shielded segment format, network, or interval mismatch",
-        ));
-    }
-    Ok(header)
-}
-
-fn authenticate_rows(
-    input: &mut impl BufRead,
-    expected: SegmentIdentity,
-    file_len: u64,
-    protected: bool,
-) -> io::Result<Vec<AuthenticatedRow>> {
-    let header = read_segment_header(input, expected)?;
-    let count = u64::from(expected.end.height.value() - expected.start.value()) + 1;
-    // Each message contains two 32-byte hashes with one-byte tags and lengths.
-    let minimum = HEADER_LEN as u64 + count * (LENGTHS_LEN as u64 + 68);
-    let maximum = HEADER_LEN as u64 + count * (LENGTHS_LEN + MAX_PAYLOAD_BYTES) as u64;
-    if !(minimum..=maximum).contains(&file_len) {
-        return Err(invalid(
-            "shielded segment file size does not fit its interval",
-        ));
-    }
-    let mut digest = Sha256::new_with_prefix(header);
-    let mut rows = Vec::new();
-    let mut offset = HEADER_LEN as u64;
-    for _ in BlockHeightRange::inclusive(expected.start, expected.end.height) {
-        let mut lengths = [0; LENGTHS_LEN];
-        input.read_exact(&mut lengths)?;
-        digest.update(lengths);
-        let (_, len) = decode_lengths(lengths)?;
-        // At most 2^32 rows of at most MAX_PAYLOAD_BYTES fit the signed interval.
-        offset += LENGTHS_LEN as u64 + len as u64;
-        if offset > file_len {
-            return Err(invalid("shielded segment row exceeds file size"));
-        }
-        let mut payload_digest = (!protected).then(Sha256::new);
-        let mut remaining = len;
-        while remaining > 0 {
-            let available = input.fill_buf()?;
-            if available.is_empty() {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            let consumed = remaining.min(available.len());
-            let bytes = &available[..consumed];
-            digest.update(bytes);
-            if let Some(sha256) = &mut payload_digest {
-                sha256.update(bytes);
-            }
-            input.consume(consumed);
-            remaining -= consumed;
-        }
-        rows.push(AuthenticatedRow {
-            lengths,
-            sha256: payload_digest.map(|hash| hash.finalize().into()),
-        });
-    }
-    if offset != file_len
-        || !input.fill_buf()?.is_empty()
-        || <[u8; 32]>::from(digest.finalize()) != expected.sha256
-    {
-        return Err(invalid("shielded segment length or SHA-256 mismatch"));
-    }
-    Ok(rows)
-}
-
-fn index_rows(
-    input: &mut (impl BufRead + Seek),
-    expected: SegmentIdentity,
-    authenticated: Vec<AuthenticatedRow>,
-) -> io::Result<Vec<IndexedBlock>> {
-    input.rewind()?;
-    read_segment_header(input, expected)?;
-    let mut offset = HEADER_LEN as u64;
-    let mut payload = Vec::new();
-    let mut prior = None;
-    let mut index = Vec::with_capacity(authenticated.len());
-    for (height, row) in BlockHeightRange::inclusive(expected.start, expected.end.height)
-        .into_iter()
-        .zip(authenticated)
-    {
-        let mut lengths = [0; LENGTHS_LEN];
-        input.read_exact(&mut lengths)?;
-        if lengths != row.lengths {
-            return Err(invalid(
-                "shielded segment row lengths changed after authentication",
-            ));
-        }
-        let (native_bytes, len) = decode_lengths(lengths)?;
-        payload.resize(len, 0);
-        input.read_exact(&mut payload)?;
-        // Check and decode the same buffer. Another process can still write to an ordinary file.
-        verify_payload(&payload, row.sha256)?;
-        let block = lightwalletd::CompactBlock::decode(payload.as_slice())?;
-        if block.height != u64::from(height.value()) {
-            return Err(invalid("wrong shielded segment payload height"));
-        }
-        let id = BlockId::new(height, decode_hash(&block.hash)?);
-        let parent = decode_hash(&block.prev_hash)?;
-        expected.check_block(id, parent, prior)?;
-        offset += LENGTHS_LEN as u64;
-        index.push(IndexedBlock {
-            id,
-            parent,
-            native_bytes,
-            offset,
-            len,
-            sha256: row.sha256,
-        });
-        offset += len as u64;
-        prior = Some(id);
-    }
-    if !input.fill_buf()?.is_empty() {
-        return Err(invalid("shielded segment length mismatch"));
-    }
-    Ok(index)
-}
-
-fn verify_payload(payload: &[u8], expected: Option<[u8; 32]>) -> io::Result<()> {
-    if expected.is_some_and(|hash| <[u8; 32]>::from(Sha256::digest(payload)) != hash) {
-        return Err(invalid("shielded segment payload SHA-256 mismatch"));
-    }
-    Ok(())
-}
-
 impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
-        let protected = kernel_verifies_reads(&file);
-        let mut input = BufReader::new(&file);
-        let authenticated = authenticate_rows(&mut input, expected, file_len, protected)?;
-        let rows = index_rows(&mut input, expected, authenticated)?;
+        let protected = index::pinned_verity(expected.verity, || measured_verity(&file))?;
+        let rows = index::admit(&mut &file, expected, file_len, protected)?;
         Ok(Self {
             kernel_verified: protected,
             identity: expected,
@@ -423,22 +364,32 @@ impl SealedHistory {
         let last = selected
             .last()
             .ok_or_else(|| invalid("empty shielded chunk"))?;
+        let first_frame = first.offset - LENGTHS_LEN as u64;
         let relative = |row: &IndexedBlock| {
-            usize::try_from(row.offset - first.offset)
+            usize::try_from(row.offset - first_frame)
                 .map_err(|_| invalid("shielded chunk exceeds address space"))
         };
         let len = relative(last)?
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
         let mut packed = vec![0; len];
-        read_exact_at(&self.file, &mut packed, first.offset)?;
+        read_exact_at(&self.file, &mut packed, first_frame)?;
         let packed = Bytes::from(packed);
         selected
             .iter()
             .map(|row| {
                 let start = relative(row)?;
+                let lengths = packed[..start]
+                    .last_chunk()
+                    .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
+                if decode_lengths(*lengths)? != (row.native_bytes, row.len) {
+                    return Err(invalid(
+                        "shielded segment frame lengths differ from its index",
+                    ));
+                }
                 let payload = packed.slice(start..start + row.len);
-                verify_payload(&payload, row.sha256)?;
+                row.verify_payload(&payload, self.kernel_verified)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 Ok(SealedBlock {
                     id: row.id,
                     parent: row.parent,
@@ -469,9 +420,31 @@ fn kernel_verifies_reads(file: &File) -> bool {
         })
 }
 
+#[cfg(target_os = "linux")]
+fn measured_verity(file: &File) -> io::Result<Option<[u8; 32]>> {
+    use composefs_ioctls::fsverity::{MeasureVerityError, fs_ioc_measure_verity};
+
+    if !kernel_verifies_reads(file) {
+        return Ok(None);
+    }
+    fs_ioc_measure_verity(file, fs_verity::InnerHashAlgorithm::Sha256 as u8)
+        .map(Some)
+        .map_err(|error| match error {
+            MeasureVerityError::Io(source) => source,
+            MeasureVerityError::FilesystemNotSupported => {
+                io::Error::new(io::ErrorKind::Unsupported, error)
+            }
+            MeasureVerityError::VerityMissing
+            | MeasureVerityError::InvalidDigestAlgorithm { .. }
+            | MeasureVerityError::InvalidDigestSize { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
+        })
+}
+
 #[cfg(not(target_os = "linux"))]
-fn kernel_verifies_reads(_file: &File) -> bool {
-    false
+fn measured_verity(_file: &File) -> io::Result<Option<[u8; 32]>> {
+    Ok(None)
 }
 
 #[cfg(unix)]

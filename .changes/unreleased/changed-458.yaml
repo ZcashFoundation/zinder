@@ -1,0 +1,6 @@
+kind: changed
+body: Signed wallet history now uses version 2 segments with an authenticated index. Republish version 1 catalogs into a new directory before switching listeners. Portable readers verify each file in a single pass, and a matching signed fs-verity measurement allows admission from the index.
+time: 2026-11-21T22:18:19.414211467Z
+custom:
+    Bump: minor
+    PR: "458"

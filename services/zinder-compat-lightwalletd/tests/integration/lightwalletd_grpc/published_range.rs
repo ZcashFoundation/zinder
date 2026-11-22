@@ -944,7 +944,7 @@ async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders
         .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
         .ok_or_else(|| eyre!("missing segment"))?;
     let mut file = std::fs::OpenOptions::new().write(true).open(segment)?;
-    file.seek(SeekFrom::End(-1))?;
+    file.seek(SeekFrom::Start(60))?;
     file.write_all(&[0xff])?;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(
@@ -1023,7 +1023,7 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
             let mut segment = std::fs::read(&path)?;
             if segment[12..16] == middle.value().to_be_bytes() {
                 let byte = segment
-                    .last_mut()
+                    .get_mut(60)
                     .ok_or_else(|| eyre!("missing middle block"))?;
                 *byte ^= 1;
                 std::fs::write(path, &segment)?;

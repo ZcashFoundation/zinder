@@ -167,7 +167,9 @@ fn admitted_reader_checks_copied_bytes_and_keeps_its_original_file() -> eyre::Re
     let rows = opened.read_chunk(heights, HeightOrder::Ascending, usize::MAX)?;
     assert_eq!(rows.len(), 3);
     let mut file = fs::OpenOptions::new().write(true).open(&original)?;
-    file.seek(SeekFrom::End(-1))?;
+    file.seek(SeekFrom::Start(
+        opened.rows[2].offset + opened.rows[2].len as u64 - 1,
+    ))?;
     let last_byte = rows[2]
         .payload
         .last()
@@ -192,88 +194,165 @@ fn admitted_reader_checks_copied_bytes_and_keeps_its_original_file() -> eyre::Re
     Ok(())
 }
 
-#[test]
-fn broken_payload_link_is_rejected_even_with_matching_digest() -> eyre::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("shielded");
-    let identity = publish(&path, 1, 3)?;
-    let history = SealedHistory::open(&path, identity)?;
-    let row = &history.rows[1];
-    let mut bytes = fs::read(&path)?;
-    let start = usize::try_from(row.offset)?;
-    let payload = &mut bytes[start..start + row.len];
-    let mut message = lightwalletd::CompactBlock::decode(&*payload)?;
-    message.prev_hash = encode_internal_block_hash(hash(0)).to_vec();
-    payload.copy_from_slice(&message.encode_to_vec());
-    fs::write(&path, &bytes)?;
-    let altered = SegmentIdentity {
+fn rewrite_last_frame(
+    path: &Path,
+    rewrite: impl FnOnce(&mut [u8], &mut [u8]) -> eyre::Result<()>,
+) -> eyre::Result<SegmentIdentity> {
+    let identity = publish(path, 1, 2)?;
+    let mut bytes = fs::read(path)?;
+    let trailer = bytes.len() - 2 * INDEX_LEN;
+    let (frames, index) = bytes.split_at_mut(trailer);
+    let entry = &mut index[INDEX_LEN..];
+    let offset = usize::try_from(u64::from_be_bytes(entry[..8].try_into()?))?;
+    rewrite(&mut frames[offset - LENGTHS_LEN..], entry)?;
+    fs::write(path, &bytes)?;
+    let mut measurement = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
+    measurement.write_all(&bytes)?;
+    Ok(SegmentIdentity {
         sha256: Sha256::digest(&bytes).into(),
+        verity: Some(measurement.finalize().as_ref().try_into()?),
         ..identity
-    };
-    assert!(SealedHistory::open(&path, altered).is_err());
+    })
+}
+
+fn assert_second_payload_fails(history: &SealedHistory, reason: &str) -> eyre::Result<()> {
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        let unaffected = history.read_chunk(range(1, 1), order, usize::MAX)?;
+        assert_eq!(unaffected[0].id, id(1));
+        let error = history
+            .read_chunk(range(1, 2), order, usize::MAX)
+            .err()
+            .ok_or_else(|| invalid("served an invalid signed payload"))?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), reason);
+    }
     Ok(())
 }
 
 #[test]
-fn malformed_chain_metadata_fails_admission_even_with_matching_links_and_digest() -> eyre::Result<()>
-{
+fn authenticated_payload_identity_must_match_its_index() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("shielded");
-    let identity = publish(&path, 1, 1)?;
-    let mut bytes = fs::read(&path)?;
-    let message = lightwalletd::CompactBlock::decode(&bytes[HEADER_LEN + LENGTHS_LEN..])?;
+    for (field, height, block_hash, parent) in [
+        ("height", 1, hash(2), hash(1)),
+        ("hash", 2, hash(3), hash(1)),
+        ("parent", 2, hash(2), hash(0)),
+    ] {
+        let path = dir.path().join(field);
+        let identity = rewrite_last_frame(&path, |frame, index| {
+            let payload = &mut frame[LENGTHS_LEN..];
+            let mut message = lightwalletd::CompactBlock::decode(&*payload)?;
+            message.height = height;
+            message.hash = encode_internal_block_hash(block_hash).to_vec();
+            message.prev_hash = encode_internal_block_hash(parent).to_vec();
+            payload.copy_from_slice(&message.encode_to_vec());
+            index[80..].copy_from_slice(&Sha256::digest(payload));
+            Ok(())
+        })?;
+        assert_second_payload_fails(
+            &SealedHistory::open(&path, identity)?,
+            &PayloadError::Identity.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+fn malformed_metadata(frame: &mut [u8], index: &mut [u8]) -> eyre::Result<()> {
+    let payload = &mut frame[LENGTHS_LEN..];
+    let message = lightwalletd::CompactBlock::decode(&*payload)?;
     let metadata = message
         .chain_metadata
         .ok_or_else(|| invalid("missing fixture metadata"))?;
-    assert!(bytes.ends_with(&metadata.encode_to_vec()));
-    // An unterminated varint lies inside the nested metadata, after all block links.
-    *bytes.last_mut().ok_or_else(|| invalid("empty segment"))? |= 0x80;
-    fs::write(&path, &bytes)?;
-    let unauthenticated = SealedHistory::open(&path, identity)
-        .err()
-        .ok_or_else(|| invalid("admitted unsigned change"))?;
-    assert_eq!(
-        unauthenticated.to_string(),
-        "shielded segment length or SHA-256 mismatch"
-    );
-    let altered = SegmentIdentity {
-        sha256: Sha256::digest(&bytes).into(),
-        ..identity
-    };
-    assert!(SealedHistory::open(&path, altered).is_err());
+    assert!(payload.ends_with(&metadata.encode_to_vec()));
+    // The final varint in the nested metadata must terminate.
+    *payload.last_mut().ok_or_else(|| invalid("empty segment"))? |= 0x80;
+    index[80..].copy_from_slice(&Sha256::digest(payload));
     Ok(())
 }
 
 #[test]
-fn an_ordinary_file_must_match_its_authenticated_framing_and_payload_at_decode_time()
--> eyre::Result<()> {
+fn malformed_nested_protobuf_with_matching_digests_fails_on_read() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("shielded");
-    let identity = publish(&path, 1, 2)?;
+    let path = dir.path().join("segment");
+    let identity = rewrite_last_frame(&path, malformed_metadata)?;
+    assert_second_payload_fails(
+        &SealedHistory::open(&path, identity)?,
+        &PayloadError::Protobuf.to_string(),
+    )
+}
+
+#[test]
+fn admission_reads_each_portable_byte_once_and_skips_protected_payloads() -> eyre::Result<()> {
+    struct Meter {
+        file: io::Cursor<Vec<u8>>,
+        bytes: usize,
+        reads: usize,
+        seeks: Vec<u64>,
+    }
+    impl Read for Meter {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let count = self.file.read(buffer)?;
+            self.bytes += count;
+            Ok(count)
+        }
+    }
+    impl Seek for Meter {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            let offset = self.file.seek(position)?;
+            self.seeks.push(offset);
+            Ok(offset)
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("segment");
+    let identity = publish(&path, 1, 7)?;
+    let bytes = fs::read(&path)?;
+    let len = bytes.len();
+    for protected in [false, true] {
+        let mut meter = Meter {
+            file: io::Cursor::new(bytes.clone()),
+            bytes: 0,
+            reads: 0,
+            seeks: Vec::new(),
+        };
+        let rows = index::admit(&mut meter, identity, len as u64, protected)?;
+        assert_eq!(rows.len(), 7);
+        if protected {
+            assert_eq!(meter.reads, 2);
+            assert_eq!(meter.bytes, HEADER_LEN + 7 * INDEX_LEN);
+            assert_eq!(meter.seeks, [(len - 7 * INDEX_LEN) as u64]);
+        } else {
+            assert_eq!(meter.bytes, len);
+            assert_eq!(meter.seeks, [] as [u64; 0]);
+        }
+    }
+    assert!(index::pinned_verity(identity.verity, || Ok(
+        identity.verity
+    ))?);
+    assert!(index::pinned_verity(identity.verity, || Ok(Some([0; 32]))).is_err());
+    assert!(!index::pinned_verity(None, || Err(invalid(
+        "unnecessary kernel measurement"
+    )))?);
+    assert!(!index::pinned_verity(identity.verity, || Ok(None))?);
+    Ok(())
+}
+
+#[test]
+fn signed_index_must_describe_the_exact_frames_and_links() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("segment");
+    let identity = publish(&path, 1, 3)?;
     let original = fs::read(&path)?;
-    let file = open_regular_file(&path)?;
-    let mut input = BufReader::with_capacity(13, &file);
-    for (offset, reason) in [
-        (0, "shielded segment format, network, or interval mismatch"),
-        (
-            original.len() - 1,
-            "shielded segment payload SHA-256 mismatch",
-        ),
-        (
-            HEADER_LEN + 3,
-            "shielded segment row lengths changed after authentication",
-        ),
-    ] {
-        fs::write(&path, &original)?;
-        input.rewind()?;
-        let verified = authenticate_rows(&mut input, identity, file.metadata()?.len(), false)?;
+    let trailer = original.len() - 3 * INDEX_LEN;
+    for byte in [0, 8, 15, 16, INDEX_LEN + 48, 80] {
         let mut changed = original.clone();
-        changed[offset] ^= 1;
-        fs::write(&path, changed)?;
-        let error = index_rows(&mut input, identity, verified)
-            .err()
-            .ok_or_else(|| invalid("indexed changed file"))?;
-        assert_eq!(error.to_string(), reason);
+        changed[trailer + byte] ^= 1;
+        let expected = SegmentIdentity {
+            sha256: Sha256::digest(&changed).into(),
+            ..identity
+        };
+        fs::write(&path, &changed)?;
+        assert!(SealedHistory::open(&path, expected).is_err());
     }
     Ok(())
 }
@@ -290,31 +369,36 @@ fn a_single_row_at_the_highest_height_round_trips() -> eyre::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
-fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("shielded");
-    let identity = publish(&path, 1, 3)?;
-    let ordinary = SealedHistory::open(&path, identity)?;
-    assert!(ordinary.rows.iter().all(|row| row.sha256.is_some()));
+fn enable_verity(path: &Path) -> eyre::Result<()> {
     let protection = std::process::Command::new("fsverity")
         .arg("enable")
-        .arg(&path)
+        .arg(path)
         .output()?;
     eyre::ensure!(
         protection.status.success(),
         "fsverity enable failed: {}",
         String::from_utf8_lossy(&protection.stderr)
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 3)?;
+    assert!(!SealedHistory::open(&path, identity)?.kernel_verified);
+    enable_verity(&path)?;
     assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
     let sealed = SealedHistory::open(&path, identity)?;
-    assert!(sealed.rows.iter().all(|row| row.sha256.is_none()));
+    assert!(sealed.kernel_verified);
     assert!(
         SealedHistory::open(
             &path,
             SegmentIdentity {
-                sha256: [0; 32],
+                verity: Some([0; 32]),
                 ..identity
             }
         )
@@ -327,7 +411,7 @@ fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
     permissions.set_readonly(true);
     fs::set_permissions(&copy, permissions)?;
     let portable = SealedHistory::open(&copy, identity)?;
-    assert!(portable.rows.iter().all(|row| row.sha256.is_some()));
+    assert!(!portable.kernel_verified);
     let second = portable.read_chunk(range(1, 3), HeightOrder::Descending, usize::MAX)?;
     assert!(
         first
@@ -335,6 +419,60 @@ fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
             .map(|row| &row.payload)
             .eq(second.iter().map(|row| &row.payload))
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+fn kernel_protected_segment_with_sha512_rejects_a_signed_sha256_pin() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 3)?;
+    let status = std::process::Command::new("fsverity")
+        .args(["enable", "--hash-alg", "sha512", "--block-size", "4096"])
+        .arg(&path)
+        .status()?;
+    eyre::ensure!(status.success(), "fsverity enable failed: {status}");
+    assert_eq!(
+        SealedHistory::open(&path, identity)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+fn kernel_protected_payload_must_match_its_index_before_serving() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (field, reason) in [
+        ("protobuf", PayloadError::Protobuf.to_string()),
+        (
+            "length",
+            "shielded segment frame lengths differ from its index".into(),
+        ),
+        ("digest", PayloadError::Digest.to_string()),
+    ] {
+        let path = dir.path().join(field);
+        let identity = rewrite_last_frame(&path, |frame, index| match field {
+            "protobuf" => malformed_metadata(frame, index),
+            "length" => {
+                frame[3] ^= 1;
+                Ok(())
+            }
+            _ => {
+                index[80] ^= 1;
+                Ok(())
+            }
+        })?;
+        enable_verity(&path)?;
+        let history = SealedHistory::open(&path, identity)?;
+        assert!(history.kernel_verified);
+        assert_second_payload_fails(&history, &reason)?;
+    }
     Ok(())
 }
 
@@ -354,6 +492,7 @@ fn the_terminal_height_and_hash_end_the_segment() {
         start: id(1).height,
         end: id(2),
         sha256: [0; 32],
+        verity: None,
     };
     assert!(segment.check_block(id(1), hash(0), None).is_ok());
     assert!(segment.check_block(id(2), hash(1), Some(id(1))).is_ok());

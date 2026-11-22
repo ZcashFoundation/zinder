@@ -33,6 +33,8 @@ struct ShieldedRangeIdentity {
     last: u32,
     last_hash: [u8; 32],
     sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fs_verity_sha256: Option<[u8; 32]>,
 }
 
 /// A settled, read-only projection of the default shielded range format.
@@ -111,6 +113,7 @@ impl PublishedShieldedRange {
                 last: segment.end.height.value(),
                 last_hash: segment.end.hash.as_bytes(),
                 sha256: segment.sha256,
+                fs_verity_sha256: segment.verity,
             },
         )
     }
@@ -132,6 +135,7 @@ impl PublishedShieldedRange {
                 BlockHash::from_bytes(identity.last_hash),
             ),
             sha256: identity.sha256,
+            verity: identity.fs_verity_sha256,
         };
         let segment = SealedHistory::open(path, descriptor)?;
         Ok(Self {
