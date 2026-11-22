@@ -168,6 +168,7 @@ if [[ -n "$compose_contract" ]]; then
 
   jq -e '
     .services as $services
+    | (.volumes // {} | to_entries) as $volumes
     | $services["zinder-history-publisher"] as $publisher
     | $services["zinder-compat-lightwalletd"] as $reader
     | "/var/lib/zinder-history" as $catalog
@@ -177,6 +178,29 @@ if [[ -n "$compose_contract" ]]; then
     | def binds($source; $target; $readonly):
         any(.volumes[]?; .type == "bind" and .source == $source and .target == $target
           and ((.read_only // false) == $readonly) and (.bind.create_host_path == false));
+      def host_path:
+        if type != "string" or (startswith("/") | not) or (split("/") | index("..") != null)
+        then error("expected an absolute host mount path without parent traversal")
+        else "/" + (split("/") | map(select(. != "" and . != ".")) | join("/"))
+        end;
+      def backing_paths($mount):
+        if $mount.type == "bind" then $mount.source | host_path
+        elif $mount.type == "volume" and $mount.source != null then
+          ($volumes[] | select(.key == $mount.source) | .value.name // .key) as $name
+          | $volumes[] | select((.value.name // .key) == $name)
+          | .value | select((.driver // "local") == "local")
+          | (.driver_opts // {}) as $opts
+          | select((($opts.device // "") | startswith("/")) or
+                   (($opts.o // "") | split(",") | any(test("^\\s*(rbind|bind)\\s*$"))))
+          | ($opts.device | host_path) + "/" + ($mount.volume.subpath // "") | host_path
+        else empty end;
+      def permitted_source($dir; $readonly):
+        . as $path
+        | ($dir + "/publisher.pk8") as $key
+        | $path != "/" and $path != $key and ($key | startswith($path + "/") | not)
+          and (if $path == ($dir + "/publisher.pub") or $path == ($dir + "/catalog")
+                 or ($path | startswith($dir + "/catalog/"))
+               then $readonly == true else true end);
       $publisher.network_mode == "none" and $publisher.image == $reader.image
       and ($publisher.command | index("publish-shielded-history") != null and index("--follow-interval-secs") != null)
       and ($publisher | any(.volumes[]?; .type == "volume" and .source == "data" and .target == "/var/lib/zinder" and .read_only))
@@ -186,14 +210,8 @@ if [[ -n "$compose_contract" ]]; then
       and ($reader | binds($generation + "/catalog"; $catalog; true))
       and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY == $catalog
       and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY == $public_key
-      and all($services | del(.["zinder-history-publisher"]) | .[].volumes[]? | select(.type == "bind");
-        (.source | rtrimstr("/")) as $source
-        | $source != ($generation + "/publisher.pk8")
-          and (($generation + "/publisher.pk8") | startswith($source + "/") | not)
-          and (if $source == ($generation + "/publisher.pub")
-                or $source == ($generation + "/catalog")
-                or ($source | startswith($generation + "/catalog/"))
-               then .read_only == true else true end))
+      and all($services | del(.["zinder-history-publisher"]) | .[].volumes[]?;
+        . as $mount | all(backing_paths($mount); permitted_source(($generation | host_path); $mount.read_only)))
   ' "$compose_contract" >/dev/null || {
     echo "release admission rejected: invalid signed wallet history publication or reader mounts" >&2
     exit 1

@@ -290,7 +290,10 @@ checks for newly settled blocks and publishes complete 4,096-block segments.
 The installed generation contains a private signing key, a separate trusted
 public key, and a `catalog/` directory. Compose gives only the publisher
 access to the private key. The wallet reader mounts the public key and
-catalog read-only.
+catalog read-only. Deployment admission checks these permissions for direct
+host mounts and local named volumes whose backing paths appear in the resolved
+Compose configuration. Verify operator-provisioned external volumes and host
+symlinks point to their intended storage before starting the stack.
 
 The wallet listener verifies the publisher's signed empty checkpoint before
 serving canonical ranges during bootstrap. A newly starting reader waits up to
