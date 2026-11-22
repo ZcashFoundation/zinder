@@ -1,58 +1,109 @@
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use super::super::TreeStateReplayLimit;
-use super::{ReplayKey, SETTLED_ENTRIES, SettledStates};
-use crate::{CanonicalReader as _, RocksDbCanonicalReader};
+use super::super::settled_cache::{LookupStep, SETTLED_MAX_ENTRIES, SettledStates};
+use super::{ReadyState, ReplayKey};
+use crate::{
+    CanonicalReader as _, RocksDbCanonicalReader,
+    observed_canonical_reader::ObservedCanonicalReader,
+};
 use futures_util::FutureExt as _;
 use zinder_core::{BlockHash, BlockHeight, CanonicalHistoryBounds, Network};
 use zinder_store::TreeStateLookup;
-use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
+};
 
 #[tokio::test]
 async fn only_settled_rows_at_the_same_retained_fence_survive_eviction() -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
-    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+    let generation: std::sync::Weak<dyn Send + Sync> =
+        Arc::<RocksDbCanonicalReader>::downgrade(&reader);
     let height = reader.chain_epoch().visible_tip_height;
     let Some(TreeStateLookup::Stored(state)) = reader.tree_state_lookup(height).await? else {
         return Err(eyre::eyre!("missing tip checkpoint"));
     };
-    let mut key = ReplayKey::new(height, &reader);
-    key.epoch.settled_tip_height = BlockHeight::new(u32::try_from(SETTLED_ENTRIES)?);
+    let mut key = ReplayKey::new(height, reader.as_ref());
+    key.epoch.settled_tip_height = BlockHeight::new(u32::try_from(SETTLED_MAX_ENTRIES)?);
     let mut cache = SettledStates::default();
     for number in 0..=key.epoch.settled_tip_height.value() {
         key.height = BlockHeight::new(number);
-        cache.remember(key, &state);
+        let entry_state = served_for_height(&state, key.height)?;
+        cache.remember(key.settled_anchor(), &generation, &entry_state);
     }
-    assert_eq!(cache.cached(key), Some(state.clone()));
-    assert_eq!(
-        cache.cached(ReplayKey {
-            height: BlockHeight::new(0),
-            ..key
-        }),
-        None
-    );
+    assert!(matches!(
+        cache.classify_lookup(key.settled_anchor(), &generation, key.height),
+        LookupStep::Hit(_)
+    ));
+    assert!(matches!(
+        cache.classify_lookup(key.settled_anchor(), &generation, BlockHeight::new(0)),
+        LookupStep::Miss
+    ));
+
+    // A visible-tip append at the same settled tip reuses the settled cache without re-anchoring.
+    let mut appended = key;
+    appended.height = BlockHeight::new(1);
+    appended.epoch.visible_tip_height =
+        BlockHeight::new(appended.epoch.visible_tip_height.value() + 1);
+    appended.epoch.visible_tip_hash = BlockHash::from_bytes([24; 32]);
+    assert!(matches!(
+        cache.classify_lookup(appended.settled_anchor(), &generation, appended.height),
+        LookupStep::Hit(_)
+    ));
+
     let mut fork = key;
-    fork.epoch.visible_tip_hash = BlockHash::from_bytes([23; 32]);
-    assert!(cache.cached(fork).is_none());
-    assert!(
-        cache
-            .cached(ReplayKey {
+    fork.height = BlockHeight::new(1);
+    fork.epoch.settled_tip_hash = BlockHash::from_bytes([23; 32]);
+    assert!(matches!(
+        cache.classify_lookup(fork.settled_anchor(), &generation, fork.height),
+        LookupStep::Miss
+    ));
+    assert!(matches!(
+        cache.classify_lookup(
+            ReplayKey {
                 schedule_revision: None,
                 ..key
-            })
-            .is_none()
-    );
+            }
+            .settled_anchor(),
+            &generation,
+            key.height
+        ),
+        LookupStep::Miss
+    ));
     let pruned = ReplayKey {
         retained: CanonicalHistoryBounds::checkpointed(state.block_id())?,
         ..key
     };
-    assert!(cache.cached(pruned).is_none());
+    assert!(matches!(
+        cache.classify_lookup(pruned.settled_anchor(), &generation, pruned.height),
+        LookupStep::Miss
+    ));
     key.height = BlockHeight::new(key.epoch.settled_tip_height.value() + 1);
-    cache.remember(key, &state);
-    assert!(cache.cached(key).is_none());
+    cache.remember(key.settled_anchor(), &generation, &state);
+    assert!(
+        cache
+            .cached_at_anchor(key.settled_anchor(), key.height)
+            .is_none()
+    );
     Ok(())
+}
+
+fn served_for_height(
+    template: &zinder_store::ServedTreeState,
+    height: BlockHeight,
+) -> eyre::Result<zinder_store::ServedTreeState> {
+    let sapling =
+        zinder_core::CommitmentTreeFrontier::empty(zinder_core::ShieldedProtocol::Sapling);
+    let checkpoint = zinder_core::CommitmentTreeCheckpoint::new(
+        zinder_core::BlockId::new(height, template.block_id().hash),
+        height.value(),
+        zinder_core::CommitmentTreeFrontiers::from_validated_parts(Some(sapling), None, None)?,
+    );
+    Ok(zinder_store::ServedTreeState::from(checkpoint))
 }
 
 fn replay_key() -> eyre::Result<ReplayKey> {
@@ -204,7 +255,12 @@ async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss()
     let key = ReplayKey::new(height, reader.as_ref());
     let generation = Arc::downgrade(&reader);
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
-    assert!(limit.ready_state(key, reader.as_ref()).await?.is_none());
+    assert!(
+        limit
+            .ready_state(key, &generation, reader.as_ref())
+            .await?
+            .is_none()
+    );
     let first = limit.subscribe(key, &generation, limit.deadline())?;
     let slot = first.admit(&limit).await?;
     let state = first
@@ -434,5 +490,156 @@ async fn a_carried_slot_wins_when_the_queue_refuses_in_the_same_poll() -> eyre::
     let mut retry = Some(transferable(limit.admit().await?));
     assert!(!expired.accept_carried(&mut retry));
     assert!(retry.is_some());
+    Ok(())
+}
+
+fn publish_reader(
+    chain: &ChainFixture,
+    through: u32,
+    settled: u32,
+) -> eyre::Result<(WalletServingStoreFixture, Arc<ObservedCanonicalReader>)> {
+    let baseline = CanonicalBaseline::new(chain)
+        .through(BlockHeight::new(through))
+        .with_settled_tip(BlockHeight::new(settled));
+    let mut store =
+        CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+            .into_serving_store_fixture()?;
+    let reader = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+        store.take_readers()?.0,
+    )?));
+    Ok((store, reader))
+}
+
+async fn replay_and_cache(
+    limit: &TreeStateReplayLimit,
+    reader: &Arc<ObservedCanonicalReader>,
+    height: BlockHeight,
+) -> eyre::Result<zinder_store::ServedTreeState> {
+    let key = ReplayKey::new(height, reader.as_ref());
+    let generation = Arc::downgrade(reader);
+    assert!(
+        limit
+            .ready_state(key, &generation, reader.as_ref())
+            .await?
+            .is_none()
+    );
+    let sub = limit.subscribe(key, &generation, limit.deadline())?;
+    let slot = sub.admit(limit).await?;
+    let reader_ref = Arc::clone(reader);
+    sub.replay(slot, |cancelled| async move {
+        super::read_missing_height(reader_ref.as_ref(), height, cancelled).await
+    })
+    .await?
+    .ok_or_else(|| eyre::eyre!("missing reconstructed state"))
+}
+
+#[tokio::test]
+async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_header_check()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, extended) = publish_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height = BlockHeight::new(1);
+    let expected = replay_and_cache(&limit, &first, height).await?;
+
+    let key = ReplayKey::new(height, extended.as_ref());
+    let gen_ext = Arc::downgrade(&extended);
+    let mut joins = Vec::new();
+    for _ in 0..4 {
+        let lim = limit.clone();
+        let obs = Arc::clone(&extended);
+        let gen_ref = gen_ext.clone();
+        joins.push(tokio::spawn(async move {
+            lim.ready_state(key, &gen_ref, obs.as_ref()).await
+        }));
+    }
+    for task in joins {
+        assert!(matches!(task.await??, Some(ReadyState::Cached(ref s)) if *s == expected));
+    }
+    assert_eq!(extended.reads(), 1);
+    assert!(matches!(
+        limit.ready_state(key, &gen_ext, extended.as_ref()).await?,
+        Some(ReadyState::Cached(ref s)) if *s == expected
+    ));
+    assert_eq!(extended.reads(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settled_cache_clears_when_settled_tip_extension_is_on_a_fork() -> eyre::Result<()> {
+    let chain_a = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let chain_b = chain_a.fork_at(BlockHeight::new(2))?.extend_blocks(4);
+    let (_sa, reader_a) = publish_reader(&chain_a, 4, 2)?;
+    let (_sb, reader_b) = publish_reader(&chain_b, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height = BlockHeight::new(1);
+    replay_and_cache(&limit, &reader_a, height).await?;
+
+    let key_b = ReplayKey::new(height, reader_b.as_ref());
+    let gen_b = Arc::downgrade(&reader_b);
+    assert!(
+        limit
+            .ready_state(key_b, &gen_b, reader_b.as_ref())
+            .await?
+            .is_none()
+    );
+    assert_eq!(limit.flights.lock().settled.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lagging_reader_at_prior_settled_tip_does_not_wipe_promoted_cache() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, older) = publish_reader(&chain, 4, 2)?;
+    let (_s2, newer) = publish_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height = BlockHeight::new(1);
+    let expected = replay_and_cache(&limit, &newer, height).await?;
+    let baseline_reads = newer.reads();
+
+    let older_key = ReplayKey::new(height, older.as_ref());
+    let older_gen = Arc::downgrade(&older);
+    assert!(
+        limit
+            .ready_state(older_key, &older_gen, older.as_ref())
+            .await?
+            .is_none()
+    );
+
+    let newer_key = ReplayKey::new(height, newer.as_ref());
+    let newer_gen = Arc::downgrade(&newer);
+    assert!(matches!(
+        limit.ready_state(newer_key, &newer_gen, newer.as_ref()).await?,
+        Some(ReadyState::Cached(ref s)) if *s == expected
+    ));
+    assert_eq!(newer.reads(), baseline_reads);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_store_with_shorter_settled_tip_resets_cache_after_old_reader_drops()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, shorter) = publish_reader(&chain, 4, 2)?;
+    let (_s2, longer) = publish_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height = BlockHeight::new(1);
+    replay_and_cache(&limit, &longer, height).await?;
+    drop(longer);
+
+    let shorter_key = ReplayKey::new(height, shorter.as_ref());
+    let shorter_gen = Arc::downgrade(&shorter);
+    assert!(
+        limit
+            .ready_state(shorter_key, &shorter_gen, shorter.as_ref())
+            .await?
+            .is_none()
+    );
+    let rebuilt = replay_and_cache(&limit, &shorter, height).await?;
+    assert!(matches!(
+        limit.ready_state(shorter_key, &shorter_gen, shorter.as_ref()).await?,
+        Some(ReadyState::Cached(ref s)) if *s == rebuilt
+    ));
     Ok(())
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -17,14 +17,16 @@ use tokio::{
 };
 use tracing::Instrument as _;
 use zinder_core::{
-    BlockHeight, CanonicalBlockFactsSequenceDigest, CanonicalHistoryBounds, ChainEpoch,
+    BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest, CanonicalHistoryBounds, ChainEpoch,
+    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
 };
 use zinder_store::{ServedTreeState, TreeStateLookup, TreeStateReplayOutcome};
 
-use super::{ReplayRefusal, TreeStateReplayLimit, WaitingPlace, replay_holding_slot};
+use super::{
+    ReplayRefusal, TreeStateReplayLimit, WaitingPlace, replay_holding_slot,
+    settled_cache::{LookupStep, SettledChainAnchor, SettledStates},
+};
 use crate::{CanonicalReader, QueryError, StorageReadError};
-
-const SETTLED_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ReplayKey {
@@ -32,19 +34,35 @@ pub(crate) struct ReplayKey {
     epoch: ChainEpoch,
     sequence: CanonicalBlockFactsSequenceDigest,
     schedule_revision: Option<u64>,
+    activations_fingerprint: Option<NetworkUpgradeActivationsFingerprint>,
     retained: CanonicalHistoryBounds,
 }
 
 impl ReplayKey {
     pub(crate) fn new(height: BlockHeight, reader: &dyn CanonicalReader) -> Self {
+        let schedule = reader.network_upgrade_schedule();
         Self {
             height,
             epoch: reader.chain_epoch(),
             sequence: reader.event_fence().sequence_digest(),
-            schedule_revision: reader
-                .network_upgrade_schedule()
-                .map(zinder_store::CanonicalActivationSchedule::revision),
+            schedule_revision: schedule.map(zinder_store::CanonicalActivationSchedule::revision),
+            activations_fingerprint: schedule.map(|table| {
+                table
+                    .activations()
+                    .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT)
+            }),
             retained: reader.history_bounds(),
+        }
+    }
+
+    pub(super) fn settled_anchor(&self) -> SettledChainAnchor {
+        SettledChainAnchor {
+            network: self.epoch.network,
+            artifact_schema: self.epoch.artifact_schema_version,
+            retained: self.retained,
+            schedule_revision: self.schedule_revision,
+            activations_fingerprint: self.activations_fingerprint,
+            settled_tip: BlockId::new(self.epoch.settled_tip_height, self.epoch.settled_tip_hash),
         }
     }
 }
@@ -53,32 +71,6 @@ impl ReplayKey {
 pub(super) struct Flights {
     running: HashMap<(ReplayKey, usize), Weak<Flight>>,
     settled: SettledStates,
-}
-
-#[derive(Debug, Default)]
-struct SettledStates {
-    settled: VecDeque<(ReplayKey, ServedTreeState)>,
-}
-
-impl SettledStates {
-    fn cached(&self, key: ReplayKey) -> Option<ServedTreeState> {
-        self.settled
-            .iter()
-            .find(|(entry, _)| *entry == key)
-            .map(|(_, state)| state.clone())
-    }
-
-    fn remember(&mut self, key: ReplayKey, state: &ServedTreeState) {
-        if key.height > key.epoch.settled_tip_height
-            || self.settled.iter().any(|(entry, _)| *entry == key)
-        {
-            return;
-        }
-        if self.settled.len() == SETTLED_ENTRIES {
-            self.settled.pop_front();
-        }
-        self.settled.push_back((key, state.clone()));
-    }
 }
 
 pub(crate) enum ReadyState {
@@ -98,13 +90,53 @@ impl ReadyState {
 }
 
 impl TreeStateReplayLimit {
-    pub(crate) fn cached(&self, key: ReplayKey) -> Option<ServedTreeState> {
-        self.flights.lock().settled.cached(key)
-    }
-
-    pub(crate) async fn ready_state(
+    async fn lookup_settled<T: Send + Sync + 'static>(
         &self,
         key: ReplayKey,
+        generation: &Weak<T>,
+        reader: &dyn CanonicalReader,
+    ) -> Result<Option<ServedTreeState>, QueryError> {
+        let target = key.settled_anchor();
+        let weak: Weak<dyn Send + Sync> = generation.clone();
+        let initial_step = self
+            .flights
+            .lock()
+            .settled
+            .classify_lookup(target, &weak, key.height);
+        match initial_step {
+            LookupStep::Hit(state) => return Ok(Some(state)),
+            LookupStep::Miss => return Ok(None),
+            LookupStep::VerifyExtension(_) => {}
+        }
+        let _verify_guard = self.anchor_verify.lock().await;
+        let locked_step = self
+            .flights
+            .lock()
+            .settled
+            .classify_lookup(target, &weak, key.height);
+        let prior = match locked_step {
+            LookupStep::Hit(state) => return Ok(Some(state)),
+            LookupStep::Miss => return Ok(None),
+            LookupStep::VerifyExtension(prior) => prior,
+        };
+        let header = reader
+            .block_header_at(prior.settled_tip.height)
+            .await
+            .map_err(QueryError::canonical_read)?;
+        let extends_prior =
+            header.is_some_and(|stored| stored.block_hash == prior.settled_tip.hash);
+        Ok(self.flights.lock().settled.complete_extension_lookup(
+            (prior, target),
+            &weak,
+            key.height,
+            extends_prior,
+        ))
+    }
+
+    pub(crate) async fn ready_state<T: Send + Sync + 'static>(
+        &self,
+        key: ReplayKey,
+        generation: &Weak<T>,
         reader: &dyn CanonicalReader,
     ) -> Result<Option<ReadyState>, QueryError> {
         if key.height > key.epoch.visible_tip_height
@@ -115,7 +147,7 @@ impl TreeStateReplayLimit {
         {
             return Err(QueryError::BlockNotInBestChain);
         }
-        if let Some(state) = self.cached(key) {
+        if let Some(state) = self.lookup_settled(key, generation, reader).await? {
             return Ok(Some(ReadyState::Cached(state)));
         }
         let stored = reader
@@ -134,7 +166,10 @@ impl TreeStateReplayLimit {
     ) -> Result<Selection, QueryError> {
         let id = (key, generation.as_ptr().addr());
         let mut flights = self.flights.lock();
-        if let Some(state) = flights.settled.cached(key) {
+        if let Some(state) = flights
+            .settled
+            .cached_at_anchor(key.settled_anchor(), key.height)
+        {
             return Ok(Selection::Ready(ReadyState::Cached(state)));
         }
         if let Some(flight) = flights.running.get(&id).and_then(Weak::upgrade)
@@ -146,7 +181,7 @@ impl TreeStateReplayLimit {
         let (admission, place) = Admission::new(self, deadline, carried)?;
         let flight = Arc::new(Flight {
             key,
-            _generation: generation.clone(),
+            generation: generation.clone(),
             registry: self.flights.clone(),
             cancelled: Arc::default(),
             admission,
@@ -328,7 +363,7 @@ impl SubscriberPlaces {
 struct Flight {
     key: ReplayKey,
     // Keep the allocation address unique without pinning its storage reader.
-    _generation: Weak<dyn Send + Sync>,
+    generation: Weak<dyn Send + Sync>,
     registry: Arc<Mutex<Flights>>,
     cancelled: Arc<AtomicBool>,
     admission: Admission,
@@ -486,7 +521,13 @@ impl Subscription {
             "stored"
         };
         super::record_tree_state_read(flight.key.height, source);
-        flight.registry.lock().settled.remember(flight.key, &state);
+        if state.block_id().height == flight.key.height {
+            flight.registry.lock().settled.remember(
+                flight.key.settled_anchor(),
+                &flight.generation,
+                &state,
+            );
+        }
         Ok(Some(state))
     }
 }

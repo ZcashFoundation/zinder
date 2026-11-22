@@ -2,6 +2,7 @@
 //! tree-state read.
 
 mod flights;
+mod settled_cache;
 #[cfg(feature = "light-wallet-qualification")]
 pub(crate) use flights::ReadyState;
 pub(crate) use flights::{ReplayKey, Selection, read_missing_height};
@@ -89,6 +90,7 @@ pub const MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.s
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
     flights: Arc<parking_lot::Mutex<flights::Flights>>,
+    anchor_verify: Arc<tokio::sync::Mutex<()>>,
     slots: Arc<Semaphore>,
     max_replays: NonZeroU32,
     waiters: Arc<AtomicU32>,
@@ -116,6 +118,7 @@ impl TreeStateReplayLimit {
             .min(Semaphore::MAX_PERMITS);
         Self {
             flights: Arc::default(),
+            anchor_verify: Arc::default(),
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
             waiters: Arc::new(AtomicU32::new(0)),

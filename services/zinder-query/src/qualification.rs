@@ -88,17 +88,8 @@ impl QualificationWalletQuery {
         mut reader: Arc<RocksDbCanonicalReader>,
         height: Option<BlockHeight>,
     ) -> Result<TreeState, QueryError> {
-        let epoch = reader.chain_epoch();
         let Some(height) = height else {
-            let checkpoint = reader
-                .tree_state_checkpoint_at_or_before(epoch.visible_tip_height)
-                .await
-                .map_err(QueryError::canonical_read)?
-                .ok_or(QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::TreeState,
-                    key: ArtifactKey::BlockHeight(epoch.visible_tip_height),
-                })?;
-            return Ok(tree_state_response(epoch, checkpoint));
+            return latest_checkpoint(reader.as_ref()).await;
         };
         let mut deadline = None;
         let mut carried = None;
@@ -106,7 +97,11 @@ impl QualificationWalletQuery {
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
             let generation = Arc::downgrade(&reader);
-            let (selected, expected) = match self.replays.ready_state(key, reader.as_ref()).await? {
+            let (selected, expected) = match self
+                .replays
+                .ready_state(key, &generation, reader.as_ref())
+                .await?
+            {
                 Some(ready @ ReadyState::Stored(_)) => {
                     return Ok(tree_state_response(epoch, ready.serve()));
                 }
@@ -183,6 +178,19 @@ impl QualificationWalletQuery {
         }
         canonical_subtree_roots(reader.as_ref(), epoch, range).await
     }
+}
+
+async fn latest_checkpoint(reader: &RocksDbCanonicalReader) -> Result<TreeState, QueryError> {
+    let epoch = reader.chain_epoch();
+    let checkpoint = reader
+        .tree_state_checkpoint_at_or_before(epoch.visible_tip_height)
+        .await
+        .map_err(QueryError::canonical_read)?
+        .ok_or(QueryError::ArtifactUnavailable {
+            family: ArtifactFamily::TreeState,
+            key: ArtifactKey::BlockHeight(epoch.visible_tip_height),
+        })?;
+    Ok(tree_state_response(epoch, checkpoint))
 }
 
 async fn retains_block(

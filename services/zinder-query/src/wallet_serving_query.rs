@@ -1288,11 +1288,12 @@ where
                     serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
                         let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                         let key = ReplayKey::new(height, pair.canonical());
+                        let generation = Arc::downgrade(&pair);
                         let ready = self
                             .tree_state_replays
-                            .ready_state(key, pair.canonical())
+                            .ready_state(key, &generation, pair.canonical())
                             .await?;
-                        Ok((epoch, key, Arc::downgrade(&pair), ready))
+                        Ok((epoch, key, generation, ready))
                     })
                     .await?;
                 if let Some(state) = ready {
@@ -1984,7 +1985,8 @@ mod tree_state_replay_limit_tests {
 
     use zinder_core::{BlockHeight, Network};
     use zinder_testkit::{
-        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
     };
 
     use crate::{
@@ -2345,6 +2347,69 @@ mod tree_state_replay_limit_tests {
                 "missing {expected}:\n{rendered}"
             );
         }
+        Ok(())
+    }
+
+    fn build_serving_pair(
+        chain: &ChainFixture,
+        through: u32,
+        settled: u32,
+    ) -> Result<(WalletServingStoreFixture, Arc<WalletServingReadPair>), Box<dyn Error>> {
+        let baseline = CanonicalBaseline::new(chain)
+            .through(BlockHeight::new(through))
+            .with_settled_tip(BlockHeight::new(settled));
+        let mut store =
+            CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+                .into_serving_store_fixture()?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        Ok((store, pair))
+    }
+
+    #[tokio::test]
+    async fn settled_cache_survives_tip_advances_and_resets_on_fork() -> Result<(), Box<dyn Error>>
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+        let fork_chain = chain.fork_at(BlockHeight::new(2))?.extend_blocks(4);
+        let (_s1, initial) = build_serving_pair(&chain, 3, 2)?;
+        let (_s2, appended) = build_serving_pair(&chain, 4, 2)?;
+        let (_s3, settled_extended) = build_serving_pair(&chain, 5, 4)?;
+        let (_s4, settled_fork) = build_serving_pair(&fork_chain, 5, 4)?;
+
+        let slot = WalletServingPairSlot::new(initial);
+        let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+        let height = BlockHeight::new(2);
+
+        let first = query.tree_state_at(height, None).await?;
+        slot.publish_for_test(appended);
+        let second = query.tree_state_at(height, None).await?;
+        slot.publish_for_test(settled_extended);
+        let third = query.tree_state_at(height, None).await?;
+        assert_eq!(second.frontiers, first.frontiers);
+        assert_eq!(third.frontiers, first.frontiers);
+
+        slot.publish_for_test(settled_fork);
+        let rebuilt = query.tree_state_at(height, None).await?;
+        assert_ne!(rebuilt.block_hash, first.block_hash);
+
+        let report = rendered.render();
+        assert!(
+            report.lines().any(|line| line
+                == "zinder_query_tree_state_reads_total{source=\"cached\",height_band=\"0\"} 2"),
+            "expected two cached hits across visible and settled tip advances:\n{report}"
+        );
+        assert!(
+            report.lines().any(|line| line
+                == "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 2"),
+            "expected initial replay plus one post-fork rebuild:\n{report}"
+        );
         Ok(())
     }
 }
