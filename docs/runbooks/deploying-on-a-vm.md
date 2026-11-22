@@ -290,10 +290,19 @@ checks for newly settled blocks and publishes complete 4,096-block segments.
 The installed generation contains a private signing key, a separate trusted
 public key, and a `catalog/` directory. Compose gives only the publisher
 access to the private key. The wallet reader mounts the public key and
-catalog read-only. Deployment admission checks these permissions for direct
-host mounts and local named volumes whose backing paths appear in the resolved
-Compose configuration. Verify operator-provisioned external volumes and host
-symlinks point to their intended storage before starting the stack.
+catalog read-only. Choose an absolute generation directory below the host root.
+Deployment admission checks bind mounts, file-backed Compose configs and
+secrets, and local named volumes against their declared host sources. For a
+local volume with driver options, use an absolute `device`, `bind` or `rbind`
+in `o`, and omit `type` or set it to `none`. The supported additional flags are
+`ro`, `rw`, `nodev`, `nosuid`, and `noexec`.
+
+Custom overlays must declare other services’ mounts directly. Admission
+rejects inherited mounts, unrecognized volume drivers or options, and config
+or secret grants with unresolved external sources. Ordinary Docker-managed
+volumes and operator-provisioned external named volumes need no driver
+options. Verify the backing of external volumes and the destinations of host
+symlinks before starting the stack.
 
 The wallet listener verifies the publisher's signed empty checkpoint before
 serving canonical ranges during bootstrap. A newly starting reader waits up to
