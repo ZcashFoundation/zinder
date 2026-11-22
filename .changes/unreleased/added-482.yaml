@@ -1,5 +1,5 @@
 kind: added
-body: Fresh canonical construction can hash note-commitment trees on several threads with `ingest.construction.tree_hashing_workers` (default 1, which keeps the single-threaded loader). Every tree-state checkpoint written during construction, tree-state replay, and background densification now derives each changed pool's root once instead of twice, so construction with `during_construction = true` reaches READY sooner and stores the same rows.
+body: Fresh canonical construction can hash note-commitment trees on several threads with `ingest.construction.tree_hashing_workers` (default 1, which keeps the single-threaded loader). With more workers, construction with `during_construction = true` reaches READY sooner and stores the same rows. Construction checkpoints now also reject an encoding of any tree other than the one appended.
 time: 2026-11-22T21:53:27.347848412Z
 custom:
     Bump: minor
