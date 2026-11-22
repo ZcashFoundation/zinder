@@ -78,6 +78,7 @@ pub struct CanonicalActivationSchedule {
     previous_digest: Option<[u8; 32]>,
     admitted_tip: zinder_core::BlockId,
     activations: NetworkUpgradeActivations,
+    activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     digest: [u8; 32],
 }
 
@@ -240,6 +241,8 @@ impl CanonicalActivationSchedule {
             baseline_prefix_len,
             previous_digest,
             admitted_tip,
+            activations_fingerprint: activations
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT),
             activations,
             digest: [0; 32],
         };
@@ -257,6 +260,12 @@ impl CanonicalActivationSchedule {
     #[must_use]
     pub const fn activations(&self) -> &NetworkUpgradeActivations {
         &self.activations
+    }
+
+    /// Returns the fingerprint of the complete activation table admitted in this revision.
+    #[must_use]
+    pub const fn activations_fingerprint(&self) -> NetworkUpgradeActivationsFingerprint {
+        self.activations_fingerprint
     }
 
     pub(super) fn encode(&self) -> Result<Vec<u8>, String> {
@@ -694,6 +703,16 @@ mod tests {
         assert_eq!(reopened, second);
         assert_eq!(reopened.revision(), 2);
         assert_eq!(reopened.activations(), &activations(3, 12)?);
+        assert_eq!(
+            reopened.activations_fingerprint(),
+            reopened
+                .activations()
+                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT)
+        );
+        assert_ne!(
+            reopened.activations_fingerprint(),
+            first.activations_fingerprint()
+        );
         Ok(())
     }
 

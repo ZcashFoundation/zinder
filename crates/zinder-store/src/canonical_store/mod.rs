@@ -48,6 +48,7 @@ mod wallet_events;
 use std::{io, num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zinder_core::{
     ArtifactSchemaVersion, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
@@ -333,6 +334,39 @@ impl CanonicalStoreBuildPlan {
     #[must_use]
     pub const fn history_predecessor(&self) -> &CommitmentTreeCheckpoint {
         &self.history_predecessor
+    }
+
+    /// Returns a 32-byte digest covering the full admitted predecessor
+    /// checkpoint (block identity, timestamp, and every shielded seed frontier).
+    #[must_use]
+    pub fn history_predecessor_digest(&self) -> [u8; 32] {
+        let checkpoint = &self.history_predecessor;
+        let mut digest = Sha256::new();
+        digest.update(b"zinder.canonical.history-predecessor.v1");
+        digest.update(checkpoint.block_id.height.value().to_le_bytes());
+        digest.update(checkpoint.block_id.hash.as_bytes());
+        digest.update(checkpoint.block_time_seconds.to_le_bytes());
+        for (tag, protocol) in [
+            (1_u8, ShieldedProtocol::Sapling),
+            (2_u8, ShieldedProtocol::Orchard),
+            (3_u8, ShieldedProtocol::Ironwood),
+        ] {
+            digest.update([tag]);
+            if let Some(frontier) = checkpoint.frontiers.get(protocol) {
+                digest.update([1]);
+                digest.update(frontier.tree_size().to_le_bytes());
+                digest.update(frontier.final_root().as_bytes());
+                digest.update(
+                    u64::try_from(frontier.final_state_bytes().len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                digest.update(frontier.final_state_bytes());
+            } else {
+                digest.update([0]);
+            }
+        }
+        digest.finalize().into()
     }
 
     /// Returns the exact source tip this build must reach.

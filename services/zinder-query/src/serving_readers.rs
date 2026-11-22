@@ -67,6 +67,13 @@ pub trait CanonicalReader: Send + Sync + 'static {
     /// Returns the canonical history range the store retains.
     fn history_bounds(&self) -> CanonicalHistoryBounds;
 
+    /// Returns a 32-byte digest of the store's full admitted history predecessor
+    /// checkpoint (block ID, timestamp, and every shielded seed frontier), or
+    /// `None` when the reader does not expose one.
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Reads the canonical header at `height`, or `None` above the visible
     /// tip or below retained history.
     async fn block_header_at(

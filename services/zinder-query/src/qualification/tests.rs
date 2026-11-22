@@ -87,6 +87,37 @@ async fn queued_replay_releases_the_generation_and_rejects_a_replaced_block() ->
 }
 
 #[tokio::test]
+async fn a_cached_reader_recaptures_once_and_rejects_a_replacement_fork() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
+    let height = Some(BlockHeight::new(2));
+    let (_old, original) = reader(&chain)?;
+    let (_new, replacement) = reader(&chain.fork_at(BlockHeight::new(2))?.extend_blocks(3))?;
+    let slot = Arc::new(ArcSwap::from(Arc::clone(&original)));
+    let mut query = query(&slot)?;
+    let expected = query.tree_state(Arc::clone(&original), height).await?;
+    let captures = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&captures);
+    let current = Arc::clone(&slot);
+    query.capture = Arc::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+        current.load_full()
+    });
+    assert_eq!(
+        query.tree_state(Arc::clone(&original), height).await?,
+        expected
+    );
+    assert_eq!(captures.load(Ordering::Relaxed), 1);
+    slot.store(replacement);
+    assert!(matches!(
+        query.tree_state(original, height).await,
+        Err(QueryError::BlockNotInBestChain)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn replacement_keeps_the_queued_wallet_ahead_of_the_next_admission() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
     let (_old, initial) = reader(&chain)?;
