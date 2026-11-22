@@ -875,6 +875,13 @@ async fn unknown_tree_state_queries_match_reference_status() -> Result<()> {
 
     for (case, request) in [
         (
+            "unspecified zero block identifier",
+            BlockId {
+                height: 0,
+                hash: Vec::new(),
+            },
+        ),
+        (
             "unknown block hash",
             BlockId {
                 height: 0,

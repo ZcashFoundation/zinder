@@ -29,6 +29,7 @@ mod index;
 pub(crate) mod verity;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const SLAB_TARGET_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentIdentity {
@@ -368,40 +369,93 @@ impl SealedHistory {
             .last()
             .ok_or_else(|| invalid("empty shielded chunk"))?;
         let first_frame = first.offset - LENGTHS_LEN as u64;
-        let relative = |row: &IndexedBlock| {
-            usize::try_from(row.offset - first_frame)
-                .map_err(|_| invalid("shielded chunk exceeds address space"))
-        };
-        let len = relative(last)?
+        let len = relative_frame_offset(last, first_frame)?
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
-        let mut packed = vec![0; len];
-        read_exact_at(&self.file, &mut packed, first_frame)?;
-        let packed = Bytes::from(packed);
-        selected
-            .iter()
-            .map(|row| {
-                let start = relative(row)?;
-                let lengths = packed[..start]
-                    .last_chunk()
-                    .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
-                if decode_lengths(*lengths)? != (row.native_bytes, row.len) {
-                    return Err(invalid(
-                        "shielded segment frame lengths differ from its index",
-                    ));
-                }
-                let payload = packed.slice(start..start + row.len);
-                row.verify_payload(&payload, self.kernel_verified)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                Ok(SealedBlock {
-                    id: row.id,
-                    parent: row.parent,
-                    native_bytes: row.native_bytes,
-                    payload,
+        let mut raw = vec![0; len];
+        read_exact_at(&self.file, &mut raw, first_frame)?;
+        if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
+            let packed = Bytes::from(raw);
+            return selected
+                .iter()
+                .map(|row| {
+                    let start = verified_row_start(row, &packed, first_frame)?;
+                    let payload = packed.slice(start..start + row.len);
+                    verify_and_build_block(row, payload, self.kernel_verified)
                 })
-            })
-            .collect()
+                .collect();
+        }
+        pack_payload_slabs(selected, &raw, first_frame, self.kernel_verified)
     }
+}
+
+fn relative_frame_offset(row: &IndexedBlock, first_frame: u64) -> io::Result<usize> {
+    usize::try_from(row.offset - first_frame)
+        .map_err(|_| invalid("shielded chunk exceeds address space"))
+}
+
+fn verified_row_start(row: &IndexedBlock, raw: &[u8], first_frame: u64) -> io::Result<usize> {
+    let start = relative_frame_offset(row, first_frame)?;
+    let lengths = raw[..start]
+        .last_chunk()
+        .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
+    if decode_lengths(*lengths)? != (row.native_bytes, row.len) {
+        return Err(invalid(
+            "shielded segment frame lengths differ from its index",
+        ));
+    }
+    Ok(start)
+}
+
+fn verify_and_build_block(
+    row: &IndexedBlock,
+    payload: Bytes,
+    kernel_verified: bool,
+) -> io::Result<SealedBlock> {
+    row.verify_payload(&payload, kernel_verified)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(SealedBlock {
+        id: row.id,
+        parent: row.parent,
+        native_bytes: row.native_bytes,
+        payload,
+    })
+}
+
+fn pack_payload_slabs(
+    selected: &[IndexedBlock],
+    raw: &[u8],
+    first_frame: u64,
+    kernel_verified: bool,
+) -> io::Result<Vec<SealedBlock>> {
+    let mut out = Vec::with_capacity(selected.len());
+    let mut group_start = 0_usize;
+    while group_start < selected.len() {
+        let mut group_end = group_start;
+        let mut slab_bytes = 0_usize;
+        while let Some(row) = selected.get(group_end) {
+            if group_end > group_start && slab_bytes.saturating_add(row.len) > SLAB_TARGET_BYTES {
+                break;
+            }
+            let _ = verified_row_start(row, raw, first_frame)?;
+            slab_bytes = slab_bytes.saturating_add(row.len);
+            group_end += 1;
+        }
+        let mut slab_buf = Vec::with_capacity(slab_bytes);
+        for row in &selected[group_start..group_end] {
+            let start = relative_frame_offset(row, first_frame)?;
+            slab_buf.extend_from_slice(&raw[start..start + row.len]);
+        }
+        let slab = Bytes::from(slab_buf);
+        let mut cursor = 0_usize;
+        for row in &selected[group_start..group_end] {
+            let payload = slab.slice(cursor..cursor + row.len);
+            cursor += row.len;
+            out.push(verify_and_build_block(row, payload, kernel_verified)?);
+        }
+        group_start = group_end;
+    }
+    Ok(out)
 }
 
 #[cfg(unix)]

@@ -560,6 +560,11 @@ where
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
     {
+        if read.cancel.is_cancelled() {
+            return ChunkReadOutcome::unread(ChunkReadFailure::Failed(Status::cancelled(
+                "block-range stream cancelled",
+            )));
+        }
         let at_epoch_id = match read.view {
             ChunkView::Captured(view) => Some(view.id),
             ChunkView::Current => {
@@ -593,22 +598,38 @@ where
                 };
             }
         };
+        let cancel = read.cancel;
+        if cancel.is_cancelled() {
+            return ChunkReadOutcome {
+                read_duration,
+                converted: Err(ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                ))),
+            };
+        }
         // The query hands the blocks back on this task, so the conversion
         // moves to the blocking pool, inside the caller's span.
         let span = tracing::Span::current();
         let converted = tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err(ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )));
+            }
             span.in_scope(|| {
-                convert(
+                Ok(convert(
                     compact_block_range.chain_epoch,
                     compact_block_range.compact_blocks,
-                )
+                ))
             })
         })
         .await
-        .map_err(|error| {
-            ChunkReadFailure::Failed(status_from_query_error(&QueryError::BlockingTaskFailed {
-                reason: error.to_string(),
-            }))
+        .unwrap_or_else(|error| {
+            Err(ChunkReadFailure::Failed(status_from_query_error(
+                &QueryError::BlockingTaskFailed {
+                    reason: error.to_string(),
+                },
+            )))
         });
         ChunkReadOutcome {
             read_duration,

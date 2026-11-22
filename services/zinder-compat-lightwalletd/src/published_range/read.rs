@@ -1,6 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{io::ErrorKind, sync::Arc, time::Instant};
 
 use prost::{Message, bytes::Bytes};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tonic_types::StatusExt as _;
 use zinder_core::{
@@ -121,12 +122,20 @@ impl PublishedRangeRead {
         span: BlockHeightRange,
         order: zinder_store::HeightOrder,
         max_bytes: usize,
-        tail: Option<&super::tail::EncodedTail>,
+        (tail, cancel): (Option<&super::tail::EncodedTail>, &CancellationToken),
     ) -> std::io::Result<Vec<SealedBlock>> {
         use zinder_store::HeightOrder;
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "block-range stream cancelled",
+            ));
+        }
         let end = self.history.bounds().end;
         if span.end <= end {
-            return self.history.read_chunk(span, order, max_bytes, true);
+            return self
+                .history
+                .read_chunk(span, order, max_bytes, (true, cancel));
         }
         let tail = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
         if span.start > end {
@@ -136,7 +145,8 @@ impl PublishedRangeRead {
         let suffix = BlockHeightRange::inclusive(BlockHeight::new(end.value() + 1), span.end);
         let (mut first, first_span) = match order {
             HeightOrder::Ascending => (
-                self.history.read_chunk(prefix, order, max_bytes, true)?,
+                self.history
+                    .read_chunk(prefix, order, max_bytes, (true, cancel))?,
                 prefix,
             ),
             HeightOrder::Descending => (tail.select(suffix, order, max_bytes, true), suffix),
@@ -153,7 +163,9 @@ impl PublishedRangeRead {
         match order {
             HeightOrder::Ascending => first.extend(tail.select(suffix, order, room, false)),
             HeightOrder::Descending => {
-                let mut earlier = self.history.read_chunk(prefix, order, room, false)?;
+                let mut earlier = self
+                    .history
+                    .read_chunk(prefix, order, room, (false, cancel))?;
                 earlier.append(&mut first);
                 first = earlier;
             }
@@ -233,6 +245,9 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
     {
+        if read.cancel.is_cancelled() {
+            return cancelled_outcome(None);
+        }
         read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
             return native_chunk(reads, read, convert).await;
@@ -256,26 +271,16 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
                 return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(epoch));
             }
             let started = Instant::now();
+            let fence = reads.range_fence(view);
             // A replacement with the same settled tip can have a higher retention floor.
             let tail = self.history.tail.load_full().filter(|tail| {
                 tail.epoch == epoch
-                    && reads.range_fence(view) == Some(tail.fence)
+                    && fence == Some(tail.fence)
                     && read.chunk.start >= tail.fence.1.first_available_height()
             });
-            let anchor = if let Some(live) = &tail {
-                let Some(span) = self.encoded_span(read.chunk, read.order, live) else {
-                    // The current canonical view must check retention for the planner's whole offer.
-                    return native_chunk(reads, read, convert).await;
-                };
-                read.chunk = span;
-                Some(Ok(()))
-            } else if self.covers_selected_history(read.chunk)
-                && reads.block_hash_at(view, read.chunk.start).await.is_ok()
-            {
-                Some(self.history.terminal().check_view(reads, view).await)
-            } else {
-                None
-            };
+            let anchor = self
+                .resolve_anchor(reads, (view, fence), &mut read.chunk, tail.as_deref())
+                .await;
             (epoch, started, anchor, tail)
         };
         match anchor {
@@ -292,13 +297,87 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             }
         }
         drop(read.view);
+        self.spawn_encoded_read(
+            (epoch, started),
+            (read.chunk, read.order, read.max_bytes, read.cancel),
+            tail,
+            convert,
+        )
+        .await
+    }
+}
+
+impl PublishedRangeRead {
+    async fn resolve_anchor<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        (view, fence): (&Reads::View, Option<super::tail::Fence>),
+        chunk: &mut BlockHeightRange,
+        tail: Option<&super::tail::EncodedTail>,
+    ) -> Option<Result<(), Status>> {
+        if let Some(live) = tail {
+            let span = self.encoded_span(
+                *chunk,
+                if self.is_descending {
+                    zinder_store::HeightOrder::Descending
+                } else {
+                    zinder_store::HeightOrder::Ascending
+                },
+                live,
+            )?;
+            *chunk = span;
+            return Some(Ok(()));
+        }
+        if !self.covers_selected_history(*chunk) {
+            return None;
+        }
+        let retained = match fence {
+            Some((_, bounds)) => chunk.start >= bounds.first_available_height(),
+            None => reads.block_hash_at(view, chunk.start).await.is_ok(),
+        };
+        if retained {
+            Some(self.history.terminal().check_view(reads, view).await)
+        } else {
+            None
+        }
+    }
+
+    async fn spawn_encoded_read<Output, Convert>(
+        &self,
+        (epoch, started): (ChainEpoch, Instant),
+        (chunk, order, max_bytes, cancel): (
+            BlockHeightRange,
+            zinder_store::HeightOrder,
+            usize,
+            CancellationToken,
+        ),
+        tail: Option<Arc<super::tail::EncodedTail>>,
+        convert: Convert,
+    ) -> ChunkReadOutcome<Output>
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
+    {
+        if cancel.is_cancelled() {
+            return cancelled_outcome(Some(started.elapsed()));
+        }
         let source = self.clone();
         tokio::task::spawn_blocking(move || {
-            let rows = source.encoded_rows(read.chunk, read.order, read.max_bytes, tail.as_deref());
+            if cancel.is_cancelled() {
+                return cancelled_outcome(Some(started.elapsed()));
+            }
+            let rows = source.encoded_rows(chunk, order, max_bytes, (tail.as_deref(), &cancel));
             let read_duration = Some(started.elapsed());
             let converted = rows
                 .map(|rows| convert(epoch, rows.into_iter().map(Into::into).collect()))
-                .map_err(|error| ChunkReadFailure::Failed(Status::data_loss(error.to_string())));
+                .map_err(|error| {
+                    let status = if error.kind() == ErrorKind::Interrupted {
+                        Status::cancelled(error.to_string())
+                    } else {
+                        Status::data_loss(error.to_string())
+                    };
+                    ChunkReadFailure::Failed(status)
+                });
             ChunkReadOutcome {
                 read_duration,
                 converted,
@@ -306,5 +385,16 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         })
         .await
         .unwrap_or_else(|error| ChunkReadOutcome::unread(task_failure(&error)))
+    }
+}
+
+fn cancelled_outcome<Output>(
+    read_duration: Option<std::time::Duration>,
+) -> ChunkReadOutcome<Output> {
+    ChunkReadOutcome {
+        read_duration,
+        converted: Err(ChunkReadFailure::Failed(Status::cancelled(
+            "block-range stream cancelled",
+        ))),
     }
 }

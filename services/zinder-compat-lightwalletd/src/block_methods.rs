@@ -22,6 +22,7 @@ use std::{
 };
 
 use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
@@ -66,6 +67,16 @@ pub(crate) struct ChunkRead<View> {
     pub(crate) max_bytes: usize,
     /// The view the read answers at.
     pub(crate) view: ChunkView<View>,
+    /// Cooperative cancellation signal triggered when the caller drops the response.
+    pub(crate) cancel: CancellationToken,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// Returns whether `read_at` still serves every height of `chunk`.
@@ -441,11 +452,14 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
     let (view, read_permit) =
         first_chunk_view(reads, block_range.end, conversion.published_read_limit()).await?;
+    let first_cancel = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
     let first_read = read_first_chunk(
         reads.clone(),
         view,
         BlockRangeChunks::new(block_range, is_descending),
         conversion.clone(),
+        first_cancel,
     );
     let (first_messages, later_chunks) = stream_slot
         .hold_during(async move {
@@ -741,6 +755,7 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     view: Reads::View,
     mut chunks: BlockRangeChunks,
     conversion: Source,
+    cancel: CancellationToken,
 ) -> Result<(ChunkMessages<Source::Message>, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
@@ -750,6 +765,7 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         order: chunks.order(),
         max_bytes: BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
         view: ChunkView::Captured(view),
+        cancel,
     };
     read_chunk(
         &reads,
@@ -805,6 +821,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
     conversion: Source,
     sink: BlockRangeSink<Result<Source::Message, Status>>,
 ) {
+    let cancel = sink.cancellation();
     while let Some(chunk) = chunks.next_chunk() {
         let Some(room) = BlockRangeStage::Send
             .time_async(sink.room_for_chunk())
@@ -820,8 +837,18 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
                 Err(status) => { room.fill(vec![Err(status)]); return; }
             }
         };
-        let mut outcome =
-            read_later_chunk(&reads, chunk, chunks, continuity, conversion.clone()).await;
+        if sink.is_closed() {
+            drop(read_permit);
+            return;
+        }
+        let mut outcome = read_later_chunk(
+            &reads,
+            chunk,
+            chunks,
+            continuity,
+            (conversion.clone(), cancel.clone()),
+        )
+        .await;
         if let Err(status) = &outcome
             && status.code() == Code::NotFound
             && !sink.is_closed()
@@ -832,7 +859,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
                 checked,
                 only_checked,
                 continuity,
-                conversion.clone(),
+                (conversion.clone(), cancel.clone()),
             )
             .await;
         }
@@ -864,7 +891,7 @@ async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     chunk: BlockHeightRange,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    conversion: Source,
+    (conversion, cancel): (Source, CancellationToken),
 ) -> Result<
     (
         BlockRangeChunks,
@@ -878,6 +905,7 @@ async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         order: chunks.order(),
         max_bytes: BLOCK_RANGE_CHUNK_MAX_BYTES,
         view: ChunkView::Current,
+        cancel,
     };
     let sent = continuity;
     let (link, kept_blocks, messages) = read_chunk(

@@ -572,6 +572,7 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
                 order: HeightOrder::Descending,
                 max_bytes,
                 view: ChunkView::Current,
+                cancel: tokio_util::sync::CancellationToken::new(),
             },
             |_, rows| rows.into_iter().map(|row| row.height()).collect::<Vec<_>>(),
         )
@@ -583,6 +584,378 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
     let damaged = read(4, 4, 1).await;
     assert!(
         matches!(damaged.converted, Err(ChunkReadFailure::Failed(status)) if status.code() == tonic::Code::DataLoss)
+    );
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HashGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct ObservedRangeReads {
+    slot: crate::compact_blocks_grpc::CanonicalReaderSlot,
+    epoch_override: Arc<parking_lot::Mutex<Option<zinder_core::ChainEpoch>>>,
+    capture_calls: Arc<std::sync::atomic::AtomicUsize>,
+    hash_calls: Arc<std::sync::atomic::AtomicUsize>,
+    native_calls: Arc<std::sync::atomic::AtomicUsize>,
+    hash_gate: Option<HashGate>,
+}
+
+impl ObservedRangeReads {
+    fn new(reader: Arc<RocksDbCanonicalReader>) -> Self {
+        Self {
+            slot: crate::compact_blocks_grpc::CanonicalReaderSlot::new(reader),
+            epoch_override: Arc::new(parking_lot::Mutex::new(None)),
+            capture_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hash_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            native_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hash_gate: None,
+        }
+    }
+
+    fn set_settled_tip(&self, height: u32, hash: zinder_core::BlockHash) {
+        let mut epoch = self.slot.capture().chain_epoch();
+        epoch.settled_tip_height = BlockHeight::new(height);
+        epoch.settled_tip_hash = hash;
+        *self.epoch_override.lock() = Some(epoch);
+    }
+}
+
+impl crate::block_methods::CompactBlockReads for ObservedRangeReads {
+    type View = (Arc<RocksDbCanonicalReader>, zinder_core::ChainEpoch);
+
+    fn capture_view(&self) -> impl Future<Output = std::result::Result<Self::View, tonic::Status>> {
+        self.capture_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reader = self.slot.capture();
+        let epoch = (*self.epoch_override.lock()).unwrap_or_else(|| reader.chain_epoch());
+        std::future::ready(Ok((reader, epoch)))
+    }
+
+    fn view_chain_epoch(view: &Self::View) -> zinder_core::ChainEpoch {
+        view.1
+    }
+
+    fn range_fence(
+        &self,
+        view: &Self::View,
+    ) -> Option<(
+        zinder_store::CanonicalEventFence,
+        zinder_core::CanonicalHistoryBounds,
+    )> {
+        self.slot.range_fence(&view.0)
+    }
+
+    fn view_activations(
+        &self,
+        view: &Self::View,
+    ) -> impl Future<
+        Output = std::result::Result<zinder_core::NetworkUpgradeActivations, tonic::Status>,
+    > + Send {
+        self.slot.view_activations(&view.0)
+    }
+
+    fn tip_block_time(
+        &self,
+        view: &Self::View,
+    ) -> impl Future<Output = std::result::Result<i64, tonic::Status>> + Send {
+        self.slot.tip_block_time(&view.0)
+    }
+
+    fn read_compact_block(
+        &self,
+        view: &Self::View,
+        block: crate::block_methods::RequestedBlock,
+    ) -> impl Future<Output = std::result::Result<zinder_core::CompactBlockArtifact, tonic::Status>> + Send
+    {
+        self.slot.read_compact_block(&view.0, block)
+    }
+
+    async fn block_hash_at(
+        &self,
+        view: &Self::View,
+        height: BlockHeight,
+    ) -> std::result::Result<zinder_core::BlockHash, tonic::Status> {
+        let call = self
+            .hash_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0
+            && let Some(gate) = &self.hash_gate
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        self.slot.block_hash_at(&view.0, height).await
+    }
+
+    async fn read_compact_block_chunk<Output, Convert>(
+        &self,
+        read: crate::block_methods::ChunkRead<Self::View>,
+        convert: Convert,
+    ) -> crate::block_methods::ChunkReadOutcome<Output>
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(zinder_core::ChainEpoch, Vec<zinder_core::CompactBlockArtifact>) -> Output
+            + Send
+            + 'static,
+    {
+        self.native_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mapped_view = match read.view {
+            crate::block_methods::ChunkView::Captured((reader, _)) => {
+                crate::block_methods::ChunkView::Captured(reader)
+            }
+            crate::block_methods::ChunkView::Current => crate::block_methods::ChunkView::Current,
+        };
+        let forwarded = crate::block_methods::ChunkRead {
+            chunk: read.chunk,
+            order: read.order,
+            max_bytes: read.max_bytes,
+            view: mapped_view,
+            cancel: read.cancel,
+        };
+        self.slot.read_compact_block_chunk(forwarded, convert).await
+    }
+}
+
+fn synthetic_tip_hash(tag: u32) -> zinder_core::BlockHash {
+    let mut raw = [9_u8; 32];
+    raw[..4].copy_from_slice(&tag.to_le_bytes());
+    zinder_core::BlockHash::from_bytes(raw)
+}
+
+#[tokio::test]
+async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> {
+    use crate::block_methods::CompactBlockReads as _;
+
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let (_store, source) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    assert!(fixture.publisher()?.publish_next(&source)?);
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let gate = HashGate {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut reads = ObservedRangeReads::new(Arc::new(source));
+    reads.hash_gate = Some(gate.clone());
+    reads.set_settled_tip(3, synthetic_tip_hash(3));
+    let view = reads.capture_view().await?;
+
+    let first_catalog = catalog.clone();
+    let first_reads = reads.clone();
+    let first_view = view.clone();
+    let leader = tokio::spawn(async move {
+        first_catalog
+            .terminal()
+            .check_view(&first_reads, &first_view)
+            .await
+    });
+    gate.entered.notified().await;
+
+    let mut followers = tokio::task::JoinSet::new();
+    for _ in 0..15 {
+        let follower_catalog = catalog.clone();
+        let follower_reads = reads.clone();
+        let follower_view = view.clone();
+        followers.spawn(async move {
+            follower_catalog
+                .terminal()
+                .check_view(&follower_reads, &follower_view)
+                .await
+        });
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    gate.release.notify_waiters();
+    leader.await??;
+    while let Some(joined) = followers.join_next().await {
+        joined??;
+    }
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    reads.set_settled_tip(4, synthetic_tip_hash(4));
+    let view_four = reads.capture_view().await?;
+    catalog.terminal().check_view(&reads, &view_four).await?;
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    for cycle in [view.clone(), view_four.clone(), view.clone()] {
+        catalog.terminal().check_view(&reads, &cycle).await?;
+    }
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+
+    // Fill 15 newer tips while `view` (tip 3) was touched after `view_four` (tip 4).
+    for tip in 5_u32..20 {
+        reads.set_settled_tip(tip, synthetic_tip_hash(tip));
+        let newer = reads.capture_view().await?;
+        catalog.terminal().check_view(&reads, &newer).await?;
+    }
+    let after_fill = reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed);
+    catalog.terminal().check_view(&reads, &view).await?;
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        after_fill,
+        "recently touched tip 3 must survive while older tip 4 is evicted"
+    );
+    catalog.terminal().check_view(&reads, &view_four).await?;
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        after_fill + 1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_chunk_uses_range_fence_without_hash_probe_and_falls_back_below_floor() -> Result<()>
+{
+    use zinder_store::HeightOrder;
+
+    use crate::block_methods::RangeSource as _;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let baseline = CanonicalBaseline::new(&chain);
+    let activations = sample_regtest_upgrade_activations();
+    let (_full_store, full_source) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&full_source)?);
+    assert!(publisher.publish_next(&full_source)?);
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds().end, BlockHeight::new(4));
+
+    let mut floored_store = CanonicalWriterFixture::publish(
+        &baseline.with_history_floor(BlockHeight::new(1)),
+        &activations,
+    )?
+    .into_serving_store_fixture()?;
+    let floored_reader = Arc::new(RocksDbCanonicalReader::new(
+        floored_store.take_readers()?.0,
+    )?);
+    let reads = ObservedRangeReads::new(floored_reader);
+    let range = crate::published_range::PublishedRangeRead::new(
+        catalog,
+        crate::compact_block_messages::CompactBlockShape::for_range(&[])?,
+        false,
+        crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+    );
+
+    let read_chunk = |first, last| {
+        range.read(
+            &reads,
+            crate::block_methods::ChunkRead {
+                chunk: BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last)),
+                order: HeightOrder::Ascending,
+                max_bytes: usize::MAX,
+                view: crate::block_methods::ChunkView::Current,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+            |_, rows| rows.len(),
+        )
+    };
+    let covered = read_chunk(2, 4).await;
+    assert!(matches!(covered.converted, Ok(3)));
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        reads
+            .native_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let repeat = read_chunk(2, 4).await;
+    assert!(matches!(repeat.converted, Ok(3)));
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        reads
+            .native_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let below_floor = read_chunk(1, 2).await;
+    assert!(below_floor.converted.is_err());
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        reads
+            .native_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn precancelled_published_chunk_read_returns_cancelled_without_storage_io() -> Result<()> {
+    use crate::block_methods::{ChunkReadFailure, RangeSource as _};
+    use zinder_store::HeightOrder;
+
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
+    let (_store, source) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    assert!(fixture.publisher()?.publish_next(&source)?);
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let reads = ObservedRangeReads::new(Arc::new(source));
+    let range = crate::published_range::PublishedRangeRead::new(
+        catalog,
+        crate::compact_block_messages::CompactBlockShape::for_range(&[])?,
+        false,
+        crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+
+    let cancelled = range
+        .read(
+            &reads,
+            crate::block_methods::ChunkRead {
+                chunk: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+                order: HeightOrder::Ascending,
+                max_bytes: usize::MAX,
+                view: crate::block_methods::ChunkView::Current,
+                cancel,
+            },
+            |_, rows| rows.len(),
+        )
+        .await;
+    assert!(matches!(
+        cancelled.converted,
+        Err(ChunkReadFailure::Failed(status)) if status.code() == tonic::Code::Cancelled
+    ));
+    assert_eq!(
+        reads
+            .capture_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        reads
+            .native_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
     Ok(())
 }

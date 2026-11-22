@@ -45,6 +45,7 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
@@ -610,13 +611,16 @@ impl BlockRangeStreamSlot {
         Reader: Future<Output = ()> + Send + 'static,
     {
         let (next_chunk, next_chunks) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
         tokio::spawn(reader(BlockRangeSink {
             next_chunk,
+            cancel: cancel.clone(),
             _stream_slot: self.clone(),
         }));
         self.hold_for_stream(Box::pin(ChunkedMessages {
             current: Some(tokio_stream::iter(first_messages)),
             next_chunks,
+            cancel,
         }))
     }
 
@@ -637,10 +641,16 @@ impl BlockRangeStreamSlot {
 #[derive(Debug)]
 pub(crate) struct BlockRangeSink<Message> {
     next_chunk: mpsc::Sender<Vec<Message>>,
+    cancel: CancellationToken,
     _stream_slot: BlockRangeStreamSlot,
 }
 
 impl<Message> BlockRangeSink<Message> {
+    /// Returns a cooperative cancellation token signaled when the client drops
+    /// the response stream.
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
     /// Waits until the response has room for one more chunk and returns
     /// that room.
     ///
@@ -691,6 +701,14 @@ struct ChunkedMessages<Message> {
     current: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
     /// The chunks the stream's reader hands on, at most one ahead.
     next_chunks: mpsc::Receiver<Vec<Message>>,
+    /// Cooperative cancellation token signaled when this stream drops.
+    cancel: CancellationToken,
+}
+
+impl<Message> Drop for ChunkedMessages<Message> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 // No field is pinned: the stream moves its messages out by value.
@@ -1736,6 +1754,7 @@ mod tests {
         let mut chunked_messages = ChunkedMessages {
             current: Some(tokio_stream::iter(first_messages.clone())),
             next_chunks,
+            cancel: super::CancellationToken::new(),
         };
 
         let mut sent = Vec::new();

@@ -533,3 +533,89 @@ fn the_terminal_height_and_hash_end_the_segment() {
     );
     assert!(segment.check_block(id(3), hash(2), Some(id(2))).is_err());
 }
+
+fn dense_block(height: u32) -> eyre::Result<CompactBlockArtifact> {
+    use zinder_core::{
+        CompactSaplingOutput, CompactTransaction, CompactTransactionData, TransactionId,
+    };
+    let tag = u8::try_from(height)?;
+    Ok(CompactBlockArtifact::new(
+        id(height),
+        hash(height - 1),
+        height,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([tag; 32]),
+            data: CompactTransactionData {
+                fee_zat: None,
+                sapling_spends: Vec::new(),
+                sapling_outputs: vec![
+                    CompactSaplingOutput {
+                        commitment: [1; 32],
+                        ephemeral_key: [2; 32],
+                        ciphertext: [3; 52],
+                    };
+                    12
+                ],
+                orchard_actions: Vec::new(),
+                ironwood_actions: Vec::new(),
+                transparent_inputs: Vec::new(),
+                transparent_outputs: Vec::new(),
+            },
+        }],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: height * 12,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?)
+}
+
+#[test]
+fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
+    const TOTAL_BLOCKS: u32 = 100;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded-dense");
+    let staged = NamedTempFile::new_in(parent_directory(&path))?;
+    let mut writer = SegmentWriter::create(&path, staged, NETWORK, id(1).height, id(TOTAL_BLOCKS))?;
+    for height in 1..=TOTAL_BLOCKS {
+        let dense = dense_block(height)?;
+        let native_bytes = zinder_store::encode_compact_block_artifact(&dense).len();
+        writer.push(dense, native_bytes)?;
+    }
+    let identity = writer.finish()?;
+    let history = SealedHistory::open(&path, identity)?;
+    let mut rows =
+        history.read_chunk(range(1, TOTAL_BLOCKS), HeightOrder::Ascending, usize::MAX)?;
+    assert_eq!(rows.len(), TOTAL_BLOCKS as usize);
+    let total_payload_bytes: usize = rows.iter().map(|row| row.payload.len()).sum();
+    assert!(
+        total_payload_bytes > SLAB_TARGET_BYTES,
+        "test fixture must exceed 64 KiB slab target (got {total_payload_bytes} bytes)"
+    );
+
+    let mut slab_one_count = 0_usize;
+    let mut slab_bytes = 0_usize;
+    for row in &rows {
+        if slab_one_count > 0 && slab_bytes + row.payload.len() > SLAB_TARGET_BYTES {
+            break;
+        }
+        assert_eq!(row.id, id(u32::try_from(slab_one_count)? + 1));
+        slab_bytes += row.payload.len();
+        slab_one_count += 1;
+    }
+    assert!(slab_one_count > 0 && slab_one_count < rows.len());
+
+    let later_slabs = rows.split_off(slab_one_count);
+    let probe = rows
+        .pop()
+        .ok_or_else(|| eyre::eyre!("expected non-empty first slab"))?;
+    assert!(!probe.payload.is_unique());
+    drop(rows);
+    assert!(
+        probe.payload.is_unique(),
+        "first slab must release independently of later slabs"
+    );
+    assert_eq!(later_slabs[0].id, id(u32::try_from(slab_one_count)? + 1));
+    Ok(())
+}
