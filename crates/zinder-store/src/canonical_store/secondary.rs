@@ -74,6 +74,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) expectation: CanonicalStoreAdmissionExpectation,
     workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
+    history_predecessor_digest: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
     pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
     pub(super) cursor_auth_key: [u8; 32],
@@ -271,6 +272,7 @@ impl RocksDbCanonicalSecondary {
                 reorg_policy,
             ),
             workload,
+            history_predecessor_digest: opened_control.build_plan.history_predecessor_digest(),
             build_plan: opened_control.build_plan,
             ready_evidence,
             subtree_root_coverage,
@@ -493,6 +495,12 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn history_bounds(&self) -> CanonicalHistoryBounds {
         self.build_plan.history_bounds()
+    }
+
+    /// Returns the digest of the complete predecessor checkpoint admitted at open.
+    #[must_use]
+    pub const fn history_predecessor_digest(&self) -> [u8; 32] {
+        self.history_predecessor_digest
     }
 
     /// Returns the complete admitted build identity.

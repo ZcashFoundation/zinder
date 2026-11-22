@@ -139,7 +139,7 @@ impl CanonicalReader for RocksDbCanonicalReader {
     }
 
     fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
-        Some(self.secondary.build_plan().history_predecessor_digest())
+        Some(self.secondary.history_predecessor_digest())
     }
 
     async fn block_header_at(

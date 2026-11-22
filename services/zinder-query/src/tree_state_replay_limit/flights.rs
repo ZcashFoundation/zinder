@@ -18,7 +18,7 @@ use tokio::{
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest, CanonicalHistoryBounds, ChainEpoch,
-    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    NetworkUpgradeActivationsFingerprint,
 };
 use zinder_store::{ServedTreeState, TreeStateLookup, TreeStateReplayOutcome};
 
@@ -47,11 +47,8 @@ impl ReplayKey {
             epoch: reader.chain_epoch(),
             sequence: reader.event_fence().sequence_digest(),
             schedule_revision: schedule.map(zinder_store::CanonicalActivationSchedule::revision),
-            activations_fingerprint: schedule.map(|table| {
-                table
-                    .activations()
-                    .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT)
-            }),
+            activations_fingerprint: schedule
+                .map(zinder_store::CanonicalActivationSchedule::activations_fingerprint),
             retained: reader.history_bounds(),
             predecessor_digest: reader.history_predecessor_digest(),
         }
