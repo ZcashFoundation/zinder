@@ -31,6 +31,7 @@ use zinder_store::{
 };
 
 mod broadcast_byte_budget;
+mod compact_block_fence;
 mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
@@ -51,6 +52,7 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
+pub use compact_block_fence::{CompactBlockFence, CompactBlockSource};
 pub use grpc::{
     DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS, TransactionStatusLookup,
     WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata, WalletQueryGrpcAdapter,
@@ -102,15 +104,10 @@ pub use wallet_serving_query::WalletServingQuery;
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
-    /// Returns the canonical fence and retention bounds for a locally admitted epoch.
-    /// Adapters can use this identity to reuse derived compact-block bytes.
-    fn compact_block_fence(
-        &self,
-        _epoch: ChainEpoch,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
+    /// Returns the canonical fence, retention bounds, and source of a locally
+    /// admitted epoch. Adapters can use this identity to reuse derived
+    /// compact-block bytes.
+    fn compact_block_fence(&self, _epoch: ChainEpoch) -> Option<CompactBlockFence> {
         None
     }
 
@@ -229,6 +226,21 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads ascending compact blocks with their original stored byte lengths
+    /// up to `max_bytes`.
+    ///
+    /// Local canonical query implementations override this to supply exact
+    /// stored byte lengths for live-tail caching; implementations without
+    /// stored-length metadata may keep the default `Ok(None)`.
+    async fn compact_block_rows_with_lengths(
+        &self,
+        _block_range: BlockHeightRange,
+        _max_bytes: usize,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        Ok(None)
+    }
 
     /// Reads one full serialized block at a given height.
     ///

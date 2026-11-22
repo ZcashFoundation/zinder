@@ -1,4 +1,5 @@
 mod admission;
+mod tail_identity;
 
 use super::{
     EpochPinRecorder, assert_one_linked_chain, assert_stream_ended_with, block_range_request,
@@ -1226,5 +1227,257 @@ async fn paced_dense_ranges_complete_and_cancelled_readers_release_capacity() ->
         .await??;
         assert_eq!(actual, completed);
     }
+    Ok(())
+}
+
+async fn assert_adapters_match_stock(
+    wallet: &mut Endpoint,
+    blocks_only: &mut Endpoint,
+    stock: &mut Endpoint,
+    ranges: &[(u64, u64)],
+) -> eyre::Result<()> {
+    for &(first, last) in ranges {
+        let expected = stock.blocks(block_range_request(first, last)).await?;
+        assert_one_linked_chain(&expected, first, last);
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?,
+            expected
+        );
+        assert_eq!(
+            blocks_only.blocks(block_range_request(first, last)).await?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn standalone_adapters_serve_and_coalesce_on_demand_shielded_live_tail() -> eyre::Result<()> {
+    const TIP: u32 = 12;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP + 1);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let initial = ReaderFixture::new(writer.serving_store_fixture()?)?;
+    writer.append_live_block(&chain)?;
+    let advanced = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+
+    let mut recorder =
+        EpochPinRecorder::new(initial.query.clone()).with_later_views(vec![advanced.query.clone()]);
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(initial.reader.clone()))
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(initial.query.clone()).into_server()),
+    )
+    .await?;
+
+    let mut warm_clients = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let mut client = wallet.client.clone();
+        warm_clients.spawn(async move {
+            let stream = client
+                .get_block_range(block_range_request(8, 12))
+                .await?
+                .into_inner();
+            let drained = drain_slowly(stream).await;
+            eyre::ensure!(drained.ending.is_none());
+            Ok::<_, eyre::Report>(drained.blocks)
+        });
+    }
+    let expected_hot = stock.blocks(block_range_request(8, 12)).await?;
+    while let Some(joined) = warm_clients.join_next().await {
+        assert_eq!(joined??, expected_hot);
+    }
+    assert_adapters_match_stock(
+        &mut wallet,
+        &mut blocks_only,
+        &mut stock,
+        &[(4, 12), (12, 1), (1, 12)],
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(8, 12), span(4, 7), span(1, 3)]
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        Vec::<BlockHeightRange>::new()
+    );
+
+    let mut explicit = block_range_request(2, 4);
+    explicit.pool_types = vec![lightwalletd::PoolType::Transparent as i32];
+    assert_eq!(
+        wallet.blocks(explicit.clone()).await?,
+        stock.blocks(explicit).await?
+    );
+    assert_eq!(recorder.recorded_compact_block_ranges().len(), 1);
+
+    let updated = wallet.blocks(block_range_request(1, 13)).await?;
+    assert_one_linked_chain(&updated, 1, 13);
+    // The advanced view is another generation, so it refills the request.
+    assert_eq!(
+        recorder.recorded_rows_with_lengths.lock().last().copied(),
+        Some(span(1, 13))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog() -> eyre::Result<()>
+{
+    let chain = wallet_chain(1)?;
+    let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
+    let dir = tempfile::tempdir()?;
+    let directory = dir.path().join("catalog");
+    let (signer, key) = crate::common::shielded_catalog_keys(dir.path())?;
+    let mut publisher =
+        ShieldedCatalogPublisher::open(&directory, &signer, BlockHeight::new(1), 2.try_into()?)?;
+    let history = Arc::new(
+        PublishedShieldedHistory::follow_publisher(&directory, &key, false, store.reader.as_ref())
+            .await?,
+    );
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(history.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(store.reader.clone()))
+                .with_published_shielded_history(history.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(store.query.clone()).into_server()),
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+    let ranges = [(1, 6), (6, 1)];
+
+    assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
+    // Both adapters share the bootstrap tail here. Each reads its own
+    // generation, so neither serves rows the other one read.
+    let bootstrap_reads = recorder.recorded_rows_with_lengths.lock().clone();
+    assert_ne!(bootstrap_reads, Vec::new());
+    assert!(bootstrap_reads.iter().all(|read| *read == span(1, 6)));
+
+    assert!(publisher.publish_next(&store.reader)?);
+    assert!(history.refresh(store.reader.as_ref()).await?);
+    assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
+    let adopted_reads = recorder.recorded_rows_with_lengths.lock().clone();
+    assert!(
+        adopted_reads[bootstrap_reads.len()..]
+            .iter()
+            .all(|read| *read == span(3, 6))
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        Vec::<BlockHeightRange>::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_api_rows_with_lengths_preserves_exact_stored_compact_bytes() -> eyre::Result<()> {
+    use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
+    let chain = wallet_chain(8)?;
+    let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+    let expected = store
+        .reader
+        .compact_block_rows_with_lengths(range, usize::MAX)
+        .await?;
+    let queried = store
+        .query
+        .compact_block_rows_with_lengths(range, usize::MAX, None)
+        .await?
+        .ok_or_else(|| eyre!("expected query lengths"))?;
+    assert_eq!(queried, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wallet_range_below_its_cached_frontier_reads_only_the_requested_rows() -> eyre::Result<()>
+{
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP);
+    let store = ReaderFixture::new(
+        CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain),
+            &sample_regtest_upgrade_activations(),
+        )?
+        .into_serving_store_fixture()?,
+    )?;
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+
+    for (first, last) in [(85, 100), (100, 85)] {
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?.len(),
+            16
+        );
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        Vec::<BlockHeightRange>::new()
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        vec![span(85, 100), span(85, 100)]
+    );
+
+    for (first, last) in [(2_085, 2_100), (85, 100), (100, 85), (2_100, 2_085)] {
+        let blocks = wallet.blocks(block_range_request(first, last)).await?;
+        assert_eq!(blocks.len(), 16);
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(2_085, 2_100)]
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        vec![span(85, 100), span(85, 100), span(85, 100), span(85, 100)]
+    );
+
+    for (first, last) in [(2_069, 2_084), (2_068, 2_053)] {
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?.len(),
+            16
+        );
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(2_085, 2_100), span(2_069, 2_084), span(2_053, 2_068)]
+    );
+    assert_eq!(recorder.recorded_compact_block_ranges().len(), 4);
     Ok(())
 }

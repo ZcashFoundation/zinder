@@ -149,6 +149,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     response_limits: LightwalletdResponseLimits,
     block_methods: BlockMethods,
     published_history: Option<Arc<crate::PublishedShieldedHistory>>,
+    live_tail: crate::published_range::ShieldedTailBuffer,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -214,6 +215,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             response_limits,
             block_methods: BlockMethods::default(),
             published_history: None,
+            live_tail: crate::published_range::ShieldedTailBuffer::default(),
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -501,6 +503,11 @@ where
         zinder_core::CanonicalHistoryBounds,
     )> {
         self.compact_block_fence(*view)
+            .map(|fence| (fence.event_fence, fence.history_bounds))
+    }
+
+    fn tail_source(&self, view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
+        self.compact_block_fence(*view)
     }
 
     fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {
@@ -548,6 +555,17 @@ where
         self.block_header_by_selector(BlockSelector::Height(height), Some(view.id))
             .await
             .map(|row| row.block_header.block_id.hash)
+            .map_err(|err| status_from_query_error(&err))
+    }
+
+    async fn read_compact_block_rows_with_lengths(
+        &self,
+        view: &Self::View,
+        range: zinder_core::BlockHeightRange,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
+        self.compact_block_rows_with_lengths(range, max_bytes, Some(view.id))
+            .await
             .map_err(|err| status_from_query_error(&err))
     }
 
@@ -860,11 +878,10 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
-        let range = self
-            .published_history
-            .as_ref()
-            .and_then(|history| history.catalog())
-            .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range(&self.query_api, &request.into_inner(), range)
             .await
@@ -878,10 +895,7 @@ where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
-        self.published_history
-            .as_ref()
-            .filter(|history| history.has_catalog())
-            .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
+        Some(self)
     }
 
     async fn get_latest_block(

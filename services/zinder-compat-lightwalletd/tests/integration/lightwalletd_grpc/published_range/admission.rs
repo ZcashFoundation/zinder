@@ -112,7 +112,8 @@ async fn check_read_admission(
         matches!(poll_once(&mut future_height), Poll::Ready(Err(status)) if status.code() == Code::OutOfRange)
     );
 
-    let mut displaced = adapter.get_encoded_block_range(gated_range(6, 6));
+    // A chunk that can read the catalog waits, then rechecks the tip it ends at.
+    let mut displaced = adapter.get_encoded_block_range(gated_range(3, 6));
     let mut admission = queue(&mut displaced);
     let mut oldest = adapter.get_encoded_block_range(gated_range(1, 3));
     let mut cancelled = adapter.get_encoded_block_range(gated_range(2, 2));

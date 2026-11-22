@@ -180,6 +180,23 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Returns the fence of `view` with the admitted data it reads, which
+    /// together key the encoded rows the live tail may reuse for `view`.
+    fn tail_source(&self, _view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
+        None
+    }
+
+    /// Reads ascending compact blocks with their original stored lengths up to `max_bytes`.
+    fn read_compact_block_rows_with_lengths(
+        &self,
+        _view: &Self::View,
+        _range: BlockHeightRange,
+        _max_bytes: usize,
+    ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
+    {
+        std::future::ready(Ok(None))
+    }
+
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
     /// end `read.order` visits first, and runs `convert` on the blocking pool
     /// with the chain epoch they were read at and the blocks in ascending
@@ -251,6 +268,12 @@ struct ServedTip<View> {
 }
 
 impl BlockMethods {
+    /// Returns the stream and published-read limit these methods admit with.
+    #[cfg(test)]
+    pub(crate) const fn block_range_streams(&self) -> &BlockRangeStreamLimit {
+        &self.block_range_streams
+    }
+
     /// Limits how many block-range streams these methods serve at once,
     /// keeping the admission wait.
     pub(crate) fn with_max_concurrent_block_range_streams(
@@ -363,13 +386,17 @@ impl BlockMethods {
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        history: Arc<crate::published_range::PublishedShieldedCatalog>,
+        (history, live_tail): (
+            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
+            crate::published_range::ShieldedTailBuffer,
+        ),
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let slot = self.block_range_streams.open().await?;
         let shape = CompactBlockShape::for_range(&request.pool_types)?;
         let source = crate::published_range::PublishedRangeRead::new(
             history,
+            live_tail,
             shape,
             is_descending,
             self.block_range_streams.clone(),
@@ -450,14 +477,17 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     stream_slot: crate::block_range::BlockRangeStreamSlot,
     conversion: Source,
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
-    let (view, read_permit) =
-        first_chunk_view(reads, block_range.end, conversion.published_read_limit()).await?;
+    let chunks = BlockRangeChunks::new(block_range, is_descending);
+    let published_limit = chunks
+        .next_chunk()
+        .and_then(|chunk| conversion.published_read_limit(chunk));
+    let (view, read_permit) = first_chunk_view(reads, block_range.end, published_limit).await?;
     let first_cancel = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
     let first_read = read_first_chunk(
         reads.clone(),
         view,
-        BlockRangeChunks::new(block_range, is_descending),
+        chunks,
         conversion.clone(),
         first_cancel,
     );
@@ -649,7 +679,9 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     type Block: RangeBlock + Send + 'static;
     type Message: Send + 'static;
 
-    fn published_read_limit(&self) -> Option<&BlockRangeStreamLimit> {
+    /// Returns the published-read limit `chunk` waits on, when reading it can
+    /// open signed segment files.
+    fn published_read_limit(&self, _chunk: BlockHeightRange) -> Option<&BlockRangeStreamLimit> {
         None
     }
 
@@ -832,7 +864,7 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
         let read_permit = tokio::select! {
             biased;
             () = sink.closed() => return,
-            admission = published_read_permit(conversion.published_read_limit()) => match admission {
+            admission = published_read_permit(conversion.published_read_limit(chunk)) => match admission {
                 Ok(permit) => permit,
                 Err(status) => { room.fill(vec![Err(status)]); return; }
             }

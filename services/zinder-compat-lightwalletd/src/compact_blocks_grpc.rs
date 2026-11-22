@@ -84,6 +84,14 @@ impl CompactBlockReads for CanonicalReaderSlot {
         Some((view.event_fence(), view.history_bounds()))
     }
 
+    fn tail_source(&self, view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
+        Some(zinder_query::CompactBlockFence {
+            event_fence: view.event_fence(),
+            history_bounds: view.history_bounds(),
+            source: zinder_query::CompactBlockSource::of(view),
+        })
+    }
+
     fn view_chain_epoch(view: &Arc<RocksDbCanonicalReader>) -> ChainEpoch {
         view.chain_epoch()
     }
@@ -146,6 +154,18 @@ impl CompactBlockReads for CanonicalReaderSlot {
             .map_err(storage_status)?
             .map(|row| row.block_hash)
             .ok_or_else(|| Status::failed_precondition("missing settled shielded range anchor"))
+    }
+
+    async fn read_compact_block_rows_with_lengths(
+        &self,
+        view: &Self::View,
+        range: zinder_core::BlockHeightRange,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
+        view.compact_block_rows_with_lengths(range, max_bytes)
+            .await
+            .map(Some)
+            .map_err(storage_status)
     }
 
     async fn read_compact_block_chunk<Output, Convert>(
@@ -242,6 +262,7 @@ pub struct CompactBlocksGrpcAdapter {
     slot: CanonicalReaderSlot,
     block_methods: BlockMethods,
     published_history: Option<Arc<crate::PublishedShieldedHistory>>,
+    live_tail: crate::published_range::ShieldedTailBuffer,
     ping: LightwalletdPing,
 }
 
@@ -264,6 +285,7 @@ impl CompactBlocksGrpcAdapter {
             slot,
             block_methods: BlockMethods::default(),
             published_history: None,
+            live_tail: crate::published_range::ShieldedTailBuffer::default(),
             ping: LightwalletdPing::default(),
         }
     }
@@ -346,11 +368,10 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
-        let range = self
-            .published_history
-            .as_ref()
-            .and_then(|history| history.catalog())
-            .ok_or_else(|| Status::failed_precondition("no shielded range admitted"))?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range(&self.slot, &request.into_inner(), range)
             .await
@@ -361,10 +382,7 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
 #[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter {
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
-        self.published_history
-            .as_ref()
-            .filter(|history| history.has_catalog())
-            .map(|_| self as &dyn lightwalletd::EncodedBlockRange)
+        Some(self)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;

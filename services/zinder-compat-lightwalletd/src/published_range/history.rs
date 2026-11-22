@@ -4,23 +4,46 @@ use std::{
     sync::Arc,
 };
 
-use arc_swap::ArcSwapOption;
+use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::BlockHeightRange;
 use zinder_query::CanonicalReader;
 use zinder_store::HeightOrder;
 
-use super::PublishedShieldedCatalog;
+use super::{PublishedShieldedCatalog, ShieldedTailBuffer};
 use crate::sealed_history::SealedBlock;
 
 /// The admitted shielded history shared by a listener and its catalog refresher.
 pub struct PublishedShieldedHistory {
-    current: ArcSwapOption<PublishedShieldedCatalog>,
+    current: ArcSwap<HistorySnapshot>,
     manifest: PathBuf,
     publisher_directory: Option<PathBuf>,
     key: [u8; 32],
     require_fs_verity: bool,
+}
+
+pub(super) enum HistorySnapshot {
+    Bootstrap(ShieldedTailBuffer),
+    Published(Arc<PublishedShieldedCatalog>),
+}
+
+impl HistorySnapshot {
+    fn catalog(&self) -> Option<&Arc<PublishedShieldedCatalog>> {
+        match self {
+            Self::Bootstrap(_) => None,
+            Self::Published(catalog) => Some(catalog),
+        }
+    }
+
+    pub(super) fn encoded_range(
+        &self,
+    ) -> (Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer) {
+        match self {
+            Self::Bootstrap(tail) => (None, tail.clone()),
+            Self::Published(catalog) => (Some(catalog.clone()), catalog.tail()),
+        }
+    }
 }
 
 impl PublishedShieldedHistory {
@@ -85,10 +108,13 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if let Some(catalog) = &catalog {
-            catalog.admit_source(source).await?;
+            catalog.verify_source(source).await?;
         }
         Ok(Self {
-            current: ArcSwapOption::from(catalog.map(Arc::new)),
+            current: ArcSwap::from_pointee(catalog.map_or_else(
+                || HistorySnapshot::Bootstrap(ShieldedTailBuffer::default()),
+                |catalog| HistorySnapshot::Published(Arc::new(catalog)),
+            )),
             manifest: manifest.to_owned(),
             publisher_directory: publisher_directory.map(Path::to_owned),
             key,
@@ -96,21 +122,30 @@ impl PublishedShieldedHistory {
         })
     }
 
-    /// Refreshes the default shielded live tail against a captured canonical view.
-    /// An incomplete or displaced refresh keeps the previous fence available.
-    pub async fn refresh_tail(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
-        if let Some(catalog) = self.catalog() {
-            catalog.refresh_tail(source).await?;
+    /// Checks the active catalog's terminal against a captured canonical view.
+    /// The encoded live tail fills on demand for the view each request reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the view no longer holds the catalog's terminal.
+    pub async fn verify_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
+        if let Some(catalog) = self.snapshot().catalog() {
+            catalog.verify_source(source).await?;
         }
         Ok(())
     }
 
-    pub(crate) fn has_catalog(&self) -> bool {
-        self.current.load().is_some()
+    pub(super) fn snapshot(&self) -> Arc<HistorySnapshot> {
+        self.current.load_full()
     }
 
-    pub(crate) fn catalog(&self) -> Option<Arc<PublishedShieldedCatalog>> {
-        self.current.load_full()
+    /// Serves the admitted catalog with its tail, or a standalone live tail
+    /// until the first catalog is adopted. Adoption releases the standalone
+    /// rows once streams that started before it finish.
+    pub(crate) fn encoded_range(
+        &self,
+    ) -> (Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer) {
+        self.current.load().encoded_range()
     }
 
     /// Admits an extension of the active signed catalog against the current canonical source.
@@ -120,8 +155,8 @@ impl PublishedShieldedHistory {
     ///
     /// A signature, storage, or chain error leaves the active catalog serving existing requests.
     pub async fn refresh(&self, source: &dyn CanonicalReader) -> Result<bool, Status> {
-        let current = self.catalog();
-        let previous = current.clone();
+        let current = self.snapshot();
+        let previous = current.catalog().cloned();
         let manifest = self.manifest.clone();
         let directory = self.publisher_directory.clone();
         let key = self.key;
@@ -141,17 +176,16 @@ impl PublishedShieldedHistory {
         let Some(candidate) = candidate else {
             return Ok(false);
         };
-        if let Some(active) = &current
+        if let Some(active) = current.catalog()
             && candidate.segments().len() == active.segments().len()
         {
-            active.refresh_tail(source).await?;
+            active.verify_source(source).await?;
             return Ok(false);
         }
-        candidate.admit_source(source).await?;
-        let displaced = self
-            .current
-            .compare_and_swap(&current, Some(Arc::new(candidate)));
-        Ok(current.as_ref().map(Arc::as_ptr) == displaced.as_ref().map(Arc::as_ptr))
+        candidate.verify_source(source).await?;
+        let next = Arc::new(HistorySnapshot::Published(Arc::new(candidate)));
+        let displaced = self.current.compare_and_swap(&current, next);
+        Ok(Arc::ptr_eq(&current, &displaced))
     }
 }
 
@@ -201,14 +235,6 @@ fn read_catalog(
 }
 
 impl PublishedShieldedCatalog {
-    async fn admit_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
-        self.verify_source(source).await?;
-        if let Err(status) = self.refresh_tail(source).await {
-            tracing::warn!(%status, "serving the uncovered tail from canonical storage");
-        }
-        Ok(())
-    }
-
     pub(super) fn read_chunk(
         &self,
         range: BlockHeightRange,

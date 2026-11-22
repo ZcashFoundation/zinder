@@ -1405,28 +1405,26 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
         .await
         .transpose()?
         .ok_or_else(|| eyre::eyre!("missing canonical block"))?;
-    assert!(adapter.encoded_block_range().is_none());
+    let expected = expected.encode_to_vec();
+    let encoded_rows = || async {
+        let encoded = adapter
+            .encoded_block_range()
+            .ok_or_else(|| eyre::eyre!("missing encoded block range"))?;
+        let mut rows = encoded
+            .get_encoded_block_range(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        let mut received = Vec::new();
+        while let Some(row) = rows.next().await.transpose()? {
+            received.push(row.to_vec());
+        }
+        Ok::<_, eyre::Report>(received)
+    };
+    assert_eq!(encoded_rows().await?, vec![expected.clone()]);
     assert!(publisher.publish_next(&canonical.canonical_reader)?);
     assert!(history.refresh(canonical.as_ref()).await?);
-    assert!(
-        history
-            .refresh_tail(canonical.as_ref())
-            .await
-            .is_err_and(|status| status.code() == Code::Unavailable
-                && status.message().contains("row lengths"))
-    );
-    let encoded = adapter
-        .encoded_block_range()
-        .ok_or_else(|| eyre::eyre!("missing signed prefix"))?;
-    let mut rows = encoded
-        .get_encoded_block_range(Request::new(request))
-        .await?
-        .into_inner();
-    assert_eq!(
-        rows.next().await.transpose()?.as_deref(),
-        Some(expected.encode_to_vec().as_slice())
-    );
-    assert!(rows.next().await.is_none());
+    history.verify_source(canonical.as_ref()).await?;
+    assert_eq!(encoded_rows().await?, vec![expected]);
     Ok(())
 }
 
@@ -2086,9 +2084,9 @@ async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() ->
         &reader,
     )
     .await?;
-    assert!(history.refresh_tail(&reader).await.is_err());
+    history.verify_source(&reader).await?;
     assert!(publisher.publish_next(&reader.canonical_reader)?);
     assert!(history.refresh(&reader).await?);
-    assert!(history.refresh_tail(&reader).await.is_err());
+    history.verify_source(&reader).await?;
     Ok(())
 }

@@ -3012,6 +3012,7 @@ struct EpochPinRecorder<Inner> {
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
+    recorded_rows_with_lengths: Arc<Mutex<Vec<BlockHeightRange>>>,
     /// Heights each compact-block range read was offered, which it checks in
     /// full however few blocks its byte budget keeps.
     offered_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
@@ -3074,6 +3075,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             gated_chunk_reads: None,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
+            recorded_rows_with_lengths: Arc::new(Mutex::new(Vec::new())),
             offered_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             transparent_address_balance: None,
             synthetic_views: None,
@@ -3399,10 +3401,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     fn compact_block_fence(
         &self,
         epoch: zinder_core::ChainEpoch,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
+    ) -> Option<zinder_query::CompactBlockFence> {
         if self.expose_range_fence {
             self.served_inner(self.view_index())
                 .compact_block_fence(epoch)
@@ -3584,6 +3583,21 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
                 .push(served.chain_epoch.id);
         }
         compact_block_range
+    }
+
+    async fn compact_block_rows_with_lengths(
+        &self,
+        block_range: BlockHeightRange,
+        max_bytes: usize,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        if !self.expose_range_fence {
+            return Ok(None);
+        }
+        self.recorded_rows_with_lengths.lock().push(block_range);
+        self.served_inner(self.view_index())
+            .compact_block_rows_with_lengths(block_range, max_bytes, at_epoch_id)
+            .await
     }
 
     async fn full_block_at(
