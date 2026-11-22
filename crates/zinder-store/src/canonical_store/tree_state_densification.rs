@@ -57,6 +57,19 @@ pub enum TreeStateCheckpointSelection {
 }
 
 impl TreeStateCheckpointSelection {
+    /// Returns whether the selection calls for a checkpoint after the given
+    /// tree sizes advance from the previous checkpoint.
+    #[must_use]
+    pub fn requires_checkpoint_since(
+        self,
+        previous: ChainTipMetadata,
+        current: ChainTipMetadata,
+    ) -> bool {
+        self.requires_checkpoint(
+            commitment_count(current).saturating_sub(commitment_count(previous)),
+        )
+    }
+
     /// Returns whether a gap that starts after `committed_since_checkpoint`
     /// commitments still needs a checkpoint before its next stored one.
     fn requires_checkpoint(self, committed_since_checkpoint: u64) -> bool {

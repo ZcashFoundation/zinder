@@ -693,7 +693,7 @@ fn held_construction_writer_config(
         checkpoint_height: None,
         raw_blob_retention: RawBlobRetention::Transactions,
         reorg_window_blocks: 100,
-        every_block_tree_state_checkpoints: false,
+        tree_state_checkpoint_selection: None,
         follow: CanonicalFollowConfig {
             request_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(10),
@@ -1075,7 +1075,8 @@ fn multi_block_writer_config(
 ) -> CanonicalWriterConfig {
     CanonicalWriterConfig {
         reorg_window_blocks: 1,
-        every_block_tree_state_checkpoints,
+        tree_state_checkpoint_selection: every_block_tree_state_checkpoints
+            .then_some(zinder_store::TreeStateCheckpointSelection::EveryBlock),
         ..held_construction_writer_config(storage_path, activations)
     }
 }
@@ -1152,6 +1153,58 @@ async fn every_block_construction_stores_every_height_while_sparse_construction_
         let replayed =
             sparse_store.tree_state_checkpoint_at(BlockHeight::new(height), &activations)?;
         assert_eq!(replayed.as_ref(), Some(source.checkpoint_at(height)?));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commitment_budget_construction_serves_the_same_tree_states_as_every_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    use zinder_store::TreeStateCheckpointSelection::CommitmentBudget;
+
+    let activations = regtest_activations();
+    let source = MultiBlockConstructionSource::build(6, &activations)?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let directory = TempDir::new()?;
+    let dense = multi_block_writer_config(
+        directory.path().join("every-block"),
+        Arc::clone(&activations),
+        true,
+    );
+    let budgeted = CanonicalWriterConfig {
+        storage_path: directory.path().join("commitment-budget"),
+        tree_state_checkpoint_selection: Some(CommitmentBudget(std::num::NonZeroU32::MIN)),
+        ..dense.clone()
+    };
+    let cancel = CancellationToken::new();
+    let dense = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &dense,
+        &readiness,
+        &cancel,
+    )
+    .await?;
+    let budgeted = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &budgeted,
+        &readiness,
+        &cancel,
+    )
+    .await?;
+    for height in 0..=5 {
+        let at = BlockHeight::new(height);
+        let lookup = budgeted.tree_state_lookup(at, &activations)?;
+        assert_eq!(
+            matches!(lookup, Some(TreeStateLookup::Stored(_))),
+            matches!(height, 0 | 2 | 4 | 5),
+            "unexpected checkpoint coverage at height {height}"
+        );
+        assert_eq!(
+            budgeted.tree_state_checkpoint_at(at, &activations)?,
+            dense.tree_state_checkpoint_at(at, &activations)?,
+        );
     }
     Ok(())
 }

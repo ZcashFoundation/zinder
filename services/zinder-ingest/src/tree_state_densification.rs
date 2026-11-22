@@ -1,7 +1,7 @@
 //! Background densification of settled tree-state checkpoints.
 //!
 //! Fresh construction checkpoints the commitment trees every 100 blocks and at
-//! the build tip by default. Operators can opt into every-block construction.
+//! the build tip by default. Operators can apply the selected densification policy during construction.
 //! This background pass fills settled strides with the selected checkpoints. For fully covered strides,
 //! the pass checks checkpoint heights and advances the watermark. A canonical secondary replays
 //! incomplete strides on a bounded number of blocking threads, and the writer
@@ -89,7 +89,7 @@ const FAILED_SCAN_CHARGE_BLOCKS: u32 =
 pub struct TreeStateDensificationConfig {
     /// Whether the pass runs.
     pub enabled: bool,
-    /// Whether every-block densification also runs during fresh construction.
+    /// Whether the selected densification policy also applies during fresh construction.
     pub during_construction: bool,
     /// Which blocks of a stride receive a stored checkpoint.
     pub selection: TreeStateCheckpointSelection,
@@ -101,14 +101,11 @@ pub struct TreeStateDensificationConfig {
 }
 
 impl TreeStateDensificationConfig {
-    /// Returns whether fresh canonical construction stores a tree-state
-    /// checkpoint for every loaded block instead of only on the 100-block
-    /// cadence and at the build tip.
+    /// Returns the optional selection applied in addition to the fresh
+    /// construction cadence and build tip.
     #[must_use]
-    pub fn stores_checkpoints_during_construction(&self) -> bool {
-        self.during_construction
-            && self.enabled
-            && self.selection == TreeStateCheckpointSelection::EveryBlock
+    pub fn construction_selection(&self) -> Option<TreeStateCheckpointSelection> {
+        (self.during_construction && self.enabled).then_some(self.selection)
     }
 }
 

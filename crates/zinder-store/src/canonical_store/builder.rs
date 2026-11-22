@@ -8,6 +8,7 @@ use crate::{
 
 use super::{
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    TreeStateCheckpointSelection,
     activation_schedule::admits_activation_table,
     block_load::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
@@ -156,11 +157,20 @@ impl RocksDbCanonicalBuilder {
 
     /// Requires and stores a tree-state checkpoint for every loaded block
     /// instead of only on the global cadence and at the build tip.
-    pub fn with_every_block_tree_state_checkpoints(mut self) -> Result<Self, CanonicalStoreError> {
+    pub fn with_every_block_tree_state_checkpoints(self) -> Result<Self, CanonicalStoreError> {
+        self.with_tree_state_checkpoint_selection(TreeStateCheckpointSelection::EveryBlock)
+    }
+
+    /// Requires the selected checkpoints in addition to the global cadence
+    /// and build tip. Set this before passing any blocks to the loader.
+    pub fn with_tree_state_checkpoint_selection(
+        mut self,
+        selection: TreeStateCheckpointSelection,
+    ) -> Result<Self, CanonicalStoreError> {
         if self.canonical_block_evidence.is_some() {
             return Err(CanonicalStoreError::BlockLoadAlreadyLoaded);
         }
-        self.tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::EveryBlock;
+        self.tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::Selected(selection);
         Ok(self)
     }
 
@@ -170,8 +180,14 @@ impl RocksDbCanonicalBuilder {
     pub const fn stores_every_block_tree_state_checkpoints(&self) -> bool {
         matches!(
             self.tree_state_checkpoint_coverage,
-            TreeStateCheckpointCoverage::EveryBlock
+            TreeStateCheckpointCoverage::Selected(TreeStateCheckpointSelection::EveryBlock)
         )
+    }
+
+    /// Returns the optional selection applied beyond the cadence and build tip.
+    #[must_use]
+    pub const fn tree_state_checkpoint_selection(&self) -> Option<TreeStateCheckpointSelection> {
+        self.tree_state_checkpoint_coverage.selection()
     }
 
     /// Bulk-loads every source-derived canonical block family.
