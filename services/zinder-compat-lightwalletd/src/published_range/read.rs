@@ -22,6 +22,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct PublishedRangeRead {
     history: Arc<PublishedShieldedCatalog>,
+    limits: crate::block_range::BlockRangeStreamLimit,
     shape: CompactBlockShape,
     is_descending: bool,
 }
@@ -74,9 +75,11 @@ impl PublishedRangeRead {
         history: Arc<PublishedShieldedCatalog>,
         shape: CompactBlockShape,
         is_descending: bool,
+        limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
         Self {
             history,
+            limits,
             shape,
             is_descending,
         }
@@ -201,6 +204,10 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Block = ReadBlock;
     type Message = Bytes;
 
+    fn published_read_limit(&self) -> Option<&crate::block_range::BlockRangeStreamLimit> {
+        Some(&self.limits)
+    }
+
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {
         if self.is_descending {
             blocks.reverse();
@@ -226,6 +233,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         Output: Send + 'static,
         Convert: FnOnce(ChainEpoch, Vec<ReadBlock>) -> Output + Send + 'static,
     {
+        read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
             return native_chunk(reads, read, convert).await;
         }

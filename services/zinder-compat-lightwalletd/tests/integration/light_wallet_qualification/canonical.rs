@@ -562,6 +562,21 @@ async fn dependency_probe_reports_a_missing_broadcast_capability_and_a_divergent
 }
 
 #[tokio::test]
+async fn checkpointed_tree_state_rejects_genesis_but_preserves_height_lookups() -> Result<()> {
+    use super::super::lightwalletd_grpc::{
+        assert_checkpointed_tree_state_selectors, checkpointed_tree_state_store,
+    };
+
+    let fixture = Fixture::new([])?;
+    let mut store = checkpointed_tree_state_store()?;
+    let reader = super::RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    drop(fixture.slot.publish(Arc::new(reader)));
+    assert_checkpointed_tree_state_selectors(&fixture.adapter).await?;
+    assert!(fixture.node.requests()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn stored_replayed_and_latest_tree_states_return_the_canonical_frontiers() -> Result<()> {
     let activations = sample_regtest_upgrade_activations();
     let chain = with_note_commitments(

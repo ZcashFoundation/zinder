@@ -485,7 +485,12 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
         .open(segment)?
         .set_len(0)?;
 
-    let range = PublishedRangeRead::new(catalog, CompactBlockShape::for_range(&[])?, true);
+    let range = PublishedRangeRead::new(
+        catalog,
+        CompactBlockShape::for_range(&[])?,
+        true,
+        crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+    );
     let slot = CanonicalReaderSlot::new(Arc::new(source));
     let read = |first, last, max_bytes| {
         range.read(

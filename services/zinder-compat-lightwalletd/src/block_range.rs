@@ -303,13 +303,35 @@ impl BlockRangeStage {
 /// the limit has slots, so a request that finds the queue full fails at once.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockRangeStreamLimit {
+    published_reads: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     waiters: Arc<AtomicUsize>,
     max_streams: NonZeroU32,
     max_wait: Duration,
 }
 
+const PUBLISHED_READERS: usize = 16;
+
 impl BlockRangeStreamLimit {
+    pub(crate) fn published_chunk_budget(&self, offered: usize) -> usize {
+        let capacity = (self.max_streams.get() as usize).min(Semaphore::MAX_PERMITS);
+        let active = capacity.saturating_sub(self.slots.available_permits());
+        offered
+            .min((PUBLISHED_READERS * BLOCK_RANGE_CHUNK_MAX_BYTES) / active.max(PUBLISHED_READERS))
+    }
+
+    pub(crate) fn try_published_read_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.published_reads.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn published_read_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.published_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("published range reader closed"))
+    }
+
     /// Creates a limit that admits at most `max_streams` streams at once and
     /// lets a request wait [`DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`] for a slot.
     #[must_use]
@@ -321,6 +343,7 @@ impl BlockRangeStreamLimit {
         // zero would discard the slots that other limits in the process hold.
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         Self {
+            published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
             waiters: Arc::new(AtomicUsize::new(0)),
             max_streams,
@@ -631,6 +654,10 @@ impl<Message> BlockRangeSink<Message> {
     pub(crate) async fn room_for_chunk(&self) -> Option<ChunkRoom<'_, Message>> {
         let permit = self.next_chunk.reserve().await.ok()?;
         Some(ChunkRoom { permit })
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.next_chunk.closed().await;
     }
 
     /// Returns whether the client has dropped the response, so a reader
