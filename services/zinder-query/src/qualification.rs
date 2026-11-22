@@ -13,7 +13,8 @@ use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
     tree_state_replay_limit::{
-        ReadyState, ReplayKey, Selection, TreeStateReplayLimit, read_missing_height,
+        ReaderGeneration, ReadyState, ReplayKey, Selection, TreeStateReplayLimit,
+        read_missing_height,
     },
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
@@ -82,31 +83,55 @@ impl QualificationWalletQuery {
             .await
     }
 
+    fn live_generation(
+        &self,
+        reader: &Arc<RocksDbCanonicalReader>,
+    ) -> (std::sync::Weak<RocksDbCanonicalReader>, ReaderGeneration) {
+        let generation = Arc::downgrade(reader);
+        let capture = Arc::clone(&self.capture);
+        let weak_for_check = generation.clone();
+        let cache_generation = ReaderGeneration::live(&generation, move || {
+            std::sync::Weak::ptr_eq(&weak_for_check, &Arc::downgrade(&capture()))
+        });
+        (generation, cache_generation)
+    }
+
+    fn cached_on_current_reader(
+        &self,
+        key: &ReplayKey,
+        reader: &Arc<RocksDbCanonicalReader>,
+    ) -> Option<ReadyState> {
+        self.replays
+            .cached_for_reader(key, reader)
+            .filter(|_| Arc::ptr_eq(reader, &(self.capture)()))
+    }
+
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
     pub async fn tree_state(
         &self,
         mut reader: Arc<RocksDbCanonicalReader>,
         height: Option<BlockHeight>,
     ) -> Result<TreeState, QueryError> {
-        let epoch = reader.chain_epoch();
         let Some(height) = height else {
-            let checkpoint = reader
-                .tree_state_checkpoint_at_or_before(epoch.visible_tip_height)
-                .await
-                .map_err(QueryError::canonical_read)?
-                .ok_or(QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::TreeState,
-                    key: ArtifactKey::BlockHeight(epoch.visible_tip_height),
-                })?;
-            return Ok(tree_state_response(epoch, checkpoint));
+            return latest_checkpoint(reader.as_ref()).await;
         };
         let mut deadline = None;
         let mut carried = None;
         loop {
+            let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
-            let generation = Arc::downgrade(&reader);
-            let (selected, expected) = match self.replays.ready_state(key, reader.as_ref()).await? {
+            if let Some(ready) = self.cached_on_current_reader(&key, &reader) {
+                return Ok(tree_state_response(epoch, ready.serve()));
+            }
+            let (generation, cache_generation) = self.live_generation(&reader);
+            let ready = {
+                let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
+                self.replays
+                    .ready_state(&key, &cache_generation, &canonical_reader, request_deadline)
+                    .await?
+            };
+            let (selected, expected) = match ready {
                 Some(ready @ ReadyState::Stored(_)) => {
                     return Ok(tree_state_response(epoch, ready.serve()));
                 }
@@ -121,9 +146,9 @@ impl QualificationWalletQuery {
                         .map_err(QueryError::canonical_read)?
                         .ok_or(QueryError::BlockNotInBestChain)?;
                     let selected = self.replays.select(
-                        key,
-                        &generation,
-                        *deadline.get_or_insert_with(|| self.replays.deadline()),
+                        &key,
+                        &cache_generation,
+                        request_deadline,
                         carried.take(),
                     )?;
                     (selected, BlockId::new(height, block.block_hash))
@@ -183,6 +208,19 @@ impl QualificationWalletQuery {
         }
         canonical_subtree_roots(reader.as_ref(), epoch, range).await
     }
+}
+
+async fn latest_checkpoint(reader: &RocksDbCanonicalReader) -> Result<TreeState, QueryError> {
+    let epoch = reader.chain_epoch();
+    let checkpoint = reader
+        .tree_state_checkpoint_at_or_before(epoch.visible_tip_height)
+        .await
+        .map_err(QueryError::canonical_read)?
+        .ok_or(QueryError::ArtifactUnavailable {
+            family: ArtifactFamily::TreeState,
+            key: ArtifactKey::BlockHeight(epoch.visible_tip_height),
+        })?;
+    Ok(tree_state_response(epoch, checkpoint))
 }
 
 async fn retains_block(

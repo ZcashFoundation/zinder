@@ -1905,6 +1905,10 @@ impl CanonicalReader for InstrumentedCanonicalReader {
         self.canonical_reader.history_bounds()
     }
 
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        self.canonical_reader.history_predecessor_digest()
+    }
+
     async fn block_header_at(
         &self,
         height: BlockHeight,

@@ -50,8 +50,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, Selection, TreeStateReplayLimit,
-        read_missing_height,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, ReaderGeneration, ReplayKey, Selection,
+        TreeStateReplayLimit, read_missing_height,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1284,25 +1284,46 @@ where
             let mut deadline = None;
             let mut carried = None;
             loop {
-                let (epoch, key, generation, ready) =
-                    serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
-                        let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                        let key = ReplayKey::new(height, pair.canonical());
-                        let ready = self
-                            .tree_state_replays
-                            .ready_state(key, pair.canonical())
-                            .await?;
-                        Ok((epoch, key, Arc::downgrade(&pair), ready))
-                    })
-                    .await?;
-                if let Some(state) = ready {
-                    return Ok(tree_state_response(epoch, state.serve()));
-                }
-                let deadline = *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
+                let request_deadline =
+                    *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
+                let selected = serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
+                    let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                    let key = ReplayKey::new(height, pair.canonical());
+                    if let Some(ready) = self.tree_state_replays.cached_for_reader(&key, &pair) {
+                        return Ok(ControlFlow::Break((epoch, ready)));
+                    }
+                    let generation = Arc::downgrade(&pair);
+                    let slot = self.serving_pair_slot.clone();
+                    let weak_for_check = generation.clone();
+                    let cache_generation = ReaderGeneration::live(&generation, move || {
+                        slot.is_current_weak(&weak_for_check)
+                    });
+                    let reader = pair.canonical_arc();
+                    if let Some(ready) = self
+                        .tree_state_replays
+                        .ready_state(&key, &cache_generation, &reader, request_deadline)
+                        .await?
+                    {
+                        return Ok(ControlFlow::Break((epoch, ready)));
+                    }
+                    Ok(ControlFlow::Continue((
+                        epoch,
+                        key,
+                        generation,
+                        cache_generation,
+                    )))
+                })
+                .await?;
+                let (epoch, key, generation, cache_generation) = match selected {
+                    ControlFlow::Break((epoch, ready)) => {
+                        return Ok(tree_state_response(epoch, ready.serve()));
+                    }
+                    ControlFlow::Continue(missing) => missing,
+                };
                 let subscription = match self.tree_state_replays.select(
-                    key,
-                    &generation,
-                    deadline,
+                    &key,
+                    &cache_generation,
+                    request_deadline,
                     carried.take(),
                 )? {
                     Selection::Ready(state) => {
@@ -1984,7 +2005,8 @@ mod tree_state_replay_limit_tests {
 
     use zinder_core::{BlockHeight, Network};
     use zinder_testkit::{
-        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
     };
 
     use crate::{
@@ -2345,6 +2367,69 @@ mod tree_state_replay_limit_tests {
                 "missing {expected}:\n{rendered}"
             );
         }
+        Ok(())
+    }
+
+    fn build_serving_pair(
+        chain: &ChainFixture,
+        through: u32,
+        settled: u32,
+    ) -> Result<(WalletServingStoreFixture, Arc<WalletServingReadPair>), Box<dyn Error>> {
+        let baseline = CanonicalBaseline::new(chain)
+            .through(BlockHeight::new(through))
+            .with_settled_tip(BlockHeight::new(settled));
+        let mut store =
+            CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+                .into_serving_store_fixture()?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        Ok((store, pair))
+    }
+
+    #[tokio::test]
+    async fn settled_cache_survives_tip_advances_and_resets_on_fork() -> Result<(), Box<dyn Error>>
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+        let fork_chain = chain.fork_at(BlockHeight::new(2))?.extend_blocks(4);
+        let (_s1, initial) = build_serving_pair(&chain, 3, 2)?;
+        let (_s2, appended) = build_serving_pair(&chain, 4, 2)?;
+        let (_s3, settled_extended) = build_serving_pair(&chain, 5, 4)?;
+        let (_s4, settled_fork) = build_serving_pair(&fork_chain, 5, 4)?;
+
+        let slot = WalletServingPairSlot::new(initial);
+        let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+        let height = BlockHeight::new(2);
+
+        let first = query.tree_state_at(height, None).await?;
+        slot.publish_for_test(appended);
+        let second = query.tree_state_at(height, None).await?;
+        slot.publish_for_test(settled_extended);
+        let third = query.tree_state_at(height, None).await?;
+        assert_eq!(second.frontiers, first.frontiers);
+        assert_eq!(third.frontiers, first.frontiers);
+
+        slot.publish_for_test(settled_fork);
+        let rebuilt = query.tree_state_at(height, None).await?;
+        assert_ne!(rebuilt.block_hash, first.block_hash);
+
+        let report = rendered.render();
+        assert!(
+            report.lines().any(|line| line
+                == "zinder_query_tree_state_reads_total{source=\"cached\",height_band=\"0\"} 2"),
+            "expected two cached hits across visible and settled tip advances:\n{report}"
+        );
+        assert!(
+            report.lines().any(|line| line
+                == "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 2"),
+            "expected initial replay plus one post-fork rebuild:\n{report}"
+        );
         Ok(())
     }
 }
