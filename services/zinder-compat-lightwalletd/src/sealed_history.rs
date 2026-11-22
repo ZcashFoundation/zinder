@@ -372,20 +372,48 @@ impl SealedHistory {
         let len = relative_frame_offset(last, first_frame)?
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
-        let mut raw = vec![0; len];
-        read_exact_at(&self.file, &mut raw, first_frame)?;
+        let mut out = Vec::with_capacity(selected.len());
         if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
-            let packed = Bytes::from(raw);
-            return selected
-                .iter()
-                .map(|row| {
-                    let start = verified_row_start(row, &packed, first_frame)?;
-                    let payload = packed.slice(start..start + row.len);
-                    verify_and_build_block(row, payload, self.kernel_verified)
-                })
-                .collect();
+            let mut slab = vec![0; len];
+            read_exact_at(&self.file, &mut slab, first_frame)?;
+            self.append_slab(&mut out, selected, slab)?;
+        } else {
+            let mut slabs = Vec::new();
+            let mut start = 0;
+            let mut bytes = 0;
+            for (index, row) in selected.iter().enumerate() {
+                let frame_len = LENGTHS_LEN + row.len;
+                if bytes != 0 && bytes + frame_len > SLAB_TARGET_BYTES {
+                    slabs.push((&selected[start..index], vec![0; bytes]));
+                    start = index;
+                    bytes = 0;
+                }
+                bytes += frame_len;
+            }
+            slabs.push((&selected[start..], vec![0; bytes]));
+            let buffers = slabs.iter_mut().map(|(_, slab)| slab.as_mut_slice());
+            read_slabs_at(&self.file, buffers, first_frame)?;
+            for (rows, slab) in slabs {
+                self.append_slab(&mut out, rows, slab)?;
+            }
         }
-        pack_payload_slabs(selected, &raw, first_frame, self.kernel_verified)
+        Ok(out)
+    }
+
+    fn append_slab(
+        &self,
+        out: &mut Vec<SealedBlock>,
+        rows: &[IndexedBlock],
+        slab: Vec<u8>,
+    ) -> io::Result<()> {
+        let packed = Bytes::from(slab);
+        let first_frame = rows[0].offset - LENGTHS_LEN as u64;
+        for row in rows {
+            let start = verified_row_start(row, &packed, first_frame)?;
+            let payload = packed.slice(start..start + row.len);
+            out.push(verify_and_build_block(row, payload, self.kernel_verified)?);
+        }
+        Ok(())
     }
 }
 
@@ -422,40 +450,41 @@ fn verify_and_build_block(
     })
 }
 
-fn pack_payload_slabs(
-    selected: &[IndexedBlock],
-    raw: &[u8],
-    first_frame: u64,
-    kernel_verified: bool,
-) -> io::Result<Vec<SealedBlock>> {
-    let mut out = Vec::with_capacity(selected.len());
-    let mut group_start = 0_usize;
-    while group_start < selected.len() {
-        let mut group_end = group_start;
-        let mut slab_bytes = 0_usize;
-        while let Some(row) = selected.get(group_end) {
-            if group_end > group_start && slab_bytes.saturating_add(row.len) > SLAB_TARGET_BYTES {
-                break;
-            }
-            let _ = verified_row_start(row, raw, first_frame)?;
-            slab_bytes = slab_bytes.saturating_add(row.len);
-            group_end += 1;
+#[cfg(target_os = "linux")]
+fn read_slabs_at<'a>(
+    file: &File,
+    buffers: impl Iterator<Item = &'a mut [u8]>,
+    mut offset: u64,
+) -> io::Result<()> {
+    use std::io::IoSliceMut;
+
+    use rustix::io::{preadv, retry_on_intr};
+
+    let mut buffers: Vec<_> = buffers.map(IoSliceMut::new).collect();
+    let mut remaining = buffers.as_mut_slice();
+    while !remaining.is_empty() {
+        // rustix caps each preadv at the platform iovec limit.
+        let count = retry_on_intr(|| preadv(file, remaining, offset))?;
+        if count == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        let mut slab_buf = Vec::with_capacity(slab_bytes);
-        for row in &selected[group_start..group_end] {
-            let start = relative_frame_offset(row, first_frame)?;
-            slab_buf.extend_from_slice(&raw[start..start + row.len]);
-        }
-        let slab = Bytes::from(slab_buf);
-        let mut cursor = 0_usize;
-        for row in &selected[group_start..group_end] {
-            let payload = slab.slice(cursor..cursor + row.len);
-            cursor += row.len;
-            out.push(verify_and_build_block(row, payload, kernel_verified)?);
-        }
-        group_start = group_end;
+        IoSliceMut::advance_slices(&mut remaining, count);
+        offset += count as u64;
     }
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_slabs_at<'a>(
+    file: &File,
+    buffers: impl Iterator<Item = &'a mut [u8]>,
+    mut offset: u64,
+) -> io::Result<()> {
+    for buffer in buffers {
+        read_exact_at(file, buffer, offset)?;
+        offset += buffer.len() as u64;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
