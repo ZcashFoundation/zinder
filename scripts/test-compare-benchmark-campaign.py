@@ -2,6 +2,7 @@
 """Exercise the paired benchmark comparison through its CLI on synthetic campaign evidence."""
 
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -34,6 +35,11 @@ class CompareTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
 
+    def refresh_hash(self, summary, repetition, arm):
+        run = summary[repetition - 1]["runs"][arm]
+        report = self.evidence / run["path"] / "report.json"
+        run["report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+
     def build(self, cases, repeats=4):
         """cases: {name: [(before, after), ...]} one tuple per repetition."""
         self.write(self.evidence / "provenance.json", {
@@ -47,8 +53,10 @@ class CompareTests(unittest.TestCase):
                 runs = {}
                 for arm, value in zip(ARMS, values):
                     path = f"{name}/round-{repetition}/{arm}"
-                    self.write(self.evidence / path / "report.json", {"ms": value})
-                    runs[arm] = {"path": path, "problems": [], "matched_fields": {}}
+                    report_path = self.evidence / path / "report.json"
+                    self.write(report_path, {"ms": value})
+                    runs[arm] = {"path": path, "problems": [], "matched_fields": {},
+                                 "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
                 summary.append({"case": name, "repetition": repetition, "order": order(repetition),
                                 "runs": runs, "mismatched_fields": []})
         self.write(self.evidence / "summary.json", summary)
@@ -81,6 +89,20 @@ class CompareTests(unittest.TestCase):
         self.build({"range": [(100, 120)] * 4})
         self.policy["metrics"][0]["direction"] = "higher_is_better"
         self.assertEqual(self.compare(0)["verdict"], "improvement")
+
+    def test_median_relative_delta_uses_paired_percentages(self):
+        self.build({"range": [(10, 11), (100, 110), (1000, 1000), (10000, 10000)]})
+        self.policy["metrics"][0]["tolerance_relative"] = 0.03
+        report = self.compare(1)
+        self.assertEqual(report["metrics"][0]["verdict"], "regression")
+        self.assertAlmostEqual(report["metrics"][0]["median_relative_delta"], 0.05)
+
+    def test_mixed_baseline_scales_cannot_flip_combined_threshold_direction(self):
+        self.build({"range": [(10_000_000, 10_001_000), (10_000_000, 10_001_000),
+                               (10, 8), (10, 8)]})
+        self.policy["metrics"][0]["tolerance_absolute"] = 100
+        report = self.compare(0)
+        self.assertEqual(report["metrics"][0]["verdict"], "no_clear_change")
 
     def test_changes_inside_tolerance_are_not_clear(self):
         self.build({"range": [(100, 103), (100, 97), (100, 104), (100, 101)]})
@@ -135,6 +157,65 @@ class CompareTests(unittest.TestCase):
         self.write(self.evidence / "summary.json", summary)
         self.assertIn("unexpected_order", self.issue_kinds(self.compare(4)))
 
+    def test_changed_raw_report_is_invalid(self):
+        self.build({"range": [(100, 120)] * 4})
+        self.write(self.evidence / "range/round-1/after/report.json", {"ms": 1})
+        report = self.compare(4)
+        self.assertIn("report does not match its recorded digest",
+                      {issue.get("reason") for issue in report["issues"]})
+
+    def test_raw_pair_identity_is_checked_even_when_summary_agrees(self):
+        summary = self.build({"range": [(100, 120)] * 4})
+        provenance = json.loads((self.evidence / "provenance.json").read_text())
+        provenance["campaign"]["cases"]["range"] = {"match": ["/chain"], "expect": {"/chain": "same"}}
+        self.write(self.evidence / "provenance.json", provenance)
+        for pair in summary:
+            for arm in ARMS:
+                run = pair["runs"][arm]
+                path = self.evidence / run["path"] / "report.json"
+                report = json.loads(path.read_text())
+                report["chain"] = "same" if arm == "before" else "different"
+                self.write(path, report)
+                run["matched_fields"] = {"/chain": "same"}
+                self.refresh_hash(summary, pair["repetition"], arm)
+        self.write(self.evidence / "summary.json", summary)
+        report = self.compare(4)
+        self.assertIn("raw_pair_mismatch", self.issue_kinds(report))
+        self.assertIn("report_expectation_mismatch", self.issue_kinds(report))
+        self.assertIn("report_summary_mismatch", self.issue_kinds(report))
+
+    def test_legacy_report_without_digest_is_unverifiable(self):
+        summary = self.build({"range": [(100, 120)] * 4})
+        del summary[0]["runs"]["before"]["report_sha256"]
+        self.write(self.evidence / "summary.json", summary)
+        report = self.compare(4)
+        self.assertTrue(any("older evidence is unverifiable" in issue.get("reason", "")
+                            for issue in report["issues"]))
+
+    def test_copied_run_path_is_invalid(self):
+        summary = self.build({"range": [(100, 120)] * 4})
+        summary[1]["runs"]["after"]["path"] = "range/round-1/before"
+        self.write(self.evidence / "summary.json", summary)
+        report = self.compare(4)
+        self.assertIn("invalid_report", self.issue_kinds(report))
+
+    def test_malformed_evidence_is_reported_as_invalid_json(self):
+        self.build({"range": [(100, 100)] * 4})
+        (self.evidence / "provenance.json").unlink()
+        report = self.compare(4)
+        self.assertIn("invalid_evidence", self.issue_kinds(report))
+
+    def test_alternating_order_is_shared_with_runner(self):
+        self.build({"range": [(100, 100)] * 4})
+        provenance = json.loads((self.evidence / "provenance.json").read_text())
+        provenance["campaign"]["order"] = "alternating"
+        self.write(self.evidence / "provenance.json", provenance)
+        summary = json.loads((self.evidence / "summary.json").read_text())
+        for pair in summary:
+            pair["order"] = ARMS if pair["repetition"] % 2 else ARMS[::-1]
+        self.write(self.evidence / "summary.json", summary)
+        self.assertEqual(self.compare(0)["verdict"], "no_clear_change")
+
     def test_missing_invalid_and_zero_metrics_are_invalid(self):
         self.build({"range": [(100, 100)] * 4})
         self.write(self.evidence / "range/round-1/after/report.json", {})
@@ -142,14 +223,26 @@ class CompareTests(unittest.TestCase):
         self.write(self.evidence / "range/round-3/before/report.json", {"ms": 0})
         self.write(self.evidence / "range/round-4/after/report.json", {"ms": True})
         report = self.compare(4)
-        reasons = {issue["reason"] for issue in report["issues"] if issue["kind"] == "invalid_metric"}
-        self.assertEqual(reasons, {"metric missing", "metric is not a finite number", "metric is zero"})
+        reasons = {issue["reason"] for issue in report["issues"] if issue["kind"] == "invalid_report"}
+        self.assertEqual(reasons, {"report does not match its recorded digest"})
 
     def test_zero_allowed_when_metric_opts_in(self):
         self.build({"range": [(0, 0)] * 4})
         self.policy["metrics"][0] = {"name": "errors", "pointer": "/ms", "direction": "lower_is_better",
                                      "tolerance_absolute": 0, "allow_zero": True}
         self.assertEqual(self.compare(0)["verdict"], "no_clear_change")
+
+    def test_zero_baseline_relative_only_is_invalid(self):
+        self.build({"range": [(0, 1)] * 4})
+        self.policy["metrics"][0]["allow_zero"] = True
+        report = self.compare(4)
+        self.assertIn("undefined_relative_baseline", self.issue_kinds(report))
+
+    def test_zero_baseline_uses_absolute_tolerance(self):
+        self.build({"range": [(0, 2)] * 4})
+        self.policy["metrics"][0] = {"name": "errors", "pointer": "/ms", "direction": "lower_is_better",
+                                      "tolerance_absolute": 1, "allow_zero": True}
+        self.assertEqual(self.compare(1)["verdict"], "regression")
 
     def test_policy_errors_are_usage_errors(self):
         self.build({"range": [(100, 100)] * 4})
@@ -175,9 +268,10 @@ class CompareTests(unittest.TestCase):
         self.compare(2, ["--output", str(target)])
 
     def test_reads_evidence_written_by_the_runner(self):
-        script = ("import json, sys; print(json.dumps({'ms': 100 if sys.argv[1] == 'before' else 130}))")
+        script = ("import json, sys; print(json.dumps({'ms': 100 if sys.argv[1] == 'before' else 130, 'verified': True}))")
         campaign = {"arms": {"before": {"name": "before"}, "after": {"name": "after"}},
-                    "cases": {"range": {"command": [sys.executable, "-c", script, "{name}"]}}}
+                    "cases": {"range": {"command": [sys.executable, "-c", script, "{name}"],
+                                        "expect": {"/verified": True}}}}
         self.write(self.root / "campaign.json", campaign)
         runner = COMPARE.with_name("run-benchmark-campaign.py")
         subprocess.run([sys.executable, str(runner), str(self.root / "campaign.json"), "--output", str(self.evidence)],

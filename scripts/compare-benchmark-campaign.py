@@ -11,8 +11,10 @@ Exit status: 0 improvement or no clear change, 1 regression, 2 usage error,
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import io
 import math
 from pathlib import Path
 import statistics
@@ -79,10 +81,6 @@ def read_policy(path):
     return baseline, candidate, metrics, min_pairs
 
 
-def expected_order(arms, repetition):
-    return arms if repetition % 4 in (0, 1) else arms[::-1]
-
-
 def check_structure(evidence, campaign, summary, baseline, candidate, min_pairs, issues):
     """Validate the matched design; returns {(case, repetition): pair} for usable pairs."""
     arms = list(campaign["arms"])
@@ -122,7 +120,7 @@ def check_structure(evidence, campaign, summary, baseline, candidate, min_pairs,
             if not isinstance(runs, dict) or set(runs) != {baseline, candidate}:
                 issues.append({"kind": "unequal_arms", **where, "arms": sorted(runs) if isinstance(runs, dict) else None})
                 continue
-            if pair.get("order") != expected_order(arms, repetition):
+            if pair.get("order") != runner.trial_order(arms, repetition, campaign.get("order", "balanced")):
                 issues.append({"kind": "unexpected_order", **where, "order": pair.get("order")})
                 continue
             bad = False
@@ -141,17 +139,40 @@ def check_structure(evidence, campaign, summary, baseline, candidate, min_pairs,
     return usable
 
 
-def read_metric(evidence, run, pointer, allow_zero):
-    """Return (value, reason); reason is set when the observation is unusable."""
-    path = (evidence / run["path"]).resolve()
-    if evidence.resolve() not in path.parents:
-        return None, "run path escapes the evidence directory"
+def read_report(evidence, run, case, repetition, arm, pointers):
+    """Read one raw report and retain only its requested pointer values."""
     try:
-        value = runner.at_pointer(runner.read_json(path / "report.json"), pointer)
+        relative = Path(run["path"])
+        expected = Path(case) / f"round-{repetition}" / arm
+        if relative.is_absolute() or relative != expected:
+            return None, "run path does not match its case, repetition, and arm"
+        path = evidence / relative
+        resolved = (path / "report.json").resolve(strict=True)
+        if evidence.resolve() not in resolved.parents:
+            return None, "run path escapes the evidence directory or is not a report"
+        expected_hash = run.get("report_sha256")
+        if not isinstance(expected_hash, str):
+            return None, "report digest missing; older evidence is unverifiable"
+        raw = resolved.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_hash:
+            return None, "report does not match its recorded digest"
+        document = json.load(io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"),
+                             parse_float=runner.finite_float, parse_constant=runner.finite_float)
+        extracted = {}
+        for pointer in pointers:
+            try:
+                extracted[pointer] = runner.at_pointer(document, pointer)
+            except (IndexError, KeyError, TypeError):
+                extracted[pointer] = None
+        return extracted, None
+    except (KeyError, TypeError):
+        return None, "run path missing or malformed"
     except (OSError, ValueError):
         return None, "report unreadable"
-    except (IndexError, KeyError):
-        return None, "metric missing"
+
+
+def read_metric(value, allow_zero):
+    """Return (value, reason); reason is set when the observation is unusable."""
     if not is_number(value):
         return None, "metric is not a finite number"
     if value < 0 or (value == 0 and not allow_zero):
@@ -165,7 +186,8 @@ def meaningful(delta, baseline, metric):
     relative = metric.get("tolerance_relative")
     if absolute is not None and not abs(delta) > absolute:
         return False
-    return relative is None or abs(delta) > relative * baseline
+    return (relative is None or baseline == 0 and absolute is not None or
+            baseline > 0 and abs(delta / baseline) > relative)
 
 
 def classify_pair(delta, baseline, metric):
@@ -174,7 +196,7 @@ def classify_pair(delta, baseline, metric):
     return "worse" if delta * DIRECTIONS[metric["direction"]] > 0 else "better"
 
 
-def assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues):
+def assess_metric(case, metric, usable, records, repeats, min_pairs, issues):
     name = metric["name"]
     where = {"case": case, "metric": name}
     pairs = []
@@ -184,7 +206,11 @@ def assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues):
             continue
         values = {}
         for role, arm in (("baseline", metric["_baseline"]), ("candidate", metric["_candidate"])):
-            value, reason = read_metric(evidence, pair["runs"][arm], metric["pointer"], metric.get("allow_zero", False))
+            record = records.get((case, repetition, arm))
+            if record is None:
+                values[role] = None
+                continue
+            value, reason = read_metric(record.get(metric["pointer"]), metric.get("allow_zero", False))
             if reason:
                 issues.append({"kind": "invalid_metric", **where, "repetition": repetition, "arm": arm, "reason": reason})
             values[role] = value
@@ -207,6 +233,16 @@ def assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues):
     for key in ("tolerance_absolute", "tolerance_relative"):
         if key in metric:
             assessed[key] = metric[key]
+    zero_baselines = {entry["baseline"] == 0 for entry in pairs}
+    if len(zero_baselines) > 1:
+        issues.append({"kind": "inconsistent_zero_baselines", **where})
+        assessed["verdict"] = "invalid"
+        return assessed
+    all_zero = zero_baselines == {True}
+    if all_zero and "tolerance_relative" in metric and "tolerance_absolute" not in metric:
+        issues.append({"kind": "undefined_relative_baseline", **where})
+        assessed["verdict"] = "invalid"
+        return assessed
     if len(pairs) < repeats or len(pairs) < min_pairs:
         issues.append({"kind": "incomplete_metric", **where, "observed_pairs": len(pairs), "planned_pairs": repeats})
         assessed["verdict"] = "invalid"
@@ -216,12 +252,20 @@ def assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues):
     median_delta = statistics.median(entry["delta"] for entry in pairs)
     assessed["median_baseline"] = median_baseline
     assessed["median_delta"] = median_delta
-    if median_baseline > 0:
-        assessed["median_relative_delta"] = median_delta / median_baseline
+    relative_deltas = [entry["relative_delta"] for entry in pairs if "relative_delta" in entry]
+    median_relative_delta = statistics.median(relative_deltas) if relative_deltas else None
+    assessed["median_relative_delta"] = median_relative_delta
     worse = sum(entry["outcome"] == "worse" for entry in pairs)
     better = sum(entry["outcome"] == "better" for entry in pairs)
     assessed["pairs_worse"], assessed["pairs_better"] = worse, better
-    median_outcome = classify_pair(median_delta, median_baseline, metric)
+    significant = ("tolerance_absolute" not in metric or abs(median_delta) > metric["tolerance_absolute"])
+    if "tolerance_relative" in metric and not all_zero:
+        significant = significant and abs(median_relative_delta) > metric["tolerance_relative"]
+    median_effect = median_delta if all_zero else median_relative_delta
+    if not all_zero and median_delta * median_relative_delta < 0:
+        significant = False
+    median_outcome = ("neutral" if not significant else
+                      "worse" if median_effect * DIRECTIONS[metric["direction"]] > 0 else "better")
     if worse and better:
         verdict = "mixed"
     elif worse and median_outcome == "worse":
@@ -232,6 +276,44 @@ def assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues):
         verdict = "no_clear_change"
     assessed["verdict"] = verdict
     return assessed
+
+
+def prepare_records(evidence, campaign, metrics, usable, shared_expectations, issues):
+    """Verify each raw report once and retain only metric and identity fields."""
+    records = {}
+    metric_pointers = {}
+    for metric in metrics:
+        for case in metric.get("cases") or campaign["cases"]:
+            metric_pointers.setdefault(case, set()).add(metric["pointer"])
+    for (case, repetition), pair in usable.items():
+        case_config = campaign["cases"][case]
+        expectations = {**shared_expectations, **case_config.get("expect", {})}
+        identity_pointers = set(case_config.get("match", [])) | expectations.keys()
+        pointers = identity_pointers | metric_pointers.get(case, set())
+        for arm, run in pair["runs"].items():
+            extracted, reason = read_report(evidence, run, case, repetition, arm, pointers)
+            if reason:
+                issues.append({"kind": "invalid_report", "case": case, "repetition": repetition,
+                               "arm": arm, "reason": reason})
+                continue
+            records[case, repetition, arm] = extracted
+            for pointer, expected in expectations.items():
+                if not runner.json_equal(extracted.get(pointer), expected):
+                    issues.append({"kind": "report_expectation_mismatch", "case": case, "repetition": repetition,
+                                   "arm": arm, "pointer": pointer})
+            matched_fields = run.get("matched_fields")
+            for pointer in case_config.get("match", []):
+                cached = matched_fields[pointer] if isinstance(matched_fields, dict) and pointer in matched_fields else object()
+                if not runner.json_equal(extracted.get(pointer), cached):
+                    issues.append({"kind": "report_summary_mismatch", "case": case, "repetition": repetition,
+                                   "arm": arm, "pointer": pointer})
+        if all((case, repetition, arm) in records for arm in pair["runs"]):
+            for pointer in case_config.get("match", []):
+                left, right = (records[case, repetition, arm].get(pointer) for arm in pair["runs"])
+                if not runner.json_equal(left, right):
+                    issues.append({"kind": "raw_pair_mismatch", "case": case, "repetition": repetition,
+                                   "pointer": pointer})
+    return records
 
 
 def overall(verdicts):
@@ -246,8 +328,7 @@ def overall(verdicts):
     return "no_clear_change"
 
 
-def compare(evidence, policy_path):
-    baseline, candidate, metrics, min_pairs = read_policy(policy_path)
+def compare(evidence, baseline, candidate, metrics, min_pairs):
     provenance = runner.read_json(evidence / "provenance.json")
     summary = runner.read_json(evidence / "summary.json")
     campaign = provenance["campaign"]
@@ -255,6 +336,7 @@ def compare(evidence, policy_path):
     cases = list(campaign["cases"])
     issues = []
     usable = check_structure(evidence, campaign, summary, baseline, candidate, min_pairs, issues)
+    shared_expectations = runner.environment_expectations(campaign)
 
     for metric in metrics:
         unknown = set(metric.get("cases") or []) - set(cases)
@@ -262,13 +344,15 @@ def compare(evidence, policy_path):
             raise ValueError(f"{metric['name']}: unknown cases {sorted(unknown)}")
         metric["_baseline"], metric["_candidate"] = baseline, candidate
 
+    records = prepare_records(evidence, campaign, metrics, usable, shared_expectations, issues)
+
     assessments = []
     covered = set()
     for metric in metrics:
         for case in metric.get("cases") or cases:
             covered.add(case)
             if usable or not issues:
-                assessments.append(assess_metric(evidence, case, metric, usable, repeats, min_pairs, issues))
+                assessments.append(assess_metric(case, metric, usable, records, repeats, min_pairs, issues))
     verdicts = [item["verdict"] for item in assessments]
     verdict = "invalid" if issues else overall(verdicts)
     if not assessments:
@@ -314,9 +398,18 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="also write the decision JSON to this new file")
     args = parser.parse_args(argv)
     try:
-        report = compare(args.evidence, args.policy)
+        baseline, candidate, metrics, min_pairs = read_policy(args.policy)
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
         parser.error(str(error))
+    try:
+        report = compare(args.evidence, baseline, candidate, metrics, min_pairs)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
+        report = {"schema": SCHEMA, "verdict": "invalid", "baseline": baseline, "candidate": candidate,
+                  "scope": {"cases_assessed": [], "cases_without_metrics": [], "pairs_per_case": None,
+                            "host": None, "machine": None,
+                            "claim": "Applies only to the cases, arms, inputs, and host recorded in this campaign; "
+                                     "it is not a claim about other hosts, networks, or fleets."},
+                  "issues": [{"kind": "invalid_evidence", "reason": str(error)}], "metrics": []}
     document = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.output:
         try:

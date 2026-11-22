@@ -790,7 +790,9 @@ mod tests {
                 "--clients",
                 "4",
                 "--server-pid",
-                "7"
+                "7",
+                "--server-executable",
+                "reader"
             ])?
             .command,
             Command::RawRangeProbe(_)

@@ -102,8 +102,11 @@ pub(crate) struct RawRangeProbeArgs {
     request_timeout_secs: u64,
     /// Local server process to sample read-only from `/proc` (Linux): CPU time
     /// and resident memory around the timed interval.
-    #[arg(long)]
+    #[arg(long, requires = "server_executable")]
     server_pid: Option<u32>,
+    /// Expected running reader executable for process CPU and memory attribution.
+    #[arg(long, requires = "server_pid", value_name = "FILE")]
+    server_executable: Option<PathBuf>,
     /// The server's Prometheus `/metrics` URL, read around the timed interval
     /// for the `--server-counter` series and `--rocksdb-multiget-counters`.
     #[arg(long, value_name = "URL", requires_all = ["counter_series", "freshness_witness"])]
@@ -169,8 +172,7 @@ impl ProbeOutput {
             return Ok(());
         }
         Err(BenchError::raw_range_probe(format!(
-            "{} request(s) did not match the oracle; first: {}",
-            self.report.totals.failed_requests,
+            "range verification failed: {}",
             self.report
                 .problems
                 .first()
@@ -327,12 +329,12 @@ async fn stream_range(
         end: block(end),
         pool_types: Vec::new(),
     };
-    client
-        .ready()
-        .await
-        .map_err(|error| format!("channel not ready: {error}"))?;
-    let started = Instant::now();
     let stream = async {
+        client
+            .ready()
+            .await
+            .map_err(|error| format!("channel not ready: {error}"))?;
+        let started = Instant::now();
         let mut frames = client
             .server_streaming(
                 tonic::Request::new(request),
@@ -559,6 +561,32 @@ fn write_new_file(path: &std::path::Path, contents: &[u8]) -> Result<(), BenchEr
         .map_err(|source| BenchError::io(path, source))
 }
 
+async fn endpoint_addresses(
+    endpoint: &str,
+    timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, BenchError> {
+    let uri = endpoint
+        .parse::<tonic::codegen::http::Uri>()
+        .map_err(|error| BenchError::invalid_argument(format!("invalid endpoint URI: {error}")))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| BenchError::invalid_argument("endpoint must include a host"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| BenchError::raw_range_probe("endpoint address lookup timed out"))?
+        .map(Iterator::collect)
+        .map_err(|error| BenchError::raw_range_probe(format!("endpoint address lookup: {error}")))
+}
+
 /// The oracle to check against and where it came from.
 async fn load_oracle(
     args: &RawRangeProbeArgs,
@@ -572,7 +600,12 @@ async fn load_oracle(
         return Ok((oracle, format!("file:{}", path.display())));
     }
     let reference = args.oracle_endpoint.as_deref().unwrap_or_default();
-    if reference.trim_end_matches('/') == args.endpoint.trim_end_matches('/') {
+    let reference_addrs = endpoint_addresses(reference, timeout).await?;
+    let measured_addrs = endpoint_addresses(&args.endpoint, timeout).await?;
+    if reference_addrs
+        .iter()
+        .any(|addr| measured_addrs.contains(addr))
+    {
         return Err(BenchError::invalid_argument(
             "--oracle-endpoint must differ from --endpoint, or the server grades itself",
         ));
@@ -629,9 +662,11 @@ async fn read_tip(client: &mut CompactTxStreamerClient<Channel>) -> Result<Tip, 
 }
 
 /// One process's cumulative CPU and resident memory, read from `/proc`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ServerSample {
     cpu_ticks: u64,
+    start_ticks: u64,
+    executable: PathBuf,
     rss_kib: u64,
     hwm_kib: u64,
 }
@@ -643,8 +678,12 @@ fn sample_server(pid: u32) -> Result<ServerSample, String> {
     };
     let stat = read("stat")?;
     let status = read("status")?;
+    let (cpu_ticks, start_ticks) = process_ticks(&stat).ok_or("unreadable /proc stat")?;
     Ok(ServerSample {
-        cpu_ticks: parse_cpu_ticks(&stat).ok_or("unreadable /proc stat")?,
+        cpu_ticks,
+        start_ticks,
+        executable: std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map_err(|error| error.to_string())?,
         rss_kib: parse_status_kib(&status, "VmRSS:").ok_or("no VmRSS in /proc status")?,
         hwm_kib: parse_status_kib(&status, "VmHWM:").ok_or("no VmHWM in /proc status")?,
     })
@@ -652,7 +691,7 @@ fn sample_server(pid: u32) -> Result<ServerSample, String> {
 
 /// User plus system CPU ticks. The command name, field 2, may hold spaces and
 /// parentheses, so the fields are counted after its closing parenthesis.
-fn parse_cpu_ticks(stat: &str) -> Option<u64> {
+fn process_ticks(stat: &str) -> Option<(u64, u64)> {
     let fields = stat
         .rsplit_once(')')?
         .1
@@ -660,7 +699,7 @@ fn parse_cpu_ticks(stat: &str) -> Option<u64> {
         .collect::<Vec<_>>();
     let utime = fields.get(11)?.parse::<u64>().ok()?;
     let stime = fields.get(12)?.parse::<u64>().ok()?;
-    Some(utime.saturating_add(stime))
+    Some((utime.checked_add(stime)?, fields.get(19)?.parse().ok()?))
 }
 
 fn parse_status_kib(status: &str, field: &str) -> Option<u64> {
@@ -676,6 +715,8 @@ fn parse_status_kib(status: &str, field: &str) -> Option<u64> {
 #[derive(Serialize)]
 struct ServerReport {
     pid: u32,
+    start_time_ticks: u64,
+    executable: PathBuf,
     /// CPU time the process used over the timed interval, in whole clock
     /// ticks (`clock_ticks_per_second`), so a short run is coarse.
     cpu_ms: f64,
@@ -690,12 +731,14 @@ struct ServerReport {
     hwm_kib_after: u64,
 }
 
-fn server_report(pid: u32, before: ServerSample, after: ServerSample, mib: f64) -> ServerReport {
+fn server_report(pid: u32, before: ServerSample, after: &ServerSample, mib: f64) -> ServerReport {
     let ticks_per_second = rustix::param::clock_ticks_per_second().max(1);
     let ticks = after.cpu_ticks.saturating_sub(before.cpu_ticks);
     let cpu_ms = as_f64(ticks) * 1000.0 / as_f64(ticks_per_second);
     ServerReport {
         pid,
+        start_time_ticks: before.start_ticks,
+        executable: before.executable,
         cpu_ms,
         cpu_ms_per_mib: (mib > 0.0).then(|| cpu_ms / mib),
         clock_ticks_per_second: ticks_per_second,
@@ -907,10 +950,29 @@ async fn run_timed(
         None => None,
     };
     let server_before = sample_pid(args.server_pid)?;
+    if let (Some(sample), Some(expected)) = (&server_before, &args.server_executable) {
+        let path = expected
+            .canonicalize()
+            .map_err(|error| BenchError::io(expected, error))?;
+        if sample.executable != path {
+            return Err(BenchError::invalid_argument(
+                "server PID is running a different executable",
+            ));
+        }
+    }
     let client_cpu_before = process_cpu_ms();
     let phase = run_phase(channels, jobs, args.repetitions, timeout).await?;
     let client_cpu_ms = process_cpu_ms() - client_cpu_before;
     let server_after = sample_pid(args.server_pid)?;
+    if let (Some(before), Some(after)) = (&server_before, &server_after)
+        && (before.start_ticks != after.start_ticks
+            || before.executable != after.executable
+            || after.cpu_ticks < before.cpu_ticks)
+    {
+        return Err(BenchError::raw_range_probe(
+            "server process changed during the timed period",
+        ));
+    }
     let tip_after = read_tip(chain_client).await?;
     let counters = match (&counters, counters_before) {
         (Some(source), Some(before)) => Some(counters::report(
@@ -1076,7 +1138,7 @@ fn build_report(
         },
         server: match (args.server_pid, server) {
             (Some(pid), Some((before, after))) => {
-                Some(server_report(pid, before, after, payload_mib))
+                Some(server_report(pid, before, &after, payload_mib))
             }
             _ => None,
         },
@@ -1092,8 +1154,8 @@ mod tests {
     use std::error::Error;
 
     use super::{
-        FramedDigest, OracleFile, OracleJob, RawRangeProbeArgs, difference, parse_cpu_ticks,
-        parse_range, parse_status_kib, run_raw_range_probe, sample_server,
+        FramedDigest, OracleFile, OracleJob, RawRangeProbeArgs, difference, parse_range,
+        parse_status_kib, process_ticks, run_raw_range_probe, sample_server,
     };
     use crate::wallet_load::mock_streamer::{MockStreamer, RangeEnding, serve, tip_hash};
 
@@ -1110,6 +1172,7 @@ mod tests {
             warmup_repetitions: 1,
             request_timeout_secs: 10,
             server_pid: None,
+            server_executable: None,
             server_metrics_url: None,
             server_counters: Vec::new(),
             rocksdb_multiget_counters: false,
@@ -1190,7 +1253,7 @@ mod tests {
     #[test]
     fn proc_stat_parsing_survives_a_command_name_with_spaces() {
         let stat = "42 (zinder (compat) x) S 1 42 42 0 -1 4194560 100 0 0 0 7 5 0 0 20 0 9 0 100 1000 200 18446744073709551615";
-        assert_eq!(parse_cpu_ticks(stat), Some(12));
+        assert_eq!(process_ticks(stat), Some((12, 100)));
         assert_eq!(
             parse_status_kib("Name:\tx\nVmHWM:\t  2048 kB\n", "VmHWM:"),
             Some(2048)
@@ -1203,6 +1266,22 @@ mod tests {
     fn samples_this_process() -> Result<(), Box<dyn Error>> {
         let sample = sample_server(std::process::id())?;
         assert!(sample.hwm_kib >= sample.rss_kib && sample.rss_kib > 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refuses_to_charge_cpu_to_an_unrelated_executable() -> Result<(), Box<dyn Error>> {
+        let reference = serve(mock(&[12], &[], RangeEnding::Clean)).await?;
+        let server = serve(mock(&[12], &[], RangeEnding::Clean)).await?;
+        let mut options = args(&server.url, &reference.url);
+        options.server_pid = Some(std::process::id());
+        options.server_executable = Some(std::env::temp_dir());
+        let error = run_raw_range_probe(options)
+            .await
+            .err()
+            .ok_or("accepted the wrong executable")?;
+        assert!(error.to_string().contains("different executable"));
         Ok(())
     }
 
@@ -1245,6 +1324,7 @@ mod tests {
         let server = serve(mock(&[12], &[], RangeEnding::Clean)).await?;
         let mut options = args(&server.url, &reference.url);
         options.server_pid = Some(std::process::id());
+        options.server_executable = Some(std::env::current_exe()?);
         let output = run_raw_range_probe(options).await?;
         let report = serde_json::to_value(&output.report)?;
         for pointer in [
@@ -1343,9 +1423,12 @@ mod tests {
     async fn refuses_to_grade_a_server_against_itself() -> Result<(), Box<dyn Error>> {
         let server = serve(mock(&[], &[], RangeEnding::Clean)).await?;
         assert!(
-            run_raw_range_probe(args(&server.url, &server.url))
-                .await
-                .is_err()
+            run_raw_range_probe(args(
+                &server.url,
+                &server.url.replace("127.0.0.1", "localhost")
+            ))
+            .await
+            .is_err()
         );
         Ok(())
     }

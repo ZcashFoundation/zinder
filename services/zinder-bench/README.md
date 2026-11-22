@@ -812,6 +812,8 @@ separate recompression run on copies.
 
 ## 7. Drive wallet-shaped load at an endpoint
 
+For a two-binary A/B comparison on a private fixture, follow [Wallet performance qualification](../../docs/runbooks/wallet-performance-qualification.md).
+
 `lightwalletd-wallet-load` syncs a height range from a running
 lightwalletd-compatible endpoint the way a real wallet engine does, for many
 simulated wallets at once. The endpoint can be `zinder-compat-lightwalletd`, Go
@@ -1218,7 +1220,7 @@ changes a block fails the request even when a wallet would still parse it.
 
 Every request is compared with an oracle of frame count, payload bytes, and
 digest. The oracle comes from a file, or from a different reference server read
-before the run, so the server under test never grades itself. A `START:END`
+before the run. The probe rejects two URLs resolving to a common host and port. For listeners behind proxies, supply a known independent source or a trusted oracle file. A `START:END`
 range with `START` above `END` streams descending.
 
 ```bash
@@ -1229,7 +1231,7 @@ zinder-bench raw-range-probe \
   --range 4598001:4600000 --both-directions \
   --write-oracle .tmp/oracle.json \
   --clients 4 --repetitions 32 --warmup-repetitions 1 \
-  --server-pid "$(pgrep -f zinder-compat-lightwalletd)" \
+  --server-pid "$READER_PID" --server-executable "$READER_BINARY" \
   --report .tmp/raw-range-probe.json
 
 # Later runs reuse the recorded oracle.
