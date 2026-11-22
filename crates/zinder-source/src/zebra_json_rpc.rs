@@ -1139,8 +1139,8 @@ impl ZebraJsonRpcSource {
     /// [`SourceError::SourceResponseTooLarge`] when the answer exceeds
     /// `node.max_response_bytes`, [`SourceError::SourceProtocolMismatch`]
     /// when any returned row names an address outside `lookup`, has a script
-    /// that does not pay its address, is out of chain order, or repeats an
-    /// outpoint, and the errors of
+    /// that does not pay its address, is out of chain order, repeats an
+    /// outpoint, or lies above the reported tip, and the errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_utxos(
         &self,
@@ -1224,6 +1224,11 @@ impl ZebraJsonRpcSource {
             decode_rpc_block_hash(&reply.hash)?,
         );
         let rows: Vec<_> = reply.utxos.into_iter().map(|JsonObject(row)| row).collect();
+        if rows.iter().any(|row| row.height() > reply.height) {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "getaddressutxos returned an output above the tip it reports",
+            });
+        }
         let decoded = decode_address_utxos(&rows, lookup, start_height, bound)?;
         Ok(SourceTransparentUtxoPage {
             outputs: decoded.outputs,

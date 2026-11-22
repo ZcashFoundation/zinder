@@ -383,6 +383,32 @@ async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Res
 }
 
 #[tokio::test]
+async fn transparent_address_utxos_refuse_an_output_above_the_reported_tip() -> eyre::Result<()> {
+    // utxos_at_tip reports height 9.
+    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
+        utxos_at_tip(&json!([utxo_row(9, 1, 0), utxo_row(10, 2, 0)])),
+    ))])?;
+    let source = regtest_source(server.url())?;
+
+    let error = source
+        .fetch_transparent_address_utxos(&regtest_lookup()?, BlockHeight::new(0))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted an output above the reported tip"))?;
+
+    assert!(
+        matches!(
+            error,
+            SourceError::SourceProtocolMismatch {
+                reason: "getaddressutxos returned an output above the tip it reports"
+            }
+        ),
+        "unexpected error {error:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_address_utxos_ask_for_the_complete_set_and_refuse_a_capped_answer()
 -> eyre::Result<()> {
     // Zebra 7.1.0 returns the first maxEntries outputs without saying whether

@@ -149,6 +149,17 @@ impl QualificationWallet {
             .map_err(|error| status_from_query_error(&QueryError::Node(error)))
     }
 
+    /// Admits one node UTXO lookup per instance, including those behind a balance.
+    fn utxo_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
+        Arc::clone(&self.utxo_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "a node UTXO response is in progress; retry with backoff",
+                )
+            })
+    }
+
     async fn balance(
         &self,
         mut addresses: impl Stream<Item = Result<String, Status>> + Unpin,
@@ -176,6 +187,7 @@ impl QualificationWallet {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // The node's balance RPC does not report the tip it answered at, so
         // the balance is summed from outputs the node attests at the served tip.
+        let _permit = self.utxo_permit()?;
         let node = self.node().await?;
         let unspent = served_utxo_page(node, &lookup, BlockHeight::new(0), None, view.tip).await?;
         let exceeds = || Status::out_of_range("transparent address balance exceeds i64");
@@ -213,13 +225,7 @@ impl QualificationWallet {
             u32::try_from(request.start_height)
                 .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?,
         );
-        let permit = Arc::clone(&self.utxo_slots)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted(
-                    "a node UTXO response is in progress; retry with backoff",
-                )
-            })?;
+        let permit = self.utxo_permit()?;
         let node = self.node().await?;
         let mut rows =
             wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?;

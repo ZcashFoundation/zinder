@@ -216,6 +216,13 @@ pub(crate) struct ZebraAddressUtxo {
     height: u32,
 }
 
+impl ZebraAddressUtxo {
+    /// Returns the height of the block that mined the output.
+    pub(crate) const fn height(&self) -> u32 {
+        self.height
+    }
+}
+
 /// How many of the matching unspent outputs a `getaddressutxos` lookup keeps.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UtxoRowBound {

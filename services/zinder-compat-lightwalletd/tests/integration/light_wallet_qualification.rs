@@ -930,6 +930,12 @@ async fn utxo_admission_is_shared_until_the_stream_drains_or_is_dropped() -> Res
             .err()
             .ok_or_else(|| eyre!("a second request bypassed UTXO admission"))?;
         assert_eq!(refused.code(), Code::ResourceExhausted);
+        let balance = concurrent
+            .get_taddress_balance(balance_request())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("a balance bypassed UTXO admission"))?;
+        assert_eq!(balance.code(), Code::ResourceExhausted);
         assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), before);
         if cancel {
             drop(stream);
@@ -939,6 +945,39 @@ async fn utxo_admission_is_shared_until_the_stream_drains_or_is_dropped() -> Res
         }
         populated_wallet_utxos(&fixture, 2).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_balance_holds_utxo_admission_until_it_answers() -> Result<()> {
+    let tip = served_tip(1)?;
+    let fixture = Fixture::new([
+        method("getaddressutxos").reply(RpcReply::delayed(
+            Duration::from_millis(300),
+            utxos_at(tip, &json!([])),
+        )),
+        method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
+    ])?;
+    let mut pending = Box::pin(fixture.adapter.get_taddress_balance(balance_request()));
+    tokio::select! {
+        _ = &mut pending => return Err(eyre!("delayed balance arrived before inspection")),
+        outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.node.requests_for("getaddressutxos")?.is_empty() { tokio::task::yield_now().await; }
+            Ok::<(),eyre::Report>(())
+        }) => outcome??,
+    }
+    let utxos = fixture.adapter.get_address_utxos(utxo_request(0)).await;
+    let balance = fixture
+        .adapter
+        .get_taddress_balance(balance_request())
+        .await;
+    for refused in [utxos.err(), balance.err()] {
+        let status = refused.ok_or_else(|| eyre!("a request bypassed a pending balance"))?;
+        assert_eq!(status.code(), Code::ResourceExhausted);
+    }
+    assert_eq!(pending.await?.into_inner().value_zat, 0);
+    assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 1);
+    fixture.adapter.get_address_utxos(utxo_request(0)).await?;
     Ok(())
 }
 

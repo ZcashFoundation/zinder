@@ -507,7 +507,8 @@ order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
 32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
 
 Each qualification instance admits one nonempty UTXO request and one
-address-history request at a time. `GetTaddressTxids` and
+address-history request at a time. Balance requests read the node's UTXOs and
+share the UTXO slot. `GetTaddressTxids` and
 `GetTaddressTransactions` share the history slot. Each request holds its slot
 while it reads from the node and while the client drains the stream. A request
 for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
