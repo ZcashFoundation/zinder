@@ -90,41 +90,30 @@ impl PublishedRangeRead {
         chunk: BlockHeightRange,
         order: zinder_store::HeightOrder,
         tail: &super::tail::EncodedTail,
-    ) -> (BlockHeightRange, bool) {
+    ) -> Option<BlockHeightRange> {
         use zinder_store::HeightOrder;
-        let catalog = self.history.bounds();
-        let start = match order {
+        let first = match order {
             HeightOrder::Ascending => chunk.start,
             HeightOrder::Descending => chunk.end,
         };
-        let spans = match tail.bounds() {
-            Some(live) if catalog.end.next().is_some_and(|next| next >= live.start) => [
-                Some(BlockHeightRange::inclusive(
-                    catalog.start,
-                    catalog.end.max(live.end),
-                )),
-                None,
-            ],
-            live => [Some(catalog), live],
-        };
-        let mut span = chunk;
-        for covered in spans.into_iter().flatten() {
-            if (covered.start..=covered.end).contains(&start) {
-                span.start = span.start.max(covered.start);
-                span.end = span.end.min(covered.end);
-                return (span, true);
-            }
-            match order {
-                HeightOrder::Ascending if covered.start > start => {
-                    span.end = span.end.min(BlockHeight::new(covered.start.value() - 1));
-                }
-                HeightOrder::Descending if covered.end < start => {
-                    span.start = span.start.max(BlockHeight::new(covered.end.value() + 1));
-                }
-                HeightOrder::Ascending | HeightOrder::Descending => {}
-            }
+        let mut catalog = self.history.bounds();
+        let mut live = tail.bounds();
+        if let Some(suffix) = live
+            && catalog.end.next().is_some_and(|next| next >= suffix.start)
+        {
+            catalog.end = catalog.end.max(suffix.end);
+            live = None;
         }
-        (span, false)
+        [Some(catalog), live]
+            .into_iter()
+            .flatten()
+            .find(|covered| (covered.start..=covered.end).contains(&first))
+            .map(|covered| {
+                BlockHeightRange::inclusive(
+                    chunk.start.max(covered.start),
+                    chunk.end.min(covered.end),
+                )
+            })
     }
 
     fn encoded_rows(
@@ -274,11 +263,11 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
                     && read.chunk.start >= tail.fence.1.first_available_height()
             });
             let anchor = if let Some(live) = &tail {
-                let (span, encoded) = self.encoded_span(read.chunk, read.order, live);
-                read.chunk = span;
-                if !encoded {
+                let Some(span) = self.encoded_span(read.chunk, read.order, live) else {
+                    // The current canonical view must check retention for the planner's whole offer.
                     return native_chunk(reads, read, convert).await;
-                }
+                };
+                read.chunk = span;
                 Some(Ok(()))
             } else if self.covers_selected_history(read.chunk)
                 && reads.block_hash_at(view, read.chunk.start).await.is_ok()
