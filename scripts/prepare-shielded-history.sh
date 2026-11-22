@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 1 || $1 != /* ]]; then
+if [[ $# != 1 || $1 != /* || $1 =~ ^/+$ ]]; then
   echo "Usage: $0 /absolute/path/to/new-generation" >&2
   exit 2
 fi
@@ -10,6 +10,7 @@ fi
 # replace the trust root of an existing generation, even on concurrent setup.
 umask 077
 generation=$1
+while [[ $generation == */ ]]; do generation=${generation%/}; done
 staging=$(mktemp -d -- "${generation}.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 openssl genpkey -algorithm ED25519 -outform DER -out "$staging/publisher.pk8"
