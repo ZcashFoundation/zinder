@@ -244,7 +244,7 @@ impl ShieldedTailBuffer {
         }
         // A stale view must not spend the refresh lock building rows it may
         // not install.
-        if existing.is_some() && !source.is_current().await {
+        if !source.is_current().await {
             return Ok(None);
         }
         check_cancel(source)?;
@@ -260,6 +260,11 @@ impl ShieldedTailBuffer {
         {
             return Ok(Some(existing.clone()));
         }
+        // The view may have changed while this miss waited for the lock.
+        if !source.is_current().await {
+            return Ok(None);
+        }
+        check_cancel(source)?;
         // Another generation's rows are never reused: two admitted stores can
         // share block hashes while holding different compact bytes.
         let updated = match &previous {
@@ -635,6 +640,7 @@ mod tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    use eyre::OptionExt as _;
     use parking_lot::Mutex;
     use tokio_stream::StreamExt as _;
     use tonic::Code;
@@ -659,6 +665,7 @@ mod tests {
         current: Arc<AtomicBool>,
         cancel: CancellationToken,
         cancel_on_read: bool,
+        read_gate: Option<Arc<tokio::sync::Notify>>,
         /// Marks the view stale when a read starts.
         stale_on_read: bool,
         native_row_bytes: usize,
@@ -725,6 +732,7 @@ mod tests {
             current: Arc::new(AtomicBool::new(true)),
             cancel: CancellationToken::new(),
             cancel_on_read: false,
+            read_gate: None,
             stale_on_read: false,
             native_row_bytes: 64,
             source: CompactBlockSource::of(&owner),
@@ -781,13 +789,15 @@ mod tests {
             std::future::ready(self.current.load(Ordering::SeqCst))
         }
 
-        fn read_rows(
+        async fn read_rows(
             &self,
             range: BlockHeightRange,
             max_bytes: usize,
-        ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
-        {
+        ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
             self.reads.lock().push(range);
+            if let Some(gate) = &self.read_gate {
+                gate.notified().await;
+            }
             if self.cancel_on_read {
                 self.cancel.cancel();
             }
@@ -795,9 +805,9 @@ mod tests {
                 self.current.store(false, Ordering::SeqCst);
             }
             if self.unsupported {
-                return std::future::ready(Ok(None));
+                return Ok(None);
             }
-            std::future::ready(Ok(Some(self.stored_rows(range, max_bytes))))
+            Ok(Some(self.stored_rows(range, max_bytes)))
         }
     }
 
@@ -946,6 +956,40 @@ mod tests {
         Ok(())
     }
 
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[tokio::test]
+    async fn a_stale_cold_miss_skips_the_refresh_queue() {
+        let buffer = ShieldedTailBuffer::default();
+        let stale = build_source(5, 1);
+        stale.current.store(false, Ordering::SeqCst);
+        let _guard = buffer.0.refresh_lock.lock().await;
+        let read = buffer.refresh_with_limit(&stale, None, (span(1, 5), TAIL_BYTES));
+        tokio::pin!(read);
+        assert!(matches!(
+            poll_once(read.as_mut()),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        assert!(stale.reads.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_queued_miss_that_turns_stale_skips_its_storage_reads() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let source = build_source(5, 1);
+        let guard = buffer.0.refresh_lock.lock().await;
+        let read = buffer.refresh_with_limit(&source, None, (span(1, 5), TAIL_BYTES));
+        tokio::pin!(read);
+        assert!(poll_once(read.as_mut()).is_pending());
+        source.current.store(false, Ordering::SeqCst);
+        drop(guard);
+        assert!(read.await?.is_none());
+        assert!(source.reads.lock().is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_view_that_turns_stale_during_its_fill_serves_only_its_request() -> eyre::Result<()> {
         let buffer = ShieldedTailBuffer::default();
@@ -1005,6 +1049,37 @@ mod tests {
             .await;
         assert!(matches!(cancelled, Err(status) if status.code() == Code::Cancelled));
         assert!(precancelled.reads.lock().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_queued_refresh_proceeds_when_a_cancelled_storage_chunk_finishes() -> eyre::Result<()>
+    {
+        let buffer = ShieldedTailBuffer::default();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut source = build_source(2_500, 1);
+        source.read_gate = Some(gate.clone());
+        let follower = build_source(5, 2);
+        let owner = buffer.refresh_with_limit(&source, None, (span(1, 2_500), TAIL_BYTES));
+        let next = buffer.refresh_with_limit(&follower, None, (span(1, 5), TAIL_BYTES));
+        tokio::pin!(owner, next);
+        assert!(poll_once(owner.as_mut()).is_pending());
+        assert_eq!(*source.reads.lock(), vec![span(1, 1_000)]);
+        assert!(poll_once(next.as_mut()).is_pending());
+        source.cancel.cancel();
+        assert!(poll_once(owner.as_mut()).is_pending());
+        assert!(poll_once(next.as_mut()).is_pending());
+        assert!(follower.reads.lock().is_empty());
+        gate.notify_one();
+        assert!(matches!(owner.await, Err(status) if status.code() == Code::Cancelled));
+        let installed = next.await?.ok_or_eyre("missing refreshed tail")?;
+        assert!(
+            buffer
+                .load_full()
+                .is_some_and(|tail| Arc::ptr_eq(&tail, &installed))
+        );
+        assert_eq!(*source.reads.lock(), vec![span(1, 1_000)]);
+        assert_eq!(*follower.reads.lock(), vec![span(1, 5)]);
         Ok(())
     }
 
