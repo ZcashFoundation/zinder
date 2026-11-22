@@ -1694,7 +1694,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to also apply the enabled densification selection before READY. Changing this setting leaves stored checkpoints in place.",
+        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to also apply the enabled densification selection before READY. Full Mainnet time to READY and disk growth are unqualified for the `every-block` and `commitment-budget` construction selections. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",

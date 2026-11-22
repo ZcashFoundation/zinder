@@ -488,7 +488,7 @@ mod tests {
     use crate::canonical_store::{
         block_load::{
             canonical_block_families_are_empty, encode_block_position,
-            encode_tree_state_checkpoint, validate_compact_block_payload,
+            validate_compact_block_payload,
         },
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
         control::{decode_store_control, encode_ready_store_control},
@@ -793,58 +793,62 @@ mod tests {
     }
 
     #[test]
-    fn commitment_budget_cold_readback_rejects_a_skipped_cadence_checkpoint()
+    fn commitment_budget_cold_readback_rejects_misplaced_checkpoints()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
         let activations = testnet_activations()?;
         let tip = BlockHeight::new(102);
-        let mut builder = building_store_through(&temporary.path().join("canonical"), tip)?
-            .with_tree_state_checkpoint_selection(
-                TreeStateCheckpointSelection::CommitmentBudget(
-                    NonZeroU32::new(203).ok_or("budget must be positive")?,
-                ),
+        for (original, moved, expected) in [
+            (85, 84, "the budget has not been reached"),
+            (85, 86, "the budget was already reached before height 86"),
+            (100, 101, "outside the selected construction coverage"),
+        ] {
+            let temporary = TempDir::new()?;
+            let mut builder = building_store_through(&temporary.path().join("canonical"), tip)?
+                .with_tree_state_checkpoint_selection(
+                    TreeStateCheckpointSelection::CommitmentBudget(
+                        NonZeroU32::new(203).ok_or("budget must be positive")?,
+                    ),
+                )?;
+            let blocks = shielded_chain_with_checkpoints(&activations, tip, &[85, 100, 102])?;
+            let source_tip = blocks
+                .last()
+                .and_then(|block| block.as_ref().ok())
+                .and_then(|block| block.tree_state_checkpoint.clone())
+                .ok_or("missing tip checkpoint")?;
+            let evidence = builder.bulk_load_blocks(&activations, blocks)?;
+            assert_eq!(evidence.tree_state_checkpoint_count, 4);
+            builder.load_subtree_roots(std::iter::empty())?;
+            builder.confirm_source_tip_checkpoint(&source_tip)?;
+            let db = &builder.bounded_open.db;
+            let family = db
+                .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+                .ok_or("tree-state checkpoint family must exist")?;
+            // Moving the key preserves the number of rows and logical bytes.
+            let key = encode_block_position(BlockHeight::new(original));
+            let encoded = db.get_cf(&family, key)?.ok_or("checkpoint row absent")?;
+            db.delete_cf(&family, key)?;
+            db.put_cf(
+                &family,
+                encode_block_position(BlockHeight::new(moved)),
+                encoded,
             )?;
-        // The budget is reached at 85. Capture height 101's frontier for the
-        // replacement row and omit it from the initial load.
-        let mut blocks = shielded_chain_with_checkpoints(&activations, tip, &[85, 100, 101, 102])?;
-        let replacement = blocks
-            .get_mut(100)
-            .and_then(|block| block.as_mut().ok())
-            .and_then(|block| block.tree_state_checkpoint.take())
-            .ok_or("missing height 101 test frontier")?;
-        let source_tip = blocks
-            .last()
-            .and_then(|block| block.as_ref().ok())
-            .and_then(|block| block.tree_state_checkpoint.clone())
-            .ok_or("missing tip checkpoint")?;
-        let evidence = builder.bulk_load_blocks(&activations, blocks)?;
-        assert_eq!(evidence.tree_state_checkpoint_count, 4);
-        builder.load_subtree_roots(std::iter::empty())?;
-        builder.confirm_source_tip_checkpoint(&source_tip)?;
-        let db = &builder.bounded_open.db;
-        let family = db
-            .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
-            .ok_or("tree-state checkpoint family must exist")?;
-        db.delete_cf(&family, encode_block_position(BlockHeight::new(100)))?;
-        db.put_cf(
-            &family,
-            encode_block_position(replacement.block_id.height),
-            encode_tree_state_checkpoint(replacement.block_time_seconds, &replacement.frontiers),
-        )?;
-        drop(family);
+            drop(family);
 
-        let error = builder
-            .prepare_cold_certified_publication()
-            .err()
-            .ok_or("cold readback must reject a skipped cadence checkpoint")?;
-        assert!(
-            matches!(
-                error,
-                CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
-                    if reason == "persisted tree-state checkpoint at height 101 is outside the selected construction coverage"
-            ),
-            "{error}"
-        );
+            let error = builder
+                .prepare_cold_certified_publication()
+                .err()
+                .ok_or_else(|| {
+                    format!("cold readback accepted a checkpoint moved from {original} to {moved}")
+                })?;
+            assert!(
+                matches!(
+                    error,
+                    CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
+                        if reason.contains(expected)
+                ),
+                "{original} -> {moved}: {error}"
+            );
+        }
         Ok(())
     }
 

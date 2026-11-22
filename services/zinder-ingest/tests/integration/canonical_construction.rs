@@ -1183,20 +1183,8 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
     use zinder_store::TreeStateCheckpointSelection::CommitmentBudget;
 
     let activations = regtest_activations();
-    let sapling = fixture_sapling_source_block()?;
-    let orchard = fixture_orchard_source_block()?;
-    // The Sapling fixture appends one commitment and the Orchard fixture appends two.
     let budget = NonZeroU32::new(3).ok_or("zero commitment budget")?;
-    let source =
-        MultiBlockConstructionSource::build_with_transactions(105, &activations, |height| {
-            let fixture = match height {
-                97 | 99 | 102 => &sapling,
-                98 | 101 => &orchard,
-                _ => return Ok(Vec::new()),
-            };
-            // Distinct lock times give repeated shielded bundles distinct transaction IDs.
-            shielded_transactions_with_lock_time(fixture, Some(height))
-        })?;
+    let source = commitment_budget_construction_source(&activations)?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let directory = TempDir::new()?;
     let dense = multi_block_writer_config(
@@ -1231,7 +1219,7 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
         let lookup = budgeted.tree_state_lookup(at, &activations)?;
         assert_eq!(
             matches!(lookup, Some(TreeStateLookup::Stored(_))),
-            matches!(height, 0 | 98 | 100 | 102 | 104),
+            matches!(height, 0 | 95 | 98 | 100 | 102 | 104),
             "unexpected checkpoint coverage at height {height}"
         );
         let expected = dense
@@ -1261,6 +1249,45 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
         );
     }
     Ok(())
+}
+
+fn commitment_budget_construction_source(
+    activations: &NetworkUpgradeActivations,
+) -> Result<MultiBlockConstructionSource, Box<dyn std::error::Error>> {
+    let sapling = fixture_sapling_source_block()?;
+    let orchard = fixture_orchard_source_block()?;
+    // One block exceeds the budget, later blocks reach it jointly, and a
+    // final sub-budget block immediately precedes the required tip checkpoint.
+    let source =
+        MultiBlockConstructionSource::build_with_transactions(105, activations, |height| {
+            let fixture = match height {
+                95 => {
+                    let mut transactions =
+                        shielded_transactions_with_lock_time(&orchard, Some(95))?;
+                    transactions.extend(shielded_transactions_with_lock_time(&orchard, Some(195))?);
+                    return Ok(transactions);
+                }
+                97 | 99 | 102 | 103 => &sapling,
+                98 | 101 => &orchard,
+                _ => return Ok(Vec::new()),
+            };
+            // Distinct lock times give repeated shielded bundles distinct transaction IDs.
+            shielded_transactions_with_lock_time(fixture, Some(height))
+        })?;
+    let sizes_at = |height| {
+        source
+            .checkpoint_at(height)
+            .map(CommitmentTreeCheckpoint::tip_metadata)
+    };
+    assert_eq!(
+        sizes_at(95)?.orchard_commitment_tree_size - sizes_at(94)?.orchard_commitment_tree_size,
+        4
+    );
+    assert_eq!(
+        sizes_at(103)?.sapling_commitment_tree_size - sizes_at(102)?.sapling_commitment_tree_size,
+        1
+    );
+    Ok(source)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

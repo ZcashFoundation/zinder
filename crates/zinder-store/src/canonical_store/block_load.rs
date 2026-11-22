@@ -40,12 +40,14 @@ use super::{
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     construction_manifest::CanonicalConstructionFamilyEvidence,
     frontier_presence_mismatch,
+    reader::read_compact_block_at,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
         TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
+    tree_state_replay::recorded_tree_sizes,
 };
 
 /// Required tree-state checkpoint coverage for a fresh canonical build.
@@ -891,12 +893,19 @@ fn validate_persisted_tree_state_checkpoints(
                     "first persisted tree-state checkpoint does not match the history predecessor",
                 ));
             }
-            Some(previous) => validate_persisted_checkpoint_step(
-                coverage,
-                previous,
-                height,
-                build_plan.build_tip().height,
-            )?,
+            Some(previous) => {
+                validate_persisted_checkpoint_step(
+                    coverage,
+                    previous,
+                    height,
+                    build_plan.build_tip().height,
+                )?;
+                if let Some(selection @ TreeStateCheckpointSelection::CommitmentBudget(_)) =
+                    coverage.selection()
+                {
+                    validate_persisted_budget_step(db, build_plan, selection, previous, height)?;
+                }
+            }
             None => {}
         }
         if height == build_plan.build_tip().height {
@@ -948,6 +957,50 @@ fn validate_persisted_checkpoint_step(
         return Err(CanonicalStoreError::block_load_sequence(format!(
             "persisted tree-state checkpoint at height {} is outside the selected construction coverage",
             height.value()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_persisted_budget_step(
+    db: &DB,
+    build_plan: &CanonicalStoreBuildPlan,
+    selection: TreeStateCheckpointSelection,
+    previous: BlockHeight,
+    height: BlockHeight,
+) -> Result<(), CanonicalStoreError> {
+    let predecessor = build_plan.history_predecessor();
+    let tree_sizes = |height: BlockHeight| {
+        if height == predecessor.block_id.height {
+            return Ok(predecessor.tip_metadata());
+        }
+        let compact = read_compact_block_at(db, height)?.ok_or_else(|| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "compact block at height {} is absent during checkpoint validation",
+                height.value(),
+            ))
+        })?;
+        Ok(recorded_tree_sizes(&compact))
+    };
+    let anchored = tree_sizes(previous)?;
+    if !selection.gap_satisfies(previous, height, &mut 0, |at| {
+        if at == previous {
+            Ok(anchored)
+        } else {
+            tree_sizes(at)
+        }
+    })? {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "the budget was already reached before height {}",
+            height.value(),
+        )));
+    }
+    if !tree_state_checkpoint_required(height, build_plan.build_tip().height)
+        && !selection.requires_checkpoint_since(anchored, tree_sizes(height)?)
+    {
+        return Err(CanonicalStoreError::block_load_sequence(format!(
+            "persisted tree-state checkpoint at height {} is outside the selected construction coverage: the budget has not been reached",
+            height.value(),
         )));
     }
     Ok(())
