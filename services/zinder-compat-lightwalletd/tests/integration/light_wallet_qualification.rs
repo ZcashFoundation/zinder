@@ -36,6 +36,7 @@ use zinder_testkit::{
 
 mod address_validation;
 mod canonical;
+mod served_view;
 mod utxo_transport;
 
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
@@ -49,14 +50,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(replies: impl IntoIterator<Item = JsonRpcStub>) -> Result<Self> {
-        Self::with_node_timeout(replies, Duration::from_secs(2))
+        Self::with_node_timeout(1, replies, Duration::from_secs(2))
     }
 
     fn with_node_timeout(
+        blocks: u32,
         replies: impl IntoIterator<Item = JsonRpcStub>,
         timeout: Duration,
     ) -> Result<Self> {
-        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(blocks);
         Self::from_chain(&chain, &one_upgrade_per_height()?, replies, timeout)
     }
 
@@ -72,7 +74,15 @@ impl Fixture {
             .ok_or_else(|| eyre!("missing fixture tip"))?;
         let mut store = WalletServingStoreFixture::from_chain(chain, schedule)?;
         let (canonical, _) = store.take_readers()?;
-        let node = verifiable_node(schedule, tip.hash, replies)?;
+        let (height, hash) = (tip.height.value(), tip.hash);
+        let served_tip = method("getbestblockheightandhash").reply_with(move |_| {
+            RpcReply::result(json!({"height": height, "hash": hash.as_bytes()}))
+        });
+        let node = verifiable_node(
+            schedule,
+            tip.hash,
+            std::iter::once(served_tip).chain(replies),
+        )?;
         let source =
             ZebraJsonRpcSource::new(Network::ZcashRegtest, node.url(), NodeAuth::None, timeout)?;
         let slot = CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(canonical)?));
@@ -118,18 +128,17 @@ fn history_fixture(
     replies: impl IntoIterator<Item = JsonRpcStub>,
 ) -> Result<(Fixture, Arc<AtomicBool>)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
-    let starting_hash = chain
-        .blocks()
-        .last()
-        .ok_or_else(|| eyre!("missing history tip"))?
-        .hash;
+    let hashes: Vec<_> = chain.blocks().iter().map(|block| block.hash).collect();
     let replaced = Arc::new(AtomicBool::new(false));
     let fork = Arc::clone(&replaced);
-    let block_hash = move || {
-        if fork.load(Ordering::Acquire) {
-            BlockHash::from_bytes([0xff; 32])
-        } else {
-            starting_hash
+    let block_hash = move |height: u64| {
+        let served = usize::try_from(height)
+            .ok()
+            .and_then(|height| hashes.get(height.checked_sub(1)?).copied());
+        match served {
+            Some(_) if fork.load(Ordering::Acquire) => BlockHash::from_bytes([0xff; 32]),
+            Some(hash) => hash,
+            None => BlockHash::from_bytes([0xee; 32]),
         }
     };
     let tip_hash = block_hash.clone();
@@ -138,10 +147,11 @@ fn history_fixture(
         &one_upgrade_per_height()?,
         [
             method("getbestblockheightandhash").reply_with(move |_| {
-                RpcReply::result(json!({"height": 4, "hash": tip_hash().as_bytes()}))
+                RpcReply::result(json!({"height": 4, "hash": tip_hash(4).as_bytes()}))
             }),
-            method("getblockhash").reply_with(move |_| {
-                RpcReply::result(json!(encode_rpc_block_hash_hex(block_hash())))
+            method("getblockhash").reply_with(move |params| {
+                let height = params[0].as_u64().unwrap_or_default();
+                RpcReply::result(json!(encode_rpc_block_hash_hex(block_hash(height))))
             }),
             method("getaddresstxids").reply_with(|params| {
                 let start = params[0]["start"].as_u64().unwrap_or_default();
@@ -579,16 +589,23 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
             .script()
             .as_raw_bytes(),
     );
-    let tip = |hash| {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let served = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?
+        .hash;
+    let tip = |hash: BlockHash| {
         method("getbestblockheightandhash").reply(RpcReply::result(
-            json!({"height": 2, "hash": vec![hash; 32]}),
+            json!({"height": 2, "hash": hash.as_bytes()}),
         ))
     };
-    let fixture = Fixture::new([
-        tip(0),
-        tip(0),
-        tip(0),
-        tip(1),
+    let moved = BlockHash::from_bytes([1; 32]);
+    let replies = [
+        tip(served),
+        tip(served),
+        tip(served),
+        tip(moved),
         method("getaddressutxos").reply_with(move |params| {
             let requested = params[0]["maxEntries"]
                 .as_u64()
@@ -606,7 +623,13 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
                 .collect();
             RpcReply::result(json!(rows))
         }),
-    ])?;
+    ];
+    let fixture = Fixture::from_chain(
+        &chain,
+        &one_upgrade_per_height()?,
+        replies,
+        Duration::from_secs(2),
+    )?;
     let request = || {
         Request::new(lightwalletd::GetAddressUtxosArg {
             addresses: vec![ADDRESS.to_owned()],
@@ -661,17 +684,13 @@ async fn balance_address_limit_is_checked_before_contacting_the_node() -> Result
 
 #[tokio::test]
 async fn maximum_utxo_prefix_uses_a_bounded_node_lookup() -> Result<()> {
-    let fixture = Fixture::new([
-        method("getbestblockheightandhash")
-            .reply(RpcReply::result(json!({"height":1, "hash":vec![0;32]}))),
-        method("getaddressutxos").reply_with(|params| {
-            if params[0]["maxEntries"] == 100_000 {
-                RpcReply::result(json!([]))
-            } else {
-                RpcReply::error_with_code(-1, "expected an explicit 100,000-row prefix")
-            }
-        }),
-    ])?;
+    let fixture = Fixture::new([method("getaddressutxos").reply_with(|params| {
+        if params[0]["maxEntries"] == 100_000 {
+            RpcReply::result(json!([]))
+        } else {
+            RpcReply::error_with_code(-1, "expected an explicit 100,000-row prefix")
+        }
+    })])?;
     let result = fixture
         .adapter
         .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
@@ -717,40 +736,42 @@ fn populated_utxo_fixture(
         (6, "03".repeat(32), next_height_rows),
     ];
     Fixture::with_node_timeout(
-        [
-            method("getbestblockheightandhash")
-                .reply_with(|_| RpcReply::result(json!({"height":6, "hash":vec![0;32]}))),
-            method("getaddressutxos").reply_with(move |params| {
-                let (start, limit) = match node {
-                    UtxoNode::Zebra => (
-                        params[0]["startHeight"].as_u64().unwrap_or(0),
-                        params[0]["maxEntries"].as_u64().unwrap_or(0),
-                    ),
-                    UtxoNode::Zakura => (0, 0),
-                };
-                let matching: u32 = groups.iter().filter(|(height, _, _)| *height >= start)
-                    .map(|(_, _, count)| count).sum();
-                if matches!(node, UtxoNode::Zebra) && limit == 0 && matching > 100_000 {
-                    return RpcReply::error("more than 100000 unspent outputs match; page with startHeight and maxEntries");
+        6,
+        [method("getaddressutxos").reply_with(move |params| {
+            let (start, limit) = match node {
+                UtxoNode::Zebra => (
+                    params[0]["startHeight"].as_u64().unwrap_or(0),
+                    params[0]["maxEntries"].as_u64().unwrap_or(0),
+                ),
+                UtxoNode::Zakura => (0, 0),
+            };
+            let matching: u32 = groups
+                .iter()
+                .filter(|(height, _, _)| *height >= start)
+                .map(|(_, _, count)| count)
+                .sum();
+            if matches!(node, UtxoNode::Zebra) && limit == 0 && matching > 100_000 {
+                return RpcReply::error(
+                    "more than 100000 unspent outputs match; page with startHeight and maxEntries",
+                );
+            }
+            let mut rows = Vec::new();
+            for (height, txid, count) in &groups {
+                if *height < start {
+                    continue;
                 }
-                let mut rows = Vec::new();
-                for (height, txid, count) in &groups {
-                    if *height < start {
-                        continue;
-                    }
-                    for index in 0..*count {
-                        rows.push(
-                            json!({"address": ADDRESS, "txid": txid, "outputIndex": index,
+                for index in 0..*count {
+                    rows.push(
+                        json!({"address": ADDRESS, "txid": txid, "outputIndex": index,
                             "script": script, "satoshis": 1, "height": height}),
-                        );
-                        if u64::try_from(rows.len()) == Ok(limit) {
-                            return RpcReply::result(Value::Array(rows));
-                        }
+                    );
+                    if u64::try_from(rows.len()) == Ok(limit) {
+                        return RpcReply::result(Value::Array(rows));
                     }
                 }
-                RpcReply::result(Value::Array(rows))
-            }),
-        ],
+            }
+            RpcReply::result(Value::Array(rows))
+        })],
         Duration::from_secs(30),
     )
 }

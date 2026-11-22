@@ -483,8 +483,16 @@ schedule through the next block for up to one minute. A failed tip check, a
 new schedule revision, or a change to the upgrade active at the next block
 requires fresh discovery. If discovery fails, concurrent callers waiting for it
 return the refusal or a retryable error. The next request can retry immediately.
-The node can advance while answering. Compare forwarded
-answers with wallet serving while the node stays at the same hash and height.
+
+Every forwarded answer describes the served tip captured for the request, or
+the call returns `UNAVAILABLE`. A node on another chain
+fails the tip check. The node answers balance and UTXO lookups at its own tip,
+so qualification reads the node tip before and after each lookup and requires
+both reads to match. When that tip equals the served tip, the answer is exact.
+When the node is ahead on the same chain, the answer is kept only if the
+node's address history lists no transaction for the addresses above the
+served tip. Otherwise the lookup fails, and a retry succeeds once ingest
+serves the newer blocks.
 
 The node orders UTXOs within a block by position. Qualification needs every
 matching output in the last block of a wallet's request to sort them by wallet
@@ -543,15 +551,19 @@ closes admission until the publisher verifies the recovered writer's fence.
 
 Both mempool methods use ingest control. If an address-history lookup
 exceeds a row or byte limit, qualification splits it into disjoint height ranges.
-Before looking up transaction IDs, the stream records the hash at the end of
-the requested range. Each page is read in order. For each transaction, one
+Before looking up transaction IDs, the stream records the served block hash at
+the end of the requested range. Each page is read in order. For each transaction, one
 verbose node call obtains its bytes and mined height, then a block-hash
-lookup checks the range before the wallet receives the row. The stream also
+lookup checks that the node still holds that block before the wallet receives
+the row. The stream also
 checks the hash for empty pages and before reporting completion. A replacement
 returns `UNAVAILABLE`, and cancelling the stream stops further calls. If one
 height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
-With `none`, `GetTransaction` fetches the bytes from
-the node. To exercise local mined-transaction reads, repeat with fresh store
+With `none`, `GetTransaction` finds the transaction's block in the canonical
+store and fetches only its bytes from the node. The node must report the same
+block. A transaction the served chain does not mine is looked up in the
+ingest mempool, as wallet serving does, even when the node has mined it in a
+later block. To exercise local mined-transaction reads, repeat with fresh store
 paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
 projector or wallet store. The feature is for qualification only. Release
 builds accept `wallet` and `compact-blocks`.
