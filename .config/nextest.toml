@@ -25,6 +25,12 @@ final-status-level = "fail"
 junit = { path = "target/nextest/junit.xml" }
 
 [[profile.default.overrides]]
+# This fixture flushes 128 separate tables and waits for RocksDB to delete
+# them during compaction before resuming the publisher.
+filter = "package(=zinder-compat-lightwalletd) & test(=integration::cli::publication::publisher_recovers_a_missing_table_while_holding_the_catalog_lock)"
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # Concurrent canonical and wallet fixture builds stall on filesystem journal
 # commits. Each replay then copies and syncs both stores and opens a secondary.
 # Limit overlapping fixtures. Even two can cross 20s when other suites share

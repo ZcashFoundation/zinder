@@ -61,7 +61,7 @@ struct Cli {
     /// Canonical primary path replicated only through an immutable secondary.
     #[arg(long = "canonical-primary-path")]
     canonical_primary_path: Option<PathBuf>,
-    /// Root containing this process's two canonical secondary generations.
+    /// Root for the canonical secondary generations used by this process.
     #[arg(long = "canonical-secondary-root")]
     canonical_secondary_root: Option<PathBuf>,
     /// Wallet primary path replicated only through an immutable secondary.
