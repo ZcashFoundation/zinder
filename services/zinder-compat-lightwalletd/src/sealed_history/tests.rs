@@ -597,11 +597,11 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     let mut slab_one_count = 0_usize;
     let mut slab_bytes = 0_usize;
     for row in &rows {
-        if slab_one_count > 0 && slab_bytes + row.payload.len() > SLAB_TARGET_BYTES {
+        if slab_one_count > 0 && slab_bytes + LENGTHS_LEN + row.payload.len() > SLAB_TARGET_BYTES {
             break;
         }
         assert_eq!(row.id, id(u32::try_from(slab_one_count)? + 1));
-        slab_bytes += row.payload.len();
+        slab_bytes += LENGTHS_LEN + row.payload.len();
         slab_one_count += 1;
     }
     assert!(slab_one_count > 0 && slab_one_count < rows.len());
@@ -617,5 +617,24 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
         "first slab must release independently of later slabs"
     );
     assert_eq!(later_slabs[0].id, id(u32::try_from(slab_one_count)? + 1));
+    Ok(())
+}
+
+#[test]
+fn positional_reads_fill_all_slabs_and_report_a_short_final_frame() -> eyre::Result<()> {
+    let mut file = tempfile::tempfile()?;
+    file.write_all(b"prefix")?;
+    let expected: Vec<_> = (0_u16..1025).map(u16::to_be_bytes).collect();
+    file.write_all(expected.as_flattened())?;
+
+    let mut buffers = vec![[0; 2]; expected.len()];
+    read_slabs_at(&file, buffers.iter_mut().map(<[_; 2]>::as_mut_slice), 6)?;
+    assert_eq!(buffers, expected);
+
+    file.set_len(6 + u64::try_from(expected.as_flattened().len())? - 1)?;
+    let error = read_slabs_at(&file, buffers.iter_mut().map(<[_; 2]>::as_mut_slice), 6)
+        .err()
+        .ok_or_else(|| invalid("served a truncated frame"))?;
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     Ok(())
 }
