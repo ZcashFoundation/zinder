@@ -8,7 +8,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CanonicalHistoryBounds, ChainEpoch,
     CompactBlockArtifact,
 };
-use zinder_query::CanonicalReader;
+use zinder_query::{CanonicalReader, CompactBlockSource};
 use zinder_store::{CanonicalEventFence, HeightOrder};
 
 use super::PublishedShieldedCatalog;
@@ -35,13 +35,21 @@ struct ShieldedTailBufferInner {
 pub(super) struct EncodedTail {
     pub(super) epoch: ChainEpoch,
     pub(super) fence: Fence,
+    /// The admitted data the rows were read or verified against. A tail
+    /// prepared without one only seeds a later verified rebuild.
+    source: Option<CompactBlockSource>,
     rows: VecDeque<SealedBlock>,
     bytes: usize,
     byte_capped: bool,
+    /// The most payload bytes the build of this tail held at once, counting
+    /// the rows it keeps and the storage chunk it was converting.
+    build_peak_bytes: usize,
 }
 
 trait TailSource: Sync {
     fn epoch_and_fence(&self) -> (ChainEpoch, Fence);
+
+    fn source(&self) -> Option<&CompactBlockSource>;
 
     fn cancel(&self) -> &CancellationToken;
 
@@ -71,6 +79,10 @@ impl TailSource for CanonicalTailSource<'_> {
             self.reader.chain_epoch(),
             (self.reader.event_fence(), self.reader.history_bounds()),
         )
+    }
+
+    fn source(&self) -> Option<&CompactBlockSource> {
+        None
     }
 
     fn cancel(&self) -> &CancellationToken {
@@ -106,12 +118,26 @@ struct ReadsTailSource<'a, Reads: CompactBlockReads> {
     reads: &'a Reads,
     view: &'a Reads::View,
     fence: Fence,
+    source: CompactBlockSource,
     cancel: &'a CancellationToken,
+}
+
+impl<Reads: CompactBlockReads> ReadsTailSource<'_, Reads> {
+    /// Returns whether `view` still reads this source's fence and data.
+    fn reads_same_source(&self, view: &Reads::View) -> bool {
+        self.reads
+            .tail_source(view)
+            .is_some_and(|(fence, source)| fence == self.fence && source.is(&self.source))
+    }
 }
 
 impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
     fn epoch_and_fence(&self) -> (ChainEpoch, Fence) {
         (Reads::view_chain_epoch(self.view), self.fence)
+    }
+
+    fn source(&self) -> Option<&CompactBlockSource> {
+        Some(&self.source)
     }
 
     fn cancel(&self) -> &CancellationToken {
@@ -121,7 +147,7 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
     async fn is_current(&self) -> bool {
         self.reads.capture_view().await.is_ok_and(|current| {
             Reads::view_chain_epoch(&current) == Reads::view_chain_epoch(self.view)
-                && self.reads.range_fence(&current) == Some(self.fence)
+                && self.reads_same_source(&current)
         })
     }
 
@@ -154,8 +180,8 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
             .read_compact_block_rows_with_lengths(self.view, range, max_bytes)
             .await?;
         // Epoch pins match by identifier, and a republished pair keeps it.
-        // Cached rows must come from the pair that still answers this fence.
-        if rows.is_some() && self.reads.range_fence(self.view) != Some(self.fence) {
+        // Cached rows must come from the data that still answers this view.
+        if rows.is_some() && !self.reads_same_source(self.view) {
             return Err(Status::aborted(
                 "the canonical view changed during the live-tail read",
             ));
@@ -173,6 +199,10 @@ fn check_cancel(source: &impl TailSource) -> Result<(), Status> {
         return Err(cancelled());
     }
     Ok(())
+}
+
+fn payload_bytes<'a>(rows: impl IntoIterator<Item = &'a SealedBlock>) -> usize {
+    rows.into_iter().map(|row| row.payload.len()).sum()
 }
 
 impl ShieldedTailBuffer {
@@ -209,29 +239,22 @@ impl ShieldedTailBuffer {
 
     pub(super) async fn load_or_refresh<Reads: CompactBlockReads>(
         &self,
-        (reads, view, fence, cancel): (&Reads, &Reads::View, Fence, &CancellationToken),
+        (reads, view, cancel): (&Reads, &Reads::View, &CancellationToken),
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
+        let Some((fence, source)) = reads.tail_source(view) else {
+            return Ok(None);
+        };
         let source = ReadsTailSource {
             reads,
             view,
             fence,
+            source,
             cancel,
         };
         self.refresh_with_limit(&source, catalog, (Some(requested), TAIL_BYTES))
             .await
-    }
-
-    /// Returns whether `source` would replace a tail built for another view
-    /// although a newer view is current, so its rows must not be installed.
-    async fn displaces_current<Source: TailSource>(
-        source: &Source,
-        tail: Option<&EncodedTail>,
-    ) -> bool {
-        let (epoch, fence) = source.epoch_and_fence();
-        tail.is_some_and(|tail| tail.epoch != epoch || tail.fence != fence)
-            && !source.is_current().await
     }
 
     async fn refresh_with_limit<Source: TailSource>(
@@ -255,11 +278,13 @@ impl ShieldedTailBuffer {
         let existing = self.load_full();
         if let Some(existing) = existing
             .as_ref()
-            .filter(|tail| tail.satisfies(epoch, fence, requested_floor))
+            .filter(|tail| tail.satisfies(source, requested_floor))
         {
             return Ok(Some(existing.clone()));
         }
-        if Self::displaces_current(source, existing.as_deref()).await {
+        // A stale view must not spend the refresh lock rebuilding rows it may
+        // not install.
+        if existing.is_some() && !source.is_current().await {
             return Ok(None);
         }
         check_cancel(source)?;
@@ -271,17 +296,12 @@ impl ShieldedTailBuffer {
         check_cancel(source)?;
         let previous = self.load_full();
         if let Some(existing) = &previous
-            && existing.satisfies(epoch, fence, requested_floor)
+            && existing.satisfies(source, requested_floor)
         {
             return Ok(Some(existing.clone()));
         }
-        if !option_ptr_eq(existing.as_ref(), previous.as_ref())
-            && Self::displaces_current(source, previous.as_deref()).await
-        {
-            return Ok(None);
-        }
         let updated = match &previous {
-            Some(existing) if existing.epoch == epoch && existing.fence == fence => {
+            Some(existing) if existing.serves(source) => {
                 prepend_missing(source, existing, requested_floor, max_tail_bytes).await?
             }
             _ => {
@@ -294,18 +314,18 @@ impl ShieldedTailBuffer {
                 .await?
             }
         };
-        if let Some(next_tail) = updated {
+        let Some(next_tail) = updated else {
+            return Ok(None);
+        };
+        // Rows built for a view that stopped being current during the build
+        // serve this request only.
+        if source.is_current().await {
             self.0
                 .current
                 .compare_and_swap(&previous, Some(next_tail.clone()));
-            return Ok(Some(next_tail));
         }
-        Ok(None)
+        Ok(Some(next_tail))
     }
-}
-
-fn option_ptr_eq<T>(left: Option<&Arc<T>>, right: Option<&Arc<T>>) -> bool {
-    left.map(Arc::as_ptr) == right.map(Arc::as_ptr)
 }
 
 impl EncodedTail {
@@ -315,12 +335,15 @@ impl EncodedTail {
             return self;
         }
         let rows: VecDeque<_> = self.rows.range(covered..).cloned().collect();
+        let bytes = payload_bytes(&rows);
         Arc::new(Self {
             epoch: self.epoch,
             fence: self.fence,
-            bytes: rows.iter().map(|row| row.payload.len()).sum(),
+            source: self.source.clone(),
+            bytes,
             byte_capped: false,
             rows,
+            build_peak_bytes: bytes,
         })
     }
 
@@ -331,13 +354,36 @@ impl EncodedTail {
         ))
     }
 
-    fn satisfies(&self, epoch: ChainEpoch, fence: Fence, requested_floor: BlockHeight) -> bool {
+    /// Returns whether these rows were read from `source`'s view and data.
+    /// A source without data identity only matches to skip preparing again.
+    fn serves(&self, source: &impl TailSource) -> bool {
+        let (epoch, fence) = source.epoch_and_fence();
         self.epoch == epoch
             && self.fence == fence
+            && source
+                .source()
+                .is_none_or(|source| self.source.as_ref().is_some_and(|own| own.is(source)))
+    }
+
+    fn satisfies(&self, source: &impl TailSource, requested_floor: BlockHeight) -> bool {
+        self.serves(source)
             && (self.byte_capped
+                || source.source().is_none()
                 || self
                     .bounds()
                     .is_some_and(|bounds| bounds.start <= requested_floor))
+    }
+
+    fn with_rows(&self, rows: VecDeque<SealedBlock>, byte_capped: bool, peak: usize) -> Self {
+        Self {
+            epoch: self.epoch,
+            fence: self.fence,
+            source: self.source.clone(),
+            bytes: payload_bytes(&rows),
+            byte_capped,
+            rows,
+            build_peak_bytes: peak,
+        }
     }
 
     pub(super) fn select(
@@ -372,7 +418,14 @@ impl EncodedTail {
         selected
     }
 
-    async fn retained_prefix<Source: TailSource>(
+    /// Returns the rows below `source`'s tip that its view still holds with
+    /// the same bytes.
+    ///
+    /// Block hashes link the rows, so a matching hash keeps every row below
+    /// it. Tree sizes come from the store's seed checkpoint rather than the
+    /// block, so the highest kept row must also read back byte for byte;
+    /// later rows only add their own commitments to it.
+    async fn verified_prefix<Source: TailSource>(
         &self,
         source: &Source,
         first: BlockHeight,
@@ -408,7 +461,26 @@ impl EncodedTail {
                 hi = mid;
             }
         }
-        Ok(self.rows.range(left.min(lo)..lo).cloned().collect())
+        let kept: VecDeque<_> = self.rows.range(left.min(lo)..lo).cloned().collect();
+        let Some(top) = kept.back() else {
+            return Ok(kept);
+        };
+        check_cancel(source)?;
+        let reread = encode_range(
+            source,
+            BlockHeightRange::inclusive(top.id.height, top.id.height),
+        )
+        .await?;
+        let identical = reread
+            .as_deref()
+            .and_then(<[SealedBlock]>::first)
+            .is_some_and(|row| {
+                row.id == top.id
+                    && row.parent == top.parent
+                    && row.native_bytes == top.native_bytes
+                    && row.payload == top.payload
+            });
+        Ok(if identical { kept } else { VecDeque::new() })
     }
 
     fn push_with_limit(&mut self, row: SealedBlock, max_tail_bytes: usize) {
@@ -434,7 +506,7 @@ async fn build_or_extend<Source: TailSource>(
 ) -> Result<Option<Arc<EncodedTail>>, Status> {
     let (epoch, fence) = source.epoch_and_fence();
     let retained = match previous {
-        Some(prior) => prior.retained_prefix(source, window_floor).await?,
+        Some(prior) => prior.verified_prefix(source, window_floor).await?,
         None => VecDeque::new(),
     };
     // A retained capped front keeps the cap, so a floor below it does not
@@ -457,26 +529,32 @@ async fn build_or_extend<Source: TailSource>(
     let mut prior = retained.back().map(|row| row.id).or_else(|| {
         catalog.and_then(|(end, id)| (Some(end.next()?) == Some(start_floor)).then_some(id))
     });
+    let bytes = payload_bytes(&retained);
     let mut tail = EncodedTail {
         epoch,
         fence,
-        bytes: retained.iter().map(|row| row.payload.len()).sum(),
+        source: source.source().cloned(),
+        bytes,
         byte_capped,
         rows: retained,
+        build_peak_bytes: bytes,
     };
     if let Some(first) = next
         && first <= epoch.visible_tip_height
     {
         let span = BlockHeightRange::inclusive(first, epoch.visible_tip_height);
-        let Some(rows) = encode_span(source, span, prior).await? else {
-            return Ok(None);
+        let mut peak = tail.build_peak_bytes;
+        let mut keep = |chunk: Vec<SealedBlock>| {
+            peak = peak.max(tail.bytes + payload_bytes(&chunk));
+            for row in chunk {
+                tail.push_with_limit(row, max_tail_bytes);
+            }
         };
-        if let Some(last) = rows.last() {
-            prior = Some(last.id);
+        match encode_span(source, span, prior, &mut keep).await? {
+            SpanEnd::Unsupported => return Ok(None),
+            SpanEnd::Through(last) => prior = last.or(prior),
         }
-        for row in rows {
-            tail.push_with_limit(row, max_tail_bytes);
-        }
+        tail.build_peak_bytes = peak;
     }
     if prior.is_some_and(|id| {
         id.height == epoch.visible_tip_height && id.hash != epoch.visible_tip_hash
@@ -501,34 +579,48 @@ async fn prepend_missing<Source: TailSource>(
     target_floor: BlockHeight,
     max_tail_bytes: usize,
 ) -> Result<Option<Arc<EncodedTail>>, Status> {
+    let unchanged = || {
+        Ok(Some(Arc::new(existing.with_rows(
+            existing.rows.clone(),
+            existing.byte_capped,
+            existing.build_peak_bytes,
+        ))))
+    };
     let Some(bounds) = existing.bounds() else {
-        return Ok(Some(Arc::new(EncodedTail {
-            epoch: existing.epoch,
-            fence: existing.fence,
-            rows: existing.rows.clone(),
-            bytes: existing.bytes,
-            byte_capped: existing.byte_capped,
-        })));
+        return unchanged();
     };
     if bounds.start <= target_floor || existing.byte_capped {
-        return Ok(Some(Arc::new(EncodedTail {
-            epoch: existing.epoch,
-            fence: existing.fence,
-            rows: existing.rows.clone(),
-            bytes: existing.bytes,
-            byte_capped: existing.byte_capped,
-        })));
+        return unchanged();
     }
     let Some(end_val) = bounds.start.value().checked_sub(1) else {
-        return Ok(Some(Arc::new(EncodedTail {
-            epoch: existing.epoch,
-            fence: existing.fence,
-            rows: existing.rows.clone(),
-            bytes: existing.bytes,
-            byte_capped: existing.byte_capped,
-        })));
+        return unchanged();
     };
     read_prepend_batches(source, existing, (target_floor, end_val), max_tail_bytes).await
+}
+
+/// The highest contiguous rows of one prepend batch that fit a byte budget.
+struct PrependWindow {
+    rows: VecDeque<SealedBlock>,
+    bytes: usize,
+    budget: usize,
+    /// The last row read, which must link to the rows above the batch.
+    top: Option<SealedBlock>,
+    dropped: bool,
+}
+
+impl PrependWindow {
+    fn push(&mut self, row: SealedBlock) {
+        self.top = Some(row.clone());
+        self.bytes += row.payload.len();
+        self.rows.push_back(row);
+        while self.bytes > self.budget {
+            let Some(evicted) = self.rows.pop_front() else {
+                break;
+            };
+            self.bytes -= evicted.payload.len();
+            self.dropped = true;
+        }
+    }
 }
 
 async fn read_prepend_batches<Source: TailSource>(
@@ -538,7 +630,9 @@ async fn read_prepend_batches<Source: TailSource>(
     max_tail_bytes: usize,
 ) -> Result<Option<Arc<EncodedTail>>, Status> {
     let mut remaining_bytes = max_tail_bytes.saturating_sub(existing.bytes);
-    let mut batches: Vec<Vec<SealedBlock>> = Vec::new();
+    let mut kept_bytes = 0;
+    let mut peak = existing.bytes;
+    let mut batches: Vec<VecDeque<SealedBlock>> = Vec::new();
     let mut expected_height = existing.rows.front().map_or(0, |row| row.id.height.value());
     let mut expected_parent = existing.rows.front().map(|row| row.parent);
     let mut byte_capped =
@@ -550,61 +644,76 @@ async fn read_prepend_batches<Source: TailSource>(
             .max(target_floor.value());
         let span =
             BlockHeightRange::inclusive(BlockHeight::new(batch_start), BlockHeight::new(cursor));
-        let Some(mut batch) = encode_span(source, span, None).await? else {
-            return Ok(None);
+        let mut window = PrependWindow {
+            rows: VecDeque::new(),
+            bytes: 0,
+            budget: remaining_bytes,
+            top: None,
+            dropped: false,
         };
-        let Some(last_row) = batch.last() else {
+        let held = existing.bytes + kept_bytes;
+        let mut keep = |chunk: Vec<SealedBlock>| {
+            peak = peak.max(held + window.bytes + payload_bytes(&chunk));
+            for row in chunk {
+                window.push(row);
+            }
+        };
+        if matches!(
+            encode_span(source, span, None, &mut keep).await?,
+            SpanEnd::Unsupported
+        ) {
+            return Ok(None);
+        }
+        let Some(top) = &window.top else {
             return Err(Status::data_loss("missing canonical tail block"));
         };
-        if last_row.id.height.value() + 1 != expected_height
-            || expected_parent.is_some_and(|parent| last_row.id.hash != parent)
+        if top.id.height.value() + 1 != expected_height
+            || expected_parent.is_some_and(|parent| top.id.hash != parent)
         {
             return Err(Status::data_loss("discontinuous canonical tail"));
         }
-        let mut keep_from = batch.len();
-        for (idx, row) in batch.iter().enumerate().rev() {
-            if row.payload.len() > remaining_bytes {
-                byte_capped = true;
-                break;
-            }
-            remaining_bytes -= row.payload.len();
-            keep_from = idx;
-        }
-        let kept = batch.split_off(keep_from);
-        if kept.is_empty() {
+        byte_capped |= window.dropped;
+        let Some(front) = window.rows.front() else {
             break;
-        }
-        expected_height = kept[0].id.height.value();
-        expected_parent = Some(kept[0].parent);
-        batches.push(kept);
+        };
+        expected_height = front.id.height.value();
+        expected_parent = Some(front.parent);
+        remaining_bytes -= window.bytes;
+        kept_bytes += window.bytes;
+        batches.push(window.rows);
         if byte_capped || batch_start == 0 || batch_start <= target_floor.value() {
             break;
         }
         cursor = batch_start - 1;
     }
-    let mut rows =
-        VecDeque::with_capacity(batches.iter().map(Vec::len).sum::<usize>() + existing.rows.len());
+    let mut rows = VecDeque::with_capacity(
+        batches.iter().map(VecDeque::len).sum::<usize>() + existing.rows.len(),
+    );
     for batch in batches.into_iter().rev() {
         rows.extend(batch);
     }
     rows.extend(existing.rows.iter().cloned());
-    let bytes = rows.iter().map(|row| row.payload.len()).sum();
-    Ok(Some(Arc::new(EncodedTail {
-        epoch: existing.epoch,
-        fence: existing.fence,
-        rows,
-        bytes,
-        byte_capped,
-    })))
+    Ok(Some(Arc::new(existing.with_rows(rows, byte_capped, peak))))
 }
 
+enum SpanEnd {
+    /// The source cannot supply stored row lengths.
+    Unsupported,
+    /// Every row was handed over; holds the last row's identity.
+    Through(Option<BlockId>),
+}
+
+/// Reads `span` in ascending storage chunks and hands each linked chunk to
+/// `keep`, so a build holds its kept rows and at most one chunk at a time.
+///
+/// Each chunk is capped at [`crate::BLOCK_RANGE_CHUNK_MAX_BYTES`] of stored
+/// bytes, except that a single row larger than the cap is read alone.
 async fn encode_span<Source: TailSource>(
     source: &Source,
     span: BlockHeightRange,
     mut prior: Option<BlockId>,
-) -> Result<Option<Vec<SealedBlock>>, Status> {
-    let mut out =
-        Vec::with_capacity(usize::try_from(span.end.value() - span.start.value() + 1).unwrap_or(0));
+    keep: &mut impl FnMut(Vec<SealedBlock>),
+) -> Result<SpanEnd, Status> {
     let mut next = Some(span.start);
     while let Some(height) = next.filter(|height| *height <= span.end) {
         check_cancel(source)?;
@@ -612,9 +721,9 @@ async fn encode_span<Source: TailSource>(
             BlockHeight::new(height.value().saturating_add(ENCODE_BATCH_BLOCKS - 1)).min(span.end);
         let Some(rows) = encode_range(source, BlockHeightRange::inclusive(height, last)).await?
         else {
-            return Ok(None);
+            return Ok(SpanEnd::Unsupported);
         };
-        for row in rows {
+        for row in &rows {
             if next != Some(row.id.height)
                 || row.id.height > last
                 || prior.is_some_and(|id| id.hash != row.parent)
@@ -623,10 +732,10 @@ async fn encode_span<Source: TailSource>(
             }
             prior = Some(row.id);
             next = row.id.height.next();
-            out.push(row);
         }
+        keep(rows);
     }
-    Ok(Some(out))
+    Ok(SpanEnd::Through(prior))
 }
 
 impl PublishedShieldedCatalog {
@@ -679,6 +788,8 @@ async fn encode_range<Source: TailSource>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use parking_lot::Mutex;
     use zinder_core::{
         ArtifactSchemaVersion, CanonicalBlockFactsSequenceDigest,
@@ -694,9 +805,14 @@ mod tests {
         blocks: Vec<CompactBlockArtifact>,
         reads: Mutex<Vec<BlockHeightRange>>,
         unsupported: bool,
-        current: bool,
+        current: Arc<AtomicBool>,
         cancel: CancellationToken,
         cancel_on_read: bool,
+        /// Marks the view stale when a read starts.
+        stale_on_read: bool,
+        native_row_bytes: usize,
+        owner: Arc<()>,
+        source: CompactBlockSource,
     }
 
     fn mock_hash(height: u32, branch: u8) -> BlockHash {
@@ -746,15 +862,20 @@ mod tests {
             CanonicalEventFence::new(epoch.id, u64::from(tip), tip_id, digest),
             CanonicalHistoryBounds::complete(),
         );
+        let owner = Arc::new(());
         MockTailSource {
             epoch,
             fence,
             blocks,
             reads: Mutex::new(Vec::new()),
             unsupported: false,
-            current: true,
+            current: Arc::new(AtomicBool::new(true)),
             cancel: CancellationToken::new(),
             cancel_on_read: false,
+            stale_on_read: false,
+            native_row_bytes: 64,
+            source: CompactBlockSource::of(&owner),
+            owner,
         }
     }
 
@@ -763,12 +884,16 @@ mod tests {
             (self.epoch, self.fence)
         }
 
+        fn source(&self) -> Option<&CompactBlockSource> {
+            Some(&self.source)
+        }
+
         fn cancel(&self) -> &CancellationToken {
             &self.cancel
         }
 
         fn is_current(&self) -> impl Future<Output = bool> + Send {
-            std::future::ready(self.current)
+            std::future::ready(self.current.load(Ordering::SeqCst))
         }
 
         fn block_hash_at(
@@ -785,23 +910,32 @@ mod tests {
         fn read_rows(
             &self,
             range: BlockHeightRange,
-            _max_bytes: usize,
+            max_bytes: usize,
         ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
         {
             self.reads.lock().push(range);
             if self.cancel_on_read {
                 self.cancel.cancel();
             }
+            if self.stale_on_read {
+                self.current.store(false, Ordering::SeqCst);
+            }
             if self.unsupported {
                 return std::future::ready(Ok(None));
             }
+            let mut stored = 0_usize;
             let out: Vec<_> = (range.start.value()..=range.end.value())
                 .filter_map(|height| {
                     self.blocks
                         .get(usize::try_from(height).unwrap_or(usize::MAX))
                         .cloned()
                 })
-                .map(|block| (block, 64))
+                .take_while(|_| {
+                    let fits = stored == 0 || stored + self.native_row_bytes <= max_bytes;
+                    stored += self.native_row_bytes;
+                    fits
+                })
+                .map(|block| (block, self.native_row_bytes))
                 .collect();
             std::future::ready(Ok(Some(out)))
         }
@@ -847,7 +981,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("expected byte-capped tail"))?;
         assert_eq!(capped.bounds(), Some(span(4, 10)));
         assert!(capped.byte_capped);
-        assert!(capped.satisfies(source.epoch, source.fence, BlockHeight::new(1)));
+        assert!(capped.satisfies(&source, BlockHeight::new(1)));
 
         let precancelled = build_source(10, 1);
         precancelled.cancel.cancel();
@@ -882,7 +1016,7 @@ mod tests {
             .await?
             .ok_or_else(|| eyre::eyre!("expected extended tail"))?;
         assert_eq!(tail_two.bounds(), Some(span(3, 6)));
-        assert_eq!(*extended.reads.lock(), vec![span(6, 6)]);
+        assert_eq!(*extended.reads.lock(), vec![span(5, 5), span(6, 6)]);
         assert_eq!(
             tail_two.rows[0].payload.as_ptr(),
             tail_one.rows[0].payload.as_ptr()
@@ -903,8 +1037,8 @@ mod tests {
             .await?
             .ok_or_else(|| eyre::eyre!("expected current tail"))?;
 
-        let mut stale = build_source(5, 1);
-        stale.current = false;
+        let stale = build_source(5, 1);
+        stale.current.store(false, Ordering::SeqCst);
         assert!(
             buffer
                 .refresh_with_limit(&stale, None, (Some(span(3, 5)), TAIL_BYTES))
@@ -992,7 +1126,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("expected extended tail"))?;
         assert_eq!(extended.bounds(), Some(span(5, 11)));
         assert!(extended.byte_capped);
-        assert_eq!(*advanced.reads.lock(), vec![span(11, 11)]);
+        assert_eq!(*advanced.reads.lock(), vec![span(10, 10), span(11, 11)]);
         Ok(())
     }
 
@@ -1000,6 +1134,8 @@ mod tests {
     struct FencedReads {
         source: Arc<MockTailSource>,
         fence: Arc<Mutex<Option<Fence>>>,
+        /// The admitted data the fence reads, replaced by a republication.
+        source_owner: Arc<Mutex<Option<Arc<()>>>>,
         republished: Option<Fence>,
         pin_lost: bool,
     }
@@ -1008,6 +1144,7 @@ mod tests {
         fn new(source: MockTailSource) -> Self {
             Self {
                 fence: Arc::new(Mutex::new(Some(source.fence))),
+                source_owner: Arc::new(Mutex::new(Some(source.owner.clone()))),
                 source: Arc::new(source),
                 republished: None,
                 pin_lost: false,
@@ -1028,6 +1165,15 @@ mod tests {
 
         fn range_fence(&self, _view: &ChainEpoch) -> Option<Fence> {
             *self.fence.lock()
+        }
+
+        fn tail_source(&self, _view: &ChainEpoch) -> Option<(Fence, CompactBlockSource)> {
+            let source = self
+                .source_owner
+                .lock()
+                .as_ref()
+                .map(CompactBlockSource::of)?;
+            Some(((*self.fence.lock())?, source))
         }
 
         fn view_activations(
@@ -1106,10 +1252,10 @@ mod tests {
         let buffer = ShieldedTailBuffer::default();
         let mut reads = FencedReads::new(build_source(6, 1));
         reads.republished = Some(build_source(6, 2).fence);
-        let (epoch, fence) = reads.source.epoch_and_fence();
+        let epoch = reads.source.epoch;
         let cancel = CancellationToken::new();
         let refreshed = buffer
-            .load_or_refresh((&reads, &epoch, fence, &cancel), None, span(3, 6))
+            .load_or_refresh((&reads, &epoch, &cancel), None, span(3, 6))
             .await;
         assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
         assert!(buffer.load_full().is_none());
@@ -1120,18 +1266,18 @@ mod tests {
     async fn an_expired_pin_is_not_read_as_a_reorg() -> eyre::Result<()> {
         let buffer = ShieldedTailBuffer::default();
         let reads = FencedReads::new(build_source(6, 1));
-        let (epoch, fence) = reads.source.epoch_and_fence();
+        let epoch = reads.source.epoch;
         let cancel = CancellationToken::new();
         buffer
-            .load_or_refresh((&reads, &epoch, fence, &cancel), None, span(3, 6))
+            .load_or_refresh((&reads, &epoch, &cancel), None, span(3, 6))
             .await?
             .ok_or_else(|| eyre::eyre!("expected initial tail"))?;
 
         let mut advanced = FencedReads::new(build_source(7, 1));
         advanced.pin_lost = true;
-        let (epoch, fence) = advanced.source.epoch_and_fence();
+        let epoch = advanced.source.epoch;
         let refreshed = buffer
-            .load_or_refresh((&advanced, &epoch, fence, &cancel), None, span(3, 7))
+            .load_or_refresh((&advanced, &epoch, &cancel), None, span(3, 7))
             .await;
         assert!(matches!(refreshed, Err(status) if super::super::read::pin_unavailable(&status)));
         assert!(advanced.source.reads.lock().is_empty());

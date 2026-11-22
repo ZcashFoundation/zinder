@@ -3401,10 +3401,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     fn compact_block_fence(
         &self,
         epoch: zinder_core::ChainEpoch,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
+    ) -> Option<zinder_query::CompactBlockFence> {
         if self.expose_range_fence {
             self.served_inner(self.view_index())
                 .compact_block_fence(epoch)

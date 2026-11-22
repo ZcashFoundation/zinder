@@ -503,6 +503,21 @@ where
         zinder_core::CanonicalHistoryBounds,
     )> {
         self.compact_block_fence(*view)
+            .map(|fence| (fence.event_fence, fence.history_bounds))
+    }
+
+    fn tail_source(
+        &self,
+        view: &Self::View,
+    ) -> Option<(
+        (
+            zinder_store::CanonicalEventFence,
+            zinder_core::CanonicalHistoryBounds,
+        ),
+        zinder_query::CompactBlockSource,
+    )> {
+        self.compact_block_fence(*view)
+            .map(|fence| ((fence.event_fence, fence.history_bounds), fence.source))
     }
 
     fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {

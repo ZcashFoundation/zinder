@@ -285,7 +285,7 @@ impl PublishedRangeRead {
         }
         match self
             .tail
-            .load_or_refresh((reads, view, fence, cancel), catalog_end, *chunk)
+            .load_or_refresh((reads, view, cancel), catalog_end, *chunk)
             .await
         {
             Ok(Some(live)) => self.encoded_span(*chunk, self.order(), &live).map_or_else(
@@ -296,6 +296,10 @@ impl PublishedRangeRead {
                 },
             ),
             Ok(None) => AnchorPlan::FallbackNative,
+            // Cancellation and an expired pin end this read as the native path
+            // would. A tail that fails to build spans heights beyond this
+            // chunk, so the native read reports any fault at the chunk that
+            // holds it, as a reader without the tail does.
             Err(status) if status.code() == tonic::Code::Cancelled || pin_unavailable(&status) => {
                 AnchorPlan::Failed(status)
             }

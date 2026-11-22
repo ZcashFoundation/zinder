@@ -1,4 +1,5 @@
 mod admission;
+mod tail_identity;
 
 use super::{
     EpochPinRecorder, assert_one_linked_chain, assert_stream_ended_with, block_range_request,
@@ -1376,17 +1377,20 @@ async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog()
     let ranges = [(1, 6), (6, 1)];
 
     assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
-    assert_eq!(
-        *recorder.recorded_rows_with_lengths.lock(),
-        vec![span(1, 6)]
-    );
+    // Both adapters share the bootstrap tail here, and each verifies the top
+    // row the other one read before reusing its rows.
+    let bootstrap_reads = recorder.recorded_rows_with_lengths.lock().clone();
+    assert_eq!(bootstrap_reads.first(), Some(&span(1, 6)));
+    assert!(bootstrap_reads[1..].iter().all(|read| *read == span(6, 6)));
 
     assert!(publisher.publish_next(&store.reader)?);
     assert!(history.refresh(store.reader.as_ref()).await?);
     assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
-    assert_eq!(
-        *recorder.recorded_rows_with_lengths.lock(),
-        vec![span(1, 6)]
+    let adopted_reads = recorder.recorded_rows_with_lengths.lock().clone();
+    assert!(
+        adopted_reads[bootstrap_reads.len()..]
+            .iter()
+            .all(|read| *read == span(6, 6))
     );
     assert_eq!(
         recorder.recorded_compact_block_ranges(),
