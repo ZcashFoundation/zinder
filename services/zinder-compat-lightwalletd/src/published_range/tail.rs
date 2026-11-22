@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwapOption;
 use prost::Message as _;
@@ -198,6 +198,7 @@ impl ShieldedTailBuffer {
         (reads, view, cancel): (&Reads, &Reads::View, &CancellationToken),
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
+        max_wait: Duration,
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
         let Some(CompactBlockFence {
             event_fence,
@@ -214,15 +215,16 @@ impl ShieldedTailBuffer {
             source,
             cancel,
         };
-        self.refresh_with_limit(&source, catalog, (requested, TAIL_BYTES))
+        self.refresh(&source, catalog, (requested, TAIL_BYTES), max_wait)
             .await
     }
 
-    async fn refresh_with_limit<Source: TailSource>(
+    async fn refresh<Source: TailSource>(
         &self,
         source: &Source,
         catalog: Option<(BlockHeight, BlockId)>,
         (requested, max_tail_bytes): (BlockHeightRange, usize),
+        max_wait: Duration,
     ) -> Result<Option<Arc<EncodedTail>>, Status> {
         let cancel = source.cancel();
         check_cancel(source)?;
@@ -252,10 +254,17 @@ impl ShieldedTailBuffer {
             return Ok(None);
         }
         check_cancel(source)?;
-        let _guard = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(cancelled()),
-            guard = self.0.refresh_lock.lock() => guard,
+        let _guard = match self.0.refresh_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) if max_wait.is_zero() => return Ok(None),
+            Err(_) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(cancelled()),
+                acquired = tokio::time::timeout(max_wait, self.0.refresh_lock.lock()) => match acquired {
+                    Ok(guard) => guard,
+                    Err(_) => return Ok(None),
+                },
+            },
         };
         check_cancel(source)?;
         let previous = self.load_full();
@@ -850,6 +859,23 @@ mod tests {
         BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last))
     }
 
+    impl ShieldedTailBuffer {
+        async fn refresh_with_limit(
+            &self,
+            source: &MockTailSource,
+            catalog: Option<(BlockHeight, BlockId)>,
+            requested: (BlockHeightRange, usize),
+        ) -> Result<Option<Arc<EncodedTail>>, Status> {
+            self.refresh(
+                source,
+                catalog,
+                requested,
+                crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            )
+            .await
+        }
+    }
+
     async fn fill(
         buffer: &ShieldedTailBuffer,
         source: &MockTailSource,
@@ -1432,7 +1458,12 @@ mod tests {
         let epoch = reads.source.epoch;
         let cancel = CancellationToken::new();
         let refreshed = buffer
-            .load_or_refresh((&reads, &epoch, &cancel), None, span(3, 6))
+            .load_or_refresh(
+                (&reads, &epoch, &cancel),
+                None,
+                span(3, 6),
+                crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            )
             .await;
         assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
         assert!(buffer.load_full().is_none());
@@ -1440,20 +1471,28 @@ mod tests {
         let mut same_fence = FencedReads::new(build_source(6, 1));
         same_fence.republished = Some(same_fence.source.fence);
         let refreshed = buffer
-            .load_or_refresh((&same_fence, &epoch, &cancel), None, span(3, 6))
+            .load_or_refresh(
+                (&same_fence, &epoch, &cancel),
+                None,
+                span(3, 6),
+                crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            )
             .await;
         assert!(matches!(refreshed, Err(status) if status.code() == Code::Aborted));
         assert!(buffer.load_full().is_none());
         Ok(())
     }
 
-    fn published_read() -> eyre::Result<super::super::PublishedRangeRead> {
+    fn published_read(
+        buffer: ShieldedTailBuffer,
+        max_wait: Duration,
+    ) -> eyre::Result<super::super::PublishedRangeRead> {
         Ok(super::super::PublishedRangeRead::new(
             None,
-            ShieldedTailBuffer::default(),
+            buffer,
             CompactBlockShape::for_range(&[])?,
             false,
-            crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+            crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN).with_max_wait(max_wait),
         ))
     }
 
@@ -1467,26 +1506,106 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tail_fill_allows_the_replacement_to_serve_at_its_wait_limit()
+    -> eyre::Result<()> {
+        use super::super::PublishedRangeRead;
+        use crate::block_methods::RangeSource;
+
+        let buffer = ShieldedTailBuffer::default();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut original = build_source(6, 1);
+        original.read_gate = Some(gate.clone());
+        let owner = fill(&buffer, &original, span(3, 6), TAIL_BYTES);
+        tokio::pin!(owner);
+        assert!(poll_once(owner.as_mut()).is_pending());
+        assert_eq!(*original.reads.lock(), vec![span(3, 6)]);
+        original.current.store(false, Ordering::SeqCst);
+
+        let replacement = FencedReads::new(build_source(6, 2));
+        let shape = CompactBlockShape::for_range(&[])?;
+        let expected = replacement.source.blocks[3..=6]
+            .iter()
+            .cloned()
+            .map(|block| Ok(shape.message(block)?.encode_to_vec()))
+            .collect::<Result<Vec<_>, Status>>()?;
+        for wait in [Duration::ZERO, Duration::from_millis(80)] {
+            let published = published_read(buffer.clone(), wait)?;
+            let read = published.read(&replacement, chunk_read(ChunkView::Current), |_, rows| rows);
+            tokio::pin!(read);
+            if !wait.is_zero() {
+                assert!(poll_once(read.as_mut()).is_pending());
+                tokio::time::advance(wait / 2).await;
+                assert!(poll_once(read.as_mut()).is_pending());
+                tokio::time::advance(wait / 2).await;
+            }
+            let std::task::Poll::Ready(outcome) = poll_once(read.as_mut()) else {
+                eyre::bail!("replacement still waiting for the tail after {wait:?}");
+            };
+            let blocks = outcome
+                .converted
+                .map_err(|_| eyre::eyre!("canonical fallback failed"))?;
+            let messages =
+                <PublishedRangeRead as RangeSource<FencedReads>>::messages(&published, blocks)?;
+            let bytes = messages.into_iter().collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(replacement.native_reads.load(Ordering::SeqCst), 2);
+        assert!(replacement.source.reads.lock().is_empty());
+        assert!(poll_once(owner.as_mut()).is_pending());
+        gate.notify_one();
+        owner.await?;
+        assert!(buffer.load_full().is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiter_does_not_fall_back_at_its_tail_deadline() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let _guard = buffer.0.refresh_lock.lock().await;
+        let wait = Duration::from_millis(80);
+        let published = published_read(buffer.clone(), wait)?;
+        let reads = FencedReads::new(build_source(6, 1));
+        let chunk = chunk_read(ChunkView::Current);
+        let cancel = chunk.cancel.clone();
+        let read = published.read(&reads, chunk, |_, rows| rows.len());
+        tokio::pin!(read);
+        assert!(poll_once(read.as_mut()).is_pending());
+        tokio::time::advance(wait).await;
+        cancel.cancel();
+        assert!(
+            matches!(read.await.converted, Err(ChunkReadFailure::Failed(status)) if status.code() == Code::Cancelled)
+        );
+        assert_eq!(reads.native_reads.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn an_expired_pin_during_the_tail_fill_reaches_the_existing_retry() -> eyre::Result<()> {
         let mut reads = FencedReads::new(build_source(6, 1));
         reads.pin_lost = true;
 
-        let current = published_read()?
-            .read(&reads, chunk_read(ChunkView::Current), |_, blocks| {
-                blocks.len()
-            })
-            .await;
+        let current = published_read(
+            ShieldedTailBuffer::default(),
+            crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        )?
+        .read(&reads, chunk_read(ChunkView::Current), |_, blocks| {
+            blocks.len()
+        })
+        .await;
         assert!(matches!(current.converted, Ok(4)));
         assert_eq!(reads.native_reads.load(Ordering::SeqCst), 1);
 
-        let captured = published_read()?
-            .read(
-                &reads,
-                chunk_read(ChunkView::Captured(reads.source.epoch)),
-                |_, blocks| blocks.len(),
-            )
-            .await;
+        let captured = published_read(
+            ShieldedTailBuffer::default(),
+            crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        )?
+        .read(
+            &reads,
+            chunk_read(ChunkView::Captured(reads.source.epoch)),
+            |_, blocks| blocks.len(),
+        )
+        .await;
         assert!(matches!(
             captured.converted,
             Err(ChunkReadFailure::Failed(status)) if super::super::read::pin_unavailable(&status)

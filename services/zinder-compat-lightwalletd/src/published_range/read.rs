@@ -294,7 +294,12 @@ impl PublishedRangeRead {
         }
         match self
             .tail
-            .load_or_refresh((reads, view, cancel), catalog_end, *chunk)
+            .load_or_refresh(
+                (reads, view, cancel),
+                catalog_end,
+                *chunk,
+                self.limits.max_wait(),
+            )
             .await
         {
             Ok(Some(live)) => self.encoded_span(*chunk, self.order(), &live).map_or_else(
