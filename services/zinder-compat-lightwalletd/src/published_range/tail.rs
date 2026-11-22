@@ -636,10 +636,15 @@ async fn encode_range<Source: TailSource>(
     else {
         return Ok(None);
     };
+    check_cancel(source)?;
     if blocks.is_empty() {
         return Err(Status::data_loss("missing canonical tail block"));
     }
+    let cancel = source.cancel().clone();
     let rows = tokio::task::spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
         let shape = CompactBlockShape::for_range(&[])?;
         blocks
             .into_iter()
@@ -1036,6 +1041,43 @@ mod tests {
         fill(&empty, &first_fill, span(3, 7), TAIL_BYTES).await?;
         assert!(empty.load_full().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn cancelled_storage_results_skip_queued_conversion() -> eyre::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                let (started, running) = tokio::sync::oneshot::channel();
+                let (release, gate) = tokio::sync::oneshot::channel::<()>();
+                let worker = tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    let _ = gate.blocking_recv();
+                });
+                running.await?;
+
+                let mut disconnected = build_source(5, 1);
+                disconnected.cancel_on_read = true;
+                let read = encode_range(&disconnected, span(1, 5));
+                tokio::pin!(read);
+                assert!(matches!(
+                    poll_once(read.as_mut()),
+                    std::task::Poll::Ready(Err(status)) if status.code() == Code::Cancelled
+                ));
+
+                let queued = build_source(5, 1);
+                let conversion = encode_range(&queued, span(1, 5));
+                tokio::pin!(conversion);
+                assert!(poll_once(conversion.as_mut()).is_pending());
+                queued.cancel.cancel();
+                drop(release);
+                worker.await?;
+                assert!(
+                    matches!(conversion.await, Err(status) if status.code() == Code::Cancelled)
+                );
+                Ok(())
+            })
     }
 
     #[tokio::test]
