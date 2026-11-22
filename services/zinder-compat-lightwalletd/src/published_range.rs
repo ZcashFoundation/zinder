@@ -73,6 +73,8 @@ impl PublishedShieldedRange {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing terminal block header")
             })?;
+        #[cfg(target_os = "linux")]
+        let fresh_file = crate::sealed_history::verity::reopen_staged(&staged)?;
         let mut writer = SegmentWriter::create(
             path,
             staged,
@@ -106,6 +108,8 @@ impl PublishedShieldedRange {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "height overflow"))?;
         }
         let segment = writer.finish()?;
+        #[cfg(target_os = "linux")]
+        crate::sealed_history::verity::protect_new_segment(&fresh_file, segment.verity)?;
         Self::open(
             path,
             ShieldedRangeIdentity {

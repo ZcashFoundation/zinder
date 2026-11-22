@@ -931,14 +931,38 @@ async fn wallets_read_across_multiple_signed_segments_and_the_live_suffix() -> e
     Ok(())
 }
 
+fn copy_portable_catalog(source: &Path, destination: &Path) -> eyre::Result<()> {
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == "current.json"
+            || entry.path().extension().is_some_and(|ext| ext == "bin")
+        {
+            std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders()
 -> eyre::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let files = tempfile::tempdir()?;
     let fixture = ReaderFixture::new(writer(&wallet_chain(1)?)?.into_serving_store_fixture()?)?;
-    let directory = files.path().join("catalog");
-    let history = fixture.publish(&directory, SEALED_END).await?;
+    let source = files.path().join("catalog");
+    fixture.publish(&source, SEALED_END).await?;
+    let directory = files.path().join("portable");
+    copy_portable_catalog(&source, &directory)?;
+    let history = Arc::new(
+        PublishedShieldedHistory::open(
+            &directory.join("current.json"),
+            &files.path().join("verification.pub"),
+            false,
+            fixture.reader.as_ref(),
+        )
+        .await?,
+    );
     let segment = std::fs::read_dir(&directory)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -1002,9 +1026,11 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
         std::num::NonZeroU32::MIN,
     )?;
     while publisher.publish_next(&fixture.reader)? {}
+    let portable = files.path().join("portable");
+    copy_portable_catalog(&directory, &portable)?;
     let history = Arc::new(
         PublishedShieldedHistory::open(
-            &directory.join("current.json"),
+            &portable.join("current.json"),
             &key,
             false,
             fixture.reader.as_ref(),
@@ -1019,7 +1045,7 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
         ),
     )
     .await?;
-    for entry in std::fs::read_dir(directory)? {
+    for entry in std::fs::read_dir(portable)? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "bin") {
             let mut segment = std::fs::read(&path)?;

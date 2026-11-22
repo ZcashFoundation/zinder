@@ -447,6 +447,32 @@ fn kernel_protected_segment_with_sha512_rejects_a_signed_sha256_pin() -> eyre::R
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem"]
+fn kernel_protected_publication_requires_a_closed_writer_and_matching_pin() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded");
+    let identity = publish(&path, 1, 3)?;
+    let reader = File::open(&path)?;
+    let writer = fs::OpenOptions::new().write(true).open(&path)?;
+    assert_eq!(
+        verity::protect_new_segment(&reader, identity.verity)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::ExecutableFileBusy)
+    );
+    drop(writer);
+    assert_eq!(
+        verity::protect_new_segment(&reader, Some([0; 32]))
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    assert_eq!(verity::measure(&reader)?, identity.verity);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
 fn kernel_protected_payload_must_match_its_index_before_serving() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;

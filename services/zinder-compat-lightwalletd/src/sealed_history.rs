@@ -26,6 +26,7 @@ const HEADER_LEN: usize = 52;
 const LENGTHS_LEN: usize = 8;
 const INDEX_LEN: usize = 112;
 mod index;
+pub(crate) mod verity;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -185,8 +186,9 @@ impl SegmentWriter {
             if failure.error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(failure.error);
             }
-            // A crash after the directory entry appeared can leave a complete earlier publication.
+            // Keep the newly written inode for protection after authenticating the old staging name.
             SealedHistory::open(&self.target, identity)?;
+            failure.file.persist(&self.target)?;
         }
         File::open(parent_directory(&self.target))?.sync_all()?;
         Ok(identity)
@@ -286,7 +288,7 @@ impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
-        let protected = index::pinned_verity(expected.verity, || measured_verity(&file))?;
+        let protected = index::pinned_verity(expected.verity, || verity::measure(&file))?;
         let rows = index::admit(&mut &file, expected, file_len, protected)?;
         Ok(Self {
             kernel_verified: protected,
@@ -400,52 +402,6 @@ impl SealedHistory {
             })
             .collect()
     }
-}
-
-#[cfg(target_os = "linux")]
-fn kernel_verifies_reads(file: &File) -> bool {
-    use rustix::fs::{AtFlags, StatxAttributes, StatxFlags, fstatfs, statx};
-
-    // Restrict the attestation to kernel filesystems implementing fs-verity.
-    // A userspace or network filesystem can supply its own statx attributes.
-    let native = fstatfs(file).is_ok_and(|stats| {
-        matches!(
-            i128::from(stats.f_type) & 0xffff_ffff,
-            0xef53 | 0x9123_683e | 0xf2f5_2010
-        )
-    });
-    native
-        && statx(file, c"", AtFlags::EMPTY_PATH, StatxFlags::empty()).is_ok_and(|stat| {
-            stat.stx_attributes_mask.contains(StatxAttributes::VERITY)
-                && stat.stx_attributes.contains(StatxAttributes::VERITY)
-        })
-}
-
-#[cfg(target_os = "linux")]
-fn measured_verity(file: &File) -> io::Result<Option<[u8; 32]>> {
-    use composefs_ioctls::fsverity::{MeasureVerityError, fs_ioc_measure_verity};
-
-    if !kernel_verifies_reads(file) {
-        return Ok(None);
-    }
-    fs_ioc_measure_verity(file, fs_verity::InnerHashAlgorithm::Sha256 as u8)
-        .map(Some)
-        .map_err(|error| match error {
-            MeasureVerityError::Io(source) => source,
-            MeasureVerityError::FilesystemNotSupported => {
-                io::Error::new(io::ErrorKind::Unsupported, error)
-            }
-            MeasureVerityError::VerityMissing
-            | MeasureVerityError::InvalidDigestAlgorithm { .. }
-            | MeasureVerityError::InvalidDigestSize { .. } => {
-                io::Error::new(io::ErrorKind::InvalidData, error)
-            }
-        })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn measured_verity(_file: &File) -> io::Result<Option<[u8; 32]>> {
-    Ok(None)
 }
 
 #[cfg(unix)]

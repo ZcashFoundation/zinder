@@ -1,0 +1,6 @@
+kind: changed
+body: The wallet-history publisher automatically enables fs-verity on new segments when the local Linux filesystem supports it. Readers use the signed kernel measurement to avoid rehashing each payload. Other filesystems retain portable verification.
+time: 2026-11-21T22:53:15.892043487Z
+custom:
+    Bump: patch
+    PR: "463"
