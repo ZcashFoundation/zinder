@@ -217,6 +217,16 @@ async fn wallet_adopts_first_publication_on_the_same_connection() -> Result<()> 
     assert!(publisher.publish_next(&reader)?);
     wait_for_log(&runtime, "shielded_catalog_installed").await?;
     assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
+
+    replace_manifest(&checkpoint, br#"{"manifest":"{}","signature":"invalid"}"#)?;
+    wait_for_log(&runtime, "invalid shielded range signature encoding").await?;
+    assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
+    fs::remove_file(&checkpoint)?;
+    let missing = fs::metadata(&checkpoint)
+        .err()
+        .ok_or_eyre("removed publisher checkpoint still present")?;
+    wait_for_log(&runtime, &missing.to_string()).await?;
+    assert_eq!(collect_range(&mut wallet, 1, 3).await?, expected);
     Ok(())
 }
 

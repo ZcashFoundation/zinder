@@ -112,26 +112,26 @@ impl FileStamp {
     }
 }
 
-#[derive(Eq, PartialEq)]
-enum CatalogStamp {
-    Missing,
-    Checkpoint(FileStamp),
-    Manifest(FileStamp),
+#[derive(Default, Eq, PartialEq)]
+struct CatalogStamp {
+    checkpoint: Option<FileStamp>,
+    manifest: Option<FileStamp>,
 }
 
 impl HistoryLocation {
     async fn stamp(&self) -> io::Result<CatalogStamp> {
         let location = self.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(stamp) = FileStamp::read(&location.manifest())? {
-                return Ok(CatalogStamp::Manifest(stamp));
-            }
-            if let Self::Directory(directory) = location
-                && let Some(stamp) = FileStamp::read(&directory.join(".publisher-head.json"))?
-            {
-                return Ok(CatalogStamp::Checkpoint(stamp));
-            }
-            Ok(CatalogStamp::Missing)
+            let checkpoint = match &location {
+                Self::Directory(directory) => {
+                    FileStamp::read(&directory.join(".publisher-head.json"))?
+                }
+                Self::Manifest(_) => None,
+            };
+            Ok(CatalogStamp {
+                checkpoint,
+                manifest: FileStamp::read(&location.manifest())?,
+            })
         })
         .await
         .map_err(io::Error::other)?
@@ -139,7 +139,7 @@ impl HistoryLocation {
 
     async fn initial_stamp(&self, timeout: Duration) -> io::Result<CatalogStamp> {
         let stamp = self.stamp().await?;
-        if matches!(self, Self::Manifest(_)) || stamp != CatalogStamp::Missing {
+        if matches!(self, Self::Manifest(_)) || stamp != CatalogStamp::default() {
             return Ok(stamp);
         }
         tracing::info!(target: "zinder::compat_lightwalletd",
@@ -150,7 +150,7 @@ impl HistoryLocation {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let stamp = self.stamp().await?;
-                if stamp != CatalogStamp::Missing {
+                if stamp != CatalogStamp::default() {
                     return Ok(stamp);
                 }
             }
@@ -283,15 +283,20 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("missing timeout"))?;
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         let snapshot = HistoryLocation::Manifest(files.manifest());
-        assert!(snapshot.initial_stamp(timeout).await? == CatalogStamp::Missing);
+        assert!(snapshot.initial_stamp(timeout).await? == CatalogStamp::default());
         std::fs::write(
             files.manifest(),
             b"requires immediate signature verification",
         )?;
-        assert!(matches!(
-            files.initial_stamp(timeout).await?,
-            CatalogStamp::Manifest(_)
-        ));
+        let managed = files.initial_stamp(timeout).await?;
+        assert!(managed.manifest.is_some());
+        let standalone = snapshot.stamp().await?;
+        std::fs::write(
+            dir.path().join(".publisher-head.json"),
+            b"updated checkpoint",
+        )?;
+        assert!(files.stamp().await? != managed);
+        assert!(snapshot.stamp().await? == standalone);
         Ok(())
     }
 }
