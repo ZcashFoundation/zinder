@@ -83,6 +83,19 @@ impl QualificationWalletQuery {
             .await
     }
 
+    fn live_generation(
+        &self,
+        reader: &Arc<RocksDbCanonicalReader>,
+    ) -> (std::sync::Weak<RocksDbCanonicalReader>, ReaderGeneration) {
+        let generation = Arc::downgrade(reader);
+        let capture = Arc::clone(&self.capture);
+        let weak_for_check = generation.clone();
+        let cache_generation = ReaderGeneration::live(&generation, move || {
+            std::sync::Weak::ptr_eq(&weak_for_check, &Arc::downgrade(&capture()))
+        });
+        (generation, cache_generation)
+    }
+
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
     pub async fn tree_state(
         &self,
@@ -98,12 +111,11 @@ impl QualificationWalletQuery {
             let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
-            let generation = Arc::downgrade(&reader);
-            let cache_generation =
-                ReaderGeneration::new(&generation, Arc::ptr_eq(&reader, &(self.capture)()));
+            let (generation, cache_generation) = self.live_generation(&reader);
+            let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
             let (selected, expected) = match self
                 .replays
-                .ready_state(key, &cache_generation, reader.as_ref(), request_deadline)
+                .ready_state(&key, &cache_generation, &canonical_reader, request_deadline)
                 .await?
             {
                 Some(ready @ ReadyState::Stored(_)) => {
@@ -120,7 +132,7 @@ impl QualificationWalletQuery {
                         .map_err(QueryError::canonical_read)?
                         .ok_or(QueryError::BlockNotInBestChain)?;
                     let selected = self.replays.select(
-                        key,
+                        &key,
                         &cache_generation,
                         request_deadline,
                         carried.take(),

@@ -8,8 +8,9 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt,
     mem::size_of,
-    sync::Weak,
+    sync::{Arc, Weak},
 };
 
 use zinder_core::{
@@ -24,25 +25,51 @@ pub(super) const SETTLED_MAX_ENTRIES: usize = 1_024;
 /// Default byte budget (8 MiB) for one query's settled tree-state cache.
 pub(super) const SETTLED_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+type CurrentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Lookup and ownership context for the caller's storage reader generation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ReaderGeneration {
     weak: Weak<dyn Send + Sync>,
-    is_current: bool,
+    current: CurrentCheck,
+}
+
+impl fmt::Debug for ReaderGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReaderGeneration")
+            .field("addr", &self.addr())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReaderGeneration {
-    /// Captures a weak reader handle and whether it was current when read.
-    pub(crate) fn new<T: Send + Sync + 'static>(weak: &Weak<T>, is_current: bool) -> Self {
+    /// Captures a weak reader handle alongside an authoritative current-ownership check.
+    pub(crate) fn live<T: Send + Sync + 'static>(
+        weak: &Weak<T>,
+        is_current: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self {
             weak: weak.clone(),
-            is_current,
+            current: Arc::new(is_current),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn static_for_test<T: Send + Sync + 'static>(
+        weak: &Weak<T>,
+        is_current: bool,
+    ) -> Self {
+        Self::live(weak, move || is_current)
     }
 
     /// Returns the allocation address used to identify an active flight's reader generation.
     pub(crate) fn addr(&self) -> usize {
         self.weak.as_ptr().addr()
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        (self.current)()
     }
 }
 
@@ -52,6 +79,7 @@ pub(super) struct SettledChainAnchor {
     pub(super) network: Network,
     pub(super) artifact_schema: ArtifactSchemaVersion,
     pub(super) retained: CanonicalHistoryBounds,
+    pub(super) predecessor_digest: Option<[u8; 32]>,
     pub(super) schedule_revision: Option<u64>,
     pub(super) activations_fingerprint: Option<NetworkUpgradeActivationsFingerprint>,
     pub(super) settled_tip: BlockId,
@@ -60,6 +88,9 @@ pub(super) struct SettledChainAnchor {
 impl SettledChainAnchor {
     /// Returns whether `height` lies within retained settled history under this anchor.
     pub(super) fn covers(&self, height: BlockHeight) -> bool {
+        if self.retained.preceding_checkpoint().is_some() && self.predecessor_digest.is_none() {
+            return false;
+        }
         let predecessor = self
             .retained
             .preceding_checkpoint()
@@ -67,11 +98,12 @@ impl SettledChainAnchor {
         height >= predecessor && height <= self.settled_tip.height
     }
 
-    /// Returns whether `other` preserves network, schema, retention, and upgrade schedule.
+    /// Returns whether `other` preserves network, schema, retention, seed checkpoint, and upgrade schedule.
     pub(super) fn shares_immutable_identity(&self, other: &Self) -> bool {
         self.network == other.network
             && self.artifact_schema == other.artifact_schema
             && self.retained == other.retained
+            && self.predecessor_digest == other.predecessor_digest
             && self.schedule_revision == other.schedule_revision
             && self.activations_fingerprint == other.activations_fingerprint
     }
@@ -183,21 +215,22 @@ impl SettledStates {
         if !target.covers(height) {
             return LookupStep::Miss;
         }
+        let is_current = generation.is_current();
         match self.anchor {
             None => {
-                if generation.is_current {
+                if is_current {
                     self.reset_to(target, &generation.weak);
                 }
                 LookupStep::Miss
             }
             Some(current) if current == target => {
-                if generation.is_current {
+                if is_current {
                     self.adopt_generation(&generation.weak);
                 }
                 self.get_touching(height)
                     .map_or(LookupStep::Miss, LookupStep::Hit)
             }
-            Some(_) if !generation.is_current => LookupStep::Miss,
+            Some(_) if !is_current => LookupStep::Miss,
             Some(_) if self.entries.is_empty() => {
                 self.reset_to(target, &generation.weak);
                 LookupStep::Miss
@@ -224,34 +257,42 @@ impl SettledStates {
         }
     }
 
-    pub(super) fn complete_extension_lookup(
+    pub(super) fn apply_extension_result(
         &mut self,
         (prior, target): (SettledChainAnchor, SettledChainAnchor),
         generation: &ReaderGeneration,
-        height: BlockHeight,
         extends_prior: bool,
-    ) -> Option<ServedTreeState> {
+    ) {
+        let is_current = generation.is_current();
         if self.anchor == Some(prior) {
+            if !is_current {
+                return;
+            }
             if extends_prior {
                 self.anchor = Some(target);
                 self.anchor_generations.clear();
-                if generation.is_current {
-                    self.adopt_generation(&generation.weak);
-                }
-                return self.get_touching(height);
-            }
-            if generation.is_current {
+                self.adopt_generation(&generation.weak);
+            } else {
                 self.reset_to(target, &generation.weak);
             }
+        } else if self.anchor == Some(target) && is_current {
+            self.adopt_generation(&generation.weak);
+        }
+    }
+
+    pub(super) fn cached_after_extension(
+        &mut self,
+        target: SettledChainAnchor,
+        generation: &ReaderGeneration,
+        height: BlockHeight,
+    ) -> Option<ServedTreeState> {
+        if !target.covers(height) || self.anchor != Some(target) {
             return None;
         }
-        if self.anchor == Some(target) {
-            if generation.is_current {
-                self.adopt_generation(&generation.weak);
-            }
-            return self.get_touching(height);
+        if generation.is_current() {
+            self.adopt_generation(&generation.weak);
         }
-        None
+        self.get_touching(height)
     }
 
     pub(super) fn cached_at_anchor(
@@ -275,15 +316,16 @@ impl SettledStates {
         if !anchor.covers(height) {
             return;
         }
+        let is_current = generation.is_current();
         match self.anchor {
             None => {
-                if !generation.is_current {
+                if !is_current {
                     return;
                 }
                 self.reset_to(anchor, &generation.weak);
             }
             Some(current) if current == anchor => {
-                if generation.is_current {
+                if is_current {
                     self.adopt_generation(&generation.weak);
                 }
             }
@@ -344,7 +386,13 @@ pub(super) fn tree_state_byte_footprint(tree_state: &ServedTreeState) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc};
+    use std::{
+        error::Error,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockId, CanonicalHistoryBounds,
@@ -359,11 +407,11 @@ mod tests {
     };
 
     fn current_gen(holder: &Arc<()>) -> ReaderGeneration {
-        ReaderGeneration::new(&Arc::downgrade(holder), true)
+        ReaderGeneration::static_for_test(&Arc::downgrade(holder), true)
     }
 
     fn obsolete_gen(holder: &Arc<()>) -> ReaderGeneration {
-        ReaderGeneration::new(&Arc::downgrade(holder), false)
+        ReaderGeneration::static_for_test(&Arc::downgrade(holder), false)
     }
 
     fn anchor(settled_height: u32, hash_byte: u8) -> SettledChainAnchor {
@@ -371,6 +419,7 @@ mod tests {
             network: Network::ZcashRegtest,
             artifact_schema: ArtifactSchemaVersion::new(1),
             retained: CanonicalHistoryBounds::complete(),
+            predecessor_digest: None,
             schedule_revision: Some(1),
             activations_fingerprint: Some(NetworkUpgradeActivationsFingerprint::from_bytes(
                 NetworkUpgradeActivationsFingerprintVersion::V1,
@@ -497,6 +546,7 @@ mod tests {
             BlockHeight::new(10),
             BlockHash::from_bytes([1; 32]),
         ))?;
+        settled.predecessor_digest = Some([0x22; 32]);
         let holder = Arc::new(());
         let generation = current_gen(&holder);
         let mut cache = SettledStates::new(8, 64 * 1024);
@@ -504,6 +554,15 @@ mod tests {
         cache.remember(settled, &generation, &served_at(9)?);
         cache.remember(settled, &generation, &served_at(51)?);
         assert_eq!(cache.len(), 0);
+
+        // Checkpointed anchors without a predecessor digest must fail closed.
+        let unverified = SettledChainAnchor {
+            predecessor_digest: None,
+            ..settled
+        };
+        cache.remember(unverified, &generation, &served_at(10)?);
+        assert_eq!(cache.len(), 0);
+        assert!(!unverified.covers(BlockHeight::new(10)));
 
         cache.remember(settled, &generation, &served_at(10)?);
         cache.remember(settled, &generation, &served_at(50)?);
@@ -569,6 +628,7 @@ mod tests {
                 BlockHeight::new(5),
                 BlockHash::from_bytes([2; 32]),
             ))?,
+            predecessor_digest: Some([0x22; 32]),
             ..current
         };
         let same_height_fork = anchor(100, 0xbb);
@@ -604,6 +664,7 @@ mod tests {
                 BlockHeight::new(5),
                 BlockHash::from_bytes([3; 32]),
             ))?,
+            predecessor_digest: Some([0x33; 32]),
             ..prior
         };
         let old_holder = Arc::new(());
@@ -634,6 +695,81 @@ mod tests {
         assert_eq!(
             populated_replacement.cached_at_anchor(replacement, BlockHeight::new(12)),
             Some(replacement_state)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_lookup_from_superseded_request_does_not_clear_replacement_cache()
+    -> Result<(), Box<dyn Error>> {
+        let active_id = Arc::new(AtomicUsize::new(1));
+        let holder_a = Arc::new(());
+        let gen_a = ReaderGeneration::live(&Arc::downgrade(&holder_a), {
+            let active = Arc::clone(&active_id);
+            move || active.load(Ordering::Acquire) == 1
+        });
+        let fork = anchor(100, 0xcc);
+        let retention_change = SettledChainAnchor {
+            retained: CanonicalHistoryBounds::checkpointed(BlockId::new(
+                BlockHeight::new(5),
+                BlockHash::from_bytes([4; 32]),
+            ))?,
+            predecessor_digest: Some([0x44; 32]),
+            ..anchor(100, 0xaa)
+        };
+        let schedule_change = SettledChainAnchor {
+            schedule_revision: Some(2),
+            ..anchor(100, 0xaa)
+        };
+
+        for (slot_id, replacement_anchor) in
+            [(2, fork), (3, retention_change), (4, schedule_change)]
+        {
+            let holder_b = Arc::new(());
+            let gen_b = ReaderGeneration::live(&Arc::downgrade(&holder_b), {
+                let active = Arc::clone(&active_id);
+                move || active.load(Ordering::Acquire) == slot_id
+            });
+            active_id.store(slot_id, Ordering::Release);
+
+            let mut cache = SettledStates::new(8, 64 * 1024);
+            let replacement_state = served_at(10)?;
+            assert!(matches!(
+                cache.classify_lookup(replacement_anchor, &gen_b, BlockHeight::new(10)),
+                LookupStep::Miss
+            ));
+            cache.remember(replacement_anchor, &gen_b, &replacement_state);
+
+            // Delayed Request A still uses gen_a created before replacement.
+            assert!(matches!(
+                cache.classify_lookup(anchor(100, 0xaa), &gen_a, BlockHeight::new(10)),
+                LookupStep::Miss
+            ));
+            cache.apply_extension_result((anchor(90, 0x99), anchor(100, 0xaa)), &gen_a, true);
+            assert!(matches!(
+                cache.classify_lookup(replacement_anchor, &gen_b, BlockHeight::new(10)),
+                LookupStep::Hit(ref state) if state == &replacement_state
+            ));
+        }
+
+        // Also ensure delayed apply_extension_result does not promote prior anchor once superseded.
+        let prior = anchor(90, 0x99);
+        let stale_ext = anchor(100, 0xaa);
+        active_id.store(1, Ordering::Release);
+        let mut cache = SettledStates::new(8, 64 * 1024);
+        let prior_state = served_at(10)?;
+        cache.remember(prior, &gen_a, &prior_state);
+        active_id.store(2, Ordering::Release);
+        cache.apply_extension_result((prior, stale_ext), &gen_a, true);
+        assert!(
+            cache
+                .cached_at_anchor(prior, BlockHeight::new(10))
+                .is_some()
+        );
+        assert!(
+            cache
+                .cached_at_anchor(stale_ext, BlockHeight::new(10))
+                .is_none()
         );
         Ok(())
     }

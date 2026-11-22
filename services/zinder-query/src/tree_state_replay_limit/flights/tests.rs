@@ -24,7 +24,7 @@ async fn only_settled_rows_at_the_same_retained_fence_survive_eviction() -> eyre
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
     let weak: std::sync::Weak<RocksDbCanonicalReader> = Arc::downgrade(&reader);
-    let generation = ReaderGeneration::new(&weak, true);
+    let generation = ReaderGeneration::static_for_test(&weak, true);
     let height = reader.chain_epoch().visible_tip_height;
     let Some(TreeStateLookup::Stored(state)) = reader.tree_state_lookup(height).await? else {
         return Err(eyre::eyre!("missing tip checkpoint"));
@@ -125,10 +125,10 @@ async fn queued_subscribers_keep_their_place_and_deadline_after_the_first_wallet
     let held = limit.admit().await?;
     let generation = Arc::downgrade(&Arc::new(()));
     let deadline = limit.deadline();
-    let first = limit.subscribe(key, &generation, deadline)?;
+    let first = limit.subscribe(&key, &generation, deadline)?;
     assert!(first.admit(&limit).now_or_never().is_none());
     let other = limit.subscribe(
-        ReplayKey {
+        &ReplayKey {
             height: BlockHeight::new(1),
             ..key
         },
@@ -137,12 +137,16 @@ async fn queued_subscribers_keep_their_place_and_deadline_after_the_first_wallet
     )?;
     assert!(other.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(2)).await;
-    let follower = limit.subscribe(key, &generation, limit.deadline())?;
-    assert!(limit.subscribe(key, &generation, limit.deadline()).is_err());
+    let follower = limit.subscribe(&key, &generation, limit.deadline())?;
+    assert!(
+        limit
+            .subscribe(&key, &generation, limit.deadline())
+            .is_err()
+    );
     drop(first);
     assert_eq!(limit.waiter_count(), 2);
     let recovered = limit.subscribe(
-        ReplayKey {
+        &ReplayKey {
             height: BlockHeight::new(3),
             ..key
         },
@@ -172,15 +176,15 @@ async fn refused_flights_can_be_retried_while_an_old_subscriber_still_holds_the_
     let held = limit.admit().await?;
     let generation = Arc::downgrade(&Arc::new(()));
     let deadline = limit.deadline();
-    let first = limit.subscribe(key, &generation, deadline)?;
+    let first = limit.subscribe(&key, &generation, deadline)?;
     assert!(first.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(2)).await;
-    let follower = limit.subscribe(key, &generation, limit.deadline())?;
+    let follower = limit.subscribe(&key, &generation, limit.deadline())?;
     drop(first);
     assert!(follower.admit(&limit).await.is_err());
     assert_eq!(tokio::time::Instant::now(), deadline);
     drop(held);
-    let retried = limit.subscribe(key, &generation, limit.deadline())?;
+    let retried = limit.subscribe(&key, &generation, limit.deadline())?;
     retried.admit(&limit).await?;
     assert!(!Arc::ptr_eq(&follower.flight, &retried.flight));
     Ok(())
@@ -195,16 +199,20 @@ async fn same_fence_readers_cannot_share_an_invalidation_and_completed_work_free
         .with_waiters_per_slot(NonZeroU32::MIN);
     let generation = Arc::downgrade(&Arc::new(()));
     let replacement = Arc::downgrade(&Arc::new(()));
-    let first = limit.subscribe(key, &generation, limit.deadline())?;
+    let first = limit.subscribe(&key, &generation, limit.deadline())?;
     let slot = first.admit(&limit).await?;
     assert!(
         limit
-            .subscribe(key, &replacement, limit.deadline())
+            .subscribe(&key, &replacement, limit.deadline())
             .is_err()
     );
-    let follower = limit.subscribe(key, &generation, limit.deadline())?;
+    let follower = limit.subscribe(&key, &generation, limit.deadline())?;
     let delayed = follower.admit(&limit).await?;
-    assert!(limit.subscribe(key, &generation, limit.deadline()).is_err());
+    assert!(
+        limit
+            .subscribe(&key, &generation, limit.deadline())
+            .is_err()
+    );
     let failure = first
         .replay(slot, |_| async {
             Err(StorageReadError::ReaderInvalidated {
@@ -213,7 +221,7 @@ async fn same_fence_readers_cannot_share_an_invalidation_and_completed_work_free
         })
         .await;
     assert!(failure.is_err());
-    let fresh = limit.subscribe(key, &replacement, limit.deadline())?;
+    let fresh = limit.subscribe(&key, &replacement, limit.deadline())?;
     let available = fresh.admit(&limit).await?;
     assert!(!Arc::ptr_eq(&first.flight, &fresh.flight));
     assert!(available().is_some());
@@ -228,7 +236,7 @@ async fn replacement_flights_only_wait_until_the_original_request_deadline() -> 
     let held = limit.admit().await?;
     let generation = Arc::downgrade(&Arc::new(()));
     let deadline = limit.deadline();
-    let first = limit.subscribe(key, &generation, deadline)?;
+    let first = limit.subscribe(&key, &generation, deadline)?;
     assert!(first.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(3)).await;
     drop(held);
@@ -236,11 +244,11 @@ async fn replacement_flights_only_wait_until_the_original_request_deadline() -> 
     drop(first);
     let other_wallet = limit.admit().await?;
     let replacement = Arc::downgrade(&Arc::new(()));
-    let second = limit.subscribe(key, &replacement, deadline)?;
+    let second = limit.subscribe(&key, &replacement, deadline)?;
     assert!(second.admit(&limit).await.is_err());
     assert_eq!(tokio::time::Instant::now(), deadline);
     drop(other_wallet);
-    let third = limit.subscribe(key, &replacement, deadline)?;
+    let third = limit.subscribe(&key, &replacement, deadline)?;
     third.admit(&limit).await?;
     Ok(())
 }
@@ -256,15 +264,16 @@ async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss()
     let height = BlockHeight::new(2);
     let key = ReplayKey::new(height, reader.as_ref());
     let generation = Arc::downgrade(&reader);
-    let cache_generation = ReaderGeneration::new(&generation, true);
+    let cache_generation = ReaderGeneration::static_for_test(&generation, true);
+    let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
     assert!(
         limit
-            .ready_state(key, &cache_generation, reader.as_ref(), limit.deadline())
+            .ready_state(&key, &cache_generation, &canonical_reader, limit.deadline())
             .await?
             .is_none()
     );
-    let first = limit.subscribe(key, &generation, limit.deadline())?;
+    let first = limit.subscribe(&key, &generation, limit.deadline())?;
     let slot = first.admit(&limit).await?;
     let state = first
         .replay(slot, |cancelled| async move {
@@ -274,7 +283,7 @@ async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss()
         .ok_or_else(|| eyre::eyre!("missing reconstructed state"))?;
     drop(first);
     let _occupied = limit.admit().await?;
-    let Selection::Ready(cached) = limit.select(key, &cache_generation, limit.deadline(), None)?
+    let Selection::Ready(cached) = limit.select(&key, &cache_generation, limit.deadline(), None)?
     else {
         return Err(eyre::eyre!("settled state started a second reconstruction"));
     };
@@ -289,23 +298,23 @@ async fn an_admitted_wallet_supplies_its_slot_to_a_waiting_replacement_without_l
     let key = replay_key()?;
     let old = Arc::downgrade(&Arc::new(()));
     let new = Arc::downgrade(&Arc::new(()));
-    let new_cache = ReaderGeneration::new(&new, true);
+    let new_cache = ReaderGeneration::static_for_test(&new, true);
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
     let deadline = limit.deadline();
     let occupied = limit.admit().await?;
-    let first = limit.subscribe(key, &old, deadline)?;
+    let first = limit.subscribe(&key, &old, deadline)?;
     assert!(first.admit(&limit).now_or_never().is_none());
     let later_key = ReplayKey {
         height: BlockHeight::new(1),
         ..key
     };
-    let later = limit.subscribe(later_key, &new, deadline)?;
+    let later = limit.subscribe(&later_key, &new, deadline)?;
     assert!(later.admit(&limit).now_or_never().is_none());
-    let previous = limit.subscribe(key, &new, deadline)?;
+    let previous = limit.subscribe(&key, &new, deadline)?;
     assert!(previous.admit(&limit).now_or_never().is_none());
     drop(occupied);
     let carried = first.carry(&first.admit(&limit).await?);
-    let Selection::Waiting(moved) = limit.select(key, &new_cache, deadline, carried)? else {
+    let Selection::Waiting(moved) = limit.select(&key, &new_cache, deadline, carried)? else {
         return Err(eyre::eyre!("unexpected cached state"));
     };
     assert!(Arc::ptr_eq(&moved.flight, &previous.flight));
@@ -357,7 +366,7 @@ async fn a_full_running_flight_refuses_a_carried_join_and_frees_its_unused_slot(
     let original = Arc::downgrade(&Arc::new(()));
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN.saturating_add(1), Duration::ZERO)
         .with_waiters_per_slot(NonZeroU32::MIN);
-    let first = limit.subscribe(key, &destination, limit.deadline())?;
+    let first = limit.subscribe(&key, &destination, limit.deadline())?;
     let slot = first.admit(&limit).await?;
     let (finish, wait) = tokio::sync::oneshot::channel::<()>();
     let work = first.replay(slot, |_| async move {
@@ -366,15 +375,15 @@ async fn a_full_running_flight_refuses_a_carried_join_and_frees_its_unused_slot(
     });
     tokio::pin!(work);
     assert!(futures_util::poll!(&mut work).is_pending());
-    let _subscriber = limit.subscribe(key, &destination, limit.deadline())?;
-    let _another = limit.subscribe(key, &destination, limit.deadline())?;
-    let previous = limit.subscribe(key, &original, limit.deadline())?;
+    let _subscriber = limit.subscribe(&key, &destination, limit.deadline())?;
+    let _another = limit.subscribe(&key, &destination, limit.deadline())?;
+    let previous = limit.subscribe(&key, &original, limit.deadline())?;
     let carried = previous.carry(&previous.admit(&limit).await?);
     assert!(carried.is_some());
     assert!(matches!(
         limit.select(
-            key,
-            &ReaderGeneration::new(&destination, true),
+            &key,
+            &ReaderGeneration::static_for_test(&destination, true),
             limit.deadline(),
             carried
         ),
@@ -382,7 +391,7 @@ async fn a_full_running_flight_refuses_a_carried_join_and_frees_its_unused_slot(
     ));
     assert_eq!(limit.waiter_count(), 2);
     let unrelated = limit.subscribe(
-        ReplayKey {
+        &ReplayKey {
             height: BlockHeight::new(1),
             ..key
         },
@@ -417,10 +426,10 @@ async fn selection_preserves_its_incoming_slot_while_the_destination_is_moving()
     let donor = Arc::downgrade(&Arc::new(()));
     let limit =
         TreeStateReplayLimit::new(NonZeroU32::MIN.saturating_add(1), Duration::from_secs(4));
-    let first = limit.subscribe(key, &destination, limit.deadline())?;
+    let first = limit.subscribe(&key, &destination, limit.deadline())?;
     let old_flight = first.flight.clone();
     let slot = first.admit(&limit).await?;
-    let second = limit.subscribe(key, &donor, limit.deadline())?;
+    let second = limit.subscribe(&key, &donor, limit.deadline())?;
     let incoming = second.carry(&second.admit(&limit).await?);
     assert!(incoming.is_some());
     let unrelated = limit.admit();
@@ -440,8 +449,8 @@ async fn selection_preserves_its_incoming_slot_while_the_destination_is_moving()
     tokio::time::timeout(Duration::from_secs(3), entered_move).await??;
     let selecting = tokio::task::spawn_blocking({
         let limit = limit.clone();
-        let dest_cache = ReaderGeneration::new(&destination, true);
-        move || limit.select(key, &dest_cache, limit.deadline(), incoming)
+        let dest_cache = ReaderGeneration::static_for_test(&destination, true);
+        move || limit.select(&key, &dest_cache, limit.deadline(), incoming)
     });
     let selected_candidate = tokio::time::timeout(Duration::from_secs(3), async {
         while limit.flights.try_lock().is_some() {
@@ -528,14 +537,15 @@ async fn replay_and_cache(
 ) -> eyre::Result<zinder_store::ServedTreeState> {
     let key = ReplayKey::new(height, reader.as_ref());
     let generation = Arc::downgrade(reader);
-    let cache_generation = ReaderGeneration::new(&generation, true);
+    let cache_generation = ReaderGeneration::static_for_test(&generation, true);
+    let canonical_reader = Arc::clone(reader) as Arc<dyn CanonicalReader>;
     assert!(
         limit
-            .ready_state(key, &cache_generation, reader.as_ref(), limit.deadline())
+            .ready_state(&key, &cache_generation, &canonical_reader, limit.deadline())
             .await?
             .is_none()
     );
-    let sub = limit.subscribe(key, &generation, limit.deadline())?;
+    let sub = limit.subscribe(&key, &generation, limit.deadline())?;
     let slot = sub.admit(limit).await?;
     let reader_ref = Arc::clone(reader);
     sub.replay(slot, |cancelled| async move {
@@ -556,15 +566,16 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     let expected = replay_and_cache(&limit, &first, height).await?;
 
     let key = ReplayKey::new(height, extended.as_ref());
-    let gen_ext = ReaderGeneration::new(&Arc::downgrade(&extended), true);
+    let gen_ext = ReaderGeneration::static_for_test(&Arc::downgrade(&extended), true);
+    let dyn_extended = Arc::clone(&extended) as Arc<dyn CanonicalReader>;
     let mut joins = Vec::new();
     for _ in 0..4 {
         let lim = limit.clone();
-        let obs = Arc::clone(&extended);
+        let obs = Arc::clone(&dyn_extended);
         let gen_ref = gen_ext.clone();
         let deadline = limit.deadline();
         joins.push(tokio::spawn(async move {
-            lim.ready_state(key, &gen_ref, obs.as_ref(), deadline).await
+            lim.ready_state(&key, &gen_ref, &obs, deadline).await
         }));
     }
     for task in joins {
@@ -573,7 +584,7 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     assert_eq!(extended.reads(), 1);
     assert!(matches!(
         limit
-            .ready_state(key, &gen_ext, extended.as_ref(), limit.deadline())
+            .ready_state(&key, &gen_ext, &dyn_extended, limit.deadline())
             .await?,
         Some(ReadyState::Cached(ref s)) if *s == expected
     ));
@@ -592,10 +603,11 @@ async fn settled_cache_clears_when_settled_tip_extension_is_on_a_fork() -> eyre:
     replay_and_cache(&limit, &reader_a, height).await?;
 
     let key_b = ReplayKey::new(height, reader_b.as_ref());
-    let gen_b = ReaderGeneration::new(&Arc::downgrade(&reader_b), true);
+    let gen_b = ReaderGeneration::static_for_test(&Arc::downgrade(&reader_b), true);
+    let dyn_b = Arc::clone(&reader_b) as Arc<dyn CanonicalReader>;
     assert!(
         limit
-            .ready_state(key_b, &gen_b, reader_b.as_ref(), limit.deadline())
+            .ready_state(&key_b, &gen_b, &dyn_b, limit.deadline())
             .await?
             .is_none()
     );
@@ -614,19 +626,21 @@ async fn lagging_reader_at_prior_settled_tip_does_not_wipe_promoted_cache() -> e
     let baseline_reads = newer.reads();
 
     let older_key = ReplayKey::new(height, older.as_ref());
-    let older_gen = ReaderGeneration::new(&Arc::downgrade(&older), false);
+    let older_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&older), false);
+    let dyn_older = Arc::clone(&older) as Arc<dyn CanonicalReader>;
     assert!(
         limit
-            .ready_state(older_key, &older_gen, older.as_ref(), limit.deadline())
+            .ready_state(&older_key, &older_gen, &dyn_older, limit.deadline())
             .await?
             .is_none()
     );
 
     let newer_key = ReplayKey::new(height, newer.as_ref());
-    let newer_gen = ReaderGeneration::new(&Arc::downgrade(&newer), true);
+    let newer_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&newer), true);
+    let dyn_newer = Arc::clone(&newer) as Arc<dyn CanonicalReader>;
     assert!(matches!(
         limit
-            .ready_state(newer_key, &newer_gen, newer.as_ref(), limit.deadline())
+            .ready_state(&newer_key, &newer_gen, &dyn_newer, limit.deadline())
             .await?,
         Some(ReadyState::Cached(ref s)) if *s == expected
     ));
@@ -646,52 +660,94 @@ async fn replacement_store_with_shorter_settled_tip_resets_cache_after_old_reade
     drop(longer);
 
     let shorter_key = ReplayKey::new(height, shorter.as_ref());
-    let shorter_gen = ReaderGeneration::new(&Arc::downgrade(&shorter), true);
+    let shorter_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&shorter), true);
+    let dyn_shorter = Arc::clone(&shorter) as Arc<dyn CanonicalReader>;
     assert!(
         limit
-            .ready_state(
-                shorter_key,
-                &shorter_gen,
-                shorter.as_ref(),
-                limit.deadline()
-            )
+            .ready_state(&shorter_key, &shorter_gen, &dyn_shorter, limit.deadline())
             .await?
             .is_none()
     );
     let rebuilt = replay_and_cache(&limit, &shorter, height).await?;
     assert!(matches!(
         limit
-            .ready_state(shorter_key, &shorter_gen, shorter.as_ref(), limit.deadline())
+            .ready_state(&shorter_key, &shorter_gen, &dyn_shorter, limit.deadline())
             .await?,
         Some(ReadyState::Cached(ref s)) if *s == rebuilt
     ));
     Ok(())
 }
 
-struct HeaderGate {
-    entered: tokio::sync::Notify,
-    open: tokio::sync::Semaphore,
+enum HeaderHook {
+    AsyncGate {
+        entered: tokio::sync::Notify,
+        open: tokio::sync::Semaphore,
+    },
+    BlockingDispatch {
+        dispatches: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+        release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        secondary: Arc<zinder_store::RocksDbCanonicalSecondary>,
+    },
 }
 
-struct StalledHeaderReader {
+struct TestHeaderReader {
     inner: Arc<ObservedCanonicalReader>,
-    gate: Arc<HeaderGate>,
+    hook: Arc<HeaderHook>,
 }
 
-impl StalledHeaderReader {
-    fn new(inner: Arc<ObservedCanonicalReader>) -> Self {
+impl TestHeaderReader {
+    fn gated(inner: Arc<ObservedCanonicalReader>) -> Self {
         Self {
             inner,
-            gate: Arc::new(HeaderGate {
+            hook: Arc::new(HeaderHook::AsyncGate {
                 entered: tokio::sync::Notify::new(),
                 open: tokio::sync::Semaphore::new(0),
             }),
         }
     }
+
+    fn blocking(
+        inner: Arc<ObservedCanonicalReader>,
+        secondary: Arc<zinder_store::RocksDbCanonicalSecondary>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            inner,
+            hook: Arc::new(HeaderHook::BlockingDispatch {
+                dispatches: std::sync::atomic::AtomicUsize::new(0),
+                started: tokio::sync::Notify::new(),
+                release: parking_lot::Mutex::new(Some(release)),
+                secondary,
+            }),
+        }
+    }
+
+    async fn wait_entered(&self) {
+        match &*self.hook {
+            HeaderHook::AsyncGate { entered, .. } => entered.notified().await,
+            HeaderHook::BlockingDispatch { started, .. } => started.notified().await,
+        }
+    }
+
+    fn release_gate(&self) {
+        if let HeaderHook::AsyncGate { open, .. } = &*self.hook {
+            open.close();
+        }
+    }
+
+    fn blocking_dispatches(&self) -> usize {
+        match &*self.hook {
+            HeaderHook::AsyncGate { .. } => 0,
+            HeaderHook::BlockingDispatch { dispatches, .. } => {
+                dispatches.load(std::sync::atomic::Ordering::Acquire)
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl CanonicalReader for StalledHeaderReader {
+impl CanonicalReader for TestHeaderReader {
     fn network(&self) -> Network {
         self.inner.network()
     }
@@ -716,13 +772,52 @@ impl CanonicalReader for StalledHeaderReader {
         self.inner.history_bounds()
     }
 
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        self.inner.history_predecessor_digest()
+    }
+
     async fn block_header_at(
         &self,
         height: BlockHeight,
     ) -> Result<Option<zinder_core::BlockHeaderArtifact>, StorageReadError> {
-        self.gate.entered.notify_one();
-        let _released = self.gate.open.acquire().await;
-        self.inner.block_header_at(height).await
+        match &*self.hook {
+            HeaderHook::AsyncGate { entered, open } => {
+                entered.notify_one();
+                let _released = open.acquire().await;
+                self.inner.block_header_at(height).await
+            }
+            HeaderHook::BlockingDispatch { .. } => {
+                let hook = Arc::clone(&self.hook);
+                tokio::task::spawn_blocking(move || {
+                    let HeaderHook::BlockingDispatch {
+                        dispatches,
+                        started,
+                        release,
+                        secondary,
+                    } = &*hook
+                    else {
+                        return Ok(None);
+                    };
+                    dispatches.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    started.notify_one();
+                    let wait_rx = release.lock().take();
+                    if let Some(receiver) = wait_rx {
+                        let _ = receiver.recv();
+                    }
+                    secondary.block_header_at(height).map_err(|err| {
+                        StorageReadError::ReadTaskFailed {
+                            reason: err.to_string(),
+                        }
+                    })
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    Err(StorageReadError::ReadTaskFailed {
+                        reason: err.to_string(),
+                    })
+                })
+            }
+        }
     }
 
     async fn block_hash_lookup(
@@ -877,38 +972,39 @@ async fn stalled_extension_header_check_bounds_waiters_and_expires_wait_deadline
     let height = BlockHeight::new(1);
     replay_and_cache(&limit, &first, height).await?;
 
-    let stalled = Arc::new(StalledHeaderReader::new(Arc::clone(&extended_inner)));
+    let stalled = Arc::new(TestHeaderReader::gated(Arc::clone(&extended_inner)));
     let key = ReplayKey::new(height, stalled.as_ref());
-    let stalled_gen = ReaderGeneration::new(&Arc::downgrade(&stalled), true);
+    let stalled_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&stalled), true);
+    let dyn_stalled = Arc::clone(&stalled) as Arc<dyn CanonicalReader>;
 
     let leader = tokio::spawn({
         let limit = limit.clone();
-        let stalled = Arc::clone(&stalled);
+        let dyn_stalled = Arc::clone(&dyn_stalled);
         let stalled_gen = stalled_gen.clone();
         let deadline = limit.deadline();
         async move {
             limit
-                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .ready_state(&key, &stalled_gen, &dyn_stalled, deadline)
                 .await
         }
     });
-    stalled.gate.entered.notified().await;
+    stalled.wait_entered().await;
 
     let follower = tokio::spawn({
         let limit = limit.clone();
-        let stalled = Arc::clone(&stalled);
+        let dyn_stalled = Arc::clone(&dyn_stalled);
         let stalled_gen = stalled_gen.clone();
         let deadline = limit.deadline();
         async move {
             limit
-                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .ready_state(&key, &stalled_gen, &dyn_stalled, deadline)
                 .await
         }
     });
     limit.wait_for_waiters(1).await?;
 
     let overflow = limit
-        .ready_state(key, &stalled_gen, stalled.as_ref(), limit.deadline())
+        .ready_state(&key, &stalled_gen, &dyn_stalled, limit.deadline())
         .await;
     assert!(matches!(
         overflow,
@@ -925,6 +1021,7 @@ async fn stalled_extension_header_check_bounds_waiters_and_expires_wait_deadline
         Err(crate::QueryError::TreeStateReplayLimitReached { .. })
     ));
     assert_eq!(limit.waiter_count(), 0);
+    stalled.release_gate();
     assert_eq!(extended_inner.reads(), 0);
     Ok(())
 }
@@ -940,25 +1037,26 @@ async fn zero_wait_refuses_contended_extension_check_immediately_without_queuein
     let height = BlockHeight::new(1);
     let expected = replay_and_cache(&limit, &first, height).await?;
 
-    let stalled = Arc::new(StalledHeaderReader::new(Arc::clone(&extended_inner)));
+    let stalled = Arc::new(TestHeaderReader::gated(Arc::clone(&extended_inner)));
     let key = ReplayKey::new(height, stalled.as_ref());
-    let stalled_gen = ReaderGeneration::new(&Arc::downgrade(&stalled), true);
+    let stalled_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&stalled), true);
+    let dyn_stalled = Arc::clone(&stalled) as Arc<dyn CanonicalReader>;
 
     let leader = tokio::spawn({
         let limit = limit.clone();
-        let stalled = Arc::clone(&stalled);
+        let dyn_stalled = Arc::clone(&dyn_stalled);
         let stalled_gen = stalled_gen.clone();
         let deadline = limit.deadline();
         async move {
             limit
-                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .ready_state(&key, &stalled_gen, &dyn_stalled, deadline)
                 .await
         }
     });
-    stalled.gate.entered.notified().await;
+    stalled.wait_entered().await;
 
     let contender = limit
-        .ready_state(key, &stalled_gen, stalled.as_ref(), limit.deadline())
+        .ready_state(&key, &stalled_gen, &dyn_stalled, limit.deadline())
         .await;
     assert!(matches!(
         contender,
@@ -966,11 +1064,232 @@ async fn zero_wait_refuses_contended_extension_check_immediately_without_queuein
     ));
     assert_eq!(limit.waiter_count(), 0);
 
-    stalled.gate.open.close();
+    stalled.release_gate();
     assert!(matches!(
         leader.await??,
         Some(ReadyState::Cached(ref state)) if *state == expected
     ));
     assert_eq!(extended_inner.reads(), 1);
+    Ok(())
+}
+
+fn frontiers_with_sapling_commitment(
+    commitment: [u8; 32],
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> eyre::Result<zinder_core::CommitmentTreeFrontiers> {
+    let mut accumulator = zinder_core::CommitmentTreeAccumulator::from_validated_frontiers(
+        BlockHeight::new(0),
+        &zinder_core::CommitmentTreeFrontiers::default(),
+        activations,
+    )?;
+    accumulator.append_block_commitments(BlockHeight::new(1), &[commitment], &[], &[])?;
+    Ok(accumulator.validated_frontiers()?)
+}
+
+fn checkpointed_chain_with_seed(
+    base: &ChainFixture,
+    seed_frontiers: zinder_core::CommitmentTreeFrontiers,
+) -> ChainFixture {
+    let meta = zinder_core::CompactChainMetadata {
+        sapling_commitment_tree_size: 1,
+        orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 0,
+    };
+    let mut configured = base.clone();
+    for block in base.blocks() {
+        let parent_hash = if block.height == BlockHeight::new(1) {
+            Network::ZcashRegtest.genesis_hash()
+        } else {
+            block.parent_hash
+        };
+        configured =
+            configured.with_compact_block_artifact(zinder_core::CompactBlockArtifact::empty(
+                zinder_core::BlockId::new(block.height, block.hash),
+                parent_hash,
+                block.block_time_seconds,
+                meta,
+            ));
+    }
+    configured.with_commitment_tree_frontiers_at(BlockHeight::new(1), seed_frontiers)
+}
+
+fn publish_checkpointed_reader(
+    chain: &ChainFixture,
+    through: u32,
+    settled: u32,
+) -> eyre::Result<(WalletServingStoreFixture, Arc<ObservedCanonicalReader>)> {
+    let baseline = CanonicalBaseline::new(chain)
+        .through(BlockHeight::new(through))
+        .with_history_floor(BlockHeight::new(1))
+        .with_settled_tip(BlockHeight::new(settled));
+    let mut store =
+        CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+            .into_serving_store_fixture()?;
+    let reader = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+        store.take_readers()?.0,
+    )?));
+    Ok((store, reader))
+}
+
+#[tokio::test]
+async fn predecessor_frontier_mismatch_isolates_replacement_store_on_same_anchor_and_extension()
+-> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let base_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let mut cmu_a = [0_u8; 32];
+    cmu_a[0] = 1;
+    let mut cmu_b = [0_u8; 32];
+    cmu_b[0] = 2;
+    let chain_a = checkpointed_chain_with_seed(
+        &base_chain,
+        frontiers_with_sapling_commitment(cmu_a, &activations)?,
+    );
+    let chain_b = checkpointed_chain_with_seed(
+        &base_chain,
+        frontiers_with_sapling_commitment(cmu_b, &activations)?,
+    );
+    let (_sa, reader_a) = publish_checkpointed_reader(&chain_a, 4, 3)?;
+    let (_sb_same, reader_b_same) = publish_checkpointed_reader(&chain_b, 4, 3)?;
+    let (_sb_ext, reader_b_ext) = publish_checkpointed_reader(&chain_b, 5, 4)?;
+    let height = BlockHeight::new(2);
+
+    let limit_same = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
+    let state_a = replay_and_cache(&limit_same, &reader_a, height).await?;
+    let key_b_same = ReplayKey::new(height, reader_b_same.as_ref());
+    let gen_b_same = ReaderGeneration::static_for_test(&Arc::downgrade(&reader_b_same), true);
+    let dyn_b_same = Arc::clone(&reader_b_same) as Arc<dyn CanonicalReader>;
+    assert!(
+        limit_same
+            .ready_state(&key_b_same, &gen_b_same, &dyn_b_same, limit_same.deadline())
+            .await?
+            .is_none()
+    );
+    assert_eq!(limit_same.flights.lock().settled.len(), 0);
+    let state_b_same = replay_and_cache(&limit_same, &reader_b_same, height).await?;
+    assert_ne!(state_a, state_b_same);
+
+    let limit_ext = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
+    replay_and_cache(&limit_ext, &reader_a, height).await?;
+    let key_b_ext = ReplayKey::new(height, reader_b_ext.as_ref());
+    let gen_b_ext = ReaderGeneration::static_for_test(&Arc::downgrade(&reader_b_ext), true);
+    let dyn_b_ext = Arc::clone(&reader_b_ext) as Arc<dyn CanonicalReader>;
+    assert!(
+        limit_ext
+            .ready_state(&key_b_ext, &gen_b_ext, &dyn_b_ext, limit_ext.deadline())
+            .await?
+            .is_none()
+    );
+    assert_eq!(limit_ext.flights.lock().settled.len(), 0);
+    let state_b_ext = replay_and_cache(&limit_ext, &reader_b_ext, height).await?;
+    assert_ne!(state_a, state_b_ext);
+    Ok(())
+}
+
+fn publish_blocking_reader(
+    chain: &ChainFixture,
+    through: u32,
+    settled: u32,
+) -> eyre::Result<(
+    WalletServingStoreFixture,
+    Arc<TestHeaderReader>,
+    std::sync::mpsc::Sender<()>,
+)> {
+    let baseline = CanonicalBaseline::new(chain)
+        .through(BlockHeight::new(through))
+        .with_settled_tip(BlockHeight::new(settled));
+    let mut store =
+        CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+            .into_serving_store_fixture()?;
+    let secondary = Arc::new(store.take_readers()?.0);
+    let inner = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+        Arc::clone(&secondary),
+    )?));
+    let (send, recv) = std::sync::mpsc::channel();
+    Ok((
+        store,
+        Arc::new(TestHeaderReader::blocking(inner, secondary, recv)),
+        send,
+    ))
+}
+
+#[tokio::test]
+async fn already_dispatched_blocking_header_read_stays_single_flight_across_timeout_and_concurrent_callers()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, blocking, release) = publish_blocking_reader(&chain, 5, 4)?;
+    let (_s3, foreign, release_foreign) = publish_blocking_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_millis(120))
+        .with_waiters_per_slot(NonZeroU32::MIN);
+    let height = BlockHeight::new(1);
+    let expected = replay_and_cache(&limit, &first, height).await?;
+
+    let key = ReplayKey::new(height, blocking.as_ref());
+    let gen_primary = ReaderGeneration::static_for_test(&Arc::downgrade(&blocking), true);
+    let dyn_primary = Arc::clone(&blocking) as Arc<dyn CanonicalReader>;
+
+    let leader = tokio::spawn({
+        let limit = limit.clone();
+        let dyn_primary = Arc::clone(&dyn_primary);
+        let gen_primary = gen_primary.clone();
+        async move {
+            limit
+                .ready_state(&key, &gen_primary, &dyn_primary, limit.deadline())
+                .await
+        }
+    });
+    blocking.wait_entered().await;
+    assert!(matches!(
+        leader.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert_eq!(blocking.blocking_dispatches(), 1);
+
+    let follower = tokio::spawn({
+        let limit = limit.clone();
+        let dyn_primary = Arc::clone(&dyn_primary);
+        let gen_primary = gen_primary.clone();
+        async move {
+            limit
+                .ready_state(&key, &gen_primary, &dyn_primary, limit.deadline())
+                .await
+        }
+    });
+    limit.wait_for_waiters(1).await?;
+    assert!(matches!(
+        limit
+            .ready_state(&key, &gen_primary, &dyn_primary, limit.deadline())
+            .await,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert!(matches!(
+        follower.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+
+    let gen_foreign = ReaderGeneration::static_for_test(&Arc::downgrade(&foreign), true);
+    let dyn_foreign = Arc::clone(&foreign) as Arc<dyn CanonicalReader>;
+    assert!(matches!(
+        limit
+            .ready_state(&key, &gen_foreign, &dyn_foreign, limit.deadline())
+            .await,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert_eq!(foreign.blocking_dispatches(), 0);
+    assert_eq!(blocking.blocking_dispatches(), 1);
+
+    release.send(())?;
+    release_foreign.send(())?;
+    let promoted = limit
+        .ready_state(
+            &key,
+            &gen_primary,
+            &dyn_primary,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await?;
+    assert!(matches!(promoted, Some(ReadyState::Cached(ref state)) if *state == expected));
+    assert_eq!(blocking.blocking_dispatches(), 1);
+    assert_eq!(limit.waiter_count(), 0);
     Ok(())
 }

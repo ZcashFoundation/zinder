@@ -1286,26 +1286,29 @@ where
             loop {
                 let request_deadline =
                     *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
-                let (epoch, key, generation, is_current, ready) =
+                let (epoch, key, generation, cache_generation, ready) =
                     serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
                         let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                         let key = ReplayKey::new(height, pair.canonical());
                         let generation = Arc::downgrade(&pair);
-                        let is_current = Arc::ptr_eq(&pair, &self.capture_pair());
-                        let cache_generation = ReaderGeneration::new(&generation, is_current);
+                        let slot = self.serving_pair_slot.clone();
+                        let weak_for_check = generation.clone();
+                        let cache_generation = ReaderGeneration::live(&generation, move || {
+                            slot.is_current_weak(&weak_for_check)
+                        });
+                        let reader = pair.canonical_arc();
                         let ready = self
                             .tree_state_replays
-                            .ready_state(key, &cache_generation, pair.canonical(), request_deadline)
+                            .ready_state(&key, &cache_generation, &reader, request_deadline)
                             .await?;
-                        Ok((epoch, key, generation, is_current, ready))
+                        Ok((epoch, key, generation, cache_generation, ready))
                     })
                     .await?;
                 if let Some(state) = ready {
                     return Ok(tree_state_response(epoch, state.serve()));
                 }
-                let cache_generation = ReaderGeneration::new(&generation, is_current);
                 let subscription = match self.tree_state_replays.select(
-                    key,
+                    &key,
                     &cache_generation,
                     request_deadline,
                     carried.take(),

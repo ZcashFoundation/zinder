@@ -36,6 +36,7 @@ pub(crate) struct ReplayKey {
     schedule_revision: Option<u64>,
     activations_fingerprint: Option<NetworkUpgradeActivationsFingerprint>,
     retained: CanonicalHistoryBounds,
+    predecessor_digest: Option<[u8; 32]>,
 }
 
 impl ReplayKey {
@@ -52,6 +53,7 @@ impl ReplayKey {
                     .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT)
             }),
             retained: reader.history_bounds(),
+            predecessor_digest: reader.history_predecessor_digest(),
         }
     }
 
@@ -60,6 +62,7 @@ impl ReplayKey {
             network: self.epoch.network,
             artifact_schema: self.epoch.artifact_schema_version,
             retained: self.retained,
+            predecessor_digest: self.predecessor_digest,
             schedule_revision: self.schedule_revision,
             activations_fingerprint: self.activations_fingerprint,
             settled_tip: BlockId::new(self.epoch.settled_tip_height, self.epoch.settled_tip_hash),
@@ -71,6 +74,48 @@ impl ReplayKey {
 pub(super) struct Flights {
     running: HashMap<(ReplayKey, usize), Weak<Flight>>,
     settled: SettledStates,
+    active_verify: Option<ActiveAnchorVerify>,
+}
+
+type AnchorVerifyOutcome = Result<bool, Arc<StorageReadError>>;
+
+#[derive(Clone, Debug)]
+struct ActiveAnchorVerify {
+    prior: SettledChainAnchor,
+    target: SettledChainAnchor,
+    reader_addr: usize,
+    outcome: watch::Receiver<Option<AnchorVerifyOutcome>>,
+}
+
+impl ActiveAnchorVerify {
+    fn matches(
+        &self,
+        prior: SettledChainAnchor,
+        target: SettledChainAnchor,
+        reader_addr: usize,
+    ) -> bool {
+        self.prior == prior && self.target == target && self.reader_addr == reader_addr
+    }
+}
+
+struct ActiveAnchorVerifyGuard {
+    flights: Arc<Mutex<Flights>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ActiveAnchorVerifyGuard {
+    fn drop(&mut self) {
+        self.flights.lock().active_verify = None;
+    }
+}
+
+enum AnchorVerifyStep {
+    Ready(Option<ServedTreeState>),
+    Wait {
+        rx: watch::Receiver<Option<AnchorVerifyOutcome>>,
+        is_leader: bool,
+        waited: bool,
+    },
 }
 
 pub(crate) enum ReadyState {
@@ -89,80 +134,220 @@ impl ReadyState {
     }
 }
 
+fn spawn_anchor_verify_task(
+    flights: Arc<Mutex<Flights>>,
+    (prior, target): (SettledChainAnchor, SettledChainAnchor),
+    task_generation: ReaderGeneration,
+    reader: Arc<dyn CanonicalReader>,
+    (send, permit): (
+        watch::Sender<Option<AnchorVerifyOutcome>>,
+        OwnedSemaphorePermit,
+    ),
+) {
+    let guard = ActiveAnchorVerifyGuard {
+        flights: Arc::clone(&flights),
+        _permit: permit,
+    };
+    tokio::spawn(
+        async move {
+            let outcome = reader
+                .block_header_at(prior.settled_tip.height)
+                .await
+                .map(|header| {
+                    header.is_some_and(|stored| stored.block_hash == prior.settled_tip.hash)
+                })
+                .map_err(Arc::new);
+            {
+                let mut state = flights.lock();
+                if let Ok(extends_prior) = outcome {
+                    state.settled.apply_extension_result(
+                        (prior, target),
+                        &task_generation,
+                        extends_prior,
+                    );
+                }
+                state.active_verify = None;
+            }
+            send.send_replace(Some(outcome));
+            drop(guard);
+        }
+        .in_current_span(),
+    );
+}
+
+async fn wait_anchor_verify(
+    limit: &TreeStateReplayLimit,
+    rx: &mut watch::Receiver<Option<AnchorVerifyOutcome>>,
+    (is_leader, waited): (bool, bool),
+    deadline: Instant,
+) -> Result<(), QueryError> {
+    let needs_timeout = !is_leader || !limit.wait.is_zero() || waited;
+    if !needs_timeout {
+        let _ = rx.wait_for(Option::is_some).await;
+        return Ok(());
+    }
+    let _place = if is_leader {
+        None
+    } else {
+        if Instant::now() >= deadline {
+            return Err(limit.refused(ReplayRefusal::WaitExpired));
+        }
+        Some(
+            WaitingPlace::take(&limit.waiters, limit.max_waiters)
+                .ok_or_else(|| limit.refused(ReplayRefusal::WaitersFull))?,
+        )
+    };
+    let _ = tokio::time::timeout_at(deadline, rx.wait_for(Option::is_some))
+        .await
+        .map_err(|_| limit.refused(ReplayRefusal::WaitExpired))?;
+    Ok(())
+}
+
 impl TreeStateReplayLimit {
-    async fn acquire_anchor_verify(
+    fn try_verify_step(
+        &self,
+        (target, height): (SettledChainAnchor, BlockHeight),
+        generation: &ReaderGeneration,
+        reader: &Arc<dyn CanonicalReader>,
+        (held_permit, waited): (Option<OwnedSemaphorePermit>, bool),
+    ) -> std::ops::ControlFlow<AnchorVerifyStep> {
+        use std::ops::ControlFlow;
+
+        let mut state = self.flights.lock();
+        match state.settled.classify_lookup(target, generation, height) {
+            LookupStep::Hit(cached) => {
+                drop(state);
+                drop(held_permit);
+                ControlFlow::Break(AnchorVerifyStep::Ready(Some(cached)))
+            }
+            LookupStep::Miss => {
+                drop(state);
+                drop(held_permit);
+                ControlFlow::Break(AnchorVerifyStep::Ready(None))
+            }
+            LookupStep::VerifyExtension(prior) => {
+                if let Some(active) = &state.active_verify
+                    && active.matches(prior, target, generation.addr())
+                {
+                    let rx = active.outcome.clone();
+                    drop(state);
+                    drop(held_permit);
+                    return ControlFlow::Break(AnchorVerifyStep::Wait {
+                        rx,
+                        is_leader: false,
+                        waited,
+                    });
+                }
+                if let Some(permit) =
+                    held_permit.or_else(|| self.anchor_verify_slot.clone().try_acquire_owned().ok())
+                {
+                    let (send, rx) = watch::channel(None);
+                    state.active_verify = Some(ActiveAnchorVerify {
+                        prior,
+                        target,
+                        reader_addr: generation.addr(),
+                        outcome: rx.clone(),
+                    });
+                    drop(state);
+                    spawn_anchor_verify_task(
+                        Arc::clone(&self.flights),
+                        (prior, target),
+                        generation.clone(),
+                        Arc::clone(reader),
+                        (send, permit),
+                    );
+                    return ControlFlow::Break(AnchorVerifyStep::Wait {
+                        rx,
+                        is_leader: true,
+                        waited,
+                    });
+                }
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    async fn acquire_verify_permit(
         &self,
         deadline: Instant,
-    ) -> Result<(tokio::sync::MutexGuard<'_, ()>, bool), QueryError> {
-        if let Ok(guard) = self.anchor_verify.try_lock() {
-            return Ok((guard, false));
-        }
+    ) -> Result<OwnedSemaphorePermit, QueryError> {
         if Instant::now() >= deadline {
             return Err(self.refused(ReplayRefusal::WaitExpired));
         }
         let _place = WaitingPlace::take(&self.waiters, self.max_waiters)
             .ok_or_else(|| self.refused(ReplayRefusal::WaitersFull))?;
-        let guard = tokio::time::timeout_at(deadline, self.anchor_verify.lock())
+        tokio::time::timeout_at(deadline, self.anchor_verify_slot.clone().acquire_owned())
             .await
-            .map_err(|_| self.refused(ReplayRefusal::WaitExpired))?;
-        Ok((guard, true))
+            .map_err(|_| self.refused(ReplayRefusal::WaitExpired))?
+            .map_err(|_| self.refused(ReplayRefusal::WaitExpired))
+    }
+
+    async fn acquire_or_join_verify(
+        &self,
+        (target, height): (SettledChainAnchor, BlockHeight),
+        generation: &ReaderGeneration,
+        reader: &Arc<dyn CanonicalReader>,
+        deadline: Instant,
+    ) -> Result<AnchorVerifyStep, QueryError> {
+        let first_step = self.try_verify_step((target, height), generation, reader, (None, false));
+        if let std::ops::ControlFlow::Break(step) = first_step {
+            return Ok(step);
+        }
+        loop {
+            let next_step = self.try_verify_step(
+                (target, height),
+                generation,
+                reader,
+                (Some(self.acquire_verify_permit(deadline).await?), true),
+            );
+            if let std::ops::ControlFlow::Break(step) = next_step {
+                return Ok(step);
+            }
+        }
     }
 
     async fn lookup_settled(
         &self,
-        key: ReplayKey,
+        key: &ReplayKey,
         generation: &ReaderGeneration,
-        reader: &dyn CanonicalReader,
+        reader: &Arc<dyn CanonicalReader>,
         deadline: Instant,
     ) -> Result<Option<ServedTreeState>, QueryError> {
         let target = key.settled_anchor();
-        let initial_step = self
-            .flights
-            .lock()
-            .settled
-            .classify_lookup(target, generation, key.height);
-        match initial_step {
-            LookupStep::Hit(state) => return Ok(Some(state)),
-            LookupStep::Miss => return Ok(None),
-            LookupStep::VerifyExtension(_) => {}
+        let (mut rx, is_leader, waited) = match self
+            .acquire_or_join_verify((target, key.height), generation, reader, deadline)
+            .await?
+        {
+            AnchorVerifyStep::Ready(state) => return Ok(state),
+            AnchorVerifyStep::Wait {
+                rx,
+                is_leader,
+                waited,
+            } => (rx, is_leader, waited),
+        };
+        if rx.borrow().is_none() {
+            wait_anchor_verify(self, &mut rx, (is_leader, waited), deadline).await?;
         }
-        let (_verify_guard, waited) = self.acquire_anchor_verify(deadline).await?;
-        let locked_step = self
-            .flights
-            .lock()
-            .settled
-            .classify_lookup(target, generation, key.height);
-        let prior = match locked_step {
-            LookupStep::Hit(state) => return Ok(Some(state)),
-            LookupStep::Miss => return Ok(None),
-            LookupStep::VerifyExtension(prior) => prior,
-        };
-        let header = if !self.wait.is_zero() || waited {
-            tokio::time::timeout_at(deadline, reader.block_header_at(prior.settled_tip.height))
-                .await
-                .map_err(|_| self.refused(ReplayRefusal::WaitExpired))?
-                .map_err(QueryError::canonical_read)?
-        } else {
-            reader
-                .block_header_at(prior.settled_tip.height)
-                .await
-                .map_err(QueryError::canonical_read)?
-        };
-        let extends_prior =
-            header.is_some_and(|stored| stored.block_hash == prior.settled_tip.hash);
-        Ok(self.flights.lock().settled.complete_extension_lookup(
-            (prior, target),
-            generation,
-            key.height,
-            extends_prior,
-        ))
+        let outcome = rx.borrow().clone();
+        match outcome {
+            Some(Err(err)) => Err(shared_read_error(err)),
+            Some(Ok(false)) => Ok(None),
+            Some(Ok(true)) => Ok(self
+                .flights
+                .lock()
+                .settled
+                .cached_after_extension(target, generation, key.height)),
+            None => Err(QueryError::BlockingTaskFailed {
+                reason: "settled anchor verification ended early".to_owned(),
+            }),
+        }
     }
 
     pub(crate) async fn ready_state(
         &self,
-        key: ReplayKey,
+        key: &ReplayKey,
         generation: &ReaderGeneration,
-        reader: &dyn CanonicalReader,
+        reader: &Arc<dyn CanonicalReader>,
         deadline: Instant,
     ) -> Result<Option<ReadyState>, QueryError> {
         if key.height > key.epoch.visible_tip_height
@@ -188,12 +373,12 @@ impl TreeStateReplayLimit {
 
     pub(crate) fn select(
         &self,
-        key: ReplayKey,
+        key: &ReplayKey,
         generation: &ReaderGeneration,
         deadline: Instant,
         mut carried: Option<TakeReplayPermit>,
     ) -> Result<Selection, QueryError> {
-        let id = (key, generation.addr());
+        let id = (*key, generation.addr());
         let mut flights = self.flights.lock();
         if let Some(state) = flights
             .settled
@@ -209,7 +394,7 @@ impl TreeStateReplayLimit {
         flights.running.retain(|_, old| old.strong_count() > 0);
         let (admission, place) = Admission::new(self, deadline, carried)?;
         let flight = Arc::new(Flight {
-            key,
+            key: *key,
             generation: generation.clone(),
             registry: self.flights.clone(),
             cancelled: Arc::default(),
@@ -227,11 +412,11 @@ impl TreeStateReplayLimit {
     #[cfg(test)]
     fn subscribe<T: Send + Sync + 'static>(
         &self,
-        key: ReplayKey,
+        key: &ReplayKey,
         generation: &Weak<T>,
         deadline: Instant,
     ) -> Result<Arc<Subscription>, QueryError> {
-        let cache_generation = ReaderGeneration::new(generation, true);
+        let cache_generation = ReaderGeneration::static_for_test(generation, true);
         match self.select(key, &cache_generation, deadline, None)? {
             Selection::Waiting(subscription) => Ok(subscription),
             Selection::Ready(_) => Err(QueryError::BlockNotInBestChain),
