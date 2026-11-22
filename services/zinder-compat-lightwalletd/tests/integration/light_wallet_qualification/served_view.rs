@@ -512,3 +512,28 @@ async fn history_after_the_node_rolls_back_below_the_range_is_unavailable() -> R
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn history_after_a_rollback_the_node_recovers_from_is_unavailable() -> Result<()> {
+    // The tip read for the lookup of 2..=2 catches a rollback to height 1,
+    // and every hash read still finds the served tip.
+    for txids in [true, false] {
+        let (fixture, _) = served_view_fixture(
+            |_| {},
+            false,
+            [method("getbestblockheightandhash")
+                .reply_with(|_| RpcReply::result(json!({"height": 1, "hash": vec![0xa1_u8; 32]})))],
+        )?;
+        let request = history_request(2, 2);
+        let answer = if txids {
+            fixture.adapter.get_taddress_txids(request).await
+        } else {
+            fixture.adapter.get_taddress_transactions(request).await
+        };
+        let status = answer
+            .err()
+            .ok_or_else(|| eyre!("served empty history from a stale tip read"))?;
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    }
+    Ok(())
+}

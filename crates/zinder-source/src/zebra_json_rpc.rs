@@ -1052,15 +1052,17 @@ impl ZebraJsonRpcSource {
     /// The source reads the node's hash at `chain_block`'s height immediately
     /// before and after each request and keeps the answer only when both name
     /// `chain_block`, so the answer comes from a chain that holds it unless the
-    /// node left that chain and returned to it within the request.
+    /// node left that chain and returned to it within the request. A tip read
+    /// below `chain_block` is refused rather than answered as an empty range.
     ///
     /// # Errors
     ///
     /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when the
     /// range holds more than [`TransparentAddressRowLimit::MAX`]
     /// transactions, [`SourceError::ChainTipChangedDuringFetch`] when the tip
-    /// changed during every attempt or a read around a request names another
-    /// block than `chain_block`, and the errors of
+    /// changed during every attempt, a tip read lies below `chain_block`, or a
+    /// read around a request names another block than `chain_block`, and the
+    /// errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_transaction_ids(
         &self,
@@ -1075,8 +1077,14 @@ impl ZebraJsonRpcSource {
         }
         let mut tip = self.tip_id().await?;
         for _ in 0..TRANSPARENT_ADDRESS_TIP_ATTEMPTS {
-            // A tip below the range answers nothing only on a chain that
-            // still holds `chain_block`; a node that rolled back must not.
+            // A tip below `chain_block` may be a rollback the node recovers
+            // from before the next read, so it proves no range empty.
+            if tip.height < chain_block.height {
+                return Err(SourceError::ChainTipChangedDuringFetch {
+                    operation: "getaddresstxids",
+                    attempts: 1,
+                });
+            }
             self.require_chain_block(chain_block, "getaddresstxids")
                 .await?;
             let indexed_end_height = end_height.min(tip.height);

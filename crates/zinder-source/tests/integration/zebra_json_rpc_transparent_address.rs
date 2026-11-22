@@ -198,6 +198,36 @@ async fn transparent_address_transaction_ids_refuse_an_empty_answer_after_a_roll
 }
 
 #[tokio::test]
+async fn transparent_address_transaction_ids_refuse_a_tip_read_below_the_required_block()
+-> eyre::Result<()> {
+    // The tip read catches a rollback; by the hash read the node holds the
+    // required block again.
+    let server = start_node([method("getbestblockheightandhash").reply_with(|_| tip_reply(0))])?;
+    let source = regtest_source(server.url())?;
+
+    let outcome = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(1),
+            BlockHeight::new(1),
+            CHAIN_BLOCK,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(SourceError::ChainTipChangedDuringFetch {
+                operation: "getaddresstxids",
+                attempts: 1,
+            })
+        ),
+        "answered {outcome:?} from a tip below the required block"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_address_transaction_ids_refuse_an_answer_from_a_chain_without_the_required_block()
 -> eyre::Result<()> {
     // The node's tip reads agree, but around the request it holds another
