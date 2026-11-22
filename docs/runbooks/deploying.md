@@ -62,12 +62,20 @@ its own disk on top of the figures below.
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
-ceilings. Actual usage varies. The publisher has its own container with the same memory limit as
-the compatibility reader. Reserve additional disk for signed history.
-Full Mainnet catalog size, startup I/O, memory, and file descriptor usage remain
-unmeasured. Give the single-volume container at least 8 GB.
-The release binaries need an x86-64-v3 or AArch64 CPU. CPU use is not
-measured.
+ceilings. Actual usage varies. The publisher has its own container with the same
+memory limit as the compatibility reader. Give the single-volume container at
+least 8 GB. The release binaries need an x86-64-v3 or AArch64 CPU.
+
+Reserve additional disk for signed history. In a single-host trial at Mainnet
+height 3,593,347, the 877 settled segments occupied 17.28 GiB on ext4 with
+fs-verity. Fresh publication took 8 min 40 s and 140 CPU-seconds. The publisher
+reached its 4 GiB cgroup limit, including file cache, with no OOM kills.
+
+After a host page-cache reset, the wallet reader admitted all 877 segments and
+reached READY in 9.75 s, compared with 5.72 s for the canonical reader. At
+readiness it had read 1.30 GiB, used 0.66 CPU-seconds, and reached 537 MiB
+peak RSS and 1,218 open descriptors. These figures describe startup on a
+12,000-IOPS disk. Catalog growth and concurrent wallet traffic affect sizing.
 
 ### Optional Pasta assembly backend
 
