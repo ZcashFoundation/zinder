@@ -295,7 +295,7 @@ class FixtureTests(unittest.TestCase):
         def alive(pid):
             try:
                 return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z'
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return False
 
         try:
