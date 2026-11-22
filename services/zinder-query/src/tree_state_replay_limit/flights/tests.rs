@@ -287,3 +287,152 @@ fn a_cancelled_blocking_seed_lookup_releases_capacity_without_validating_its_row
         Ok(())
     })
 }
+
+#[tokio::test]
+async fn a_full_running_flight_refuses_a_carried_join_and_frees_its_unused_slot() -> eyre::Result<()>
+{
+    let key = replay_key()?;
+    let destination = Arc::downgrade(&Arc::new(()));
+    let original = Arc::downgrade(&Arc::new(()));
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN.saturating_add(1), Duration::ZERO)
+        .with_waiters_per_slot(NonZeroU32::MIN);
+    let first = limit.subscribe(key, &destination, limit.deadline())?;
+    let slot = first.admit(&limit).await?;
+    let (finish, wait) = tokio::sync::oneshot::channel::<()>();
+    let work = first.replay(slot, |_| async move {
+        let _ = wait.await;
+        Ok(None)
+    });
+    tokio::pin!(work);
+    assert!(futures_util::poll!(&mut work).is_pending());
+    let _subscriber = limit.subscribe(key, &destination, limit.deadline())?;
+    let _another = limit.subscribe(key, &destination, limit.deadline())?;
+    let previous = limit.subscribe(key, &original, limit.deadline())?;
+    let carried = previous.carry(&previous.admit(&limit).await?);
+    assert!(carried.is_some());
+    assert!(matches!(
+        limit.select(key, &destination, limit.deadline(), carried),
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert_eq!(limit.waiter_count(), 2);
+    let unrelated = limit.subscribe(
+        ReplayKey {
+            height: BlockHeight::new(1),
+            ..key
+        },
+        &destination,
+        limit.deadline(),
+    )?;
+    assert!(
+        unrelated
+            .admit(&limit)
+            .now_or_never()
+            .transpose()?
+            .is_some()
+    );
+    finish
+        .send(())
+        .map_err(|()| eyre::eyre!("worker ended early"))?;
+    assert!(matches!(
+        work.await,
+        Err(crate::QueryError::BlockNotInBestChain)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn selection_preserves_its_incoming_slot_while_the_destination_is_moving() -> eyre::Result<()>
+{
+    use super::{Selection, TakeReplayPermit};
+    use parking_lot::Mutex;
+
+    let key = replay_key()?;
+    let destination = Arc::downgrade(&Arc::new(()));
+    let donor = Arc::downgrade(&Arc::new(()));
+    let limit =
+        TreeStateReplayLimit::new(NonZeroU32::MIN.saturating_add(1), Duration::from_secs(4));
+    let first = limit.subscribe(key, &destination, limit.deadline())?;
+    let old_flight = first.flight.clone();
+    let slot = first.admit(&limit).await?;
+    let second = limit.subscribe(key, &donor, limit.deadline())?;
+    let incoming = second.carry(&second.admit(&limit).await?);
+    assert!(incoming.is_some());
+    let unrelated = limit.admit();
+    tokio::pin!(unrelated);
+    assert!(futures_util::poll!(&mut unrelated).is_pending());
+
+    let (entered, entered_move) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (resume, pause) = std::sync::mpsc::channel();
+    let pause = Mutex::new(pause);
+    let paused_slot: TakeReplayPermit = Arc::new(move || {
+        entered.lock().take()?.send(()).ok()?;
+        pause.lock().recv().ok()?;
+        slot()
+    });
+    let moving = tokio::task::spawn_blocking(move || first.carry(&paused_slot));
+    tokio::time::timeout(Duration::from_secs(3), entered_move).await??;
+    let selecting = tokio::task::spawn_blocking({
+        let limit = limit.clone();
+        move || limit.select(key, &destination, limit.deadline(), incoming)
+    });
+    let selected_candidate = tokio::time::timeout(Duration::from_secs(3), async {
+        while limit.flights.try_lock().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    resume.send(())?;
+    selected_candidate?;
+    let _outgoing = moving
+        .await?
+        .ok_or_else(|| eyre::eyre!("first permit did not move"))?;
+    let Selection::Waiting(replacement) = selecting.await?? else {
+        return Err(eyre::eyre!("unexpected cached state"));
+    };
+    assert!(!Arc::ptr_eq(&replacement.flight, &old_flight));
+    assert!(
+        replacement
+            .admit(&limit)
+            .now_or_never()
+            .transpose()?
+            .is_some()
+    );
+    assert!(futures_util::poll!(&mut unrelated).is_pending());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_carried_slot_wins_when_the_queue_refuses_in_the_same_poll() -> eyre::Result<()> {
+    use super::{Admission, ReplayRefusal, transferable};
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let permit = transferable(limit.admit().await?);
+    let (publish, contender) = tokio::sync::oneshot::channel::<std::sync::Weak<Admission>>();
+    let admission = Arc::new(Admission::queued(async move {
+        let active = contender
+            .await
+            .ok()
+            .and_then(|weak| weak.upgrade())
+            .ok_or(ReplayRefusal::WaitExpired)?;
+        let mut carried = Some(permit);
+        assert!(active.accept_carried(&mut carried));
+        assert!(carried.is_none());
+        Err(ReplayRefusal::WaitExpired)
+    }));
+    publish
+        .send(Arc::downgrade(&admission))
+        .map_err(|_| eyre::eyre!("admission ended early"))?;
+    let slot = admission
+        .slot
+        .clone()
+        .await
+        .map_err(|_| eyre::eyre!("lost transferred slot"))?;
+    assert!(slot().is_some());
+
+    let expired = Admission::queued(std::future::ready(Err(ReplayRefusal::WaitExpired)));
+    assert!(expired.slot.clone().await.is_err());
+    let mut retry = Some(transferable(limit.admit().await?));
+    assert!(!expired.accept_carried(&mut retry));
+    assert!(retry.is_some());
+    Ok(())
+}

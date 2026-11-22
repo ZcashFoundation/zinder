@@ -12,7 +12,7 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use tokio::{
-    sync::{OwnedSemaphorePermit, oneshot, watch},
+    sync::{OwnedSemaphorePermit, watch},
     time::Instant,
 };
 use tracing::Instrument as _;
@@ -130,7 +130,7 @@ impl TreeStateReplayLimit {
         key: ReplayKey,
         generation: &Weak<T>,
         deadline: Instant,
-        carried: Option<TakeReplayPermit>,
+        mut carried: Option<TakeReplayPermit>,
     ) -> Result<Selection, QueryError> {
         let id = (key, generation.as_ptr().addr());
         let mut flights = self.flights.lock();
@@ -138,11 +138,9 @@ impl TreeStateReplayLimit {
             return Ok(Selection::Ready(ReadyState::Cached(state)));
         }
         if let Some(flight) = flights.running.get(&id).and_then(Weak::upgrade)
-            && flight.joinable()
+            && flight.try_join(self, &mut carried)?
         {
-            return flight
-                .subscribe(self, deadline, carried)
-                .map(Selection::Waiting);
+            return Ok(Selection::Waiting(Subscription::new(flight, deadline)));
         }
         flights.running.retain(|_, old| old.strong_count() > 0);
         let (admission, place) = Admission::new(self, deadline, carried)?;
@@ -152,9 +150,10 @@ impl TreeStateReplayLimit {
             registry: self.flights.clone(),
             cancelled: Arc::default(),
             admission,
-            subscribers: Mutex::new(SubscriberPlaces::first(place)),
-            moved: AtomicBool::new(false),
-            read: Mutex::default(),
+            state: Mutex::new(FlightState {
+                subscribers: SubscriberPlaces::first(place),
+                work: Work::Waiting,
+            }),
         });
         flights.running.insert(id, Arc::downgrade(&flight));
         drop(flights);
@@ -207,9 +206,11 @@ fn transferable(permit: OwnedSemaphorePermit) -> TakeReplayPermit {
     Arc::new(move || slot.lock().take())
 }
 
+type SlotDecision = Result<TakeReplayPermit, ReplayRefusal>;
+
 struct Admission {
-    slot: Shared<BoxFuture<'static, Result<TakeReplayPermit, ReplayRefusal>>>,
-    offer: Mutex<Option<oneshot::Sender<TakeReplayPermit>>>,
+    slot: Shared<BoxFuture<'static, SlotDecision>>,
+    decision: Option<watch::Sender<Option<SlotDecision>>>,
 }
 
 impl Admission {
@@ -222,33 +223,78 @@ impl Admission {
             return Ok((
                 Self {
                     slot: futures_util::future::ready(Ok(slot)).boxed().shared(),
-                    offer: Mutex::default(),
+                    decision: None,
                 },
                 None,
             ));
         }
         let (queued, place) = limit.admit_until(deadline)?;
         let admitted = queued.map(|admission| admission.map(transferable));
-        let (slot, offer) = if place.is_some() {
-            let (offer, offered) = oneshot::channel();
-            let slot = async move {
-                tokio::select! {
-                    biased;
-                    Ok(carried) = offered => Ok(carried),
-                    slot = admitted => slot,
+        if place.is_none() {
+            return Ok((
+                Self {
+                    slot: admitted.boxed().shared(),
+                    decision: None,
+                },
+                None,
+            ));
+        }
+        Ok((Self::queued(admitted), place))
+    }
+
+    fn queued(admitted: impl Future<Output = SlotDecision> + Send + 'static) -> Self {
+        let (decision, mut accepted) = watch::channel(None::<SlotDecision>);
+        let publish = decision.clone();
+        let slot = async move {
+            tokio::select! {
+                biased;
+                Some(slot) = async {
+                    accepted.changed().await.ok()?;
+                    accepted.borrow_and_update().clone()
+                } => slot,
+                mut slot = admitted => {
+                    // The queued acquisition and a carried permit can both complete in the same poll.
+                    publish.send_if_modified(|chosen| {
+                        if let Some(first) = chosen {
+                            slot.clone_from(first);
+                            false
+                        } else {
+                            *chosen = Some(slot.clone());
+                            true
+                        }
+                    });
+                    slot
                 }
-            };
-            (slot.boxed(), Some(offer))
-        } else {
-            (admitted.boxed(), None)
+            }
         };
-        Ok((
-            Self {
-                slot: slot.shared(),
-                offer: Mutex::new(offer),
-            },
-            place,
-        ))
+        Self {
+            slot: slot.boxed().shared(),
+            decision: Some(decision),
+        }
+    }
+
+    /// A refusal leaves the incoming permit available for a fresh flight.
+    fn accept_carried(&self, carried: &mut Option<TakeReplayPermit>) -> bool {
+        let Some(decision) = &self.decision else {
+            return true;
+        };
+        decision.send_if_modified(|chosen| {
+            if chosen.is_none()
+                && let Some(slot) = carried.take()
+            {
+                *chosen = Some(Ok(slot));
+                true
+            } else {
+                false
+            }
+        });
+        decision.borrow().as_ref().is_some_and(Result::is_ok)
+    }
+
+    fn refused(&self) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.borrow().as_ref().is_some_and(Result::is_err))
     }
 }
 
@@ -258,7 +304,6 @@ struct SubscriberPlaces {
     count: usize,
     admitted: bool,
     waiting: Vec<WaitingPlace>,
-    carried: Vec<TakeReplayPermit>,
 }
 
 impl SubscriberPlaces {
@@ -267,7 +312,6 @@ impl SubscriberPlaces {
             count: 1,
             admitted: place.is_none(),
             waiting: place.into_iter().collect(),
-            carried: Vec::new(),
         }
     }
 
@@ -275,7 +319,7 @@ impl SubscriberPlaces {
         self.count -= 1;
         if moved && self.admitted {
             self.admitted = false;
-        } else if self.carried.pop().is_none() {
+        } else {
             self.waiting.pop();
         }
     }
@@ -288,47 +332,47 @@ struct Flight {
     registry: Arc<Mutex<Flights>>,
     cancelled: Arc<AtomicBool>,
     admission: Admission,
-    subscribers: Mutex<SubscriberPlaces>,
-    moved: AtomicBool,
-    read: Mutex<Option<ReplayRead>>,
+    state: Mutex<FlightState>,
+}
+
+struct FlightState {
+    subscribers: SubscriberPlaces,
+    work: Work,
+}
+
+enum Work {
+    Waiting,
+    Running(ReplayRead),
+    Moved,
 }
 
 impl Flight {
-    fn subscribe(
-        self: Arc<Self>,
+    fn try_join(
+        &self,
         limit: &TreeStateReplayLimit,
-        deadline: Instant,
-        carried: Option<TakeReplayPermit>,
-    ) -> Result<Arc<Subscription>, QueryError> {
-        let mut places = self.subscribers.lock();
+        carried: &mut Option<TakeReplayPermit>,
+    ) -> Result<bool, QueryError> {
+        let mut state = self.state.lock();
+        match &state.work {
+            Work::Moved => return Ok(false),
+            Work::Running(rx) if matches!(rx.borrow().as_ref(), Some(Err(_))) => return Ok(false),
+            Work::Waiting if self.admission.refused() => return Ok(false),
+            Work::Waiting | Work::Running(_) => {}
+        }
+        let places = &mut state.subscribers;
         if carried.is_some() && !places.admitted {
+            if !self.admission.accept_carried(carried) {
+                return Ok(false);
+            }
             places.admitted = true;
-            let offer = self.admission.offer.lock().take();
-            if let (Some(offer), Some(slot)) = (offer, carried) {
-                let _ = offer.send(slot);
-            }
         } else if places.count != 0 || !places.admitted {
-            if let Some(place) = WaitingPlace::take(&limit.waiters, limit.max_waiters) {
-                places.waiting.push(place);
-            } else if let Some(slot) = carried {
-                places.carried.push(slot);
-            } else {
-                return Err(limit.refused(ReplayRefusal::WaitersFull));
-            }
+            let place = WaitingPlace::take(&limit.waiters, limit.max_waiters)
+                .ok_or_else(|| limit.refused(ReplayRefusal::WaitersFull))?;
+            places.waiting.push(place);
         }
         places.count += 1;
-        drop(places);
-        Ok(Subscription::new(self, deadline))
-    }
-
-    fn joinable(&self) -> bool {
-        !self.moved.load(Ordering::Acquire)
-            && !matches!(self.admission.slot.peek(), Some(Err(_)))
-            && !self
-                .read
-                .lock()
-                .as_ref()
-                .is_some_and(|rx| matches!(rx.borrow().as_ref(), Some(Err(_))))
+        drop(state);
+        Ok(true)
     }
 }
 
@@ -345,10 +389,9 @@ pub(crate) struct Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.flight
-            .subscribers
-            .lock()
-            .leave(self.flight.moved.load(Ordering::Acquire));
+        let mut state = self.flight.state.lock();
+        let moved = matches!(state.work, Work::Moved);
+        state.subscribers.leave(moved);
     }
 }
 
@@ -359,13 +402,13 @@ impl Subscription {
 
     /// Transfers unstarted work's slot. Subscribers that still need the old generation retry there.
     pub(crate) fn carry(&self, slot: &TakeReplayPermit) -> Option<TakeReplayPermit> {
-        let current = self.flight.read.lock();
-        if current.is_some() {
+        let mut state = self.flight.state.lock();
+        if !matches!(state.work, Work::Waiting) {
             return None;
         }
         let permit = slot()?;
-        self.flight.moved.store(true, Ordering::Release);
-        drop(current);
+        state.work = Work::Moved;
+        drop(state);
         Some(transferable(permit))
     }
 
@@ -378,12 +421,12 @@ impl Subscription {
             .await
             .map_err(|_| limit.refused(ReplayRefusal::WaitExpired))?
             .map_err(|reason| limit.refused(reason))?;
-        let mut places = self.flight.subscribers.lock();
-        if !places.admitted && !self.flight.moved.load(Ordering::Acquire) {
-            places.admitted = true;
-            places.waiting.pop();
+        let mut state = self.flight.state.lock();
+        if !state.subscribers.admitted && !matches!(state.work, Work::Moved) {
+            state.subscribers.admitted = true;
+            state.subscribers.waiting.pop();
         }
-        drop(places);
+        drop(state);
         Ok(slot)
     }
 
@@ -400,30 +443,29 @@ impl Subscription {
     {
         let flight = &self.flight;
         let (mut pending, joined) = {
-            let mut current = flight.read.lock();
-            if flight.moved.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            if let Some(pending) = current.as_ref() {
-                (pending.clone(), true)
-            } else {
-                let (send, pending) = watch::channel(None);
-                let work = replay_holding_slot(
-                    flight.key.height,
-                    take_permit().ok_or_else(|| QueryError::BlockingTaskFailed {
-                        reason: "tree-state replay lost its slot".to_owned(),
-                    })?,
-                    read(flight.cancelled.clone()),
-                );
-                tokio::spawn(
-                    async move {
-                        send.send_replace(Some(work.await.map_err(Arc::new)));
-                    }
-                    .in_current_span(),
-                );
-                *current = Some(pending.clone());
-                drop(current);
-                (pending, false)
+            let mut state = flight.state.lock();
+            match &state.work {
+                Work::Moved => return Ok(None),
+                Work::Running(pending) => (pending.clone(), true),
+                Work::Waiting => {
+                    let (send, pending) = watch::channel(None);
+                    let work = replay_holding_slot(
+                        flight.key.height,
+                        take_permit().ok_or_else(|| QueryError::BlockingTaskFailed {
+                            reason: "tree-state replay lost its slot".to_owned(),
+                        })?,
+                        read(flight.cancelled.clone()),
+                    );
+                    tokio::spawn(
+                        async move {
+                            send.send_replace(Some(work.await.map_err(Arc::new)));
+                        }
+                        .in_current_span(),
+                    );
+                    state.work = Work::Running(pending.clone());
+                    drop(state);
+                    (pending, false)
+                }
             }
         };
         let (state, reconstructed) = pending
