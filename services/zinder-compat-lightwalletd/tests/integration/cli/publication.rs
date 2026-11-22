@@ -1,4 +1,11 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 use eyre::Result;
 use tokio::process::Command;
@@ -19,7 +26,7 @@ async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Resu
     let catalog = files.path().join("catalog");
     let scratch = files.path().join("publisher-secondary");
     let manifest = catalog.join("current.json");
-    let chain = ChainFixture::new(Network::ZcashRegtest)
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(3)
         .with_raw_blob_retention(RawBlobRetention::Transactions);
     let baseline = CanonicalBaseline::new(&chain)
@@ -38,19 +45,64 @@ async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Resu
     assert_eq!(fs::read_dir(&scratch)?.count(), 1);
     assert!(!manifest.try_exists()?);
     writer.append_settled_blocks(&chain)?;
-    let first = wait_for_change(&manifest, &[]).await?;
-    publisher.kill().await?;
+    let mut current = wait_for_change(&manifest, &[]).await?;
+    let own = scratch_reservation(&scratch, None)?;
+    let other_catalog = files.path().join("other-catalog");
+    let mut other = follow_command(
+        writer.canonical_primary_path(),
+        &scratch,
+        &other_catalog,
+        &private,
+    )
+    .spawn()?;
+    wait_for_change(&other_catalog.join("current.json"), &[]).await?;
+    let other_scratch = scratch_reservation(&scratch, Some(&own))?;
+    let other_file = other_scratch.join("canonical/other-publisher");
+    fs::write(&other_file, b"active")?;
+    let operator_file = scratch.join(".tmp-operator");
+    fs::write(&operator_file, b"operator")?;
     let mut store = writer.serving_store_fixture()?;
     let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
     let admitted = PublishedShieldedHistory::open(&manifest, &public, false, &reader).await?;
-    let mut resumed = command.spawn()?;
-    writer.append_settled_blocks(&chain.extend_blocks(2))?;
-    wait_for_change(&manifest, &first).await?;
+    for _ in 0..3 {
+        publisher.kill().await?;
+        let abandoned = own.join("canonical/interrupted");
+        fs::write(&abandoned, b"abandoned")?;
+        publisher = command.spawn()?;
+        chain = chain.extend_blocks(2);
+        writer.append_settled_blocks(&chain)?;
+        current = wait_for_change(&manifest, &current).await?;
+        assert!(!abandoned.try_exists()?);
+        assert_eq!(fs::read_dir(&scratch)?.count(), 3);
+        assert_eq!(fs::read_dir(&own)?.count(), 2);
+        assert_eq!(fs::read(&other_file)?, b"active");
+        assert_eq!(fs::read(&operator_file)?, b"operator");
+    }
     let mut store = writer.serving_store_fixture()?;
     let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
     assert!(admitted.refresh(&reader).await?);
-    resumed.kill().await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fs::read(other_catalog.join("current.json"))? != current {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    assert!(other.try_wait()?.is_none());
+    other.kill().await?;
+    publisher.kill().await?;
     Ok(())
+}
+
+fn scratch_reservation(root: &Path, except: Option<&Path>) -> io::Result<PathBuf> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() && Some(path.as_path()) != except {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::other("missing publisher scratch reservation"))
 }
 
 #[cfg(unix)]
@@ -94,11 +146,9 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
         paused.len() <= 24,
         "publisher advanced too far before suspension"
     );
-    let generation = fs::read_dir(&scratch)?
-        .next()
-        .transpose()?
-        .ok_or_else(|| eyre::eyre!("missing publisher secondary"))?
-        .path();
+    let generation = scratch_reservation(&scratch, None)?.join("canonical");
+    let previous = fs::File::open(&generation)?;
+    let previous_inode = previous.metadata()?.ino();
     compact_away_the_old_tables(&db).await?;
     assert!(
         Command::new("kill")
@@ -108,8 +158,12 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
             .success()
     );
     tokio::time::timeout(Duration::from_secs(15), async {
-        while generation.try_exists()? {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        loop {
+            match generation.metadata() {
+                Ok(metadata) if metadata.ino() != previous_inode => break,
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
         }
         Ok::<_, io::Error>(())
     })

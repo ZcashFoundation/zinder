@@ -1,7 +1,7 @@
 # Match the canonical identity in ingest.toml when customizing the deployment.
 [storage]
 path = "/var/lib/zinder/canonical"
-# Each publisher process opens a private scratch directory under this root.
+# Each catalog and canonical store pair reuses one leased directory under this root.
 secondary_path = "/tmp/secondary"
 raw_blob_policy = "transactions"
 
