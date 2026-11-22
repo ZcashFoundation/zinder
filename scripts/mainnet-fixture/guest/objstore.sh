@@ -20,7 +20,14 @@ if [[ -n ${R2_ACCOUNT_ID:-} ]]; then
     exec aws "$@" --endpoint-url "$R2_ENDPOINT"
   )
   obj_url() { echo "s3://$R2_BUCKET/$1"; }
-  obj_exists() { r2_aws s3api head-object --bucket "$R2_BUCKET" --key "$1" >/dev/null 2>&1; }
+  # obj_exists returns 0 when the object exists and 1 when it does not; any
+  # other failure stops the script, so a credential error never reads as absent.
+  obj_exists() {
+    local out
+    out=$(r2_aws s3api head-object --bucket "$R2_BUCKET" --key "$1" 2>&1) && return 0
+    grep -q -E '404|Not Found' <<< "$out" && return 1
+    echo "cannot check $1: $out" >&2; exit 1
+  }
   obj_put() { r2_aws s3 cp --only-show-errors "$1" "$(obj_url "$2")"; }
   obj_get() { r2_aws s3 cp --only-show-errors "$(obj_url "$1")" "$2"; }
   obj_put_dir() { r2_aws s3 cp --only-show-errors --recursive "$1" "$(obj_url "$2")"; }
@@ -29,7 +36,12 @@ else
   : "${GCS_BUCKET:?set GCS_BUCKET or the R2_* variables}"
   _g() { gcloud storage --access-token-file=/root/.gcs-token "$@"; }
   obj_url() { echo "gs://$GCS_BUCKET/$1"; }
-  obj_exists() { _g ls "$(obj_url "$1")" >/dev/null 2>&1; }
+  obj_exists() {
+    local out
+    out=$(_g ls "$(obj_url "$1")" 2>&1) && return 0
+    grep -q 'matched no objects' <<< "$out" && return 1
+    echo "cannot check $1: $out" >&2; exit 1
+  }
   obj_put() { _g cp "$1" "$(obj_url "$2")"; }
   obj_get() { _g cp "$(obj_url "$1")" "$2"; }
   obj_put_dir() { _g cp -r "$1/*" "$(obj_url "$2")"; }

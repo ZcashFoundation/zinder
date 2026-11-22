@@ -15,7 +15,7 @@ ZEBRA_IMAGE=docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f176
 JQ_URL=https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
 JQ_SHA256=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
 GRPCURL_URL=https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz
-GRPCURL_SHA256=4315b81477fa25e227b693b9cdbdb2a2ee2f1e93607d3dd90401cfaa010791f7
+GRPCURL_SHA256=588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214
 
 binaries="" out="" upload=""
 while [[ $# -gt 0 ]]; do
