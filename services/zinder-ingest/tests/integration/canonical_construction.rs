@@ -1194,6 +1194,20 @@ async fn every_block_construction_stores_every_height_while_sparse_construction_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commitment_budget_construction_serves_the_same_tree_states_as_every_block()
 -> Result<(), Box<dyn std::error::Error>> {
+    // The loader selects budget checkpoints in height order whether it hashes
+    // serially or ahead on workers, so both place them at the same heights.
+    for tree_hashing_workers in [1_u32, 4] {
+        Box::pin(assert_commitment_budget_matches_every_block(
+            tree_hashing_workers,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn assert_commitment_budget_matches_every_block(
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     use zinder_store::TreeStateCheckpointSelection::CommitmentBudget;
 
     let activations = regtest_activations();
@@ -1201,11 +1215,13 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
     let source = commitment_budget_construction_source(&activations)?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let directory = TempDir::new()?;
-    let dense = multi_block_writer_config(
+    let mut dense = multi_block_writer_config(
         directory.path().join("every-block"),
         Arc::clone(&activations),
         true,
     );
+    dense.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let budgeted = CanonicalWriterConfig {
         storage_path: directory.path().join("commitment-budget"),
         tree_state_checkpoint_selection: Some(CommitmentBudget(budget)),
@@ -1234,7 +1250,7 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
         assert_eq!(
             matches!(lookup, Some(TreeStateLookup::Stored(_))),
             matches!(height, 0 | 95 | 98 | 100 | 102 | 104),
-            "unexpected checkpoint coverage at height {height}"
+            "unexpected checkpoint coverage at height {height} with {tree_hashing_workers} workers"
         );
         let expected = dense
             .tree_state_checkpoint_at(at, &activations)?
