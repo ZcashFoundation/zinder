@@ -72,6 +72,19 @@ refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
 tree is still empty.
 
+The loader appends each block to the trees and writes it to the store in
+height order. Each stored checkpoint derives a pool's root once from the
+appended frontier, and its canonical encoding must decode to that same
+frontier. With `ingest.construction.tree_hashing_workers` above one, a block's
+pools are hashed concurrently. A pool that receives many commitments in one
+block hashes them as aligned complete subtrees in parallel and merges their
+roots into its frontier. The checkpoints and final roots of up to twice the
+worker count of blocks, at most 64, are derived on the workers while the loader
+appends and writes the blocks around them. Those blocks keep their preparation
+memory until the store has written them, so the preparation watermark still
+bounds the memory they hold. The stored trees, checkpoints, and subtree roots
+do not depend on the worker count.
+
 Before publishing, construction compares its derived tree state at the build
 tip, and every subtree root the loaded blocks complete, with the node's. A
 mismatch stops construction with an error that names it, such as
@@ -170,7 +183,8 @@ construction checkpoint coverage and the background densification pass:
 - To serve every constructed height through the build tip directly at READY,
   including the final partial stride, set `during_construction = true` before
   the first sync with the enabled `every-block` selection. Ingest then
-  cross-checks and stores each frontier on the serial loader. Completed
+  cross-checks and stores each frontier during construction, on the loader or
+  on its tree-hashing workers. Completed
   strides already satisfy the background pass, avoiding a second replay of
   their commitments. The rows are estimated at about 2.4 GB before compression.
 - The `commitment-budget` selection stores a checkpoint once at least

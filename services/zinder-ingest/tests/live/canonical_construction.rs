@@ -144,6 +144,7 @@ fn live_construction_config(
                 .ok_or_else(|| eyre!("invalid prepare concurrency"))?,
             block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * MIB)
                 .ok_or_else(|| eyre!("invalid prepare byte watermark"))?,
+            tree_hashing_workers: NonZeroU32::MIN,
         },
         network_upgrade_activations: activations,
     })

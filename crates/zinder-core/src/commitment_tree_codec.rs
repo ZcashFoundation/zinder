@@ -1,9 +1,13 @@
 //! Durable commitment tree-state artifact values.
 
 #[cfg(feature = "commitment-tree-codec")]
+mod parallel_append;
+
+#[cfg(feature = "commitment-tree-codec")]
 use std::{
     collections::VecDeque,
     io::{self, Cursor},
+    sync::{Arc, OnceLock},
 };
 
 #[cfg(feature = "commitment-tree-codec")]
@@ -636,13 +640,14 @@ pub struct CommitmentTreeAccumulator {
 struct PoolAccumulator<Node> {
     frontier: Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>,
     tree_size: u32,
-    /// Root of `frontier` in Zebra RPC display order, or `None` until it is
+    /// Root of `frontier` in Zebra RPC display order, empty until it is
     /// derived after the pool activates or receives commitments.
     ///
     /// It comes from the validated seed checkpoint or from `frontier` itself,
     /// never from a snapshot's encoding, so a snapshot can be checked against
-    /// it.
-    root: Option<FinalNoteCommitmentRoot>,
+    /// it. Snapshots share the cell, so the root of one frontier is derived at
+    /// most once, on whichever thread first needs it.
+    root: Arc<OnceLock<FinalNoteCommitmentRoot>>,
 }
 
 impl CommitmentTreeAccumulator {
@@ -722,6 +727,100 @@ impl CommitmentTreeAccumulator {
         orchard_cmxs: &[[u8; 32]],
         ironwood_cmxs: &[[u8; 32]],
     ) -> Result<(), CommitmentTreeAccumulatorError> {
+        let updates =
+            self.prepare_block_updates(block_height, sapling_cmus, orchard_cmxs, ironwood_cmxs)?;
+        let mut completed_subtree_roots = Vec::new();
+        apply_pool_update(
+            &mut self.sapling,
+            updates.sapling,
+            SaplingNode::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        apply_pool_update(
+            &mut self.orchard,
+            updates.orchard,
+            MerkleHashOrchard::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        apply_pool_update(
+            &mut self.ironwood,
+            updates.ironwood,
+            MerkleHashOrchard::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        self.completed_subtree_roots = completed_subtree_roots;
+        self.tip_height = block_height;
+        Ok(())
+    }
+
+    /// Applies one block like [`Self::append_block_commitments`], hashing on
+    /// rayon's current thread pool.
+    ///
+    /// The pools' trees are hashed concurrently, and a pool that receives many
+    /// commitments hashes them as aligned complete subtrees in parallel. The
+    /// frontiers, completed subtree roots, and errors are the same as those of
+    /// [`Self::append_block_commitments`], and a failure still leaves this
+    /// accumulator unchanged. Call it inside `rayon::ThreadPool::install` to
+    /// bound the threads it hashes on.
+    pub fn append_block_commitments_in_parallel(
+        &mut self,
+        block_height: BlockHeight,
+        sapling_cmus: &[[u8; 32]],
+        orchard_cmxs: &[[u8; 32]],
+        ironwood_cmxs: &[[u8; 32]],
+    ) -> Result<(), CommitmentTreeAccumulatorError> {
+        let updates =
+            self.prepare_block_updates(block_height, sapling_cmus, orchard_cmxs, ironwood_cmxs)?;
+        let (sapling_batch, (orchard_batch, ironwood_batch)) = rayon::join(
+            || batch_pool_update(self.sapling.as_ref(), &updates.sapling),
+            || {
+                rayon::join(
+                    || batch_pool_update(self.orchard.as_ref(), &updates.orchard),
+                    || batch_pool_update(self.ironwood.as_ref(), &updates.ironwood),
+                )
+            },
+        );
+        let (sapling_batch, orchard_batch, ironwood_batch) = (
+            sapling_batch.transpose()?,
+            orchard_batch.transpose()?,
+            ironwood_batch.transpose()?,
+        );
+        let mut completed_subtree_roots = Vec::new();
+        commit_pool_batch(
+            &mut self.sapling,
+            &updates.sapling,
+            sapling_batch,
+            SaplingNode::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        commit_pool_batch(
+            &mut self.orchard,
+            &updates.orchard,
+            orchard_batch,
+            MerkleHashOrchard::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        commit_pool_batch(
+            &mut self.ironwood,
+            &updates.ironwood,
+            ironwood_batch,
+            MerkleHashOrchard::to_bytes,
+            &mut completed_subtree_roots,
+        );
+        self.completed_subtree_roots = completed_subtree_roots;
+        self.tip_height = block_height;
+        Ok(())
+    }
+
+    /// Checks that `block_height` extends this accumulator and decodes the
+    /// block's commitments for each pool, without changing any tree.
+    fn prepare_block_updates(
+        &self,
+        block_height: BlockHeight,
+        sapling_cmus: &[[u8; 32]],
+        orchard_cmxs: &[[u8; 32]],
+        ironwood_cmxs: &[[u8; 32]],
+    ) -> Result<PreparedBlockUpdates, CommitmentTreeAccumulatorError> {
         let expected_height =
             self.tip_height
                 .next()
@@ -753,29 +852,11 @@ impl CommitmentTreeAccumulator {
             ironwood_cmxs,
             |bytes| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&bytes)),
         )?;
-
-        let mut completed_subtree_roots = Vec::new();
-        apply_pool_update(
-            &mut self.sapling,
-            sapling_update,
-            SaplingNode::to_bytes,
-            &mut completed_subtree_roots,
-        );
-        apply_pool_update(
-            &mut self.orchard,
-            orchard_update,
-            MerkleHashOrchard::to_bytes,
-            &mut completed_subtree_roots,
-        );
-        apply_pool_update(
-            &mut self.ironwood,
-            ironwood_update,
-            MerkleHashOrchard::to_bytes,
-            &mut completed_subtree_roots,
-        );
-        self.completed_subtree_roots = completed_subtree_roots;
-        self.tip_height = block_height;
-        Ok(())
+        Ok(PreparedBlockUpdates {
+            sapling: sapling_update,
+            orchard: orchard_update,
+            ironwood: ironwood_update,
+        })
     }
 
     /// Returns the roots of the subtrees that the most recently appended block
@@ -867,32 +948,28 @@ impl CommitmentTreeAccumulator {
         })
     }
 
-    /// Produces the checkpoints of [`Self::validated_frontiers`] after
-    /// requiring each pool's canonical encoding to have the same root as its
-    /// in-memory frontier.
+    /// Produces canonical checkpoints whose encodings are checked against the
+    /// in-memory frontiers instead of a node's tree state.
     ///
-    /// The comparison rejects an encoding that does not round-trip to the
-    /// appended tree. Use it when no node tree state is compared with the
-    /// result, as for the checkpoints that canonical construction persists. It
-    /// costs one more root derivation for each pool that received commitments
-    /// since its root was last derived.
+    /// Each pool's frontier is encoded with the official codec, and the
+    /// encoding must be canonical and decode to that same frontier, so it
+    /// cannot lose or alter an appended commitment. The root stored with it is
+    /// derived once from the frontier and reused until the pool changes. Use it
+    /// when no node tree state is compared with the result, as for the
+    /// checkpoints that canonical construction persists.
     ///
-    /// A mismatch returns
+    /// An encoding that does not decode to the frontier returns
     /// [`CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed`]
-    /// with [`CommitmentTreeFrontierValidationError::RootMismatch`].
+    /// with [`CommitmentTreeFrontierValidationError::RootMismatch`], since its
+    /// root would differ from the frontier's.
     pub fn cross_checked_frontiers(
         &mut self,
     ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
-        if let Some(pool) = self.sapling.as_mut() {
-            current_pool_root(pool, sapling_root_bytes_in_rpc_order);
-        }
-        if let Some(pool) = self.orchard.as_mut() {
-            current_pool_root(pool, orchard_root_bytes_in_rpc_order);
-        }
-        if let Some(pool) = self.ironwood.as_mut() {
-            current_pool_root(pool, orchard_root_bytes_in_rpc_order);
-        }
-        self.validated_frontiers()
+        cross_checked_pools(
+            self.sapling.as_ref(),
+            self.orchard.as_ref(),
+            self.ironwood.as_ref(),
+        )
     }
 
     /// Produces final roots for the current accumulator tip.
@@ -901,20 +978,131 @@ impl CommitmentTreeAccumulator {
         &mut self,
         block_hash: BlockHash,
     ) -> BlockFinalNoteCommitmentRoots {
-        BlockFinalNoteCommitmentRoots::new(
-            self.tip_height,
-            block_hash,
-            self.sapling
-                .as_mut()
-                .map(|pool| current_pool_root(pool, sapling_root_bytes_in_rpc_order)),
-            self.orchard
-                .as_mut()
-                .map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
-            self.ironwood
-                .as_mut()
-                .map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
+        pool_final_roots(
+            BlockId::new(self.tip_height, block_hash),
+            self.sapling.as_ref(),
+            self.orchard.as_ref(),
+            self.ironwood.as_ref(),
         )
     }
+
+    /// Detaches the trees after the latest appended block, so their
+    /// checkpoint and final roots can be derived on another thread while this
+    /// accumulator appends later blocks.
+    ///
+    /// The snapshot copies each frontier, at most 33 nodes per pool, and
+    /// shares each pool's root with this accumulator, so the root of one
+    /// frontier is still derived at most once.
+    #[must_use]
+    pub fn snapshot(&self) -> CommitmentTreeSnapshot {
+        CommitmentTreeSnapshot {
+            tip_height: self.tip_height,
+            sapling: self.sapling.clone(),
+            orchard: self.orchard.clone(),
+            ironwood: self.ironwood.clone(),
+        }
+    }
+}
+
+/// Note-commitment trees after one appended block, detached from their
+/// [`CommitmentTreeAccumulator`] by [`CommitmentTreeAccumulator::snapshot`].
+///
+/// Its checkpoint and final roots equal the ones the accumulator produces at
+/// that block, whichever thread derives them.
+#[derive(Clone, Debug)]
+pub struct CommitmentTreeSnapshot {
+    tip_height: BlockHeight,
+    sapling: Option<PoolAccumulator<SaplingNode>>,
+    orchard: Option<PoolAccumulator<MerkleHashOrchard>>,
+    ironwood: Option<PoolAccumulator<MerkleHashOrchard>>,
+}
+
+impl CommitmentTreeSnapshot {
+    /// Returns the height of the block these trees follow.
+    #[must_use]
+    pub const fn tip_height(&self) -> BlockHeight {
+        self.tip_height
+    }
+
+    /// Produces the checkpoint frontiers of
+    /// [`CommitmentTreeAccumulator::cross_checked_frontiers`] at this block.
+    pub fn cross_checked_frontiers(
+        &self,
+    ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
+        cross_checked_pools(
+            self.sapling.as_ref(),
+            self.orchard.as_ref(),
+            self.ironwood.as_ref(),
+        )
+    }
+
+    /// Produces the final roots of
+    /// [`CommitmentTreeAccumulator::final_note_commitment_roots`] at this
+    /// block.
+    #[must_use]
+    pub fn final_note_commitment_roots(
+        &self,
+        block_hash: BlockHash,
+    ) -> BlockFinalNoteCommitmentRoots {
+        pool_final_roots(
+            BlockId::new(self.tip_height, block_hash),
+            self.sapling.as_ref(),
+            self.orchard.as_ref(),
+            self.ironwood.as_ref(),
+        )
+    }
+}
+
+fn cross_checked_pools(
+    sapling: Option<&PoolAccumulator<SaplingNode>>,
+    orchard: Option<&PoolAccumulator<MerkleHashOrchard>>,
+    ironwood: Option<&PoolAccumulator<MerkleHashOrchard>>,
+) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
+    // Each frontier is encoded and checked for the pool it fills.
+    Ok(CommitmentTreeFrontiers {
+        sapling: sapling
+            .map(|pool| {
+                cross_checked_pool(
+                    ShieldedProtocol::Sapling,
+                    pool,
+                    sapling_root_bytes_in_rpc_order,
+                )
+            })
+            .transpose()?,
+        orchard: orchard
+            .map(|pool| {
+                cross_checked_pool(
+                    ShieldedProtocol::Orchard,
+                    pool,
+                    orchard_root_bytes_in_rpc_order,
+                )
+            })
+            .transpose()?,
+        ironwood: ironwood
+            .map(|pool| {
+                cross_checked_pool(
+                    ShieldedProtocol::Ironwood,
+                    pool,
+                    orchard_root_bytes_in_rpc_order,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn pool_final_roots(
+    block_id: BlockId,
+    sapling: Option<&PoolAccumulator<SaplingNode>>,
+    orchard: Option<&PoolAccumulator<MerkleHashOrchard>>,
+    ironwood: Option<&PoolAccumulator<MerkleHashOrchard>>,
+) -> BlockFinalNoteCommitmentRoots {
+    BlockFinalNoteCommitmentRoots::new(
+        block_id.height,
+        block_id.hash,
+        sapling.map(|pool| current_pool_root(pool, sapling_root_bytes_in_rpc_order)),
+        orchard.map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
+        ironwood.map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
+    )
 }
 
 /// Failure to seed, advance, or checkpoint a commitment-tree accumulator.
@@ -1023,6 +1211,17 @@ pub enum CommitmentTreeAccumulatorError {
         #[source]
         source: CommitmentTreeFrontierValidationError,
     },
+    /// The subtree roots hashed in parallel for one block did not form a
+    /// frontier, so the accumulator was left unchanged.
+    #[error(
+        "parallel {protocol:?} commitment-tree append at height {block_height:?} produced no valid frontier"
+    )]
+    ParallelAppendInvalidFrontier {
+        /// Shielded pool whose append failed.
+        protocol: ShieldedProtocol,
+        /// Block being appended.
+        block_height: BlockHeight,
+    },
 }
 
 fn pool_is_active(
@@ -1080,7 +1279,7 @@ where
     Ok(PoolAccumulator {
         frontier,
         tree_size: validated_frontier.tree_size(),
-        root: Some(validated_frontier.final_root()),
+        root: Arc::new(OnceLock::from(validated_frontier.final_root())),
     })
 }
 
@@ -1090,6 +1289,88 @@ struct PreparedPoolUpdate<Node> {
     pool_active: bool,
     commitments: Vec<Node>,
     next_tree_size: u32,
+}
+
+/// One block's validated and decoded commitments for every pool.
+struct PreparedBlockUpdates {
+    sapling: PreparedPoolUpdate<SaplingNode>,
+    orchard: PreparedPoolUpdate<MerkleHashOrchard>,
+    ironwood: PreparedPoolUpdate<MerkleHashOrchard>,
+}
+
+/// Fewest commitments that one pool hashes as parallel subtrees. Fewer are
+/// appended one at a time on the pool's thread.
+const PARALLEL_APPEND_MIN_COMMITMENTS: usize = 32;
+
+/// Computes the frontier after `update` without changing `current`, or
+/// returns `None` for a pool that is not active.
+fn batch_pool_update<Node>(
+    current: Option<&PoolAccumulator<Node>>,
+    update: &PreparedPoolUpdate<Node>,
+) -> Option<Result<parallel_append::BatchAppend<Node>, CommitmentTreeAccumulatorError>>
+where
+    Node: Clone + Hashable + Send + Sync,
+{
+    if !update.pool_active {
+        return None;
+    }
+    let empty = Frontier::empty();
+    let frontier = current.map_or(&empty, |pool| &pool.frontier);
+    if update.commitments.len() < PARALLEL_APPEND_MIN_COMMITMENTS {
+        let mut frontier = frontier.clone();
+        let mut completed_subtree_roots = Vec::new();
+        for commitment in &update.commitments {
+            // Capacity was checked for all pools before any hashing.
+            let _appended_within_prevalidated_capacity = frontier.append(commitment.clone());
+            if let Some((subtree_index, root)) = completed_subtree_root(&frontier) {
+                completed_subtree_roots.push((subtree_index.value(), root));
+            }
+        }
+        return Some(Ok(parallel_append::BatchAppend {
+            frontier,
+            completed_subtree_roots,
+        }));
+    }
+    Some(
+        parallel_append::append_batch(frontier, &update.commitments).ok_or(
+            CommitmentTreeAccumulatorError::ParallelAppendInvalidFrontier {
+                protocol: update.protocol,
+                block_height: update.block_height,
+            },
+        ),
+    )
+}
+
+/// Stores a pool's computed frontier, as [`apply_pool_update`] would have
+/// left it, and adds the subtrees it completed to `completed_subtree_roots`.
+fn commit_pool_batch<Node>(
+    current: &mut Option<PoolAccumulator<Node>>,
+    update: &PreparedPoolUpdate<Node>,
+    batch: Option<parallel_append::BatchAppend<Node>>,
+    subtree_root_bytes: impl Fn(&Node) -> [u8; 32],
+    completed_subtree_roots: &mut Vec<CompletedSubtreeRoot>,
+) {
+    let Some(batch) = batch else {
+        return;
+    };
+    let pool = current.get_or_insert_with(|| PoolAccumulator {
+        frontier: Frontier::empty(),
+        tree_size: 0,
+        root: Arc::default(),
+    });
+    if !update.commitments.is_empty() {
+        pool.root = Arc::default();
+    }
+    pool.frontier = batch.frontier;
+    pool.tree_size = update.next_tree_size;
+    completed_subtree_roots.extend(batch.completed_subtree_roots.into_iter().map(
+        |(subtree_index, root)| CompletedSubtreeRoot {
+            protocol: update.protocol,
+            subtree_index: SubtreeRootIndex::new(subtree_index),
+            root_hash: SubtreeRootHash::from_bytes(subtree_root_bytes(&root)),
+            completing_block_height: update.block_height,
+        },
+    ));
 }
 
 #[derive(Clone, Copy)]
@@ -1207,7 +1488,7 @@ fn apply_pool_update<Node>(
     let pool = current.get_or_insert_with(|| PoolAccumulator {
         frontier: Frontier::empty(),
         tree_size: 0,
-        root: None,
+        root: Arc::default(),
     });
     let has_commitments = !update.commitments.is_empty();
     for commitment in update.commitments {
@@ -1224,7 +1505,7 @@ fn apply_pool_update<Node>(
         }
     }
     if has_commitments {
-        pool.root = None;
+        pool.root = Arc::default();
     }
     pool.tree_size = update.next_tree_size;
 }
@@ -1255,13 +1536,13 @@ where
 }
 
 fn current_pool_root<Node>(
-    pool: &mut PoolAccumulator<Node>,
+    pool: &PoolAccumulator<Node>,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> FinalNoteCommitmentRoot
 where
     Node: Clone + Hashable,
 {
-    *pool.root.get_or_insert_with(|| {
+    *pool.root.get_or_init(|| {
         FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&frontier_root(&pool.frontier)))
     })
 }
@@ -1325,12 +1606,46 @@ where
         .map_err(validation_failed)?;
     // A root already derived from the in-memory frontier must agree with the
     // root of its canonical encoding.
-    if pool.root.is_some_and(|root| root != snapshot.final_root()) {
+    if pool
+        .root
+        .get()
+        .is_some_and(|root| *root != snapshot.final_root())
+    {
         return Err(validation_failed(
             CommitmentTreeFrontierValidationError::RootMismatch,
         ));
     }
     Ok(snapshot)
+}
+
+fn cross_checked_pool<Node>(
+    protocol: ShieldedProtocol,
+    pool: &PoolAccumulator<Node>,
+    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+) -> Result<CommitmentTreeFrontier, CommitmentTreeAccumulatorError>
+where
+    Node: Clone + Hashable + HashSer + PartialEq,
+{
+    let final_root = current_pool_root(pool, root_bytes_in_rpc_order);
+    let final_state_bytes = encode_pool(protocol, pool)?;
+    let validation_failed = |source| {
+        CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
+    };
+    let (decoded, tree_size) =
+        decode_canonical_frontier::<Node>(&final_state_bytes).map_err(validation_failed)?;
+    // Bytes that decode to the appended frontier have that frontier's root,
+    // so it is not derived a second time from the encoding.
+    if decoded != pool.frontier || tree_size != pool.tree_size {
+        return Err(validation_failed(
+            CommitmentTreeFrontierValidationError::RootMismatch,
+        ));
+    }
+    Ok(CommitmentTreeFrontier {
+        protocol,
+        tree_size,
+        final_root,
+        final_state_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -2168,8 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn a_construction_checkpoint_rejects_a_memoized_root_that_differs_from_its_frontier()
-    -> TestResult {
+    fn a_construction_checkpoint_derives_its_root_from_its_frontier_not_the_memo() -> TestResult {
         let block = BlockCommitments {
             sapling: vec![commitment(1)],
             ..BlockCommitments::default()
@@ -2199,20 +2513,12 @@ mod tests {
                 .map(CommitmentTreeFrontier::final_root),
             Some(wrong_root)
         );
-        assert!(matches!(
-            accumulator.cross_checked_frontiers(),
-            Err(
-                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
-                    protocol: ShieldedProtocol::Sapling,
-                    source: CommitmentTreeFrontierValidationError::RootMismatch,
-                }
-            )
-        ));
+        assert_eq!(accumulator.cross_checked_frontiers()?, source);
         Ok(())
     }
 
     #[test]
-    fn a_construction_checkpoint_derives_two_roots_per_changed_pool() -> TestResult {
+    fn a_construction_checkpoint_derives_one_root_per_changed_pool() -> TestResult {
         forget_derived_roots();
         let first_leaves = BlockCommitments {
             sapling: vec![commitment(1)],
@@ -2236,10 +2542,10 @@ mod tests {
             node.append(&block)?;
         }
         assert_eq!(root_computations() - before, 0);
-        // The changed pool derives its root from its frontier and from its
-        // encoding, and the unchanged pools derive none.
+        // The changed pool derives its root from its frontier once, and the
+        // unchanged pools derive none.
         let checkpoint = accumulator.cross_checked_frontiers()?;
-        assert_eq!(root_computations() - before, 2);
+        assert_eq!(root_computations() - before, 1);
         // Explorer final roots and an unchanged checkpoint reuse those roots.
         assert_eq!(
             accumulator.final_note_commitment_roots(BlockHash::from_bytes([7; 32])),
@@ -2249,8 +2555,226 @@ mod tests {
             ))
         );
         assert_eq!(accumulator.cross_checked_frontiers()?, checkpoint);
-        assert_eq!(root_computations() - before, 2);
+        assert_eq!(
+            accumulator.snapshot().cross_checked_frontiers()?,
+            checkpoint
+        );
+        assert_eq!(root_computations() - before, 1);
         assert_eq!(checkpoint, node.checkpoint()?);
+        Ok(())
+    }
+
+    /// Builds the validated frontier after `size` leaves of `protocol` from
+    /// canonical but arbitrary ommers, so a test can start next to a subtree
+    /// boundary without hashing the leaves before it.
+    fn frontier_of_size<Node>(
+        protocol: ShieldedProtocol,
+        size: u64,
+        decode: impl Fn([u8; 32]) -> Option<Node>,
+        root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+    ) -> TestResultWith<CommitmentTreeFrontier>
+    where
+        Node: Clone + Hashable + HashSer,
+    {
+        let position = Position::from(size - 1);
+        let ommers = (0..position.past_ommer_count())
+            .map(|level| decode(commitment(200 + level)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("ommer must be canonical")?;
+        let tip = decode(commitment(199)).ok_or("tip leaf must be canonical")?;
+        let frontier =
+            Frontier::<Node, NOTE_COMMITMENT_TREE_DEPTH>::from_parts(position, tip, ommers)
+                .map_err(|error| format!("{error:?}"))?;
+        node_frontier(protocol, &frontier, root_bytes_in_rpc_order)
+    }
+
+    fn decode_sapling(bytes: [u8; 32]) -> Option<SaplingNode> {
+        Option::from(SaplingNode::from_bytes(bytes))
+    }
+
+    fn decode_orchard(bytes: [u8; 32]) -> Option<MerkleHashOrchard> {
+        Option::from(MerkleHashOrchard::from_bytes(&bytes))
+    }
+
+    fn commitments(first: u8, count: u8) -> Vec<[u8; 32]> {
+        (first..first + count).map(commitment).collect()
+    }
+
+    /// Appends `blocks` serially and in parallel from the same seed.
+    ///
+    /// Requires identical trees, completed subtree roots, checkpoints derived
+    /// on a worker thread, and final roots after every block, and returns the
+    /// number of subtree roots completed.
+    fn assert_parallel_appends_match_serial(
+        mut serial: CommitmentTreeAccumulator,
+        blocks: &[BlockCommitments],
+    ) -> TestResultWith<usize> {
+        let workers = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let mut parallel = serial.clone();
+        let mut completed = 0;
+        for block in blocks {
+            let height = serial
+                .tip_height()
+                .next()
+                .ok_or("fixture height must advance")?;
+            serial.append_block_commitments(
+                height,
+                &block.sapling,
+                &block.orchard,
+                &block.ironwood,
+            )?;
+            workers.install(|| {
+                parallel.append_block_commitments_in_parallel(
+                    height,
+                    &block.sapling,
+                    &block.orchard,
+                    &block.ironwood,
+                )
+            })?;
+            assert_eq!(parallel.tip_metadata(), serial.tip_metadata());
+            assert_eq!(
+                parallel.completed_subtree_roots(),
+                serial.completed_subtree_roots()
+            );
+            completed += serial.completed_subtree_roots().len();
+            let snapshot = parallel.snapshot();
+            let block_hash = BlockHash::from_bytes([height.value().to_le_bytes()[0]; 32]);
+            let (checkpoint, final_roots) = workers.install(|| {
+                (
+                    snapshot.cross_checked_frontiers(),
+                    snapshot.final_note_commitment_roots(block_hash),
+                )
+            });
+            assert_eq!(checkpoint?, serial.cross_checked_frontiers()?);
+            assert_eq!(final_roots, serial.final_note_commitment_roots(block_hash));
+        }
+        Ok(completed)
+    }
+
+    #[test]
+    fn parallel_appends_match_serial_appends_across_pool_activations() -> TestResult {
+        let serial = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            &pool_activations(2, 4, 6)?,
+        )?;
+        let blocks = [
+            BlockCommitments::default(),
+            BlockCommitments {
+                sapling: commitments(1, 40),
+                ..BlockCommitments::default()
+            },
+            BlockCommitments {
+                sapling: commitments(41, 3),
+                ..BlockCommitments::default()
+            },
+            BlockCommitments {
+                sapling: commitments(44, 5),
+                orchard: commitments(49, 35),
+                ..BlockCommitments::default()
+            },
+            BlockCommitments::default(),
+            BlockCommitments {
+                sapling: commitments(84, 33),
+                orchard: commitments(117, 2),
+                ironwood: commitments(119, 64),
+            },
+            BlockCommitments {
+                ironwood: commitments(183, 1),
+                ..BlockCommitments::default()
+            },
+        ];
+        assert_eq!(assert_parallel_appends_match_serial(serial, &blocks)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_appends_match_serial_appends_across_subtree_boundaries() -> TestResult {
+        let subtree = u64::from(SUBTREE_LEAF_COUNT);
+        let seed = CommitmentTreeFrontiers::from_validated_parts(
+            Some(frontier_of_size(
+                ShieldedProtocol::Sapling,
+                subtree - 40,
+                decode_sapling,
+                sapling_root_bytes_in_rpc_order,
+            )?),
+            Some(frontier_of_size(
+                ShieldedProtocol::Orchard,
+                subtree - 5,
+                decode_orchard,
+                orchard_root_bytes_in_rpc_order,
+            )?),
+            Some(frontier_of_size(
+                ShieldedProtocol::Ironwood,
+                2 * subtree - 33,
+                decode_orchard,
+                orchard_root_bytes_in_rpc_order,
+            )?),
+        )?;
+        let serial = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(10),
+            &seed,
+            &pool_activations(1, 1, 1)?,
+        )?;
+        let blocks = [
+            // Sapling completes a subtree inside a parallel batch, Orchard in
+            // a short block, and Ironwood with the batch's last commitment.
+            BlockCommitments {
+                sapling: commitments(1, 50),
+                orchard: commitments(51, 10),
+                ironwood: commitments(61, 33),
+            },
+            BlockCommitments {
+                sapling: commitments(94, 64),
+                orchard: commitments(158, 40),
+                ironwood: commitments(198, 32),
+            },
+        ];
+        assert_eq!(assert_parallel_appends_match_serial(serial, &blocks)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_parallel_append_leaves_the_accumulator_unchanged() -> TestResult {
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            &pool_activations(1, 3, 3)?,
+        )?;
+        let before = accumulator.tip_metadata();
+        let mut malformed = commitments(1, 40);
+        malformed.push([0xff; 32]);
+        assert!(matches!(
+            accumulator.append_block_commitments_in_parallel(
+                BlockHeight::new(1),
+                &malformed,
+                &[],
+                &[]
+            ),
+            Err(
+                CommitmentTreeAccumulatorError::MalformedCommitmentEncoding {
+                    protocol: ShieldedProtocol::Sapling,
+                    commitment_index: 40,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            accumulator.append_block_commitments_in_parallel(
+                BlockHeight::new(1),
+                &commitments(1, 40),
+                &commitments(41, 1),
+                &[]
+            ),
+            Err(
+                CommitmentTreeAccumulatorError::UnexpectedCommitmentsBeforeActivation {
+                    protocol: ShieldedProtocol::Orchard,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(accumulator.tip_height(), BlockHeight::new(0));
+        assert_eq!(accumulator.tip_metadata(), before);
         Ok(())
     }
 

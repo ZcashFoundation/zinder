@@ -94,8 +94,13 @@ The report records the constructed coverage in
 `resource_limits.tree_state_checkpoint_coverage` and verifies
 `source_load.tree_state_checkpoint_count` against it. Every
 `CanonicalPipelineLimits` field has an explicit positive override for controlled
-source-admission experiments, and `--source-segment-delay-millis` injects a
-fixed delay into each outer fixture segment response.
+source-admission experiments, including `--tree-hashing-workers` for the
+loader's commitment-tree hashing threads, and `--source-segment-delay-millis`
+injects a fixed delay into each outer fixture segment response. The report's
+`stage_durations` include the ordered loader's stages
+(`canonical_block_load`) and the store's per-block stages
+(`canonical_block_store_load`), and the replay requires every subtree root the
+loaded blocks complete to equal the fixture's node-observed root.
 
 This command certifies the exact captured bytes, the complete index-zero
 subtree-root prefixes through the fixed tip, replay-plan checkpoints, canonical
