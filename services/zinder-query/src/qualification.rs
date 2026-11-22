@@ -13,7 +13,8 @@ use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
     tree_state_replay_limit::{
-        ReadyState, ReplayKey, Selection, TreeStateReplayLimit, read_missing_height,
+        ReaderGeneration, ReadyState, ReplayKey, Selection, TreeStateReplayLimit,
+        read_missing_height,
     },
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
@@ -94,12 +95,15 @@ impl QualificationWalletQuery {
         let mut deadline = None;
         let mut carried = None;
         loop {
+            let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
             let generation = Arc::downgrade(&reader);
+            let cache_generation =
+                ReaderGeneration::new(&generation, Arc::ptr_eq(&reader, &(self.capture)()));
             let (selected, expected) = match self
                 .replays
-                .ready_state(key, &generation, reader.as_ref())
+                .ready_state(key, &cache_generation, reader.as_ref(), request_deadline)
                 .await?
             {
                 Some(ready @ ReadyState::Stored(_)) => {
@@ -117,8 +121,8 @@ impl QualificationWalletQuery {
                         .ok_or(QueryError::BlockNotInBestChain)?;
                     let selected = self.replays.select(
                         key,
-                        &generation,
-                        *deadline.get_or_insert_with(|| self.replays.deadline()),
+                        &cache_generation,
+                        request_deadline,
                         carried.take(),
                     )?;
                     (selected, BlockId::new(height, block.block_hash))

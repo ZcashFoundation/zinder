@@ -24,7 +24,7 @@ use zinder_store::{ServedTreeState, TreeStateLookup, TreeStateReplayOutcome};
 
 use super::{
     ReplayRefusal, TreeStateReplayLimit, WaitingPlace, replay_holding_slot,
-    settled_cache::{LookupStep, SettledChainAnchor, SettledStates},
+    settled_cache::{LookupStep, ReaderGeneration, SettledChainAnchor, SettledStates},
 };
 use crate::{CanonicalReader, QueryError, StorageReadError};
 
@@ -90,54 +90,80 @@ impl ReadyState {
 }
 
 impl TreeStateReplayLimit {
-    async fn lookup_settled<T: Send + Sync + 'static>(
+    async fn acquire_anchor_verify(
+        &self,
+        deadline: Instant,
+    ) -> Result<(tokio::sync::MutexGuard<'_, ()>, bool), QueryError> {
+        if let Ok(guard) = self.anchor_verify.try_lock() {
+            return Ok((guard, false));
+        }
+        if Instant::now() >= deadline {
+            return Err(self.refused(ReplayRefusal::WaitExpired));
+        }
+        let _place = WaitingPlace::take(&self.waiters, self.max_waiters)
+            .ok_or_else(|| self.refused(ReplayRefusal::WaitersFull))?;
+        let guard = tokio::time::timeout_at(deadline, self.anchor_verify.lock())
+            .await
+            .map_err(|_| self.refused(ReplayRefusal::WaitExpired))?;
+        Ok((guard, true))
+    }
+
+    async fn lookup_settled(
         &self,
         key: ReplayKey,
-        generation: &Weak<T>,
+        generation: &ReaderGeneration,
         reader: &dyn CanonicalReader,
+        deadline: Instant,
     ) -> Result<Option<ServedTreeState>, QueryError> {
         let target = key.settled_anchor();
-        let weak: Weak<dyn Send + Sync> = generation.clone();
         let initial_step = self
             .flights
             .lock()
             .settled
-            .classify_lookup(target, &weak, key.height);
+            .classify_lookup(target, generation, key.height);
         match initial_step {
             LookupStep::Hit(state) => return Ok(Some(state)),
             LookupStep::Miss => return Ok(None),
             LookupStep::VerifyExtension(_) => {}
         }
-        let _verify_guard = self.anchor_verify.lock().await;
+        let (_verify_guard, waited) = self.acquire_anchor_verify(deadline).await?;
         let locked_step = self
             .flights
             .lock()
             .settled
-            .classify_lookup(target, &weak, key.height);
+            .classify_lookup(target, generation, key.height);
         let prior = match locked_step {
             LookupStep::Hit(state) => return Ok(Some(state)),
             LookupStep::Miss => return Ok(None),
             LookupStep::VerifyExtension(prior) => prior,
         };
-        let header = reader
-            .block_header_at(prior.settled_tip.height)
-            .await
-            .map_err(QueryError::canonical_read)?;
+        let header = if !self.wait.is_zero() || waited {
+            tokio::time::timeout_at(deadline, reader.block_header_at(prior.settled_tip.height))
+                .await
+                .map_err(|_| self.refused(ReplayRefusal::WaitExpired))?
+                .map_err(QueryError::canonical_read)?
+        } else {
+            reader
+                .block_header_at(prior.settled_tip.height)
+                .await
+                .map_err(QueryError::canonical_read)?
+        };
         let extends_prior =
             header.is_some_and(|stored| stored.block_hash == prior.settled_tip.hash);
         Ok(self.flights.lock().settled.complete_extension_lookup(
             (prior, target),
-            &weak,
+            generation,
             key.height,
             extends_prior,
         ))
     }
 
-    pub(crate) async fn ready_state<T: Send + Sync + 'static>(
+    pub(crate) async fn ready_state(
         &self,
         key: ReplayKey,
-        generation: &Weak<T>,
+        generation: &ReaderGeneration,
         reader: &dyn CanonicalReader,
+        deadline: Instant,
     ) -> Result<Option<ReadyState>, QueryError> {
         if key.height > key.epoch.visible_tip_height
             || key
@@ -147,7 +173,10 @@ impl TreeStateReplayLimit {
         {
             return Err(QueryError::BlockNotInBestChain);
         }
-        if let Some(state) = self.lookup_settled(key, generation, reader).await? {
+        if let Some(state) = self
+            .lookup_settled(key, generation, reader, deadline)
+            .await?
+        {
             return Ok(Some(ReadyState::Cached(state)));
         }
         let stored = reader
@@ -157,14 +186,14 @@ impl TreeStateReplayLimit {
         Ok(stored.map(ReadyState::Stored))
     }
 
-    pub(crate) fn select<T: Send + Sync + 'static>(
+    pub(crate) fn select(
         &self,
         key: ReplayKey,
-        generation: &Weak<T>,
+        generation: &ReaderGeneration,
         deadline: Instant,
         mut carried: Option<TakeReplayPermit>,
     ) -> Result<Selection, QueryError> {
-        let id = (key, generation.as_ptr().addr());
+        let id = (key, generation.addr());
         let mut flights = self.flights.lock();
         if let Some(state) = flights
             .settled
@@ -202,7 +231,8 @@ impl TreeStateReplayLimit {
         generation: &Weak<T>,
         deadline: Instant,
     ) -> Result<Arc<Subscription>, QueryError> {
-        match self.select(key, generation, deadline, None)? {
+        let cache_generation = ReaderGeneration::new(generation, true);
+        match self.select(key, &cache_generation, deadline, None)? {
             Selection::Waiting(subscription) => Ok(subscription),
             Selection::Ready(_) => Err(QueryError::BlockNotInBestChain),
         }
@@ -362,8 +392,8 @@ impl SubscriberPlaces {
 
 struct Flight {
     key: ReplayKey,
-    // Keep the allocation address unique without pinning its storage reader.
-    generation: Weak<dyn Send + Sync>,
+    // Keep the allocation address and ownership context without pinning its storage reader.
+    generation: ReaderGeneration,
     registry: Arc<Mutex<Flights>>,
     cancelled: Arc<AtomicBool>,
     admission: Admission,

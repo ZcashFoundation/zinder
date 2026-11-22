@@ -1,10 +1,12 @@
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use super::super::TreeStateReplayLimit;
-use super::super::settled_cache::{LookupStep, SETTLED_MAX_ENTRIES, SettledStates};
+use super::super::settled_cache::{
+    LookupStep, ReaderGeneration, SETTLED_MAX_ENTRIES, SettledStates,
+};
 use super::{ReadyState, ReplayKey};
 use crate::{
-    CanonicalReader as _, RocksDbCanonicalReader,
+    CanonicalReader, RocksDbCanonicalReader, StorageReadError,
     observed_canonical_reader::ObservedCanonicalReader,
 };
 use futures_util::FutureExt as _;
@@ -21,8 +23,8 @@ async fn only_settled_rows_at_the_same_retained_fence_survive_eviction() -> eyre
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
-    let generation: std::sync::Weak<dyn Send + Sync> =
-        Arc::<RocksDbCanonicalReader>::downgrade(&reader);
+    let weak: std::sync::Weak<RocksDbCanonicalReader> = Arc::downgrade(&reader);
+    let generation = ReaderGeneration::new(&weak, true);
     let height = reader.chain_epoch().visible_tip_height;
     let Some(TreeStateLookup::Stored(state)) = reader.tree_state_lookup(height).await? else {
         return Err(eyre::eyre!("missing tip checkpoint"));
@@ -254,10 +256,11 @@ async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss()
     let height = BlockHeight::new(2);
     let key = ReplayKey::new(height, reader.as_ref());
     let generation = Arc::downgrade(&reader);
+    let cache_generation = ReaderGeneration::new(&generation, true);
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
     assert!(
         limit
-            .ready_state(key, &generation, reader.as_ref())
+            .ready_state(key, &cache_generation, reader.as_ref(), limit.deadline())
             .await?
             .is_none()
     );
@@ -271,7 +274,8 @@ async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss()
         .ok_or_else(|| eyre::eyre!("missing reconstructed state"))?;
     drop(first);
     let _occupied = limit.admit().await?;
-    let Selection::Ready(cached) = limit.select(key, &generation, limit.deadline(), None)? else {
+    let Selection::Ready(cached) = limit.select(key, &cache_generation, limit.deadline(), None)?
+    else {
         return Err(eyre::eyre!("settled state started a second reconstruction"));
     };
     assert_eq!(cached.serve(), state);
@@ -285,6 +289,7 @@ async fn an_admitted_wallet_supplies_its_slot_to_a_waiting_replacement_without_l
     let key = replay_key()?;
     let old = Arc::downgrade(&Arc::new(()));
     let new = Arc::downgrade(&Arc::new(()));
+    let new_cache = ReaderGeneration::new(&new, true);
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
     let deadline = limit.deadline();
     let occupied = limit.admit().await?;
@@ -300,7 +305,7 @@ async fn an_admitted_wallet_supplies_its_slot_to_a_waiting_replacement_without_l
     assert!(previous.admit(&limit).now_or_never().is_none());
     drop(occupied);
     let carried = first.carry(&first.admit(&limit).await?);
-    let Selection::Waiting(moved) = limit.select(key, &new, deadline, carried)? else {
+    let Selection::Waiting(moved) = limit.select(key, &new_cache, deadline, carried)? else {
         return Err(eyre::eyre!("unexpected cached state"));
     };
     assert!(Arc::ptr_eq(&moved.flight, &previous.flight));
@@ -367,7 +372,12 @@ async fn a_full_running_flight_refuses_a_carried_join_and_frees_its_unused_slot(
     let carried = previous.carry(&previous.admit(&limit).await?);
     assert!(carried.is_some());
     assert!(matches!(
-        limit.select(key, &destination, limit.deadline(), carried),
+        limit.select(
+            key,
+            &ReaderGeneration::new(&destination, true),
+            limit.deadline(),
+            carried
+        ),
         Err(crate::QueryError::TreeStateReplayLimitReached { .. })
     ));
     assert_eq!(limit.waiter_count(), 2);
@@ -430,7 +440,8 @@ async fn selection_preserves_its_incoming_slot_while_the_destination_is_moving()
     tokio::time::timeout(Duration::from_secs(3), entered_move).await??;
     let selecting = tokio::task::spawn_blocking({
         let limit = limit.clone();
-        move || limit.select(key, &destination, limit.deadline(), incoming)
+        let dest_cache = ReaderGeneration::new(&destination, true);
+        move || limit.select(key, &dest_cache, limit.deadline(), incoming)
     });
     let selected_candidate = tokio::time::timeout(Duration::from_secs(3), async {
         while limit.flights.try_lock().is_some() {
@@ -517,9 +528,10 @@ async fn replay_and_cache(
 ) -> eyre::Result<zinder_store::ServedTreeState> {
     let key = ReplayKey::new(height, reader.as_ref());
     let generation = Arc::downgrade(reader);
+    let cache_generation = ReaderGeneration::new(&generation, true);
     assert!(
         limit
-            .ready_state(key, &generation, reader.as_ref())
+            .ready_state(key, &cache_generation, reader.as_ref(), limit.deadline())
             .await?
             .is_none()
     );
@@ -539,19 +551,20 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
     let (_s1, first) = publish_reader(&chain, 4, 2)?;
     let (_s2, extended) = publish_reader(&chain, 5, 4)?;
-    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
     let height = BlockHeight::new(1);
     let expected = replay_and_cache(&limit, &first, height).await?;
 
     let key = ReplayKey::new(height, extended.as_ref());
-    let gen_ext = Arc::downgrade(&extended);
+    let gen_ext = ReaderGeneration::new(&Arc::downgrade(&extended), true);
     let mut joins = Vec::new();
     for _ in 0..4 {
         let lim = limit.clone();
         let obs = Arc::clone(&extended);
         let gen_ref = gen_ext.clone();
+        let deadline = limit.deadline();
         joins.push(tokio::spawn(async move {
-            lim.ready_state(key, &gen_ref, obs.as_ref()).await
+            lim.ready_state(key, &gen_ref, obs.as_ref(), deadline).await
         }));
     }
     for task in joins {
@@ -559,7 +572,9 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     }
     assert_eq!(extended.reads(), 1);
     assert!(matches!(
-        limit.ready_state(key, &gen_ext, extended.as_ref()).await?,
+        limit
+            .ready_state(key, &gen_ext, extended.as_ref(), limit.deadline())
+            .await?,
         Some(ReadyState::Cached(ref s)) if *s == expected
     ));
     assert_eq!(extended.reads(), 1);
@@ -577,10 +592,10 @@ async fn settled_cache_clears_when_settled_tip_extension_is_on_a_fork() -> eyre:
     replay_and_cache(&limit, &reader_a, height).await?;
 
     let key_b = ReplayKey::new(height, reader_b.as_ref());
-    let gen_b = Arc::downgrade(&reader_b);
+    let gen_b = ReaderGeneration::new(&Arc::downgrade(&reader_b), true);
     assert!(
         limit
-            .ready_state(key_b, &gen_b, reader_b.as_ref())
+            .ready_state(key_b, &gen_b, reader_b.as_ref(), limit.deadline())
             .await?
             .is_none()
     );
@@ -599,18 +614,20 @@ async fn lagging_reader_at_prior_settled_tip_does_not_wipe_promoted_cache() -> e
     let baseline_reads = newer.reads();
 
     let older_key = ReplayKey::new(height, older.as_ref());
-    let older_gen = Arc::downgrade(&older);
+    let older_gen = ReaderGeneration::new(&Arc::downgrade(&older), false);
     assert!(
         limit
-            .ready_state(older_key, &older_gen, older.as_ref())
+            .ready_state(older_key, &older_gen, older.as_ref(), limit.deadline())
             .await?
             .is_none()
     );
 
     let newer_key = ReplayKey::new(height, newer.as_ref());
-    let newer_gen = Arc::downgrade(&newer);
+    let newer_gen = ReaderGeneration::new(&Arc::downgrade(&newer), true);
     assert!(matches!(
-        limit.ready_state(newer_key, &newer_gen, newer.as_ref()).await?,
+        limit
+            .ready_state(newer_key, &newer_gen, newer.as_ref(), limit.deadline())
+            .await?,
         Some(ReadyState::Cached(ref s)) if *s == expected
     ));
     assert_eq!(newer.reads(), baseline_reads);
@@ -629,17 +646,331 @@ async fn replacement_store_with_shorter_settled_tip_resets_cache_after_old_reade
     drop(longer);
 
     let shorter_key = ReplayKey::new(height, shorter.as_ref());
-    let shorter_gen = Arc::downgrade(&shorter);
+    let shorter_gen = ReaderGeneration::new(&Arc::downgrade(&shorter), true);
     assert!(
         limit
-            .ready_state(shorter_key, &shorter_gen, shorter.as_ref())
+            .ready_state(
+                shorter_key,
+                &shorter_gen,
+                shorter.as_ref(),
+                limit.deadline()
+            )
             .await?
             .is_none()
     );
     let rebuilt = replay_and_cache(&limit, &shorter, height).await?;
     assert!(matches!(
-        limit.ready_state(shorter_key, &shorter_gen, shorter.as_ref()).await?,
+        limit
+            .ready_state(shorter_key, &shorter_gen, shorter.as_ref(), limit.deadline())
+            .await?,
         Some(ReadyState::Cached(ref s)) if *s == rebuilt
     ));
+    Ok(())
+}
+
+struct HeaderGate {
+    entered: tokio::sync::Notify,
+    open: tokio::sync::Semaphore,
+}
+
+struct StalledHeaderReader {
+    inner: Arc<ObservedCanonicalReader>,
+    gate: Arc<HeaderGate>,
+}
+
+impl StalledHeaderReader {
+    fn new(inner: Arc<ObservedCanonicalReader>) -> Self {
+        Self {
+            inner,
+            gate: Arc::new(HeaderGate {
+                entered: tokio::sync::Notify::new(),
+                open: tokio::sync::Semaphore::new(0),
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CanonicalReader for StalledHeaderReader {
+    fn network(&self) -> Network {
+        self.inner.network()
+    }
+
+    fn network_upgrade_schedule(&self) -> Option<&zinder_store::CanonicalActivationSchedule> {
+        self.inner.network_upgrade_schedule()
+    }
+
+    fn raw_blob_retention(&self) -> zinder_store::RawBlobRetention {
+        self.inner.raw_blob_retention()
+    }
+
+    fn event_fence(&self) -> zinder_store::CanonicalEventFence {
+        self.inner.event_fence()
+    }
+
+    fn chain_epoch(&self) -> zinder_core::ChainEpoch {
+        self.inner.chain_epoch()
+    }
+
+    fn history_bounds(&self) -> CanonicalHistoryBounds {
+        self.inner.history_bounds()
+    }
+
+    async fn block_header_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<zinder_core::BlockHeaderArtifact>, StorageReadError> {
+        self.gate.entered.notify_one();
+        let _released = self.gate.open.acquire().await;
+        self.inner.block_header_at(height).await
+    }
+
+    async fn block_hash_lookup(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<zinder_store::BlockHashLookup, StorageReadError> {
+        self.inner.block_hash_lookup(block_hash).await
+    }
+
+    async fn block_header_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<zinder_core::BlockHeaderArtifact>, StorageReadError> {
+        self.inner.block_header_by_hash(block_hash).await
+    }
+
+    async fn compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<zinder_core::CompactBlockArtifact>, StorageReadError> {
+        self.inner.compact_block_by_hash(block_hash).await
+    }
+
+    async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<zinder_core::CompactBlockArtifact>, StorageReadError> {
+        self.inner.compact_block_at(height).await
+    }
+
+    async fn compact_blocks_in_range(
+        &self,
+        range: zinder_core::BlockHeightRange,
+    ) -> Result<Vec<zinder_core::CompactBlockArtifact>, StorageReadError> {
+        self.inner.compact_blocks_in_range(range).await
+    }
+
+    async fn compact_blocks_in_range_up_to(
+        &self,
+        range: zinder_core::BlockHeightRange,
+        order: zinder_store::HeightOrder,
+        max_bytes: usize,
+    ) -> Result<Vec<zinder_core::CompactBlockArtifact>, StorageReadError> {
+        self.inner
+            .compact_blocks_in_range_up_to(range, order, max_bytes)
+            .await
+    }
+
+    async fn block_blob_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<zinder_core::BlockBlobArtifact>, StorageReadError> {
+        self.inner.block_blob_at(height).await
+    }
+
+    async fn block_blobs_in_range(
+        &self,
+        range: zinder_core::BlockHeightRange,
+    ) -> Result<Vec<Option<zinder_core::BlockBlobArtifact>>, StorageReadError> {
+        self.inner.block_blobs_in_range(range).await
+    }
+
+    async fn mined_transaction(
+        &self,
+        transaction_id: zinder_core::TransactionId,
+    ) -> Result<Option<crate::IndexedTransaction>, StorageReadError> {
+        self.inner.mined_transaction(transaction_id).await
+    }
+
+    async fn transaction_blob_by_id(
+        &self,
+        transaction_id: zinder_core::TransactionId,
+    ) -> Result<zinder_core::TransactionBlobArtifact, StorageReadError> {
+        self.inner.transaction_blob_by_id(transaction_id).await
+    }
+
+    async fn tree_state_checkpoint_at_or_before(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<zinder_store::ServedTreeState>, StorageReadError> {
+        self.inner.tree_state_checkpoint_at_or_before(height).await
+    }
+
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<zinder_store::ServedTreeState>, StorageReadError> {
+        self.inner.stored_tree_state_at(height).await
+    }
+
+    async fn tree_state_lookup(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        self.inner.tree_state_lookup(height).await
+    }
+
+    async fn replay_tree_state(
+        &self,
+        replay: zinder_store::TreeStateReplay,
+    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, StorageReadError> {
+        self.inner.replay_tree_state(replay).await
+    }
+
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: zinder_store::TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<zinder_store::TreeStateReplayOutcome>, StorageReadError> {
+        self.inner
+            .replay_tree_state_until_cancelled(replay, cancelled)
+            .await
+    }
+
+    async fn subtree_roots(
+        &self,
+        range: zinder_core::SubtreeRootRange,
+    ) -> Result<Vec<zinder_core::SubtreeRootArtifact>, StorageReadError> {
+        self.inner.subtree_roots(range).await
+    }
+
+    async fn wallet_chain_event_history(
+        &self,
+        from_cursor: Option<zinder_store::StreamCursorTokenV1>,
+        family: zinder_store::ChainEventStreamFamily,
+        max_events: NonZeroU32,
+    ) -> Result<Vec<zinder_store::ChainEventEnvelope>, StorageReadError> {
+        self.inner
+            .wallet_chain_event_history(from_cursor, family, max_events)
+            .await
+    }
+
+    async fn resolve_wallet_chain_event_stream_start(
+        &self,
+        start: zinder_store::EventStreamStartPosition,
+        requested_family: zinder_store::ChainEventStreamFamily,
+    ) -> Result<zinder_store::ChainEventStreamResume, StorageReadError> {
+        self.inner
+            .resolve_wallet_chain_event_stream_start(start, requested_family)
+            .await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_extension_header_check_bounds_waiters_and_expires_wait_deadline()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, extended_inner) = publish_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_millis(60))
+        .with_waiters_per_slot(NonZeroU32::MIN);
+    let height = BlockHeight::new(1);
+    replay_and_cache(&limit, &first, height).await?;
+
+    let stalled = Arc::new(StalledHeaderReader::new(Arc::clone(&extended_inner)));
+    let key = ReplayKey::new(height, stalled.as_ref());
+    let stalled_gen = ReaderGeneration::new(&Arc::downgrade(&stalled), true);
+
+    let leader = tokio::spawn({
+        let limit = limit.clone();
+        let stalled = Arc::clone(&stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .await
+        }
+    });
+    stalled.gate.entered.notified().await;
+
+    let follower = tokio::spawn({
+        let limit = limit.clone();
+        let stalled = Arc::clone(&stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .await
+        }
+    });
+    limit.wait_for_waiters(1).await?;
+
+    let overflow = limit
+        .ready_state(key, &stalled_gen, stalled.as_ref(), limit.deadline())
+        .await;
+    assert!(matches!(
+        overflow,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+
+    tokio::time::advance(Duration::from_millis(65)).await;
+    assert!(matches!(
+        follower.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert!(matches!(
+        leader.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert_eq!(limit.waiter_count(), 0);
+    assert_eq!(extended_inner.reads(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_wait_refuses_contended_extension_check_immediately_without_queueing()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, extended_inner) = publish_reader(&chain, 5, 4)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO)
+        .with_waiters_per_slot(NonZeroU32::MIN);
+    let height = BlockHeight::new(1);
+    let expected = replay_and_cache(&limit, &first, height).await?;
+
+    let stalled = Arc::new(StalledHeaderReader::new(Arc::clone(&extended_inner)));
+    let key = ReplayKey::new(height, stalled.as_ref());
+    let stalled_gen = ReaderGeneration::new(&Arc::downgrade(&stalled), true);
+
+    let leader = tokio::spawn({
+        let limit = limit.clone();
+        let stalled = Arc::clone(&stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(key, &stalled_gen, stalled.as_ref(), deadline)
+                .await
+        }
+    });
+    stalled.gate.entered.notified().await;
+
+    let contender = limit
+        .ready_state(key, &stalled_gen, stalled.as_ref(), limit.deadline())
+        .await;
+    assert!(matches!(
+        contender,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert_eq!(limit.waiter_count(), 0);
+
+    stalled.gate.open.close();
+    assert!(matches!(
+        leader.await??,
+        Some(ReadyState::Cached(ref state)) if *state == expected
+    ));
+    assert_eq!(extended_inner.reads(), 1);
     Ok(())
 }
