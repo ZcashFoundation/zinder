@@ -258,12 +258,15 @@ def assess_metric(case, metric, usable, records, repeats, min_pairs, issues):
     worse = sum(entry["outcome"] == "worse" for entry in pairs)
     better = sum(entry["outcome"] == "better" for entry in pairs)
     assessed["pairs_worse"], assessed["pairs_better"] = worse, better
-    significant = ("tolerance_absolute" not in metric or abs(median_delta) > metric["tolerance_absolute"])
-    if "tolerance_relative" in metric and not all_zero:
-        significant = significant and abs(median_relative_delta) > metric["tolerance_relative"]
-    median_effect = median_delta if all_zero else median_relative_delta
-    if not all_zero and median_delta * median_relative_delta < 0:
-        significant = False
+    absolute = metric.get("tolerance_absolute")
+    relative = metric.get("tolerance_relative")
+    median_effect = median_delta
+    significant = absolute is None or abs(median_delta) > absolute
+    if relative is not None and not all_zero:
+        median_effect = median_relative_delta
+        significant = significant and abs(median_effect) > relative
+        if absolute is not None and median_delta * median_effect < 0:
+            significant = False
     median_outcome = ("neutral" if not significant else
                       "worse" if median_effect * DIRECTIONS[metric["direction"]] > 0 else "better")
     if worse and better:

@@ -104,6 +104,14 @@ class CompareTests(unittest.TestCase):
         report = self.compare(0)
         self.assertEqual(report["metrics"][0]["verdict"], "no_clear_change")
 
+    def test_single_tolerance_decides_direction_in_its_own_units(self):
+        self.build({"range": [(10_000_000, 10_001_000)] * 2 + [(10, 8)] * 2})
+        metric = self.policy["metrics"][0]
+        self.assertEqual(self.compare(0)["verdict"], "improvement")
+        del metric["tolerance_relative"]
+        metric["tolerance_absolute"] = 100
+        self.assertEqual(self.compare(1)["verdict"], "regression")
+
     def test_changes_inside_tolerance_are_not_clear(self):
         self.build({"range": [(100, 103), (100, 97), (100, 104), (100, 101)]})
         self.assertEqual(self.compare(0)["verdict"], "no_clear_change")

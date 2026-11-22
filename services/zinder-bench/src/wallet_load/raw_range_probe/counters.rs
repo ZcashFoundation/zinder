@@ -133,11 +133,19 @@ impl CounterSource {
     pub(super) async fn fresh_snapshot(&self) -> Snapshot {
         let witness_total = |samples: &[MetricSample]| self.witness.total(samples).unwrap_or(0.0);
         let start = witness_total(&server_metrics::scrape(&self.url).await?);
+        if !start.is_finite() {
+            return Err(format!(
+                "witness `{}` is non-finite",
+                self.witness.describe()
+            ));
+        }
         let deadline = Instant::now() + self.wait;
         while Instant::now() < deadline {
             tokio::time::sleep(POLL_INTERVAL).await;
             let samples = server_metrics::scrape(&self.url).await?;
-            if witness_total(&samples) > start
+            let current = witness_total(&samples);
+            if current.is_finite()
+                && current > start
                 && let Some(totals) = self
                     .counters
                     .iter()
@@ -175,12 +183,16 @@ pub(super) fn report(source: &CounterSource, before: Snapshot, after: Snapshot) 
             .into_iter()
             .map(|(alias, after)| {
                 let before = before.get(&alias).copied().unwrap_or(f64::NAN);
+                let increase = after - before;
+                if !increase.is_finite() {
+                    return Err(format!("counter `{alias}` has a non-finite increase"));
+                }
                 if after < before {
                     return Err(format!(
                         "counter `{alias}` went from {before} to {after}; the server restarted"
                     ));
                 }
-                Ok((alias, after - before))
+                Ok((alias, increase))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()
     });
@@ -318,6 +330,23 @@ mod tests {
         let report = report(&source, before, Err("unread".to_owned()));
         assert!(!report.available);
         assert!(report.increases.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn non_finite_counter_increases_are_unavailable() -> Result<(), Box<dyn Error>> {
+        let source = source("http://unused".to_owned(), Duration::ZERO)?;
+        let snapshot = |v| Ok(std::iter::once(("multiget_get".to_owned(), v)).collect());
+        for (before, after) in [(f64::NAN, 1.0), (1.0, f64::INFINITY), (-f64::MAX, f64::MAX)] {
+            let result = report(&source, snapshot(before), snapshot(after));
+            assert!(!result.available);
+            assert!(
+                result
+                    .reason
+                    .is_some_and(|reason| reason.contains("finite"))
+            );
+            assert!(result.increases.is_none());
+        }
         Ok(())
     }
 
