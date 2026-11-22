@@ -727,8 +727,12 @@ fn synthetic_tip_hash(tag: u32) -> zinder_core::BlockHash {
     zinder_core::BlockHash::from_bytes(raw)
 }
 
-#[tokio::test]
-async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> {
+async fn setup_gated_anchor_fixture() -> Result<(
+    Arc<PublishedShieldedCatalog>,
+    ObservedRangeReads,
+    HashGate,
+    (Arc<RocksDbCanonicalReader>, zinder_core::ChainEpoch),
+)> {
     use crate::block_methods::CompactBlockReads as _;
 
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
@@ -744,29 +748,36 @@ async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> 
     reads.hash_gate = Some(gate.clone());
     reads.set_settled_tip(3, synthetic_tip_hash(3));
     let view = reads.capture_view().await?;
+    Ok((catalog, reads, gate, view))
+}
 
-    let first_catalog = catalog.clone();
-    let first_reads = reads.clone();
-    let first_view = view.clone();
+#[tokio::test]
+async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> {
+    use crate::block_methods::CompactBlockReads as _;
+
+    let (catalog, reads, gate, view) = setup_gated_anchor_fixture().await?;
+    let no_cancel = tokio_util::sync::CancellationToken::new();
+    let leader_catalog = catalog.clone();
+    let leader_reads = reads.clone();
+    let leader_view = view.clone();
+    let leader_cancel = no_cancel.clone();
     let leader = tokio::spawn(async move {
-        first_catalog
+        leader_catalog
             .terminal()
-            .check_view(&first_reads, &first_view)
+            .check_view(&leader_reads, &leader_view, &leader_cancel)
             .await
     });
     gate.entered.notified().await;
 
     let mut followers = tokio::task::JoinSet::new();
     for _ in 0..15 {
-        let follower_catalog = catalog.clone();
-        let follower_reads = reads.clone();
-        let follower_view = view.clone();
-        followers.spawn(async move {
-            follower_catalog
-                .terminal()
-                .check_view(&follower_reads, &follower_view)
-                .await
-        });
+        let (fc, fr, fv, ft) = (
+            catalog.clone(),
+            reads.clone(),
+            view.clone(),
+            no_cancel.clone(),
+        );
+        followers.spawn(async move { fc.terminal().check_view(&fr, &fv, &ft).await });
     }
     for _ in 0..8 {
         tokio::task::yield_now().await;
@@ -783,13 +794,15 @@ async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> 
 
     reads.set_settled_tip(4, synthetic_tip_hash(4));
     let view_four = reads.capture_view().await?;
-    catalog.terminal().check_view(&reads, &view_four).await?;
-    assert_eq!(
-        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
-        2
-    );
+    catalog
+        .terminal()
+        .check_view(&reads, &view_four, &no_cancel)
+        .await?;
     for cycle in [view.clone(), view_four.clone(), view.clone()] {
-        catalog.terminal().check_view(&reads, &cycle).await?;
+        catalog
+            .terminal()
+            .check_view(&reads, &cycle, &no_cancel)
+            .await?;
     }
     assert_eq!(
         reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -800,19 +813,89 @@ async fn anchor_cache_is_single_flight_and_keeps_lru_of_16_tips() -> Result<()> 
     for tip in 5_u32..20 {
         reads.set_settled_tip(tip, synthetic_tip_hash(tip));
         let newer = reads.capture_view().await?;
-        catalog.terminal().check_view(&reads, &newer).await?;
+        catalog
+            .terminal()
+            .check_view(&reads, &newer, &no_cancel)
+            .await?;
     }
     let after_fill = reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed);
-    catalog.terminal().check_view(&reads, &view).await?;
+    catalog
+        .terminal()
+        .check_view(&reads, &view, &no_cancel)
+        .await?;
     assert_eq!(
         reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
-        after_fill,
-        "recently touched tip 3 must survive while older tip 4 is evicted"
+        after_fill
     );
-    catalog.terminal().check_view(&reads, &view_four).await?;
+    catalog
+        .terminal()
+        .check_view(&reads, &view_four, &no_cancel)
+        .await?;
     assert_eq!(
         reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
         after_fill + 1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_anchor_waiter_exits_mutex_queue_without_extra_hash_read() -> Result<()> {
+    use crate::block_methods::CompactBlockReads as _;
+
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let (_store, source) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    assert!(fixture.publisher()?.publish_next(&source)?);
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let gate = HashGate {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut reads = ObservedRangeReads::new(Arc::new(source));
+    reads.hash_gate = Some(gate.clone());
+    reads.set_settled_tip(3, synthetic_tip_hash(3));
+    let view = reads.capture_view().await?;
+
+    let leader_catalog = catalog.clone();
+    let leader_reads = reads.clone();
+    let leader_view = view.clone();
+    let leader = tokio::spawn(async move {
+        leader_catalog
+            .terminal()
+            .check_view(
+                &leader_reads,
+                &leader_view,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    });
+    gate.entered.notified().await;
+
+    let follower_cancel = tokio_util::sync::CancellationToken::new();
+    let follower_catalog = catalog.clone();
+    let follower_reads = reads.clone();
+    let follower_token = follower_cancel.clone();
+    let follower = tokio::spawn(async move {
+        follower_catalog
+            .terminal()
+            .check_view(&follower_reads, &view, &follower_token)
+            .await
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    follower_cancel.cancel();
+    let follower_outcome = follower.await?;
+    assert!(
+        matches!(follower_outcome, Err(status) if status.code() == tonic::Code::Cancelled),
+        "cancelled waiter must leave anchor queue immediately"
+    );
+
+    gate.release.notify_waiters();
+    leader.await??;
+    assert_eq!(
+        reads.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
     );
     Ok(())
 }

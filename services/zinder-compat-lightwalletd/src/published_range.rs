@@ -15,6 +15,7 @@ use std::{collections::VecDeque, io, path::Path};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, Network};
 use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
@@ -195,9 +196,11 @@ impl PublishedShieldedRange {
         &self,
         reads: &Reads,
         view: &Reads::View,
+        cancel: &CancellationToken,
     ) -> Result<(), Status> {
         self.check_anchor(
             Reads::view_chain_epoch(view),
+            cancel,
             reads.block_hash_at(view, self.segment.identity().end.height),
         )
         .await
@@ -210,7 +213,7 @@ impl PublishedShieldedRange {
     /// Rejects a differently settled chain, an incompatible artifact schema, or unavailable canonical data.
     async fn verify_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
         let end = self.segment.identity().end.height;
-        self.check_anchor(source.chain_epoch(), async {
+        self.check_anchor(source.chain_epoch(), &CancellationToken::new(), async {
             source
                 .block_header_at(end)
                 .await
@@ -224,6 +227,7 @@ impl PublishedShieldedRange {
     async fn check_anchor(
         &self,
         chain: ChainEpoch,
+        cancel: &CancellationToken,
         terminal: impl Future<Output = Result<BlockHash, Status>> + Send,
     ) -> Result<(), Status> {
         let segment = self.segment.identity();
@@ -240,7 +244,17 @@ impl PublishedShieldedRange {
         if self.is_settled_tip_verified(settled) {
             return Ok(());
         }
-        let _anchor_guard = self.anchor_check_lock.lock().await;
+        if cancel.is_cancelled() {
+            return Err(Status::cancelled("block-range stream cancelled"));
+        }
+        let _anchor_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(Status::cancelled("block-range stream cancelled")),
+            guard = self.anchor_check_lock.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return Err(Status::cancelled("block-range stream cancelled"));
+        }
         if self.is_settled_tip_verified(settled) {
             return Ok(());
         }
