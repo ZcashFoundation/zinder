@@ -570,5 +570,8 @@ which each binary reads with `--config`, and provide what Compose provides:
   node's user;
 - the start order ingest, projector, then the readers, each after the previous
   one is ready;
+- an open-file limit for the compatibility reader when it serves signed
+  history. Set `LimitNOFILE=65536` in the `[Service]` section of its systemd
+  unit to match the Compose deployment;
 - loopback listen addresses. `compat-lightwalletd.toml` binds `0.0.0.0:9067`
   for the Compose network namespace, so set a loopback address in its place.

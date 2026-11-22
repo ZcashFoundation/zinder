@@ -135,6 +135,11 @@ expect_rejected "a query process with access to the publisher signing key" --com
 jq '(.services["zinder-compat-lightwalletd"].volumes[] | select(.target == "/var/lib/zinder-history")).read_only = false' \
   "$history_compose" > "$invalid_history_compose"
 expect_rejected "a writer-capable catalog mount in a reader" --compose-contract "$invalid_history_compose"
+jq 'del(.services["zinder-compat-lightwalletd"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
+expect_rejected "a wallet reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
+jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \
+  "$history_compose" > "$invalid_history_compose"
+expect_rejected "a wallet reader using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
 
 indexer_tls_directory="$temporary_directory/indexer-tls"
 mkdir -p "$indexer_tls_directory"
