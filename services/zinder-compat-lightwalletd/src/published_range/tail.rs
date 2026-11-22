@@ -305,16 +305,16 @@ impl ShieldedTailBuffer {
         // share block hashes while holding different compact bytes.
         let updated = match &previous {
             Some(existing) if existing.serves(source) => {
-                prepend_missing(source, existing, requested_floor, max_tail_bytes).await?
+                prepend_missing(source, existing, requested_floor, max_tail_bytes, catalog).await?
             }
-            _ => {
-                build(
-                    source,
-                    (window_floor, requested_floor, max_tail_bytes),
-                    catalog,
-                )
-                .await?
-            }
+            _ => build(
+                source,
+                BlockHeightRange::inclusive(requested_floor, epoch.visible_tip_height),
+                max_tail_bytes,
+                catalog,
+            )
+            .await?
+            .map(Arc::new),
         };
         let Some(next_tail) = updated else {
             return Ok(None);
@@ -448,19 +448,12 @@ impl EncodedTail {
 /// Reads the requested part of the window from `source` alone.
 async fn build<Source: TailSource>(
     source: &Source,
-    (window_floor, requested_floor, max_tail_bytes): (BlockHeight, BlockHeight, usize),
+    span: BlockHeightRange,
+    max_tail_bytes: usize,
     catalog: Option<(BlockHeight, BlockId)>,
-) -> Result<Option<Arc<EncodedTail>>, Status> {
+) -> Result<Option<EncodedTail>, Status> {
     let (epoch, fence) = source.epoch_and_fence();
-    let mut start_floor = requested_floor;
-    if let Some((catalog_end, _)) = catalog
-        && requested_floor == window_floor
-        && let Some(after_catalog) = catalog_end.next()
-    {
-        start_floor = start_floor.max(after_catalog);
-    }
-    let mut prior =
-        catalog.and_then(|(end, id)| (Some(end.next()?) == Some(start_floor)).then_some(id));
+    let mut prior = catalog.and_then(|(end, id)| (end.next()? == span.start).then_some(id));
     let mut tail = EncodedTail {
         epoch,
         fence,
@@ -470,24 +463,21 @@ async fn build<Source: TailSource>(
         rows: VecDeque::new(),
         held: HeldBytes::default(),
     };
-    if start_floor <= epoch.visible_tip_height {
-        let span = BlockHeightRange::inclusive(start_floor, epoch.visible_tip_height);
-        let mut held = HeldBytes::default();
-        let mut keep = |chunk: Vec<SealedBlock>| {
-            held.observe(tail.bytes + payload_bytes(&chunk));
-            for row in chunk {
-                tail.push_with_limit(row, max_tail_bytes);
-            }
-        };
-        // A request that sends from its lowest height takes only the rows its
-        // own budget reads, so a dense span never fills past the rows it sends.
-        let budget = source.ascending_budget();
-        match encode_span(source, span, prior, (&mut keep, budget)).await? {
-            SpanEnd::Unsupported => return Ok(None),
-            SpanEnd::Through(last) => prior = last.or(prior),
+    let mut held = HeldBytes::default();
+    let mut keep = |chunk: Vec<SealedBlock>| {
+        held.observe(tail.bytes + payload_bytes(&chunk));
+        for row in chunk {
+            tail.push_with_limit(row, max_tail_bytes);
         }
-        tail.held = held;
+    };
+    // A request that sends from its lowest height takes only the rows its
+    // own budget reads, so a dense span never fills past the rows it sends.
+    let budget = source.ascending_budget();
+    match encode_span(source, span, prior, (&mut keep, budget)).await? {
+        SpanEnd::Unsupported => return Ok(None),
+        SpanEnd::Through(last) => prior = last.or(prior),
     }
+    tail.held = held;
     if prior.is_some_and(|id| {
         id.height == epoch.visible_tip_height && id.hash != epoch.visible_tip_hash
     }) {
@@ -495,31 +485,42 @@ async fn build<Source: TailSource>(
             "encoded tail differs from the visible tip",
         ));
     }
-    Ok(Some(Arc::new(tail)))
+    Ok(Some(tail))
 }
 
 async fn prepend_missing<Source: TailSource>(
     source: &Source,
-    existing: &EncodedTail,
+    existing: &Arc<EncodedTail>,
     target_floor: BlockHeight,
     max_tail_bytes: usize,
+    catalog: Option<(BlockHeight, BlockId)>,
 ) -> Result<Option<Arc<EncodedTail>>, Status> {
-    let unchanged = || {
-        Ok(Some(Arc::new(existing.with_rows(
-            existing.rows.clone(),
-            existing.byte_capped,
-            existing.held,
-        ))))
+    let Some(first) = existing.rows.front() else {
+        return Ok(Some(existing.clone()));
     };
-    let Some(bounds) = existing.bounds() else {
-        return unchanged();
-    };
-    if bounds.start <= target_floor || existing.byte_capped {
-        return unchanged();
+    if first.id.height <= target_floor || existing.byte_capped {
+        return Ok(Some(existing.clone()));
     }
-    let Some(end_val) = bounds.start.value().checked_sub(1) else {
-        return unchanged();
-    };
+    let end_val = first.id.height.value() - 1;
+    if source.ascending_budget().is_some() {
+        let missing = BlockHeightRange::inclusive(target_floor, BlockHeight::new(end_val));
+        let Some(mut prefix) = build(source, missing, max_tail_bytes, catalog).await? else {
+            return Ok(None);
+        };
+        let Some(last) = prefix.rows.back() else {
+            return Err(Status::data_loss("missing canonical tail block"));
+        };
+        if last.id.height == missing.end {
+            if last.id.hash != first.parent {
+                return Err(Status::data_loss("discontinuous canonical tail"));
+            }
+            if prefix.bytes + existing.bytes <= max_tail_bytes {
+                prefix.rows.extend(existing.rows.iter().cloned());
+                prefix.bytes += existing.bytes;
+            }
+        }
+        return Ok(Some(Arc::new(prefix)));
+    }
     read_prepend_batches(source, existing, (target_floor, end_val), max_tail_bytes).await
 }
 
@@ -1713,6 +1714,14 @@ mod tests {
         source: MockTailSource,
         request: lightwalletd::BlockRange,
     ) -> eyre::Result<(usize, ShieldedTailBuffer)> {
+        primed_tail_rows_before_response(source, request, None).await
+    }
+
+    async fn primed_tail_rows_before_response(
+        source: MockTailSource,
+        request: lightwalletd::BlockRange,
+        warm: Option<BlockHeightRange>,
+    ) -> eyre::Result<(usize, ShieldedTailBuffer)> {
         let with_tail = FencedReads::new(source);
         let mut without_tail = with_tail.clone();
         without_tail.tail_enabled = false;
@@ -1743,10 +1752,14 @@ mod tests {
         .await;
         assert_eq!(with_tail.source.rows_read.load(Ordering::SeqCst), 0);
         let buffer = ShieldedTailBuffer::default();
+        if let Some(warm) = warm {
+            fill(&buffer, &with_tail.source, warm, TAIL_BYTES).await?;
+        }
+        let primed = with_tail.source.rows_read.load(Ordering::SeqCst);
         let opened = methods
             .published_block_range(&with_tail, &request, (None, buffer.clone()))
             .await;
-        let before_response = with_tail.source.rows_read.load(Ordering::SeqCst);
+        let before_response = with_tail.source.rows_read.load(Ordering::SeqCst) - primed;
         assert_eq!(drain(opened).await, native);
         assert!(native.1.is_none());
         Ok((before_response, buffer))
@@ -1801,6 +1814,24 @@ mod tests {
         .await?;
         assert_eq!(read, 0);
         assert!(buffer.load_full().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_ascending_dense_prepend_reads_one_byte_bounded_chunk_before_responding()
+    -> eyre::Result<()> {
+        let (read, buffer) = primed_tail_rows_before_response(
+            sized_rows(1_100, 100 * 1024),
+            range_request(100, 1_099, Vec::new()),
+            Some(span(1_100, 1_100)),
+        )
+        .await?;
+        assert_eq!(read, 2);
+        let cached = buffer.load_full().ok_or_eyre("missing cached suffix")?;
+        let bounds = cached.bounds().ok_or_eyre("empty cached suffix")?;
+        assert_eq!(bounds.end, BlockHeight::new(1_100));
+        assert!(bounds.start > BlockHeight::new(100));
+        assert!(bounds.start < BlockHeight::new(1_100));
         Ok(())
     }
 

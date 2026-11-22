@@ -194,7 +194,6 @@ async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> R
         .is_err()
     );
     let waiting = follow().await?;
-    assert!(waiting.catalog().is_none());
     assert!(waiting.encoded_range().0.is_none());
     assert!(
         super::super::PublishedShieldedHistory::follow_publisher(
@@ -223,7 +222,63 @@ async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> R
     fs::remove_file(f.current())?;
     assert!(follow().await.is_err());
     assert!(waiting.refresh(&canonical).await.is_err());
-    assert!(waiting.catalog().is_some());
+    assert!(waiting.encoded_range().0.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn captures_on_either_side_of_first_adoption_keep_their_shared_tail() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+    let (_files, canonical) = reader(&chain)?;
+    let canonical = Arc::new(canonical);
+    let fixture = Fixture::new()?;
+    let keys = tempdir()?;
+    let trusted = keys.path().join("publisher.pub");
+    fs::copy(&fixture.public, &trusted)?;
+    let mut publisher = fixture.publisher()?;
+    let history = super::super::PublishedShieldedHistory::follow_publisher(
+        fixture.directory.path(),
+        &trusted,
+        false,
+        canonical.as_ref(),
+    )
+    .await?;
+
+    let first = history.snapshot();
+    let second = history.snapshot();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(publisher.publish_next(&canonical)?);
+    assert!(history.refresh(canonical.as_ref()).await?);
+
+    let (old_catalog, old_tail) = first.encoded_range();
+    let (other_catalog, other_tail) = second.encoded_range();
+    assert!(old_catalog.is_none() && other_catalog.is_none());
+    let (new_catalog, new_tail) = history.encoded_range();
+    assert!(new_catalog.is_some());
+    let slot = crate::CanonicalReaderSlot::new(canonical.clone());
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+    let filled = old_tail
+        .load_or_refresh(
+            (
+                &slot,
+                &canonical,
+                &tokio_util::sync::CancellationToken::new(),
+            ),
+            None,
+            range,
+            super::super::tail::TailReadLimits {
+                ascending_bytes: None,
+                refresh_wait: crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+            },
+        )
+        .await?
+        .ok_or_else(|| eyre!("missing bootstrap rows"))?;
+    assert!(
+        other_tail
+            .load_full()
+            .is_some_and(|tail| Arc::ptr_eq(&tail, &filled))
+    );
+    assert!(new_tail.load_full().is_none());
     Ok(())
 }
 
