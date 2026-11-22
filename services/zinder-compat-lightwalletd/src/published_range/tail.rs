@@ -242,6 +242,9 @@ impl ShieldedTailBuffer {
         {
             return Ok(Some(existing.clone()));
         }
+        if !fills(existing.as_deref(), source, requested) {
+            return Ok(None);
+        }
         // A stale view must not spend the refresh lock building rows it may
         // not install.
         if !source.is_current().await {
@@ -265,6 +268,9 @@ impl ShieldedTailBuffer {
             return Ok(None);
         }
         check_cancel(source)?;
+        if !fills(previous.as_deref(), source, requested) {
+            return Ok(None);
+        }
         // Another generation's rows are never reused: two admitted stores can
         // share block hashes while holding different compact bytes.
         let updated = match &previous {
@@ -291,6 +297,26 @@ impl ShieldedTailBuffer {
                 .compare_and_swap(&previous, Some(next_tail.clone()));
         }
         Ok(Some(next_tail))
+    }
+}
+
+/// Returns whether filling `requested` reads only rows the tail keeps.
+///
+/// The tail always ends at the visible tip. A request that reaches the tip
+/// starts it, and one that reaches its lowest row extends it downward. Any
+/// other request reads canonical storage, so a short older range neither
+/// reads the heights between it and the tail nor replaces the tail.
+fn fills(
+    tail: Option<&EncodedTail>,
+    source: &impl TailSource,
+    requested: BlockHeightRange,
+) -> bool {
+    match tail
+        .filter(|tail| tail.serves(source))
+        .and_then(EncodedTail::bounds)
+    {
+        Some(bounds) => requested.end.value().saturating_add(1) >= bounds.start.value(),
+        None => requested.end >= source.epoch_and_fence().0.visible_tip_height,
     }
 }
 
