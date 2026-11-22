@@ -1418,3 +1418,66 @@ async fn query_api_rows_with_lengths_preserves_exact_stored_compact_bytes() -> e
     assert_eq!(queried, expected);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_wallet_range_below_its_cached_frontier_reads_only_the_requested_rows() -> eyre::Result<()>
+{
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(NETWORK).extend_blocks(TIP);
+    let store = ReaderFixture::new(
+        CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain),
+            &sample_regtest_upgrade_activations(),
+        )?
+        .into_serving_store_fixture()?,
+    )?;
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
+    )
+    .await?;
+    let span =
+        |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
+
+    for (first, last) in [(85, 100), (100, 85)] {
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?.len(),
+            16
+        );
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        Vec::<BlockHeightRange>::new()
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        vec![span(85, 100), span(85, 100)]
+    );
+
+    for (first, last) in [(2_085, 2_100), (85, 100), (100, 85), (2_100, 2_085)] {
+        let blocks = wallet.blocks(block_range_request(first, last)).await?;
+        assert_eq!(blocks.len(), 16);
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(2_085, 2_100)]
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        vec![span(85, 100), span(85, 100), span(85, 100), span(85, 100)]
+    );
+
+    for (first, last) in [(2_069, 2_084), (2_068, 2_053)] {
+        assert_eq!(
+            wallet.blocks(block_range_request(first, last)).await?.len(),
+            16
+        );
+    }
+    assert_eq!(
+        *recorder.recorded_rows_with_lengths.lock(),
+        vec![span(2_085, 2_100), span(2_069, 2_084), span(2_053, 2_068)]
+    );
+    assert_eq!(recorder.recorded_compact_block_ranges().len(), 4);
+    Ok(())
+}

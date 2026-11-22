@@ -311,13 +311,12 @@ fn fills(
     source: &impl TailSource,
     requested: BlockHeightRange,
 ) -> bool {
-    match tail
-        .filter(|tail| tail.serves(source))
+    tail.filter(|tail| tail.serves(source))
         .and_then(EncodedTail::bounds)
-    {
-        Some(bounds) => requested.end.value().saturating_add(1) >= bounds.start.value(),
-        None => requested.end >= source.epoch_and_fence().0.visible_tip_height,
-    }
+        .map_or_else(
+            || requested.end >= source.epoch_and_fence().0.visible_tip_height,
+            |bounds| requested.end.value().saturating_add(1) >= bounds.start.value(),
+        )
 }
 
 impl EncodedTail {
@@ -1106,6 +1105,82 @@ mod tests {
         );
         assert_eq!(*source.reads.lock(), vec![span(1, 1_000)]);
         assert_eq!(*follower.reads.lock(), vec![span(1, 5)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_short_range_below_the_frontier_reads_no_gap_and_keeps_the_frontier()
+    -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let source = build_source(2_100, 1);
+        let frontier = fill(&buffer, &source, span(2_085, 2_100), TAIL_BYTES).await?;
+        assert!(
+            buffer
+                .refresh_with_limit(&source, None, (span(85, 100), TAIL_BYTES))
+                .await?
+                .is_none()
+        );
+        assert_eq!(*source.reads.lock(), vec![span(2_085, 2_100)]);
+        assert!(
+            buffer
+                .load_full()
+                .is_some_and(|tail| Arc::ptr_eq(&tail, &frontier))
+        );
+
+        let adjacent = fill(&buffer, &source, span(2_069, 2_084), TAIL_BYTES).await?;
+        assert_eq!(adjacent.bounds(), Some(span(2_069, 2_100)));
+        let overlapping = fill(&buffer, &source, span(2_060, 2_075), TAIL_BYTES).await?;
+        assert_eq!(overlapping.bounds(), Some(span(2_060, 2_100)));
+        assert_eq!(
+            *source.reads.lock(),
+            vec![span(2_085, 2_100), span(2_069, 2_084), span(2_060, 2_068)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cold_range_below_the_tip_reads_canonical_storage() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let source = build_source(2_100, 1);
+        assert!(
+            buffer
+                .refresh_with_limit(&source, None, (span(85, 100), TAIL_BYTES))
+                .await?
+                .is_none()
+        );
+        assert!(source.reads.lock().is_empty());
+        assert!(buffer.load_full().is_none());
+
+        let started = fill(&buffer, &source, span(2_085, 2_100), TAIL_BYTES).await?;
+        assert_eq!(started.bounds(), Some(span(2_085, 2_100)));
+        assert_eq!(*source.reads.lock(), vec![span(2_085, 2_100)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn another_generation_does_not_replace_the_frontier_for_an_older_range()
+    -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let frontier = fill(
+            &buffer,
+            &build_source(2_100, 1),
+            span(2_085, 2_100),
+            TAIL_BYTES,
+        )
+        .await?;
+        let advanced = build_source(2_101, 1);
+        assert!(
+            buffer
+                .refresh_with_limit(&advanced, None, (span(85, 100), TAIL_BYTES))
+                .await?
+                .is_none()
+        );
+        assert!(advanced.reads.lock().is_empty());
+        assert!(
+            buffer
+                .load_full()
+                .is_some_and(|tail| Arc::ptr_eq(&tail, &frontier))
+        );
         Ok(())
     }
 
