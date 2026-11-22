@@ -111,35 +111,6 @@ impl RocksDbCanonicalReader {
         off_reactor(move || read(&secondary).map_err(canonical_read_error)).await
     }
 
-    /// Reads where the served chain mines `transaction_id` and the digest of
-    /// the bytes ingest committed for it.
-    ///
-    /// The digest is kept with each block's canonical facts under every
-    /// blob-retention policy, so it identifies the exact bytes, including
-    /// authorizing data the transaction ID does not commit to. `Ok(None)` is a
-    /// proven absence from the served chain.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageReadError::CanonicalHistoryUnavailable`] for a miss
-    /// below a checkpointed store's history floor, and
-    /// [`StorageReadError::ArtifactUnavailable`] when the block's canonical
-    /// facts do not list the transaction at its location.
-    #[cfg(feature = "light-wallet-qualification")]
-    pub async fn mined_transaction_digest(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<Option<MinedTransactionDigest>, StorageReadError> {
-        let Some(location) = self.mined_transaction_location(transaction_id).await? else {
-            return Ok(None);
-        };
-        let block = zinder_core::BlockId::new(location.block_height, location.block_hash);
-        self.block_transaction_digests(block)
-            .await?
-            .digest_of(location)
-            .map(Some)
-    }
-
     /// Reads where the served chain mines `transaction_id`, answering `None`
     /// only for a proven absence.
     ///

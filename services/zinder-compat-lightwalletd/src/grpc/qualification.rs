@@ -9,7 +9,7 @@ use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address;
 use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SerializedBytesDigest,
-    SubtreeRootRange, TransactionId,
+    SubtreeRootRange, TransactionId, TransactionLocation,
     wire::{
         decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_internal_transaction_id,
     },
@@ -48,6 +48,44 @@ pub struct QualificationWallet {
     query: QualificationWalletQuery,
     utxo_slots: Arc<Semaphore>,
     history_slots: Arc<Semaphore>,
+    block_digests: BlockDigestCache,
+}
+
+/// The recorded digests of the block the latest forwarded lookup read.
+///
+/// Lookups of several transactions in one block, such as a wallet enhancing
+/// them one call at a time, decode that block's facts once. A block's height
+/// and hash fix its contents, so an entry stays valid across reader
+/// generations.
+#[derive(Clone, Default)]
+struct BlockDigestCache(Arc<parking_lot::Mutex<Option<Arc<BlockTransactionDigests>>>>);
+
+impl BlockDigestCache {
+    async fn digest_of(
+        &self,
+        reader: &RocksDbCanonicalReader,
+        location: TransactionLocation,
+    ) -> Result<MinedTransactionDigest, Status> {
+        let block = BlockId::new(location.block_height, location.block_hash);
+        let cached = self
+            .0
+            .lock()
+            .clone()
+            .filter(|digests| digests.block() == block);
+        let digests = if let Some(digests) = cached {
+            digests
+        } else {
+            let digests = Arc::new(
+                reader
+                    .block_transaction_digests(block)
+                    .await
+                    .map_err(storage_status)?,
+            );
+            *self.0.lock() = Some(Arc::clone(&digests));
+            digests
+        };
+        digests.digest_of(location).map_err(storage_status)
+    }
 }
 
 impl LightwalletdGrpcAdapter<QualificationWallet> {
@@ -71,6 +109,7 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             query,
             utxo_slots: Arc::new(Semaphore::new(1)),
             history_slots: Arc::new(Semaphore::new(1)),
+            block_digests: BlockDigestCache::default(),
         })
     }
 
@@ -134,8 +173,13 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
         id: TransactionId,
     ) -> Result<lightwalletd::RawTransaction, Status> {
         let view = served_view(&reader)?;
-        let miss = match reader.mined_transaction_digest(id).await {
-            Ok(Some(mined)) => {
+        let miss = match reader.mined_transaction_location(id).await {
+            Ok(Some(location)) => {
+                let mined = self
+                    .query_api
+                    .block_digests
+                    .digest_of(&reader, location)
+                    .await?;
                 drop(reader);
                 let node = self.query_api.node(&view).await?;
                 let reported = node
@@ -312,7 +356,7 @@ impl QualificationWallet {
             page: IntoIter::default(),
             page_range: (range.start_height, range.end_height),
             last_position: None,
-            block_digests: None,
+            block_digests: self.block_digests.clone(),
             _permit: permit,
         }
         .into_stream()
@@ -515,9 +559,7 @@ struct NodeAddressHistory {
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
     last_position: Option<(BlockHeight, u32)>,
-    /// The recorded digests of the block the latest row came from, so a
-    /// block's facts are decoded once however many of its rows match.
-    block_digests: Option<BlockTransactionDigests>,
+    block_digests: BlockDigestCache,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -578,10 +620,7 @@ impl NodeAddressHistory {
 
     /// Reads where the served chain mines `id` from a reader that still holds
     /// the served tip, without keeping that reader across node calls.
-    async fn served_location(
-        &mut self,
-        id: TransactionId,
-    ) -> Result<MinedTransactionDigest, Status> {
+    async fn served_location(&self, id: TransactionId) -> Result<MinedTransactionDigest, Status> {
         let reader = self.slot.capture();
         let epoch = reader.chain_epoch();
         if BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash) != self.served
@@ -598,17 +637,7 @@ impl NodeAddressHistory {
             .await
             .map_err(storage_status)?
             .ok_or_else(history_changed)?;
-        let block = BlockId::new(location.block_height, location.block_hash);
-        let digests = match self.block_digests.take() {
-            Some(digests) if digests.block() == block => digests,
-            Some(_) | None => reader
-                .block_transaction_digests(block)
-                .await
-                .map_err(storage_status)?,
-        };
-        let mined = digests.digest_of(location).map_err(storage_status);
-        self.block_digests = Some(digests);
-        mined
+        self.block_digests.digest_of(&reader, location).await
     }
 
     async fn next(mut self) -> Result<Option<(lightwalletd::RawTransaction, Self)>, Status> {

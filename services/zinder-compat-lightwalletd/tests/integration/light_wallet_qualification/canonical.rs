@@ -843,3 +843,56 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
         Ok(())
     })
 }
+
+#[tokio::test]
+async fn transactions_of_one_block_share_its_recorded_digests() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .blocks()
+        .first()
+        .ok_or_else(|| eyre!("missing block"))?;
+    let served = zinder_core::BlockId::new(block.height, block.hash);
+    let block = served;
+    let coinbase = TransactionId::from_bytes([0x55; 32]);
+    let spend = TransactionId::from_bytes([0x56; 32]);
+    let chain = chain
+        .with_transaction_rows(FixtureTransactionRows::coinbase(
+            coinbase,
+            block.height,
+            block.hash,
+            vec![0x55],
+        ))
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            spend,
+            block.height,
+            block.hash,
+            1,
+            vec![0x56],
+        ));
+    let fixture = Fixture::from_chain(
+        &chain,
+        &super::one_upgrade_per_height()?,
+        [
+            method("getrawtransaction").reply(mined_reply(coinbase, served, "55")),
+            method("getrawtransaction").reply(mined_reply(spend, served, "56")),
+            method("getrawtransaction").reply(mined_reply(spend, served, "57")),
+        ],
+        Duration::from_secs(2),
+    )?;
+    for (id, body) in [(coinbase, 0x55), (spend, 0x56)] {
+        let reply = fixture
+            .adapter
+            .get_transaction(transaction(id))
+            .await?
+            .into_inner();
+        assert_eq!((reply.height, reply.data), (1, vec![body]));
+    }
+    let status = fixture
+        .adapter
+        .get_transaction(transaction(spend))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted bytes the block's digests do not record"))?;
+    assert_eq!(status.code(), Code::DataLoss);
+    Ok(())
+}
