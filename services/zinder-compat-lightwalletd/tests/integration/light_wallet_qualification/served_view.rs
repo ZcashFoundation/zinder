@@ -477,3 +477,38 @@ async fn history_rows_need_the_served_block_and_committed_bytes() -> Result<()> 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn history_after_the_node_rolls_back_below_the_range_is_unavailable() -> Result<()> {
+    // Admission sees the served tip at height 2; the history lookup for 2..=2
+    // then meets a node rolled back to height 1.
+    let served_tip = super::served_tip(2)?;
+    for txids in [true, false] {
+        let (fixture, _) = served_view_fixture(
+            |_| {},
+            false,
+            [
+                method("getbestblockheightandhash").reply_with(|_| {
+                    RpcReply::result(json!({"height": 1, "hash": vec![0xa1_u8; 32]}))
+                }),
+                method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(
+                    served_tip.hash
+                )))),
+                method("getblockhash").reply_with(|_| {
+                    RpcReply::error_with_code(-8, "block height not in best chain")
+                }),
+            ],
+        )?;
+        let request = history_request(2, 2);
+        let answer = if txids {
+            fixture.adapter.get_taddress_txids(request).await
+        } else {
+            fixture.adapter.get_taddress_transactions(request).await
+        };
+        let status = answer
+            .err()
+            .ok_or_else(|| eyre!("served empty history from a rolled-back node"))?;
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    }
+    Ok(())
+}

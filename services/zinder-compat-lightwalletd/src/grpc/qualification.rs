@@ -16,10 +16,10 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_query::{
-    ArtifactKey, CanonicalReader, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-    MinedTransactionDigest, QualificationNodeTarget, QualificationWalletQuery, QueryError,
-    RocksDbCanonicalReader, StorageReadError, SubtreeRoots, parse_receivable_transparent_address,
-    status_from_query_error,
+    ArtifactKey, BlockTransactionDigests, CanonicalReader,
+    MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, MinedTransactionDigest, QualificationNodeTarget,
+    QualificationWalletQuery, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
+    parse_receivable_transparent_address, status_from_query_error,
 };
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
@@ -312,6 +312,7 @@ impl QualificationWallet {
             page: IntoIter::default(),
             page_range: (range.start_height, range.end_height),
             last_position: None,
+            block_digests: None,
             _permit: permit,
         }
         .into_stream()
@@ -519,6 +520,9 @@ struct NodeAddressHistory {
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
     last_position: Option<(BlockHeight, u32)>,
+    /// The recorded digests of the block the latest row came from, so a
+    /// block's facts are decoded once however many of its rows match.
+    block_digests: Option<BlockTransactionDigests>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -579,7 +583,10 @@ impl NodeAddressHistory {
 
     /// Reads where the served chain mines `id` from a reader that still holds
     /// the served tip, without keeping that reader across node calls.
-    async fn served_location(&self, id: TransactionId) -> Result<MinedTransactionDigest, Status> {
+    async fn served_location(
+        &mut self,
+        id: TransactionId,
+    ) -> Result<MinedTransactionDigest, Status> {
         let reader = self.slot.capture();
         let epoch = reader.chain_epoch();
         if BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash) != self.served
@@ -591,11 +598,22 @@ impl NodeAddressHistory {
         {
             return Err(history_changed());
         }
-        reader
-            .mined_transaction_digest(id)
+        let location = reader
+            .mined_transaction_location(id)
             .await
             .map_err(storage_status)?
-            .ok_or_else(history_changed)
+            .ok_or_else(history_changed)?;
+        let block = BlockId::new(location.block_height, location.block_hash);
+        let digests = match self.block_digests.take() {
+            Some(digests) if digests.block() == block => digests,
+            Some(_) | None => reader
+                .block_transaction_digests(block)
+                .await
+                .map_err(storage_status)?,
+        };
+        let mined = digests.digest_of(location).map_err(storage_status);
+        self.block_digests = Some(digests);
+        mined
     }
 
     async fn next(mut self) -> Result<Option<(lightwalletd::RawTransaction, Self)>, Status> {

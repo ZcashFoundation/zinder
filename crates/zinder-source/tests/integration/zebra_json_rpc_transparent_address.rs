@@ -169,6 +169,35 @@ async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip()
 }
 
 #[tokio::test]
+async fn transparent_address_transaction_ids_refuse_an_empty_answer_after_a_rollback()
+-> eyre::Result<()> {
+    // The node rolled back below the range and below the required block,
+    // so it no longer holds the block at that height.
+    let server = start_node([
+        method("getbestblockheightandhash").reply_with(|_| tip_reply(0)),
+        method("getblockhash")
+            .reply_with(|_| RpcReply::error_with_code(-8, "block height not in best chain")),
+    ])?;
+    let source = regtest_source(server.url())?;
+
+    let outcome = source
+        .fetch_transparent_address_transaction_ids(
+            &regtest_lookup()?,
+            BlockHeight::new(1),
+            BlockHeight::new(1),
+            CHAIN_BLOCK,
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "answered {outcome:?} from a rolled-back node"
+    );
+    assert!(server.requests_for("getaddresstxids")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_address_transaction_ids_refuse_an_answer_from_a_chain_without_the_required_block()
 -> eyre::Result<()> {
     // The node's tip reads agree, but around the request it holds another

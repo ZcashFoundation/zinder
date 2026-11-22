@@ -1075,12 +1075,14 @@ impl ZebraJsonRpcSource {
         }
         let mut tip = self.tip_id().await?;
         for _ in 0..TRANSPARENT_ADDRESS_TIP_ATTEMPTS {
+            // A tip below the range answers nothing only on a chain that
+            // still holds `chain_block`; a node that rolled back must not.
+            self.require_chain_block(chain_block, "getaddresstxids")
+                .await?;
             let indexed_end_height = end_height.min(tip.height);
             if start_height > indexed_end_height || indexed_end_height == BlockHeight::new(0) {
                 return Ok(Vec::new());
             }
-            self.require_chain_block(chain_block, "getaddresstxids")
-                .await?;
             let txid_hex_list = match self
                 .request_address_transaction_ids(lookup, start_height, indexed_end_height)
                 .await

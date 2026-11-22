@@ -97,8 +97,8 @@ differently, and the source gives both the same result:
 - **Answer chain.** Neither node reports the chain a `getaddresstxids` answer
   describes. The caller names a block the answer's chain must hold, and the
   source reads the node's hash at that block's height immediately before and
-  after each request. A read that names another block reports
-  `ChainTipChangedDuringFetch`.
+  after each request, and before it answers a range above the tip as empty. A
+  read that names another block reports `ChainTipChangedDuringFetch`.
 - **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
   `maxEntries` zero, the only value for which Zebra refuses a lookup over the
   row limit. With a positive `maxEntries`, Zebra returns that many outputs and

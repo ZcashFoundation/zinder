@@ -77,7 +77,7 @@ pub use native_wallet_endpoint_capabilities::{
 };
 pub use node_broadcast::OrderedBroadcaster;
 #[cfg(feature = "light-wallet-qualification")]
-pub use rocksdb_serving_readers::MinedTransactionDigest;
+pub use rocksdb_serving_readers::{BlockTransactionDigests, MinedTransactionDigest};
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
     CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
