@@ -180,6 +180,17 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError>;
 
+    /// Reads a checkpoint at exactly this height without reconstructing its frontier.
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        Ok(self
+            .tree_state_checkpoint_at_or_before(height)
+            .await?
+            .filter(|state| state.block_id().height == height))
+    }
+
     /// Finds how the tree state at `height` is answered under the admitted
     /// network-upgrade schedule: by the checkpoint stored there, or by a
     /// reconstruction [`Self::replay_tree_state`] runs.
@@ -189,6 +200,19 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         height: BlockHeight,
     ) -> Result<Option<TreeStateLookup>, StorageReadError>;
+
+    /// Looks up a checkpoint while its wallet request still needs it.
+    /// Storage backends check again before a queued read starts and before validating the seed.
+    async fn tree_state_lookup_until_cancelled(
+        &self,
+        height: BlockHeight,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        self.tree_state_lookup(height).await
+    }
 
     /// Reconstructs the tree state `replay` names from stored compact
     /// blocks, or answers from a checkpoint this reader stores at its
@@ -203,6 +227,16 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         replay: TreeStateReplay,
     ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError>;
+
+    /// Replays a frontier while the request group still has a reader.
+    /// Engines with a block replay loop should check the flag between blocks.
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        _cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        self.replay_tree_state(replay).await
+    }
 
     /// Reads a contiguous range of the subtree roots the visible chain has
     /// completed, which its chain epoch's tip metadata counts.

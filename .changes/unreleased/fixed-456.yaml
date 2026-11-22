@@ -1,0 +1,6 @@
+kind: fixed
+body: Concurrent wallets querying the same missing tree state now share its reconstruction. When the last caller disconnects, Zinder stops the abandoned replay. Query metrics distinguish coalesced and cached tree-state responses.
+time: 2026-11-21T22:16:40.895427648Z
+custom:
+    Bump: patch
+    PR: "456"

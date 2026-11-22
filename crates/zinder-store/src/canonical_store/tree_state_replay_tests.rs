@@ -26,6 +26,51 @@ use crate::{RawBlobRetention, RocksDbResourceBudget};
 const TIP_HEIGHT: u32 = 150;
 
 #[test]
+fn cancellation_stops_replay_between_compact_blocks() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let Some(TreeStateLookup::Replay(replay)) =
+        store.tree_state_lookup(BlockHeight::new(99), &activations)?
+    else {
+        return Err("missing sparse replay".into());
+    };
+    let checks = std::cell::Cell::new(0);
+    let outcome = store.replay_tree_state_until_cancelled(&replay, &activations, || {
+        checks.set(checks.get() + 1);
+        checks.get() == 4
+    });
+    assert!(matches!(outcome, Err(CanonicalStoreError::ReplayCancelled)));
+    assert_eq!(checks.get(), 4);
+    Ok(())
+}
+
+#[test]
+fn abandoned_lookup_stops_before_reading_or_validating_the_seed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let seed = BlockHeight::new(100);
+    let height = BlockHeight::new(101);
+    replace_checkpoint_row(&store, seed, b"damaged seed")?;
+    for stop_at in [1, 2] {
+        let checks = std::cell::Cell::new(0);
+        let lookup = store.tree_state_lookup_until_cancelled(height, &activations, || {
+            checks.set(checks.get() + 1);
+            checks.get() == stop_at
+        });
+        assert!(matches!(lookup, Err(CanonicalStoreError::ReplayCancelled)));
+        assert_eq!(checks.get(), stop_at);
+    }
+    assert!(matches!(
+        store.tree_state_lookup(height, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn every_retained_height_reads_the_checkpoint_construction_would_store()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

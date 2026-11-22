@@ -280,6 +280,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
             .await
     }
 
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        admitted_activations(&self.secondary)?;
+        self.read(move |secondary| secondary.stored_tree_state_at(height))
+            .await
+    }
+
     async fn tree_state_lookup(
         &self,
         height: BlockHeight,
@@ -293,6 +302,24 @@ impl CanonicalReader for RocksDbCanonicalReader {
         .await
     }
 
+    async fn tree_state_lookup_until_cancelled(
+        &self,
+        height: BlockHeight,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        let secondary = Arc::clone(&self.secondary);
+        off_reactor(move || {
+            secondary
+                .tree_state_lookup_until_cancelled(
+                    height,
+                    admitted_activations(&secondary)?,
+                    || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .map_err(canonical_read_error)
+        })
+        .await
+    }
+
     async fn replay_tree_state(
         &self,
         replay: TreeStateReplay,
@@ -301,6 +328,24 @@ impl CanonicalReader for RocksDbCanonicalReader {
         off_reactor(move || {
             secondary
                 .replay_tree_state(&replay, admitted_activations(&secondary)?)
+                .map_err(canonical_read_error)
+        })
+        .await
+    }
+
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        let secondary = Arc::clone(&self.secondary);
+        off_reactor(move || {
+            secondary
+                .replay_tree_state_until_cancelled(
+                    &replay,
+                    admitted_activations(&secondary)?,
+                    || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                )
                 .map_err(canonical_read_error)
         })
         .await
