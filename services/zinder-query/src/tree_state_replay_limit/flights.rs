@@ -358,17 +358,23 @@ impl TreeStateReplayLimit {
         {
             return Err(QueryError::BlockNotInBestChain);
         }
-        if let Some(state) = self
-            .lookup_settled(key, generation, reader, deadline)
-            .await?
-        {
-            return Ok(Some(ReadyState::Cached(state)));
-        }
+        let lookup_refusal = match self.lookup_settled(key, generation, reader, deadline).await {
+            Ok(Some(state)) => return Ok(Some(ReadyState::Cached(state))),
+            Ok(None) => None,
+            Err(err @ QueryError::TreeStateReplayLimitReached { .. }) => Some(err),
+            Err(err) => return Err(err),
+        };
         let stored = reader
             .stored_tree_state_at(key.height)
             .await
             .map_err(QueryError::canonical_read)?;
-        Ok(stored.map(ReadyState::Stored))
+        if let Some(state) = stored {
+            return Ok(Some(ReadyState::Stored(state)));
+        }
+        if let Some(refusal) = lookup_refusal {
+            return Err(refusal);
+        }
+        Ok(None)
     }
 
     pub(crate) fn select(

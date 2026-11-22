@@ -682,7 +682,9 @@ enum HeaderHook {
     AsyncGate {
         entered: tokio::sync::Notify,
         open: tokio::sync::Semaphore,
+        fail_stored: bool,
     },
+    FailHeader,
     BlockingDispatch {
         dispatches: std::sync::atomic::AtomicUsize,
         started: tokio::sync::Notify,
@@ -694,6 +696,7 @@ enum HeaderHook {
 struct TestHeaderReader {
     inner: Arc<ObservedCanonicalReader>,
     hook: Arc<HeaderHook>,
+    header_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl TestHeaderReader {
@@ -703,7 +706,29 @@ impl TestHeaderReader {
             hook: Arc::new(HeaderHook::AsyncGate {
                 entered: tokio::sync::Notify::new(),
                 open: tokio::sync::Semaphore::new(0),
+                fail_stored: false,
             }),
+            header_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn gated_with_failing_stored(inner: Arc<ObservedCanonicalReader>) -> Self {
+        Self {
+            inner,
+            hook: Arc::new(HeaderHook::AsyncGate {
+                entered: tokio::sync::Notify::new(),
+                open: tokio::sync::Semaphore::new(0),
+                fail_stored: true,
+            }),
+            header_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn failing_header(inner: Arc<ObservedCanonicalReader>) -> Self {
+        Self {
+            inner,
+            hook: Arc::new(HeaderHook::FailHeader),
+            header_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -720,12 +745,14 @@ impl TestHeaderReader {
                 release: parking_lot::Mutex::new(Some(release)),
                 secondary,
             }),
+            header_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     async fn wait_entered(&self) {
         match &*self.hook {
             HeaderHook::AsyncGate { entered, .. } => entered.notified().await,
+            HeaderHook::FailHeader => {}
             HeaderHook::BlockingDispatch { started, .. } => started.notified().await,
         }
     }
@@ -738,11 +765,15 @@ impl TestHeaderReader {
 
     fn blocking_dispatches(&self) -> usize {
         match &*self.hook {
-            HeaderHook::AsyncGate { .. } => 0,
+            HeaderHook::AsyncGate { .. } | HeaderHook::FailHeader => 0,
             HeaderHook::BlockingDispatch { dispatches, .. } => {
                 dispatches.load(std::sync::atomic::Ordering::Acquire)
             }
         }
+    }
+
+    fn header_reads(&self) -> usize {
+        self.header_reads.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -781,11 +812,16 @@ impl CanonicalReader for TestHeaderReader {
         height: BlockHeight,
     ) -> Result<Option<zinder_core::BlockHeaderArtifact>, StorageReadError> {
         match &*self.hook {
-            HeaderHook::AsyncGate { entered, open } => {
+            HeaderHook::AsyncGate { entered, open, .. } => {
                 entered.notify_one();
                 let _released = open.acquire().await;
+                self.header_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 self.inner.block_header_at(height).await
             }
+            HeaderHook::FailHeader => Err(StorageReadError::ReaderInvalidated {
+                source: Box::new(std::io::Error::other("simulated reader invalidation")),
+            }),
             HeaderHook::BlockingDispatch { .. } => {
                 let hook = Arc::clone(&self.hook);
                 tokio::task::spawn_blocking(move || {
@@ -905,6 +941,16 @@ impl CanonicalReader for TestHeaderReader {
         &self,
         height: BlockHeight,
     ) -> Result<Option<zinder_store::ServedTreeState>, StorageReadError> {
+        if let HeaderHook::AsyncGate {
+            fail_stored: true, ..
+        } = &*self.hook
+        {
+            return Err(StorageReadError::ReaderInvalidated {
+                source: Box::new(std::io::Error::other(
+                    "simulated stored checkpoint invalidation",
+                )),
+            });
+        }
         self.inner.stored_tree_state_at(height).await
     }
 
@@ -1021,8 +1067,9 @@ async fn stalled_extension_header_check_bounds_waiters_and_expires_wait_deadline
         Err(crate::QueryError::TreeStateReplayLimitReached { .. })
     ));
     assert_eq!(limit.waiter_count(), 0);
+    assert_eq!(stalled.header_reads(), 0);
+    assert_eq!(extended_inner.reads(), 3);
     stalled.release_gate();
-    assert_eq!(extended_inner.reads(), 0);
     Ok(())
 }
 
@@ -1069,7 +1116,8 @@ async fn zero_wait_refuses_contended_extension_check_immediately_without_queuein
         leader.await??,
         Some(ReadyState::Cached(ref state)) if *state == expected
     ));
-    assert_eq!(extended_inner.reads(), 1);
+    assert_eq!(stalled.header_reads(), 1);
+    assert_eq!(extended_inner.reads(), 2);
     Ok(())
 }
 
@@ -1291,5 +1339,156 @@ async fn already_dispatched_blocking_header_read_stays_single_flight_across_time
     assert!(matches!(promoted, Some(ReadyState::Cached(ref state)) if *state == expected));
     assert_eq!(blocking.blocking_dispatches(), 1);
     assert_eq!(limit.waiter_count(), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_extension_serves_stored_checkpoint_instead_of_replay_limit_refusal()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, extended_inner) = publish_reader(&chain, 5, 4)?;
+    let stored_height = BlockHeight::new(0);
+    let Some(expected_stored) = first.stored_tree_state_at(stored_height).await? else {
+        return Err(eyre::eyre!("missing stored checkpoint"));
+    };
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_millis(60))
+        .with_waiters_per_slot(NonZeroU32::MIN);
+    replay_and_cache(&limit, &first, BlockHeight::new(1)).await?;
+
+    let stalled = Arc::new(TestHeaderReader::gated(Arc::clone(&extended_inner)));
+    let replay_key = ReplayKey::new(BlockHeight::new(1), stalled.as_ref());
+    let stored_key = ReplayKey::new(stored_height, stalled.as_ref());
+    let stalled_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&stalled), true);
+    let dyn_stalled = Arc::clone(&stalled) as Arc<dyn CanonicalReader>;
+
+    let leader = tokio::spawn({
+        let limit = limit.clone();
+        let dyn_stalled = Arc::clone(&dyn_stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(&replay_key, &stalled_gen, &dyn_stalled, deadline)
+                .await
+        }
+    });
+    stalled.wait_entered().await;
+
+    let follower = tokio::spawn({
+        let limit = limit.clone();
+        let dyn_stalled = Arc::clone(&dyn_stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(&replay_key, &stalled_gen, &dyn_stalled, deadline)
+                .await
+        }
+    });
+    limit.wait_for_waiters(1).await?;
+
+    let served_under_contention = limit
+        .ready_state(&stored_key, &stalled_gen, &dyn_stalled, limit.deadline())
+        .await?;
+    assert!(matches!(
+        served_under_contention,
+        Some(ReadyState::Stored(ref state)) if *state == expected_stored
+    ));
+
+    tokio::time::advance(Duration::from_millis(65)).await;
+    assert!(matches!(
+        follower.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+    assert!(matches!(
+        leader.await?,
+        Err(crate::QueryError::TreeStateReplayLimitReached { .. })
+    ));
+
+    let stored_waiter = tokio::spawn({
+        let limit = limit.clone();
+        let dyn_stalled = Arc::clone(&dyn_stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(&stored_key, &stalled_gen, &dyn_stalled, deadline)
+                .await
+        }
+    });
+    limit.wait_for_waiters(1).await?;
+    tokio::time::advance(Duration::from_millis(65)).await;
+    let served_after_timeout = stored_waiter.await??;
+    assert!(matches!(
+        served_after_timeout,
+        Some(ReadyState::Stored(ref state)) if *state == expected_stored
+    ));
+
+    assert_eq!(stalled.header_reads(), 0);
+    stalled.release_gate();
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_storage_error_is_not_masked_by_stored_checkpoint_fallback() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_s1, first) = publish_reader(&chain, 4, 2)?;
+    let (_s2, extended_inner) = publish_reader(&chain, 5, 4)?;
+    let stored_height = BlockHeight::new(0);
+
+    let limit_header_err = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
+    replay_and_cache(&limit_header_err, &first, BlockHeight::new(1)).await?;
+    let failing = Arc::new(TestHeaderReader::failing_header(Arc::clone(
+        &extended_inner,
+    )));
+    let stored_key = ReplayKey::new(stored_height, failing.as_ref());
+    let failing_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&failing), true);
+    let dyn_failing = Arc::clone(&failing) as Arc<dyn CanonicalReader>;
+    let header_err = limit_header_err
+        .ready_state(
+            &stored_key,
+            &failing_gen,
+            &dyn_failing,
+            limit_header_err.deadline(),
+        )
+        .await;
+    assert!(matches!(header_err, Err(ref err) if err.invalidates_reader()));
+    assert_eq!(extended_inner.reads(), 0);
+
+    let limit_stored_err = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    replay_and_cache(&limit_stored_err, &first, BlockHeight::new(1)).await?;
+    let gated_fail_stored = Arc::new(TestHeaderReader::gated_with_failing_stored(Arc::clone(
+        &extended_inner,
+    )));
+    let replay_key = ReplayKey::new(BlockHeight::new(1), gated_fail_stored.as_ref());
+    let stored_err_key = ReplayKey::new(stored_height, gated_fail_stored.as_ref());
+    let stalled_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&gated_fail_stored), true);
+    let dyn_stalled = Arc::clone(&gated_fail_stored) as Arc<dyn CanonicalReader>;
+
+    let leader = tokio::spawn({
+        let limit = limit_stored_err.clone();
+        let dyn_stalled = Arc::clone(&dyn_stalled);
+        let stalled_gen = stalled_gen.clone();
+        let deadline = limit.deadline();
+        async move {
+            limit
+                .ready_state(&replay_key, &stalled_gen, &dyn_stalled, deadline)
+                .await
+        }
+    });
+    gated_fail_stored.wait_entered().await;
+
+    let stored_err = limit_stored_err
+        .ready_state(
+            &stored_err_key,
+            &stalled_gen,
+            &dyn_stalled,
+            limit_stored_err.deadline(),
+        )
+        .await;
+    assert!(matches!(stored_err, Err(ref err) if err.invalidates_reader()));
+    gated_fail_stored.release_gate();
+    let _ = leader.await?;
     Ok(())
 }
