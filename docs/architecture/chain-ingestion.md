@@ -73,9 +73,9 @@ node's activation table makes active at its height, including a pool whose
 tree is still empty.
 
 The loader appends each block to the trees and writes it to the store in
-height order. Each stored checkpoint derives a pool's root once from the
-appended frontier, and its canonical encoding must decode to that same
-frontier. With `ingest.construction.tree_hashing_workers` above one, a block's
+height order. Each stored checkpoint's canonical encoding must decode to
+exactly the appended frontier, and the root derived from that encoding must
+equal the root derived from the frontier. With `ingest.construction.tree_hashing_workers` above one, a block's
 pools are hashed concurrently. A pool that receives many commitments in one
 block hashes them as aligned complete subtrees in parallel and merges their
 roots into its frontier. The checkpoints and final roots of up to twice the
