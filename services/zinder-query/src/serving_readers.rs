@@ -201,6 +201,19 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<TreeStateLookup>, StorageReadError>;
 
+    /// Looks up a checkpoint while its wallet request still needs it.
+    /// Storage backends check again before a queued read starts and before validating the seed.
+    async fn tree_state_lookup_until_cancelled(
+        &self,
+        height: BlockHeight,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        self.tree_state_lookup(height).await
+    }
+
     /// Reconstructs the tree state `replay` names from stored compact
     /// blocks, or answers from a checkpoint this reader stores at its
     /// height, and reports which.

@@ -388,6 +388,22 @@ macro_rules! impl_canonical_typed_reads {
                 )
             }
 
+            /// Looks up a wallet checkpoint while the caller still needs its validated seed.
+            /// Checks cancellation before reading the row and again before decoding it.
+            pub fn tree_state_lookup_until_cancelled(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+                cancelled: impl Fn() -> bool,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                super::tree_state_replay::lookup_until_cancelled(
+                    self,
+                    height,
+                    network_upgrade_activations,
+                    cancelled,
+                )
+            }
+
             /// Reconstructs the tree state a [`Self::tree_state_lookup`]
             /// found no checkpoint for, applying every check of
             /// [`Self::tree_state_checkpoint_at`], and reports how it was

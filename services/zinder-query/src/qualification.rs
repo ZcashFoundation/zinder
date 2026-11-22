@@ -12,7 +12,9 @@ use zinder_store::{ArtifactFamily, BlockHashLookup};
 use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
-    tree_state_replay_limit::{ReadyState, ReplayKey, TreeStateReplayLimit, read_missing_height},
+    tree_state_replay_limit::{
+        ReadyState, ReplayKey, Selection, TreeStateReplayLimit, read_missing_height,
+    },
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
 
@@ -99,38 +101,53 @@ impl QualificationWalletQuery {
             return Ok(tree_state_response(epoch, checkpoint));
         };
         let mut deadline = None;
+        let mut carried = None;
         loop {
             let epoch = reader.chain_epoch();
             let key = ReplayKey::new(height, reader.as_ref());
-            if let Some(state) = self.replays.ready_state(key, reader.as_ref()).await? {
-                let ReadyState::Cached(ref cached) = state else {
-                    return Ok(tree_state_response(epoch, state.serve()));
-                };
-                let expected = cached.block_id();
-                let current = (self.capture)();
-                if !retains_block(&current, epoch, expected).await? {
-                    return Err(QueryError::BlockNotInBestChain);
-                }
-                if ReplayKey::new(height, current.as_ref()) == key {
-                    return Ok(tree_state_response(epoch, state.serve()));
-                }
-                self.replays.admission_deadline(&mut deadline)?;
-                reader = current;
-                continue;
-            }
-            let block = reader
-                .block_header_at(height)
-                .await
-                .map_err(QueryError::canonical_read)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-            let expected = BlockId::new(height, block.block_hash);
             let generation = Arc::downgrade(&reader);
+            let (selected, expected) = match self.replays.ready_state(key, reader.as_ref()).await? {
+                Some(ready @ ReadyState::Stored(_)) => {
+                    return Ok(tree_state_response(epoch, ready.serve()));
+                }
+                Some(ReadyState::Cached(state)) => {
+                    let block = state.block_id();
+                    (Selection::Ready(ReadyState::Cached(state)), block)
+                }
+                None => {
+                    let block = reader
+                        .block_header_at(height)
+                        .await
+                        .map_err(QueryError::canonical_read)?
+                        .ok_or(QueryError::BlockNotInBestChain)?;
+                    let selected = self.replays.select(
+                        key,
+                        &generation,
+                        *deadline.get_or_insert_with(|| self.replays.deadline()),
+                        carried.take(),
+                    )?;
+                    (selected, BlockId::new(height, block.block_hash))
+                }
+            };
+            let subscription = match selected {
+                Selection::Ready(state) => {
+                    let current = (self.capture)();
+                    if !retains_block(&current, epoch, expected).await? {
+                        return Err(QueryError::BlockNotInBestChain);
+                    }
+                    if ReplayKey::new(height, current.as_ref()) == key {
+                        return Ok(tree_state_response(epoch, state.serve()));
+                    }
+                    reader = current;
+                    continue;
+                }
+                Selection::Waiting(subscription) => subscription,
+            };
             drop(reader);
-            let deadline = self.replays.admission_deadline(&mut deadline)?;
-            let subscription = self.replays.subscribe(key, &generation, deadline)?;
-            let slot = subscription.admit(&self.replays, deadline).await?;
+            let slot = subscription.admit(&self.replays).await?;
             reader = (self.capture)();
             if !generation.ptr_eq(&Arc::downgrade(&reader)) {
+                carried = subscription.carry(&slot);
                 drop(subscription);
                 drop(slot);
                 if !retains_block(&reader, epoch, expected).await? {
@@ -138,12 +155,15 @@ impl QualificationWalletQuery {
                 }
                 continue;
             }
-            return subscription
+            let captured = reader.clone();
+            if let Some(state) = subscription
                 .replay(slot, |cancelled| async move {
-                    read_missing_height(reader.as_ref(), height, cancelled).await
+                    read_missing_height(captured.as_ref(), height, cancelled).await
                 })
-                .await
-                .map(|state| tree_state_response(epoch, state));
+                .await?
+            {
+                return Ok(tree_state_response(epoch, state));
+            }
         }
     }
 

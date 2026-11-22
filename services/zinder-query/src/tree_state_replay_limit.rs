@@ -4,7 +4,7 @@
 mod flights;
 #[cfg(feature = "light-wallet-qualification")]
 pub(crate) use flights::ReadyState;
-pub(crate) use flights::{ReplayKey, read_missing_height};
+pub(crate) use flights::{ReplayKey, Selection, read_missing_height};
 
 use std::{
     num::NonZeroU32,
@@ -160,9 +160,8 @@ impl TreeStateReplayLimit {
     /// within the wait, or when every waiting place is taken.
     #[cfg(test)]
     pub(crate) async fn admit(&self) -> Result<OwnedSemaphorePermit, QueryError> {
-        self.admit_until(self.deadline())?
-            .await
-            .map_err(|reason| self.refused(reason))
+        let (admission, _waiting) = self.admit_until(self.deadline())?;
+        admission.await.map_err(|reason| self.refused(reason))
     }
 
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
@@ -176,47 +175,49 @@ impl TreeStateReplayLimit {
         }
     }
 
-    pub(crate) fn admission_deadline(
-        &self,
-        previous: &mut Option<tokio::time::Instant>,
-    ) -> Result<tokio::time::Instant, QueryError> {
-        if previous.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(self.refused(ReplayRefusal::WaitExpired));
-        }
-        Ok(*previous.get_or_insert_with(|| self.deadline()))
-    }
-
     fn admit_until(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>, QueryError>
-    {
+    ) -> Result<
+        (
+            impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>,
+            Option<WaitingPlace>,
+        ),
+        QueryError,
+    > {
         let started_at = Instant::now();
-        let admission = self.acquire(deadline).map_err(|reason| {
+        let (admission, waiting) = self.acquire(deadline).map_err(|reason| {
             metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(started_at.elapsed().as_secs_f64());
             self.refused(reason)
         })?;
-        Ok(async move {
-            let slot = admission.await;
-            metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(started_at.elapsed().as_secs_f64());
-            if slot.is_ok() {
-                metrics::counter!(REPLAY_ADMISSIONS_COUNTER).increment(1);
-            }
-            slot
-        })
+        Ok((
+            async move {
+                let slot = admission.await;
+                metrics::histogram!(REPLAY_WAIT_HISTOGRAM)
+                    .record(started_at.elapsed().as_secs_f64());
+                if slot.is_ok() {
+                    metrics::counter!(REPLAY_ADMISSIONS_COUNTER).increment(1);
+                }
+                slot
+            },
+            waiting,
+        ))
     }
 
     fn acquire(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<
-        impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>,
+        (
+            impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>,
+            Option<WaitingPlace>,
+        ),
         ReplayRefusal,
     > {
         use futures_util::future::{Either, ready};
         let slots = Arc::clone(&self.slots);
         if let Ok(permit) = slots.clone().try_acquire_owned() {
-            return Ok(Either::Left(ready(Ok(permit))));
+            return Ok((Either::Left(ready(Ok(permit))), None));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(ReplayRefusal::WaitExpired);
@@ -224,13 +225,15 @@ impl TreeStateReplayLimit {
         let Some(place) = WaitingPlace::take(&self.waiters, self.max_waiters) else {
             return Err(ReplayRefusal::WaitersFull);
         };
-        Ok(Either::Right(async move {
-            let _waiting_place = place;
-            match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
-                Ok(Ok(permit)) => Ok(permit),
-                Ok(Err(_)) | Err(_) => Err(ReplayRefusal::WaitExpired),
-            }
-        }))
+        Ok((
+            Either::Right(async move {
+                match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
+                    Ok(Ok(permit)) => Ok(permit),
+                    Ok(Err(_)) | Err(_) => Err(ReplayRefusal::WaitExpired),
+                }
+            }),
+            Some(place),
+        ))
     }
 }
 

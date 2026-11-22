@@ -50,7 +50,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, TreeStateReplayLimit, read_missing_height,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, ReplayKey, Selection, TreeStateReplayLimit,
+        read_missing_height,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1268,8 +1269,11 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
+        use std::ops::ControlFlow;
+
         serving_read::record("tree_state_at", None, async {
             let mut deadline = None;
+            let mut carried = None;
             loop {
                 let (epoch, key, generation, ready) =
                     serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
@@ -1285,28 +1289,37 @@ where
                 if let Some(state) = ready {
                     return Ok(tree_state_response(epoch, state.serve()));
                 }
-                let deadline = self.tree_state_replays.admission_deadline(&mut deadline)?;
-                let subscription = self
-                    .tree_state_replays
-                    .subscribe(key, &generation, deadline)?;
-                let slot = subscription
-                    .admit(&self.tree_state_replays, deadline)
-                    .await?;
+                let deadline = *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
+                let subscription = match self.tree_state_replays.select(
+                    key,
+                    &generation,
+                    deadline,
+                    carried.take(),
+                )? {
+                    Selection::Ready(state) => {
+                        return Ok(tree_state_response(epoch, state.serve()));
+                    }
+                    Selection::Waiting(subscription) => subscription,
+                };
+                let slot = subscription.admit(&self.tree_state_replays).await?;
                 let answer = serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
                     let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     if !generation.ptr_eq(&Arc::downgrade(&pair)) {
-                        return Ok(None);
+                        return Ok(ControlFlow::Continue(subscription.carry(&slot)));
                     }
                     let state = subscription
                         .replay(slot, |cancelled| async move {
                             read_missing_height(pair.canonical(), height, cancelled).await
                         })
                         .await?;
-                    Ok(Some(tree_state_response(epoch, state)))
+                    Ok(state.map_or(ControlFlow::Continue(None), |state| {
+                        ControlFlow::Break(tree_state_response(epoch, state))
+                    }))
                 })
                 .await?;
-                if let Some(answer) = answer {
-                    return Ok(answer);
+                match answer {
+                    ControlFlow::Break(state) => return Ok(state),
+                    ControlFlow::Continue(slot) => carried = slot,
                 }
             }
         })
@@ -2072,6 +2085,7 @@ mod tree_state_replay_limit_tests {
         ));
         first.abort();
         assert!(first.await.is_err_and(|error| error.is_cancelled()));
+        assert_eq!(query.tree_state_replays.waiter_count(), 0);
         gate.release();
         assert_eq!(follower.await??.height, height);
         assert_eq!(query.tree_state_at(height, None).await?.height, height);
@@ -2164,6 +2178,43 @@ mod tree_state_replay_limit_tests {
         drop(held_slot);
 
         assert_eq!(waiting.await??.height, reconstructed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_serves_the_waiting_wallet_before_a_later_wallet()
+    -> Result<(), Box<dyn Error>> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let activations = sample_regtest_upgrade_activations();
+        let mut original = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let mut updated =
+            WalletServingStoreFixture::from_chain(&chain.extend_blocks(1), &activations)?;
+        let read_pair = |store: &mut WalletServingStoreFixture| -> Result<_, Box<dyn Error>> {
+            let (canonical, wallet) = store.take_readers()?;
+            Ok(Arc::new(WalletServingReadPair::new(
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
+            )?))
+        };
+        let slot = WalletServingPairSlot::new(read_pair(&mut original)?);
+        let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        query.tree_state_replays =
+            TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
+        let occupied = query.tree_state_replays.admit().await?;
+        let first = tokio::spawn({
+            let query = query.clone();
+            async move { query.tree_state_at(BlockHeight::new(2), None).await }
+        });
+        query.tree_state_replays.wait_for_waiters(1).await?;
+        let later = query.tree_state_replays.admit();
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        slot.publish_for_test(read_pair(&mut updated)?);
+        drop(occupied);
+        let answer = first.await??;
+        assert_eq!(answer.height, BlockHeight::new(2));
+        assert_eq!(answer.chain_epoch.visible_tip_height, BlockHeight::new(4));
+        drop(later.await?);
         Ok(())
     }
 

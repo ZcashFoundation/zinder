@@ -46,6 +46,31 @@ fn cancellation_stops_replay_between_compact_blocks() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn abandoned_lookup_stops_before_reading_or_validating_the_seed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let seed = BlockHeight::new(100);
+    let height = BlockHeight::new(101);
+    replace_checkpoint_row(&store, seed, b"damaged seed")?;
+    for stop_at in [1, 2] {
+        let checks = std::cell::Cell::new(0);
+        let lookup = store.tree_state_lookup_until_cancelled(height, &activations, || {
+            checks.set(checks.get() + 1);
+            checks.get() == stop_at
+        });
+        assert!(matches!(lookup, Err(CanonicalStoreError::ReplayCancelled)));
+        assert_eq!(checks.get(), stop_at);
+    }
+    assert!(matches!(
+        store.tree_state_lookup(height, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    Ok(())
+}
+
+#[test]
 fn every_retained_height_reads_the_checkpoint_construction_would_store()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

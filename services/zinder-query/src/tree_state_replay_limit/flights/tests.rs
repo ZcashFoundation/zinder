@@ -73,7 +73,7 @@ async fn queued_subscribers_keep_their_place_and_deadline_after_the_first_wallet
     let generation = Arc::downgrade(&Arc::new(()));
     let deadline = limit.deadline();
     let first = limit.subscribe(key, &generation, deadline)?;
-    assert!(first.admit(&limit, deadline).now_or_never().is_none());
+    assert!(first.admit(&limit).now_or_never().is_none());
     let other = limit.subscribe(
         ReplayKey {
             height: BlockHeight::new(1),
@@ -82,20 +82,31 @@ async fn queued_subscribers_keep_their_place_and_deadline_after_the_first_wallet
         &generation,
         deadline,
     )?;
-    assert!(other.admit(&limit, deadline).now_or_never().is_none());
+    assert!(other.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(2)).await;
     let follower = limit.subscribe(key, &generation, limit.deadline())?;
     assert!(limit.subscribe(key, &generation, limit.deadline()).is_err());
     drop(first);
+    assert_eq!(limit.waiter_count(), 2);
+    let recovered = limit.subscribe(
+        ReplayKey {
+            height: BlockHeight::new(3),
+            ..key
+        },
+        &generation,
+        deadline,
+    )?;
+    assert_eq!(limit.waiter_count(), 3);
+    drop(recovered);
     drop(held);
     let slot = follower
-        .admit(&limit, limit.deadline())
+        .admit(&limit)
         .now_or_never()
         .ok_or_else(|| eyre::eyre!("follower lost the first queue position"))??;
-    assert!(other.admit(&limit, deadline).now_or_never().is_none());
+    assert!(other.admit(&limit).now_or_never().is_none());
     drop(slot);
     drop(follower);
-    other.admit(&limit, deadline).await?;
+    other.admit(&limit).await?;
     assert_eq!(limit.waiter_count(), 0);
     Ok(())
 }
@@ -109,15 +120,15 @@ async fn refused_flights_can_be_retried_while_an_old_subscriber_still_holds_the_
     let generation = Arc::downgrade(&Arc::new(()));
     let deadline = limit.deadline();
     let first = limit.subscribe(key, &generation, deadline)?;
-    assert!(first.admit(&limit, deadline).now_or_never().is_none());
+    assert!(first.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(2)).await;
     let follower = limit.subscribe(key, &generation, limit.deadline())?;
     drop(first);
-    assert!(follower.admit(&limit, limit.deadline()).await.is_err());
+    assert!(follower.admit(&limit).await.is_err());
     assert_eq!(tokio::time::Instant::now(), deadline);
     drop(held);
     let retried = limit.subscribe(key, &generation, limit.deadline())?;
-    retried.admit(&limit, limit.deadline()).await?;
+    retried.admit(&limit).await?;
     assert!(!Arc::ptr_eq(&follower.flight, &retried.flight));
     Ok(())
 }
@@ -132,14 +143,14 @@ async fn same_fence_readers_cannot_share_an_invalidation_and_completed_work_free
     let generation = Arc::downgrade(&Arc::new(()));
     let replacement = Arc::downgrade(&Arc::new(()));
     let first = limit.subscribe(key, &generation, limit.deadline())?;
-    let slot = first.admit(&limit, limit.deadline()).await?;
+    let slot = first.admit(&limit).await?;
     assert!(
         limit
             .subscribe(key, &replacement, limit.deadline())
             .is_err()
     );
     let follower = limit.subscribe(key, &generation, limit.deadline())?;
-    let delayed = follower.admit(&limit, limit.deadline()).await?;
+    let delayed = follower.admit(&limit).await?;
     assert!(limit.subscribe(key, &generation, limit.deadline()).is_err());
     let failure = first
         .replay(slot, |_| async {
@@ -150,7 +161,7 @@ async fn same_fence_readers_cannot_share_an_invalidation_and_completed_work_free
         .await;
     assert!(failure.is_err());
     let fresh = limit.subscribe(key, &replacement, limit.deadline())?;
-    let available = fresh.admit(&limit, limit.deadline()).await?;
+    let available = fresh.admit(&limit).await?;
     assert!(!Arc::ptr_eq(&first.flight, &fresh.flight));
     assert!(available().is_some());
     assert!(delayed().is_none());
@@ -163,20 +174,116 @@ async fn replacement_flights_only_wait_until_the_original_request_deadline() -> 
     let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
     let held = limit.admit().await?;
     let generation = Arc::downgrade(&Arc::new(()));
-    let mut previous = None;
-    let deadline = limit.admission_deadline(&mut previous)?;
+    let deadline = limit.deadline();
     let first = limit.subscribe(key, &generation, deadline)?;
-    assert!(first.admit(&limit, deadline).now_or_never().is_none());
+    assert!(first.admit(&limit).now_or_never().is_none());
     tokio::time::advance(Duration::from_secs(3)).await;
     drop(held);
-    first.admit(&limit, deadline).await?;
+    first.admit(&limit).await?;
     drop(first);
-    let _other_wallet = limit.admit().await?;
+    let other_wallet = limit.admit().await?;
     let replacement = Arc::downgrade(&Arc::new(()));
-    let deadline = limit.admission_deadline(&mut previous)?;
     let second = limit.subscribe(key, &replacement, deadline)?;
-    assert!(second.admit(&limit, deadline).await.is_err());
+    assert!(second.admit(&limit).await.is_err());
     assert_eq!(tokio::time::Instant::now(), deadline);
-    assert!(limit.admission_deadline(&mut previous).is_err());
+    drop(other_wallet);
+    let third = limit.subscribe(key, &replacement, deadline)?;
+    third.admit(&limit).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn selection_reuses_a_settled_answer_completed_after_the_checkpoint_miss() -> eyre::Result<()>
+{
+    use super::{Selection, read_missing_height};
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut store =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+    let height = BlockHeight::new(2);
+    let key = ReplayKey::new(height, reader.as_ref());
+    let generation = Arc::downgrade(&reader);
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    assert!(limit.ready_state(key, reader.as_ref()).await?.is_none());
+    let first = limit.subscribe(key, &generation, limit.deadline())?;
+    let slot = first.admit(&limit).await?;
+    let state = first
+        .replay(slot, |cancelled| async move {
+            read_missing_height(reader.as_ref(), height, cancelled).await
+        })
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing reconstructed state"))?;
+    drop(first);
+    let _occupied = limit.admit().await?;
+    let Selection::Ready(cached) = limit.select(key, &generation, limit.deadline(), None)? else {
+        return Err(eyre::eyre!("settled state started a second reconstruction"));
+    };
+    assert_eq!(cached.serve(), state);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_admitted_wallet_supplies_its_slot_to_a_waiting_replacement_without_losing_its_turn()
+-> eyre::Result<()> {
+    use super::Selection;
+    let key = replay_key()?;
+    let old = Arc::downgrade(&Arc::new(()));
+    let new = Arc::downgrade(&Arc::new(()));
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
+    let deadline = limit.deadline();
+    let occupied = limit.admit().await?;
+    let first = limit.subscribe(key, &old, deadline)?;
+    assert!(first.admit(&limit).now_or_never().is_none());
+    let later_key = ReplayKey {
+        height: BlockHeight::new(1),
+        ..key
+    };
+    let later = limit.subscribe(later_key, &new, deadline)?;
+    assert!(later.admit(&limit).now_or_never().is_none());
+    let previous = limit.subscribe(key, &new, deadline)?;
+    assert!(previous.admit(&limit).now_or_never().is_none());
+    drop(occupied);
+    let carried = first.carry(&first.admit(&limit).await?);
+    let Selection::Waiting(moved) = limit.select(key, &new, deadline, carried)? else {
+        return Err(eyre::eyre!("unexpected cached state"));
+    };
+    assert!(Arc::ptr_eq(&moved.flight, &previous.flight));
+    assert!(moved.admit(&limit).now_or_never().transpose()?.is_some());
+    assert!(later.admit(&limit).now_or_never().is_none());
+    let slot = previous.admit(&limit).await?;
+    assert!(slot().is_some());
+    later.admit(&limit).await?;
+    Ok(())
+}
+
+#[test]
+fn a_cancelled_blocking_seed_lookup_releases_capacity_without_validating_its_row()
+-> eyre::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut store =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    runtime.block_on(async {
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || held.recv());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let lookup =
+            reader.tree_state_lookup_until_cancelled(BlockHeight::new(2), cancelled.clone());
+        tokio::pin!(lookup);
+        assert!(futures_util::poll!(&mut lookup).is_pending());
+        cancelled.store(true, Ordering::Relaxed);
+        release.send(())?;
+        blocker.await??;
+        assert!(lookup.await.is_err());
+        assert!(matches!(
+            reader.tree_state_lookup(BlockHeight::new(2)).await?,
+            Some(TreeStateLookup::Replay(_))
+        ));
+        Ok(())
+    })
 }

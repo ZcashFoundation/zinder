@@ -12,7 +12,7 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use tokio::{
-    sync::{OwnedSemaphorePermit, watch},
+    sync::{OwnedSemaphorePermit, oneshot, watch},
     time::Instant,
 };
 use tracing::Instrument as _;
@@ -52,7 +52,7 @@ impl ReplayKey {
 #[derive(Default, Debug)]
 pub(super) struct Flights {
     running: HashMap<(ReplayKey, usize), Weak<Flight>>,
-    settled: Arc<Mutex<SettledStates>>,
+    settled: SettledStates,
 }
 
 #[derive(Debug, Default)]
@@ -99,7 +99,7 @@ impl ReadyState {
 
 impl TreeStateReplayLimit {
     pub(crate) fn cached(&self, key: ReplayKey) -> Option<ServedTreeState> {
-        self.flights.lock().settled.lock().cached(key)
+        self.flights.lock().settled.cached(key)
     }
 
     pub(crate) async fn ready_state(
@@ -125,49 +125,66 @@ impl TreeStateReplayLimit {
         Ok(stored.map(ReadyState::Stored))
     }
 
-    pub(crate) fn subscribe<T: Send + Sync + 'static>(
+    pub(crate) fn select<T: Send + Sync + 'static>(
+        &self,
+        key: ReplayKey,
+        generation: &Weak<T>,
+        deadline: Instant,
+        carried: Option<TakeReplayPermit>,
+    ) -> Result<Selection, QueryError> {
+        let id = (key, generation.as_ptr().addr());
+        let mut flights = self.flights.lock();
+        if let Some(state) = flights.settled.cached(key) {
+            return Ok(Selection::Ready(ReadyState::Cached(state)));
+        }
+        if let Some(flight) = flights.running.get(&id).and_then(Weak::upgrade)
+            && flight.joinable()
+        {
+            return flight
+                .subscribe(self, deadline, carried)
+                .map(Selection::Waiting);
+        }
+        flights.running.retain(|_, old| old.strong_count() > 0);
+        let (admission, place) = Admission::new(self, deadline, carried)?;
+        let flight = Arc::new(Flight {
+            key,
+            _generation: generation.clone(),
+            registry: self.flights.clone(),
+            cancelled: Arc::default(),
+            admission,
+            subscribers: Mutex::new(SubscriberPlaces::first(place)),
+            moved: AtomicBool::new(false),
+            read: Mutex::default(),
+        });
+        flights.running.insert(id, Arc::downgrade(&flight));
+        drop(flights);
+        Ok(Selection::Waiting(Subscription::new(flight, deadline)))
+    }
+
+    #[cfg(test)]
+    fn subscribe<T: Send + Sync + 'static>(
         &self,
         key: ReplayKey,
         generation: &Weak<T>,
         deadline: Instant,
     ) -> Result<Arc<Subscription>, QueryError> {
-        let id = (key, generation.as_ptr().addr());
-        let mut flights = self.flights.lock();
-        if let Some(flight) = flights.running.get(&id).and_then(Weak::upgrade)
-            && flight.joinable()
-        {
-            let place = WaitingPlace::take(&self.waiters, self.max_waiters)
-                .ok_or_else(|| self.refused(ReplayRefusal::WaitersFull))?;
-            return Ok(Arc::new(Subscription {
-                flight,
-                _place: Some(place),
-            }));
+        match self.select(key, generation, deadline, None)? {
+            Selection::Waiting(subscription) => Ok(subscription),
+            Selection::Ready(_) => Err(QueryError::BlockNotInBestChain),
         }
-        flights.running.retain(|_, old| old.strong_count() > 0);
-        let admission = self
-            .admit_until(deadline)?
-            .map(|admission| {
-                admission.map(|permit| {
-                    let slot = Mutex::new(Some(permit));
-                    Arc::new(move || slot.lock().take()) as TakeReplayPermit
-                })
-            })
-            .boxed()
-            .shared();
-        let flight = Arc::new(Flight {
-            key,
-            _generation: generation.clone(),
-            cache: flights.settled.clone(),
-            cancelled: Arc::default(),
-            admission,
-            read: Mutex::default(),
-        });
-        flights.running.insert(id, Arc::downgrade(&flight));
-        drop(flights);
-        Ok(Arc::new(Subscription {
-            flight,
-            _place: None,
-        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_waiters(
+        &self,
+        count: u32,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.waiter_count() != count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -176,23 +193,137 @@ impl TreeStateReplayLimit {
     }
 }
 
-type TakeReplayPermit = Arc<dyn Fn() -> Option<OwnedSemaphorePermit> + Send + Sync>;
+pub(crate) type TakeReplayPermit = Arc<dyn Fn() -> Option<OwnedSemaphorePermit> + Send + Sync>;
 type ReplayRead =
     watch::Receiver<Option<Result<Option<(ServedTreeState, bool)>, Arc<StorageReadError>>>>;
+
+pub(crate) enum Selection {
+    Ready(ReadyState),
+    Waiting(Arc<Subscription>),
+}
+
+fn transferable(permit: OwnedSemaphorePermit) -> TakeReplayPermit {
+    let slot = Mutex::new(Some(permit));
+    Arc::new(move || slot.lock().take())
+}
+
+struct Admission {
+    slot: Shared<BoxFuture<'static, Result<TakeReplayPermit, ReplayRefusal>>>,
+    offer: Mutex<Option<oneshot::Sender<TakeReplayPermit>>>,
+}
+
+impl Admission {
+    fn new(
+        limit: &TreeStateReplayLimit,
+        deadline: Instant,
+        carried: Option<TakeReplayPermit>,
+    ) -> Result<(Self, Option<WaitingPlace>), QueryError> {
+        if let Some(slot) = carried {
+            return Ok((
+                Self {
+                    slot: futures_util::future::ready(Ok(slot)).boxed().shared(),
+                    offer: Mutex::default(),
+                },
+                None,
+            ));
+        }
+        let (queued, place) = limit.admit_until(deadline)?;
+        let admitted = queued.map(|admission| admission.map(transferable));
+        let (slot, offer) = if place.is_some() {
+            let (offer, offered) = oneshot::channel();
+            let slot = async move {
+                tokio::select! {
+                    biased;
+                    Ok(carried) = offered => Ok(carried),
+                    slot = admitted => slot,
+                }
+            };
+            (slot.boxed(), Some(offer))
+        } else {
+            (admitted.boxed(), None)
+        };
+        Ok((
+            Self {
+                slot: slot.shared(),
+                offer: Mutex::new(offer),
+            },
+            place,
+        ))
+    }
+}
+
+// A queued flight needs one waiting place per caller. After admission the slot
+// covers one live caller, regardless of which subscriber leaves next.
+struct SubscriberPlaces {
+    count: usize,
+    admitted: bool,
+    waiting: Vec<WaitingPlace>,
+    carried: Vec<TakeReplayPermit>,
+}
+
+impl SubscriberPlaces {
+    fn first(place: Option<WaitingPlace>) -> Self {
+        Self {
+            count: 1,
+            admitted: place.is_none(),
+            waiting: place.into_iter().collect(),
+            carried: Vec::new(),
+        }
+    }
+
+    fn leave(&mut self, moved: bool) {
+        self.count -= 1;
+        if moved && self.admitted {
+            self.admitted = false;
+        } else if self.carried.pop().is_none() {
+            self.waiting.pop();
+        }
+    }
+}
 
 struct Flight {
     key: ReplayKey,
     // Keep the allocation address unique without pinning its storage reader.
     _generation: Weak<dyn Send + Sync>,
-    cache: Arc<Mutex<SettledStates>>,
+    registry: Arc<Mutex<Flights>>,
     cancelled: Arc<AtomicBool>,
-    admission: Shared<BoxFuture<'static, Result<TakeReplayPermit, ReplayRefusal>>>,
+    admission: Admission,
+    subscribers: Mutex<SubscriberPlaces>,
+    moved: AtomicBool,
     read: Mutex<Option<ReplayRead>>,
 }
 
 impl Flight {
+    fn subscribe(
+        self: Arc<Self>,
+        limit: &TreeStateReplayLimit,
+        deadline: Instant,
+        carried: Option<TakeReplayPermit>,
+    ) -> Result<Arc<Subscription>, QueryError> {
+        let mut places = self.subscribers.lock();
+        if carried.is_some() && !places.admitted {
+            places.admitted = true;
+            let offer = self.admission.offer.lock().take();
+            if let (Some(offer), Some(slot)) = (offer, carried) {
+                let _ = offer.send(slot);
+            }
+        } else if places.count != 0 || !places.admitted {
+            if let Some(place) = WaitingPlace::take(&limit.waiters, limit.max_waiters) {
+                places.waiting.push(place);
+            } else if let Some(slot) = carried {
+                places.carried.push(slot);
+            } else {
+                return Err(limit.refused(ReplayRefusal::WaitersFull));
+            }
+        }
+        places.count += 1;
+        drop(places);
+        Ok(Subscription::new(self, deadline))
+    }
+
     fn joinable(&self) -> bool {
-        !matches!(self.admission.peek(), Some(Err(_)))
+        !self.moved.load(Ordering::Acquire)
+            && !matches!(self.admission.slot.peek(), Some(Err(_)))
             && !self
                 .read
                 .lock()
@@ -209,26 +340,58 @@ impl Drop for Flight {
 
 pub(crate) struct Subscription {
     flight: Arc<Flight>,
-    _place: Option<WaitingPlace>,
+    deadline: Instant,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.flight
+            .subscribers
+            .lock()
+            .leave(self.flight.moved.load(Ordering::Acquire));
+    }
 }
 
 impl Subscription {
+    fn new(flight: Arc<Flight>, deadline: Instant) -> Arc<Self> {
+        Arc::new(Self { flight, deadline })
+    }
+
+    /// Transfers unstarted work's slot. Subscribers that still need the old generation retry there.
+    pub(crate) fn carry(&self, slot: &TakeReplayPermit) -> Option<TakeReplayPermit> {
+        let current = self.flight.read.lock();
+        if current.is_some() {
+            return None;
+        }
+        let permit = slot()?;
+        self.flight.moved.store(true, Ordering::Release);
+        drop(current);
+        Some(transferable(permit))
+    }
+
     pub(crate) async fn admit(
         &self,
         limit: &TreeStateReplayLimit,
-        deadline: Instant,
     ) -> Result<TakeReplayPermit, QueryError> {
-        tokio::time::timeout_at(deadline, self.flight.admission.clone())
+        let admission = &self.flight.admission;
+        let slot = tokio::time::timeout_at(self.deadline, admission.slot.clone())
             .await
             .map_err(|_| limit.refused(ReplayRefusal::WaitExpired))?
-            .map_err(|reason| limit.refused(reason))
+            .map_err(|reason| limit.refused(reason))?;
+        let mut places = self.flight.subscribers.lock();
+        if !places.admitted && !self.flight.moved.load(Ordering::Acquire) {
+            places.admitted = true;
+            places.waiting.pop();
+        }
+        drop(places);
+        Ok(slot)
     }
 
     pub(crate) async fn replay<Read, Reading>(
         &self,
         take_permit: TakeReplayPermit,
         read: Read,
-    ) -> Result<ServedTreeState, QueryError>
+    ) -> Result<Option<ServedTreeState>, QueryError>
     where
         Read: FnOnce(Arc<AtomicBool>) -> Reading,
         Reading: Future<Output = Result<Option<TreeStateReplayOutcome>, StorageReadError>>
@@ -238,6 +401,9 @@ impl Subscription {
         let flight = &self.flight;
         let (mut pending, joined) = {
             let mut current = flight.read.lock();
+            if flight.moved.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             if let Some(pending) = current.as_ref() {
                 (pending.clone(), true)
             } else {
@@ -278,8 +444,8 @@ impl Subscription {
             "stored"
         };
         super::record_tree_state_read(flight.key.height, source);
-        flight.cache.lock().remember(flight.key, &state);
-        Ok(state)
+        flight.registry.lock().settled.remember(flight.key, &state);
+        Ok(Some(state))
     }
 }
 
@@ -288,7 +454,13 @@ pub(crate) async fn read_missing_height(
     height: BlockHeight,
     cancelled: Arc<AtomicBool>,
 ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
-    match reader.tree_state_lookup(height).await? {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    match reader
+        .tree_state_lookup_until_cancelled(height, cancelled.clone())
+        .await?
+    {
         Some(TreeStateLookup::Replay(replay)) => {
             reader
                 .replay_tree_state_until_cancelled(replay, cancelled)
