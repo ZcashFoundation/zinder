@@ -3404,7 +3404,8 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         zinder_core::CanonicalHistoryBounds,
     )> {
         if self.expose_range_fence {
-            self.inner.compact_block_fence(epoch)
+            self.served_inner(self.view_index())
+                .compact_block_fence(epoch)
         } else {
             None
         }
