@@ -101,8 +101,7 @@ impl TreeHashers {
         block_time_seconds: u32,
         work: TreeWork,
     ) -> PendingTreeWork {
-        let (sender, receiver) = sync_channel(1);
-        self.workers.spawn(move || {
+        self.spawn_job(move || {
             let checkpoint = work.checkpoint_required.then(|| {
                 snapshot.cross_checked_frontiers().map(|frontiers| {
                     CommitmentTreeCheckpoint::new(block, block_time_seconds, frontiers)
@@ -112,11 +111,18 @@ impl TreeHashers {
                 .final_roots_required
                 .then(|| final_roots(&snapshot, block.hash))
                 .flatten();
-            // The loader drops the receiver only when construction stops.
-            let _loader_stopped = sender.send(TreeWorkOutput {
+            TreeWorkOutput {
                 checkpoint,
                 final_roots,
-            });
+            }
+        })
+    }
+
+    fn spawn_job(&self, job: impl FnOnce() -> TreeWorkOutput + Send + 'static) -> PendingTreeWork {
+        let (sender, receiver) = sync_channel(1);
+        self.workers.spawn(move || {
+            // The loader drops the receiver only when construction stops.
+            let _loader_stopped = sender.send(job());
         });
         PendingTreeWork { receiver }
     }
@@ -170,4 +176,69 @@ pub(super) fn final_roots(
     let roots = snapshot.final_note_commitment_roots(block_hash);
     (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
         .then_some(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        time::{Duration, Instant},
+    };
+
+    use super::{CanonicalConstructionError, NonZeroU32, TreeHashers, TreeWorkOutput};
+
+    fn two_workers() -> Result<TreeHashers, Box<dyn std::error::Error>> {
+        TreeHashers::start(NonZeroU32::new(2).ok_or("two is non-zero")?)?
+            .ok_or_else(|| "two workers start a pool".into())
+    }
+
+    #[test]
+    fn one_worker_hashes_on_the_loader_thread() -> Result<(), CanonicalConstructionError> {
+        assert!(TreeHashers::start(NonZeroU32::MIN)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::panic, reason = "the test injects a worker panic")]
+    fn a_panicking_worker_fails_its_block_instead_of_the_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tree_hashers = two_workers()?;
+        assert!(matches!(
+            tree_hashers
+                .spawn_job(|| std::panic::panic_any("injected worker failure"))
+                .wait(),
+            Err(CanonicalConstructionError::LoaderTaskFailed { .. })
+        ));
+        // The pool keeps running the next block's work.
+        let next = tree_hashers.spawn_job(TreeWorkOutput::default);
+        drop(tree_hashers);
+        assert!(next.wait().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_while_a_worker_hashes_returns_without_waiting_for_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tree_hashers = two_workers()?;
+        let inside_job = Arc::new(Barrier::new(2));
+        let release_job = Arc::new(Barrier::new(2));
+        let pending = {
+            let inside_job = Arc::clone(&inside_job);
+            let release_job = Arc::clone(&release_job);
+            tree_hashers.spawn_job(move || {
+                inside_job.wait();
+                release_job.wait();
+                TreeWorkOutput::default()
+            })
+        };
+        inside_job.wait();
+        // Construction stops with this block's work still running: the loader
+        // drops its pending blocks and the pool without joining the worker.
+        let stopped_at = Instant::now();
+        drop(pending);
+        drop(tree_hashers);
+        assert!(stopped_at.elapsed() < Duration::from_secs(1));
+        release_job.wait();
+        Ok(())
+    }
 }

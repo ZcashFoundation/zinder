@@ -1357,17 +1357,31 @@ async fn every_block_construction_preserves_checkpointed_bounds()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_every_block_construction_discards_unpublished_staging_and_rebuilds_densely()
 -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_interrupted_dense_construction_rebuilds(1)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_parallel_dense_construction_discards_unpublished_staging_and_rebuilds()
+-> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_interrupted_dense_construction_rebuilds(4)).await
+}
+
+async fn assert_interrupted_dense_construction_rebuilds(
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let activations = regtest_activations();
     let source = MultiBlockConstructionSource::build(6, &activations)?;
     let reached = Arc::new(Notify::new());
     let mut interrupted_source = source.clone();
     interrupted_source.hold_checkpoint = Some((BlockHeight::new(5), Arc::clone(&reached)));
     let temporary = TempDir::new()?;
-    let config = multi_block_writer_config(
+    let mut config = multi_block_writer_config(
         temporary.path().join("canonical"),
         Arc::clone(&activations),
         true,
     );
+    config.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
 
