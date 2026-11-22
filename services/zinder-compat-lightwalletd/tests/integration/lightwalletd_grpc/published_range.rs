@@ -391,6 +391,52 @@ async fn covered_chunks_respect_a_replacements_higher_floor_at_the_same_settled_
     Ok(())
 }
 
+#[tokio::test]
+async fn descending_gap_retry_delivers_every_previously_checked_retained_block() -> eyre::Result<()>
+{
+    // At tip 6,100 the 5,096-block tail begins at 1,005. The catalog ends at 1,000.
+    let chain = ChainFixture::new(NETWORK).extend_blocks(6_100);
+    let baseline = CanonicalBaseline::new(&chain);
+    let activations = sample_regtest_upgrade_activations();
+    let before = ReaderFixture::new(
+        CanonicalWriterFixture::publish(&baseline, &activations)?.into_serving_store_fixture()?,
+    )?;
+    let dir = tempfile::tempdir()?;
+    let history = before.publish(&dir.path().join("settled"), 1_000).await?;
+    let after = ReaderFixture::new(
+        CanonicalWriterFixture::publish(
+            &baseline.with_history_floor(BlockHeight::new(10)),
+            &activations,
+        )?
+        .into_serving_store_fixture()?,
+    )?;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut recorder = EpochPinRecorder::new(before.query.clone())
+        .with_later_views(vec![after.query.clone()])
+        .with_later_chunk_gate(gate.clone());
+    recorder.expose_range_fence = true;
+    let mut endpoint = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(history)
+                .into_server(),
+        ),
+    )
+    .await?;
+    let stream = endpoint
+        .client
+        .get_block_range(block_range_request(1_010, 1))
+        .await?
+        .into_inner();
+    super::later_chunk_read_at_gate(&recorder).await?;
+    recorder.advance_view();
+    gate.add_permits(1);
+    let received = drain_slowly(stream).await;
+    assert_stream_ended_with(received.ending.as_ref(), Code::NotFound);
+    assert_one_linked_chain(&received.blocks, 1_010, 11);
+    Ok(())
+}
+
 async fn crossing_a_replaced_live_suffix(
     replacement_tip: u32,
     expected_status: Code,

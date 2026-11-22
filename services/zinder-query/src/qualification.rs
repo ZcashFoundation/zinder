@@ -7,13 +7,13 @@ use zinder_core::{
     TransactionBroadcastOutcome,
 };
 use zinder_source::{SourceError, TransactionBroadcaster, ZebraJsonRpcSource};
-use zinder_store::{ArtifactFamily, BlockHashLookup, TreeStateLookup};
+use zinder_store::{ArtifactFamily, BlockHashLookup};
 
 use crate::{
     ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
     tree_state_replay_limit::{
-        TreeStateReplayLimit, record_stored_tree_state_read, replay_holding_slot,
+        ReadyState, ReplayKey, Selection, TreeStateReplayLimit, read_missing_height,
     },
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
@@ -85,7 +85,7 @@ impl QualificationWalletQuery {
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
     pub async fn tree_state(
         &self,
-        reader: Arc<RocksDbCanonicalReader>,
+        mut reader: Arc<RocksDbCanonicalReader>,
         height: Option<BlockHeight>,
     ) -> Result<TreeState, QueryError> {
         let epoch = reader.chain_epoch();
@@ -100,36 +100,71 @@ impl QualificationWalletQuery {
                 })?;
             return Ok(tree_state_response(epoch, checkpoint));
         };
-        let lookup = reader
-            .tree_state_lookup(height)
-            .await
-            .map_err(QueryError::canonical_read)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let replay = match lookup {
-            TreeStateLookup::Stored(state) => {
-                record_stored_tree_state_read(height, &state);
+        let mut deadline = None;
+        let mut carried = None;
+        loop {
+            let epoch = reader.chain_epoch();
+            let key = ReplayKey::new(height, reader.as_ref());
+            let generation = Arc::downgrade(&reader);
+            let (selected, expected) = match self.replays.ready_state(key, reader.as_ref()).await? {
+                Some(ready @ ReadyState::Stored(_)) => {
+                    return Ok(tree_state_response(epoch, ready.serve()));
+                }
+                Some(ReadyState::Cached(state)) => {
+                    let block = state.block_id();
+                    (Selection::Ready(ReadyState::Cached(state)), block)
+                }
+                None => {
+                    let block = reader
+                        .block_header_at(height)
+                        .await
+                        .map_err(QueryError::canonical_read)?
+                        .ok_or(QueryError::BlockNotInBestChain)?;
+                    let selected = self.replays.select(
+                        key,
+                        &generation,
+                        *deadline.get_or_insert_with(|| self.replays.deadline()),
+                        carried.take(),
+                    )?;
+                    (selected, BlockId::new(height, block.block_hash))
+                }
+            };
+            let subscription = match selected {
+                Selection::Ready(state) => {
+                    let current = (self.capture)();
+                    if !retains_block(&current, epoch, expected).await? {
+                        return Err(QueryError::BlockNotInBestChain);
+                    }
+                    if ReplayKey::new(height, current.as_ref()) == key {
+                        return Ok(tree_state_response(epoch, state.serve()));
+                    }
+                    reader = current;
+                    continue;
+                }
+                Selection::Waiting(subscription) => subscription,
+            };
+            drop(reader);
+            let slot = subscription.admit(&self.replays).await?;
+            reader = (self.capture)();
+            if !generation.ptr_eq(&Arc::downgrade(&reader)) {
+                carried = subscription.carry(&slot);
+                drop(subscription);
+                drop(slot);
+                if !retains_block(&reader, epoch, expected).await? {
+                    return Err(QueryError::BlockNotInBestChain);
+                }
+                continue;
+            }
+            let captured = reader.clone();
+            if let Some(state) = subscription
+                .replay(slot, |cancelled| async move {
+                    read_missing_height(captured.as_ref(), height, cancelled).await
+                })
+                .await?
+            {
                 return Ok(tree_state_response(epoch, state));
             }
-            TreeStateLookup::Replay(replay) => replay,
-        };
-        let block = reader
-            .block_header_at(height)
-            .await
-            .map_err(QueryError::canonical_read)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let expected = BlockId::new(height, block.block_hash);
-        drop(reader);
-        let replay_slot = Arc::new(self.replays.admit().await?);
-        let reader = (self.capture)();
-        let replay_epoch = reader.chain_epoch();
-        if !retains_block(&reader, epoch, expected).await? {
-            return Err(QueryError::BlockNotInBestChain);
         }
-        replay_holding_slot(height, replay_slot, async move {
-            reader.replay_tree_state(replay).await
-        })
-        .await
-        .map(|state| tree_state_response(replay_epoch, state))
     }
 
     /// Returns the completed roots in one bounded page as of the captured epoch, while its tip remains canonical.

@@ -10,6 +10,9 @@ use zinder_store::{CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonical
 
 use super::config::{LightwalletdConfig, LightwalletdConfigError};
 
+mod scratch;
+use scratch::PublicationScratch;
+
 #[derive(Args)]
 pub(super) struct PublishHistory {
     /// Directory for the signed current.json, segment files, and publisher state.
@@ -38,12 +41,16 @@ impl PublishHistory {
         let _signal = self
             .follow_interval_secs
             .map(|_| zinder_runtime::cancel_on_terminating_signal(stopping.clone()));
-        std::fs::create_dir_all(&config.storage.secondary_path)?;
+        let scratch = PublicationScratch::reserve(
+            &config.storage.secondary_path,
+            &self.directory,
+            &config.storage.path,
+        )?;
         let mut generation: Option<PublicationReader> = None;
         let mut publisher = None;
         loop {
             let candidate = generation.take().map_or_else(
-                || PublicationReader::open(config),
+                || PublicationReader::open(config, &scratch),
                 PublicationReader::catch_up,
             );
             let publication = candidate.and_then(|current| {
@@ -100,8 +107,8 @@ struct PublicationReader {
 }
 
 impl PublicationReader {
-    fn open(config: &LightwalletdConfig) -> io::Result<Self> {
-        let scratch = tempfile::tempdir_in(&config.storage.secondary_path)?;
+    fn open(config: &LightwalletdConfig, reservation: &PublicationScratch) -> io::Result<Self> {
+        let scratch = reservation.generation()?;
         let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             &config.storage.path,
             scratch.path(),

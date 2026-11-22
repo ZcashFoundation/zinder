@@ -657,6 +657,10 @@ pub struct CanonicalStoreReadyEvidence {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CanonicalStoreError {
+    /// The caller cancelled a commitment-tree reconstruction.
+    #[error("tree-state replay cancelled")]
+    ReplayCancelled,
+
     /// The supplied `RocksDB` resource budget violates a hard bound.
     #[error("invalid canonical store resource budget: {reason}")]
     InvalidResourceBudget {

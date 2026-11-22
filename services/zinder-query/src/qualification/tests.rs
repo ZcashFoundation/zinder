@@ -62,7 +62,9 @@ async fn queued_replay_releases_the_generation_and_rejects_a_replaced_block() ->
         }
     })
     .await?;
-    let refused = query.tree_state(Arc::clone(&old), Some(height)).await;
+    let refused = query
+        .tree_state(Arc::clone(&old), Some(BlockHeight::new(16)))
+        .await;
     assert!(
         matches!(refused, Err(QueryError::TreeStateReplayLimitReached { .. })),
         "{refused:?}"
@@ -81,6 +83,32 @@ async fn queued_replay_releases_the_generation_and_rejects_a_replaced_block() ->
             .ok_or_else(|| eyre!("replacement header missing"))?
             .block_hash
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_keeps_the_queued_wallet_ahead_of_the_next_admission() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let (_old, initial) = reader(&chain)?;
+    let (_new, replacement) = reader(&chain.extend_blocks(1))?;
+    let slot = Arc::new(ArcSwap::from(initial.clone()));
+    let mut query = query(&slot)?;
+    query.replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(4));
+    let occupied = query.replays.admit().await?;
+    let first = tokio::spawn({
+        let query = query.clone();
+        async move { query.tree_state(initial, Some(BlockHeight::new(2))).await }
+    });
+    query.replays.wait_for_waiters(1).await?;
+    let later = query.replays.admit();
+    tokio::pin!(later);
+    assert!(futures_util::poll!(&mut later).is_pending());
+    slot.store(replacement);
+    drop(occupied);
+    let answer = first.await??;
+    assert_eq!(answer.height, BlockHeight::new(2));
+    assert_eq!(answer.chain_epoch.visible_tip_height, BlockHeight::new(4));
+    drop(later.await?);
     Ok(())
 }
 
@@ -117,16 +145,16 @@ async fn tree_state_metrics_count_each_height_read_from_its_served_outcome() -> 
     for expected in [
         r#"zinder_query_tree_state_reads_total{source="stored",height_band="0"} 2"#,
         r#"zinder_query_tree_state_reads_total{source="replayed",height_band="0"} 1"#,
-        r#"zinder_query_tree_state_replayed_blocks_count{height_band="0"} 3"#,
+        r#"zinder_query_tree_state_replayed_blocks_count{height_band="0"} 1"#,
         &format!(
             r#"zinder_query_tree_state_replayed_blocks_sum{{height_band="0"}} {}"#,
             replay.replayed_blocks()
         ),
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="sapling",height_band="0"} 3"#,
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="orchard",height_band="0"} 3"#,
-        r#"zinder_query_tree_state_replayed_commitments_count{pool="ironwood",height_band="0"} 3"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="sapling",height_band="0"} 1"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="orchard",height_band="0"} 1"#,
+        r#"zinder_query_tree_state_replayed_commitments_count{pool="ironwood",height_band="0"} 1"#,
         r#"zinder_query_tree_state_replay_duration_seconds_count{height_band="0"} 1"#,
-        "zinder_query_tree_state_replay_admissions_total 2",
+        "zinder_query_tree_state_replay_admissions_total 1",
     ] {
         assert!(
             rendered.lines().any(|line| line == expected),

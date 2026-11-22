@@ -304,6 +304,25 @@ macro_rules! impl_canonical_typed_reads {
                     .transpose()
             }
 
+            /// Reads the wallet checkpoint stored at exactly `height` without loading a replay seed.
+            pub fn stored_tree_state_at(
+                &self,
+                height: BlockHeight,
+            ) -> Result<Option<ServedTreeState>, CanonicalStoreError> {
+                let predecessor = self
+                    .serving_build_plan()
+                    .history_predecessor()
+                    .block_id
+                    .height;
+                if height < predecessor || height > self.serving_ready_evidence().visible_tip.height
+                {
+                    return Ok(None);
+                }
+                read_tree_state_row_at(self, height)?
+                    .map(|encoded| decode_served_tree_state(self, height, &encoded))
+                    .transpose()
+            }
+
             /// Reads the commitment-tree checkpoint after the canonical block
             /// at `height`, reconstructing it when no checkpoint is stored
             /// there.
@@ -369,6 +388,22 @@ macro_rules! impl_canonical_typed_reads {
                 )
             }
 
+            /// Looks up a wallet checkpoint while the caller still needs its validated seed.
+            /// Checks cancellation before reading the row and again before decoding it.
+            pub fn tree_state_lookup_until_cancelled(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+                cancelled: impl Fn() -> bool,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                super::tree_state_replay::lookup_until_cancelled(
+                    self,
+                    height,
+                    network_upgrade_activations,
+                    cancelled,
+                )
+            }
+
             /// Reconstructs the tree state a [`Self::tree_state_lookup`]
             /// found no checkpoint for, applying every check of
             /// [`Self::tree_state_checkpoint_at`], and reports how it was
@@ -391,6 +426,22 @@ macro_rules! impl_canonical_typed_reads {
                     self,
                     replay,
                     network_upgrade_activations,
+                )
+            }
+
+            /// Reconstructs a frontier while a caller still needs it. Checks for
+            /// cancellation before starting and after each replayed block.
+            pub fn replay_tree_state_until_cancelled(
+                &self,
+                replay: &TreeStateReplay,
+                activations: &zinder_core::NetworkUpgradeActivations,
+                cancelled: impl Fn() -> bool,
+            ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+                super::tree_state_replay::replay_until_cancelled(
+                    self,
+                    replay,
+                    activations,
+                    cancelled,
                 )
             }
 
@@ -980,14 +1031,21 @@ pub(super) fn read_stored_tree_state_checkpoint_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+    read_tree_state_row_at(store, height)?
+        .map(|encoded| decode_stored_tree_state_checkpoint(store, height, &encoded))
+        .transpose()
+}
+
+fn read_tree_state_row_at(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
     read_optional(
         store,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         &encode_block_position(height),
         "tree-state checkpoint read",
-    )?
-    .map(|encoded| decode_stored_tree_state_checkpoint(store, height, &encoded))
-    .transpose()
+    )
 }
 
 /// One stored tree-state checkpoint row, not yet decoded.
