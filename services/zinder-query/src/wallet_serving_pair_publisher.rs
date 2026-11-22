@@ -938,7 +938,7 @@ impl crate::QualificationWalletQuery {
             let mut outage = None;
             loop {
                 let probe = async {
-                    let node = self.verified_node().await?;
+                    let node = self.verified_current_node().await?;
                     probe_wallet_node_readiness(node).await
                 };
                 let observation = tokio::select! {

@@ -8,8 +8,8 @@ use tokio_stream::{self as stream, Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address;
 use zinder_core::{
-    BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SubtreeRootRange,
-    TransactionId,
+    BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SerializedBytesDigest,
+    SubtreeRootRange, TransactionId,
     wire::{
         decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_internal_transaction_id,
     },
@@ -17,8 +17,9 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_query::{
     ArtifactKey, CanonicalReader, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-    QualificationWalletQuery, QueryError, StorageReadError, SubtreeRoots,
-    parse_receivable_transparent_address, status_from_query_error,
+    MinedTransactionDigest, QualificationNodeTarget, QualificationWalletQuery, QueryError,
+    RocksDbCanonicalReader, StorageReadError, SubtreeRoots, parse_receivable_transparent_address,
+    status_from_query_error,
 };
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
@@ -97,20 +98,10 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
         let id = decode_internal_transaction_id(&filter.hash)
             .map_err(|e| wire_decode_error_to_status(&e))?;
         let reader = self.query_api.slot.capture();
-        let forwarded = !reader.raw_blob_retention().retains_transaction_blobs();
+        if !reader.raw_blob_retention().retains_transaction_blobs() {
+            return self.forwarded_transaction(reader, id).await;
+        }
         let miss = match reader.mined_transaction(id).await {
-            Ok(Some(mined)) if forwarded => {
-                let header = mined.block_header.ok_or_else(|| {
-                    status_from_query_error(&QueryError::ArtifactUnavailable {
-                        family: ArtifactFamily::BlockHeader,
-                        key: ArtifactKey::BlockHeight(mined.location.block_height),
-                    })
-                })?;
-                drop(reader);
-                let node = self.query_api.node().await?;
-                let block = BlockId::new(mined.location.block_height, header.block_hash);
-                return forwarded_transaction(node, id, block).await;
-            }
             Ok(Some(mined)) => {
                 let blob = mined.transaction_blob.ok_or_else(|| {
                     status_from_query_error(&QueryError::ArtifactUnavailable {
@@ -132,19 +123,52 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             Err(error) => return Err(storage_status(error)),
         };
         drop(reader);
-        if forwarded {
-            // A forwarded lookup reports an unverified node the same way for
-            // every transaction, including ones the served view does not mine.
-            self.query_api.node().await?;
-        }
+        self.pending_transaction(id, miss).await
+    }
+
+    /// Answers `GetTransaction` from the served chain's location and recorded
+    /// digest, with only the bytes read from the node.
+    async fn forwarded_transaction(
+        &self,
+        reader: Arc<RocksDbCanonicalReader>,
+        id: TransactionId,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let view = served_view(&reader)?;
+        let miss = match reader.mined_transaction_digest(id).await {
+            Ok(Some(mined)) => {
+                drop(reader);
+                let node = self.query_api.node(&view).await?;
+                let reported = node
+                    .fetch_mined_transaction_bytes(id)
+                    .await
+                    .map_err(node_status)?
+                    .ok_or_else(|| {
+                        outside_served_view(
+                            "node does not mine the transaction in the served block",
+                        )
+                    })?;
+                return served_transaction(mined, reported);
+            }
+            Ok(None) => CanonicalTransactionMiss::NotInChain {
+                at_epoch_id: reader.chain_epoch().id,
+            },
+            Err(error @ StorageReadError::CanonicalHistoryUnavailable { .. }) => {
+                CanonicalTransactionMiss::BelowHistoryFloor(storage_status(error))
+            }
+            Err(error) => return Err(storage_status(error)),
+        };
+        drop(reader);
+        // A forwarded lookup reports an unverified node the same way for
+        // every transaction, including ones the served view does not mine.
+        self.query_api.node(&view).await?;
         self.pending_transaction(id, miss).await
     }
 }
 
 impl QualificationWallet {
-    async fn node(&self) -> Result<&ZebraJsonRpcSource, Status> {
+    async fn node(&self, view: &ServedView) -> Result<&ZebraJsonRpcSource, Status> {
         self.query
-            .verified_node()
+            .verified_node(&view.target)
             .await
             .map_err(|error| status_from_query_error(&QueryError::Node(error)))
     }
@@ -164,8 +188,7 @@ impl QualificationWallet {
         &self,
         mut addresses: impl Stream<Item = Result<String, Status>> + Unpin,
     ) -> Result<lightwalletd::Balance, Status> {
-        let view = served_view(self.slot.capture().chain_epoch());
-        let network = view.network;
+        let network = self.slot.capture().network();
         let mut distinct = HashSet::new();
         while let Some(address) = addresses.next().await {
             let parsed = parse_receivable_transparent_address(&address?, network)
@@ -188,7 +211,8 @@ impl QualificationWallet {
         // The node's balance RPC does not report the tip it answered at, so
         // the balance is summed from outputs the node attests at the served tip.
         let _permit = self.utxo_permit()?;
-        let node = self.node().await?;
+        let view = served_view(&self.slot.capture())?;
+        let node = self.node(&view).await?;
         let unspent = served_utxo_page(node, &lookup, BlockHeight::new(0), None, view.tip).await?;
         let exceeds = || Status::out_of_range("transparent address balance exceeds i64");
         let balance_zat = unspent
@@ -209,7 +233,7 @@ impl QualificationWallet {
         if request.addresses.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
-        let view = served_view(self.slot.capture().chain_epoch());
+        let view = served_view(&self.slot.capture())?;
         let network = view.network;
         let mut addresses = Vec::with_capacity(request.addresses.len());
         for text in request.addresses {
@@ -226,7 +250,7 @@ impl QualificationWallet {
                 .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?,
         );
         let permit = self.utxo_permit()?;
-        let node = self.node().await?;
+        let node = self.node(&view).await?;
         let mut rows =
             wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?;
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
@@ -276,26 +300,18 @@ impl QualificationWallet {
                     "a node address history response is in progress; retry with backoff",
                 )
             })?;
-        let end_hash = reader
-            .block_header_at(range.end_height)
-            .await
-            .map_err(storage_status)?
-            .ok_or_else(|| {
-                status_from_query_error(&QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::BlockHeader,
-                    key: ArtifactKey::BlockHeight(range.end_height),
-                })
-            })?
-            .block_hash;
+        let view = served_view(&reader)?;
         drop(reader);
-        let node = self.node().await?;
+        let node = self.node(&view).await?;
         NodeAddressHistory {
             node: node.clone(),
+            slot: self.slot.clone(),
             lookup,
             pending: vec![(range.start_height, range.end_height)],
-            anchor: BlockId::new(range.end_height, end_hash),
+            served: view.tip,
             page: IntoIter::default(),
             page_range: (range.start_height, range.end_height),
+            last_position: None,
             _permit: permit,
         }
         .into_stream()
@@ -303,17 +319,45 @@ impl QualificationWallet {
     }
 }
 
-/// The served tip a forwarded request answers for, captured once per request.
+/// The served tip a forwarded request answers for, captured once per request
+/// with the node admission target of the same reader.
 struct ServedView {
     network: Network,
     tip: BlockId,
+    target: QualificationNodeTarget,
 }
 
-fn served_view(epoch: ChainEpoch) -> ServedView {
-    ServedView {
+fn served_view(reader: &RocksDbCanonicalReader) -> Result<ServedView, Status> {
+    let epoch = reader.chain_epoch();
+    Ok(ServedView {
         network: epoch.network,
         tip: BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash),
+        target: QualificationNodeTarget::of(reader)
+            .map_err(|error| status_from_query_error(&QueryError::Node(error)))?,
+    })
+}
+
+/// Keeps node bytes for a served transaction only when the node mines it in
+/// the served block and they are the bytes ingest committed there.
+fn served_transaction(
+    mined: MinedTransactionDigest,
+    (reported, bytes): (BlockId, Vec<u8>),
+) -> Result<lightwalletd::RawTransaction, Status> {
+    let location = mined.location;
+    if reported != BlockId::new(location.block_height, location.block_hash) {
+        return Err(outside_served_view(
+            "node does not mine the transaction in the served block",
+        ));
     }
+    if SerializedBytesDigest::from_serialized_bytes(&bytes) != mined.serialized_bytes_digest {
+        return Err(Status::data_loss(
+            "node transaction bytes differ from the bytes committed to the served chain",
+        ));
+    }
+    Ok(lightwalletd::RawTransaction {
+        data: bytes,
+        height: u64::from(location.block_height.value()),
+    })
 }
 
 fn wallet_utxo_response_len(
@@ -400,6 +444,10 @@ async fn wallet_ordered_utxos(
     }
     let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
     let mut at_cutoff = rows.len() - before_cutoff;
+    let first_read: Vec<_> = rows[before_cutoff..]
+        .iter()
+        .map(|row| row.outpoint)
+        .collect();
     rows.truncate(before_cutoff);
     let mut tail_limit = limit;
     let mut tail = loop {
@@ -421,7 +469,24 @@ async fn wallet_ordered_utxos(
         }
     };
     tail.truncate(tail.partition_point(|row| row.block_height == cutoff));
+    // Both reads answer at the served tip, so the reread must repeat the
+    // outputs the first read returned at the cutoff height.
+    let repeats_first_read = tail.len() >= first_read.len()
+        && tail
+            .iter()
+            .zip(&first_read)
+            .all(|(row, outpoint)| row.outpoint == *outpoint);
     rows.append(&mut tail);
+    let distinct = rows
+        .iter()
+        .map(|row| row.outpoint)
+        .collect::<HashSet<_>>()
+        .len();
+    if !repeats_first_read || distinct != rows.len() {
+        return Err(outside_served_view(
+            "node UTXO pages at the served tip disagree",
+        ));
+    }
     Ok(rows)
 }
 
@@ -440,13 +505,20 @@ fn utxo_reply(
     })
 }
 
+/// A forwarded address-history stream bound to the served tip it started at.
+///
+/// Every page request proves the node holds that tip, and every row must be a
+/// served transaction, in canonical position order, whose node bytes match the
+/// digest ingest committed.
 struct NodeAddressHistory {
     node: ZebraJsonRpcSource,
+    slot: CanonicalReaderSlot,
     lookup: TransparentAddressLookup,
     pending: Vec<(BlockHeight, BlockHeight)>,
-    anchor: BlockId,
+    served: BlockId,
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
+    last_position: Option<(BlockHeight, u32)>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -464,11 +536,10 @@ impl NodeAddressHistory {
         while let Some((start, end)) = self.pending.pop() {
             match self
                 .node
-                .fetch_transparent_address_transaction_ids(&self.lookup, start, end)
+                .fetch_transparent_address_transaction_ids(&self.lookup, start, end, self.served)
                 .await
             {
                 Ok(ids) => {
-                    self.verify_anchor().await?;
                     if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
                         return Err(Status::data_loss(
                             "node address history repeated a transaction ID",
@@ -493,44 +564,71 @@ impl NodeAddressHistory {
         Ok(())
     }
 
-    async fn verify_anchor(&self) -> Result<(), Status> {
+    async fn verify_served_tip(&self) -> Result<(), Status> {
         let hash = self
             .node
-            .fetch_block_hash(self.anchor.height)
+            .fetch_block_hash(self.served.height)
             .await
             .map_err(node_status)?;
-        if hash == self.anchor.hash {
+        if hash == self.served.hash {
             Ok(())
         } else {
             Err(history_changed())
         }
     }
 
+    /// Reads where the served chain mines `id` from a reader that still holds
+    /// the served tip, without keeping that reader across node calls.
+    async fn served_location(&self, id: TransactionId) -> Result<MinedTransactionDigest, Status> {
+        let reader = self.slot.capture();
+        let epoch = reader.chain_epoch();
+        if BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash) != self.served
+            && reader
+                .block_hash_lookup(self.served.hash)
+                .await
+                .map_err(storage_status)?
+                != BlockHashLookup::Resolved(self.served)
+        {
+            return Err(history_changed());
+        }
+        reader
+            .mined_transaction_digest(id)
+            .await
+            .map_err(storage_status)?
+            .ok_or_else(history_changed)
+    }
+
     async fn next(mut self) -> Result<Option<(lightwalletd::RawTransaction, Self)>, Status> {
         loop {
             if let Some(id) = self.page.next() {
-                let (block, bytes) = self
+                let reported = self
                     .node
                     .fetch_mined_transaction_bytes(id)
                     .await
                     .map_err(node_status)?
                     .ok_or_else(history_changed)?;
                 let (start, end) = self.page_range;
-                if block.height < start || block.height > end {
+                if reported.0.height < start || reported.0.height > end {
                     return Err(history_changed());
                 }
-                self.verify_anchor().await?;
-                self.page_range.0 = block.height;
-                return Ok(Some((
-                    lightwalletd::RawTransaction {
-                        data: bytes,
-                        height: u64::from(block.height.value()),
-                    },
-                    self,
-                )));
+                let mined = self.served_location(id).await?;
+                let position = (
+                    mined.location.block_height,
+                    mined.location.tx_index_in_block,
+                );
+                let row = served_transaction(mined, reported)?;
+                if self.last_position.is_some_and(|last| last >= position) {
+                    return Err(Status::data_loss(
+                        "node address history is out of canonical transaction order",
+                    ));
+                }
+                self.verify_served_tip().await?;
+                self.last_position = Some(position);
+                self.page_range.0 = position.0;
+                return Ok(Some((row, self)));
             }
             if self.pending.is_empty() {
-                self.verify_anchor().await?;
+                self.verify_served_tip().await?;
                 return Ok(None);
             }
             self.read_page().await?;
@@ -542,30 +640,6 @@ fn history_changed() -> Status {
     Status::unavailable(
         "node address history changed while reading transactions; retry with backoff",
     )
-}
-
-/// Reads the bytes of a transaction the served view mines in `block`.
-///
-/// The node reply has no block position, so the transaction ID and block
-/// identity bind it to the served location.
-async fn forwarded_transaction(
-    node: &ZebraJsonRpcSource,
-    id: TransactionId,
-    block: BlockId,
-) -> Result<lightwalletd::RawTransaction, Status> {
-    match node
-        .fetch_mined_transaction_bytes(id)
-        .await
-        .map_err(node_status)?
-    {
-        Some((mined, bytes)) if mined == block => Ok(lightwalletd::RawTransaction {
-            data: bytes,
-            height: u64::from(block.height.value()),
-        }),
-        Some(_) | None => Err(outside_served_view(
-            "node does not mine the transaction in the served block",
-        )),
-    }
 }
 
 /// Refuses a forwarded answer the node cannot give for the served chain view.
@@ -881,7 +955,8 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::StandardFee>, Status> {
-        let node = self.query_api.node().await?;
+        let view = served_view(&self.query_api.slot.capture())?;
+        let node = self.query_api.node(&view).await?;
         standard_fee_response(node.standard_fee().await.map_err(QueryError::Node))
     }
 

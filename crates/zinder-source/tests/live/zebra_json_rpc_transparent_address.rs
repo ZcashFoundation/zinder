@@ -40,7 +40,12 @@ async fn transparent_address_lookups_agree_on_a_mined_coinbase_output() -> Resul
 
     let balance = source.fetch_transparent_address_balance(&lookup).await?;
     let transaction_ids = source
-        .fetch_transparent_address_transaction_ids(&lookup, mined.block_height, mined.block_height)
+        .fetch_transparent_address_transaction_ids(
+            &lookup,
+            mined.block_height,
+            mined.block_height,
+            source.tip_id().await?,
+        )
         .await?;
     let utxos = source
         .fetch_transparent_address_utxos(&lookup, mined.block_height)

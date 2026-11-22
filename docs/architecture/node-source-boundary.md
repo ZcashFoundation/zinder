@@ -94,6 +94,11 @@ differently, and the source gives both the same result:
   refusal of the answer's size the same way, because that refusal may be for
   the new tip's range. After three attempts whose tip changed, it reports
   `ChainTipChangedDuringFetch`, classed `upstream_view_changed`.
+- **Answer chain.** Neither node reports the chain a `getaddresstxids` answer
+  describes. The caller names a block the answer's chain must hold, and the
+  source reads the node's hash at that block's height immediately before and
+  after each request. A read that names another block reports
+  `ChainTipChangedDuringFetch`.
 - **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
   `maxEntries` zero, the only value for which Zebra refuses a lookup over the
   row limit. With a positive `maxEntries`, Zebra returns that many outputs and

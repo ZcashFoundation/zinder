@@ -110,6 +110,70 @@ impl RocksDbCanonicalReader {
         let secondary = Arc::clone(&self.secondary);
         off_reactor(move || read(&secondary).map_err(canonical_read_error)).await
     }
+
+    /// Reads where the served chain mines `transaction_id` and the digest of
+    /// the bytes ingest committed for it.
+    ///
+    /// The digest is kept with each block's canonical facts under every
+    /// blob-retention policy, so it identifies the exact bytes, including
+    /// authorizing data the transaction ID does not commit to. `Ok(None)` is a
+    /// proven absence from the served chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageReadError::CanonicalHistoryUnavailable`] for a miss
+    /// below a checkpointed store's history floor, and
+    /// [`StorageReadError::ArtifactUnavailable`] when the block's canonical
+    /// facts do not list the transaction at its location.
+    #[cfg(feature = "light-wallet-qualification")]
+    pub async fn mined_transaction_digest(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<MinedTransactionDigest>, StorageReadError> {
+        let located = self
+            .read(move |secondary| {
+                let Some(location) =
+                    secondary.transaction_location_or_proven_absence(transaction_id)?
+                else {
+                    return Ok(None);
+                };
+                let digest = secondary
+                    .block_replay_facts_at(location.block_height)?
+                    .filter(|facts| facts.block_header.block_hash == location.block_hash)
+                    .and_then(|facts| {
+                        let index = usize::try_from(location.tx_index_in_block).ok()?;
+                        facts
+                            .transactions
+                            .get(index)
+                            .filter(|facts| facts.public_facts.transaction_id == transaction_id)
+                            .map(|facts| facts.serialized_bytes_digest)
+                    });
+                Ok(Some((location, digest)))
+            })
+            .await?;
+        let Some((location, digest)) = located else {
+            return Ok(None);
+        };
+        let serialized_bytes_digest = digest.ok_or(StorageReadError::ArtifactUnavailable {
+            family: ArtifactFamily::TransactionLocation,
+            key: ArtifactKey::TransactionId(transaction_id),
+        })?;
+        Ok(Some(MinedTransactionDigest {
+            location,
+            serialized_bytes_digest,
+        }))
+    }
+}
+
+/// Where the served chain mines a transaction and the digest of the bytes
+/// ingest committed for it.
+#[cfg(feature = "light-wallet-qualification")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MinedTransactionDigest {
+    /// The transaction's canonical location.
+    pub location: zinder_core::TransactionLocation,
+    /// The digest of the transaction's serialized bytes.
+    pub serialized_bytes_digest: zinder_core::SerializedBytesDigest,
 }
 
 #[async_trait]

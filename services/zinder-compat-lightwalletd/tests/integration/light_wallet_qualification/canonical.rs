@@ -74,9 +74,9 @@ fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcS
     Ok((fixture, served))
 }
 
-fn mined_reply(id: TransactionId, block: zinder_core::BlockId) -> RpcReply {
+fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> RpcReply {
     RpcReply::result(json!({
-        "hex": "1221",
+        "hex": hex,
         "txid": zinder_core::wire::encode_rpc_transaction_id_hex(id),
         "height": block.height.value(),
         "blockhash": encode_rpc_block_hash_hex(block.hash),
@@ -93,8 +93,10 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
     );
     let (fixture, _) = mined_without_retention(mined, |served| {
         [
-            method("getrawtransaction").reply(mined_reply(mined, served)),
-            method("getrawtransaction").reply(mined_reply(mined, other)),
+            method("getrawtransaction").reply(mined_reply(mined, served, "55")),
+            method("getrawtransaction").reply(mined_reply(mined, other, "55")),
+            // The served block and ID, with bytes ingest did not commit there.
+            method("getrawtransaction").reply(mined_reply(mined, served, "56")),
         ]
     })?;
     let epoch = fixture.slot.capture().chain_epoch();
@@ -118,7 +120,7 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
                 control.endpoint().to_owned(),
             )));
     for (id, height, bytes) in [
-        (mined, 1, vec![0x12, 0x21]),
+        (mined, 1, vec![0x55]),
         (pending.transaction_id(), 0, vec![0x22]),
     ] {
         let reply = adapter.get_transaction(transaction(id)).await?.into_inner();
@@ -127,12 +129,16 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
     let refusal =
         |result: Result<_, Status>| result.err().ok_or_else(|| eyre!("expected an RPC refusal"));
     node_unavailable(&refusal(adapter.get_transaction(transaction(mined)).await)?);
+    assert_eq!(
+        refusal(adapter.get_transaction(transaction(mined)).await)?.code(),
+        Code::DataLoss
+    );
     let missing = TransactionId::from_bytes([3; 32]);
     assert_eq!(
         refusal(fixture.adapter.get_transaction(transaction(missing)).await)?.code(),
         Code::NotFound
     );
-    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 2);
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 3);
     drop(fixture.node);
     node_unavailable(&refusal(
         adapter.get_transaction(transaction(missing)).await,

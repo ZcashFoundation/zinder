@@ -93,13 +93,13 @@ impl NodeChain {
                     );
                 };
                 if params[1] == 0 {
-                    return RpcReply::result(json!("1221"));
+                    return RpcReply::result(json!("55"));
                 }
                 let hash = transactions
                     .hash_at(u64::from(height))
                     .unwrap_or(BlockHash::from_bytes([0; 32]));
                 RpcReply::result(json!({
-                    "hex": "1221",
+                    "hex": "55",
                     "txid": params[0],
                     "height": height,
                     "blockhash": encode_rpc_block_hash_hex(hash),
@@ -273,7 +273,7 @@ async fn a_node_one_block_ahead_answers_only_for_the_served_tip() -> Result<()> 
         .get_transaction(transaction(SERVED))
         .await?
         .into_inner();
-    assert_eq!((mined.height, mined.data), (1, vec![0x12, 0x21]));
+    assert_eq!((mined.height, mined.data), (1, vec![0x55]));
     let above = fixture
         .adapter
         .get_transaction(transaction(ABOVE))
@@ -374,5 +374,106 @@ async fn a_node_on_another_chain_at_the_served_height_is_unavailable() -> Result
         .await?
         .into_inner();
     assert_eq!(latest.height, 2);
+    Ok(())
+}
+
+/// A node that answers history from a fork, then returns to the served chain.
+///
+/// The served tip is the reader's A2 at height 2. The node moves to the
+/// higher-work B3, whose block at height 2 is B2, for its first two tip reads,
+/// then to A4, which extends A2, before any later check.
+fn leave_and_regain_stubs(served_tip: BlockId) -> [JsonRpcStub; 3] {
+    let on_fork = Arc::new(AtomicBool::new(false));
+    let tip_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tips, hashes, history) = (Arc::clone(&on_fork), Arc::clone(&on_fork), on_fork);
+    [
+        method("getbestblockheightandhash").reply_with(move |_| {
+            let read = tip_reads.fetch_add(1, Ordering::AcqRel);
+            tips.store(read == 0, Ordering::Release);
+            let (height, hash) = if read < 2 {
+                (3, [0xb3; 32])
+            } else {
+                (4, [0xa4; 32])
+            };
+            RpcReply::result(json!({"height": height, "hash": hash}))
+        }),
+        method("getblockhash").reply_with(move |params| {
+            let on_fork = hashes.load(Ordering::Acquire);
+            let hash = match params[0].as_u64() {
+                Some(2) if on_fork => BlockHash::from_bytes([0xb2; 32]),
+                Some(2) => served_tip.hash,
+                Some(3) if on_fork => BlockHash::from_bytes([0xb3; 32]),
+                _ => BlockHash::from_bytes([0xa4; 32]),
+            };
+            RpcReply::result(json!(encode_rpc_block_hash_hex(hash)))
+        }),
+        method("getaddresstxids").reply_with(move |_| {
+            // The fork does not hold the served payment.
+            let ids: Vec<String> = if history.load(Ordering::Acquire) {
+                Vec::new()
+            } else {
+                vec![encode_rpc_transaction_id_hex(SERVED)]
+            };
+            RpcReply::result(json!(ids))
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn history_answered_from_a_fork_the_node_leaves_again_is_unavailable() -> Result<()> {
+    let served_tip = super::served_tip(2)?;
+    for txids in [true, false] {
+        let (fixture, _) = served_view_fixture(|_| {}, false, leave_and_regain_stubs(served_tip))?;
+        let request = history_request(1, 2);
+        let answer = if txids {
+            fixture.adapter.get_taddress_txids(request).await
+        } else {
+            fixture.adapter.get_taddress_transactions(request).await
+        };
+        let status = answer
+            .err()
+            .ok_or_else(|| eyre!("served history the node read from a fork"))?;
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_rows_need_the_served_block_and_committed_bytes() -> Result<()> {
+    let served_block_one = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .blocks()
+        .first()
+        .map(|block| block.hash)
+        .ok_or_else(|| eyre!("missing block"))?;
+    // A sibling of served block 1, then the served block with other bytes.
+    for (reported, body, expected) in [
+        (BlockHash::from_bytes([0x99; 32]), "55", Code::Unavailable),
+        (served_block_one, "56", Code::DataLoss),
+    ] {
+        let (fixture, _) = served_view_fixture(
+            |_| {},
+            false,
+            [method("getrawtransaction").reply_with(move |params| {
+                RpcReply::result(json!({
+                    "hex": body,
+                    "txid": params[0],
+                    "height": 1,
+                    "blockhash": encode_rpc_block_hash_hex(reported),
+                }))
+            })],
+        )?;
+        let mut history = fixture
+            .adapter
+            .get_taddress_transactions(history_request(1, 2))
+            .await?
+            .into_inner();
+        let status = history
+            .next()
+            .await
+            .and_then(Result::err)
+            .ok_or_else(|| eyre!("served a row that is not the served transaction"))?;
+        assert_eq!(status.code(), expected, "{status:?}");
+    }
     Ok(())
 }

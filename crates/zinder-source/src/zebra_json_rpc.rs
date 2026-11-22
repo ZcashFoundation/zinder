@@ -1048,18 +1048,26 @@ impl ZebraJsonRpcSource {
     /// as the tip, so an empty range or one ending at genesis is answered
     /// without a node request.
     ///
+    /// Neither node reports the chain a `getaddresstxids` answer describes.
+    /// The source reads the node's hash at `chain_block`'s height immediately
+    /// before and after each request and keeps the answer only when both name
+    /// `chain_block`, so the answer comes from a chain that holds it unless the
+    /// node left that chain and returned to it within the request.
+    ///
     /// # Errors
     ///
     /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when the
     /// range holds more than [`TransparentAddressRowLimit::MAX`]
     /// transactions, [`SourceError::ChainTipChangedDuringFetch`] when the tip
-    /// changed during every attempt, and the errors of
+    /// changed during every attempt or a read around a request names another
+    /// block than `chain_block`, and the errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_transaction_ids(
         &self,
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
         end_height: BlockHeight,
+        chain_block: BlockId,
     ) -> Result<Vec<TransactionId>, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         if start_height > end_height || end_height == BlockHeight::new(0) {
@@ -1071,6 +1079,8 @@ impl ZebraJsonRpcSource {
             if start_height > indexed_end_height || indexed_end_height == BlockHeight::new(0) {
                 return Ok(Vec::new());
             }
+            self.require_chain_block(chain_block, "getaddresstxids")
+                .await?;
             let txid_hex_list = match self
                 .request_address_transaction_ids(lookup, start_height, indexed_end_height)
                 .await
@@ -1079,6 +1089,8 @@ impl ZebraJsonRpcSource {
                 Err(error) if is_answer_size_refusal(&error) => Err(error),
                 Err(error) => return Err(error),
             };
+            self.require_chain_block(chain_block, "getaddresstxids")
+                .await?;
             let tip_after_request = self.tip_id().await?;
             if tip_after_request == tip {
                 return txid_hex_list?
@@ -1092,6 +1104,21 @@ impl ZebraJsonRpcSource {
             operation: "getaddresstxids",
             attempts: TRANSPARENT_ADDRESS_TIP_ATTEMPTS,
         })
+    }
+
+    async fn require_chain_block(
+        &self,
+        block: BlockId,
+        operation: &'static str,
+    ) -> Result<(), SourceError> {
+        if self.fetch_block_hash(block.height).await? == block.hash {
+            Ok(())
+        } else {
+            Err(SourceError::ChainTipChangedDuringFetch {
+                operation,
+                attempts: 1,
+            })
+        }
     }
 
     async fn request_address_transaction_ids(

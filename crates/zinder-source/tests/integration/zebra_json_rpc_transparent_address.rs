@@ -10,14 +10,14 @@ use serde_json::{Value, json};
 use zebra_chain::parameters::NetworkKind as ZebraNetworkKind;
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
-    BlockHeight, BlockId, Network, TransactionId, TransparentOutPoint,
-    wire::decode_rpc_block_hash_hex,
+    BlockHash, BlockHeight, BlockId, Network, TransactionId, TransparentOutPoint,
+    wire::{decode_rpc_block_hash_hex, encode_rpc_block_hash_hex},
 };
 use zinder_source::{
     CookieSource, NodeAuth, SourceError, SourceFailureClass, SourceTransparentAddressBalance,
     TransparentAddressLookup, TransparentAddressRowLimit, ZebraJsonRpcSource,
 };
-use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+use zinder_testkit::{JsonRpcStub, JsonRpcTestServer, RpcReply, method};
 
 /// Zakura's refusal from a pruned node that stopped maintaining its
 /// transparent address indexes (`zakura_state::TransparentIndexesUnavailable`).
@@ -54,6 +54,17 @@ fn sorted_addresses() -> Vec<String> {
     ];
     addresses.sort();
     addresses
+}
+
+/// The block every lookup in these tests requires the node's chain to hold.
+const CHAIN_BLOCK: BlockId = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32]));
+
+/// Starts a node double whose best chain holds [`CHAIN_BLOCK`] unless `stubs`
+/// replace its `getblockhash` reply.
+fn start_node(stubs: impl IntoIterator<Item = JsonRpcStub>) -> eyre::Result<JsonRpcTestServer> {
+    let holds_chain_block = method("getblockhash")
+        .reply_with(|_| RpcReply::result(json!(encode_rpc_block_hash_hex(CHAIN_BLOCK.hash))));
+    JsonRpcTestServer::start(std::iter::once(holds_chain_block).chain(stubs))
 }
 
 fn tip_reply(height: u32) -> RpcReply {
@@ -108,7 +119,7 @@ fn utxo_row(height: u32, txid_byte: u8, output_index: u32) -> Value {
 #[tokio::test]
 async fn transparent_address_balance_sends_sorted_distinct_addresses() -> eyre::Result<()> {
     let server =
-        JsonRpcTestServer::start([method("getaddressbalance")
+        start_node([method("getaddressbalance")
             .reply(RpcReply::result(json!({ "balance": 7, "received": 9 })))])?;
     let source = regtest_source(server.url())?;
 
@@ -133,7 +144,7 @@ async fn transparent_address_balance_sends_sorted_distinct_addresses() -> eyre::
 #[tokio::test]
 async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip() -> eyre::Result<()>
 {
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids")
             .reply(RpcReply::result(json!([display_txid(3), display_txid(4)]))),
@@ -145,6 +156,7 @@ async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip()
             &regtest_lookup()?,
             BlockHeight::new(2),
             BlockHeight::new(50),
+            CHAIN_BLOCK,
         )
         .await?;
 
@@ -157,11 +169,63 @@ async fn transparent_address_transaction_ids_clamp_the_end_to_the_observed_tip()
 }
 
 #[tokio::test]
+async fn transparent_address_transaction_ids_refuse_an_answer_from_a_chain_without_the_required_block()
+-> eyre::Result<()> {
+    // The node's tip reads agree, but around the request it holds another
+    // block at the required height: first before the request, then after it.
+    for (before, after) in [([0xee; 32], [0x11; 32]), ([0x11; 32], [0xee; 32])] {
+        let server = start_node([
+            method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
+            method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(
+                BlockHash::from_bytes(before)
+            )))),
+            method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(
+                BlockHash::from_bytes(after)
+            )))),
+            method("getaddresstxids").reply_with(|_| RpcReply::result(json!([]))),
+        ])?;
+        let source = regtest_source(server.url())?;
+
+        let error = source
+            .fetch_transparent_address_transaction_ids(
+                &regtest_lookup()?,
+                BlockHeight::new(2),
+                BlockHeight::new(10),
+                CHAIN_BLOCK,
+            )
+            .await
+            .err()
+            .ok_or_else(|| eyre!("kept an answer from a chain without the required block"))?;
+
+        assert!(
+            matches!(
+                error,
+                SourceError::ChainTipChangedDuringFetch {
+                    operation: "getaddresstxids",
+                    attempts: 1,
+                }
+            ),
+            "unexpected error {error:?}"
+        );
+        let checked: Vec<Value> = server
+            .requests_for("getblockhash")?
+            .into_iter()
+            .map(|request| request.params)
+            .collect();
+        assert!(
+            checked.iter().all(|params| *params == json!([1])),
+            "{checked:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn transparent_address_transaction_ids_repeat_the_lookup_when_the_tip_changes_during_it()
 -> eyre::Result<()> {
     // The tip falls from block 10 to a sibling at height 9 while the node
     // answers, so the first answer may hold transactions of the old tip.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(9, 2)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(9, 2)),
@@ -176,6 +240,7 @@ async fn transparent_address_transaction_ids_repeat_the_lookup_when_the_tip_chan
             &regtest_lookup()?,
             BlockHeight::new(2),
             BlockHeight::new(50),
+            CHAIN_BLOCK,
         )
         .await?;
 
@@ -195,7 +260,7 @@ async fn transparent_address_transaction_ids_drop_an_answer_for_a_tip_that_fell_
     // The tip rolls back from 10 to 8 before the node answers, so the node
     // clamps the range 10..=10 to its new tip and returns block 8's
     // transactions, which lie outside the range.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(8, 2)),
         method("getaddresstxids").reply(RpcReply::result(json!([display_txid(7)]))),
@@ -207,6 +272,7 @@ async fn transparent_address_transaction_ids_drop_an_answer_for_a_tip_that_fell_
             &regtest_lookup()?,
             BlockHeight::new(10),
             BlockHeight::new(10),
+            CHAIN_BLOCK,
         )
         .await?;
 
@@ -218,7 +284,7 @@ async fn transparent_address_transaction_ids_drop_an_answer_for_a_tip_that_fell_
 #[tokio::test]
 async fn transparent_address_transaction_ids_report_a_tip_that_changes_during_every_attempt()
 -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(11, 2)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(12, 3)),
@@ -232,6 +298,7 @@ async fn transparent_address_transaction_ids_report_a_tip_that_changes_during_ev
             &regtest_lookup()?,
             BlockHeight::new(1),
             BlockHeight::new(10),
+            CHAIN_BLOCK,
         )
         .await
         .err()
@@ -259,7 +326,7 @@ async fn transparent_address_transaction_ids_report_a_tip_that_changes_during_ev
 async fn transparent_address_transaction_ids_above_the_tip_skip_the_lookup() -> eyre::Result<()> {
     // The node clamps a start height above its tip to the tip, which would
     // return the tip block's transactions for a range that holds none.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply(10)),
         method("getaddresstxids").reply(RpcReply::result(json!([display_txid(3)]))),
     ])?;
@@ -270,6 +337,7 @@ async fn transparent_address_transaction_ids_above_the_tip_skip_the_lookup() -> 
             &regtest_lookup()?,
             BlockHeight::new(11),
             BlockHeight::new(20),
+            CHAIN_BLOCK,
         )
         .await?;
 
@@ -283,7 +351,7 @@ async fn transparent_address_transaction_ids_for_genesis_or_empty_ranges_send_no
 -> eyre::Result<()> {
     // The node reads an end height of zero as its tip and never indexes the
     // genesis block, so neither range reaches the node.
-    let server = JsonRpcTestServer::start([])?;
+    let server = start_node([])?;
     let source = regtest_source(server.url())?;
     let lookup = regtest_lookup()?;
 
@@ -293,6 +361,7 @@ async fn transparent_address_transaction_ids_for_genesis_or_empty_ranges_send_no
                 &lookup,
                 BlockHeight::new(start_height),
                 BlockHeight::new(end_height),
+                CHAIN_BLOCK,
             )
             .await?;
         assert_eq!(transaction_ids, Vec::<TransactionId>::new());
@@ -304,7 +373,7 @@ async fn transparent_address_transaction_ids_for_genesis_or_empty_ranges_send_no
 #[tokio::test]
 async fn transparent_address_row_cap_refusal_is_typed() -> eyre::Result<()> {
     // Zebra 7.1.0 refuses a lookup matching more than 100,000 rows with -8.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids").reply(RpcReply::error(
             "more than 100000 transactions match; narrow the height range",
@@ -321,6 +390,7 @@ async fn transparent_address_row_cap_refusal_is_typed() -> eyre::Result<()> {
             &lookup,
             BlockHeight::new(1),
             BlockHeight::new(10),
+            CHAIN_BLOCK,
         )
         .await
         .err()
@@ -356,7 +426,7 @@ async fn transparent_address_row_cap_refusal_is_typed() -> eyre::Result<()> {
 async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Result<()> {
     // Zakura 1.8.6 answers getaddresstxids without a row cap.
     let over_cap: Vec<String> = std::iter::repeat_n(display_txid(5), 100_001).collect();
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids").reply(RpcReply::result(json!(over_cap))),
     ])?;
@@ -367,6 +437,7 @@ async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Res
             &regtest_lookup()?,
             BlockHeight::new(1),
             BlockHeight::new(10),
+            CHAIN_BLOCK,
         )
         .await
         .err()
@@ -385,9 +456,12 @@ async fn transparent_address_row_cap_holds_for_a_node_without_one() -> eyre::Res
 #[tokio::test]
 async fn transparent_address_utxos_refuse_an_output_above_the_reported_tip() -> eyre::Result<()> {
     // utxos_at_tip reports height 9.
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
-        utxos_at_tip(&json!([utxo_row(9, 1, 0), utxo_row(10, 2, 0)])),
-    ))])?;
+    let server = start_node([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([
+            utxo_row(9, 1, 0),
+            utxo_row(10, 2, 0)
+        ])))),
+    ])?;
     let source = regtest_source(server.url())?;
 
     let error = source
@@ -414,7 +488,7 @@ async fn transparent_address_utxos_ask_for_the_complete_set_and_refuse_a_capped_
     // Zebra 7.1.0 returns the first maxEntries outputs without saying whether
     // more match. Only maxEntries 0 makes it refuse a lookup that matches
     // more than 100,000 outputs.
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply_with(|params| {
+    let server = start_node([method("getaddressutxos").reply_with(|params| {
         if params[0]["maxEntries"] == json!(0) {
             RpcReply::error(
                 "more than 100000 unspent outputs match; page with startHeight and maxEntries",
@@ -453,14 +527,14 @@ async fn transparent_address_utxos_return_every_output_at_or_above_the_start_hei
 -> eyre::Result<()> {
     // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
     // unspent output in chain order.
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
-        utxos_at_tip(&json!([
+    let server = start_node([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([
             utxo_row(2, 1, 0),
             utxo_row(5, 2, 0),
             utxo_row(5, 2, 1),
             utxo_row(6, 3, 0),
-        ])),
-    ))])?;
+        ])))),
+    ])?;
     let source = regtest_source(server.url())?;
 
     let utxos = source
@@ -490,9 +564,12 @@ async fn transparent_address_utxos_return_every_output_at_or_above_the_start_hei
 
 #[tokio::test]
 async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
-        utxos_at_tip(&json!([utxo_row(4, 6, 0), utxo_row(7, 7, 1)])),
-    ))])?;
+    let server = start_node([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([
+            utxo_row(4, 6, 0),
+            utxo_row(7, 7, 1)
+        ])))),
+    ])?;
     let source = regtest_source(server.url())?;
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
@@ -521,14 +598,14 @@ async fn transparent_address_utxo_prefix_sends_its_bounds_and_decodes_rows() -> 
 async fn transparent_address_utxo_prefix_bounds_a_node_that_ignores_paging() -> eyre::Result<()> {
     // Zakura 1.8.6 ignores startHeight and maxEntries and returns every
     // unspent output in chain order.
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
-        utxos_at_tip(&json!([
+    let server = start_node([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([
             utxo_row(2, 1, 0),
             utxo_row(5, 2, 0),
             utxo_row(5, 2, 1),
             utxo_row(6, 3, 0),
-        ])),
-    ))])?;
+        ])))),
+    ])?;
     let source = regtest_source(server.url())?;
     let max_rows = TransparentAddressRowLimit::new(2).ok_or_else(|| eyre!("row limit"))?;
 
@@ -552,7 +629,7 @@ async fn transparent_address_utxos_refuse_an_output_of_an_address_outside_the_lo
 -> eyre::Result<()> {
     let mut foreign_row = utxo_row(6, 3, 0);
     foreign_row["address"] = json!(testnet_address(9).to_string());
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply_with(move |_| {
+    let server = start_node([method("getaddressutxos").reply_with(move |_| {
         RpcReply::result(utxos_at_tip(&json!([
             utxo_row(5, 2, 0),
             foreign_row.clone()
@@ -591,9 +668,10 @@ async fn transparent_address_utxos_refuse_an_output_of_an_address_outside_the_lo
 async fn transparent_address_answer_over_the_node_response_limit_is_typed() -> eyre::Result<()> {
     // Zakura and Zebra answer -32008 instead of a response larger than their
     // rpc.max_response_body_size.
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(
-        RpcReply::error_with_code(NODE_RESPONSE_TOO_LARGE_CODE, "Response is too big"),
-    )])?;
+    let server = start_node([method("getaddressutxos").reply(RpcReply::error_with_code(
+        NODE_RESPONSE_TOO_LARGE_CODE,
+        "Response is too big",
+    ))])?;
     let source = regtest_source(server.url())?;
 
     let error = source
@@ -622,7 +700,7 @@ async fn transparent_address_answer_over_the_node_response_limit_is_typed() -> e
 #[tokio::test]
 async fn transparent_address_lookups_on_a_node_without_indexes_are_capability_missing()
 -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply(10)),
         method("getaddressbalance").reply(RpcReply::error_with_code(
             -1,
@@ -647,6 +725,7 @@ async fn transparent_address_lookups_on_a_node_without_indexes_are_capability_mi
                 &lookup,
                 BlockHeight::new(1),
                 BlockHeight::new(10),
+                CHAIN_BLOCK,
             )
             .await
             .err(),
@@ -695,7 +774,7 @@ async fn transparent_address_lookup_on_an_unreachable_node_is_node_unavailable()
 
 #[tokio::test]
 async fn transparent_address_lookup_for_another_network_sends_nothing() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([])?;
+    let server = start_node([])?;
     let source = regtest_source(server.url())?;
     let testnet_lookup =
         TransparentAddressLookup::new(Network::ZcashTestnet, [testnet_address(1)])?;
@@ -722,7 +801,7 @@ async fn transparent_address_transaction_ids_drop_a_size_refusal_for_a_tip_that_
 -> eyre::Result<()> {
     // The tip rolls back from 10 to 8 before the node answers, so the node
     // clamps the range 10..=10 to block 8 and refuses that block's answer.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(8, 2)),
         method("getaddresstxids").reply(RpcReply::error_with_code(
@@ -737,6 +816,7 @@ async fn transparent_address_transaction_ids_drop_a_size_refusal_for_a_tip_that_
             &regtest_lookup()?,
             BlockHeight::new(10),
             BlockHeight::new(10),
+            CHAIN_BLOCK,
         )
         .await?;
 
@@ -748,13 +828,13 @@ async fn transparent_address_transaction_ids_drop_a_size_refusal_for_a_tip_that_
 #[tokio::test]
 async fn transparent_address_transaction_ids_report_a_size_refusal_only_for_a_steady_tip()
 -> eyre::Result<()> {
-    let steady_server = JsonRpcTestServer::start([
+    let steady_server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddresstxids").reply_with(|_| {
             RpcReply::error_with_code(NODE_RESPONSE_TOO_LARGE_CODE, "Response is too big")
         }),
     ])?;
-    let moving_server = JsonRpcTestServer::start([
+    let moving_server = start_node([
         method("getbestblockheightandhash").reply(tip_reply_with_hash(10, 1)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(11, 2)),
         method("getbestblockheightandhash").reply(tip_reply_with_hash(12, 3)),
@@ -773,6 +853,7 @@ async fn transparent_address_transaction_ids_report_a_size_refusal_only_for_a_st
                     &lookup,
                     BlockHeight::new(1),
                     BlockHeight::new(10),
+                    CHAIN_BLOCK,
                 )
                 .await
                 .err()
@@ -816,7 +897,7 @@ async fn transparent_address_utxos_refuse_a_script_that_does_not_pay_the_row_add
     other_recipient_row["script"] = json!(format!("76a914{}88ac", "02".repeat(20)));
 
     for row in [op_return_row, other_recipient_row] {
-        let server = JsonRpcTestServer::start([
+        let server = start_node([
             method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([row]))))
         ])?;
         let error = regtest_source(server.url())?
@@ -840,9 +921,12 @@ async fn transparent_address_utxos_refuse_a_script_that_does_not_pay_the_row_add
 
 #[tokio::test]
 async fn transparent_address_utxos_refuse_a_repeated_outpoint() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([method("getaddressutxos").reply(RpcReply::result(
-        utxos_at_tip(&json!([utxo_row(5, 2, 0), utxo_row(5, 2, 0)])),
-    ))])?;
+    let server = start_node([
+        method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([
+            utxo_row(5, 2, 0),
+            utxo_row(5, 2, 0)
+        ])))),
+    ])?;
     let source = regtest_source(server.url())?;
 
     let error = source
@@ -865,7 +949,7 @@ async fn transparent_address_answers_of_another_shape_are_protocol_mismatches() 
     row_without_script
         .as_object_mut()
         .and_then(|row| row.remove("script"));
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddressbalance").reply(RpcReply::result(json!({ "balance": 7 }))),
         method("getaddresstxids").reply(RpcReply::result(json!({ "txids": [] }))),
@@ -885,6 +969,7 @@ async fn transparent_address_answers_of_another_shape_are_protocol_mismatches() 
                 &lookup,
                 BlockHeight::new(1),
                 BlockHeight::new(10),
+                CHAIN_BLOCK,
             )
             .await
             .err(),
@@ -918,7 +1003,7 @@ async fn transparent_address_utxos_reject_a_positional_row() -> eyre::Result<()>
         1_005,
         5
     ]);
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getaddressutxos").reply(RpcReply::result(utxos_at_tip(&json!([row]))))
     ])?;
     let outputs = regtest_source(server.url())?
@@ -940,9 +1025,8 @@ async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre:
     const ATTEMPTS: usize = 8;
     const STARTUP_AUTHORIZATION: &str = "Basic X19jb29raWVfXzpiZWZvcmUtcmVzdGFydA==";
 
-    let server = JsonRpcTestServer::start([
-        method("getaddressbalance").reply_with(|_| RpcReply::result(json!([5, 10])))
-    ])?;
+    let server =
+        start_node([method("getaddressbalance").reply_with(|_| RpcReply::result(json!([5, 10])))])?;
     let cookie_dir = tempfile::tempdir()?;
     let cookie_path = cookie_dir.path().join(".cookie");
     std::fs::write(&cookie_path, "__cookie__:before-restart")?;
@@ -983,7 +1067,7 @@ async fn transparent_address_answer_of_another_shape_keeps_the_client() -> eyre:
 async fn transparent_address_lookups_during_a_block_commit_are_view_changes() -> eyre::Result<()> {
     // Zebra 7.1.0 and Zakura 1.8.6 answer -1 with these messages when their
     // finalized state commits a block during the address index read.
-    let server = JsonRpcTestServer::start([
+    let server = start_node([
         method("getbestblockheightandhash").reply_with(|_| tip_reply(10)),
         method("getaddressbalance").reply(RpcReply::error_with_code(
             NODE_MISC_ERROR_CODE,
@@ -1017,6 +1101,7 @@ async fn transparent_address_lookups_during_a_block_commit_are_view_changes() ->
                     &lookup,
                     BlockHeight::new(1),
                     BlockHeight::new(10),
+                    CHAIN_BLOCK,
                 )
                 .await
                 .err(),

@@ -194,3 +194,95 @@ async fn tree_state_metrics_count_each_height_read_from_its_served_outcome() -> 
     }
     Ok(())
 }
+
+/// The sample regtest upgrades one per height, so the node's upgrade table
+/// compares equal whatever order it lists them in.
+fn one_upgrade_per_height() -> Result<zinder_core::NetworkUpgradeActivations> {
+    Ok(zinder_core::NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(
+                |(activation, height)| zinder_core::NetworkUpgradeActivation {
+                    activation_height: BlockHeight::new(height),
+                    ..activation.clone()
+                },
+            )
+            .collect(),
+    )?)
+}
+
+/// A node double that serves `schedule` and holds `tip` at its height.
+fn node_holding(
+    schedule: &zinder_core::NetworkUpgradeActivations,
+    tip: zinder_core::BlockHash,
+) -> Result<zinder_testkit::JsonRpcTestServer> {
+    use serde_json::json;
+    use zinder_testkit::{RpcReply, method};
+    let upgrades: serde_json::Map<String, serde_json::Value> = schedule
+        .activations()
+        .iter()
+        .map(|activation| {
+            (
+                zinder_core::wire::encode_branch_id_hex(activation.branch_id),
+                json!({"name": activation.name, "status": "active",
+                    "activationheight": activation.activation_height.value()}),
+            )
+        })
+        .collect();
+    zinder_testkit::JsonRpcTestServer::start([
+        method("rpc.discover")
+            .reply_with(|_| RpcReply::result(json!({"methods": [{"name": "sendrawtransaction"}]}))),
+        method("getblockchaininfo")
+            .reply_with(move |_| RpcReply::result(json!({ "upgrades": upgrades }))),
+        method("getblockhash").reply_with(move |_| {
+            RpcReply::result(json!(zinder_core::wire::encode_rpc_block_hash_hex(tip)))
+        }),
+    ])
+}
+
+#[tokio::test]
+async fn node_admission_checks_the_reader_the_request_captured() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(12);
+    let sibling = chain.fork_at(BlockHeight::new(12))?.extend_blocks(1);
+    let open = |chain: &ChainFixture| -> Result<_> {
+        let mut store = WalletServingStoreFixture::from_chain(chain, &schedule)?;
+        let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+        Ok((store, reader))
+    };
+    let (_captured_store, captured) = open(&chain)?;
+    let (_sibling_store, published) = open(&sibling)?;
+    let request_target = super::QualificationNodeTarget::of(&captured)?;
+    let published_target = super::QualificationNodeTarget::of(&published)?;
+    // The reader the request captured is replaced by a sibling, and the node
+    // follows the sibling.
+    let slot = Arc::new(ArcSwap::from(Arc::clone(&published)));
+    let tip = sibling
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing sibling tip"))?
+        .hash;
+    let node = node_holding(&schedule, tip)?;
+    let capture = Arc::clone(&slot);
+    let query = QualificationWalletQuery::new(
+        move || capture.load_full(),
+        ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            Duration::from_secs(2),
+        )?,
+        Duration::from_secs(1),
+        NonZeroU32::MIN,
+    );
+
+    assert!(
+        query.verified_node(&request_target).await.is_err(),
+        "admitted a node that does not hold the captured reader's tip"
+    );
+    query.verified_node(&published_target).await?;
+    Ok(())
+}

@@ -18,7 +18,9 @@ use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
 };
-use zinder_core::{BlockHash, BlockHeight, BlockId, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockId, Network, TransactionId, wire::encode_rpc_block_hash_hex,
+};
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as _,
 };
@@ -30,8 +32,8 @@ use zinder_query::{
 use zinder_runtime::{Readiness, ReadinessState};
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, JsonRpcStub, JsonRpcTestServer, RpcReply,
-    WalletServingStoreFixture, method,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, JsonRpcStub, JsonRpcTestServer,
+    RpcReply, WalletServingStoreFixture, method,
 };
 
 mod address_validation;
@@ -153,6 +155,16 @@ fn history_fixture(
 ) -> Result<(Fixture, Arc<AtomicBool>)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
     let hashes: Vec<_> = chain.blocks().iter().map(|block| block.hash).collect();
+    let chain = HISTORY.iter().fold(chain, |chain, &(byte, height, index)| {
+        let block = hashes[usize::try_from(height - 1).unwrap_or_default()];
+        chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            TransactionId::from_bytes([byte; 32]),
+            BlockHeight::new(height),
+            block,
+            index,
+            vec![byte],
+        ))
+    });
     let replaced = Arc::new(AtomicBool::new(false));
     let fork = Arc::clone(&replaced);
     let block_hash = move |height: u64| {
@@ -209,17 +221,37 @@ fn history_ranges(node: &JsonRpcTestServer) -> Result<Vec<(Value, Value)>> {
         .collect())
 }
 
-fn verbose_reply(txid: &Value, height: u32, bytes: &str) -> RpcReply {
-    RpcReply::result(
-        json!({"hex": bytes, "txid": txid, "height": height, "blockhash": "00".repeat(32)}),
-    )
+/// The served history transactions: their repeated ID byte, which is also
+/// their one-byte body, and their height and block position.
+const HISTORY: [(u8, u32, u32); 4] = [(0x03, 1, 0), (0x02, 1, 1), (0x04, 3, 0), (0x01, 4, 0)];
+
+/// The hash of block `height` of the four-block chain [`history_fixture`] serves.
+fn history_block(height: u32) -> BlockHash {
+    ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(4)
+        .blocks()
+        .iter()
+        .find(|block| block.height.value() == height)
+        .map_or(BlockHash::from_bytes([0xee; 32]), |block| block.hash)
+}
+
+/// The node's verbose reply mining the history transaction `txid` in served
+/// block `height`, with the body [`history_fixture`] stores for it.
+fn verbose_reply(txid: &Value, height: u32) -> RpcReply {
+    let body = txid.as_str().and_then(|id| id.get(..2)).unwrap_or_default();
+    RpcReply::result(json!({
+        "hex": body,
+        "txid": txid,
+        "height": height,
+        "blockhash": encode_rpc_block_hash_hex(history_block(height)),
+    }))
 }
 
 #[tokio::test]
 async fn history_aliases_share_admission_until_the_stream_drains_or_is_dropped() -> Result<()> {
     let tip = served_tip(4)?;
     let (fixture, _) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01")),
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1)),
         method("getaddressutxos").reply_with(move |_| utxos_at(tip, &json!([]))),
     ])?;
     let concurrent = fixture.adapter.clone();
@@ -297,7 +329,7 @@ async fn oversized_history_splits_into_disjoint_ranges_in_chain_order() -> Resul
             "01" => 4,
             _ => 1,
         };
-        verbose_reply(&params[0], height, bytes)
+        verbose_reply(&params[0], height)
     })])?;
     let mut history = fixture
         .adapter
@@ -325,7 +357,7 @@ async fn oversized_history_splits_into_disjoint_ranges_in_chain_order() -> Resul
 #[tokio::test]
 async fn cancelled_transparent_history_stops_raw_transaction_calls() -> Result<()> {
     let (fixture, _) = history_fixture([method("getrawtransaction").reply_with(|params| {
-        let reply = verbose_reply(&params[0], 1, "02");
+        let reply = verbose_reply(&params[0], 1);
         if params[0] == "02".repeat(32) {
             RpcReply::delayed(Duration::from_millis(80), reply)
         } else {
@@ -366,7 +398,7 @@ async fn cancelled_transparent_history_stops_raw_transaction_calls() -> Result<(
 #[tokio::test]
 async fn a_transaction_mined_outside_its_history_page_ends_the_stream() -> Result<()> {
     let (fixture, _) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 4, "01"))
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 4))
     ])?;
     let mut history = fixture
         .adapter
@@ -400,7 +432,7 @@ async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<(
                     RpcReply::result(json!([]))
                 }
             }),
-            method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 4, "01")),
+            method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 4)),
         ])?;
         let mut history = fixture
             .adapter
@@ -424,7 +456,7 @@ async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<(
 #[tokio::test]
 async fn a_reorg_after_the_last_history_row_requires_retry_to_finish() -> Result<()> {
     let (fixture, replaced) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01"))
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
     ])?;
     let mut history = fixture
         .adapter
@@ -444,7 +476,7 @@ async fn a_reorg_after_the_last_history_row_requires_retry_to_finish() -> Result
 #[tokio::test]
 async fn a_reorg_between_history_pages_ends_the_stream() -> Result<()> {
     let (fixture, replaced) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1, "01"))
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
     ])?;
     let mut history = fixture
         .adapter
@@ -1017,5 +1049,87 @@ async fn cancelling_a_pending_unary_utxo_read_frees_admission() -> Result<()> {
             .address_utxos,
         Vec::<lightwalletd::GetAddressUtxosReply>::new()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_rows_out_of_canonical_order_end_the_stream() -> Result<()> {
+    // Block 1 mines 03 then 02; the node lists them the other way round.
+    let (fixture, _) = history_fixture([
+        method("getaddresstxids")
+            .reply_with(|_| RpcReply::result(json!(["02".repeat(32), "03".repeat(32)]))),
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1)),
+    ])?;
+    let mut history = fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await?
+        .into_inner();
+    assert_eq!(
+        history.next().await.transpose()?.map(|row| row.data),
+        Some(vec![0x02])
+    );
+    let status = history
+        .next()
+        .await
+        .and_then(Result::err)
+        .ok_or_else(|| eyre!("served history out of canonical order"))?;
+    assert_eq!(status.code(), Code::DataLoss);
+    Ok(())
+}
+
+/// A node whose first page shows one output at height 1 and two at height 2,
+/// and whose reread from height 2 returns `continuation`.
+fn utxo_cutoff_fixture(continuation: RpcReply) -> Result<Fixture> {
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let tip = served_tip(2)?;
+    let first = [(1_u32, "04"), (2, "03"), (2, "02")]
+        .map(|(height, id)| address_output(&id.repeat(32), height, &script));
+    Fixture::with_node_timeout(
+        2,
+        [
+            method("getaddressutxos").reply(utxos_at(tip, &json!(first))),
+            method("getaddressutxos").reply(continuation),
+        ],
+        Duration::from_secs(2),
+    )
+}
+
+fn two_utxos() -> Request<lightwalletd::GetAddressUtxosArg> {
+    Request::new(lightwalletd::GetAddressUtxosArg {
+        addresses: vec![ADDRESS.to_owned()],
+        start_height: 1,
+        max_entries: 2,
+    })
+}
+
+#[tokio::test]
+async fn a_reread_that_drops_outputs_at_the_cutoff_height_is_unavailable() -> Result<()> {
+    let fixture = utxo_cutoff_fixture(utxos_at(served_tip(2)?, &json!([])))?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(two_utxos())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("shortened the response from contradictory pages"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_continuation_page_without_chain_info_is_refused() -> Result<()> {
+    let fixture = utxo_cutoff_fixture(RpcReply::result(json!([])))?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(two_utxos())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted a page that names no tip"))?;
+    assert_eq!(status.code(), Code::DataLoss);
     Ok(())
 }
