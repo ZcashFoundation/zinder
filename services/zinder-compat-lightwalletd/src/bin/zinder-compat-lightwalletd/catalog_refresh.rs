@@ -31,10 +31,10 @@ impl CatalogSource {
         }
     }
 
-    async fn refresh_tail(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
+    async fn verify_source(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
         match self {
-            Self::Wallet(slot) => history.refresh_tail(slot.capture().canonical()).await,
-            Self::Compact(slot) => history.refresh_tail(slot.capture().as_ref()).await,
+            Self::Wallet(slot) => history.verify_source(slot.capture().canonical()).await,
+            Self::Compact(slot) => history.verify_source(slot.capture().as_ref()).await,
         }
     }
 
@@ -240,7 +240,7 @@ impl CatalogRefresh {
         if self.applied.as_ref() == Some(&stamp) {
             return self
                 .source
-                .refresh_tail(&self.history)
+                .verify_source(&self.history)
                 .await
                 .map_err(|status| status.message().to_owned());
         }

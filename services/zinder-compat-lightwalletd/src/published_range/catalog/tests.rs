@@ -93,6 +93,28 @@ fn reader(chain: &ChainFixture) -> Result<(WalletServingStoreFixture, RocksDbCan
     Ok((store, canonical))
 }
 
+/// Fills `catalog`'s live tail from `reader` as a request for `requested` does.
+async fn fill_tail(
+    catalog: &PublishedShieldedCatalog,
+    reader: &Arc<RocksDbCanonicalReader>,
+    requested: BlockHeightRange,
+) -> Result<Arc<super::super::tail::EncodedTail>> {
+    let slot = crate::CanonicalReaderSlot::new(reader.clone());
+    let terminal = (
+        catalog.bounds().end,
+        catalog.terminal().segment.identity().end,
+    );
+    catalog
+        .tail
+        .load_or_refresh(
+            (&slot, reader, &tokio_util::sync::CancellationToken::new()),
+            Some(terminal),
+            requested,
+        )
+        .await?
+        .ok_or_else(|| eyre!("missing tail"))
+}
+
 #[tokio::test]
 async fn catching_up_the_secondary_extends_and_reuses_the_admitted_prefix() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(7);
@@ -492,7 +514,7 @@ fn catalog_keys_manifests_and_segments_reject_a_pipe_without_a_writer() -> Resul
 }
 
 #[tokio::test]
-async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> Result<()> {
+async fn encoded_tail_reads_each_generation_from_its_own_store() -> Result<()> {
     use zinder_store::HeightOrder;
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
     let extension = chain.clone().extend_blocks(2);
@@ -504,12 +526,12 @@ async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> 
     assert!(fixture.publisher()?.publish_next(&initial)?);
     let catalog = fixture.catalog(None)?;
     let mut retained = None;
-    for source in [&initial, &extended, &replacement] {
-        catalog.refresh_tail(source).await?;
-        let tail = catalog
-            .tail
-            .load_full()
-            .ok_or_else(|| eyre!("missing tail"))?;
+    for source in [initial, extended, replacement].map(Arc::new) {
+        let requested = BlockHeightRange::inclusive(
+            BlockHeight::new(1),
+            source.chain_epoch().visible_tip_height,
+        );
+        let tail = fill_tail(&catalog, &source, requested).await?;
         let span = tail.bounds().ok_or_else(|| eyre!("empty tail"))?;
         assert_eq!(span.start, BlockHeight::new(3));
         assert_eq!(span.end, source.chain_epoch().visible_tip_height);
@@ -529,7 +551,7 @@ async fn encoded_tail_reuses_linked_rows_and_replaces_only_the_fork_suffix() -> 
         }
         if let Some(prior) = &retained {
             let prior: &prost::bytes::Bytes = prior;
-            assert_eq!(prior.as_ptr(), rows[0].payload.as_ptr());
+            assert_ne!(prior.as_ptr(), rows[0].payload.as_ptr());
         }
         retained = Some(rows[0].payload.clone());
         for order in [HeightOrder::Ascending, HeightOrder::Descending] {
@@ -545,18 +567,19 @@ async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Resu
     use zinder_store::HeightOrder;
     let fixture = Fixture::new()?;
     let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let source = Arc::new(source);
     let mut publisher = fixture.publisher()?;
     assert!(publisher.publish_next(&source)?);
     let first = fixture.catalog(None)?;
-    first.refresh_tail(&source).await?;
-    let original = first
-        .tail
-        .load_full()
-        .ok_or_else(|| eyre!("missing tail"))?;
+    let original = fill_tail(
+        &first,
+        &source,
+        BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6)),
+    )
+    .await?;
 
     assert!(publisher.publish_next(&source)?);
     let extension = fixture.catalog(Some(&first))?;
-    extension.refresh_tail(&source).await?;
     let retained = extension
         .tail
         .load_full()
@@ -598,6 +621,7 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
     use zinder_store::HeightOrder;
     let fixture = Fixture::new()?;
     let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let source = Arc::new(source);
     let mut publisher = fixture.publisher()?;
     assert!(publisher.publish_next(&source)?);
     assert!(publisher.publish_next(&source)?);
@@ -606,12 +630,13 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
     fs::copy(&segment, &ordinary)?;
     fs::rename(ordinary, &segment)?;
     let catalog = Arc::new(fixture.catalog(None)?);
-    catalog.refresh_tail(&source).await?;
     let fifth = BlockHeight::new(5);
-    let tail = catalog
-        .tail
-        .load_full()
-        .ok_or_else(|| eyre!("missing tail"))?;
+    let tail = fill_tail(
+        &catalog,
+        &source,
+        BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6)),
+    )
+    .await?;
     let row = tail
         .select(
             BlockHeightRange::inclusive(fifth, fifth),
@@ -633,7 +658,7 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
         true,
         crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
     );
-    let slot = CanonicalReaderSlot::new(Arc::new(source));
+    let slot = CanonicalReaderSlot::new(source.clone());
     let read = |first, last, max_bytes| {
         range.read(
             &slot,

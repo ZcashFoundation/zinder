@@ -1328,9 +1328,10 @@ async fn standalone_adapters_serve_and_coalesce_on_demand_shielded_live_tail() -
 
     let updated = wallet.blocks(block_range_request(1, 13)).await?;
     assert_one_linked_chain(&updated, 1, 13);
+    // The advanced view is another generation, so it refills the request.
     assert_eq!(
         recorder.recorded_rows_with_lengths.lock().last().copied(),
-        Some(span(13, 13))
+        Some(span(1, 13))
     );
     Ok(())
 }
@@ -1377,11 +1378,11 @@ async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog()
     let ranges = [(1, 6), (6, 1)];
 
     assert_adapters_match_stock(&mut wallet, &mut blocks_only, &mut stock, &ranges).await?;
-    // Both adapters share the bootstrap tail here, and each verifies the top
-    // row the other one read before reusing its rows.
+    // Both adapters share the bootstrap tail here. Each reads its own
+    // generation, so neither serves rows the other one read.
     let bootstrap_reads = recorder.recorded_rows_with_lengths.lock().clone();
-    assert_eq!(bootstrap_reads.first(), Some(&span(1, 6)));
-    assert!(bootstrap_reads[1..].iter().all(|read| *read == span(6, 6)));
+    assert_ne!(bootstrap_reads, Vec::new());
+    assert!(bootstrap_reads.iter().all(|read| *read == span(1, 6)));
 
     assert!(publisher.publish_next(&store.reader)?);
     assert!(history.refresh(store.reader.as_ref()).await?);
@@ -1390,7 +1391,7 @@ async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog()
     assert!(
         adopted_reads[bootstrap_reads.len()..]
             .iter()
-            .all(|read| *read == span(6, 6))
+            .all(|read| *read == span(3, 6))
     );
     assert_eq!(
         recorder.recorded_compact_block_ranges(),

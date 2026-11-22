@@ -86,7 +86,7 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if let Some(catalog) = &catalog {
-            catalog.admit_source(source).await?;
+            catalog.verify_source(source).await?;
         }
         Ok(Self {
             current: ArcSwapOption::from(catalog.map(Arc::new)),
@@ -98,11 +98,15 @@ impl PublishedShieldedHistory {
         })
     }
 
-    /// Refreshes the default shielded live tail against a captured canonical view.
-    /// An incomplete or displaced refresh keeps the previous fence available.
-    pub async fn refresh_tail(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
+    /// Checks the active catalog's terminal against a captured canonical view.
+    /// The encoded live tail fills on demand for the view each request reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the view no longer holds the catalog's terminal.
+    pub async fn verify_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
         if let Some(catalog) = self.catalog() {
-            catalog.refresh_tail(source).await?;
+            catalog.verify_source(source).await?;
         }
         Ok(())
     }
@@ -163,10 +167,10 @@ impl PublishedShieldedHistory {
         if let Some(active) = &current
             && candidate.segments().len() == active.segments().len()
         {
-            active.refresh_tail(source).await?;
+            active.verify_source(source).await?;
             return Ok(false);
         }
-        candidate.admit_source(source).await?;
+        candidate.verify_source(source).await?;
         let displaced = self
             .current
             .compare_and_swap(&current, Some(Arc::new(candidate)));
@@ -224,14 +228,6 @@ fn read_catalog(
 }
 
 impl PublishedShieldedCatalog {
-    async fn admit_source(&self, source: &dyn CanonicalReader) -> Result<(), Status> {
-        self.verify_source(source).await?;
-        if let Err(status) = self.refresh_tail(source).await {
-            tracing::warn!(%status, "serving the uncovered tail from canonical storage");
-        }
-        Ok(())
-    }
-
     pub(super) fn read_chunk(
         &self,
         range: BlockHeightRange,

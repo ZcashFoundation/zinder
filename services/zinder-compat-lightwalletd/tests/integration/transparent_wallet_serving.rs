@@ -1423,13 +1423,7 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
     assert_eq!(encoded_rows().await?, vec![expected.clone()]);
     assert!(publisher.publish_next(&canonical.canonical_reader)?);
     assert!(history.refresh(canonical.as_ref()).await?);
-    assert!(
-        history
-            .refresh_tail(canonical.as_ref())
-            .await
-            .is_err_and(|status| status.code() == Code::Unavailable
-                && status.message().contains("row lengths"))
-    );
+    history.verify_source(canonical.as_ref()).await?;
     assert_eq!(encoded_rows().await?, vec![expected]);
     Ok(())
 }
@@ -2086,9 +2080,9 @@ async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() ->
         &reader,
     )
     .await?;
-    assert!(history.refresh_tail(&reader).await.is_err());
+    history.verify_source(&reader).await?;
     assert!(publisher.publish_next(&reader.canonical_reader)?);
     assert!(history.refresh(&reader).await?);
-    assert!(history.refresh_tail(&reader).await.is_err());
+    history.verify_source(&reader).await?;
     Ok(())
 }

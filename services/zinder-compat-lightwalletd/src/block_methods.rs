@@ -182,16 +182,7 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
 
     /// Returns the fence of `view` with the admitted data it reads, which
     /// together key the encoded rows the live tail may reuse for `view`.
-    fn tail_source(
-        &self,
-        _view: &Self::View,
-    ) -> Option<(
-        (
-            zinder_store::CanonicalEventFence,
-            zinder_core::CanonicalHistoryBounds,
-        ),
-        zinder_query::CompactBlockSource,
-    )> {
+    fn tail_source(&self, _view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
         None
     }
 
