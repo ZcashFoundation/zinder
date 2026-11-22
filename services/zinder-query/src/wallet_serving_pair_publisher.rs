@@ -241,6 +241,12 @@ impl WalletServingPairSlot {
         Arc::clone(&self.published.load().current)
     }
 
+    /// Reports whether `candidate` still names the currently published pair.
+    #[must_use]
+    pub(crate) fn is_current_weak(&self, candidate: &Weak<WalletServingReadPair>) -> bool {
+        Weak::ptr_eq(candidate, &Arc::downgrade(&self.published.load().current))
+    }
+
     /// Captures the pair that answers a read pinned to `chain_epoch_id`.
     ///
     /// A retained pair answers a pin that names its epoch until its retention

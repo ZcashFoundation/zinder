@@ -199,6 +199,12 @@ impl WalletServingReadPair {
         self.canonical.as_ref()
     }
 
+    /// Returns a cloned handle to the frozen canonical reader for detached tasks.
+    #[must_use]
+    pub(crate) fn canonical_arc(&self) -> Arc<dyn CanonicalReader> {
+        Arc::clone(&self.canonical)
+    }
+
     /// Returns the wallet reader frozen for this pair's entire lifetime.
     #[must_use]
     pub fn wallet(&self) -> &(dyn WalletProjectionReader + 'static) {

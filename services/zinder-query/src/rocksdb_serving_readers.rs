@@ -138,6 +138,10 @@ impl CanonicalReader for RocksDbCanonicalReader {
         self.secondary.history_bounds()
     }
 
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        Some(self.secondary.history_predecessor_digest())
+    }
+
     async fn block_header_at(
         &self,
         height: BlockHeight,

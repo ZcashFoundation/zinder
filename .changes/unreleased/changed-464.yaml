@@ -1,0 +1,6 @@
+kind: changed
+body: Settled tree-state cache entries now survive visible-tip appends and verified settled-tip advances inside a bounded 1,024-entry / 8 MiB LRU cache, resetting only on forks, schema updates, upgrade-schedule revisions, or retention-floor changes.
+time: 2026-11-22T10:23:30.000000000Z
+custom:
+    Bump: patch
+    PR: "464"
