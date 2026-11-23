@@ -161,14 +161,45 @@ impl CanonicalStoreBuildPlan {
         CanonicalStoredSet::history_floor(self.history_bounds())
     }
 
+    pub(super) fn admitted_stored_set(
+        &self,
+        workload: CanonicalStoreWorkload,
+        coverage: CanonicalSubtreeRootLoadCoverage,
+    ) -> CanonicalStoredSet {
+        let mut stored_set = self.stored_set(workload);
+        let predecessor = self.subtree_predecessor_metadata(coverage);
+        stored_set.subtree_root_coverage = Some(coverage);
+        stored_set.first_subtree_root_indices =
+            SHIELDED_PROTOCOLS.map(|protocol| predecessor.completed_subtree_count(protocol));
+        stored_set
+    }
+
     pub(super) fn subtree_root_ranges(
         &self,
         coverage: CanonicalSubtreeRootLoadCoverage,
         tip: ChainTipMetadata,
     ) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-        subtree_root_ranges(coverage, self.history_predecessor().tip_metadata(), tip)
+        required_subtree_root_ranges(self.subtree_predecessor_metadata(coverage), tip)
+    }
+
+    fn subtree_predecessor_metadata(
+        &self,
+        coverage: CanonicalSubtreeRootLoadCoverage,
+    ) -> ChainTipMetadata {
+        match coverage {
+            CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                self.history_predecessor().tip_metadata()
+            }
+            CanonicalSubtreeRootLoadCoverage::CompletePrefix => ChainTipMetadata::empty(),
+        }
     }
 }
+
+const SHIELDED_PROTOCOLS: [ShieldedProtocol; 3] = [
+    ShieldedProtocol::Sapling,
+    ShieldedProtocol::Orchard,
+    ShieldedProtocol::Ironwood,
+];
 
 /// Retention, historical floor, and any admitted subtree-root evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +208,7 @@ pub struct CanonicalStoredSet {
     retention: RawBlobRetention,
     first_height: BlockHeight,
     subtree_root_coverage: Option<CanonicalSubtreeRootLoadCoverage>,
+    first_subtree_root_indices: [u32; 3],
 }
 
 impl CanonicalStoredSet {
@@ -202,6 +234,7 @@ impl CanonicalStoredSet {
             retention,
             first_height,
             subtree_root_coverage: None,
+            first_subtree_root_indices: [0; 3],
         }
     }
 
@@ -215,7 +248,7 @@ impl CanonicalStoredSet {
     /// within retained history. This describes coverage policy.
     #[must_use]
     pub const fn first_height(self, kind: CanonicalStoredData) -> Option<BlockHeight> {
-        if retains(self.workload, self.retention, kind) {
+        if self.contains(kind) {
             Some(self.first_height)
         } else {
             None
@@ -224,8 +257,8 @@ impl CanonicalStoredSet {
 
     /// Reports whether the store retains this data kind.
     #[must_use]
-    pub const fn contains(self, kind: CanonicalStoredData) -> bool {
-        self.first_height(kind).is_some()
+    pub const fn contains(&self, kind: CanonicalStoredData) -> bool {
+        retains(self.workload, self.retention, kind)
     }
 
     /// Returns the authenticated subtree-root coverage of an admitted store.
@@ -236,19 +269,18 @@ impl CanonicalStoredSet {
         self.subtree_root_coverage
     }
 
-    pub(super) const fn with_subtree_root_coverage(
-        mut self,
-        coverage: CanonicalSubtreeRootLoadCoverage,
-    ) -> Self {
-        self.subtree_root_coverage = Some(coverage);
-        self
+    pub(super) const fn first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32 {
+        match protocol {
+            ShieldedProtocol::Sapling => self.first_subtree_root_indices[0],
+            ShieldedProtocol::Orchard => self.first_subtree_root_indices[1],
+            ShieldedProtocol::Ironwood => self.first_subtree_root_indices[2],
+        }
     }
 
     pub(super) fn require(
         self,
         path: &Path,
         requirements: &CanonicalStoreRequirements,
-        predecessor_tip_metadata: ChainTipMetadata,
     ) -> Result<(), CanonicalStoreError> {
         for kind in std::iter::once(CanonicalStoredData::BlockHistory)
             .chain(requirements.additional_data.iter().copied())
@@ -269,17 +301,7 @@ impl CanonicalStoredSet {
             }
         }
         if requirements.complete_subtree_root_prefix
-            && [
-                ShieldedProtocol::Sapling,
-                ShieldedProtocol::Orchard,
-                ShieldedProtocol::Ironwood,
-            ]
-            .into_iter()
-            .any(|pool| {
-                self.subtree_root_coverage.map(|coverage| {
-                    first_subtree_root_index(coverage, predecessor_tip_metadata, pool)
-                }) != Some(0)
-            })
+            && (self.subtree_root_coverage.is_none() || self.first_subtree_root_indices != [0; 3])
         {
             return Err(CanonicalStoreError::IncompleteSubtreeRootPrefix {
                 path: path.to_path_buf(),
@@ -320,26 +342,10 @@ pub(super) fn required_subtree_root_ranges(
     previous_tip: ChainTipMetadata,
     next_tip: ChainTipMetadata,
 ) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-    subtree_root_ranges(
-        CanonicalSubtreeRootLoadCoverage::RetainedRange,
-        previous_tip,
-        next_tip,
-    )
-}
-
-fn subtree_root_ranges(
-    coverage: CanonicalSubtreeRootLoadCoverage,
-    predecessor_tip_metadata: ChainTipMetadata,
-    build_tip_metadata: ChainTipMetadata,
-) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
     let mut ranges = Vec::with_capacity(3);
-    for protocol in [
-        ShieldedProtocol::Sapling,
-        ShieldedProtocol::Orchard,
-        ShieldedProtocol::Ironwood,
-    ] {
-        let start_index = first_subtree_root_index(coverage, predecessor_tip_metadata, protocol);
-        let completed_at_tip = build_tip_metadata.completed_subtree_count(protocol);
+    for protocol in SHIELDED_PROTOCOLS {
+        let start_index = previous_tip.completed_subtree_count(protocol);
+        let completed_at_tip = next_tip.completed_subtree_count(protocol);
         let root_count = completed_at_tip.checked_sub(start_index).ok_or_else(|| {
             CanonicalStoreError::subtree_root_sequence(format!(
                 "{protocol:?} completed-subtree count regressed from {start_index} to {completed_at_tip}"
@@ -354,19 +360,6 @@ fn subtree_root_ranges(
         }
     }
     Ok(ranges)
-}
-
-pub(super) fn first_subtree_root_index(
-    coverage: CanonicalSubtreeRootLoadCoverage,
-    predecessor_tip_metadata: ChainTipMetadata,
-    protocol: ShieldedProtocol,
-) -> u32 {
-    match coverage {
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix => 0,
-        CanonicalSubtreeRootLoadCoverage::RetainedRange => {
-            predecessor_tip_metadata.completed_subtree_count(protocol)
-        }
-    }
 }
 
 const fn retains(

@@ -31,9 +31,7 @@ use super::{
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     served_tree_state::ServedTreeState,
-    subtree_load::{
-        CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_position,
-    },
+    subtree_load::{decode_subtree_root, encode_subtree_root_position},
     tree_state_replay::{
         TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, refuse_unadmitted_activations,
     },
@@ -51,7 +49,7 @@ pub(super) trait CanonicalServingRead {
     fn serving_network(&self) -> Network;
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence;
-    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage;
+    fn serving_first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32;
     fn serving_admits_activations_through(
         &self,
         activations: &NetworkUpgradeActivations,
@@ -76,8 +74,8 @@ impl CanonicalServingRead for RocksDbCanonicalStore {
         self.ready_evidence()
     }
 
-    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
-        self.subtree_root_coverage
+    fn serving_first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32 {
+        self.stored_set.first_subtree_root_index(protocol)
     }
 
     fn serving_admits_activations_through(
@@ -111,8 +109,8 @@ impl CanonicalServingRead for RocksDbCanonicalSecondary {
         self.ready_evidence()
     }
 
-    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
-        self.subtree_root_coverage
+    fn serving_first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32 {
+        self.stored_set.first_subtree_root_index(protocol)
     }
 
     fn serving_admits_activations_through(
@@ -1294,14 +1292,7 @@ fn read_subtree_roots(
 ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
     let db = &store.serving_open().db;
     let family = column_family(db, SUBTREE_ROOT_COLUMN_FAMILY)?;
-    let coverage_start = super::stored_set::first_subtree_root_index(
-        store.serving_subtree_root_coverage(),
-        store
-            .serving_build_plan()
-            .history_predecessor()
-            .tip_metadata(),
-        range.protocol,
-    );
+    let coverage_start = store.serving_first_subtree_root_index(range.protocol);
     let mut indices = range.into_iter();
     let mut roots = Vec::new();
     let read_point = |index| {

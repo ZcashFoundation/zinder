@@ -238,6 +238,7 @@ pub(super) fn write_canonical_block_ssts<SourceError>(
 
 struct CanonicalBlockSstStager<'options> {
     config: CanonicalBlockSstConfig<'options>,
+    stored_set: CanonicalStoredSet,
     header_writer: OrderedSstWriter<'options>,
     replay_writer: OrderedSstWriter<'options>,
     compact_writer: OrderedSstWriter<'options>,
@@ -308,6 +309,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let predecessor_checkpoint_logical_bytes =
             checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
         Ok(Self {
+            stored_set: config.build_plan.stored_set(config.workload),
             header_writer: config.ordered_writer("block-header")?,
             replay_writer: config.ordered_writer("block-replay")?,
             compact_writer: config.ordered_writer("compact-block")?,
@@ -346,10 +348,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .is_some_and(|selection| {
                 selection.requires_checkpoint_since(self.checkpoint_tree_sizes, block.tip_metadata)
             });
-        validate_block(
-            self.config.build_plan.stored_set(self.config.workload),
-            &block,
-        )?;
+        validate_block(&self.stored_set, &block)?;
         validate_tree_state_checkpoint_pools(self.config.network_upgrade_activations, &block)?;
         validate_tree_state_checkpoint(checkpoint_required, &block)?;
         if checkpoint_required {
@@ -1095,7 +1094,7 @@ fn validate_tree_state_checkpoint_pools(
 }
 
 pub(super) fn validate_live_block(
-    stored_set: CanonicalStoredSet,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     validate_block(stored_set, block)?;
@@ -1103,7 +1102,7 @@ pub(super) fn validate_live_block(
 }
 
 fn validate_block(
-    stored_set: CanonicalStoredSet,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
@@ -1185,7 +1184,7 @@ pub(super) fn validate_compact_block_payload(
 }
 
 fn validate_transaction_blobs(
-    stored_set: CanonicalStoredSet,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let height = block.facts.block_header.height;
@@ -1240,7 +1239,7 @@ fn validate_transaction_blobs(
 }
 
 fn validate_block_blob(
-    stored_set: CanonicalStoredSet,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
@@ -1327,7 +1326,7 @@ fn tree_state_checkpoint_required(height: BlockHeight, build_tip_height: BlockHe
 }
 
 fn validate_block_final_note_commitment_roots(
-    stored_set: CanonicalStoredSet,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;

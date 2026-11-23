@@ -470,7 +470,7 @@ fn validate_replacement_blocks(
     })?;
     let mut expected_parent = parent_id;
     for replacement in blocks {
-        validate_live_block(store.stored_set(), &replacement.block)?;
+        validate_live_block(&store.stored_set, &replacement.block)?;
         let header = &replacement.block.facts.block_header;
         let expected_height = expected_parent.height.next().ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement height exceeds u32::MAX")
@@ -596,6 +596,10 @@ fn capture_displaced_blocks(
     store: &RocksDbCanonicalStore,
     reverted_range: BlockHeightRange,
 ) -> Result<Vec<CanonicalDisplacedBlock>, CanonicalStoreError> {
+    let retains_raw_blocks = store.stored_set.contains(CanonicalStoredData::BlockBodies);
+    let retains_final_roots = store
+        .stored_set
+        .contains(CanonicalStoredData::FinalNoteCommitmentRoots);
     reverted_range
         .into_iter()
         .map(|height| {
@@ -624,19 +628,12 @@ fn capture_displaced_blocks(
             })
             .transpose()
             .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
-            if raw_block_bytes.is_some()
-                != store
-                    .stored_set()
-                    .contains(CanonicalStoredData::BlockBodies)
-            {
+            if raw_block_bytes.is_some() != retains_raw_blocks {
                 return Err(CanonicalStoreError::live_commit(
                     "canonical suffix raw block rows do not match admitted retention",
                 ));
             }
-            match store
-                .stored_set()
-                .contains(CanonicalStoredData::FinalNoteCommitmentRoots)
-            {
+            match retains_final_roots {
                 false if final_note_commitment_roots.is_some() => {
                     return Err(CanonicalStoreError::live_commit(
                         "wallet canonical suffix contains explorer-only rows",

@@ -17,7 +17,6 @@ use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreRequirements, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{
         CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at,
@@ -78,7 +77,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     history_predecessor_digest: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
-    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    pub(super) stored_set: super::CanonicalStoredSet,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
@@ -283,11 +282,10 @@ impl RocksDbCanonicalSecondary {
             opened_control.workload,
             &opened_control.build_plan,
         )?;
-        expectation.validate_reader_requirements(
-            &primary_path,
-            &opened_control,
-            subtree_root_coverage,
-        )?;
+        let stored_set = opened_control
+            .build_plan
+            .admitted_stored_set(opened_control.workload, subtree_root_coverage);
+        expectation.validate_reader_requirements(&primary_path, stored_set)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let replay_tail = validate_ready_publication(
             &bounded_open.db,
@@ -327,7 +325,7 @@ impl RocksDbCanonicalSecondary {
             history_predecessor_digest: opened_control.build_plan.history_predecessor_digest(),
             build_plan: opened_control.build_plan,
             ready_evidence,
-            subtree_root_coverage,
+            stored_set,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
             reorg_policy,
@@ -559,9 +557,7 @@ impl RocksDbCanonicalSecondary {
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
-        self.build_plan
-            .stored_set(self.workload)
-            .with_subtree_root_coverage(self.subtree_root_coverage)
+        self.stored_set
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.

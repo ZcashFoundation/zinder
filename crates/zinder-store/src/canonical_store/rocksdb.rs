@@ -235,19 +235,10 @@ impl CanonicalStoreAdmissionExpectation {
     pub(super) fn validate_reader_requirements(
         &self,
         path: &Path,
-        control: &DecodedStoreControl,
-        subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+        stored_set: super::CanonicalStoredSet,
     ) -> Result<(), CanonicalStoreError> {
         if let StoredDataAdmission::Minimum(requirements) = &self.stored_data {
-            control
-                .build_plan
-                .stored_set(control.workload)
-                .with_subtree_root_coverage(subtree_root_coverage)
-                .require(
-                    path,
-                    requirements,
-                    control.build_plan.history_predecessor().tip_metadata(),
-                )?;
+            stored_set.require(path, requirements)?;
         }
         Ok(())
     }
@@ -275,7 +266,7 @@ pub struct RocksDbCanonicalStore {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
-    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    pub(super) stored_set: super::CanonicalStoredSet,
     /// Serializes retained-event, projection-lease, and mempool-log lifecycle changes.
     ///
     /// The primary handle owns every canonical mutation. Keeping this lock on
@@ -306,13 +297,14 @@ impl RocksDbCanonicalStore {
         subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
         replay_tail: AuthenticatedReplayTail,
     ) -> Self {
+        let stored_set = build_plan.admitted_stored_set(workload, subtree_root_coverage);
         Self {
             bounded_open,
             workload,
             build_plan,
             cursor_auth_key,
             ready_evidence: *ready_evidence,
-            subtree_root_coverage,
+            stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule: None,
@@ -673,6 +665,8 @@ impl RocksDbCanonicalStore {
             read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
+        let stored_set =
+            build_plan.admitted_stored_set(opened_control.workload, subtree_root_coverage);
         let replay_tail = validate_ready_publication(
             &bounded_open.db,
             &build_plan,
@@ -685,7 +679,7 @@ impl RocksDbCanonicalStore {
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
-            subtree_root_coverage,
+            stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule,
@@ -1005,9 +999,7 @@ impl RocksDbCanonicalStore {
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
-        self.build_plan
-            .stored_set(self.workload)
-            .with_subtree_root_coverage(self.subtree_root_coverage)
+        self.stored_set
     }
 
     /// Returns the immutable raw-blob retention persisted by the store.
