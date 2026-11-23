@@ -340,7 +340,7 @@ transport policy.
 | Client-streaming and bidirectional calls open, per process | 32 | `UNAVAILABLE` |
 | Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
 | Time a client stream may go without sending a whole message | 20 s | `DEADLINE_EXCEEDED` |
-| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` |
+| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` after the data already sent, if it reads again |
 | HTTP/2 keepalive | Ping after 60 s without a frame; close if unanswered for 20 s | Connection closed |
 | Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`) | 1,024 | `RESOURCE_EXHAUSTED` |
 
@@ -374,8 +374,20 @@ connections counts as many clients. Limit connections per client in the
 proxy.
 
 A response that the client stops reading, by withholding HTTP/2 flow-control
-window, ends after 60 seconds. A response that is waiting for the server to
-produce its next message is not affected.
+window, is abandoned after 60 seconds. The listener drops the call's handler
+and the response data it has not yet handed to HTTP/2, which ends the call's
+work and frees a `GetBlockRange` stream's slot. A client that reads again
+receives the data HTTP/2 already holds, then `DEADLINE_EXCEEDED`. A response
+that is waiting for the server to produce its next message is not affected.
+
+Abandoning a response does not release what HTTP/2 holds for it: up to about
+528 KiB of response data (the 400 KiB send buffer, one piece queued past it,
+and one waiting for flow-control window) and the stream's place among its
+connection's 200 streams. These stay until the client reads them, resets the
+stream, or closes the connection. A client that keeps answering keepalive
+pings keeps its connection open, so one connection can keep about 103 MiB
+this way with no time limit, and the proxy's per-client connection limit is
+the only bound across the listener.
 [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
 records this policy.
 
