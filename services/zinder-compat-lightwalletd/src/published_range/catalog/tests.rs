@@ -1503,84 +1503,128 @@ async fn below_catalog_streams_without_permits(
     let catalog = Arc::new(fixture.catalog(None)?);
     assert_eq!(catalog.bounds().start, first);
     let before = reads.native.lock().len();
-    for (start, end) in [(1, 16), (16, 1)] {
+    for (start, end, count) in [(1, 16, 16), (16, 1, 16), (1_001, 999, 3)] {
         let frames = tokio::time::timeout(
             prompt,
             stream_published(methods, reads, &catalog, (start, end, Vec::new())),
         )
         .await??;
-        assert_eq!(frames, 16);
+        assert_eq!(frames, count);
     }
     let expected = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
     assert_eq!(
         reads.native.lock().get(before..),
-        Some([expected; 2].as_slice())
+        Some([expected, expected, test_span(999, 1_001)].as_slice())
     );
     Ok(())
 }
 
-#[test]
-fn a_chunk_holds_a_published_read_permit_whenever_a_read_of_its_heights_can_open_signed_files()
+#[tokio::test]
+async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_signed_files()
 -> Result<()> {
     use crate::{
-        CanonicalReaderSlot, block_methods::RangeSource, compact_block_messages::CompactBlockShape,
+        CanonicalReaderSlot,
+        block_range::{BlockRangeChunks, BlockRangeStreamLimit},
+        compact_block_messages::CompactBlockShape,
         published_range::PublishedRangeRead,
     };
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1_010);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2_010);
     let (_store, reader) = reader(&chain)?;
-    let fixture = Fixture::new()?;
-    assert!(
-        fixture
-            .publisher_from(BlockHeight::new(1_000))?
-            .publish_next(&reader)?
-    );
-    let catalog = Arc::new(fixture.catalog(None)?);
-    let coverage = catalog.bounds();
-    let heights = 995..=1_006;
-    for is_descending in [false, true] {
-        let range = PublishedRangeRead::new(
-            Some(catalog.clone()),
-            catalog.tail(),
-            CompactBlockShape::for_range(&[])?,
-            is_descending,
-            crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
-        );
-        let eligible = |start, end| {
-            let chunk = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
-            RangeSource::<CanonicalReaderSlot>::published_read_limit(&range, chunk).is_some()
-        };
-        for start in heights.clone() {
-            for end in start..=*heights.end() {
-                // A read of the whole chunk opens signed files when it starts
-                // inside the catalog, or descends through it from a live tail.
-                let reads_files = (coverage.start.value()..=coverage.end.value()).contains(&start)
-                    || (is_descending
-                        && start < coverage.start.value()
-                        && end > coverage.end.value());
-                assert!(
-                    !reads_files || eligible(start, end),
-                    "({start}, {end}) desc={is_descending}"
+    let reader = Arc::new(reader);
+    let reads = CanonicalReaderSlot::new(Arc::clone(&reader));
+    // One- and two-segment catalogs, at the chain start and above it.
+    for (first, segments, heights) in [
+        (1, 1, 1..=7),
+        (1_000, 1, 995..=1_006),
+        (1_000, 2, 995..=1_008),
+    ] {
+        let fixture = Fixture::new()?;
+        let mut publisher = fixture.publisher_from(BlockHeight::new(first))?;
+        for _ in 0..segments {
+            assert!(publisher.publish_next(&reader)?);
+        }
+        let catalog = Arc::new(fixture.catalog(None)?);
+        assert_eq!(catalog.bounds(), test_span(first, first + 2 * segments - 1));
+        // Test every read against a contiguous live tail as well as the
+        // signed catalog. An unfilled tail can only reduce what can use files.
+        fill_tail(&catalog, &reader, test_span(first, 2_010)).await?;
+        for is_descending in [false, true] {
+            let range = PublishedRangeRead::new(
+                Some(catalog.clone()),
+                catalog.tail(),
+                CompactBlockShape::for_range(&[])?,
+                is_descending,
+                BlockRangeStreamLimit::new(NonZeroU32::MIN),
+            );
+            if first == 1_000 && segments == 1 && is_descending {
+                let mut chunks = BlockRangeChunks::new(test_span(999, 1_999), true);
+                chunks.advance(998);
+                assert_eq!(chunks.next_chunk(), Some(test_span(999, 1_001)));
+                assert_eq!(
+                    chunks.checked_heights().map(|(retry, _)| retry),
+                    Some(test_span(1_000, 1_001))
                 );
-                // A clipped read or a retry of checked heights keeps the end the
-                // stream sends first and may open files for those heights alone.
-                for inner in start..=end {
-                    let (first, last) = if is_descending {
-                        (inner, end)
-                    } else {
-                        (start, inner)
-                    };
-                    assert!(
-                        !eligible(first, last) || eligible(start, end),
-                        "({first}, {last}) within ({start}, {end}) desc={is_descending}"
-                    );
+                assert!(assert_published_read_admission(&range, &reads, chunks).await?);
+            }
+            for start in heights.clone() {
+                for end in start..=*heights.end() {
+                    let chunk = test_span(start, end);
+                    let first = BlockRangeChunks::new(chunk, is_descending);
+                    assert_eq!(first.checked_heights(), None);
+                    assert_published_read_admission(&range, &reads, first).await?;
+                    // Short earlier reads leave up to five checked heights,
+                    // enough for a retry that spans the whole catalog.
+                    for previously_checked in 0..=5 {
+                        let kept = zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
+                            - previously_checked;
+                        let previous_range = if is_descending {
+                            test_span(start, end + kept)
+                        } else if start > kept {
+                            test_span(start - kept, end)
+                        } else {
+                            continue;
+                        };
+                        let mut later = BlockRangeChunks::new(previous_range, is_descending);
+                        later.advance(usize::try_from(kept)?);
+                        assert_eq!(later.next_chunk(), Some(chunk));
+                        assert_published_read_admission(&range, &reads, later).await?;
+                        if let Some((_, only_checked)) = later.checked_heights() {
+                            assert_eq!(only_checked.checked_heights(), None);
+                            assert_published_read_admission(&range, &reads, only_checked).await?;
+                        }
+                    }
                 }
             }
         }
-        assert!(!eligible(995, 999), "below coverage desc={is_descending}");
-        assert!(
-            !eligible(1_002, 1_006),
-            "above coverage desc={is_descending}"
-        );
     }
     Ok(())
+}
+
+async fn assert_published_read_admission(
+    range: &crate::published_range::PublishedRangeRead,
+    reads: &crate::CanonicalReaderSlot,
+    chunks: crate::block_range::BlockRangeChunks,
+) -> Result<bool> {
+    use crate::block_methods::RangeSource;
+    let chunk = chunks.next_chunk().ok_or_else(|| eyre!("missing chunk"))?;
+    let retry = chunks.checked_heights().map(|(checked, _)| checked);
+    let eligible =
+        RangeSource::<crate::CanonicalReaderSlot>::published_read_limit(range, chunk, retry)
+            .is_some();
+    let whole_reads_files = range.plan_can_read_signed_files(reads, chunk).await?;
+    let retry_reads_files = match retry {
+        Some(checked) => range.plan_can_read_signed_files(reads, checked).await?,
+        None => false,
+    };
+    assert_eq!(
+        eligible,
+        whole_reads_files || retry_reads_files,
+        "chunk {chunk:?} retry={retry:?} order={:?}",
+        chunks.order()
+    );
+    Ok(retry_reads_files && !whole_reads_files)
+}
+
+fn test_span(start: u32, end: u32) -> BlockHeightRange {
+    BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
 }
