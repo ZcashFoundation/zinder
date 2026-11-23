@@ -153,7 +153,9 @@ pub mod compat {
             reason = "Generated protobuf code mirrors vendored schemas."
         )]
 
-        pub use crate::encoded_block_range::{EncodedBlockRange, EncodedBlockRangeStream};
+        pub use crate::encoded_block_range::{
+            EncodedBlock, EncodedBlockRange, EncodedBlockRangeStream, InvalidEncodedBlock,
+        };
 
         /// Upstream `lightwallet-protocol` commit served by this compatibility pin.
         pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = include_str!(concat!(

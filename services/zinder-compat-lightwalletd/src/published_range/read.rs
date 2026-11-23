@@ -1,13 +1,12 @@
 use std::{io::ErrorKind, sync::Arc, time::Instant};
 
-use prost::{Message, bytes::Bytes};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact,
 };
-use zinder_proto::{ZINDER_ERROR_DOMAIN, v1::ops::ErrorReason};
+use zinder_proto::{ZINDER_ERROR_DOMAIN, compat::lightwalletd::EncodedBlock, v1::ops::ErrorReason};
 use zinder_store::HeightOrder;
 
 use super::{
@@ -41,7 +40,7 @@ pub(crate) struct ReadBlock {
 
 enum Payload {
     Canonical(CompactBlockArtifact),
-    Published(Bytes),
+    Published(EncodedBlock),
 }
 
 impl From<CompactBlockArtifact> for ReadBlock {
@@ -59,7 +58,7 @@ impl From<SealedBlock> for ReadBlock {
         Self {
             id: row.id,
             parent: row.parent,
-            payload: Payload::Published(row.payload),
+            payload: Payload::Published(row.message),
         }
     }
 }
@@ -366,7 +365,7 @@ where
 
 impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     type Block = ReadBlock;
-    type Message = Bytes;
+    type Message = EncodedBlock;
 
     fn published_read_limit(
         &self,
@@ -375,17 +374,15 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         self.reads_published_files(chunk).then_some(&self.limits)
     }
 
-    fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<Bytes>, Status> {
+    fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<EncodedBlock>, Status> {
         if self.is_descending {
             blocks.reverse();
         }
         blocks
             .into_iter()
             .map(|block| match block.payload {
-                Payload::Published(bytes) => Ok(Ok(bytes)),
-                Payload::Canonical(block) => {
-                    Ok(Ok(self.shape.message(block)?.encode_to_vec().into()))
-                }
+                Payload::Published(message) => Ok(Ok(message)),
+                Payload::Canonical(block) => Ok(Ok(self.shape.encoded(block)?)),
             })
             .collect()
     }

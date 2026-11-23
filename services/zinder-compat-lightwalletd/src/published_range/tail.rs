@@ -1,7 +1,6 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwapOption;
-use prost::Message as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
@@ -172,7 +171,7 @@ fn check_cancel(source: &impl TailSource) -> Result<(), Status> {
 }
 
 fn payload_bytes<'a>(rows: impl IntoIterator<Item = &'a SealedBlock>) -> usize {
-    rows.into_iter().map(|row| row.payload.len()).sum()
+    rows.into_iter().map(|row| row.message.payload_len()).sum()
 }
 
 impl ShieldedTailBuffer {
@@ -431,11 +430,11 @@ impl EncodedTail {
     /// Appends `row`, evicting the lowest rows past `max_tail_bytes`. The
     /// newest row stays even when it alone exceeds the budget.
     fn push_with_limit(&mut self, row: SealedBlock, max_tail_bytes: usize) {
-        self.bytes += row.payload.len();
+        self.bytes += row.message.payload_len();
         self.rows.push_back(row);
         while self.rows.len() > 1 && self.bytes > max_tail_bytes {
             if let Some(evicted) = self.rows.pop_front() {
-                self.bytes -= evicted.payload.len();
+                self.bytes -= evicted.message.payload_len();
                 self.byte_capped = true;
             }
         }
@@ -537,13 +536,13 @@ struct PrependWindow {
 impl PrependWindow {
     fn push(&mut self, row: SealedBlock) {
         self.top = Some((row.id, row.parent));
-        self.bytes += row.payload.len();
+        self.bytes += row.message.payload_len();
         self.rows.push_back(row);
         while self.bytes > self.budget {
             let Some(evicted) = self.rows.pop_front() else {
                 break;
             };
-            self.bytes -= evicted.payload.len();
+            self.bytes -= evicted.message.payload_len();
             self.dropped = true;
         }
     }
@@ -697,7 +696,7 @@ async fn encode_range<Source: TailSource>(
                     id: BlockId::new(block.height(), block.block_hash()),
                     parent: block.previous_block_hash(),
                     native_bytes,
-                    payload: shape.message(block)?.encode_to_vec().into(),
+                    message: shape.encoded(block)?,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()
@@ -720,6 +719,7 @@ mod tests {
 
     use eyre::OptionExt as _;
     use parking_lot::Mutex;
+    use prost::Message as _;
     use tokio_stream::StreamExt as _;
     use tonic::Code;
     use zinder_core::{
@@ -951,11 +951,11 @@ mod tests {
         assert_eq!(expanded.bounds(), Some(span(5, 10)));
         assert_eq!(*source.reads.lock(), vec![span(8, 10), span(5, 7)]);
         assert_eq!(
-            expanded.rows[3].payload.as_ptr(),
-            first.rows[0].payload.as_ptr()
+            expanded.rows[3].message.as_length_prefixed().as_ptr(),
+            first.rows[0].message.as_length_prefixed().as_ptr()
         );
 
-        let single_row_bytes = first.rows[0].payload.len();
+        let single_row_bytes = first.rows[0].message.payload_len();
         let capped = fill(
             &buffer,
             &source,
@@ -1000,10 +1000,10 @@ mod tests {
         assert_eq!(refilled.bounds(), Some(span(402, 501)));
         assert_eq!(*advanced.reads.lock(), vec![span(402, 501)]);
         assert!(first.rows.iter().all(|old| {
-            refilled
-                .rows
-                .iter()
-                .all(|new| old.payload.as_ptr() != new.payload.as_ptr())
+            refilled.rows.iter().all(|new| {
+                old.message.as_length_prefixed().as_ptr()
+                    != new.message.as_length_prefixed().as_ptr()
+            })
         }));
 
         let replaced = build_source(501, 2);
@@ -1026,8 +1026,11 @@ mod tests {
         assert_eq!(*other.reads.lock(), vec![span(3, 10)]);
         let shape = CompactBlockShape::for_range(&[])?;
         let expected = shape.message(other.blocks[6].clone())?.encode_to_vec();
-        assert_eq!(replacement.rows[3].payload.as_ref(), expected.as_slice());
-        assert_ne!(served.rows[3].payload, replacement.rows[3].payload);
+        assert_eq!(
+            replacement.rows[3].message.payload().as_ref(),
+            expected.as_slice()
+        );
+        assert_ne!(served.rows[3].message, replacement.rows[3].message);
         Ok(())
     }
 
@@ -1603,7 +1606,10 @@ mod tests {
                 .map_err(|_| eyre::eyre!("canonical fallback failed"))?;
             let messages =
                 <PublishedRangeRead as RangeSource<FencedReads>>::messages(&published, blocks)?;
-            let bytes = messages.into_iter().collect::<Result<Vec<_>, _>>()?;
+            let bytes = messages
+                .into_iter()
+                .map(|message| message.map(|message| message.payload().to_vec()))
+                .collect::<Result<Vec<_>, _>>()?;
             assert_eq!(bytes, expected);
         }
         assert_eq!(replacement.native_reads.load(Ordering::SeqCst), 2);
@@ -1698,7 +1704,7 @@ mod tests {
         let mut frames = Vec::new();
         while let Some(frame) = stream.next().await {
             match frame {
-                Ok(frame) => frames.push(frame),
+                Ok(frame) => frames.push(frame.payload()),
                 Err(status) => return Ok((frames, Some(status.code()))),
             }
         }
@@ -1733,7 +1739,7 @@ mod tests {
             let mut frames = Vec::new();
             while let Some(frame) = stream.next().await {
                 match frame {
-                    Ok(frame) => frames.push(frame),
+                    Ok(frame) => frames.push(frame.payload()),
                     Err(status) => return (frames, Some(status.code())),
                 }
             }

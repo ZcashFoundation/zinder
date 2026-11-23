@@ -5,7 +5,7 @@ use zinder_core::{
     CompactBlockArtifact, CompactShieldedAction, CompactTransaction, CompactTransactionData,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
-use zinder_proto::compat::lightwalletd;
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Payload {
@@ -111,6 +111,12 @@ impl CompactBlockShape {
             selected.ironwood = true;
         }
         Ok(selected)
+    }
+
+    /// Converts a stored block, as [`Self::message`] does, into a gRPC-framed message.
+    pub(crate) fn encoded(self, block: CompactBlockArtifact) -> Result<EncodedBlock, Status> {
+        EncodedBlock::encode(&self.message(block)?)
+            .map_err(|error| Status::internal(error.to_string()))
     }
 
     /// Converts a stored block and preserves the original indices of selected transactions.

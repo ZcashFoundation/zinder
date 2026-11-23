@@ -6474,6 +6474,7 @@ name = "zinder-proto"
 version = "0.23.0"
 dependencies = [
  "eyre",
+ "http-body",
  "prost",
  "prost-types",
  "thiserror 2.0.21",

@@ -604,15 +604,18 @@ async fn encoded_tail_reads_each_generation_from_its_own_store() -> Result<()> {
             let canonical =
                 crate::compact_block_messages::CompactBlockShape::for_range(&[])?.message(block)?;
             assert_eq!(
-                row.payload.as_ref(),
+                row.message.payload().as_ref(),
                 prost::Message::encode_to_vec(&canonical)
             );
         }
         if let Some(prior) = &retained {
             let prior: &prost::bytes::Bytes = prior;
-            assert_ne!(prior.as_ptr(), rows[0].payload.as_ptr());
+            assert_ne!(
+                prior.as_ptr(),
+                rows[0].message.as_length_prefixed().as_ptr()
+            );
         }
-        retained = Some(rows[0].payload.clone());
+        retained = Some(rows[0].message.as_length_prefixed().clone());
         for order in [HeightOrder::Ascending, HeightOrder::Descending] {
             assert_eq!(tail.select(span, order, 0, true).len(), 1);
             assert!(tail.select(span, order, 0, false).is_empty());
@@ -656,7 +659,8 @@ async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Resu
         previous
             .iter()
             .zip(reused)
-            .all(|(old, row)| old.payload.as_ptr() == row.payload.as_ptr())
+            .all(|(old, row)| old.message.as_length_prefixed().as_ptr()
+                == row.message.as_length_prefixed().as_ptr())
     );
 
     assert!(publisher.publish_next(&source)?);

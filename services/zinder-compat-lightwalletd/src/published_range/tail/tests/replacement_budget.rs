@@ -9,6 +9,7 @@ use std::{
 
 use eyre::OptionExt as _;
 use prost::bytes::Bytes;
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 
 use super::{SealedBlock, ShieldedTailBuffer, build_source, fill, quarter_chunk_rows, span};
 
@@ -24,6 +25,7 @@ struct LivePayloadBytes {
 
 struct TrackedPayload {
     bytes: Bytes,
+    payload_len: usize,
     live: Arc<LivePayloadBytes>,
 }
 
@@ -35,7 +37,7 @@ impl AsRef<[u8]> for TrackedPayload {
 
 impl Drop for TrackedPayload {
     fn drop(&mut self) {
-        self.live.current.fetch_sub(self.bytes.len(), Relaxed);
+        self.live.current.fetch_sub(self.payload_len, Relaxed);
     }
 }
 
@@ -45,13 +47,18 @@ pub(in crate::published_range::tail) fn track_chunk(
 ) -> Vec<SealedBlock> {
     let _ = LIVE.try_with(|live| {
         for row in &mut rows {
-            let bytes = std::mem::take(&mut row.payload);
-            let held = live.current.fetch_add(bytes.len(), Relaxed) + bytes.len();
-            live.peak.fetch_max(held, Relaxed);
-            row.payload = Bytes::from_owner(TrackedPayload {
-                bytes,
+            let payload_len = row.message.payload_len();
+            let tracked = EncodedBlock::from_length_prefixed(Bytes::from_owner(TrackedPayload {
+                bytes: row.message.as_length_prefixed().clone(),
+                payload_len,
                 live: Arc::clone(live),
-            });
+            }));
+            // An untracked row would fail the byte-count assertions.
+            if let Ok(tracked) = tracked {
+                row.message = tracked;
+                let held = live.current.fetch_add(payload_len, Relaxed) + payload_len;
+                live.peak.fetch_max(held, Relaxed);
+            }
         }
     });
     rows
@@ -98,18 +105,21 @@ async fn replacement_holds_two_full_tails_and_one_converted_chunk() -> eyre::Res
         assert_eq!(old.rows.len(), replacement.rows.len());
         for (old_row, new_row) in old.rows.iter().zip(&replacement.rows) {
             assert_eq!(old_row.id.height, new_row.id.height);
-            assert_ne!(old_row.payload, new_row.payload);
-            assert_ne!(old_row.payload.as_ptr(), new_row.payload.as_ptr());
+            assert_ne!(old_row.message, new_row.message);
+            assert_ne!(
+                old_row.message.as_length_prefixed().as_ptr(),
+                new_row.message.as_length_prefixed().as_ptr()
+            );
         }
 
         let pinned = old
             .rows
             .front()
             .ok_or_eyre("missing old row")?
-            .payload
+            .message
             .clone();
         drop(old);
-        assert_eq!(live.current.load(Relaxed), budget + pinned.len());
+        assert_eq!(live.current.load(Relaxed), budget + pinned.payload_len());
         drop(pinned);
         assert_eq!(live.current.load(Relaxed), budget);
         drop(replacement);
