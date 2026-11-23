@@ -6997,6 +6997,7 @@ mod tests {
     async fn cold_pair_replacement_refuses_a_different_admitted_stored_set()
     -> Result<(), Box<dyn std::error::Error>> {
         use zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_AT_V1;
+        use zinder_runtime::ReadinessCause;
 
         let activations = sample_regtest_upgrade_activations();
         let first_height = BlockHeight::new(1);
