@@ -370,8 +370,8 @@ jq -e \
       and .canonical_store_identity == "canonical"
       and .canonical_store_schema_version == 7
       and .wallet_store_identity == "wallet"
-      and .wallet_store_schema_version == 1
-      and .wallet_projection_schema_version == 1
+      and .wallet_store_schema_version == 2
+      and .wallet_projection_schema_version == 2
       and .wallet_value_encoding_version == 2)
     and (($report.report_format_version == 5) as $is_v5
       | (
@@ -572,7 +572,7 @@ jq -e \
         and (.utxo_count | nonnegative_integer)
         and .utxo_count == $report.wallet_storage_ready.row_counts.transparent_unspent_output_count
         and (.total_value_zat | nonnegative_integer)
-        and .commitment_scheme == "lthash16"
+        and .commitment_scheme == "lthash16-chacha12"
         and (.commitment_accumulator_hex | hex_bytes(2048))
         and (.commitment_display_digest_hex | hex_bytes(32)))
       and .scanned_block_count == $report.canonical_storage_ready.block_count

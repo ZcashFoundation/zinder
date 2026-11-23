@@ -139,6 +139,23 @@ cold and reads every row back. The row digest and per-family row counts must
 match what construction produced, and the balances must sum to the unspent
 total. Otherwise the build is refused.
 
+**Row digest.** The row digest is an `LtHash16` accumulator over every row of
+the six families: 1,024 little-endian 16-bit lanes, summed modulo 2^16. Each
+row contributes 2,048 bytes derived from its preimage. The preimage is the
+domain `zinder:wallet-projection:row:v2\0`, the accumulator version
+`WALLET_PROJECTION_ACCUMULATOR_VERSION` (2), the value encoding version, the
+family tag, and the key and value, each prefixed with its 32-bit big-endian
+length. An unkeyed 44-byte BLAKE2b hash of the preimage with the
+personalization `ZinderWProjRoot2` supplies a ChaCha12 key (32 bytes) and
+nonce (12 bytes). The first 2,048 keystream bytes are the row's lanes, and
+removing a row subtracts the same lanes. The control record keeps the full
+2,048-byte accumulator, and the 32-byte display digest is BLAKE2b-256 of it.
+The UTXO set commitment uses the same expansion over its own element encoding
+and personalization. [ADR-0017](../adrs/0017-transparent-wallet-queries.md)
+records the choice and its security limits. A store written under another
+accumulator version carries another schema version. The projector refuses to
+open it, and the wallet must be rebuilt.
+
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction hashes rows on
 `projector.build.accumulator_hashing_workers` threads, in batches, while the

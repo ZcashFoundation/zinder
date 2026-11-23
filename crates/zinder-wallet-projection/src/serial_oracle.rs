@@ -730,7 +730,7 @@ mod tests {
                     .unwrap_or_else(|error| unreachable!("valid ordering digest: {error}"))
                     .as_bytes()
             ),
-            "dcdb04fc8570f5988946cfd7ea635dbb8e32dc3f98d98e48bdf15e2efd500b13"
+            "ec5a252a735fc7d359bf20756e029199a061a9f2092789a5177567cbc31aa7da"
         );
     }
 

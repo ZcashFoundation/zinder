@@ -684,7 +684,7 @@ fn wallet_ready_summary(
             utxo_count: utxo_summary.utxo_count,
             total_value_zat: utxo_summary.total_value_zat,
             commitment_scheme: match utxo_summary.commitment.scheme() {
-                zinder_core::UtxoSetCommitmentScheme::LtHash16 => "lthash16",
+                zinder_core::UtxoSetCommitmentScheme::LtHash16ChaCha12 => "lthash16-chacha12",
                 zinder_core::UtxoSetCommitmentScheme::Unspecified => "unspecified",
                 _ => "unknown",
             },

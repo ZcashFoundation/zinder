@@ -1784,10 +1784,10 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_store_identity != "wallet"
             || self.contracts.wallet_store_schema_version
                 != zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION
-            || self.contracts.wallet_store_schema_version != 1
+            || self.contracts.wallet_store_schema_version != 2
             || self.contracts.wallet_projection_schema_version
                 != zinder_wallet_projection::WALLET_PROJECTION_SCHEMA_VERSION
-            || self.contracts.wallet_projection_schema_version != 1
+            || self.contracts.wallet_projection_schema_version != 2
             || self.contracts.wallet_value_encoding_version
                 != zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION
             || self.contracts.wallet_value_encoding_version != 2
@@ -1851,7 +1851,7 @@ impl RocksDbStorageLifecycleReport {
             || wallet.historical_prevout_read_count != 0
             || wallet.construction.cold_validation_random_read_count != 0
             || wallet.utxo_summary.utxo_count != wallet.row_counts.transparent_unspent_output_count
-            || wallet.utxo_summary.commitment_scheme != "lthash16"
+            || wallet.utxo_summary.commitment_scheme != "lthash16-chacha12"
             || !wallet.cold_reopen_evidence_match
             || !wallet.canonical_fence_match
         {
@@ -3378,7 +3378,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 utxo_summary: super::WalletStorageUtxoSummary {
                     utxo_count: 0,
                     total_value_zat: 0,
-                    commitment_scheme: "lthash16",
+                    commitment_scheme: "lthash16-chacha12",
                     commitment_accumulator_hex: "00".repeat(2048),
                     commitment_display_digest_hex: "66".repeat(32),
                 },

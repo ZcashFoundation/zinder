@@ -34,6 +34,7 @@ rust-version = "1.100"
 arc-swap = "1.9.5"
 async-trait = "0.1.92"
 blake2b_simd = "1.0.5"
+chacha20 = { version = "0.10.2", default-features = false, features = ["cipher"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base16ct = "1.0.0"
 # Zinder uses the scalar engines; avoid Base64 0.23's default `simd-unsafe` feature.

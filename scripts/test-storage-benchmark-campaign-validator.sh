@@ -990,8 +990,8 @@ write_lifecycle_evidence() {
         canonical_store_identity: "canonical",
         canonical_store_schema_version: 7,
         wallet_store_identity: "wallet",
-        wallet_store_schema_version: 1,
-        wallet_projection_schema_version: 1,
+        wallet_store_schema_version: 2,
+        wallet_projection_schema_version: 2,
         wallet_value_encoding_version: 2
       },
       resource_limits: (
@@ -1097,7 +1097,7 @@ write_lifecycle_evidence() {
         utxo_summary: {
           utxo_count: 0,
           total_value_zat: 0,
-          commitment_scheme: "lthash16",
+          commitment_scheme: "lthash16-chacha12",
           commitment_accumulator_hex: ("00" * 2048),
           commitment_display_digest_hex: ("1" * 64)
         },

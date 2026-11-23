@@ -20,7 +20,7 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestVersion, ChainEpochId,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network, UtxoSetCommitmentScheme,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
@@ -1619,8 +1619,8 @@ impl WalletCheckpointManifest {
             "wallet UTXO commitment SHA-256",
         )?;
         require_manifest_value(
-            self.utxo_commitment_scheme == 1,
-            "wallet UTXO commitment scheme must be 1",
+            self.utxo_commitment_scheme == UtxoSetCommitmentScheme::LtHash16ChaCha12.id(),
+            "wallet UTXO commitment scheme must be 2",
         )?;
         self.row_counts.validate()
     }
@@ -2316,7 +2316,7 @@ mod tests {
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 20] = [
+        let mutations: [(&str, Value); 21] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(1)),
             ("/format_version", Value::from(2)),
@@ -2352,7 +2352,10 @@ mod tests {
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
                 Value::String(hex::encode([0x99; 32])),
             ),
-            ("/wallet_checkpoint/schema_version", Value::from(2)),
+            // Schema 1 and UTXO commitment scheme 1 are the BLAKE2X wallet
+            // format, which this release refuses.
+            ("/wallet_checkpoint/schema_version", Value::from(1)),
+            ("/wallet_checkpoint/utxo_commitment_scheme", Value::from(1)),
             (
                 "/wallet_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),

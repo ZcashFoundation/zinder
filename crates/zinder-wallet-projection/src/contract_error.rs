@@ -53,6 +53,17 @@ pub enum WalletProjectionContractError {
         /// Durable contract being decoded.
         field: &'static str,
     },
+    /// A wallet store was written under a projection schema this release does not read.
+    #[error(
+        "wallet store uses projection schema version {encoded}, and this release reads only \
+         version {supported}; rebuild the wallet store from the canonical store"
+    )]
+    UnsupportedWalletProjectionSchemaVersion {
+        /// Schema version the store records.
+        encoded: u64,
+        /// The only schema version this release reads.
+        supported: u16,
+    },
     /// A durable numeric discriminator is unsupported by version 1.
     #[error("{field} has unsupported encoded value {encoded}")]
     UnsupportedEncodedValue {
@@ -173,8 +184,8 @@ pub enum WalletProjectionContractError {
     /// Version 1 accepts only canonical sequence digest version 1.
     #[error("wallet source sequence digest must use version 1")]
     ReadySourceSequenceVersionMismatch,
-    /// Version 1 requires an `LtHash16` UTXO commitment.
-    #[error("wallet readiness requires the LtHash16 UTXO commitment scheme")]
+    /// Readiness requires the `LtHash16` UTXO commitment with `ChaCha12` expansion.
+    #[error("wallet readiness requires UTXO commitment scheme 2 (LtHash16, ChaCha12 expansion)")]
     ReadyUtxoCommitmentSchemeMismatch,
     /// A persisted build lease uses an unsupported lease encoding version.
     #[error("wallet projection build lease has unsupported version {encoded}")]

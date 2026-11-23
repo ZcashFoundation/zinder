@@ -34,7 +34,10 @@ pub use rows::{
 pub use serial_oracle::WalletProjectionSerialOracle;
 
 /// Physical wallet schema version under the clean `wallet` identity.
-pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
+///
+/// Version 2 holds accumulator version 2 and UTXO commitment scheme 2. A store
+/// or state bundle of version 1 is refused and must be rebuilt.
+pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 2;
 
 /// Wallet projection row-value encoding version with source-bound reorg undo.
 pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;
