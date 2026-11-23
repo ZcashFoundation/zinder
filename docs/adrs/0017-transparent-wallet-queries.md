@@ -101,22 +101,29 @@ Method responses and pinning rules are in
 - Every wallet transition pays one expansion per changed row and one per
   changed output, and cold validation pays one per stored row and one per
   unspent output.
-- The commitment's security rests on a heuristic. Zinder treats a public
-  ChaCha12 stream keyed by a BLAKE2b root as a random function of the
-  element, and nothing proves that this composition gives LtHash16 a 128-bit
-  guarantee. Two elements with equal roots under one personalization
-  produce equal lanes. For an ideal 352-bit root, finding such a pair takes
-  about 2^176 trials.
-- LtHash16 itself is weaker than first estimated. Lewi, Kim, Maykov, and
-  Weis estimated at least 200 bits of collision security for 1,024 16-bit
-  lanes ([ePrint 2019/227](https://eprint.iacr.org/2019/227)). Ding, Gong,
-  Jiang, and Tang give a collision attack on unrestricted sets with these
+- The security of both accumulators rests on a heuristic. Zinder treats
+  ChaCha12 keyed by a public BLAKE2b root as a random function of the
+  element. With an ideal ChaCha permutation in place of the 12-round one,
+  this hash-then-expand construction behaves like a random oracle up to the
+  root's birthday bound; that argument comes from the project's security
+  review, not from a published result. Nothing proves a 128-bit guarantee
+  for the concrete 12-round permutation.
+- LtHash16 is weaker than first estimated. Lewi, Kim, Maykov, and Weis
+  estimated at least 200 bits of collision security for 1,024 16-bit lanes
+  ([ePrint 2019/227](https://eprint.iacr.org/2019/227)). Ding, Gong, Jiang,
+  and Tang give a collision attack on unrestricted sets with these
   parameters that needs about 2^81 element hashes
-  ([ePrint 2026/2083](https://eprint.iacr.org/2026/2083)). Its colliding
-  sets hold at least 550^8, about 2^72.8, distinct elements. Row and UTXO
-  counts are checked 64-bit values, so two READY states hold fewer than 2^68
-  rows together. That rules out this attack's witness, but not a smaller one.
-  Changing the lane count or width changes the problem and needs its own
+  ([ePrint 2026/2083](https://eprint.iacr.org/2026/2083)). Its colliding sets
+  hold at least 550^8, about 2^72.8, distinct elements.
+- Zinder's stores bound that attack. Row and UTXO counts are checked 64-bit
+  values, so two READY states hold fewer than 2^68 rows together, and keys
+  are unique, so no element repeats. The attack's witness cannot fit. For
+  sets this small, the cheapest known LtHash16 attack is a generalized
+  birthday search of about 2^181 hashes (same paper). The binding generic
+  limit is then the birthday bound of the hashes Zinder compares: 2^128 for
+  the 32-byte display digests and manifest hashes, and 2^176 for the full
+  accumulators, whose elements are expanded from 352-bit roots.
+- Changing the lane count or width changes the problem and needs its own
   analysis.
 - The commitment is not comparable with zcashd's `gettxoutsetinfo`, which
   excludes unspendable outputs and hashes the set in a fixed order.
@@ -141,10 +148,14 @@ Method responses and pinning rules are in
   family measured, including CPUs without AVX-512 and Arm.
 - **BLAKE3 output expansion.** Its output is fast only with AVX-512. On AVX2
   and Arm CPUs it is little faster than BLAKE2X.
-- **ChaCha8 or ChaCha20.** ChaCha8 leaves half a round of margin over
-  published 7.5-round analyses in a setting where the key is public. ChaCha20
-  costs about 40% more per element than ChaCha12, and more rounds do not
-  raise the LtHash16 bound above.
+- **ChaCha8 or ChaCha20.** ChaCha8 leaves half a round of margin over the
+  published 7.5-round attacks on the cipher, in a setting where the key is
+  public. Eight rounds are already reached by inside-out distinguishers on
+  the ChaCha permutation (Neves and Araújo, Information Processing Letters
+  149, 2019) and by a related-key attack on ChaCha8
+  ([ePrint 2025/2334](https://eprint.iacr.org/2025/2334)). ChaCha20 costs
+  about 45% more per element than ChaCha12, and more rounds do not raise the
+  LtHash16 bound above.
 - **One expansion per unspent output for both accumulators, or a commitment
   taken from the row digest.** The durable row and the commitment element
   encode different fields. Sharing one expansion either hides row-only

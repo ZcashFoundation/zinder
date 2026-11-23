@@ -165,6 +165,53 @@ mod tests {
         );
     }
 
+    /// Checks `ChaCha12` blocks alone, without a root, for the RFC 8439
+    /// section 2.3.2 key and nonce.
+    ///
+    /// The vectors come from `reference_expansion.py` in the accumulator scheme
+    /// evidence. Both the product stream and the reference block function in
+    /// this module must reproduce them at counters 0, 1, and 31.
+    #[test]
+    fn chacha12_blocks_match_independent_vectors() {
+        let key: [u8; 32] = core::array::from_fn(|index| u8::try_from(index).unwrap_or(0));
+        let nonce = [0, 0, 0, 0x09, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut keystream = ChaChaCore::<ExpansionRounds, Ietf>::new(&key.into(), &nonce.into());
+        let mut stream = [0u8; LTHASH16_EXPANSION_LEN];
+        let (blocks, _) = Array::<u8, U64>::slice_as_chunks_mut(&mut stream);
+        keystream.write_keystream_blocks(blocks);
+        for (counter, expected) in [
+            (
+                0u32,
+                concat!(
+                    "15a783e5ad5e601c5a1d3e3db3e8d2405509bcf1c986967825888dc7fd4b991e",
+                    "e5c8dfb889e3b1ecbe1e474122f60742a28322c85f8390fa8418df439fd50d66",
+                ),
+            ),
+            (
+                1,
+                concat!(
+                    "7f8b136677c73799e3e7777d16e6d8ccc787ce39694990c628e087029ce9190b",
+                    "da4be31ac3fe2102a9ad737cf82fa3b06e68b63371c65c827299040ade1ba8a0",
+                ),
+            ),
+            (
+                31,
+                concat!(
+                    "2011bf5609dfc6d8c65fb4d9840971f36e8f9851910f29821aaa6269cacd89aa",
+                    "cc3d006436a0ecbc05eb6f1edd8acf89a918861c3e963010bbb06e10e3e09e0b",
+                ),
+            ),
+        ] {
+            let index = usize::try_from(counter).unwrap_or(usize::MAX);
+            assert_eq!(block(&stream, index), expected, "product block {counter}");
+            assert_eq!(
+                hex::encode(reference_chacha_block(&key, counter, &nonce, 12)),
+                expected,
+                "reference block {counter}"
+            );
+        }
+    }
+
     #[test]
     fn expansion_matches_the_reference_in_every_block() {
         let personalizations = [
