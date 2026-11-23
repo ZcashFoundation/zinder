@@ -914,13 +914,13 @@ impl RocksDbCanonicalStore {
         if !exists {
             return Ok(None);
         }
-        let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+        let mut column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
             CanonicalStoreError::admission(
                 path,
                 format!("column-family discovery failed: {source}"),
             )
         })?;
-        validate_exact_column_families(path, &column_families)?;
+        validate_exact_column_families(path, &mut column_families)?;
         let bounded_open = open_bounded_rocksdb_read_only_probe(
             path,
             &column_families,
@@ -1219,10 +1219,10 @@ fn open_canonical_admission_probe(
     path: &Path,
     resource_budget: RocksDbResourceBudget,
 ) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
-    let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+    let mut column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
     })?;
-    validate_exact_column_families(path, &column_families)?;
+    validate_exact_column_families(path, &mut column_families)?;
     open_bounded_rocksdb_read_only_probe(path, &column_families, resource_budget).map_err(
         |source| CanonicalStoreError::admission(path, format!("read-only open failed: {source}")),
     )

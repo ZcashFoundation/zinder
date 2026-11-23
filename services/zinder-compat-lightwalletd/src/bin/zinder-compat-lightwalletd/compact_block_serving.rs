@@ -133,6 +133,21 @@ impl CompactServingReadiness {
         self.inputs.canonical_admission().publish_admission(storage);
     }
 
+    fn begin_refresh(&self, attestation: &mut WriterAttestation, reader: &RocksDbCanonicalReader) {
+        if self.requires_writer_schedule {
+            self.inputs.begin_canonical_refresh(
+                attestation,
+                reader.event_fence().visible_tip().height.value(),
+            );
+        }
+    }
+
+    fn confirm_attestation(&self) {
+        if self.requires_writer_schedule {
+            self.inputs.confirm_canonical_attestation();
+        }
+    }
+
     fn accepts_reader_schedule(
         &self,
         status: &CanonicalWriterStatusResponse,
@@ -347,10 +362,8 @@ impl CompactBlockPublisher {
     )]
     async fn refresh_once(&mut self, shutdown: &CancellationToken) {
         let active = self.slot.capture();
-        self.readiness.inputs.begin_canonical_refresh(
-            &mut self.writer_attestation,
-            active.event_fence().visible_tip().height.value(),
-        );
+        self.readiness
+            .begin_refresh(&mut self.writer_attestation, &active);
         let status = tokio::select! {
             biased;
             () = shutdown.cancelled() => return,
@@ -403,7 +416,7 @@ impl CompactBlockPublisher {
             let visible_height = Some(active.event_fence().visible_tip().height.value());
             let Some(behind) = behind else {
                 self.writer_attestation.attest();
-                self.readiness.inputs.confirm_canonical_attestation();
+                self.readiness.confirm_attestation();
                 self.readiness
                     .publish_storage(ReadinessState::ready(visible_height));
                 return;
@@ -542,7 +555,7 @@ impl CompactBlockPublisher {
             .observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             self.writer_attestation.attest();
-            self.readiness.inputs.confirm_canonical_attestation();
+            self.readiness.confirm_attestation();
         }
         self.readiness.publish_storage(
             refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),

@@ -399,14 +399,14 @@ impl RawBlobRetention {
 
 pub(super) fn validate_exact_column_families(
     path: &Path,
-    observed: &[String],
+    observed: &mut [String],
 ) -> Result<(), CanonicalStoreError> {
-    let mut observed = observed.iter().map(String::as_str).collect::<Vec<_>>();
     observed.sort_unstable();
-    let mut expected = Vec::from(CANONICAL_DATA_COLUMN_FAMILIES);
-    expected.push(DEFAULT_COLUMN_FAMILY_NAME);
+    let mut expected = [DEFAULT_COLUMN_FAMILY_NAME; CANONICAL_DATA_COLUMN_FAMILIES.len() + 1];
+    expected[..CANONICAL_DATA_COLUMN_FAMILIES.len()]
+        .copy_from_slice(&CANONICAL_DATA_COLUMN_FAMILIES);
     expected.sort_unstable();
-    if observed != expected {
+    if !observed.iter().map(String::as_str).eq(expected) {
         return Err(CanonicalStoreError::admission(
             path,
             format!(

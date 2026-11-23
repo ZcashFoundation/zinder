@@ -265,7 +265,7 @@ impl RocksDbCanonicalSecondary {
                 operation: "initial canonical secondary catch-up",
                 source,
             })?;
-        validate_exact_column_families(&primary_path, &bounded_open.db.cf_names())?;
+        validate_exact_column_families(&primary_path, &mut bounded_open.db.cf_names())?;
         let opened_control =
             validate_open_store_control(&bounded_open.db, &primary_path, expectation)?;
         validate_mempool_lifecycle_admission(
@@ -435,7 +435,7 @@ impl RocksDbCanonicalSecondary {
                 operation: "canonical secondary catch-up",
                 source,
             })?;
-        validate_exact_column_families(&self.primary_path, &self.bounded_open.db.cf_names())?;
+        validate_exact_column_families(&self.primary_path, &mut self.bounded_open.db.cf_names())?;
         let opened_control = validate_open_store_control(
             &self.bounded_open.db,
             &self.primary_path,
@@ -451,7 +451,8 @@ impl RocksDbCanonicalSecondary {
                 path: self.primary_path.clone(),
             });
         };
-        self.validate_catch_up_identity(&opened_control, &ready_evidence)?;
+        let ready_changed = ready_evidence != self.ready_evidence;
+        self.validate_catch_up_identity(&opened_control, &ready_evidence, ready_changed)?;
         if ready_evidence.visible_event_sequence < self.ready_evidence.visible_event_sequence {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
@@ -459,7 +460,7 @@ impl RocksDbCanonicalSecondary {
             ));
         }
         if ready_evidence.visible_event_sequence == self.ready_evidence.visible_event_sequence
-            && ready_evidence != self.ready_evidence
+            && ready_changed
         {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
@@ -468,7 +469,7 @@ impl RocksDbCanonicalSecondary {
         }
         // Unchanged READY evidence is still explained by the tail this reader
         // already authenticated; otherwise re-derive only what changed.
-        if ready_evidence != self.ready_evidence {
+        if ready_changed {
             follow_ready_replay_tail(
                 &self.bounded_open.db,
                 self.reorg_policy,
@@ -507,6 +508,7 @@ impl RocksDbCanonicalSecondary {
         &self,
         opened_control: &super::control::DecodedStoreControl,
         ready_evidence: &CanonicalStoreReadyEvidence,
+        ready_changed: bool,
     ) -> Result<(), CanonicalStoreError> {
         if opened_control.build_plan != self.build_plan {
             return Err(CanonicalStoreError::admission(
@@ -514,10 +516,11 @@ impl RocksDbCanonicalSecondary {
                 "canonical build identity changed during secondary catch-up",
             ));
         }
-        if ready_evidence.construction_manifest_version
-            != self.ready_evidence.construction_manifest_version
-            || ready_evidence.construction_manifest_sha256
-                != self.ready_evidence.construction_manifest_sha256
+        if ready_changed
+            && (ready_evidence.construction_manifest_version
+                != self.ready_evidence.construction_manifest_version
+                || ready_evidence.construction_manifest_sha256
+                    != self.ready_evidence.construction_manifest_sha256)
         {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
@@ -685,11 +688,11 @@ impl RocksDbCanonicalSecondary {
 fn require_exact_primary_column_family_metadata(
     primary_path: &Path,
 ) -> Result<(), CanonicalStoreError> {
-    let observed = DB::list_cf(&Options::default(), primary_path).map_err(|source| {
+    let mut observed = DB::list_cf(&Options::default(), primary_path).map_err(|source| {
         CanonicalStoreError::admission(
             primary_path,
             format!("canonical column-family metadata discovery failed: {source}"),
         )
     })?;
-    validate_exact_column_families(primary_path, &observed)
+    validate_exact_column_families(primary_path, &mut observed)
 }
