@@ -439,6 +439,16 @@ volume or store paths, and wait for the required runtimes to report
 `/readyz` before routing wallet traffic to them. See
 [Schema admission](../architecture/storage-backend.md#schema-admission).
 
+When replacing a canonical store at the same path, restart the readers if the
+workload, raw-blob retention, first retained block height, subtree-root
+coverage mode, or either pool's first retained subtree-root index changes.
+If the replacement passes normal admission but differs from the pinned
+layout, compact-blocks and light-wallet compatibility report
+`schema_mismatch`, and native query and wallet-mode compatibility report
+`storage_unavailable`. Restarting admits the new layout if it meets the
+reader's requirements. See
+[Canonical store replacement](../reference/readiness.md#canonical-store-replacement).
+
 If the deployment needs a fallback, keep the previous binaries or images and
 their matching store before the upgrade. Keep that store separate from the
 one the new release uses.

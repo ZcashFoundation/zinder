@@ -10,7 +10,7 @@
 
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
 use zinder_compat_lightwalletd::CanonicalReaderSlot;
@@ -38,6 +38,7 @@ use zinder_store::{
 
 const GENERATION_COUNT: usize = 2;
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
+const STORED_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompactBlockServingError {
@@ -241,6 +242,7 @@ pub(crate) struct CompactBlockPublisher {
     slot: CanonicalReaderSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalReader>>,
+    stored_set_retry_at: Option<Instant>,
     /// Both generations use this cache and statistics base so retirement preserves
     /// the blocks and read counts from the replaced generation.
     resources: SharedSecondaryResources,
@@ -309,6 +311,7 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
+            stored_set_retry_at: None,
             resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
@@ -409,18 +412,25 @@ impl CompactBlockPublisher {
             CanonicalFenceRelation::SecondaryBehind(behind) => Some(behind),
         };
         let lag = behind.map_or(0, |behind| behind.lag_chain_epochs);
-        if self
-            .readiness
-            .observe_reader_schedule(&self.writer_attestation, &status, &active)
-        {
-            let visible_height = Some(active.event_fence().visible_tip().height.value());
-            let Some(behind) = behind else {
-                self.writer_attestation.attest();
-                self.readiness.confirm_attestation();
-                self.readiness
-                    .publish_storage(ReadinessState::ready(visible_height));
+        let accepts_active_schedule =
+            self.readiness
+                .observe_reader_schedule(&self.writer_attestation, &status, &active);
+        let visible_height = Some(active.event_fence().visible_tip().height.value());
+        if accepts_active_schedule && behind.is_none() {
+            self.stored_set_retry_at = None;
+            self.writer_attestation.attest();
+            self.readiness.confirm_attestation();
+            self.readiness
+                .publish_storage(ReadinessState::ready(visible_height));
+            return;
+        }
+        if let Some(retry_at) = self.stored_set_retry_at {
+            self.readiness
+                .publish_storage(ReadinessState::not_ready(ReadinessCause::SchemaMismatch));
+            if Instant::now() < retry_at {
                 return;
-            };
+            }
+        } else if let Some(behind) = behind.filter(|_| accepts_active_schedule) {
             if lag <= self.config.lag_threshold {
                 self.readiness
                     .publish_storage(ReadinessState::ready_with_target(
@@ -531,7 +541,9 @@ impl CompactBlockPublisher {
                 return;
             }
         };
-        let admitted = admit_generation(candidate, Some(active.secondary().stored_set())).await;
+        let stored_set = active.secondary().stored_set();
+        let stored_set_changed = candidate.stored_set() != stored_set;
+        let admitted = admit_generation(candidate, Some(stored_set)).await;
         if shutdown.is_cancelled() {
             close_unpublished_generation(admitted.ok()).await;
             return;
@@ -539,6 +551,10 @@ impl CompactBlockPublisher {
         let reader = match admitted {
             Ok(reader) => reader,
             Err(error) => {
+                if stored_set_changed {
+                    self.writer_attestation.withdraw_allowance();
+                    self.stored_set_retry_at = Some(Instant::now() + STORED_SET_RETRY_DELAY);
+                }
                 let cause = if matches!(error, CompactBlockServingError::Storage(_)) {
                     ReadinessCause::SchemaMismatch
                 } else {
@@ -549,6 +565,7 @@ impl CompactBlockPublisher {
                 return;
             }
         };
+        self.stored_set_retry_at = None;
         let reader = Arc::new(reader);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
@@ -3087,6 +3104,65 @@ mod tests {
         cancel.cancel();
         probe.await?;
         control.shutdown().await?;
+        harness.stop().await
+    }
+
+    #[tokio::test]
+    async fn a_checkpointed_replacement_backs_off_cold_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(3);
+        let baseline = zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2));
+        let mut harness = LongRangeHarness::start(&baseline).await?;
+        let original = harness.slot.capture();
+        let mut replacement = zinder_testkit::CanonicalWriterFixture::publish(
+            &baseline.with_history_floor(BlockHeight::new(2)),
+            &zinder_testkit::sample_regtest_upgrade_activations(),
+        )?;
+        replacement.append_live_block(&chain)?;
+        harness.publisher.config.canonical_primary_path =
+            replacement.canonical_primary_path().to_path_buf();
+        harness
+            .control
+            .set_writer_status(lifecycle_writer_status(replacement.canonical_primary()?));
+
+        let candidate = harness
+            .publisher
+            .config
+            .canonical_secondary_root
+            .join("generation-1");
+        harness.publisher.refresh().await;
+        assert_eq!(
+            harness.readiness.report().cause,
+            ReadinessCause::SchemaMismatch
+        );
+        assert!(Arc::ptr_eq(&original, &harness.slot.capture()));
+        std::fs::remove_dir_all(&candidate)?;
+
+        for _ in 0..3 {
+            harness.publisher.refresh().await;
+            assert!(
+                !candidate.exists(),
+                "a refresh reopened the refused generation"
+            );
+            assert_eq!(
+                harness.readiness.report().cause,
+                ReadinessCause::SchemaMismatch
+            );
+        }
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        harness.publisher.refresh().await;
+        assert!(candidate.is_dir(), "the replacement was not retried");
+        assert_eq!(
+            harness.readiness.report().cause,
+            ReadinessCause::SchemaMismatch
+        );
+        assert!(Arc::ptr_eq(&original, &harness.slot.capture()));
+
+        drop(original);
         harness.stop().await
     }
 

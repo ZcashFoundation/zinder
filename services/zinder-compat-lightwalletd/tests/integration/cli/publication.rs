@@ -28,7 +28,10 @@ fn history_publisher_prints_its_effective_configuration() -> Result<()> {
         shipped["storage"]["raw_blob_policy"].as_str(),
         Some("transactions")
     );
-    assert_eq!(shipped["compat"]["serving"].as_str(), Some("compact-blocks"));
+    assert_eq!(
+        shipped["compat"]["serving"].as_str(),
+        Some("compact-blocks")
+    );
     let render = |path: &Path, setup: &[(&str, &str)]| {
         super::zinder_compat_command()
             .args(["--print-config", "--config"])

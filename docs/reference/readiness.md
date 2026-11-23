@@ -348,6 +348,22 @@ schedule and reports the `node_source` and `ingest_control` dependencies under
 `degraded`. Compact-blocks declares neither dependency. See
 [During a node outage](#during-a-node-outage) for how degradation affects calls.
 
+### Canonical store replacement
+
+Readers pin the canonical stored set they admit at startup. A replacement
+with a different workload, raw-blob retention, first retained block height,
+subtree-root coverage mode, or first retained subtree-root index for either
+pool cannot take over while the reader is running. Compact-blocks and
+light-wallet compatibility report `schema_mismatch` when a replacement
+passes normal admission and then fails the pin. Native query and wallet-mode
+compatibility report `storage_unavailable` for that refusal.
+
+After a stored-set refusal, the reader keeps checking writer status on its
+normal cadence and waits at least 30 seconds before trying another cold open.
+Restart the reader to adopt the new stored set. The replacement still has to
+meet the reader's configured minimum, writer attestation, and, for paired
+readers, wallet projection admission.
+
 ### Explorer
 
 Explorer is ready once its API starts and, with a materialized-view store,

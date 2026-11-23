@@ -115,6 +115,7 @@ const SECONDARY_GENERATION_COUNT: usize = 4;
 /// the read then fails, retryably, and later reads use the replacement.
 const MISSING_TABLE_FILE_REPLACEMENT_WAIT: Duration = Duration::from_secs(5);
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
+const STORED_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
 /// Immutable configuration for the bounded secondary-pair lifecycle.
@@ -1126,6 +1127,7 @@ pub struct WalletServingPairPublisher {
     readiness: WalletServingReadiness,
     serving_pair_slot: Option<WalletServingPairSlot>,
     admitted_stored_set: Option<CanonicalStoredSet>,
+    stored_set_retry_at: Option<Instant>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
     /// Closing a generation preserves both its cached blocks and its contribution
     /// to the store's cumulative tickers.
@@ -1205,6 +1207,7 @@ impl WalletServingPairPublisher {
             readiness,
             serving_pair_slot: None,
             admitted_stored_set: None,
+            stored_set_retry_at: None,
             generations,
             store_resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
@@ -1344,6 +1347,12 @@ impl WalletServingPairPublisher {
         };
         if !needs_generation {
             self.end_generation_wait("interrupted");
+            return Ok(());
+        }
+        if self
+            .stored_set_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
             return Ok(());
         }
 
@@ -1934,6 +1943,11 @@ impl WalletServingPairPublisher {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
         let admitted_stored_set = self.admitted_stored_set;
+        if admitted_stored_set.is_some_and(|expected| candidate.canonical.stored_set() != expected)
+        {
+            self.writer_attestation.withdraw_allowance();
+            self.stored_set_retry_at = Some(Instant::now() + STORED_SET_RETRY_DELAY);
+        }
         let (pair, readers) = tokio::task::spawn_blocking(move || {
             if let Some(expected) = admitted_stored_set {
                 candidate.canonical.require_stored_set(expected)?;
@@ -1952,6 +1966,7 @@ impl WalletServingPairPublisher {
         })
         .await
         .map_err(WalletServingPairError::CandidateTask)??;
+        self.stored_set_retry_at = None;
         if let Some(slot) = &self.serving_pair_slot {
             let now = Instant::now();
             let released = slot.publish(Arc::clone(&pair), now);
@@ -2050,10 +2065,17 @@ impl WalletServingPairPublisher {
                 ) =>
             {
                 record_replica_lag(0);
-                self.writer_attestation.attest();
                 self.observed_lag_chain_epochs = 0;
-                self.readiness
-                    .publish_pair_state(ReadinessState::ready(visible_height));
+                if self.stored_set_retry_at.is_some() && active_pair.has_missing_table_file() {
+                    self.readiness.publish_pair_state(ReadinessState::not_ready(
+                        ReadinessCause::StorageUnavailable,
+                    ));
+                } else {
+                    self.stored_set_retry_at = None;
+                    self.writer_attestation.attest();
+                    self.readiness
+                        .publish_pair_state(ReadinessState::ready(visible_height));
+                }
                 return Ok(ActiveWriterRelation::Exact);
             }
             // A writer restart can admit a new schedule revision without moving
@@ -2069,7 +2091,11 @@ impl WalletServingPairPublisher {
         let lag = behind.lag_chain_epochs;
         record_replica_lag(lag);
         self.observed_lag_chain_epochs = lag;
-        if lag > self.config.replica_lag_threshold_chain_epochs {
+        if self.stored_set_retry_at.is_some() {
+            self.readiness.publish_pair_state(ReadinessState::not_ready(
+                ReadinessCause::StorageUnavailable,
+            ));
+        } else if lag > self.config.replica_lag_threshold_chain_epochs {
             self.readiness.publish_pair_state(
                 self.stale_serving_pair_readiness(visible_height)
                     .unwrap_or_else(|| ReadinessState::replica_lagging(lag, visible_height)),
@@ -7013,10 +7039,13 @@ mod tests {
             paths.path().join("wallet-secondaries"),
         )?;
         config.canonical_reorg_policy = reorg;
+        // A lag within the normal allowance must not reopen the refused pair.
+        config.replica_lag_threshold_chain_epochs = u64::MAX;
+        let readiness = zinder_runtime::Readiness::default();
         let (mut publisher, slot) =
             WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                 config,
-                WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
+                WalletServingReadiness::pair_only(readiness.clone()),
                 &writer_control.endpoint,
                 None,
             )
@@ -7037,13 +7066,22 @@ mod tests {
         publisher.config.canonical_primary_path = replacement.canonical_primary_path().to_owned();
         publisher.config.wallet_primary_path = replacement_wallet;
         control.set_writer_status(writer_status_for_store(replacement_primary));
-        let refresh = publisher.refresh_once().await;
-        assert!(
-            matches!(&refresh, Err(WalletServingPairError::Canonical(
-                CanonicalStoreError::AdmissionRefused { reason, .. }
-            )) if reason.contains("stored set changed")),
-            "unexpected refresh result: {refresh:?}"
-        );
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        assert_eq!(publisher.candidate_preparations.cold, 2);
+
+        for _ in 0..3 {
+            publisher.refresh_and_record().await;
+            assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+            assert_eq!(publisher.candidate_preparations.cold, 2);
+        }
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert_eq!(publisher.candidate_preparations.cold, 3);
         assert!(Arc::ptr_eq(&original, &slot.capture()));
         query.full_block_at(first_height, None).await?;
         writer_control.shutdown().await
