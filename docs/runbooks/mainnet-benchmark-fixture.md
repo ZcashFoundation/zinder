@@ -16,13 +16,17 @@ defines that file. Each fixture records:
   built the stores;
 - for each component, the snapshot name, the disk size, the mount path, the
   paths of the stores or node state on it, and the SHA-256 of a sorted
-  `sha256sum` listing of its files.
+  `sha256sum` listing of its files;
+- for the component that holds a signed history catalog, a `signed_history`
+  entry: the publisher directory, the publisher key, the SHA-256 of the
+  catalog's `current.json` and of the key, the segment count, and the highest
+  height the catalog covers.
 
 | Component kind | Holds |
 | --- | --- |
 | `node-state` | Zebra state at the fixture tip, including the persisted non-finalized blocks. |
 | `stores` | The canonical and wallet RocksDB stores, closed. |
-| `catalog` | A signed history catalog generation on an fs-verity ext4 disk, with its benchmark-only publisher key. |
+| `catalog` | A signed history catalog generation on an fs-verity ext4 disk, with its benchmark-only publisher key. A `stores` component can carry the catalog instead. |
 | `oracle` | Recorded wallet responses that a restored reader must reproduce. |
 
 A fixture is tied to one store schema. A release that changes the canonical
@@ -82,24 +86,65 @@ The script performs these steps:
    token, and checks the stage and binary hashes. The guest steps run from
    the stage, so the stage SHA-256 in the receipt identifies the code that
    ran.
-5. It mounts each component. With `--verify-hashes stores` or `all`, it reads
-   every listed file and compares it with the component's listing. The
-   listing itself must match the SHA-256 in `fixture.json`. This read also
-   fetches every block of the restored disk, so later timings do not include
-   first-read latency.
-6. It starts Zebra with no peers, then ingest, projector, query, and
+5. It mounts each component, with `catalog` and `oracle` disks read-only.
+   With `--verify-hashes stores` or `all`, it reads every listed file and
+   compares it with the component's listing. The listing itself must match
+   the SHA-256 in `fixture.json`. This read also fetches every block of the
+   restored disk, so later timings do not include first-read latency.
+6. When the fixture describes a signed history catalog, it checks the
+   catalog's `current.json` and publisher key against the SHA-256 values in
+   `fixture.json`, whatever `--verify-hashes` is set to.
+7. It starts Zebra with no peers, then ingest, projector, query, and
    lightwalletd compatibility, with fresh control tokens and a fresh
-   projector owner identity.
-7. It waits for the compatibility reader's `/readyz`. It then checks that
+   projector owner identity. With a catalog, the compatibility reader
+   follows the publisher directory and trusts only the fixture's key, as
+   single-host Compose configures it. It requires fs-verity on every segment
+   when the component's filesystem is `ext4-verity`.
+8. It waits for the compatibility reader's `/readyz`. It then checks that
    `GetLatestBlock` returns the fixture's visible height and hash, and records
    a fixed set of wallet responses.
-8. It writes a JSON receipt with each step's start time, the profile, the
-   stage and fixture hashes, the served tip, and the wallet sample digest.
+9. With a catalog, it runs the route check described below.
+10. It writes a JSON receipt with each step's start time, the profile, the
+    stage and fixture hashes, the served tip, the wallet sample digest, and
+    the route check result.
 
-The restored compatibility reader serves from the canonical and wallet
-stores. The script does not yet configure it with a signed catalog
-generation. A `catalog` component is mounted and hash-checked, but block
-ranges are not served from it.
+A fixture without a `signed_history` entry restores as before: the reader
+serves every block range from the canonical store, the guest log says so, and
+the receipt's `signed_history` is `null`. The preflight refuses a fixture that
+has a `catalog` component, or a component path named `catalog` or
+`publisher_key`, without a `signed_history` entry. Such a restore would serve
+from canonical storage while every other check passed.
+
+### Route check
+
+Identical wallet responses do not show which route served them, so the
+restore checks the route directly, using signals the reader already exposes.
+It passes when all of these hold:
+
+- **Admission.** The reader process holds one open file for each of the
+  catalog's segments, and the count equals `signed_history.segment_count`.
+- **Covered ranges.** `GetBlockRange` over heights 1,730,000 to 1,730,099
+  (for a catalog that ends below them, the 100 heights before its last 100),
+  and over the 100 heights that end at the catalog's highest height, returns
+  every height. Segment file pages, evicted from the page cache before each
+  request, are read again. The canonical secondary's MultiGet and iterator
+  read counters do not change. The 1,730,000 range's response equals the
+  wallet sample's copy, which the fixture's sample digest pins.
+- **Uncovered range.** The 100 heights above the catalog's highest height add
+  canonical MultiGet reads, which shows that the counters catch a canonical
+  read.
+- **Trust identity.** The same reader configuration with a different, valid
+  publisher key exits before it serves, with `shielded range manifest
+  signature verification failed`.
+
+The counters reach `/metrics` only when the wallet serving pair refreshes,
+about once a second, so each request is bracketed by two refreshes. The
+catalog follower also makes a few canonical point lookups when it checks its
+anchor. The check reports them, with an idle interval for comparison, but
+does not count them as block reads.
+
+If any part fails, the guest writes `restore-receipt.json.failed` with the
+check's report, and the restore exits with an error.
 
 | Profile | Component disk IOPS | Component disk throughput |
 | --- | --- | --- |
@@ -112,12 +157,16 @@ the load client.
 
 ## Check the result
 
-The script exits with an error if any check fails. On success, the receipt
-shows the served tip and `wallet_sample_matches_fixture`:
+The script exits with an error if any check fails, and keeps any partial
+guest receipt beside the receipt path with a `.failed` suffix. On success,
+the receipt shows the served tip, `wallet_sample_matches_fixture`, and the
+route check:
 
 ```bash
 jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip,
-  wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture}' \
+  wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture,
+  open_segment_files: .guest.signed_history.admission.open_segment_files,
+  highest_height_served_from_segments: .guest.signed_history.highest_height_served_from_segments}' \
   restore-receipt-zfx-bench-1.json
 ```
 

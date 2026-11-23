@@ -5,7 +5,9 @@
 # /tmp/zfx-stage. Mounts each fixture component, checks file hashes, starts a
 # frozen node and the four Zinder services with pinned CPUs, waits for the
 # lightwalletd-compatible reader, checks a wallet response against the
-# fixture's chain fence, and writes a receipt.
+# fixture's chain fence, and writes a receipt. When a component declares
+# signed_history, the reader serves from that catalog and route-check.py must
+# prove it before the receipt is written.
 set -euo pipefail
 fixture=$1 verify=$2 receipt=$3
 stage=/tmp/zfx-stage
@@ -40,7 +42,10 @@ jq -c '.components[]' "$fixture" | while read -r c; do
   dev=/dev/disk/by-id/google-$name
   [[ -e $dev ]] || { log "component $name has no attached disk at $dev"; exit 1; }
   install -d "$dir"
-  mountpoint -q "$dir" || mount -o noatime "$dev" "$dir"
+  # Catalog and oracle disks are only read. Hyperdisk Balanced attaches
+  # read-write, so the mount itself keeps them unchanged.
+  opts=noatime; [[ $(jq -r .kind <<< "$c") == catalog || $(jq -r .kind <<< "$c") == oracle ]] && opts=ro,noload
+  mountpoint -q "$dir" || mount -o "$opts" "$dev" "$dir"
 done
 
 mark verify_hashes
@@ -65,6 +70,30 @@ if [[ $verify != none ]]; then
       || { log "file hashes under $dir differ from $listing"; exit 1; }
     verified+=("$(jq -r .name <<< "$c")")
   done < <(jq -c '.components[]' "$fixture")
+fi
+
+mark check_history
+history=$(jq -c 'first(.components[] | select(.signed_history)) // empty' "$fixture")
+history_dir="" history_key="" history_verity=false
+if [[ -n $history ]]; then
+  mnt=$(jq -r .mount_path <<< "$history")
+  history_dir=$mnt/$(jq -r .signed_history.directory <<< "$history")
+  history_key=$mnt/$(jq -r .signed_history.publisher_key <<< "$history")
+  [[ $(jq -r .filesystem <<< "$history") == ext4-verity ]] && history_verity=true
+  [[ -s $history_dir/.publisher-head.json ]] \
+    || { log "signed history directory $history_dir has no publisher checkpoint"; exit 1; }
+  for pair in "$history_dir/current.json manifest_sha256" "$history_key publisher_key_sha256"; do
+    file=${pair% *} want=$(jq -r ".signed_history.${pair#* }" <<< "$history")
+    got=$(sha256sum "$file" | cut -d' ' -f1)
+    [[ $got == "$want" ]] || { log "$file is $got, fixture records $want"; exit 1; }
+  done
+  # A writable component may hold root-owned files; the reader runs as the service user.
+  [[ $(jq -r .kind <<< "$history") == catalog ]] || chown -R zinder:zinder "$history_dir" "$history_key"
+  unreadable=$(runuser -u zinder -- find "$history_dir" "$history_key" -maxdepth 1 ! -readable -print 2>&1 || true)
+  [[ -z $unreadable ]] || { log "the service user cannot read ${unreadable%%$'\n'*}"; exit 1; }
+  log "reader will serve signed history from $history_dir (fs-verity required: $history_verity)"
+else
+  log "fixture declares no signed history; the reader serves every block range from canonical storage"
 fi
 
 mark start_node
@@ -94,6 +123,7 @@ wallet_dir=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.
 # Store snapshots may also be root-owned data; the writers open them read-write.
 chown -R zinder:zinder "$canonical_dir" "$wallet_dir"
 CANONICAL_PATH=$canonical_dir WALLET_PATH=$wallet_dir \
+HISTORY_DIRECTORY=$history_dir HISTORY_PUBLISHER_KEY=$history_key HISTORY_REQUIRE_FS_VERITY=$history_verity \
 REORG_WINDOW_BLOCKS=$(jq -r '.chain.reorg_window_blocks // 1000' "$fixture") \
   /opt/zfx/stack.sh fixture "$stores/.zfx-run" "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" 0 /run/zebra-cookie/.cookie >&2
 chown zinder:zinder "$stores/.zfx-run"
@@ -119,6 +149,28 @@ sample_digest=$(sha256sum /var/log/zfx/wallet-sample/SHA256SUMS | cut -d' ' -f1)
 want_sample=$(jq -r '.wallet_sample.sha256sums_sha256 // empty' "$fixture")
 sample_ok=true
 [[ -z $want_sample || $sample_digest == "$want_sample" ]] || sample_ok=false
+
+route=null route_ok=true
+if [[ -n $history ]]; then
+  mark route_check
+  # The sample's 100-block range is the covered probe when the catalog holds
+  # it, so its signed-segment response must equal the fixture's recorded bytes.
+  highest=$(jq -r .signed_history.highest_height <<< "$history")
+  covered=1730000:1730099 reference=(--reference /var/log/zfx/wallet-sample/block-range-1730000-1730099.json)
+  (( highest >= 1730099 )) || { covered=$((highest - 199)):$((highest - 100)); reference=(); }
+  /opt/zfx/route-check.py --grpc 127.0.0.1:9067 --ops 127.0.0.1:9107 \
+    --pid "$(systemctl show -p MainPID --value zfx-fixture-compat)" --catalog "$history_dir" \
+    --segments "$(jq -r .signed_history.segment_count <<< "$history")" --covered "$covered" "${reference[@]}" \
+    --highest "$highest" --tip "$want_height" --out /var/log/zfx/route-check \
+    --refusal-binary /opt/zfx/bin/zinder-compat-lightwalletd --refusal-config /etc/zfx/fixture/compat.toml \
+    --trusted-key "$history_key" --run-as zinder >&2 || route_ok=false
+  route=$(jq -c --arg dir "$history_dir" --argjson verity "$history_verity" \
+    --arg manifest "$(sha256sum "$history_dir/current.json" | cut -d' ' -f1)" \
+    --arg key "$(sha256sum "$history_key" | cut -d' ' -f1)" \
+    '{directory: $dir, require_fs_verity: $verity, manifest_sha256: $manifest, publisher_key_sha256: $key} + .' \
+    /var/log/zfx/route-check/route-check.json 2>/dev/null) \
+    || route=$(jq -nc --arg dir "$history_dir" '{directory: $dir, passed: false, failed: ["route-check.py wrote no report"]}')
+fi
 mark finished
 
 steps=$(for k in "${!at[@]}"; do printf '%s\t%s\n' "$k" "${at[$k]}"; done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
@@ -127,16 +179,22 @@ jq -n --arg fixture_id "$(jq -r .fixture_id "$fixture")" --arg network "$network
   --arg verify "$verify" --argjson verified "$(printf '%s\n' "${verified[@]:-}" | jq -R . | jq -s 'map(select(. != ""))')" \
   --arg sample "$sample_digest" --arg want_sample "$want_sample" \
   --argjson ready "$(cat /var/log/zfx/compat-readyz.json)" \
-  --arg binaries "$(sha256sum "$stage/binaries.sha256" | cut -d' ' -f1)" \
+  --arg binaries "$(sha256sum "$stage/binaries.sha256" | cut -d' ' -f1)" --argjson route "$route" \
   '{fixture_id: $fixture_id, network: $network, guest_steps_utc: $steps,
     verify_hashes: $verify, verified_components: $verified,
     served_tip: {height: $height, hash: $hash}, compat_readyz: $ready,
     wallet_sample_sha256sums_sha256: $sample,
     wallet_sample_matches_fixture: (if $want_sample == "" then null else ($sample == $want_sample) end),
+    signed_history: $route,
     binaries_listing_sha256: $binaries}' > "$receipt.partial"
 if [[ $sample_ok != true ]]; then
   mv "$receipt.partial" "$receipt.failed"
   log "wallet responses differ from the fixture: SHA256SUMS digest $sample_digest, fixture records $want_sample"
+  exit 1
+fi
+if [[ $route_ok != true ]]; then
+  mv "$receipt.partial" "$receipt.failed"
+  log "the fixture declares signed history, but the route check failed: $(jq -c .failed <<< "$route")"
   exit 1
 fi
 mv "$receipt.partial" "$receipt"

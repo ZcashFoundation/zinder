@@ -102,6 +102,18 @@ jq -e --arg verify "$verify" '
   ($verify == "none" or all(.components[] | select($verify == "all" or .kind == "stores");
     (.files_listing | type == "string") and (.files_sha256 | test("^[0-9a-f]{64}$"))))' "$fixture" >/dev/null \
   || die "fixture is missing fields the restore needs (component names, snapshots, sizes, mount paths, store paths, or listings for --verify-hashes $verify)"
+# A catalog the restore cannot describe would leave the reader on canonical
+# storage while every check still passes, so it is refused here.
+jq -e 'all(.components[]; ((.kind == "catalog" or .paths.catalog or .paths.publisher_key) | not) or .signed_history != null)' "$fixture" >/dev/null \
+  || die "a component names a signed history catalog without a signed_history description; see fixture.schema.json"
+jq -e '([.components[] | select(.signed_history)] | length <= 1) and
+  all(.components[] | select(.signed_history) | .signed_history;
+    (.directory | type == "string") and (.publisher_key | type == "string") and
+    (.manifest_sha256 | test("^[0-9a-f]{64}$")) and (.publisher_key_sha256 | test("^[0-9a-f]{64}$")) and
+    (.segment_count | type == "number" and . >= 1) and (.highest_height | type == "number" and . >= 200)) and
+  all(.components[] | select(.signed_history); .signed_history.highest_height < $chain.settled_height)' \
+  --argjson chain "$(jq -c .chain "$fixture")" "$fixture" >/dev/null \
+  || die "signed_history must appear on at most one component and give its directory, key, both SHA-256 values, segment count, and a highest height from 200 up to below the settled height"
 if command -v python3 >/dev/null && python3 -c 'import jsonschema' 2>/dev/null; then
   python3 -c 'import json, sys, jsonschema
 jsonschema.Draft202012Validator(json.load(open(sys.argv[1]))).validate(json.load(open(sys.argv[2])))' \
@@ -154,7 +166,9 @@ gssh "systemctl is-active -q zfx-restore-guest || sudo test -e /var/log/zfx/rest
   || sudo systemd-run --unit zfx-restore-guest --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json" < /dev/null
 until gssh 'sudo test -s /var/log/zfx/restore-receipt.json || ! systemctl is-active -q zfx-restore-guest' < /dev/null; do sleep 20; done
 gssh 'sudo test -s /var/log/zfx/restore-receipt.json' < /dev/null \
-  || { gssh 'sudo journalctl -u zfx-restore-guest -o cat --no-pager | tail -20' < /dev/null >&2; die "guest restore failed"; }
+  || { gssh 'sudo cat /var/log/zfx/restore-receipt.json.failed 2>/dev/null' < /dev/null > "$receipt.failed" || true
+       gssh 'sudo journalctl -u zfx-restore-guest -o cat --no-pager | tail -20' < /dev/null >&2
+       die "guest restore failed; any partial guest receipt is in $receipt.failed"; }
 mark finished
 guest=$(gssh 'sudo cat /var/log/zfx/restore-receipt.json' < /dev/null)
 
@@ -170,4 +184,6 @@ jq -n --argjson guest "$guest" --argjson steps "$steps" --arg name "$name" --arg
     nothing_to_reader_seconds: ((($steps.finished | sub("\\.[0-9]+Z$"; "Z") | fromdate) - ($steps.preflight | sub("\\.[0-9]+Z$"; "Z") | fromdate))),
     guest: $guest}' > "$receipt"
 echo "receipt: $receipt" >&2
-jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip, wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture}' "$receipt"
+jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip, wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture,
+  signed_history: (.guest.signed_history | if . == null then "none declared; ranges served from canonical storage"
+    else {passed, open_segment_files: .admission.open_segment_files, highest_height_served_from_segments} end)}' "$receipt"

@@ -140,6 +140,34 @@
         "files_listing": {
           "description": "Relative path, inside the evidence or the component, of that sorted listing.",
           "type": "string"
+        },
+        "signed_history": { "$ref": "#/$defs/signed_history" }
+      }
+    },
+    "signed_history": {
+      "description": "Signed history catalog on this component. A restored lightwalletd-compatible reader follows the publisher directory, trusts only the named key, and must serve historical block ranges from it. Requires fs-verity on every segment when the component's filesystem is ext4-verity.",
+      "type": "object",
+      "required": ["directory", "publisher_key", "manifest_sha256", "publisher_key_sha256", "segment_count", "highest_height"],
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "description": "Publisher directory relative to mount_path, holding current.json, .publisher-head.json, and the segment files.",
+          "type": "string"
+        },
+        "publisher_key": {
+          "description": "Path relative to mount_path of the publisher's 32-byte raw Ed25519 public key.",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "description": "SHA-256 of the directory's current.json.",
+          "$ref": "#/$defs/sha256"
+        },
+        "publisher_key_sha256": { "$ref": "#/$defs/sha256" },
+        "segment_count": { "type": "integer", "minimum": 1 },
+        "highest_height": {
+          "description": "Last height the catalog covers. It must be below the chain's settled height so a range above it exists.",
+          "type": "integer",
+          "minimum": 200
         }
       }
     }
