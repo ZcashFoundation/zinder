@@ -388,7 +388,11 @@ connection's 200 streams. These stay until the client reads them, resets the
 stream, or closes the connection. A client that keeps answering keepalive
 pings keeps its connection open, so one connection can keep about 103 MiB
 this way with no time limit, and the proxy's per-client connection limit is
-the only bound across the listener.
+the only bound across the listener. A `GetBlockRange` response on the
+lightwalletd listener hands HTTP/2 slices of its stored blocks instead of
+copies, so a stalled range stream can keep up to about 2 MiB alive and one
+connection about 406 MiB
+([lightwalletd compatibility](lightwalletd-compatibility.md)).
 [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
 records this policy.
 
