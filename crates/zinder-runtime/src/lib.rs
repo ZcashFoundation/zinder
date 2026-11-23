@@ -53,6 +53,7 @@ mod bind_guard;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
+mod deployment_profile;
 mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
@@ -73,6 +74,8 @@ mod runtime_supervision;
 mod sections;
 mod startup_phase;
 mod transport;
+
+pub use deployment_profile::DeploymentProfile;
 
 pub use allocator::RuntimeAllocator;
 pub use auth::{

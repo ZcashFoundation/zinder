@@ -145,7 +145,7 @@ pub struct CanonicalSecondaryStorageSection {
     /// Reader-local secondary metadata path; must be unique per reader
     /// process per ADR-0003.
     pub secondary_path: Option<PathBuf>,
-    /// Persisted raw-blob retention the canonical primary must attest.
+    /// Minimum raw-blob coverage required from the canonical primary.
     pub raw_blob_policy: Option<RawBlobRetention>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
@@ -501,7 +501,7 @@ pub struct CanonicalSecondaryStorageToml {
     pub path: String,
     /// Reader-local secondary metadata path.
     pub secondary_path: String,
-    /// Persisted raw-blob retention required from the canonical primary.
+    /// Minimum raw-blob coverage required from the canonical primary.
     pub raw_blob_policy: RawBlobRetention,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: u64,

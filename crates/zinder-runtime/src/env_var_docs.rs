@@ -101,6 +101,14 @@ impl Requirement {
 /// `CLAUDE.md` and `docs/runbooks/testing.md`.
 pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
+        name: "ZINDER_PROFILE",
+        toml_path: "profile",
+        used_by: &["zinder-ingest", "zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile).",
+    },
+    EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
         toml_path: "network.name",
         used_by: &[
@@ -1166,9 +1174,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults \
-                      to `wallet`. `compact-blocks` rejects wallet and node settings, and no \
-                      canonical or legacy aliases are accepted.",
+        description: "Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without \
+                      a profile. `compact-blocks` rejects wallet and node settings. Prefer `profile = \
+                      \"light-wallet\"` for a coordinated deployment.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
@@ -1414,16 +1422,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
-                      Defaults to `none` for explicit coverage so canonical indexing does not write \
-                      raw block or transaction blobs unless a deployment explicitly needs raw export. \
-                      Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
-                      native and lightwalletd-compatible transaction and transparent-history methods \
-                      require retained bytes. \
-                      Projector, query, and compatibility readers use the same value as an exact \
-                      admission expectation; Zallet full-block serving requires `all`. The first \
-                      canonical commit fixes historical coverage; changing a non-empty store requires \
-                      a rebuild and blue-green cutover.",
+        description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for \
+                      explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts \
+                      `none` with the light-wallet profile. Projector, query, and compatibility readers use the value as \
+                      a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an \
+                      existing canonical store requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",

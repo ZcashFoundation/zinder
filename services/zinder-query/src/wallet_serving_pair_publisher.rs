@@ -432,7 +432,6 @@ pub struct WalletServingReadiness {
 struct IngestControlInput {
     observed: ReadinessCause,
     unadopted_halt: Option<ReorgWindowExceededDetail>,
-    #[cfg(feature = "light-wallet-qualification")]
     awaiting_writer_attestation: bool,
 }
 
@@ -471,7 +470,6 @@ impl WalletServingReadiness {
             ingest_control: Arc::new(Mutex::new(IngestControlInput {
                 observed: ReadinessCause::Starting,
                 unadopted_halt: None,
-                #[cfg(feature = "light-wallet-qualification")]
                 awaiting_writer_attestation: false,
             })),
         }
@@ -484,7 +482,6 @@ impl WalletServingReadiness {
     }
 
     /// Hands a latched ingest halt to the canonical publisher before its writer-status read.
-    #[cfg(feature = "light-wallet-qualification")]
     pub fn begin_canonical_refresh(&self, writer: &mut WriterAttestation, height: u32) {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = input.unadopted_halt {
@@ -496,7 +493,6 @@ impl WalletServingReadiness {
 
     /// Releases the halt observed before this refresh once the writer attests the served fence.
     /// A new halt observed during the refresh must wait for the next attestation.
-    #[cfg(feature = "light-wallet-qualification")]
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the latest observation and its publication must stay ordered"
@@ -549,7 +545,6 @@ impl WalletServingReadiness {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = ingest_control_cause.reorg_window_exceeded_detail() {
             input.unadopted_halt = Some(halt);
-            #[cfg(feature = "light-wallet-qualification")]
             {
                 input.awaiting_writer_attestation = false;
             }
@@ -924,7 +919,6 @@ fn node_observation_cause(
     }
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl crate::QualificationWalletQuery {
     /// Probes this endpoint's forwarding admission and health for the node-source dependency.
     #[must_use]

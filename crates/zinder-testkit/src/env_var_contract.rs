@@ -123,13 +123,15 @@ impl EnvVarContractProbe {
     }
 
     /// Fails unless the wallet-serving image entrypoint gives `process`
-    /// exactly the variables this loader accepts.
+    /// its accepted variables for the combined wallet composition.
     ///
     /// The entrypoint passes a `ZINDER_*` variable to a process only when the
     /// variable names one of that process's `<process>_config_paths` or a key
     /// beneath one. `known_names` lists every documented variable, whichever
     /// binary uses it. A routed name the loader rejects stops the process at
     /// startup, and an accepted name that is not routed never reaches it.
+    /// `ZINDER_PROFILE` belongs to standalone binaries. The combined image
+    /// always starts the wallet projector and native query.
     pub fn check_wallet_serving_routing<'a>(
         &self,
         process: &str,
@@ -148,6 +150,12 @@ impl EnvVarContractProbe {
             let routed = config_paths
                 .iter()
                 .any(|config_path| config_path_covers(config_path, name));
+            if name == "ZINDER_PROFILE" {
+                if routed {
+                    problems.push(format!("{name}: reaches the combined wallet deployment"));
+                }
+                continue;
+            }
             match (routed, accepted.contains(name)) {
                 (true, false) => problems.push(format!(
                     "{name}: reaches {process}, whose loader rejects it"

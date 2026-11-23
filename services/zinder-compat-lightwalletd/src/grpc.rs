@@ -1,6 +1,5 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-#[cfg(feature = "light-wallet-qualification")]
 pub(crate) mod qualification;
 
 use std::sync::Arc;

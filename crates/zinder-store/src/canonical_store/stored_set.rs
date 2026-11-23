@@ -97,6 +97,12 @@ impl CanonicalStoreRequirements {
         self
     }
 
+    /// Requires canonical history and the specified raw-blob coverage.
+    #[must_use]
+    pub fn for_blob_retention(retention: RawBlobRetention) -> Self {
+        Self::from_legacy(CanonicalStoreWorkload::Wallet, retention)
+    }
+
     pub(super) fn from_legacy(
         workload: CanonicalStoreWorkload,
         retention: RawBlobRetention,

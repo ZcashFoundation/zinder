@@ -1,6 +1,9 @@
 //! Forwarded RPC behavior and storage availability under a node outage.
 
 use std::{
+    fs::File,
+    net::{SocketAddr, TcpListener},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +16,7 @@ use eyre::{Result, eyre};
 use serde_json::{Value, json};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request};
+use tonic::{Code, Request, transport::Channel};
 use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
@@ -22,7 +25,8 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, Network, TransactionId, wire::encode_rpc_block_hash_hex,
 };
 use zinder_proto::compat::lightwalletd::{
-    self, compact_tx_streamer_server::CompactTxStreamer as _,
+    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer as _,
 };
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
@@ -32,8 +36,9 @@ use zinder_query::{
 use zinder_runtime::{Readiness, ReadinessState};
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, IngestControlFixture, JsonRpcStub, JsonRpcTestServer,
-    RpcReply, WalletServingStoreFixture, method,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+    IngestControlFixture, JsonRpcStub, JsonRpcTestServer, RpcReply, WalletServingStoreFixture,
+    method,
 };
 
 mod address_validation;
@@ -610,6 +615,172 @@ async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> 
         1
     );
     assert_degraded_node_readiness(&fixture.adapter).await
+}
+
+#[tokio::test]
+async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_binary() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip = served_tip(1)?;
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &schedule)?;
+    let primary = writer.canonical_primary()?;
+    assert_eq!(
+        primary.raw_blob_retention(),
+        zinder_store::RawBlobRetention::None
+    );
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let output = address_output(&"01".repeat(32), 1_u32, &script);
+    let node = verifiable_node(
+        &schedule,
+        tip.hash,
+        [method("getaddressutxos").reply(utxos_at(tip, &json!([output])))],
+    )?;
+    let files = tempfile::tempdir()?;
+    let cancel = CancellationToken::new();
+    let _cancel_on_exit = cancel.clone().drop_guard();
+    let control =
+        spawn_binary_ingest_control(primary, files.path().join("checkpoints"), cancel).await?;
+    let log_path = files.path().join("compat.stderr");
+    let reservation = TcpListener::bind("127.0.0.1:0")?;
+    let addr = reservation.local_addr()?;
+    drop(reservation);
+    let mut child =
+        tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+            .env_clear()
+            .env("ZINDER_PROFILE", "light-wallet")
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_NODE__JSON_RPC_ADDR", node.url().as_str())
+            .env("ZINDER_INGEST_CONTROL__ADDR", control)
+            .env("ZINDER_COMPAT__STALE_TIP_LIMIT_MS", "0")
+            .env(
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                primary.reorg_policy().reorg_window_blocks().to_string(),
+            )
+            .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+            .env("ZINDER_COMPAT__LISTEN_ADDR", addr.to_string())
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                files.path().join("secondary"),
+            )
+            .stderr(File::create(&log_path)?)
+            .kill_on_drop(true)
+            .spawn()?;
+    let mut client = wait_for_compat(&mut child, addr, &log_path).await?;
+    assert_eq!(
+        client
+            .get_latest_block(lightwalletd::ChainSpec {})
+            .await?
+            .into_inner()
+            .height,
+        1
+    );
+    assert_eq!(
+        client
+            .get_taddress_balance(balance_request())
+            .await?
+            .into_inner()
+            .value_zat,
+        1
+    );
+    child.kill().await?;
+    Ok(())
+}
+
+async fn wait_for_compat(
+    child: &mut tokio::process::Child,
+    addr: SocketAddr,
+    log_path: &Path,
+) -> Result<CompactTxStreamerClient<Channel>> {
+    use tonic::transport::Endpoint;
+
+    let endpoint = Endpoint::from_shared(format!("http://{addr}"))?
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(5));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(channel) = endpoint.connect().await {
+                break Ok(CompactTxStreamerClient::new(channel));
+            }
+            if let Some(status) = child.try_wait()? {
+                break Err(eyre!(
+                    "compat exited with {status}: {}",
+                    std::fs::read_to_string(log_path)?
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+
+async fn spawn_binary_ingest_control(
+    store: &zinder_store::RocksDbCanonicalStore,
+    checkpoint_path: std::path::PathBuf,
+    cancel: CancellationToken,
+) -> Result<String> {
+    use tokio_stream::wrappers::TcpListenerStream;
+    use zinder_ingest::{
+        CanonicalCheckpointStagingRoot, CanonicalControlCommand, CanonicalControlGrpcAdapter,
+        canonical_control_channel,
+    };
+    use zinder_proto::{
+        v1::ingest::{CanonicalWriterStatusResponse, ingest_control_server::IngestControlServer},
+        wire::{canonical_writer_fence_message, encode_canonical_network_upgrade_schedule},
+    };
+
+    let fence = store.event_fence();
+    let schedule = store
+        .network_upgrade_schedule()
+        .ok_or_else(|| eyre!("missing schedule"))?;
+    let status = CanonicalWriterStatusResponse {
+        network_name: zinder_core::wire::encode_zinder_native_chain_name(store.network())
+            .to_owned(),
+        fence: Some(canonical_writer_fence_message(
+            fence.chain_epoch_id(),
+            fence.chain_event_sequence(),
+            fence.visible_tip(),
+            fence.sequence_digest(),
+        )),
+        oldest_retained_event_sequence: store.canonical_event_retention_floor()?,
+        network_upgrade_schedule: Some(encode_canonical_network_upgrade_schedule(
+            schedule.activations(),
+            schedule.revision(),
+        )),
+        ..CanonicalWriterStatusResponse::default()
+    };
+    let (handle, mut commands) = canonical_control_channel();
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            if let CanonicalControlCommand::WriterStatus { reply } = command {
+                let _ = reply.send(Ok(status.clone()));
+            }
+        }
+    });
+    let canonical = CanonicalControlGrpcAdapter::new(
+        handle,
+        CanonicalCheckpointStagingRoot::new(checkpoint_path),
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+        zinder_ingest::CanonicalStoreDamageSignal::default(),
+    );
+    let ingest = zinder_testkit::IngestControlFixtureService::new(store.network());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(canonical.into_server())
+            .add_service(IngestControlServer::new(ingest))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            )
+            .await
+    });
+    Ok(format!("http://{addr}"))
 }
 
 async fn assert_degraded_node_readiness(

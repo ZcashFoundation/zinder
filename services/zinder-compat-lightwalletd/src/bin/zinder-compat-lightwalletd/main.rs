@@ -432,7 +432,6 @@ fn with_ingest_mempool<Query>(
 
 enum CanonicalComposition {
     CompactBlocks,
-    #[cfg(feature = "light-wallet-qualification")]
     Qualification {
         source: Box<ZebraJsonRpcSource>,
         ingest: AdmittedIngestControl,
@@ -440,15 +439,12 @@ enum CanonicalComposition {
     },
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl CanonicalComposition {
     async fn admit(config: &config::LightwalletdConfig) -> Result<Self, LightwalletdConfigError> {
         match config.serving {
-            CompatServing::LightWalletQualification => {
+            CompatServing::LightWallet => {
                 let target = config.broadcaster.as_ref().ok_or_else(|| {
-                    zinder_runtime::ConfigError::invalid(
-                        "light-wallet qualification requires [node]",
-                    )
+                    zinder_runtime::ConfigError::invalid("light-wallet serving requires [node]")
                 })?;
                 let source = ZebraJsonRpcSource::from_node_target(target)
                     .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?;
@@ -489,12 +485,8 @@ async fn run_canonical(
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
-    #[cfg(feature = "light-wallet-qualification")]
     let composition = CanonicalComposition::admit(&lightwalletd_config).await?;
-    #[cfg(not(feature = "light-wallet-qualification"))]
-    let composition = CanonicalComposition::CompactBlocks;
     let serving_readiness = match &composition {
-        #[cfg(feature = "light-wallet-qualification")]
         CanonicalComposition::Qualification { .. } => {
             compact_block_serving::CompactServingReadiness::for_qualification(readiness.clone())
         }
@@ -509,7 +501,7 @@ async fn run_canonical(
             canonical_primary_path: lightwalletd_config.storage.path.clone(),
             canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
             network: lightwalletd_config.network,
-            raw_blob_retention: lightwalletd_config.storage.expected_raw_blob_retention,
+            requirements: lightwalletd_config.canonical_requirements(),
             reorg_policy: lightwalletd_config.canonical_reorg_policy,
             resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
             catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
@@ -556,7 +548,6 @@ async fn run_canonical(
     }
     .supervised();
     let (server, tasks) = match composition {
-        #[cfg(feature = "light-wallet-qualification")]
         CanonicalComposition::Qualification {
             source,
             ingest,

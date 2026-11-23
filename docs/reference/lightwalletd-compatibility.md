@@ -2,7 +2,7 @@
 
 This page is the reference for how `zinder-compat-lightwalletd` answers the lightwalletd `CompactTxStreamer` protocol, and where its behavior differs from Go lightwalletd. It is for wallet developers who point an existing lightwalletd client at Zinder, and for operators who run the compatibility runtime.
 
-The runtime serves the same stored data as the native `WalletQuery` service, described in [Wallet data plane](../architecture/wallet-data-plane.md). It uses the node only to broadcast transactions and to read the recommended fee.
+Wallet serving reads the stored data described in [Wallet data plane](../architecture/wallet-data-plane.md). The light-wallet profile combines canonical data with node-backed reads.
 
 ## Claim boundary
 
@@ -21,18 +21,22 @@ A named wallet is supported once it passes end-to-end certification against a re
 
 ## Runtime serving selection
 
-The operator selects one of two serving modes with `[compat].serving`, the `ZINDER_COMPAT__SERVING` environment variable, or `--serving`. The default is `wallet`.
+Select the [light-wallet profile](configuration.md#light-wallet-profile) to configure ingest and compatibility together, or select a serving mode with `compat.serving`, `ZINDER_COMPAT__SERVING`, or `--serving`. The default without a profile is `wallet`.
 
 - `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction` and `GetStandardFee`, and connects to ingest control for the mempool methods.
 - `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store and answers them as wallet serving does, except that `taddrSupport` is `false`. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
 
-In both modes, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
+- `light-wallet` serves the wallet methods from the canonical store, ingest control, and one configured node. The node handles transparent address reads and supplies transaction bodies when the store omits them. Mined transaction bodies are verified against the local canonical location and replay-derived digest. Transparent address history is bounded to the captured tip and best-effort. See [Light-wallet serving qualification](../runbooks/testing.md#light-wallet-serving-qualification) for request limits and failure behavior.
+
+By default, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
 
 ## Methods
 
+Light-wallet serving supports the methods in the Wallet serving column, with node-backed reads as described above.
+
 | Method | Wallet serving | Compact-blocks serving | Notes |
 | --- | --- | --- | --- |
-| `GetLightdInfo` | Served | Served | `taddrSupport` is `true` only in wallet serving |
+| `GetLightdInfo` | Served | Served | `taddrSupport` is `true` in wallet and light-wallet serving |
 | `GetLatestBlock` | Served | Served | Hash in internal byte order |
 | `GetBlock` | Served | Served | Height 0 with an empty hash is `INVALID_ARGUMENT` |
 | `GetBlockNullifiers` | Served | `UNIMPLEMENTED` | Shielded pools, nullifiers only |
@@ -67,7 +71,7 @@ Both methods describe the serving process and its current tip. Whole messages re
 | `vendor`, `version`, `gitCommit` | `Zinder`, the crate version, and the build commit. Never compare. |
 | `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress` | Always empty. Never compare. |
 | `estimatedHeight` | The network height estimated from the served tip, as [Stale tip](#stale-tip) describes. Never below `blockHeight`, and at most a few blocks above it while the tip advances. Never compare. |
-| `taddrSupport` | `true` in wallet serving, `false` in compact-blocks serving. Fixed when the process starts. |
+| `taddrSupport` | `true` in wallet and light-wallet serving, `false` in compact-blocks serving. Fixed when the process starts. |
 
 The upgrade fields come from the network-upgrade schedule that ingest admitted, never from a node. A newly admitted upgrade shows as pending until the tip reaches it. A store without an admitted schedule is not served: the process retries until `storage.initial_catchup_timeout_ms` passes, then exits.
 
@@ -105,7 +109,7 @@ How each engine uses the tip calls:
 
 A `BlockID` with a height reads that height. Zinder also accepts a 32-byte hash in internal byte order for these two methods. Height 0 with a hash selects the block by hash. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`.
 
-`GetBlock` supports these lookups in both serving modes. In compact-blocks serving it returns the stored block without pool filtering. `GetBlockNullifiers` is available only in wallet serving and returns `UNIMPLEMENTED` in compact-blocks serving.
+`GetBlock` supports these lookups in every serving mode. In compact-blocks serving it returns the stored block without pool filtering. `GetBlockNullifiers` is available in wallet and light-wallet serving and returns `UNIMPLEMENTED` in compact-blocks serving.
 
 Like Go lightwalletd v0.6.2, `GetBlockNullifiers` retains every stored transaction after clearing non-nullifier payloads. Transparent-only transactions, including a transparent-only coinbase, retain just `index`, `txid`, and `fee`. `GetBlockRangeNullifiers` selects transactions by shielded pool before clearing non-nullifier payloads. Both methods send a present `chainMetadata` submessage with all three commitment-tree sizes set to zero.
 

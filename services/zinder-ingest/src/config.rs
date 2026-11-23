@@ -22,8 +22,8 @@ use zinder_ingest::{
     container_memory_budget_bytes,
 };
 use zinder_runtime::{
-    ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
+    ConfigError, ConfigLoader, DeploymentProfile, IngestControlSection, IngestControlWriterToml,
+    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
     ResolvedIngestControlWriter, ResolvedRetention, RetentionSection, RetentionToml,
     RuntimeService, SecuritySection, SecurityToml, StorageRoleSection, StorageRoleToml,
     duration_as_millis_u64, guard_optional_serving_bind, require_field, resolve_allow_public_bind,
@@ -49,6 +49,7 @@ const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 /// run (no subcommand and the `probe` subcommand both consume this).
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
+    profile: Option<DeploymentProfile>,
     pub(crate) runtime_config: IngestRuntimeConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) explorer_views: bool,
@@ -182,10 +183,6 @@ pub(crate) fn load_ingest_config(
             "ingest.follow.max_replacement_bytes",
             zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES.get(),
         )?
-        .with_default(
-            "ingest.run_overrides.coverage",
-            DEFAULT_INGEST_COVERAGE.as_kebab_case(),
-        )?
         .with_ops_section(RuntimeService::Ingest)?
         .with_security_section()?
         .with_file(config_path)
@@ -278,6 +275,7 @@ pub(crate) fn redacted_ingest_config_toml(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestConfig {
+    profile: Option<DeploymentProfile>,
     network: NetworkSection,
     ops: OpsSection,
     node: NodeSection,
@@ -476,7 +474,10 @@ fn detected_logical_core_count() -> Option<NonZeroU32> {
     clippy::too_many_lines,
     reason = "the ingest resolver composes the network, source, storage, phase, construction, follow, and modifier knobs in one auditable validation sequence."
 )]
-fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
+fn resolve_ingest_config(
+    mut config: IngestConfig,
+) -> Result<IngestCommandConfig, IngestConfigError> {
+    apply_deployment_profile(&mut config)?;
     let network = config.network.resolve()?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
     let node_fallbacks =
@@ -629,7 +630,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ConfigError::invalid("ingest.follow.max_replacement_bytes must be greater than zero")
     })?;
 
-    let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
+    let raw_blob_policy =
+        resolve_raw_blob_policy(config.profile, coverage, configured_raw_blob_policy)?;
     let explorer_views_min_free_bytes = require_field(
         config.ingest.explorer_views_min_free_bytes,
         "ingest.explorer_views_min_free_bytes",
@@ -709,6 +711,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     };
 
     Ok(IngestCommandConfig {
+        profile: config.profile,
         runtime_config,
         coverage,
         explorer_views,
@@ -815,14 +818,39 @@ fn guard_ingest_control_bearer_token(
     Ok(())
 }
 
+fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError> {
+    if config.profile != Some(DeploymentProfile::LightWallet) {
+        return Ok(());
+    }
+    if config.ingest.explorer_views
+        || config
+            .ingest
+            .run_overrides
+            .coverage
+            .is_some_and(|coverage| coverage != IngestCoverage::WalletServing)
+        || config
+            .storage
+            .raw_blob_policy
+            .is_some_and(|policy| policy != RawBlobPolicy::None)
+    {
+        return Err(ConfigError::invalid(
+            "profile = \"light-wallet\" requires wallet-serving coverage, raw_blob_policy = \"none\", and Explorer views disabled. To select this profile, remove conflicting overrides",
+        ));
+    }
+    config.ingest.run_overrides.coverage = Some(IngestCoverage::WalletServing);
+    config.storage.raw_blob_policy = Some(RawBlobPolicy::None);
+    Ok(())
+}
+
 fn resolve_raw_blob_policy(
+    profile: Option<DeploymentProfile>,
     coverage: IngestCoverage,
     configured_policy: Option<RawBlobPolicy>,
 ) -> Result<RawBlobPolicy, ConfigError> {
     match (coverage, configured_policy) {
         (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
         (IngestCoverage::WalletServing, Some(RawBlobPolicy::None))
-            if !cfg!(feature = "light-wallet-qualification") =>
+            if profile != Some(DeploymentProfile::LightWallet) =>
         {
             Err(ConfigError::invalid(
                 "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
@@ -835,6 +863,8 @@ fn resolve_raw_blob_policy(
 
 #[derive(Serialize)]
 struct RedactedIngestConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<DeploymentProfile>,
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
@@ -855,6 +885,7 @@ impl RedactedIngestConfigToml {
     fn from_ingest_config(config: &IngestCommandConfig) -> Self {
         let runtime_config = &config.runtime_config;
         Self {
+            profile: config.profile,
             network: NetworkToml::from_network(runtime_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),

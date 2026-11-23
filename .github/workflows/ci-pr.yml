@@ -137,11 +137,6 @@ jobs:
       - name: Check configured nextest selectors
         run: scripts/test-nextest-selectors.sh
 
-      - name: Test qualification serving
-        run: >-
-          cargo nextest run --profile=ci -p zinder-compat-lightwalletd -p zinder-ingest -p zinder-query
-          --features light-wallet-qualification -E 'test(qualification)'
-
       - name: Test (PostgreSQL driver)
         env:
           ZINDER_TEST_POSTGRES_DATABASE_URL: postgresql://zinder_bench:zinder_bench_ci_only@127.0.0.1:5432/zinder_bench
