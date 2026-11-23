@@ -1037,7 +1037,8 @@ mod tests {
         CompactTransaction, MAX_BLOCK_BYTES, MIN_TRANSPARENT_TX_SIZE, ParsedSourceBlock,
         RawBlobPolicy, ShieldedProtocol, TransactionByteLayout, ZebraBlock, ZebraTransaction,
         compact_note_ciphertext_prefix, compact_transaction_has_payload, parse_source_block,
-        prepare_canonical_block, validate_transaction_byte_layout,
+        prepare_canonical_block, prepare_canonical_transactions_from_parsed,
+        validate_transaction_byte_layout,
     };
 
     #[test]
@@ -1423,6 +1424,129 @@ mod tests {
 
         assert!(assert_parse_matches_zebra(&within_limit)?);
         assert!(!assert_parse_matches_zebra(&oversized)?);
+        Ok(())
+    }
+
+    /// A block of 98-byte transactions whose last transaction's output script
+    /// grows by `extra_script_bytes`.
+    fn block_of_transparent_transactions(
+        transaction_count: usize,
+        extra_script_bytes: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut transactions = vec![v1_transaction(Some(38)); transaction_count - 1];
+        transactions.push(v1_transaction(Some(u8::try_from(38 + extra_script_bytes)?)));
+        block_with_transactions(&transactions)
+    }
+
+    #[test]
+    fn a_block_ending_at_the_size_limit_parses_and_one_more_byte_fails()
+    -> Result<(), Box<dyn Error>> {
+        let limit = usize::try_from(MAX_BLOCK_BYTES)?;
+        let mut transaction_count = limit / v1_transaction(Some(38)).len();
+        while block_of_transparent_transactions(transaction_count, 0)?.len() > limit {
+            transaction_count -= 1;
+        }
+        // One output script under 253 bytes keeps its one-byte length prefix,
+        // so lengthening it adds exactly that many block bytes.
+        let missing = limit - block_of_transparent_transactions(transaction_count, 0)?.len();
+        let at_limit = block_of_transparent_transactions(transaction_count, missing)?;
+        let over_limit = block_of_transparent_transactions(transaction_count, missing + 1)?;
+        assert_eq!((at_limit.len(), over_limit.len()), (limit, limit + 1));
+
+        assert!(assert_parse_matches_zebra(&at_limit)?);
+        assert!(!assert_parse_matches_zebra(&over_limit)?);
+        let error = parse_source_block(&unparsed_source_block(over_limit))
+            .err()
+            .ok_or("a block one byte over the limit parsed")?;
+        assert!(matches!(
+            error,
+            CanonicalBlockConstructionError::BlockParseFailed {
+                source: SerializationError::Io(ref io_error),
+            } if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_and_non_minimal_transaction_counts_match_zebra() -> Result<(), Box<dyn Error>> {
+        let fixture = fixture_block_bytes(BLOCK_FIXTURES[4])?;
+        let header = ZebraBlock::zcash_deserialize(&mut Cursor::new(fixture))?
+            .header
+            .zcash_serialize_to_vec()?;
+
+        // Zebra decodes a block with no transactions; preparation then fails
+        // because there is no coinbase to give the height.
+        let mut no_transactions = header.clone();
+        no_transactions.push(0);
+        assert!(assert_parse_matches_zebra(&no_transactions)?);
+        assert!(matches!(
+            prepare_canonical_block(
+                &unparsed_source_block(no_transactions),
+                &sample_regtest_upgrade_activations(),
+                RawBlobPolicy::None,
+            ),
+            Err(CanonicalBlockConstructionError::ParsedBlockMissingCoinbaseHeight)
+        ));
+
+        // A count of one written in three, five, or nine bytes is rejected
+        // before any transaction is read.
+        for count_encoding in [
+            &[0xfd, 0x01, 0x00][..],
+            &[0xfe, 0x01, 0x00, 0x00, 0x00][..],
+            &[0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+        ] {
+            let mut bytes = header.clone();
+            bytes.extend_from_slice(count_encoding);
+            bytes.extend(v1_transaction(Some(38)));
+            assert!(!assert_parse_matches_zebra(&bytes)?);
+            assert!(matches!(
+                parse_source_block(&unparsed_source_block(bytes)),
+                Err(CanonicalBlockConstructionError::BlockParseFailed {
+                    source: SerializationError::Parse("non-canonical CompactSize"),
+                })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_rejects_ranges_that_skip_a_parsed_transaction() -> Result<(), Box<dyn Error>> {
+        // Three transactions: an Ironwood coinbase and two version-6 spends.
+        let raw_block_bytes = fixture_block_bytes(BLOCK_FIXTURES[7])?;
+        let source_block = unparsed_source_block(raw_block_bytes.clone());
+        let activations = sample_regtest_upgrade_activations();
+        let ParsedSourceBlock {
+            block,
+            transaction_layout,
+        } = parse_source_block(&source_block)?;
+        assert_eq!(transaction_layout.transaction_sizes.len(), 3);
+        prepare_canonical_transactions_from_parsed(
+            &block,
+            &transaction_layout,
+            &source_block,
+            &activations,
+            true,
+        )?;
+
+        // Two ranges that still reach the last block byte, the second
+        // covering two transactions.
+        let sizes = &transaction_layout.transaction_sizes;
+        let merged_layout = TransactionByteLayout {
+            first_transaction_offset: transaction_layout.first_transaction_offset,
+            transaction_sizes: vec![sizes[0], sizes[1] + sizes[2]],
+        };
+        assert!(matches!(
+            prepare_canonical_transactions_from_parsed(
+                &block,
+                &merged_layout,
+                &source_block,
+                &activations,
+                true,
+            ),
+            Err(CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                block_byte_count,
+            }) if block_byte_count == raw_block_bytes.len()
+        ));
         Ok(())
     }
 
