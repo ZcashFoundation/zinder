@@ -90,6 +90,8 @@ jq -e '.format_version == 1 and (.components | length) > 0 and .chain.visible_bl
   ([.components[].kind] | index("node-state") and index("stores"))' "$fixture" >/dev/null \
   || die "fixture must have format_version 1, a chain fence, and node-state and stores components"
 # Check everything the guest needs before paying for a host.
+# The guest node configuration and services are Mainnet-only.
+[[ $(jq -r .network "$fixture") == zcash-mainnet ]] || die "only zcash-mainnet fixtures are supported; this one is $(jq -r .network "$fixture")"
 jq -e --arg verify "$verify" '
   (.network | type == "string") and (.chain.visible_height | type == "number") and
   all(.components[]; (.name | test("^[a-z][a-z0-9-]*$")) and (.snapshot | type == "string")
@@ -112,6 +114,9 @@ while read -r snap; do
 done < <(jq -r '.components[].snapshot' "$fixture")
 stage_sha=$(gcloud storage cat "$stage.sha256" | awk '{print $1}')
 [[ $stage_sha =~ ^[0-9a-f]{64}$ ]] || die "no SHA-256 at $stage.sha256"
+# A fixture that pins its stage accepts only that exact tarball.
+want_stage=$(jq -r '.stage_sha256 // empty' "$fixture")
+[[ -z $want_stage || $stage_sha == "$want_stage" ]] || die "stage $stage is $stage_sha; the fixture pins $want_stage"
 
 mark create_host
 labels="purpose=benchmark-fixture,issue=476,fixture=$(jq -r .fixture_id "$fixture" | tr '.' '-' | cut -c1-63)"
@@ -143,7 +148,10 @@ gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"
 
 mark guest_restore
 # The guest restore runs as its own unit, so a dropped ssh session cannot stop it.
-gssh "sudo systemd-run --unit zfx-restore-guest --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json" < /dev/null
+# Idempotent, so an ssh retry after the unit already started cannot fail or relaunch it.
+gssh "systemctl is-active -q zfx-restore-guest || sudo test -e /var/log/zfx/restore-receipt.json \\
+  || sudo test -e /var/log/zfx/restore-receipt.json.failed \\
+  || sudo systemd-run --unit zfx-restore-guest --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json" < /dev/null
 until gssh 'sudo test -s /var/log/zfx/restore-receipt.json || ! systemctl is-active -q zfx-restore-guest' < /dev/null; do sleep 20; done
 gssh 'sudo test -s /var/log/zfx/restore-receipt.json' < /dev/null \
   || { gssh 'sudo journalctl -u zfx-restore-guest -o cat --no-pager | tail -20' < /dev/null >&2; die "guest restore failed"; }

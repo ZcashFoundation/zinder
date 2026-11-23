@@ -61,8 +61,12 @@
         "responses": { "type": "integer", "minimum": 1 }
       }
     },
+    "stage_sha256": {
+      "description": "SHA-256 of the only stage tarball restore-fixture.sh accepts for this fixture.",
+      "$ref": "#/$defs/sha256"
+    },
     "executables": {
-      "description": "Immutable object generation that holds the pinned executables for this fixture.",
+      "description": "Immutable object generation that holds the executables the fixture was built and verified with. It is a separate artifact from the restore stage; see stage_sha256.",
       "type": "object",
       "required": ["uri", "sha256"],
       "additionalProperties": false,

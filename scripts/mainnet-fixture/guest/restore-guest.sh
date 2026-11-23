@@ -94,6 +94,7 @@ wallet_dir=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.
 # Store snapshots may also be root-owned data; the writers open them read-write.
 chown -R zinder:zinder "$canonical_dir" "$wallet_dir"
 CANONICAL_PATH=$canonical_dir WALLET_PATH=$wallet_dir \
+REORG_WINDOW_BLOCKS=$(jq -r '.chain.reorg_window_blocks // 1000' "$fixture") \
   /opt/zfx/stack.sh fixture "$stores/.zfx-run" "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" 0 /run/zebra-cookie/.cookie >&2
 chown zinder:zinder "$stores/.zfx-run"
 systemctl start zfx-fixture-ingest

@@ -9,6 +9,9 @@ name=$1 root=$2 owner=$3 off=$4 cookie=$5
 bin=${ZFX_BIN:-/opt/zfx/bin}
 cfg=/etc/zfx/$name; sec=$root/.control; mkdir -p "$cfg"
 canonical=${CANONICAL_PATH:-$root/canonical} wallet=${WALLET_PATH:-$root/wallet}
+# Every role must use the window the stores were built with.
+reorg=${REORG_WINDOW_BLOCKS:-1000}
+[[ $reorg =~ ^[1-9][0-9]*$ ]] || { echo "REORG_WINDOW_BLOCKS must be a positive integer" >&2; exit 1; }
 p() { echo $(( $1 + off )); }
 install -d -o zinder -g zinder -m 0700 "$sec" "$root/checkpoints" "$root/projector" "$root/query" "$root/compat"
 for t in ingest checkpoint; do
@@ -30,7 +33,7 @@ raw_blob_policy = "transactions"
 [ingest]
 source = "zebra-json-rpc"
 explorer_views = false
-reorg_window_blocks = 1000
+reorg_window_blocks = $reorg
 [ingest.run_overrides]
 coverage = "wallet-serving"
 [ingest.tree_state_densification]
@@ -53,7 +56,7 @@ raw_blob_policy = "transactions"
 [wallet]
 path = "$wallet"
 [projector]
-reorg_window_blocks = 1000
+reorg_window_blocks = $reorg
 lease_duration_seconds = 14400
 build_owner_hex = "$owner"
 [ingest_control]
@@ -94,8 +97,8 @@ listen_addr = "127.0.0.1:$ops"
 [security]
 allow_public_bind = false
 T
-  if [[ $role == query ]]; then printf '[query]\nlisten_addr = "127.0.0.1:%s"\nreorg_window_blocks = 1000\npair_convergence_attempts = 12\n' $lst
-  else printf '[compat]\nlisten_addr = "127.0.0.1:%s"\nreorg_window_blocks = 1000\npair_convergence_attempts = 12\nmax_concurrent_block_range_streams = 100\nping_very_insecure = false\nserving = "wallet"\n' $lst; fi
+  if [[ $role == query ]]; then printf '[query]\nlisten_addr = "127.0.0.1:%s"\nreorg_window_blocks = %s\npair_convergence_attempts = 12\n' "$lst" "$reorg"
+  else printf '[compat]\nlisten_addr = "127.0.0.1:%s"\nreorg_window_blocks = %s\npair_convergence_attempts = 12\nmax_concurrent_block_range_streams = 100\nping_very_insecure = false\nserving = "wallet"\n' "$lst" "$reorg"; fi
   } > "$cfg/$role.toml"
 done
 declare -A exe=([ingest]=zinder-ingest [projector]=zinder-projector [query]=zinder-query [compat]=zinder-compat-lightwalletd)
