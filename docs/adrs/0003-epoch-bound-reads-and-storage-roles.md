@@ -26,6 +26,14 @@ Two kinds of read span views. Lightwalletd compatibility block ranges, including
 
 [Storage backend](../architecture/storage-backend.md) describes the store roles and secondary catch-up, and [Wallet data plane](../architecture/wallet-data-plane.md) describes read consistency for clients. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) lists which serving mode forwards which method.
 
+## Evidence
+
+- Decision 1 and the paragraph after the decisions: judgment. Pinning an indexed lookup keeps one response on one chain. A block range or an event subscription is paced by its client, so no retained epoch covers it, and it proves continuity by hash linkage or by cursor instead ([ADR-0015](0015-wallet-runtime-composition.md) decision 9, [ADR-0013](0013-chain-event-streams.md)). A delivered response that joins two chains reopens it.
+- Decisions 2 and 4: judgment. They defer store admission to [ADR-0004](0004-storage-and-deployment-topologies.md) decision 2, whose evidence applies.
+- Decision 7, binding forwarded transactions, unspent outputs, and balances to the served tip: measured. On Regtest with Zebra 7.1.0, a node one block ahead of the reader returned a transaction, 141 unspent outputs, and a balance that included a block the reader had not served ([#480](https://github.com/ZcashFoundation/zinder/issues/480)). With the binding, the same skew returned `NOT_FOUND` for that transaction and refused the balance and output calls, and each check's regression test fails with its guard disabled ([#481](https://github.com/ZcashFoundation/zinder/pull/481)).
+- Decision 7, best-effort address history: external constraint. Neither Zebra 7.1.0 nor Zakura 1.8.6 reports the chain tip a `getaddresstxids` answer describes ([zebra#12575](https://github.com/ZcashFoundation/zebra/issues/12575)), so the reader can verify each returned row but not that the list is complete. A node reply bound to a tip reopens it.
+- Decision 7, outage behavior: measured. With the node stopped under load on Regtest, forwarded methods returned `UNAVAILABLE`, local payloads stayed byte-identical, and an address-history stream cut mid-way delivered 19 or 20 rows before `UNAVAILABLE` ([#475](https://github.com/ZcashFoundation/zinder/issues/475)).
+
 ## Consequences
 
 - Every multi-artifact response carries one explicit chain identity.
@@ -50,3 +58,4 @@ Two kinds of read span views. Lightwalletd compatibility block ranges, including
 
 - 2026-11-23. Decisions 1, 2, and 4 apply pinning to reads of stored data and defer store admission to ADR-0004. Decision 7 binds node-backed reads to the served tip.
 - 2026-11-23. Decision 1 pins indexed lookups, and the paragraph after the decisions names compatibility block ranges and event subscriptions as reads that span views. Decision 7 states which lookups verify the node before consulting the mempool.
+- 2026-11-23. Evidence records what decisions 1, 2, 4, and 7 rest on.
