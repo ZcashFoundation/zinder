@@ -5,7 +5,8 @@
 //! mempool surface RPCs. The translation:
 //!
 //! 1. Parses the raw transaction bytes via `zebra-chain` so the same
-//!    consensus parser used by chain ingestion drives mempool hydration.
+//!    consensus parser used by chain ingestion drives mempool hydration,
+//!    and rejects bytes left after the transaction.
 //! 2. Builds native structured wallet scan data on the ingest write side.
 //! 3. Extracts the transparent outputs and outpoint spends carried by every
 //!    snapshot entry and checked by the index's live-outpoint invariants.
@@ -15,7 +16,7 @@
 //!    consumer reads the entry.
 
 use thiserror::Error;
-use zebra_chain::serialization::ZcashDeserializeInto;
+use zebra_chain::serialization::{SerializationError, ZcashDeserializeInto};
 use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zinder_core::{AuthDigest, ChainEpoch, MempoolEntry, MempoolObservation, TransactionId};
 use zinder_source::MempoolSourceEntry;
@@ -73,11 +74,17 @@ pub fn build_mempool_entry(
     source_entry: MempoolSourceEntry,
     visible_chain_epoch: ChainEpoch,
 ) -> Result<MempoolEntry, MempoolEntryBuildError> {
-    let parsed_transaction: ZebraTransaction = source_entry
-        .raw_transaction_bytes
-        .as_slice()
+    let mut unread_bytes = source_entry.raw_transaction_bytes.as_slice();
+    let parsed_transaction: ZebraTransaction = (&mut unread_bytes)
         .zcash_deserialize_into()
         .map_err(|source| MempoolEntryBuildError::TransactionParseFailed { source })?;
+    // The entry keeps the source bytes, which readers parse as exactly one
+    // transaction, so bytes after it are a parse failure here too.
+    if !unread_bytes.is_empty() {
+        return Err(MempoolEntryBuildError::TransactionParseFailed {
+            source: SerializationError::Parse("bytes remain after the mempool transaction"),
+        });
+    }
     let parsed_transaction_id = TransactionId::from_bytes(parsed_transaction.hash().0);
     if parsed_transaction_id != source_entry.transaction_id {
         return Err(MempoolEntryBuildError::TransactionIdMismatch {
@@ -319,6 +326,55 @@ mod tests {
                 parsed_digest: Some(_),
             })
         ));
+        Ok(())
+    }
+    /// Stored mempool bytes must be exactly one transaction, because Explorer
+    /// and Cipherscan reads parse them with a check that every byte is used.
+    #[test]
+    fn build_mempool_entry_rejects_bytes_after_the_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        for fixture_json in [
+            include_str!("../../tests/fixtures/z3-regtest-block-1.json"),
+            include_str!("../../tests/fixtures/z3-regtest-ironwood-block-603.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(fixture_json)?;
+            let raw_block_bytes = hex::decode(
+                fixture
+                    .get("raw_block_hex")
+                    .and_then(Value::as_str)
+                    .ok_or("fixture raw_block_hex is missing")?,
+            )?;
+            let parsed_block: ZebraBlock = raw_block_bytes.zcash_deserialize_into()?;
+            for transaction in &parsed_block.transactions {
+                let transaction_bytes = transaction.zcash_serialize_to_vec()?;
+                let source_entry = |raw_transaction_bytes: Vec<u8>| MempoolSourceEntry {
+                    transaction_id: TransactionId::from_bytes(transaction.hash().0),
+                    auth_digest: transaction
+                        .auth_digest()
+                        .map(|digest| AuthDigest::from_bytes(digest.0)),
+                    raw_transaction_bytes: RawTransactionBytes::new(raw_transaction_bytes),
+                    observed_at_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+                };
+
+                let entry = build_mempool_entry(
+                    source_entry(transaction_bytes.clone()),
+                    synthetic_chain_epoch(),
+                )?;
+                zinder_source::parse_transaction_public_facts(
+                    entry.raw_transaction_bytes().as_slice(),
+                    None,
+                    &activations,
+                )?;
+
+                let mut with_trailing_byte = transaction_bytes;
+                with_trailing_byte.push(0);
+                assert!(matches!(
+                    build_mempool_entry(source_entry(with_trailing_byte), synthetic_chain_epoch()),
+                    Err(MempoolEntryBuildError::TransactionParseFailed { .. })
+                ));
+            }
+        }
         Ok(())
     }
 }
