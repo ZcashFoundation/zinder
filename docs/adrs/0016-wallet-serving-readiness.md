@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-A wallet reader answers almost every request from its published serving pair. Only a few requests call anything else: a transaction broadcast and the lightwalletd `GetStandardFee` call the node, and mempool reads and lookups of unmined transactions call ingest control. Compact-blocks compatibility serving calls neither.
+A wallet reader answers almost every request from its published serving pair. Only a few requests call anything else: a transaction broadcast and the lightwalletd `GetStandardFee` call the node, and mempool reads and lookups of unmined transactions call ingest control. Compact-blocks compatibility serving calls neither. Light-wallet compatibility serving also sends transparent address reads, and transaction lookups when the store keeps no transaction bodies, to the node ([ADR-0023](0023-deployment-profiles.md)).
 
 If readiness required the node and ingest control as well as the pair, any node outage or syncing node would refuse every stored read without making any request succeed. Deployment tooling would spread the outage further. A proxy that checks `/readyz` before each request would close the public route. A container supervisor would restart the container, and a restart during a node outage becomes a full outage, because ingest needs the node to start.
 
@@ -12,9 +12,9 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 
 ## Decision
 
-1. **The serving pair alone admits traffic.** For native query and compatibility wallet serving, admission is the published canonical-and-wallet pair. For compact-blocks serving, it is the published canonical generation. Every rule that guards the served chain still refuses traffic; [Readiness](../reference/readiness.md#wallet-serving-readers) lists them.
+1. **The serving pair alone admits traffic.** For native query and compatibility wallet serving, admission is the published canonical-and-wallet pair. For compact-blocks serving, it is the published canonical generation. For light-wallet serving, it is the published canonical generation at a fence the writer attests, with an upgrade schedule the writer attests. Every rule that guards the served chain still refuses traffic; [Readiness](../reference/readiness.md#wallet-serving-readers) lists them.
 2. **Dependencies degrade instead of refusing.** A failure of the node or ingest control is listed under `degraded` and never closes the traffic gate. The one exception is a parked writer's halt, which refuses traffic from any input.
-3. **Each request fails on its own.** A node-backed request always calls the node, whatever the last probe saw, and a failed call returns `UNAVAILABLE` with `NODE_UNAVAILABLE`. A mempool request fails when ingest control does not answer. A probe observation can be up to a poll interval old, and request timeouts already bound each call.
+3. **Each request fails on its own.** An admitted request that needs the node attempts it independently of readiness probes. When no verified node answers, the request fails with `UNAVAILABLE` and `NODE_UNAVAILABLE`. Local overload, a failed endpoint verification, and a node that answers but refuses each have their own errors ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7). A mempool request fails when ingest control does not answer. A probe observation can be up to a poll interval old, and request timeouts already bound each call.
 4. **Mempool streams end while the writer's mempool waits on the node.** `MempoolEvents` replays retained events and then ends with `NODE_UNAVAILABLE` instead of staying silent, because silence reads as an unchanged mempool. An ordinary tip change keeps the stream open for up to 30 seconds while a replacement certifies. After that, the same refusal applies even if the source stays connected. This revised stream semantics in place, so it raised `contract_revision` ([ADR-0013](0013-chain-event-streams.md)).
 5. **Losing ingest control is bounded by the staleness ceiling.** Without writer status, the reader keeps serving only until the staleness ceiling passes, because an unattested fence is a question about the served chain, not about a dependency.
 6. **A halt seen through ingest control is sticky.** The pair publisher adopts it and refuses traffic. It reopens only after a writer status shows a writer that follows its node with a confirmed tip and attests the pair's fence.
@@ -28,11 +28,15 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 ## Evidence
 
 - Decision 1, readiness without checkpoint coverage: judgment. Admission answers whether the served chain is correct, and a store between checkpoints still answers every tree-state read correctly by replay. Its cost is restore latency on stores that are not yet dense, measured in the consequences. A decision on [#500](https://github.com/ZcashFoundation/zinder/issues/500) to report coverage reopens it.
+- Decision 1, light-wallet admission: judgment. Light-wallet serving has no wallet store to pair, so it admits the canonical generation as compact-blocks serving does. It also requires the writer to attest the upgrade schedule, because each forwarding node endpoint is checked against that schedule.
+- Decision 1, an open traffic gate while the light-wallet node is down: measured. With the node stopped under load on Regtest, local block ranges, tree states, and subtree roots kept serving byte-identical payloads and shielded scans completed, while 0 of 16 transaction enhancements succeeded ([#475](https://github.com/ZcashFoundation/zinder/issues/475)). A decision on [#475](https://github.com/ZcashFoundation/zinder/issues/475) to report node-backed methods separately for routing reopens it.
+- Decision 3: judgment. A probe observation can be stale, and request timeouts already bound each call, as the alternatives explain. The revision names the error classes the code returns.
 
 ## Consequences
 
 - Through a node outage, a syncing node, or an ingest-control outage within the staleness ceiling, readers keep serving stored data, as [Readiness](../reference/readiness.md#during-a-node-outage) lists. Wallets keep scanning.
 - Broadcast fails per request while none of a reader's node endpoints answers. A load balancer keeps routing to such a reader, and nothing steers a broadcast to another reader.
+- A light-wallet reader has two separate dependencies. Losing the forwarding node fails only the calls that need it, including broadcast, which is rejected rather than queued, and an address-history stream can fail after delivering rows. Retained mined bodies and empty unspent-output requests still resolve locally. Mempool methods depend on ingest, not on the forwarding node (decision 4). The tip calls refuse only when the served tip is stale and no writer witness vouches for it (decision 8). Block ranges, tree states, and subtree roots keep serving while the writer's attestation holds, so a shielded scan can complete, but a completed scan does not show that the wallet can display or spend its funds. `/readyz` stays 200, `node_source` appears under `degraded` once a probe completes and fails, and readiness has no separate signal for node-backed methods. [Readiness](../reference/readiness.md#during-a-node-outage) lists the behavior per method.
 - During a node outage, lightwalletd wallets see `estimatedHeight` pull away from the served tip, and once the tip is 25 minutes old their tip calls fail, so they stop syncing and report the server unreachable instead of building transactions on a tip that has stopped. Wallets expire transactions 40 blocks after the tip they were told, 120 from NU7, which is 50 minutes of target time, so the default leaves half that window as margin.
 - A wallet that cannot reach the tip calls stops syncing even though block ranges and tree states still answer. A private deployment that prefers to keep its wallets syncing through a long outage sets `compat.stale_tip_limit_ms` to 0, and its wallets then build transactions that expire on arrival once the tip is about 50 minutes old.
 - A writer behind its node, catching up or restored from an old snapshot, also refuses the tip calls until its tip is within the limit or matches the node's, while `/readyz` reports it ready.
@@ -47,6 +51,7 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 ## Alternatives rejected
 
 - **Keep readiness as the conjunction of every input.** It refuses every stored read without making any request succeed.
+- **Close the light-wallet traffic gate while its node is down.** Shielded scanning needs no node, so closing the gate would refuse the profile's main workload while it still succeeds.
 - **A new traffic-admitting cause such as `serving_degraded`.** It would compete with `serving_pair_stale` for the single cause slot and add an enum value consumers must learn. A separate list composes with every cause.
 - **Fail node-backed requests fast while the probe reports an outage.** The observation can be stale, and the request timeout already bounds the call.
 - **Serve indefinitely without ingest control.** The staleness ceiling bounds how long a reader serves an unattested fence, whatever the reason.
@@ -64,3 +69,6 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 - 2026-11-20. Bound how long a caught-up mempool stream can wait for a replacement generation.
 - 2026-11-20. Decision 9 ties the node-outage budget to ingest’s current wait reason.
 - 2026-11-23. The consequences state that READY does not imply tree-state checkpoint coverage, with its measured restore cost and the signals that show densification progress.
+- 2026-11-23. Decision 1 adds light-wallet admission on an attested canonical generation. Decision 3 separates an unreachable node from a node that refuses a request, and the consequences state the light-wallet node-outage behavior.
+- 2026-11-23. Decision 3 says an admitted request attempts the node independently of probes and names its other errors. The light-wallet outage consequence separates the forwarding node from ingest and links the per-method readiness reference.
+- 2026-11-23. Evidence records what decisions 1 and 3 rest on for light-wallet serving.

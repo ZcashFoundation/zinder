@@ -30,8 +30,11 @@ different sets can share both.
 2. **No native balance, mempool-by-address, or UTXO-set summary reads.**
    Wallets sum the unspent outputs they already read to spend. Mempool
    watchers filter `MempoolSnapshot` and `MempoolEvents`, whose entries carry
-   transparent outputs and spends. The lightwalletd compatibility runtime
-   still answers `GetTaddressBalance` from the same wallet projection rows.
+   transparent outputs and spends. In wallet serving, the lightwalletd
+   compatibility runtime still answers `GetTaddressBalance` from the same
+   wallet projection rows. Light-wallet serving sums the unspent outputs the
+   node reports at the served tip
+   ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7).
    Newest-first history and balance totals belong to the Explorer.
 3. **Wallet spend status comes from the wallet projection.** Its unspent rows
    decide whether an output is spent, and its spent rows name the spender.
@@ -66,6 +69,13 @@ different sets can share both.
 Method responses and pinning rules are in
 [Wallet data plane](../architecture/wallet-data-plane.md).
 
+## Evidence
+
+- Decision 2, the light-wallet balance: external constraint. The node's
+  `getaddressbalance` does not report the tip it answered at, so
+  light-wallet serving sums the unspent outputs the node attests at the
+  served tip ([#481](https://github.com/ZcashFoundation/zinder/pull/481)).
+
 ## Consequences
 
 - A removed read returns only when a consumer needs a shape the kept surface
@@ -97,3 +107,10 @@ Method responses and pinning rules are in
   vanishes and crafted collisions are easy.
 - **An ordered digest like `hash_serialized`.** It requires a defined
   iteration order that Zinder's storage does not provide.
+
+## Revision history
+
+- 2026-11-23. Decision 2 names the source of `GetTaddressBalance` in
+  light-wallet serving.
+- 2026-11-23. Evidence records what decision 2 rests on for light-wallet
+  serving.
