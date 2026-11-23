@@ -48,6 +48,10 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 
 - Decision 6: judgment. It serves operators who run a managed database and does not relieve a measured limit, so no RocksDB measurement reopens it. Its cost is a second storage engine to build and certify. Decision 7's gate is the observation that reopens it: a threshold the design cannot be reworked to meet. The Context gives the current RocksDB rebuild and restore figures, which this purpose does not depend on.
 - Decision 7, the build threshold: judgment on a measured baseline. The RocksDB side measured about 1 h 51 min for canonical construction and about 1 h 19 min for the wallet projection on Mainnet ([#488](https://github.com/ZcashFoundation/zinder/issues/488), [#474](https://github.com/ZcashFoundation/zinder/issues/474)), so the former 48-hour limit was more than ten times the RocksDB build and could not detect a regression. The factor of four, like the factors of one half and two in the other thresholds, is a chosen tolerance, not a measurement. The commit-latency, streaming-rate, and size thresholds are unchanged.
+- Decision 2, exact identity for writers and minimum data for readers: judgment. A reader still compares the schema, network, reorg window, upgrade schedule, READY state, and manifest agreement, so admitting a store that holds more data changes neither the chain nor the history it serves. It lets one store serve readers that need less. A reader admitted on a richer store that answers a request differently from one admitted on the exact identity reopens it.
+- Decision 2, complete subtree-root prefixes only for light-wallet admission: judgment. Light-wallet serving serves roots from index zero and refuses at startup a store that cannot. A full-wallet pair serves a checkpointed store's retained roots and refuses an unavailable earlier root on the request that asks for it. A wallet that cannot recover from that per-request refusal reopens it.
+- Decision 5, backups of deployments with a wallet projection: judgment. A deployment without a wallet store has no second store to pair with its canonical checkpoint. No restore of such a deployment has been measured.
+- Decision 9, a fresh store per layout change with no mandatory rollback lane: judgment, resting on the maintainer's statement that team-run deployments rebuild from scratch and need no migration, side-by-side cutover, or rollback window ([#364](https://github.com/ZcashFoundation/zinder/issues/364)). Its cost is a rebuild per layout change, which the Context measures. A supported deployment that can neither absorb the rebuild outage nor keep a fallback reopens it.
 
 ## Consequences
 
@@ -88,3 +92,5 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 - 2026-11-23. Decision 2 separates a writer's exact store identity from a reader's minimum data requirements. Decision 9 replaces the 7-day build-beside rollback with a schema-version bump and a fresh store, with an optional fallback for self-hosters. Decision 5 applies the coherent-pair backup to deployments that serve a wallet projection.
 
 - 2026-11-23. Decision 2 limits the complete subtree-root prefix requirement to light-wallet admission.
+
+- 2026-11-23. Evidence records what decisions 2, 5, and 9 rest on.
