@@ -328,7 +328,10 @@ the construction manifest. A reader can require a complete subtree-root
 prefix from index zero in every pool. A retained-range load meets this
 requirement when its predecessor has no completed roots. Otherwise, a
 complete-prefix load is required. Insufficient coverage returns
-`CanonicalStoreError::IncompleteSubtreeRootPrefix`. Pool activation still
+`CanonicalStoreError::IncompleteSubtreeRootPrefix`. Native wallet query and
+lightwalletd wallet and light-wallet serving require this prefix before
+opening their listeners. Compact-block serving and signed history publication
+accept retained-range stores even when earlier roots are absent. Pool activation still
 governs final roots, and event retention still governs event streams. Serving capabilities also depend on
 the installed handlers and their admitted dependencies.
 

@@ -76,10 +76,10 @@ use zinder_source::{
     UpstreamHealthSnapshot,
 };
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
-    RocksDbOpenResources, RocksDbResourceBudget, SharedSecondaryResources, StoreRole,
-    record_instance_memory_gauges,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreRequirements, RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary,
+    RocksDbInstanceMemory, RocksDbOpenResources, RocksDbResourceBudget, SharedSecondaryResources,
+    StoreRole, record_instance_memory_gauges,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -1754,7 +1754,9 @@ impl WalletServingPairPublisher {
         let wallet_generation_path = secondary_generation.wallet_generation_path.clone();
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
-        let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
+        let requirements =
+            CanonicalStoreRequirements::for_blob_retention(self.config.expected_raw_blob_retention)
+                .with_complete_subtree_root_prefix();
         let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
         let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;
@@ -1772,15 +1774,15 @@ impl WalletServingPairPublisher {
                     source,
                 }
             })?;
-            let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
-                canonical_primary_path,
-                canonical_secondary_path,
-                network,
-                CanonicalStoreWorkload::Wallet,
-                expected_raw_blob_retention,
-                canonical_reorg_policy,
-                canonical_resources,
-            )?;
+            let canonical =
+                RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+                    canonical_primary_path,
+                    canonical_secondary_path,
+                    network,
+                    requirements,
+                    canonical_reorg_policy,
+                    canonical_resources,
+                )?;
             let wallet = RocksDbWalletSecondary::open_ready(
                 wallet_primary_path,
                 wallet_secondary_path,

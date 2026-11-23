@@ -190,7 +190,9 @@ impl LightwalletdConfig {
             self.storage.expected_raw_blob_retention,
         );
         if self.serving == CompatServing::LightWallet {
-            requirements.from_height(zinder_core::BlockHeight::new(1))
+            requirements
+                .from_height(zinder_core::BlockHeight::new(1))
+                .with_complete_subtree_root_prefix()
         } else {
             requirements
         }
