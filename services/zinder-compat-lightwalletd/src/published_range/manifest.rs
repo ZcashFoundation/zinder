@@ -73,7 +73,7 @@ pub(super) fn publish_segment(
     let published = match fs::hard_link(&segment, &destination) {
         Ok(()) => history,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = PublishedShieldedRange::open(&destination, history.identity())?;
+            let existing = PublishedShieldedRange::open(&destination, history.identity(), false)?;
             if history.segment.kernel_verified && !existing.segment.kernel_verified {
                 // Reuse the verified bytes without changing other hard links to a portable orphan.
                 fs::rename(&segment, &destination)?;

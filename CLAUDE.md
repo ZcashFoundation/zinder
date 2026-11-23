@@ -211,6 +211,7 @@ The workspace `Cargo.toml` denies (not warns):
 Practical effects:
 
 - Always use `?` and typed errors; never `unwrap()`/`expect()`, even in tests.
+- Do not write `unsafe` code. The one allowed site is the read-only mapping of fs-verity history segments in `zinder-compat-lightwalletd`; [ADR-0015](docs/adrs/0015-wallet-runtime-composition.md) records why it is sound.
 - Every public item needs a doc comment. `#[allow(..., reason = "...")]` requires the `reason =` field.
 - Use `eprintln!`/`println!` only in CLI `main`/`run` paths, behind an explicit `#[allow(clippy::print_stderr, clippy::print_stdout, reason = "...")]` block (see `services/zinder-ingest/src/main.rs`).
 - Library crates use per-boundary `thiserror` enums. Binaries may use `anyhow` only at `main.rs`. Public domain crates must not expose `tonic::Status`, `rocksdb::*`, `jsonrpsee::core::ClientError`, `reqwest::Error`, or transport-specific errors.

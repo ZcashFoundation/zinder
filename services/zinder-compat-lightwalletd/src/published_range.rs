@@ -42,6 +42,17 @@ struct ShieldedRangeIdentity {
 
 const MAX_VERIFIED_SETTLED_TIPS: usize = 16;
 
+/// How the listener admits and reads signed history segments.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SegmentAccess {
+    /// Reject any segment without an active, pinned Linux fs-verity digest.
+    pub require_fs_verity: bool,
+    /// Serve kernel-verified segments from a read-only memory mapping instead of copying
+    /// them into memory. A page that then fails verification stops the process with
+    /// `SIGBUS`, where a copied read fails one stream.
+    pub map_verified_segments: bool,
+}
+
 /// A settled, read-only projection of the default shielded range format.
 struct PublishedShieldedRange {
     identity: ShieldedRangeIdentity,
@@ -127,6 +138,7 @@ impl PublishedShieldedRange {
                 sha256: segment.sha256,
                 fs_verity_sha256: segment.verity,
             },
+            false,
         )
     }
 
@@ -136,7 +148,7 @@ impl PublishedShieldedRange {
     /// # Errors
     ///
     /// Fails on invalid identity, damaged or incomplete data, or a storage error.
-    fn open(path: &Path, identity: ShieldedRangeIdentity) -> io::Result<Self> {
+    fn open(path: &Path, identity: ShieldedRangeIdentity, map_verified: bool) -> io::Result<Self> {
         let descriptor = SegmentIdentity {
             network: Network::from_id(identity.network_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "unknown segment network")
@@ -149,7 +161,7 @@ impl PublishedShieldedRange {
             sha256: identity.sha256,
             verity: identity.fs_verity_sha256,
         };
-        let segment = SealedHistory::open(path, descriptor)?;
+        let segment = SealedHistory::open_with(path, descriptor, map_verified)?;
         Ok(Self {
             identity,
             segment,

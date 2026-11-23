@@ -11,7 +11,7 @@ use zinder_core::BlockHeightRange;
 use zinder_query::CanonicalReader;
 use zinder_store::HeightOrder;
 
-use super::{PublishedShieldedCatalog, ShieldedTailBuffer};
+use super::{PublishedShieldedCatalog, SegmentAccess, ShieldedTailBuffer};
 use crate::sealed_history::SealedBlock;
 
 /// The admitted shielded history shared by a listener and its catalog refresher.
@@ -20,7 +20,7 @@ pub struct PublishedShieldedHistory {
     manifest: PathBuf,
     publisher_directory: Option<PathBuf>,
     key: [u8; 32],
-    require_fs_verity: bool,
+    access: SegmentAccess,
 }
 
 pub(super) enum HistorySnapshot {
@@ -49,7 +49,8 @@ impl HistorySnapshot {
 impl PublishedShieldedHistory {
     /// Opens signed settled history against the listener's canonical reader.
     /// The verification key is a separate, trusted file containing 32 raw Ed25519 bytes.
-    /// When required, every segment must have active Linux fs-verity at admission.
+    /// `access` sets whether every segment needs active Linux fs-verity at admission and
+    /// whether kernel-verified segments are served from a memory mapping.
     ///
     /// # Errors
     ///
@@ -57,10 +58,10 @@ impl PublishedShieldedHistory {
     pub async fn open(
         manifest: &Path,
         publisher_key: &Path,
-        require_fs_verity: bool,
+        access: SegmentAccess,
         source: &dyn CanonicalReader,
     ) -> Result<Self, Status> {
-        Self::admit(manifest, None, publisher_key, require_fs_verity, source).await
+        Self::admit(manifest, None, publisher_key, access, source).await
     }
 
     /// Follows an active publisher and serves canonical ranges until its first segment.
@@ -72,14 +73,14 @@ impl PublishedShieldedHistory {
     pub async fn follow_publisher(
         directory: &Path,
         publisher_key: &Path,
-        require_fs_verity: bool,
+        access: SegmentAccess,
         source: &dyn CanonicalReader,
     ) -> Result<Self, Status> {
         Self::admit(
             &directory.join("current.json"),
             Some(directory),
             publisher_key,
-            require_fs_verity,
+            access,
             source,
         )
         .await
@@ -89,7 +90,7 @@ impl PublishedShieldedHistory {
         manifest: &Path,
         publisher_directory: Option<&Path>,
         publisher_key: &Path,
-        require_fs_verity: bool,
+        access: SegmentAccess,
         source: &dyn CanonicalReader,
     ) -> Result<Self, Status> {
         let path = manifest.to_owned();
@@ -101,7 +102,7 @@ impl PublishedShieldedHistory {
                 None => publisher_key,
             };
             let key = super::manifest::verification_key_from(&publisher_key)?;
-            let catalog = read_catalog(&path, directory.as_deref(), &key, require_fs_verity, None)?;
+            let catalog = read_catalog(&path, directory.as_deref(), &key, access, None)?;
             Ok::<_, io::Error>((key, catalog))
         })
         .await
@@ -118,7 +119,7 @@ impl PublishedShieldedHistory {
             manifest: manifest.to_owned(),
             publisher_directory: publisher_directory.map(Path::to_owned),
             key,
-            require_fs_verity,
+            access,
         })
     }
 
@@ -160,13 +161,13 @@ impl PublishedShieldedHistory {
         let manifest = self.manifest.clone();
         let directory = self.publisher_directory.clone();
         let key = self.key;
-        let require_fs_verity = self.require_fs_verity;
+        let access = self.access;
         let candidate = tokio::task::spawn_blocking(move || {
             read_catalog(
                 &manifest,
                 directory.as_deref(),
                 &key,
-                require_fs_verity,
+                access,
                 previous.as_deref(),
             )
         })
@@ -208,7 +209,7 @@ fn read_catalog(
     manifest: &Path,
     publisher_directory: Option<&Path>,
     key: &[u8; 32],
-    require_fs_verity: bool,
+    access: SegmentAccess,
     previous: Option<&PublishedShieldedCatalog>,
 ) -> io::Result<Option<PublishedShieldedCatalog>> {
     // The publisher installs the manifest before its checkpoint. Read the checkpoint
@@ -224,13 +225,8 @@ fn read_catalog(
         head.verify(&[])?;
         return Ok(None);
     }
-    let catalog = PublishedShieldedCatalog::open_signed(
-        manifest,
-        key,
-        require_fs_verity,
-        previous,
-        head.as_ref(),
-    )?;
+    let catalog =
+        PublishedShieldedCatalog::open_signed(manifest, key, access, previous, head.as_ref())?;
     Ok(Some(catalog))
 }
 

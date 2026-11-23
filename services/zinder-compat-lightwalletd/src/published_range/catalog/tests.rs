@@ -60,7 +60,7 @@ impl Fixture {
         PublishedShieldedCatalog::open_signed(
             &self.current(),
             &verification_key_from(&self.public)?,
-            false,
+            SegmentAccess::default(),
             previous,
             None,
         )
@@ -177,7 +177,7 @@ async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> R
         super::super::PublishedShieldedHistory::follow_publisher(
             f.directory.path(),
             &public,
-            false,
+            SegmentAccess::default(),
             &canonical,
         )
     };
@@ -187,7 +187,7 @@ async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> R
         super::super::PublishedShieldedHistory::follow_publisher(
             f.directory.path(),
             &f.public,
-            false,
+            SegmentAccess::default(),
             &canonical
         )
         .await
@@ -199,16 +199,21 @@ async fn managed_history_requires_the_trusted_checkpoint_on_every_restart() -> R
         super::super::PublishedShieldedHistory::follow_publisher(
             f.directory.path(),
             &other.public,
-            false,
+            SegmentAccess::default(),
             &canonical
         )
         .await
         .is_err()
     );
     assert!(
-        super::super::PublishedShieldedHistory::open(&f.current(), &f.public, false, &canonical)
-            .await
-            .is_err()
+        super::super::PublishedShieldedHistory::open(
+            &f.current(),
+            &f.public,
+            SegmentAccess::default(),
+            &canonical
+        )
+        .await
+        .is_err()
     );
     assert!(publisher.publish_next(&canonical)?);
     assert!(waiting.refresh(&canonical).await?);
@@ -239,7 +244,7 @@ async fn captures_on_either_side_of_first_adoption_keep_their_shared_tail() -> R
     let history = super::super::PublishedShieldedHistory::follow_publisher(
         fixture.directory.path(),
         &trusted,
-        false,
+        SegmentAccess::default(),
         canonical.as_ref(),
     )
     .await?;
@@ -368,7 +373,7 @@ fn initial_publication_creates_and_reopens_nested_directories() -> Result<()> {
     let catalog = PublishedShieldedCatalog::open_signed(
         &nested.join("current.json"),
         &verification_key_from(&fixture.public)?,
-        false,
+        SegmentAccess::default(),
         None,
         None,
     )?;
@@ -428,7 +433,7 @@ async fn adjacent_signed_files_from_disconnected_chains_and_wrong_keys_are_rejec
         PublishedShieldedCatalog::open_signed(
             &f.current(),
             &verification_key_from(&wrong.public)?,
-            false,
+            SegmentAccess::default(),
             None,
             None
         )
@@ -473,7 +478,17 @@ fn required_verity_rejects_an_ordinary_signed_segment() -> Result<()> {
     fs::rename(ordinary, segment)?;
     assert!(fixture.catalog(None).is_ok());
     assert!(
-        PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None).is_err()
+        PublishedShieldedCatalog::open_signed(
+            &fixture.current(),
+            &key,
+            SegmentAccess {
+                require_fs_verity: true,
+                ..SegmentAccess::default()
+            },
+            None,
+            None
+        )
+        .is_err()
     );
     Ok(())
 }
@@ -489,7 +504,18 @@ fn kernel_protected_catalog_requires_every_segment_before_admission() -> Result<
     assert!(publisher.publish_next(&canonical)?);
     assert!(publisher.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
-    let open = || PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None);
+    let open = || {
+        PublishedShieldedCatalog::open_signed(
+            &fixture.current(),
+            &key,
+            SegmentAccess {
+                require_fs_verity: true,
+                ..SegmentAccess::default()
+            },
+            None,
+            None,
+        )
+    };
     let catalog = open()?;
     assert_eq!(catalog.bounds().end, BlockHeight::new(4));
     let mut entries = fixture.entries()?;
@@ -523,8 +549,16 @@ fn kernel_protected_publication_recovers_portable_orphans() -> Result<()> {
 
     assert!(publisher.publish_next(&canonical)?);
     let key = verification_key_from(&fixture.public)?;
-    let catalog =
-        PublishedShieldedCatalog::open_signed(&fixture.current(), &key, true, None, None)?;
+    let catalog = PublishedShieldedCatalog::open_signed(
+        &fixture.current(),
+        &key,
+        SegmentAccess {
+            require_fs_verity: true,
+            ..SegmentAccess::default()
+        },
+        None,
+        None,
+    )?;
     assert_eq!(catalog.bounds().end, BlockHeight::new(4));
     assert!(
         fs::OpenOptions::new()

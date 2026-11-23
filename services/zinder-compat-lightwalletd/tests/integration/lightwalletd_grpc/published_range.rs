@@ -15,7 +15,7 @@ use tonic::{
 };
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, CompactBlocksGrpcAdapter, LightwalletdGrpcAdapter,
-    PublishedShieldedHistory, ShieldedCatalogPublisher,
+    PublishedShieldedHistory, SegmentAccess, ShieldedCatalogPublisher,
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, CompactChainMetadata,
@@ -80,7 +80,7 @@ impl ReaderFixture {
             PublishedShieldedHistory::open(
                 &path.join("current.json"),
                 &key,
-                false,
+                SegmentAccess::default(),
                 self.reader.as_ref(),
             )
             .await?,
@@ -898,7 +898,13 @@ async fn wallets_read_across_multiple_signed_segments_and_the_live_suffix() -> e
     let manifest = publication.join("current.json");
     assert!(publisher.publish_next(&store.reader)?);
     let history = Arc::new(
-        PublishedShieldedHistory::open(&manifest, &key, false, store.reader.as_ref()).await?,
+        PublishedShieldedHistory::open(
+            &manifest,
+            &key,
+            SegmentAccess::default(),
+            store.reader.as_ref(),
+        )
+        .await?,
     );
     let recorder = EpochPinRecorder::new(store.query.clone());
     let mut wallet = Endpoint::start(
@@ -959,7 +965,7 @@ async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders
         PublishedShieldedHistory::open(
             &directory.join("current.json"),
             &files.path().join("verification.pub"),
-            false,
+            SegmentAccess::default(),
             fixture.reader.as_ref(),
         )
         .await?,
@@ -1033,7 +1039,7 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
         PublishedShieldedHistory::open(
             &portable.join("current.json"),
             &key,
-            false,
+            SegmentAccess::default(),
             fixture.reader.as_ref(),
         )
         .await?,
@@ -1347,8 +1353,13 @@ async fn followed_publisher_serves_the_standalone_tail_until_its_first_catalog()
     let mut publisher =
         ShieldedCatalogPublisher::open(&directory, &signer, BlockHeight::new(1), 2.try_into()?)?;
     let history = Arc::new(
-        PublishedShieldedHistory::follow_publisher(&directory, &key, false, store.reader.as_ref())
-            .await?,
+        PublishedShieldedHistory::follow_publisher(
+            &directory,
+            &key,
+            SegmentAccess::default(),
+            store.reader.as_ref(),
+        )
+        .await?,
     );
     let mut recorder = EpochPinRecorder::new(store.query.clone());
     recorder.expose_range_fence = true;

@@ -206,6 +206,8 @@ pub(crate) struct SealedHistory {
     pub(crate) kernel_verified: bool,
     identity: SegmentIdentity,
     file: File,
+    // The whole file, mapped read-only, when the segment is kernel-verified and mapping is enabled.
+    mapped: Option<Bytes>,
     rows: Vec<IndexedBlock>,
 }
 
@@ -287,14 +289,30 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
 
 impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
+        Self::open_with(path, expected, false)
+    }
+
+    /// Admits a segment and, when `map_verified` is set and the kernel verifies the
+    /// file with fs-verity, serves its payloads from a read-only mapping.
+    pub(crate) fn open_with(
+        path: &Path,
+        expected: SegmentIdentity,
+        map_verified: bool,
+    ) -> io::Result<Self> {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
         let protected = index::pinned_verity(expected.verity, || verity::measure(&file))?;
         let rows = index::admit(&mut &file, expected, file_len, protected)?;
+        let mapped = if protected && map_verified {
+            Some(map_verified_segment(&file, file_len)?)
+        } else {
+            None
+        };
         Ok(Self {
             kernel_verified: protected,
             identity: expected,
             file,
+            mapped,
             rows,
         })
     }
@@ -373,6 +391,21 @@ impl SealedHistory {
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
         let mut out = Vec::with_capacity(selected.len());
+        if let Some(mapped) = &self.mapped {
+            let start = usize::try_from(first_frame)
+                .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+            let packed = start
+                .checked_add(len)
+                .filter(|end| *end <= mapped.len())
+                .map(|end| mapped.slice(start..end))
+                .ok_or_else(|| invalid("shielded chunk exceeds its mapped segment"))?;
+            for row in selected {
+                let row_start = verified_row_start(row, &packed, first_frame)?;
+                let payload = packed.slice(row_start..row_start + row.len);
+                out.push(verify_and_build_block(row, payload, self.kernel_verified)?);
+            }
+            return Ok(out);
+        }
         if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
             let mut slab = vec![0; len];
             read_exact_at(&self.file, &mut slab, first_frame)?;
@@ -415,6 +448,31 @@ impl SealedHistory {
         }
         Ok(())
     }
+}
+
+/// Maps an admitted fs-verity segment read-only for the life of its `SealedHistory`.
+///
+/// A page that fails kernel verification, or a device read error, raises `SIGBUS` in
+/// the reader when that page is touched, where a `preadv` would return an error for one
+/// stream. See ADR-0015.
+#[allow(
+    unsafe_code,
+    reason = "the only memory mapping in the workspace; ADR-0015 records the soundness argument"
+)]
+fn map_verified_segment(file: &File, file_len: u64) -> io::Result<Bytes> {
+    // SAFETY: the caller maps only a file whose fs-verity digest the kernel measured on this
+    // descriptor and that matched the signed pin. The kernel refuses to open an fs-verity file
+    // for writing or to truncate it, and fs-verity cannot be disabled, so the mapped bytes never
+    // change and never shrink while the mapping exists. Rename and unlink keep the inode alive.
+    // The mapping is read-only, and `Bytes::from_owner` keeps it mapped until the
+    // last payload slice handed to the transport is dropped.
+    let map = unsafe { memmap2::MmapOptions::new().map(file)? };
+    if u64::try_from(map.len()).ok() != Some(file_len) {
+        return Err(invalid(
+            "mapped shielded segment length differs from the file",
+        ));
+    }
+    Ok(Bytes::from_owner(map))
 }
 
 fn relative_frame_offset(row: &IndexedBlock, first_frame: u64) -> io::Result<usize> {

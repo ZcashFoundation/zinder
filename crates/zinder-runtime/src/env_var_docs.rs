@@ -1212,6 +1212,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Require Linux fs-verity on every segment. Defaults to false. See [signed settled history](lightwalletd-compatibility.md#signed-settled-history).",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__SHIELDED_HISTORY__MAP_VERIFIED_SEGMENTS",
+        toml_path: "compat.shielded_history.map_verified_segments",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Serve fs-verity segments from a read-only memory mapping instead of copying them into memory. A page that then fails kernel verification stops the listener with SIGBUS. Defaults to false. See [signed settled history](lightwalletd-compatibility.md#signed-settled-history).",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
         toml_path: "compat.pair_convergence_attempts",
         used_by: &["zinder-compat-lightwalletd"],
@@ -2151,6 +2159,7 @@ mod tests {
                 "ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST",
                 "ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY",
                 "ZINDER_COMPAT__SHIELDED_HISTORY__REQUIRE_FS_VERITY",
+                "ZINDER_COMPAT__SHIELDED_HISTORY__MAP_VERIFIED_SEGMENTS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",

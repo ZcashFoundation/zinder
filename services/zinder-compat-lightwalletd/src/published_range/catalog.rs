@@ -11,7 +11,7 @@ use zinder_core::{BlockHeight, BlockHeightRange};
 use zinder_query::CanonicalReader;
 
 use super::{
-    PublishedShieldedRange, ShieldedRangeIdentity,
+    PublishedShieldedRange, SegmentAccess, ShieldedRangeIdentity,
     manifest::{invalid, segment_path, signed_contents},
 };
 
@@ -55,8 +55,10 @@ fn open_segment(
     directory: &Path,
     entry: &ShieldedRangeIdentity,
     previous: Option<ShieldedRangeIdentity>,
+    map_verified: bool,
 ) -> io::Result<PublishedShieldedRange> {
-    let range = PublishedShieldedRange::open(&segment_path(directory, entry.sha256), *entry)?;
+    let range =
+        PublishedShieldedRange::open(&segment_path(directory, entry.sha256), *entry, map_verified)?;
     check_parent(previous, &range)?;
     Ok(range)
 }
@@ -84,7 +86,7 @@ impl PublishedShieldedCatalog {
     pub(super) fn open_signed(
         path: &Path,
         key: &[u8; 32],
-        require_fs_verity: bool,
+        access: SegmentAccess,
         previous: Option<&Self>,
         head: Option<&PublisherHead>,
     ) -> io::Result<Self> {
@@ -105,7 +107,7 @@ impl PublishedShieldedCatalog {
                     "shielded catalog changed publisher or regressed its admitted prefix",
                 ));
             }
-            if require_fs_verity
+            if access.require_fs_verity
                 && previous
                     .segments
                     .iter()
@@ -120,8 +122,8 @@ impl PublishedShieldedCatalog {
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
         for entry in &entries[segments.len()..] {
             let prior = segments.last().map(|range| range.identity());
-            let segment = open_segment(directory, entry, prior)?;
-            if require_fs_verity && !segment.segment.kernel_verified {
+            let segment = open_segment(directory, entry, prior, access.map_verified_segments)?;
+            if access.require_fs_verity && !segment.segment.kernel_verified {
                 return Err(invalid(
                     "shielded history requires Linux fs-verity on every segment",
                 ));

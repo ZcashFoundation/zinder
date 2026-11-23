@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt as _;
 
 use eyre::Result;
 use tokio::process::Command;
-use zinder_compat_lightwalletd::PublishedShieldedHistory;
+use zinder_compat_lightwalletd::{PublishedShieldedHistory, SegmentAccess};
 use zinder_core::{BlockHeight, Network};
 use zinder_query::RocksDbCanonicalReader;
 use zinder_store::RawBlobRetention;
@@ -50,6 +50,35 @@ fn history_configuration_requires_one_location_and_an_independent_key() -> Resul
     }
     assert!(!render(&[directory, manifest])?.status.success());
     assert!(!render(&[])?.status.success());
+    Ok(())
+}
+
+#[test]
+fn history_configuration_maps_verified_segments_only_when_enabled() -> Result<()> {
+    let base =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/history-publisher.toml");
+    let render = |extra: &[(&str, &str)]| {
+        super::zinder_compat_command()
+            .args(["--print-config", "--config"])
+            .arg(&base)
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env(
+                "ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY",
+                "/trusted/key",
+            )
+            .env("ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY", "/published")
+            .envs(extra.iter().copied())
+            .output()
+    };
+    let default = render(&[])?;
+    assert!(default.status.success(), "{default:?}");
+    assert!(String::from_utf8(default.stdout)?.contains("map_verified_segments = false"));
+    let enabled = render(&[(
+        "ZINDER_COMPAT__SHIELDED_HISTORY__MAP_VERIFIED_SEGMENTS",
+        "true",
+    )])?;
+    assert!(enabled.status.success(), "{enabled:?}");
+    assert!(String::from_utf8(enabled.stdout)?.contains("map_verified_segments = true"));
     Ok(())
 }
 
@@ -97,7 +126,9 @@ async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Resu
     fs::write(&operator_file, b"operator")?;
     let mut store = writer.serving_store_fixture()?;
     let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
-    let admitted = PublishedShieldedHistory::open(&manifest, &public, false, &reader).await?;
+    let admitted =
+        PublishedShieldedHistory::open(&manifest, &public, SegmentAccess::default(), &reader)
+            .await?;
     for _ in 0..3 {
         publisher.kill().await?;
         let abandoned = own.join("canonical/interrupted");

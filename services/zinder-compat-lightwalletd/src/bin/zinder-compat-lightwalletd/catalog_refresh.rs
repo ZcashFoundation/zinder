@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio_util::sync::CancellationToken;
-use zinder_compat_lightwalletd::{CanonicalReaderSlot, PublishedShieldedHistory};
+use zinder_compat_lightwalletd::{CanonicalReaderSlot, PublishedShieldedHistory, SegmentAccess};
 use zinder_query::WalletServingPairSlot;
 use zinder_runtime::{ConfigError, SupervisedTasks};
 
@@ -47,6 +47,13 @@ impl CatalogSource {
 }
 
 impl ShieldedHistorySection {
+    fn segment_access(&self) -> SegmentAccess {
+        SegmentAccess {
+            require_fs_verity: self.require_fs_verity,
+            map_verified_segments: self.map_verified_segments,
+        }
+    }
+
     async fn open(
         &self,
         source: &dyn zinder_query::CanonicalReader,
@@ -56,7 +63,7 @@ impl ShieldedHistorySection {
                 PublishedShieldedHistory::open(
                     path,
                     &self.publisher_key,
-                    self.require_fs_verity,
+                    self.segment_access(),
                     source,
                 )
                 .await
@@ -65,7 +72,7 @@ impl ShieldedHistorySection {
                 PublishedShieldedHistory::follow_publisher(
                     path,
                     &self.publisher_key,
-                    self.require_fs_verity,
+                    self.segment_access(),
                     source,
                 )
                 .await

@@ -23,6 +23,7 @@ fs-verity.workspace = true
 futures-util = { workspace = true, optional = true }
 hex.workspace = true
 http.workspace = true
+memmap2.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 metrics.workspace = true

@@ -497,9 +497,12 @@ fn kernel_protected_payload_must_match_its_index_before_serving() -> eyre::Resul
             }
         })?;
         enable_verity(&path)?;
-        let history = SealedHistory::open(&path, identity)?;
-        assert!(history.kernel_verified);
-        assert_second_payload_fails(&history, &reason)?;
+        for map_verified in [false, true] {
+            let history = SealedHistory::open_with(&path, identity, map_verified)?;
+            assert!(history.kernel_verified);
+            assert_eq!(history.mapped.is_some(), map_verified);
+            assert_second_payload_fails(&history, &reason)?;
+        }
     }
     Ok(())
 }
@@ -636,5 +639,96 @@ fn positional_reads_fill_all_slabs_and_report_a_short_final_frame() -> eyre::Res
         .err()
         .ok_or_else(|| invalid("served a truncated frame"))?;
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+fn publish_dense(path: &Path, total_blocks: u32) -> eyre::Result<SegmentIdentity> {
+    let staged = NamedTempFile::new_in(parent_directory(path))?;
+    let mut writer = SegmentWriter::create(path, staged, NETWORK, id(1).height, id(total_blocks))?;
+    for height in 1..=total_blocks {
+        let dense = dense_block(height)?;
+        let native_bytes = zinder_store::encode_compact_block_artifact(&dense).len();
+        writer.push(dense, native_bytes)?;
+    }
+    Ok(writer.finish()?)
+}
+
+#[test]
+fn portable_segments_ignore_the_mapping_request() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded-portable");
+    let identity = publish_dense(&path, 100)?;
+    let copied = SealedHistory::open(&path, identity)?;
+    let requested = SealedHistory::open_with(&path, identity, true)?;
+    assert!(!requested.kernel_verified);
+    assert!(requested.mapped.is_none());
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        let expected = copied.read_chunk(range(1, 100), order, usize::MAX)?;
+        let served = requested.read_chunk(range(1, 100), order, usize::MAX)?;
+        assert!(
+            expected
+                .iter()
+                .map(|row| (row.id, &row.payload))
+                .eq(served.iter().map(|row| (row.id, &row.payload)))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TMPDIR on a disposable fs-verity filesystem and fsverity on PATH"]
+fn kernel_verified_mapping_serves_the_rows_a_copied_read_serves() -> eyre::Result<()> {
+    const TOTAL_BLOCKS: u32 = 100;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded-dense");
+    let identity = publish_dense(&path, TOTAL_BLOCKS)?;
+    enable_verity(&path)?;
+    let copied = SealedHistory::open(&path, identity)?;
+    let mapped = SealedHistory::open_with(&path, identity, true)?;
+    assert!(copied.mapped.is_none());
+    assert!(mapped.kernel_verified && mapped.mapped.is_some());
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        for (first, last) in [
+            (1, TOTAL_BLOCKS),
+            (1, 1),
+            (TOTAL_BLOCKS, TOTAL_BLOCKS),
+            (17, 83),
+        ] {
+            for max_bytes in [
+                1,
+                4096,
+                SLAB_TARGET_BYTES,
+                3 * SLAB_TARGET_BYTES,
+                usize::MAX,
+            ] {
+                let expected = copied.bounded_rows(range(first, last), order, max_bytes, true)?;
+                let served = mapped.bounded_rows(range(first, last), order, max_bytes, true)?;
+                assert!(!served.is_empty());
+                assert!(
+                    expected
+                        .iter()
+                        .map(|row| (row.id, row.parent, row.native_bytes, &row.payload))
+                        .eq(served.iter().map(|row| (
+                            row.id,
+                            row.parent,
+                            row.native_bytes,
+                            &row.payload
+                        ))),
+                    "rows differ for {first}..={last} {order:?} within {max_bytes} bytes"
+                );
+            }
+        }
+    }
+    // A payload keeps the mapping alive after its segment is dropped.
+    let held = mapped.read_chunk(range(1, TOTAL_BLOCKS), HeightOrder::Descending, usize::MAX)?;
+    let expected =
+        copied.read_chunk(range(1, TOTAL_BLOCKS), HeightOrder::Descending, usize::MAX)?;
+    drop(mapped);
+    assert!(
+        held.iter()
+            .map(|row| &row.payload)
+            .eq(expected.iter().map(|row| &row.payload))
+    );
     Ok(())
 }

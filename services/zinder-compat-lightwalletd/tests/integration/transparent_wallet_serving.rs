@@ -1356,7 +1356,9 @@ async fn production_pair_get_block_range_outside_retained_history_keeps_lightwal
 async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavailable()
 -> eyre::Result<()> {
     use prost::Message as _;
-    use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
+    use zinder_compat_lightwalletd::{
+        PublishedShieldedHistory, SegmentAccess, ShieldedCatalogPublisher,
+    };
 
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -1378,7 +1380,7 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
         PublishedShieldedHistory::follow_publisher(
             directory.path(),
             &public,
-            false,
+            SegmentAccess::default(),
             canonical.as_ref(),
         )
         .await?,
@@ -2059,7 +2061,9 @@ impl CanonicalReader for InstrumentedCanonicalReader {
 
 #[tokio::test]
 async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() -> eyre::Result<()> {
-    use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
+    use zinder_compat_lightwalletd::{
+        PublishedShieldedHistory, SegmentAccess, ShieldedCatalogPublisher,
+    };
 
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -2080,7 +2084,7 @@ async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() ->
     let history = PublishedShieldedHistory::open(
         &directory.path().join("current.json"),
         &public,
-        false,
+        SegmentAccess::default(),
         &reader,
     )
     .await?;

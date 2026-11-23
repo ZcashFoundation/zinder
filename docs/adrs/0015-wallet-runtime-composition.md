@@ -28,6 +28,9 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 10. **Consumers own their requirements.** A native consumer reads `ServerInfo` and reports every missing capability before it touches wallet storage. Zinder's contract tests prove its own invariants. Real consumer binaries, not fixture parity tests, certify consumers.
 11. **The compatibility adapter owns signed settled history.** It can derive and serve the default shielded protobuf from an immutable projection while canonical storage remains authoritative for coverage and chain identity. A signed catalog binds each segment to its network, artifact schema, interval, terminal block, and content digest. The adapter authenticates the serving descriptor against the signed whole-file digest or the signed fs-verity measurement before trusting the segment index. The [serving contract](../reference/lightwalletd-compatibility.md#signed-settled-history) defines publication and admission.
 12. **The single-host wallet deployment follows its publisher.** The compatibility reader may begin serving from canonical storage after it verifies the publisher's signed empty checkpoint using a separately provisioned key. It switches covered shielded ranges to the signed catalog after verifying the segment index and settled chain anchor. The wallet RPC and its advertised capabilities stay the same throughout. A reader configured with an explicit snapshot manifest must authenticate that catalog before binding.
+13. **Kernel-verified segments may be served from a memory mapping, by operator choice.** With `compat.shielded_history.map_verified_segments`, the reader maps a segment read-only once at admission when the kernel measured its fs-verity digest on the serving descriptor and the digest matched the signed pin. It serves each payload as a slice of that mapping instead of copying it from the page cache into memory. Portable segments always use positional reads. The setting is off by default.
+    - **The `unsafe` boundary.** Creating the mapping is the only `unsafe` code in the workspace. It is sound because the mapped bytes cannot change: the kernel refuses to open an fs-verity file for writing or to truncate it, fs-verity cannot be removed from a file, and renaming or unlinking the file keeps its inode. The mapping is read-only, and each payload slice holds it until the transport drops the last slice. A portable file has none of these guarantees, so it is never mapped.
+    - **Damage stops the process.** The kernel verifies each page when it reads it into memory. When reader code touches a mapped page that fails verification, or that the device fails to read, the kernel raises `SIGBUS` and the listener process stops, ending every stream it serves. Reader code touches each served row: it checks the frame lengths on every read, validates the payload on the first read, and copies the payload into the response. A positional read of the same page instead fails one stream with `DATA_LOSS`, and a page that only the kernel copies into a socket fails that write and ends one connection. The reader installs no `SIGBUS` handler, because resuming safely after a fault inside Rust code is not possible. The kernel verifies the page again each time it reads it in, so after a restart the next request that touches the damaged page stops the listener again, until the segment is replaced.
 
 [Wallet data plane](../architecture/wallet-data-plane.md) describes pinning and pair publication. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) lists the block-range outcomes.
 
@@ -41,6 +44,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - Retention and slow reads delay a publication by at most about 90 seconds and never stop it.
 - A block-range stream can end early during a reorg in the unsettled suffix. The client requests again from the height it needs. An `OK` stream is one chain as read, not a promise that the chain is still best.
 - A new capability needs a registry entry, an implementation, evidence derivation, positive and negative tests, and a production consumer flow.
+- An operator who enables segment mapping trades one copy of every served payload for the failure mode above: a damaged protected page takes down the listener rather than one stream.
 
 ## Alternatives rejected
 
@@ -57,6 +61,10 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - **Catch the published pair up in place.** It would move the fence under in-flight reads and pins.
 - **Hold one pair for a whole block-range stream, or pin each chunk.** The client sets the pace, so no retention window covers it. The hash link, not a pin, proves continuity.
 - **Send the new branch after a reorg below the stream position.** One `OK` stream would no longer be one chain.
+- **Contain `SIGBUS` from a mapped segment with a signal handler.** Unwinding or jumping out of a fault inside Rust code is undefined behavior, and the handler would affect the whole process.
+- **Prefault each mapped range with `MADV_POPULATE_READ` before serving it.** It needs more `unsafe` code, and the kernel can evict and re-read a page between the prefault and the send, so a damaged page can still raise `SIGBUS`.
+- **Map portable segments.** Another process can truncate or rewrite a portable file, which raises `SIGBUS` or changes bytes the reader treats as immutable.
+- **Map protected segments by default.** It would replace the per-stream failure that operators rely on today without their choice.
 - **Compatibility aliases for removed names.** Zinder's native consumers move with it, and aliases keep obsolete names available for new code.
 
 ## Revision history
@@ -64,3 +72,4 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.
 - 2026-11-21. Bound the compact segment index and the optional kernel measurement to the signed catalog.
 - 2026-11-21. Specified trusted bootstrap and automatic catalog adoption for the single-host wallet Compose deployment.
+- 2026-11-23. Allowed serving kernel-verified segments from a read-only memory mapping as an opt-in, with its `unsafe` boundary and failure behavior.

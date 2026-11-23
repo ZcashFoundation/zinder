@@ -107,7 +107,7 @@ impl ShieldedCatalogPublisher {
         }
         let mut previous = None;
         for entry in &entries {
-            let segment = open_segment(directory, entry, previous)?;
+            let segment = open_segment(directory, entry, previous, false)?;
             previous = Some(segment.identity());
         }
         let resumed = Self {

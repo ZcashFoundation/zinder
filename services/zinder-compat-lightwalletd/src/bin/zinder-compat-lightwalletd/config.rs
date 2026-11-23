@@ -277,6 +277,8 @@ pub(crate) struct ShieldedHistorySection {
     pub(crate) publisher_key: PathBuf,
     #[serde(default)]
     pub(crate) require_fs_verity: bool,
+    #[serde(default)]
+    pub(crate) map_verified_segments: bool,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +289,8 @@ struct ShieldedHistoryConfig {
     publisher_key: PathBuf,
     #[serde(default)]
     require_fs_verity: bool,
+    #[serde(default)]
+    map_verified_segments: bool,
 }
 
 impl TryFrom<ShieldedHistoryConfig> for ShieldedHistorySection {
@@ -302,6 +306,7 @@ impl TryFrom<ShieldedHistoryConfig> for ShieldedHistorySection {
             location,
             publisher_key: config.publisher_key,
             require_fs_verity: config.require_fs_verity,
+            map_verified_segments: config.map_verified_segments,
         })
     }
 }
