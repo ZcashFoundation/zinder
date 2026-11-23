@@ -34,7 +34,7 @@ Node health is a property of the node, not of the ingest phase. When `[node.heal
 ## Evidence
 
 - Decision 5, the three-hour READY budget: judgment without a measurement. The Context records its origin. Its cost is a minimum writer size, which the next entry measures. A measurement in which a supported host size misses the budget under the default selection, or operator demand for wallet-serving stores on writers smaller than 4 cores, reopens it.
-- Decision 5, the smallest writer: measured. Fresh wallet-serving Mainnet construction to READY at height 3,593,347, with the derived limits and no overrides ([#488](https://github.com/ZcashFoundation/zinder/issues/488)):
+- Decision 5, the smallest writer: measured. Fresh wallet-serving Mainnet construction to READY at height 3,593,347 ([#488](https://github.com/ZcashFoundation/zinder/issues/488)):
 
   | Writer cores | Every block | Commitment budget 256 |
   | ---: | ---: | ---: |
@@ -42,7 +42,7 @@ Node health is a property of the node, not of the ingest phase. When `[node.heal
   | 4 | 2 h 34 min 28 s | 2 h 8 min 50 s |
   | 2 | 4 h 27 min 50 s | 3 h 40 min 40 s |
 
-  Each writer had dedicated cores on an 8-core host, with the node on other cores. A whole 4-core machine that also runs the node and the projector was not measured and would be slower.
+  The 8-core runs are earlier builds with the hashing workers set to 6 and the node pinned to 2 of the host's 8 cores. The 4- and 2-core runs used the derived limits with no overrides, and their writer had dedicated cores on an 8-core host with the node on other cores. A whole 4-core machine that also runs the node and the projector was not measured and would be slower.
 - Decision 5, every-block as the default: measured. On a fresh reader, every-block checkpoints served arbitrary historical tree-state reads at 1,519 requests per second against 182 for a 256-commitment budget at 4 clients, and 3,700 against 189 at 16. The budget reached READY 13, 26, and 47 minutes sooner on 8, 4, and 2 writer cores, but did not change which sizes met the budget ([#488](https://github.com/ZcashFoundation/zinder/issues/488)).
 
 ## Consequences
