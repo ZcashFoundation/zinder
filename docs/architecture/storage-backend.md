@@ -154,7 +154,8 @@ A secondary is a read-only view of a primary that the reader process advances
 by catching up. A secondary:
 
 - never writes the primary;
-- checks the store's identity and schema again after each catch-up;
+- checks the store's identity and schema again after each catch-up, including
+  the manifest version and digest in the canonical READY evidence;
 - reports a failed catch-up, or lag beyond
   `storage.secondary_replica_lag_threshold_chain_epochs` (default 4), to
   readiness, as listed in the [readiness reference](../reference/readiness.md);
@@ -178,10 +179,11 @@ its next publication jumps to the writer's latest chain event. How long a
 replaced pair stays readable is in
 [Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent).
 
-A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream holds a pair
-only while it reads one chunk of at most 1,000 blocks and 2 MiB. The stream
-ends if a chunk does not link by block hash to the previous one. In `compat.serving = "compact-blocks"` mode,
-the adapter alternates two canonical secondaries and keeps no replaced pair.
+A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream uses one
+published view at a time while it reads its next chunk. The stream ends if a
+chunk does not link by block hash to the previous one. In compact-blocks and
+light-wallet modes, the publisher alternates between two canonical
+secondaries. See [Block range methods](../reference/lightwalletd-compatibility.md#getblockrange-and-getblockrangenullifiers).
 
 All generations in one process share one block cache per store. The configured
 `block_cache_bytes` therefore bounds the process, not each generation. Each

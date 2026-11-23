@@ -74,14 +74,15 @@ control for local wallet reads and forwards selected reads to the node.
 Use the standalone runtimes for this profile. The bundled wallet-serving
 image starts a wallet projector and native query. Omit
 `ingest.run_overrides.coverage`, `ingest.explorer_views`, `storage.raw_blob_policy`, and
-`compat.serving` when selecting this profile. Conflicting overrides are
-rejected. Compatibility can also read an existing canonical store with
-complete history and additional retained blobs. The ingest writer must match the store's original
-retention policy. `--print-config` writes the resolved profile and omits the
-settings it supplies.
+`compat.serving` when selecting this profile. Matching values are accepted,
+and conflicting values fail at startup. Compatibility requires complete
+block history and a complete subtree-root prefix, and can read a store with
+additional retained blobs. The ingest writer must match the store's original
+retention policy. For ingest and the compatibility listener, `--print-config`
+writes the resolved profile and omits the settings it supplies.
 
 The explicit `compat.serving = "light-wallet"` setting and its
-`light-wallet-qualification` alias also require complete block history.
+`light-wallet-qualification` alias apply the same history and subtree requirements.
 Without the profile, both use the reader's configured
 `storage.raw_blob_policy`, which defaults to `transactions`.
 Set it to `none` explicitly to admit a store without transaction bodies. See

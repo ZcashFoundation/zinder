@@ -61,8 +61,9 @@ half. It logs `source_chain_segment_split`.
 
 ## Transparent address lookups
 
-Light-wallet serving uses the following `zinder-source` methods to query
-the node's transparent address index.
+The source exposes the transparent address methods below. Light-wallet
+serving queries the index for transaction IDs and unspent outputs. It
+calculates confirmed balances from the verified outputs.
 
 | Method | Node RPC | Returns |
 | --- | --- | --- |
