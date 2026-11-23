@@ -277,11 +277,53 @@ macro_rules! impl_canonical_typed_reads {
             }
 
             /// Reads one retained raw transaction at its authenticated location.
+            ///
+            /// The read first compares `location` with the store's current
+            /// location row for its transaction, and answers `None` when that
+            /// row is missing or differs in any field. A location saved before
+            /// later commits still returns bytes while the row is unchanged.
             pub fn transaction_blob(
                 &self,
                 location: TransactionLocation,
             ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
                 read_transaction_blob(self, location)
+            }
+
+            /// Reads the canonical location of one transaction and its
+            /// retained raw bytes, reading the location row once.
+            ///
+            /// Returns `None` exactly when [`Self::transaction_location`]
+            /// does. Otherwise returns that location with what
+            /// [`Self::transaction_blob`] returns for it: `None` when this
+            /// store does not retain the transaction's bytes.
+            pub fn transaction_location_and_blob(
+                &self,
+                transaction_id: TransactionId,
+            ) -> Result<
+                Option<(TransactionLocation, Option<TransactionBlobArtifact>)>,
+                CanonicalStoreError,
+            > {
+                read_transaction_location_and_blob(self, transaction_id)
+            }
+
+            /// Reads the canonical location of one transaction and its
+            /// retained raw bytes, answering `None` only for a proven absence.
+            ///
+            /// It answers as [`Self::transaction_location_and_blob`] does,
+            /// except that a miss in a store whose retained history starts
+            /// after a checkpoint fails as
+            /// [`Self::transaction_location_or_proven_absence`] does.
+            pub fn transaction_location_and_blob_or_proven_absence(
+                &self,
+                transaction_id: TransactionId,
+            ) -> Result<
+                Option<(TransactionLocation, Option<TransactionBlobArtifact>)>,
+                CanonicalStoreError,
+            > {
+                refuse_unproven_absence(
+                    self,
+                    read_transaction_location_and_blob(self, transaction_id)?,
+                )
             }
 
             /// Reads the newest commitment-tree checkpoint stored at or below
@@ -909,17 +951,38 @@ fn read_transaction_location_or_proven_absence(
     store: &impl CanonicalServingRead,
     transaction_id: TransactionId,
 ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
-    let location = read_transaction_location(store, transaction_id)?;
+    refuse_unproven_absence(store, read_transaction_location(store, transaction_id)?)
+}
+
+/// Passes a transaction lookup through unless it missed in a store that cannot
+/// prove the absence.
+fn refuse_unproven_absence<Found>(
+    store: &impl CanonicalServingRead,
+    found: Option<Found>,
+) -> Result<Option<Found>, CanonicalStoreError> {
     // Canonical history starts at height 1 because the genesis block is never
     // indexed, so only a store that retains height 1 can turn a miss into an
     // absence. The genesis coinbase is therefore reported absent.
     let history_bounds = store.serving_build_plan().history_bounds();
-    if location.is_none() && history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+    if found.is_none() && history_bounds.intentionally_excludes(BlockHeight::new(1)) {
         return Err(CanonicalStoreError::CanonicalHistoryUnavailable {
             first_available_height: super::CanonicalStoredSet::history_floor(history_bounds),
         });
     }
-    Ok(location)
+    Ok(found)
+}
+
+fn read_transaction_location_and_blob(
+    store: &impl CanonicalServingRead,
+    transaction_id: TransactionId,
+) -> Result<Option<(TransactionLocation, Option<TransactionBlobArtifact>)>, CanonicalStoreError> {
+    let Some(location) = read_transaction_location(store, transaction_id)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        location,
+        read_located_transaction_blob(store, location)?,
+    )))
 }
 
 fn read_transaction_blob(
@@ -929,6 +992,20 @@ fn read_transaction_blob(
     if read_transaction_location(store, location.transaction_id)? != Some(location) {
         return Ok(None);
     }
+    read_located_transaction_blob(store, location)
+}
+
+/// Reads the raw transaction at `location`, which the caller read from this
+/// store's location row.
+///
+/// Successful reads through one borrowed handle see the same canonical
+/// transaction mapping: a commit consumes the primary, and catching a
+/// secondary up borrows it mutably. Reading the location row again through the
+/// same borrow could not answer differently.
+fn read_located_transaction_blob(
+    store: &impl CanonicalServingRead,
+    location: TransactionLocation,
+) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
     Ok(read_optional(
         store,
         TRANSACTION_BLOB_COLUMN_FAMILY,
