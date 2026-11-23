@@ -69,10 +69,11 @@ ztreamer and Go lightwalletd each follow one validator, and ztreamer is the
 only indexer here that can also run that validator in its own process. Zingod
 accepts 1 to 64 validators.
 zinder-ingest follows one validator at a time from an ordered list of `[node]`
-and optional `[node_fallbacks.N]` endpoints. zinder-query and
-zinder-compat-lightwalletd use their own node list only to broadcast and, in
-wallet-mode compatibility, to read the recommended fee. zinder-explorer reads
-only `[node]`.
+and optional `[node_fallbacks.N]` endpoints. Native query uses its list for
+broadcast. Wallet-mode compatibility also uses its list for fee reads.
+Light-wallet compatibility uses one node for its
+[forwarded methods](lightwalletd-compatibility.md#runtime-serving-selection).
+Explorer observes the tip from `[node]`.
 
 ## Interfaces
 
@@ -446,9 +447,9 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^ping]: Only with `--ping-very-insecure`, which ztreamer and Go lightwalletd both label for testing only ([ztreamer cli.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/bin/ztreamerd/src/cli.rs#L142-L144), [Go lightwalletd service.go](https://github.com/zcash/lightwalletd/blob/f8fe2cca7ede03b1f06b1d637a2ab467d151b79d/frontend/service.go#L1251-L1258)).
 
-[^zinder-ping]: Needs `compat.ping_very_insecure = true` or `--ping-very-insecure`, which Zinder says to enable only on a server under load testing, and otherwise both serving modes refuse `Ping` with `FAILED_PRECONDITION` ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L162-L175), [main.rs](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/services/zinder-compat-lightwalletd/src/bin/zinder-compat-lightwalletd/main.rs#L101-L103)).
+[^zinder-ping]: All three serving modes require `compat.ping_very_insecure = true` or `--ping-very-insecure` for `Ping`. See [Lightwalletd serving modes](lightwalletd-compatibility.md#runtime-serving-selection).
 
-[^zinder-standard-fee]: In wallet serving, Zinder returns the fee and estimator version that a verified node in its broadcast list reports through `getstandardfee`, as Go lightwalletd returns its node's. It returns `UNIMPLEMENTED` when no configured node implements the RPC, and in `compact-blocks` serving ([lightwalletd-compatibility.md](lightwalletd-compatibility.md#getstandardfee)).
+[^zinder-standard-fee]: Wallet and light-wallet serving return the fee and estimator version reported by a verified node. See [GetStandardFee](lightwalletd-compatibility.md#getstandardfee).
 
 [^transparent-pool]: In `GetBlockRange`, only when the request names the transparent pool type, while Zingod's `GetBlock` always includes it and ztreamer fetches each full block from its validator ([ztreamer](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/service/src/compact/blocks/mod.rs#L92-L137), [Zingod](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/book/src/wallets/methods.md#L25-L26), [Go lightwalletd](https://github.com/zcash/lightwalletd/blob/f8fe2cca7ede03b1f06b1d637a2ab467d151b79d/common/common.go#L645-L696), [Zinder](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L194-L204)).
 

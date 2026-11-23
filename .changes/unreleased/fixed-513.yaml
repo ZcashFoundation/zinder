@@ -1,0 +1,6 @@
+kind: fixed
+body: Docker builds that reuse a Cargo target cache now recompile every Zinder workspace crate from the tree being built. Before, a build of a source tree whose files carried older modification times, such as one extracted from `git archive` or a tarball, could reuse another tree's compiled Zinder crates and produce a binary that reported the new commit but ran some old code. The `zinder-ingest-live-tests` image now builds with Rust 1.100 again.
+time: 2026-11-23T17:01:33.387448942Z
+custom:
+    Bump: patch
+    PR: "513"

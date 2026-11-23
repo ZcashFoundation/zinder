@@ -118,7 +118,6 @@ impl RocksDbCanonicalReader {
     ///
     /// Returns [`StorageReadError::CanonicalHistoryUnavailable`] for a miss
     /// below a checkpointed store's history floor.
-    #[cfg(feature = "light-wallet-qualification")]
     pub async fn mined_transaction_location(
         &self,
         transaction_id: TransactionId,
@@ -134,7 +133,6 @@ impl RocksDbCanonicalReader {
     ///
     /// Returns [`StorageReadError::ArtifactUnavailable`] when the served
     /// chain holds no canonical facts for `block`.
-    #[cfg(feature = "light-wallet-qualification")]
     pub async fn block_transaction_digests(
         &self,
         block: zinder_core::BlockId,
@@ -167,14 +165,12 @@ impl RocksDbCanonicalReader {
 }
 
 /// The digests ingest recorded for one served block's transactions.
-#[cfg(feature = "light-wallet-qualification")]
 #[derive(Clone, Debug)]
 pub struct BlockTransactionDigests {
     block: zinder_core::BlockId,
     digests: Vec<(TransactionId, zinder_core::SerializedBytesDigest)>,
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl BlockTransactionDigests {
     /// The block these digests belong to.
     #[must_use]
@@ -212,7 +208,6 @@ impl BlockTransactionDigests {
 
 /// Where the served chain mines a transaction and the digest of the bytes
 /// ingest committed for it.
-#[cfg(feature = "light-wallet-qualification")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MinedTransactionDigest {
     /// The transaction's canonical location.

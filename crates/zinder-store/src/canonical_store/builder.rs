@@ -23,7 +23,7 @@ use super::{
     },
     subtree_load::{
         CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence,
-        load_complete_subtree_root_prefix, load_subtree_roots, required_subtree_root_ranges,
+        load_complete_subtree_root_prefix, load_subtree_roots,
     },
 };
 
@@ -133,6 +133,12 @@ impl RocksDbCanonicalBuilder {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the retained block data and historical floor.
+    #[must_use]
+    pub const fn stored_set(&self) -> super::CanonicalStoredSet {
+        self.build_plan.stored_set(self.workload)
     }
 
     /// Returns the immutable raw-blob retention persisted by this build.
@@ -282,8 +288,8 @@ impl RocksDbCanonicalBuilder {
             .canonical_block_evidence
             .as_ref()
             .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
-        required_subtree_root_ranges(
-            self.build_plan.history_predecessor().tip_metadata(),
+        self.build_plan.subtree_root_ranges(
+            super::CanonicalSubtreeRootLoadCoverage::RetainedRange,
             block_evidence.tip_metadata,
         )
     }
@@ -370,7 +376,7 @@ impl RocksDbCanonicalBuilder {
     pub fn record_resource_gauges(&self) {
         self.bounded_open.record_resource_gauges(
             crate::StoreRole::CanonicalPrimary,
-            &super::rocksdb::CANONICAL_DATA_COLUMN_FAMILIES,
+            &super::stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
         );
     }
 
@@ -385,7 +391,7 @@ fn validate_block_load_range(
     build_plan: &CanonicalStoreBuildPlan,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
-    let expected_first_height = build_plan.history_bounds().first_available_height();
+    let expected_first_height = build_plan.first_retained_height();
     if evidence.first_height != expected_first_height {
         return Err(CanonicalStoreError::block_load_sequence(format!(
             "expected first available height {}, observed {}",
@@ -500,11 +506,12 @@ mod tests {
         note_commitment_trees_tests::NoteCommitmentTrees,
         publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
-            BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
-            CANONICAL_DATA_COLUMN_FAMILIES, CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
-            COMPACT_BLOCK_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
             TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         },
+        stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
     };
     use crate::{
         CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RawBlobRetention,

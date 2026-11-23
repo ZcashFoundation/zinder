@@ -2,8 +2,8 @@ use std::{fs, path::Path, sync::Arc};
 
 use parking_lot::Mutex;
 use rust_rocksdb::{
-    Cache, ColumnFamilyDescriptor, DB, DBCompressionType, DEFAULT_COLUMN_FAMILY_NAME, IteratorMode,
-    Options, WriteBatch, WriteOptions, checkpoint::Checkpoint,
+    Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, WriteBatch,
+    WriteOptions, checkpoint::Checkpoint,
 };
 use zinder_core::{
     BlockId, CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
@@ -22,7 +22,7 @@ use super::{
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
-    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
+    block_replay::CanonicalReplayScan,
     construction_manifest::{
         copy_construction_manifest, read_construction_manifest_binding,
         validate_ready_construction_manifest,
@@ -40,6 +40,7 @@ use super::{
     },
     publication::{read_chain_epoch_tips, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
+    stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, validate_exact_column_families},
 };
 
 /// What a READY canonical store records that a writer checks node endpoints
@@ -142,32 +143,19 @@ pub(super) const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_fa
 pub(super) const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
 pub(super) const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
-pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
-    BLOCK_HEADER_COLUMN_FAMILY,
-    BLOCK_HASH_INDEX_COLUMN_FAMILY,
-    BLOCK_REPLAY_COLUMN_FAMILY,
-    DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-    TRANSACTION_LOCATION_COLUMN_FAMILY,
-    COMPACT_BLOCK_COLUMN_FAMILY,
-    TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-    SUBTREE_ROOT_COLUMN_FAMILY,
-    CHAIN_EPOCH_COLUMN_FAMILY,
-    CHAIN_EVENT_COLUMN_FAMILY,
-    MEMPOOL_EVENT_COLUMN_FAMILY,
-    DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-    BLOCK_BLOB_COLUMN_FAMILY,
-    TRANSACTION_BLOB_COLUMN_FAMILY,
-];
-
 #[derive(Clone)]
 pub(super) struct CanonicalStoreAdmissionExpectation {
     network: Network,
     activations: ActivationAdmission,
     allow_schedule_update: bool,
-    workload: CanonicalStoreWorkload,
-    raw_blob_retention: RawBlobRetention,
+    stored_data: StoredDataAdmission,
     reorg_policy: ReorgPolicyAdmission,
+}
+
+#[derive(Clone)]
+pub(super) enum StoredDataAdmission {
+    Exact(CanonicalStoreWorkload, RawBlobRetention),
+    Minimum(super::CanonicalStoreRequirements),
 }
 
 /// How admission compares a caller's activation table with persisted identity.
@@ -198,16 +186,14 @@ enum ReorgPolicyAdmission {
 impl CanonicalStoreAdmissionExpectation {
     pub(super) fn from_activations(
         activations: &NetworkUpgradeActivations,
-        workload: CanonicalStoreWorkload,
-        raw_blob_retention: RawBlobRetention,
+        stored_data: StoredDataAdmission,
         reorg_policy: super::CanonicalReorgPolicy,
     ) -> Self {
         Self {
             network: activations.network(),
             activations: ActivationAdmission::NodeObserved(activations.clone()),
             allow_schedule_update: false,
-            workload,
-            raw_blob_retention,
+            stored_data,
             reorg_policy: ReorgPolicyAdmission::Exact(reorg_policy),
         }
     }
@@ -216,16 +202,14 @@ impl CanonicalStoreAdmissionExpectation {
     /// network-upgrade schedule, which the reader then adopts.
     pub(super) const fn adopting_writer_schedule(
         network: Network,
-        workload: CanonicalStoreWorkload,
-        raw_blob_retention: RawBlobRetention,
+        stored_data: StoredDataAdmission,
         reorg_policy: super::CanonicalReorgPolicy,
     ) -> Self {
         Self {
             network,
             activations: ActivationAdmission::WriterAdmitted,
             allow_schedule_update: false,
-            workload,
-            raw_blob_retention,
+            stored_data,
             reorg_policy: ReorgPolicyAdmission::Exact(reorg_policy),
         }
     }
@@ -243,10 +227,20 @@ impl CanonicalStoreAdmissionExpectation {
                 build_plan.network_upgrade_activations_fingerprint(),
             ),
             allow_schedule_update: false,
-            workload,
-            raw_blob_retention: build_plan.raw_blob_retention(),
+            stored_data: StoredDataAdmission::Exact(workload, build_plan.raw_blob_retention()),
             reorg_policy: ReorgPolicyAdmission::Exact(effective_reorg_policy),
         }
+    }
+
+    pub(super) fn validate_reader_requirements(
+        &self,
+        path: &Path,
+        stored_set: super::CanonicalStoredSet,
+    ) -> Result<(), CanonicalStoreError> {
+        if let StoredDataAdmission::Minimum(requirements) = &self.stored_data {
+            stored_set.require(path, requirements)?;
+        }
+        Ok(())
     }
 
     pub(super) fn allowing_schedule_update(mut self) -> Self {
@@ -272,7 +266,7 @@ pub struct RocksDbCanonicalStore {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
-    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    pub(super) stored_set: super::CanonicalStoredSet,
     /// Serializes retained-event, projection-lease, and mempool-log lifecycle changes.
     ///
     /// The primary handle owns every canonical mutation. Keeping this lock on
@@ -303,13 +297,14 @@ impl RocksDbCanonicalStore {
         subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
         replay_tail: AuthenticatedReplayTail,
     ) -> Self {
+        let stored_set = build_plan.admitted_stored_set(workload, subtree_root_coverage);
         Self {
             bounded_open,
             workload,
             build_plan,
             cursor_auth_key,
             ready_evidence: *ready_evidence,
-            subtree_root_coverage,
+            stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule: None,
@@ -340,8 +335,7 @@ impl RocksDbCanonicalStore {
         let path = path.as_ref();
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             expected_network_upgrade_activations,
-            expected_workload,
-            expected_raw_blob_retention,
+            StoredDataAdmission::Exact(expected_workload, expected_raw_blob_retention),
             expected_reorg_policy,
         );
         Self::open_ready_with_expectation(path, &expectation, resource_budget)
@@ -368,8 +362,7 @@ impl RocksDbCanonicalStore {
     ) -> Result<Self, CanonicalStoreError> {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             observed_activations,
-            expected_workload,
-            expected_raw_blob_retention,
+            StoredDataAdmission::Exact(expected_workload, expected_raw_blob_retention),
             reorg_policy,
         )
         .allowing_schedule_update()
@@ -672,6 +665,8 @@ impl RocksDbCanonicalStore {
             read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
+        let stored_set =
+            build_plan.admitted_stored_set(opened_control.workload, subtree_root_coverage);
         let replay_tail = validate_ready_publication(
             &bounded_open.db,
             &build_plan,
@@ -680,11 +675,11 @@ impl RocksDbCanonicalStore {
         )?;
         Ok(Self {
             bounded_open,
-            workload: expectation.workload,
+            workload: opened_control.workload,
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
-            subtree_root_coverage,
+            stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule,
@@ -832,8 +827,7 @@ impl RocksDbCanonicalStore {
         let opened = open_canonical_admission_probe(target, budget)?;
         let expectation = CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
             network,
-            CanonicalStoreWorkload::Wallet,
-            retention,
+            StoredDataAdmission::Exact(CanonicalStoreWorkload::Wallet, retention),
             reorg_policy,
         );
         let (database_identity, control, _) = admit_open_store(target, &opened.db, &expectation)?;
@@ -920,13 +914,13 @@ impl RocksDbCanonicalStore {
         if !exists {
             return Ok(None);
         }
-        let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+        let mut column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
             CanonicalStoreError::admission(
                 path,
                 format!("column-family discovery failed: {source}"),
             )
         })?;
-        validate_exact_column_families(path, &column_families)?;
+        validate_exact_column_families(path, &mut column_families)?;
         let bounded_open = open_bounded_rocksdb_read_only_probe(
             path,
             &column_families,
@@ -1000,6 +994,12 @@ impl RocksDbCanonicalStore {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the retained block data and historical floor.
+    #[must_use]
+    pub const fn stored_set(&self) -> super::CanonicalStoredSet {
+        self.stored_set
     }
 
     /// Returns the immutable raw-blob retention persisted by the store.
@@ -1219,10 +1219,10 @@ fn open_canonical_admission_probe(
     path: &Path,
     resource_budget: RocksDbResourceBudget,
 ) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
-    let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+    let mut column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
     })?;
-    validate_exact_column_families(path, &column_families)?;
+    validate_exact_column_families(path, &mut column_families)?;
     open_bounded_rocksdb_read_only_probe(path, &column_families, resource_budget).map_err(
         |source| CanonicalStoreError::admission(path, format!("read-only open failed: {source}")),
     )
@@ -1257,23 +1257,31 @@ fn admit_open_store(
     Ok((database_identity, control, subtree_root_coverage))
 }
 
-fn validate_exact_column_families(
+fn validate_stored_data(
     path: &Path,
-    observed: &[String],
+    expectation: &CanonicalStoreAdmissionExpectation,
+    persisted: &DecodedStoreControl,
 ) -> Result<(), CanonicalStoreError> {
-    let mut observed = observed.to_vec();
-    observed.sort_unstable();
-    let mut expected = CANONICAL_DATA_COLUMN_FAMILIES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
-    expected.sort_unstable();
-    if observed != expected {
+    let StoredDataAdmission::Exact(workload, retention) = expectation.stored_data else {
+        return Ok(());
+    };
+    if persisted.workload != workload {
         return Err(CanonicalStoreError::admission(
             path,
             format!(
-                "column families {observed:?} do not exactly match required canonical set {expected:?}"
+                "persisted workload {} does not equal requested workload {}",
+                persisted.workload.as_str(),
+                workload.as_str()
+            ),
+        ));
+    }
+    if persisted.build_plan.raw_blob_retention() != retention {
+        return Err(CanonicalStoreError::admission(
+            path,
+            format!(
+                "persisted raw blob retention {} does not equal requested raw blob retention {}; rebuild the canonical store to change retention",
+                persisted.build_plan.raw_blob_retention(),
+                retention
             ),
         ));
     }
@@ -1358,26 +1366,7 @@ pub(super) fn validate_open_store_control(
             "activation schedule journal keys do not exactly match store control",
         ));
     }
-    if persisted.workload != expectation.workload {
-        return Err(CanonicalStoreError::admission(
-            path,
-            format!(
-                "persisted workload {} does not equal requested workload {}",
-                persisted.workload.as_str(),
-                expectation.workload.as_str()
-            ),
-        ));
-    }
-    if persisted.build_plan.raw_blob_retention() != expectation.raw_blob_retention {
-        return Err(CanonicalStoreError::admission(
-            path,
-            format!(
-                "persisted raw blob retention {} does not equal requested raw blob retention {}; rebuild the canonical store to change retention",
-                persisted.build_plan.raw_blob_retention(),
-                expectation.raw_blob_retention
-            ),
-        ));
-    }
+    validate_stored_data(path, expectation, &persisted)?;
     let persisted_reorg_policy = persisted.effective_reorg_policy();
     match expectation.reorg_policy {
         ReorgPolicyAdmission::Exact(requested) if requested != persisted_reorg_policy => {
@@ -1547,7 +1536,62 @@ mod tests {
     }
 
     #[test]
-    fn building_layout_is_exact_and_not_servable() -> Result<(), Box<dyn std::error::Error>> {
+    fn v7_physical_inventory_is_exact_for_every_construction_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut expected = [
+            "block_blob",
+            "block_final_note_commitment_roots",
+            "block_hash_index",
+            "block_header",
+            "block_replay",
+            "chain_epoch",
+            "chain_event",
+            "compact_block",
+            "daily_value_pool_balance",
+            "default",
+            "displaced_block_facts",
+            "mempool_event",
+            "subtree_root",
+            "transaction_blob",
+            "transaction_location",
+            "tree_state_checkpoint",
+        ];
+        expected.sort_unstable();
+        for workload in [
+            CanonicalStoreWorkload::Wallet,
+            CanonicalStoreWorkload::Explorer,
+        ] {
+            for retention in [
+                RawBlobRetention::None,
+                RawBlobRetention::Transactions,
+                RawBlobRetention::All,
+            ] {
+                let path = temporary.path().join(format!("{workload:?}-{retention}"));
+                let build_plan = CanonicalStoreBuildPlan::complete(
+                    &activations,
+                    0,
+                    BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+                    retention,
+                    CanonicalReorgPolicy::new(100)?,
+                )?;
+                drop(RocksDbCanonicalBuilder::create_fresh(
+                    &path,
+                    workload,
+                    build_plan,
+                    RocksDbResourceBudget::for_local_tests(),
+                )?);
+                let mut observed = DB::list_cf(&Options::default(), &path)?;
+                observed.sort_unstable();
+                assert_eq!(observed, expected, "{workload:?} / {retention}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn building_store_is_not_servable() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let path = temporary.path().join("canonical");
         let store = RocksDbCanonicalBuilder::create_fresh(
@@ -1569,16 +1613,6 @@ mod tests {
             CanonicalHistoryBounds::complete()
         );
         drop(store);
-
-        let mut observed = DB::list_cf(&Options::default(), &path)?;
-        observed.sort_unstable();
-        let mut expected = CANONICAL_DATA_COLUMN_FAMILIES
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
-        expected.sort_unstable();
-        assert_eq!(observed, expected);
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,

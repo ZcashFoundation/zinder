@@ -41,7 +41,8 @@ Look up:
 ## Integrate
 
 Start with [Integration surfaces](reference/integration-surfaces.md). It shows
-how each kind of client connects.
+how each kind of client connects. A Rust application can start from its
+[quickstart](reference/integration-surfaces.md#quickstart).
 
 - [Lightwalletd compatibility](reference/lightwalletd-compatibility.md):
   `CompactTxStreamer` behavior, method by method

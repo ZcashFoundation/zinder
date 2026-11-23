@@ -44,14 +44,6 @@ impl RawBlobPolicy {
         self.to_retention().as_kebab_case()
     }
 
-    const fn writes_block_blobs(self) -> bool {
-        matches!(self, Self::All)
-    }
-
-    const fn writes_transaction_blobs(self) -> bool {
-        matches!(self, Self::Transactions | Self::All)
-    }
-
     /// Maps the configured policy to the immutable store retention contract
     /// used for capability discovery and commit validation.
     #[must_use]
@@ -60,6 +52,16 @@ impl RawBlobPolicy {
             Self::None => RawBlobRetention::None,
             Self::Transactions => RawBlobRetention::Transactions,
             Self::All => RawBlobRetention::All,
+        }
+    }
+}
+
+impl From<RawBlobRetention> for RawBlobPolicy {
+    fn from(retention: RawBlobRetention) -> Self {
+        match retention {
+            RawBlobRetention::None => Self::None,
+            RawBlobRetention::Transactions => Self::Transactions,
+            RawBlobRetention::All => Self::All,
         }
     }
 }
@@ -331,14 +333,22 @@ pub struct PositionedCanonicalBlock {
 /// [`position_canonical_block`] stamps the final commitment-tree position
 /// before encoding the proto and validating against any source-supplied
 /// observation.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one parse-and-construct pipeline keeps stage timing and field ownership auditable"
-)]
 pub fn prepare_canonical_block(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     raw_blob_policy: RawBlobPolicy,
+) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
+    prepare_canonical_block_for_retention(source_block, activations, raw_blob_policy.to_retention())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one parse-and-construct pipeline keeps stage timing and field ownership auditable"
+)]
+pub(crate) fn prepare_canonical_block_for_retention(
+    source_block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+    raw_blob_retention: RawBlobRetention,
 ) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
     validate_source_block_payload(source_block)?;
     let parsed_block =
@@ -351,7 +361,7 @@ pub fn prepare_canonical_block(
             &parsed_block,
             source_block,
             activations,
-            raw_blob_policy,
+            raw_blob_retention.retains_transaction_blobs(),
         )
     })?;
     let (compact_transactions, tree_size_additions) =
@@ -366,7 +376,7 @@ pub fn prepare_canonical_block(
         ))
     })?;
     let block_blob = measure_canonical_construction_stage("block_blob", || {
-        Ok(if raw_blob_policy.writes_block_blobs() {
+        Ok(if raw_blob_retention.retains_block_blobs() {
             Some(BlockBlobArtifact::new(
                 block_header.height,
                 block_header.block_hash,
@@ -487,7 +497,7 @@ fn prepare_canonical_transactions_from_parsed(
     parsed_block: &ZebraBlock,
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
-    raw_blob_policy: RawBlobPolicy,
+    retain_transaction_blobs: bool,
 ) -> Result<PreparedCanonicalTransactions, CanonicalBlockConstructionError> {
     let mut transactions = Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_blobs = Vec::new();
@@ -518,7 +528,7 @@ fn prepare_canonical_transactions_from_parsed(
                 reason: source.to_string(),
             }
         })?;
-        if raw_blob_policy.writes_transaction_blobs() {
+        if retain_transaction_blobs {
             transaction_blobs.push(TransactionBlobArtifact::new(
                 TransactionLocation::new(
                     fact_set.public_facts.transaction_id,

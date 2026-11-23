@@ -1,4 +1,5 @@
 # Match the canonical identity in ingest.toml when customizing the deployment.
+# Older binaries require the retention and serving settings for publication.
 [storage]
 path = "/var/lib/zinder/canonical"
 # Each catalog and canonical store pair reuses one leased directory under this root.

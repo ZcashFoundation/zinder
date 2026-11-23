@@ -6,9 +6,11 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::ShieldedCatalogPublisher;
 use zinder_core::BlockHeight;
 use zinder_query::{RocksDbCanonicalReader, StorageReadError};
-use zinder_store::{CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary};
+use zinder_store::{
+    CanonicalStoreError, CanonicalStoreRequirements, CanonicalStoredSet, RocksDbCanonicalSecondary,
+};
 
-use super::config::{LightwalletdConfig, LightwalletdConfigError};
+use super::config::{HistoryPublisherConfig, LightwalletdConfigError};
 
 mod scratch;
 use scratch::PublicationScratch;
@@ -35,25 +37,27 @@ pub(super) struct PublishHistory {
 impl PublishHistory {
     pub(super) async fn publish(
         &self,
-        config: &LightwalletdConfig,
+        config: &HistoryPublisherConfig,
     ) -> Result<(), LightwalletdConfigError> {
         let stopping = CancellationToken::new();
         let _signal = self
             .follow_interval_secs
             .map(|_| zinder_runtime::cancel_on_terminating_signal(stopping.clone()));
         let scratch = PublicationScratch::reserve(
-            &config.storage.secondary_path,
+            &config.secondary_path,
             &self.directory,
-            &config.storage.path,
+            &config.primary_path,
         )?;
         let mut generation: Option<PublicationReader> = None;
+        let mut admitted_stored_set = None;
         let mut publisher = None;
         loop {
             let candidate = generation.take().map_or_else(
-                || PublicationReader::open(config, &scratch),
+                || PublicationReader::open(config, &scratch, admitted_stored_set),
                 PublicationReader::catch_up,
             );
             let publication = candidate.and_then(|current| {
+                admitted_stored_set.get_or_insert_with(|| current.reader.secondary().stored_set());
                 let publisher = match &mut publisher {
                     Some(resumed) => resumed,
                     None => publisher.insert(self.open_publisher(&current.reader)?),
@@ -107,18 +111,26 @@ struct PublicationReader {
 }
 
 impl PublicationReader {
-    fn open(config: &LightwalletdConfig, reservation: &PublicationScratch) -> io::Result<Self> {
+    fn open(
+        config: &HistoryPublisherConfig,
+        reservation: &PublicationScratch,
+        admitted_stored_set: Option<CanonicalStoredSet>,
+    ) -> io::Result<Self> {
         let scratch = reservation.generation()?;
-        let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
-            &config.storage.path,
+        let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+            &config.primary_path,
             scratch.path(),
             config.network,
-            CanonicalStoreWorkload::Wallet,
-            config.storage.expected_raw_blob_retention,
+            CanonicalStoreRequirements::default(),
             config.canonical_reorg_policy,
-            config.storage.canonical_rocksdb_budget,
+            config.canonical_rocksdb_budget,
         )
         .map_err(io::Error::other)?;
+        if let Some(expected) = admitted_stored_set {
+            secondary
+                .require_stored_set(expected)
+                .map_err(io::Error::other)?;
+        }
         Ok(Self {
             reader: RocksDbCanonicalReader::new(secondary).map_err(io::Error::other)?,
             scratch,

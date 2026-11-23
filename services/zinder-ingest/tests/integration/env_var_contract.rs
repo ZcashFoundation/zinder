@@ -30,7 +30,7 @@ fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
 }
 
 #[test]
-fn wallet_serving_entrypoint_routes_exactly_the_accepted_variables() -> eyre::Result<()> {
+fn wallet_serving_entrypoint_routes_only_combined_deployment_variables() -> eyre::Result<()> {
     EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-ingest"))
         .check_wallet_serving_routing(
             "ingest",

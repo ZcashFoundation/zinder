@@ -1,6 +1,9 @@
 //! Forwarded RPC behavior and storage availability under a node outage.
 
 use std::{
+    fs::File,
+    net::{SocketAddr, TcpListener},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +16,7 @@ use eyre::{Result, eyre};
 use serde_json::{Value, json};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request};
+use tonic::{Code, Request, Status, transport::Channel};
 use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
@@ -22,7 +25,8 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, Network, TransactionId, wire::encode_rpc_block_hash_hex,
 };
 use zinder_proto::compat::lightwalletd::{
-    self, compact_tx_streamer_server::CompactTxStreamer as _,
+    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer as _,
 };
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
@@ -32,8 +36,9 @@ use zinder_query::{
 use zinder_runtime::{Readiness, ReadinessState};
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, IngestControlFixture, JsonRpcStub, JsonRpcTestServer,
-    RpcReply, WalletServingStoreFixture, method,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+    IngestControlFixture, JsonRpcStub, JsonRpcTestServer, RpcReply, WalletServingStoreFixture,
+    method,
 };
 
 mod address_validation;
@@ -254,56 +259,225 @@ fn verbose_reply(txid: &Value, height: u32) -> RpcReply {
 }
 
 #[tokio::test]
-async fn history_aliases_share_admission_until_the_stream_drains_or_is_dropped() -> Result<()> {
-    let tip = served_tip(4)?;
+async fn two_of_four_concurrent_history_requests_complete_while_a_reader_pauses() -> Result<()> {
     let (fixture, _) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1)),
-        method("getaddressutxos").reply_with(move |_| utxos_at(tip, &json!([]))),
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
     ])?;
-    let concurrent = fixture.adapter.clone();
-    for drain in [true, false] {
+    let adapter = &fixture.adapter;
+    let requests = (0..4).map(|index| async move {
+        if index % 2 == 0 {
+            adapter
+                .get_taddress_transactions(history_request(1, 1))
+                .await
+        } else {
+            adapter.get_taddress_txids(history_request(1, 1)).await
+        }
+    });
+    let mut streams = Vec::new();
+    for outcome in futures_util::future::join_all(requests).await {
+        match outcome {
+            Ok(response) => streams.push(response.into_inner()),
+            Err(status) => {
+                assert_eq!(status.code(), Code::ResourceExhausted);
+                assert!(status.message().contains("retry with backoff"));
+            }
+        }
+    }
+    let admitted = streams.len();
+    if let Some(mut slow) = streams.pop() {
+        assert!(slow.next().await.transpose()?.is_some());
+        for mut other in streams {
+            assert!(other.next().await.transpose()?.is_some());
+            assert!(other.next().await.transpose()?.is_some());
+            assert!(other.next().await.is_none());
+        }
+        assert!(slow.next().await.transpose()?.is_some());
+        assert!(slow.next().await.is_none());
+    }
+    assert_eq!(admitted, 2, "completed history requests out of four");
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_deadline_releases_admission_without_polling_a_slow_response() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
+    ])?;
+    let mut paused = Vec::new();
+    for _ in 0..2 {
         let mut history = fixture
             .adapter
             .get_taddress_transactions(history_request(1, 1))
             .await?
             .into_inner();
         assert!(history.next().await.transpose()?.is_some());
-        let before = fixture.node.requests()?.len();
-        let refused = concurrent
-            .get_taddress_txids(history_request(1, 1))
-            .await
-            .err()
-            .ok_or_else(|| eyre!("a second request bypassed history admission"))?;
-        assert_eq!(refused.code(), Code::ResourceExhausted);
-        assert_eq!(fixture.node.requests()?.len(), before);
-        concurrent.get_address_utxos(utxo_request(0)).await?;
-
-        if drain {
-            assert!(history.next().await.transpose()?.is_some());
-            assert!(history.next().await.is_none());
-        } else {
-            drop(history);
-        }
-        concurrent.get_taddress_txids(history_request(1, 1)).await?;
+        paused.push(history);
     }
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+
+    let wait_for_admission = async || {
+        loop {
+            match fixture
+                .adapter
+                .get_taddress_txids(history_request(1, 1))
+                .await
+            {
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result,
+            }
+        }
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        let first = wait_for_admission().await?;
+        let second = wait_for_admission().await?;
+        Ok::<_, Status>((first, second))
+    })
+    .await??;
+    for mut history in paused {
+        assert!(
+            matches!(history.next().await, Some(Err(status)) if status.code() == Code::DeadlineExceeded)
+        );
+        assert!(history.next().await.is_none());
+    }
+    drop((first, second));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_a_history_stream_immediately_releases_its_slot() -> Result<()> {
+    let (fixture, _) = history_fixture([])?;
+    let first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    let second = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    let refused = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::ResourceExhausted)
+    );
+    drop(first);
+    let replacement = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    drop((second, replacement));
+    Ok(())
+}
+
+#[test]
+fn dropped_and_expired_history_streams_keep_in_flight_evidence_admitted() -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(history_evidence_admission())
+}
+
+async fn history_evidence_admission() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
+    ])?;
+    let logs = zinder_testkit::LogCapture::install_for_target("zinder::compat_lightwalletd");
+    let mut first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?
+        .into_inner();
+    let mut second = fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await?
+        .into_inner();
+
+    let (occupied, entered_blocking_pool) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let blocking_slot = tokio::task::spawn_blocking(move || {
+        let _ = occupied.send(());
+        let _ = blocked.blocking_recv();
+    });
+    entered_blocking_pool.await?;
+    let mut first_row = Box::pin(first.next());
+    let mut second_row = Box::pin(second.next());
+    tokio::select! {
+        _ = &mut first_row => return Err(eyre!("first history read passed the blocking gate")),
+        _ = &mut second_row => return Err(eyre!("second history read passed the blocking gate")),
+        queued = tokio::time::timeout(Duration::from_secs(10), async {
+            while logs.events().iter().filter(|event| {
+                event.message() == "queued forwarded address history evidence"
+            }).count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        }) => queued?,
+    }
+
+    drop(first_row);
+    drop(first);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let expired = tokio::time::timeout(Duration::from_secs(1), second_row).await;
+    tokio::time::resume();
+    assert!(matches!(expired?, Some(Err(status)) if status.code() == Code::DeadlineExceeded));
+    drop(second);
+
+    let refused = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::ResourceExhausted)
+    );
+    release
+        .send(())
+        .map_err(|()| eyre!("blocking pool gate closed early"))?;
+    blocking_slot.await?;
+    // The sole blocking worker completes both admitted reads before this marker.
+    tokio::task::spawn_blocking(|| ()).await?;
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 2);
+    let first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    let second = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    drop((first, second));
     Ok(())
 }
 
 #[tokio::test]
 async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
-    let page_requested = Arc::new(tokio::sync::Notify::new());
-    let received = Arc::clone(&page_requested);
+    let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (resume_node, paused_node) = std::sync::mpsc::channel::<()>();
     let paused_node = parking_lot::Mutex::new(paused_node);
     let (fixture, _) = history_fixture([method("getaddresstxids").reply_with(move |_| {
-        received.notify_one();
+        let _ = entered.send(());
         let _ = paused_node.lock().recv();
         RpcReply::result(json!([]))
     })])?;
-    let mut pending = fixture.adapter.get_taddress_txids(history_request(1, 1));
-    tokio::select! {
-        _ = &mut pending => return Err(eyre!("first history request completed before cancellation")),
-        () = page_requested.notified() => {}
+    let mut first = fixture.adapter.get_taddress_txids(history_request(1, 1));
+    let mut second = fixture.adapter.get_taddress_txids(history_request(1, 1));
+    for _ in 0..2 {
+        tokio::select! {
+            _ = &mut first => return Err(eyre!("first history request completed before cancellation")),
+            _ = &mut second => return Err(eyre!("second history request completed before cancellation")),
+            arrived = arrivals.recv() => {
+                arrived.ok_or_else(|| eyre!("node stopped before receiving the page request"))?;
+            }
+        }
     }
     let before = fixture.node.requests()?.len();
     let refused = fixture
@@ -311,11 +485,12 @@ async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
         .get_taddress_transactions(history_request(1, 1))
         .await
         .err()
-        .ok_or_else(|| eyre!("history stream bypassed a pending page fetch"))?;
+        .ok_or_else(|| eyre!("history stream bypassed two pending page fetches"))?;
     assert_eq!(refused.code(), Code::ResourceExhausted);
     assert_eq!(fixture.node.requests()?.len(), before);
-    drop(pending);
+    drop(first);
     drop(resume_node);
+    second.await?;
     fixture
         .adapter
         .get_taddress_transactions(history_request(1, 1))
@@ -610,6 +785,358 @@ async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> 
         1
     );
     assert_degraded_node_readiness(&fixture.adapter).await
+}
+
+#[tokio::test]
+async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_binary() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let tip = served_tip(2)?;
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &schedule)?;
+    let primary = writer.canonical_primary()?;
+    assert_eq!(
+        primary.raw_blob_retention(),
+        zinder_store::RawBlobRetention::None
+    );
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let output = address_output(&"01".repeat(32), 1_u32, &script);
+    let node = verifiable_node(
+        &schedule,
+        tip.hash,
+        [method("getaddressutxos").reply(utxos_at(tip, &json!([output])))],
+    )?;
+    let files = tempfile::tempdir()?;
+    let cancel = CancellationToken::new();
+    let _cancel_on_exit = cancel.clone().drop_guard();
+    let control =
+        spawn_binary_ingest_control(primary, files.path().join("checkpoints"), cancel).await?;
+    let log_path = files.path().join("compat.stderr");
+    let reservation = TcpListener::bind("127.0.0.1:0")?;
+    let addr = reservation.local_addr()?;
+    drop(reservation);
+    let mut child =
+        tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+            .env_clear()
+            .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_NODE__JSON_RPC_ADDR", node.url().as_str())
+            .env("ZINDER_INGEST_CONTROL__ADDR", control)
+            .env("ZINDER_COMPAT__STALE_TIP_LIMIT_MS", "0")
+            .env(
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                primary.reorg_policy().reorg_window_blocks().to_string(),
+            )
+            .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+            .env("ZINDER_COMPAT__LISTEN_ADDR", addr.to_string())
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                files.path().join("secondary"),
+            )
+            .stderr(File::create(&log_path)?)
+            .kill_on_drop(true)
+            .spawn()?;
+    let mut client = wait_for_compat(&mut child, addr, &log_path).await?;
+    assert_eq!(
+        client
+            .get_latest_block(lightwalletd::ChainSpec {})
+            .await?
+            .into_inner()
+            .height,
+        2
+    );
+    assert_binary_block_range(&mut client, 1..=2).await?;
+    assert_eq!(
+        client
+            .get_taddress_balance(balance_request())
+            .await?
+            .into_inner()
+            .value_zat,
+        1
+    );
+    child.kill().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+    let writer = CanonicalWriterFixture::publish(&baseline, &schedule)?;
+    let primary = writer.canonical_primary()?;
+    let node = verifiable_node(&schedule, served_tip(2)?.hash, [])?;
+    let files = tempfile::tempdir()?;
+    let cancel = CancellationToken::new();
+    let _cancel_on_exit = cancel.clone().drop_guard();
+    let control =
+        spawn_binary_ingest_control(primary, files.path().join("checkpoints"), cancel).await?;
+
+    let mut refusal = None;
+    for (label, selection) in [
+        ("profile", "[deployment]\nprofile = \"light-wallet\""),
+        ("serving", "[compat]\nserving = \"light-wallet\""),
+        (
+            "legacy",
+            "[compat]\nserving = \"light-wallet-qualification\"",
+        ),
+    ] {
+        let config_path = files.path().join(format!("{label}.toml"));
+        std::fs::write(&config_path, selection)?;
+        let child =
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+                .args([
+                    "--config",
+                    config_path
+                        .to_str()
+                        .ok_or_else(|| eyre!("non-UTF-8 config path"))?,
+                ])
+                .env_clear()
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_NODE__JSON_RPC_ADDR", node.url())
+                .env("ZINDER_INGEST_CONTROL__ADDR", &control)
+                .env(
+                    "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                    primary.reorg_policy().reorg_window_blocks().to_string(),
+                )
+                .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+                .env("ZINDER_COMPAT__LISTEN_ADDR", "127.0.0.1:0")
+                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+                .env("ZINDER_STORAGE__SECONDARY_PATH", files.path().join(label))
+                .kill_on_drop(true)
+                .output();
+        let output = tokio::time::timeout(Duration::from_secs(10), child).await??;
+        assert!(
+            !output.status.success(),
+            "{label} accepted checkpointed history"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        let diagnostic = stderr
+            .lines()
+            .find_map(|line| {
+                line.split_once("lacks required BlockHistory coverage")
+                    .map(|(_, tail)| tail)
+            })
+            .ok_or_else(|| eyre!("{label} missed the history refusal: {stderr}"))?;
+        assert!(
+            diagnostic.contains(
+                "required from Some(BlockHeight(1)), available from Some(BlockHeight(2))"
+            ),
+            "{diagnostic}"
+        );
+        if let Some(previous) = &refusal {
+            assert_eq!(previous, diagnostic);
+        }
+        refusal = Some(diagnostic.to_owned());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result<()> {
+    use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
+
+    let writer = super::lightwalletd_grpc::floor_with_completed_subtree_writer(
+        zinder_store::RawBlobRetention::Transactions,
+    )?;
+    let primary = writer.canonical_primary()?;
+    let files = tempfile::tempdir()?;
+    let wallet_path = files.path().join("wallet-primary");
+    let reorg_window = primary.reorg_policy().reorg_window_blocks();
+    let projection = build_wallet_from_canonical(
+        primary,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: reorg_window,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    drop(projection.store);
+    let cancel = CancellationToken::new();
+    let _cancel_on_exit = cancel.clone().drop_guard();
+    let control =
+        spawn_binary_ingest_control(primary, files.path().join("checkpoints"), cancel).await?;
+    let reservation = TcpListener::bind("127.0.0.1:0")?;
+    let addr = reservation.local_addr()?;
+    drop(reservation);
+    let log_path = files.path().join("wallet.stderr");
+    let mut wallet =
+        tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+            .env_clear()
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_INGEST_CONTROL__ADDR", &control)
+            .env("ZINDER_COMPAT__SERVING", "wallet")
+            .env(
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                reorg_window.to_string(),
+            )
+            .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+            .env("ZINDER_COMPAT__LISTEN_ADDR", addr.to_string())
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                files.path().join("canonical-secondary"),
+            )
+            .env("ZINDER_WALLET__PATH", wallet_path)
+            .env(
+                "ZINDER_WALLET__SECONDARY_PATH",
+                files.path().join("wallet-secondary"),
+            )
+            .kill_on_drop(true)
+            .stderr(File::create(&log_path)?)
+            .spawn()?;
+    let mut client = wait_for_compat(&mut wallet, addr, &log_path).await?;
+    assert_checkpointed_wallet_reads(&mut client).await?;
+    wallet.kill().await?;
+    Ok(())
+}
+
+async fn assert_checkpointed_wallet_reads(
+    client: &mut CompactTxStreamerClient<Channel>,
+) -> Result<()> {
+    assert_binary_block_range(client, 2..=2).await?;
+    let missing = client
+        .get_subtree_roots(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+            max_entries: 1,
+        })
+        .await
+        .err()
+        .ok_or_else(|| eyre!("the missing root unexpectedly opened a stream"))?;
+    assert_eq!(missing.code(), Code::NotFound);
+    assert_eq!(
+        missing
+            .get_error_details()
+            .error_info()
+            .map(|detail| detail.reason.as_str()),
+        Some("ARTIFACT_UNAVAILABLE")
+    );
+    Ok(())
+}
+
+async fn assert_binary_block_range(
+    client: &mut CompactTxStreamerClient<Channel>,
+    heights: std::ops::RangeInclusive<u64>,
+) -> Result<()> {
+    let block_id = |height| lightwalletd::BlockId {
+        height,
+        hash: Vec::new(),
+    };
+    let mut blocks = client
+        .get_block_range(lightwalletd::BlockRange {
+            start: Some(block_id(*heights.start())),
+            end: Some(block_id(*heights.end())),
+            pool_types: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    for height in heights {
+        assert_eq!(
+            blocks.message().await?.map(|block| block.height),
+            Some(height)
+        );
+    }
+    assert!(blocks.message().await?.is_none());
+    Ok(())
+}
+
+async fn wait_for_compat(
+    child: &mut tokio::process::Child,
+    addr: SocketAddr,
+    log_path: &Path,
+) -> Result<CompactTxStreamerClient<Channel>> {
+    use tonic::transport::Endpoint;
+
+    let endpoint = Endpoint::from_shared(format!("http://{addr}"))?
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(5));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(channel) = endpoint.connect().await {
+                break Ok(CompactTxStreamerClient::new(channel));
+            }
+            if let Some(status) = child.try_wait()? {
+                break Err(eyre!(
+                    "compat exited with {status}: {}",
+                    std::fs::read_to_string(log_path)?
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+
+async fn spawn_binary_ingest_control(
+    store: &zinder_store::RocksDbCanonicalStore,
+    checkpoint_path: std::path::PathBuf,
+    cancel: CancellationToken,
+) -> Result<String> {
+    use tokio_stream::wrappers::TcpListenerStream;
+    use zinder_ingest::{
+        CanonicalCheckpointStagingRoot, CanonicalControlCommand, CanonicalControlGrpcAdapter,
+        canonical_control_channel,
+    };
+    use zinder_proto::{
+        v1::ingest::{CanonicalWriterStatusResponse, ingest_control_server::IngestControlServer},
+        wire::{canonical_writer_fence_message, encode_canonical_network_upgrade_schedule},
+    };
+
+    let fence = store.event_fence();
+    let schedule = store
+        .network_upgrade_schedule()
+        .ok_or_else(|| eyre!("missing schedule"))?;
+    let status = CanonicalWriterStatusResponse {
+        network_name: zinder_core::wire::encode_zinder_native_chain_name(store.network())
+            .to_owned(),
+        fence: Some(canonical_writer_fence_message(
+            fence.chain_epoch_id(),
+            fence.chain_event_sequence(),
+            fence.visible_tip(),
+            fence.sequence_digest(),
+        )),
+        oldest_retained_event_sequence: store.canonical_event_retention_floor()?,
+        network_upgrade_schedule: Some(encode_canonical_network_upgrade_schedule(
+            schedule.activations(),
+            schedule.revision(),
+        )),
+        ..CanonicalWriterStatusResponse::default()
+    };
+    let (handle, mut commands) = canonical_control_channel();
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            if let CanonicalControlCommand::WriterStatus { reply } = command {
+                let _ = reply.send(Ok(status.clone()));
+            }
+        }
+    });
+    let canonical = CanonicalControlGrpcAdapter::new(
+        handle,
+        CanonicalCheckpointStagingRoot::new(checkpoint_path),
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+        zinder_ingest::CanonicalStoreDamageSignal::default(),
+    );
+    let ingest = zinder_testkit::IngestControlFixtureService::new(store.network());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(canonical.into_server())
+            .add_service(IngestControlServer::new(ingest))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            )
+            .await
+    });
+    Ok(format!("http://{addr}"))
 }
 
 async fn assert_degraded_node_readiness(
@@ -953,37 +1480,35 @@ async fn a_node_that_supplies_the_complete_utxo_page_needs_one_read() -> Result<
 }
 
 #[tokio::test]
-async fn utxo_admission_is_shared_until_the_stream_drains_or_is_dropped() -> Result<()> {
+async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance() -> Result<()> {
     let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
-    let concurrent = fixture.adapter.clone();
+    let adapter = &fixture.adapter;
     for cancel in [false, true] {
-        let mut stream = fixture
-            .adapter
+        let mut first = adapter
             .get_address_utxos_stream(utxo_request(2))
             .await?
             .into_inner();
-        assert!(stream.next().await.transpose()?.is_some());
+        assert!(first.next().await.transpose()?.is_some());
+        let second = adapter.get_address_utxos_stream(utxo_request(2)).await?;
         let before = fixture.node.requests_for("getaddressutxos")?.len();
-        let refused = concurrent
+        let refused = adapter
             .get_address_utxos(utxo_request(2))
             .await
             .err()
-            .ok_or_else(|| eyre!("a second request bypassed UTXO admission"))?;
+            .ok_or_else(|| eyre!("a third request bypassed UTXO response admission"))?;
         assert_eq!(refused.code(), Code::ResourceExhausted);
-        let balance = concurrent
-            .get_taddress_balance(balance_request())
-            .await
-            .err()
-            .ok_or_else(|| eyre!("a balance bypassed UTXO admission"))?;
-        assert_eq!(balance.code(), Code::ResourceExhausted);
+        assert!(refused.message().contains("retry with backoff"));
         assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), before);
+        let balance = adapter.get_taddress_balance(balance_request()).await?;
+        assert_eq!(balance.into_inner().value_zat, 3);
         if cancel {
-            drop(stream);
+            drop(first);
         } else {
-            assert!(stream.next().await.transpose()?.is_some());
-            assert!(stream.next().await.is_none());
+            assert!(first.next().await.transpose()?.is_some());
+            assert!(first.next().await.is_none());
         }
         populated_wallet_utxos(&fixture, 2).await?;
+        drop(second);
     }
     Ok(())
 }

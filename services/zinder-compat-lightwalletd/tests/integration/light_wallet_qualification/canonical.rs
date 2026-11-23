@@ -3,7 +3,9 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use eyre::{Result, eyre};
+use prost::Message as _;
 use serde_json::json;
+use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Status};
 use tonic_types::StatusExt as _;
@@ -27,6 +29,48 @@ use zinder_testkit::{
 };
 
 use super::Fixture;
+
+#[tokio::test]
+async fn light_wallet_uses_the_encoded_range_body() -> Result<()> {
+    let fixture = Fixture::new([])?;
+    let hook = fixture
+        .adapter
+        .encoded_block_range()
+        .ok_or_else(|| eyre!("light-wallet must provide the generated server's encoded range"))?;
+    let id = lightwalletd::BlockId {
+        height: 1,
+        hash: Vec::new(),
+    };
+    let request = lightwalletd::BlockRange {
+        start: Some(id.clone()),
+        end: Some(id),
+        pool_types: Vec::new(),
+    };
+    let mut encoded = hook
+        .get_encoded_block_range(Request::new(request.clone()))
+        .await?
+        .into_inner();
+    let mut decoded = fixture
+        .adapter
+        .get_block_range(Request::new(request))
+        .await?
+        .into_inner();
+    let message = encoded
+        .next()
+        .await
+        .ok_or_else(|| eyre!("missing encoded block"))??;
+    let block = decoded
+        .next()
+        .await
+        .ok_or_else(|| eyre!("missing typed block"))??;
+    assert_eq!(
+        lightwalletd::CompactBlock::decode(message.payload())?,
+        block
+    );
+    assert!(encoded.next().await.is_none());
+    assert!(decoded.next().await.is_none());
+    Ok(())
+}
 
 fn transaction(id: TransactionId) -> Request<lightwalletd::TxFilter> {
     Request::new(lightwalletd::TxFilter {
@@ -56,6 +100,7 @@ fn node_unavailable(status: &Status) {
 /// A fixture whose served block 1 mines `id` without retaining its bytes.
 fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcStub>>(
     id: TransactionId,
+    timeout: Duration,
     replies: impl FnOnce(zinder_core::BlockId) -> Replies,
 ) -> Result<(Fixture, zinder_core::BlockId)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
@@ -69,7 +114,7 @@ fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcS
         &chain.with_transaction_rows(rows),
         &super::one_upgrade_per_height()?,
         replies(served),
-        Duration::from_secs(2),
+        timeout,
     )?;
     Ok((fixture, served))
 }
@@ -83,6 +128,103 @@ fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> Rpc
     }))
 }
 
+#[test]
+fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(forwarded_transaction_admission())
+}
+
+async fn forwarded_transaction_admission() -> Result<()> {
+    use parking_lot::{Condvar, Mutex};
+
+    let id = TransactionId::from_bytes([0x55; 32]);
+    let timeout = Duration::from_mins(2);
+    let (entered, mut calls) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let node_gate = Arc::clone(&gate);
+    let (fixture, _) = mined_without_retention(id, timeout, |served| {
+        [method("getrawtransaction").reply_with(move |_| {
+            let _ = entered.send(());
+            let released_in_time = {
+                let (released, ready) = &*node_gate;
+                let mut released = released.lock();
+                ready.wait_while_for(&mut released, |released| !*released, timeout);
+                *released
+            };
+            if released_in_time {
+                mined_reply(id, served, "55")
+            } else {
+                RpcReply::error("test node gate did not release")
+            }
+        })]
+    })?;
+
+    let (occupied, entered_blocking_pool) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let blocking_slot = tokio::task::spawn_blocking(move || {
+        let _ = occupied.send(());
+        let _ = blocked.blocking_recv();
+    });
+    entered_blocking_pool.await?;
+    let mut replay_requests: Vec<_> = (0..8)
+        .map(|_| Box::pin(fixture.adapter.get_transaction(transaction(id))))
+        .collect();
+    for request in &mut replay_requests {
+        assert!(futures_util::poll!(request).is_pending());
+    }
+    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
+    drop(replay_requests);
+    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
+    release
+        .send(())
+        .map_err(|()| eyre!("blocking pool gate closed early"))?;
+    blocking_slot.await?;
+    // The single blocking worker runs all admitted evidence before this marker.
+    tokio::task::spawn_blocking(|| ()).await?;
+    assert!(
+        fixture.node.requests()?.is_empty(),
+        "cancelled evidence forwarded to the node"
+    );
+
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let adapter = fixture.adapter.clone();
+        pending.spawn(async move { adapter.get_transaction(transaction(id)).await });
+    }
+    for _ in 0..8 {
+        tokio::time::timeout(timeout, calls.recv())
+            .await?
+            .ok_or_else(|| eyre!("forwarded lookup did not reach the node"))?;
+    }
+    let extra = fixture.adapter.get_transaction(transaction(id)).await;
+    let (released, ready) = &*gate;
+    *released.lock() = true;
+    ready.notify_all();
+
+    assert_transaction_refused(extra)?;
+    while let Some(reply) = pending.join_next().await {
+        assert_eq!(reply??.into_inner().data, [0x55]);
+    }
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 8);
+    let reply = fixture.adapter.get_transaction(transaction(id)).await?;
+    assert_eq!(reply.into_inner().data, [0x55]);
+    Ok(())
+}
+
+fn assert_transaction_refused(
+    response: Result<tonic::Response<lightwalletd::RawTransaction>, Status>,
+) -> Result<()> {
+    let status = response
+        .err()
+        .ok_or_else(|| eyre!("ninth lookup was admitted"))?;
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("retry with backoff"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_location()
 -> Result<()> {
@@ -91,7 +233,7 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
         BlockHeight::new(1),
         zinder_core::BlockHash::from_bytes([0x45; 32]),
     );
-    let (fixture, _) = mined_without_retention(mined, |served| {
+    let (fixture, _) = mined_without_retention(mined, Duration::from_secs(2), |served| {
         [
             method("getrawtransaction").reply(mined_reply(mined, served, "55")),
             method("getrawtransaction").reply(mined_reply(mined, other, "55")),
@@ -551,7 +693,7 @@ async fn verification_lookup_and_submission_leave_generations_recyclable() -> Re
         fixture.adapter.get_transaction(transaction(id)),
     )
     .await?;
-    let (fixture, _) = mined_without_retention(id, |_| {
+    let (fixture, _) = mined_without_retention(id, Duration::from_secs(2), |_| {
         [
             method("getrawtransaction").reply(slow()),
             method("sendrawtransaction").reply(slow()),

@@ -9,8 +9,9 @@ for contributors changing the `zinder-source` crate.
 authentication, node response types, capability discovery, and the parsing of
 block and transaction bytes with Zebra's consensus primitives. It returns
 Zinder types and typed `SourceError` values. The caller decides whether to
-retry, switch nodes, or exit. Query handlers and storage code never call a
-node, and a missing stored artifact never falls back to a node query. See
+retry, switch nodes, or exit. Storage code reads local stores. Light-wallet
+handlers use `zinder-source` for the node-backed methods described in
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection). See
 [ADR-0006](../adrs/0006-node-source-boundary.md).
 
 ## Node adapters
@@ -60,8 +61,9 @@ half. It logs `source_chain_segment_split`.
 
 ## Transparent address lookups
 
-`ZebraJsonRpcSource` can forward transparent-address lookups to the node's
-own address index. The light-wallet qualification build uses these lookups.
+The source exposes the transparent address methods below. Light-wallet
+serving queries the index for transaction IDs and unspent outputs. It
+calculates confirmed balances from the verified outputs.
 
 | Method | Node RPC | Returns |
 | --- | --- | --- |

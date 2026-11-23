@@ -145,7 +145,7 @@ pub struct CanonicalSecondaryStorageSection {
     /// Reader-local secondary metadata path; must be unique per reader
     /// process per ADR-0003.
     pub secondary_path: Option<PathBuf>,
-    /// Persisted raw-blob retention the canonical primary must attest.
+    /// Minimum raw-blob coverage required from the canonical primary.
     pub raw_blob_policy: Option<RawBlobRetention>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
@@ -501,8 +501,9 @@ pub struct CanonicalSecondaryStorageToml {
     pub path: String,
     /// Reader-local secondary metadata path.
     pub secondary_path: String,
-    /// Persisted raw-blob retention required from the canonical primary.
-    pub raw_blob_policy: RawBlobRetention,
+    /// Minimum raw-blob coverage required from the canonical primary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_blob_policy: Option<RawBlobRetention>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: u64,
     /// Initial catchup timeout in milliseconds.
@@ -523,7 +524,7 @@ impl CanonicalSecondaryStorageToml {
         Self {
             path: resolved.path.display().to_string(),
             secondary_path: resolved.secondary_path.display().to_string(),
-            raw_blob_policy: resolved.expected_raw_blob_retention,
+            raw_blob_policy: Some(resolved.expected_raw_blob_retention),
             secondary_catchup_interval_ms: duration_as_millis_u64(
                 resolved.secondary_catchup_interval,
             ),

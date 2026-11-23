@@ -101,6 +101,14 @@ impl Requirement {
 /// `CLAUDE.md` and `docs/runbooks/testing.md`.
 pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
+        name: "ZINDER_DEPLOYMENT__PROFILE",
+        toml_path: "deployment.profile",
+        used_by: &["zinder-ingest", "zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile).",
+    },
+    EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
         toml_path: "network.name",
         used_by: &[
@@ -127,19 +135,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn(
-            "running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader",
+            "running ingest or light-wallet serving, broadcasting, or reading wallet fees",
         ),
         sensitive: false,
-        description: "Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` \
-                      and wallet-mode `zinder-compat-lightwalletd` broadcast transactions \
-                      through it, compatibility also reads the recommended fee for \
-                      `GetStandardFee` through it, and both start without contacting it. \
-                      Without it they serve \
-                      storage only and advertise no broadcast, and compatibility answers \
-                      `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility \
-                      rejects every `ZINDER_NODE__*` variable. Optional for \
-                      `zinder-explorer`: without it the upstream-observation probe stays \
-                      off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
+        description: "Upstream node JSON-RPC URL. Light-wallet serving forwards transparent \
+                      address reads, omitted transaction bodies, broadcasts, and fee reads to \
+                      this node. Query and wallet-mode compatibility use a configured node for \
+                      broadcasts, and wallet-mode compatibility also reads the fee. \
+                      Compact-blocks serving rejects node settings. Explorer uses the address \
+                      for upstream tip observation. See [The node sections](#the-node-sections).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
@@ -1166,9 +1170,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults \
-                      to `wallet`. `compact-blocks` rejects wallet and node settings, and no \
-                      canonical or legacy aliases are accepted.",
+        description: "Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without \
+                      a profile. `compact-blocks` rejects wallet and node settings. Prefer `deployment.profile = \
+                      \"light-wallet\"` for a coordinated deployment.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
@@ -1239,9 +1243,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot \
-                      before it is refused with `UNAVAILABLE`. Wallet serving only; \
-                      compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at \
-                      once; defaults to 2000.",
+                      before it is refused with `UNAVAILABLE`. Applies to wallet and light-wallet \
+                      serving. Compact-blocks serving rejects it. Accepts 0 to 5000 and defaults \
+                      to 2000. A value of 0 refuses at once.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
@@ -1249,10 +1253,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; \
-                      a rebuild that finds every waiting place taken fails at once with \
-                      `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. \
-                      Must be in 1..=256; defaults to 64.",
+        description: "Number of lightwalletd `GetTreeState` rebuilds that may wait for each rebuild \
+                      slot. A rebuild that finds every waiting place taken fails at once with \
+                      `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks \
+                      serving rejects it. Accepts 1 to 256 and defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
@@ -1384,12 +1388,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Boolean request for the complete bundled Explorer materialized-view \
-                      workload. Defaults to `false` for every coverage. `true` requires \
-                      genesis-complete canonical history or the authenticated \
-                      `checkpoint_height = 0`; checkpoint heights above zero are rejected before \
-                      storage mutation. The request appears in `--print-config`; admission \
-                      evidence appears only after the Explorer store opens successfully.",
+        description: "Requests the bundled Explorer materialized views. Defaults to `false`. \
+                      `true` requires genesis-complete canonical history or the authenticated \
+                      `checkpoint_height = 0`. Without a profile, `--print-config` shows the request. \
+                      The light-wallet profile disables the views and omits this field. \
+                      Admission evidence appears after the Explorer store opens successfully.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES",
@@ -1414,16 +1417,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
-                      Defaults to `none` for explicit coverage so canonical indexing does not write \
-                      raw block or transaction blobs unless a deployment explicitly needs raw export. \
-                      Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
-                      native and lightwalletd-compatible transaction and transparent-history methods \
-                      require retained bytes. \
-                      Projector, query, and compatibility readers use the same value as an exact \
-                      admission expectation; Zallet full-block serving requires `all`. The first \
-                      canonical commit fixes historical coverage; changing a non-empty store requires \
-                      a rebuild and blue-green cutover.",
+        description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for \
+                      explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts \
+                      `none` with the light-wallet profile. Projector, query, and compatibility readers use the value as \
+                      a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an \
+                      existing canonical store requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",

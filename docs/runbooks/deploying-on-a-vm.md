@@ -316,8 +316,10 @@ its chain view matches. Uncovered blocks use canonical storage. On a compatible 
 [signed history reference](../reference/lightwalletd-compatibility.md#signed-settled-history)
 for coverage, tail reads, and fs-verity requirements.
 
-If you customize canonical retention or the reorg window, match those settings
-in `deploy/config/history-publisher.toml`. The publisher inherits the compatibility
+If you customize the canonical reorg window, match it
+in `deploy/config/history-publisher.toml`. The publisher ignores
+`storage.raw_blob_policy`, but earlier releases require it to match ingest,
+so keep it equal to ingest's value if you might roll back. The publisher inherits the compatibility
 reader's memory limit. Set `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` to size its
 container separately. The wallet reader keeps one file open per admitted
 segment alongside its database files and sockets. Compose sets its soft and
@@ -433,6 +435,27 @@ startup. To rebuild the views:
 
 ## Upgrade, restart, and roll back
 
+Check the release notes for store layout changes before changing the tag.
+A different layout requires fresh storage. Give the new release a fresh
+volume or store paths, and wait for the required runtimes to report
+`/readyz` before routing wallet traffic to them. See
+[Schema admission](../architecture/storage-backend.md#schema-admission).
+
+When replacing a canonical store at the same path, restart the readers if the
+workload, raw-blob retention, first retained block height, subtree-root
+coverage mode, or first retained subtree-root index of any shielded pool
+changes.
+If the replacement passes normal admission but differs from the pinned
+layout, compact-blocks and light-wallet compatibility report
+`schema_mismatch`, and native query and wallet-mode compatibility report
+`storage_unavailable`. Restarting admits the new layout if it meets the
+reader's requirements. See
+[Canonical store replacement](../reference/readiness.md#canonical-store-replacement).
+
+If the deployment needs a fallback, keep the previous binaries or images and
+their matching store before the upgrade. Keep that store separate from the
+one the new release uses.
+
 To upgrade, change the release tag:
 
 1. Read the new release's notes for any step the upgrade needs.
@@ -474,9 +497,10 @@ Repeat for `zinder-projector`, `zinder-query`, and
 `zinder-compat-lightwalletd`. Readers stop serving five minutes after ingest
 stops, so keep ingest's downtime short.
 
-To roll back, repeat the upgrade steps with the earlier tag only when that
-release states it can open stores the later release wrote. Otherwise, route
-traffic to a lane that already runs the earlier release.
+To roll back, start the earlier binaries against the store you kept for
+them. Reuse the active store only when the earlier release explicitly
+supports its layout. Wait for the earlier runtimes to report `/readyz`
+before routing traffic to them.
 
 ## Inspect a runtime container
 

@@ -11,9 +11,6 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[features]
-light-wallet-qualification = []
-
 [dependencies]
 arc-swap.workspace = true
 async-trait.workspace = true

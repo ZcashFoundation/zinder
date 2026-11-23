@@ -5420,7 +5420,8 @@ async fn get_subtree_roots_honors_max_entries_above_the_reference_limit() -> eyr
     reason = "the retained-history floor contract is a cross-RPC lightwalletd compatibility claim"
 )]
 async fn retained_history_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
-    let store = acceptance_store_from_writer(floor_with_completed_subtree_writer()?)?;
+    let store =
+        acceptance_store_from_writer(floor_with_completed_subtree_writer(RawBlobRetention::None)?)?;
     let adapter = acceptance_adapter(&store);
     let floor = || lightwalletd::BlockId {
         height: u64::from(FLOOR_HEIGHT.value()),
@@ -5682,13 +5683,17 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
 
 /// Checkpointed history whose floor already completed one Sapling subtree,
 /// with one retained block that adds no note commitments.
-fn floor_with_completed_subtree_writer() -> eyre::Result<CanonicalWriterFixture> {
+pub(super) fn floor_with_completed_subtree_writer(
+    retention: RawBlobRetention,
+) -> eyre::Result<CanonicalWriterFixture> {
     let completed_tree = CompactChainMetadata {
         sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
         orchard_commitment_tree_size: 0,
         ironwood_commitment_tree_size: 0,
     };
-    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_raw_blob_retention(retention);
     for block in chain.blocks().to_vec() {
         chain = chain.with_compact_block_artifact(CompactBlockArtifact::empty(
             BlockId::new(block.height, block.hash),

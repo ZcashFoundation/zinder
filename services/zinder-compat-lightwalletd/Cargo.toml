@@ -11,18 +11,16 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[features]
-light-wallet-qualification = ["dep:futures-util", "zinder-query/light-wallet-qualification"]
-
 [dependencies]
 async-trait.workspace = true
 arc-swap.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 fs-verity.workspace = true
-futures-util = { workspace = true, optional = true }
+futures-util.workspace = true
 hex.workspace = true
 http.workspace = true
+http-body.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 metrics.workspace = true
@@ -63,7 +61,6 @@ composefs-ioctls.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 eyre.workspace = true
-http-body.workspace = true
 http-body-util.workspace = true
 metrics-exporter-prometheus.workspace = true
 prost-types.workspace = true

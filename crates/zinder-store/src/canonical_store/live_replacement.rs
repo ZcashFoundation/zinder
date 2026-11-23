@@ -13,7 +13,7 @@ use zinder_core::{
 
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalEventFence, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalStore,
+    CanonicalStoreReadyEvidence, CanonicalStoredData, RocksDbCanonicalStore,
     block_load::{
         decode_block_final_note_commitment_roots, encode_block_position,
         encode_transaction_position, read_persisted_tip_metadata, validate_live_block,
@@ -37,7 +37,8 @@ use super::{
         SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
         TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{encode_subtree_root_key, required_subtree_root_ranges},
+    stored_set::required_subtree_root_ranges,
+    subtree_load::encode_subtree_root_key,
     tree_state_replay::append_compact_block_commitments,
 };
 
@@ -469,11 +470,7 @@ fn validate_replacement_blocks(
     })?;
     let mut expected_parent = parent_id;
     for replacement in blocks {
-        validate_live_block(
-            store.workload,
-            store.build_plan.raw_blob_retention(),
-            &replacement.block,
-        )?;
+        validate_live_block(&store.stored_set, &replacement.block)?;
         let header = &replacement.block.facts.block_header;
         let expected_height = expected_parent.height.next().ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement height exceeds u32::MAX")
@@ -599,6 +596,10 @@ fn capture_displaced_blocks(
     store: &RocksDbCanonicalStore,
     reverted_range: BlockHeightRange,
 ) -> Result<Vec<CanonicalDisplacedBlock>, CanonicalStoreError> {
+    let retains_raw_blocks = store.stored_set.contains(CanonicalStoredData::BlockBodies);
+    let retains_final_roots = store
+        .stored_set
+        .contains(CanonicalStoredData::FinalNoteCommitmentRoots);
     reverted_range
         .into_iter()
         .map(|height| {
@@ -627,25 +628,23 @@ fn capture_displaced_blocks(
             })
             .transpose()
             .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
-            if raw_block_bytes.is_some()
-                != store.build_plan.raw_blob_retention().retains_block_blobs()
-            {
+            if raw_block_bytes.is_some() != retains_raw_blocks {
                 return Err(CanonicalStoreError::live_commit(
                     "canonical suffix raw block rows do not match admitted retention",
                 ));
             }
-            match store.workload {
-                CanonicalStoreWorkload::Wallet if final_note_commitment_roots.is_some() => {
+            match retains_final_roots {
+                false if final_note_commitment_roots.is_some() => {
                     return Err(CanonicalStoreError::live_commit(
                         "wallet canonical suffix contains explorer-only rows",
                     ));
                 }
-                CanonicalStoreWorkload::Explorer if final_note_commitment_roots.is_none() => {
+                true if final_note_commitment_roots.is_none() => {
                     return Err(CanonicalStoreError::live_commit(
                         "explorer canonical suffix is missing archive facts",
                     ));
                 }
-                CanonicalStoreWorkload::Wallet | CanonicalStoreWorkload::Explorer => {}
+                _ => {}
             }
             Ok(CanonicalDisplacedBlock {
                 block_id,

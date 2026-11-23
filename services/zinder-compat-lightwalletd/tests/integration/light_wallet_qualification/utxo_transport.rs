@@ -1,21 +1,25 @@
 use std::time::Duration;
 
 use eyre::{Result, eyre};
+use http_body_util::{BodyExt as _, Full};
 use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{
-    Code,
-    transport::{Channel, Server},
-};
+use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tonic::{Code, Status, body::Body, codegen::Bytes, transport::Channel};
+use tower::{Layer as _, ServiceExt as _};
 use zinder_core::{BlockId, Network, TransactionId, wire::encode_rpc_transaction_id_hex};
 use zinder_proto::compat::lightwalletd::{
     GetAddressUtxosArg, GetAddressUtxosReply, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer as _,
 };
+use zinder_runtime::{ClientAddressSource, GrpcSendStallLayer, public_grpc_server};
 use zinder_testkit::{ChainFixture, RpcReply, method};
 
-use super::{ADDRESS, Fixture, one_upgrade_per_height, utxos_at};
+use super::{
+    ADDRESS, Fixture, UtxoNode, balance_request, one_upgrade_per_height, populated_utxo_fixture,
+    utxo_request, utxos_at,
+};
 
 const HEIGHTS: u8 = 100;
 const OUTPUTS_PER_TX: i32 = 500;
@@ -98,14 +102,24 @@ async fn with_client(
 ) -> Result<()> {
     let script = zinder_source::parse_transparent_address(ADDRESS)?.script();
     let fixture = fixture(script.as_raw_bytes())?;
+    with_fixture_client(fixture, async |client| {
+        check(client, script.as_raw_bytes()).await
+    })
+    .await
+}
+
+async fn with_fixture_client(
+    fixture: Fixture,
+    check: impl AsyncFnOnce(CompactTxStreamerClient<Channel>) -> Result<()>,
+) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
-    let server = Server::builder()
+    let server = public_grpc_server(ClientAddressSource::Connection)
         .add_service(fixture.adapter.into_server())
         .serve_with_incoming(TcpListenerStream::new(listener));
     let request = async {
         let client = CompactTxStreamerClient::connect(endpoint).await?;
-        check(client, script.as_raw_bytes()).await
+        check(client).await
     };
     tokio::select! {
         stopped = server => Err(eyre!("gRPC server stopped during UTXO request: {stopped:?}")),
@@ -164,6 +178,107 @@ async fn default_client_streams_every_wallet_ordered_utxo() -> Result<()> {
             assert_eq!(stream.message().await?, Some(expected));
         }
         assert!(stream.message().await?.is_none());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_paused_utxo_stream_leaves_node_admission_for_another_call() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    let mut paused = fixture
+        .adapter
+        .get_address_utxos_stream(utxo_request(2))
+        .await?
+        .into_inner();
+    let first = paused
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| eyre!("missing first output"))?;
+    let fast = fixture
+        .adapter
+        .get_address_utxos(utxo_request(1))
+        .await?
+        .into_inner();
+    assert_eq!(fast.address_utxos, [first]);
+    assert!(paused.next().await.transpose()?.is_some());
+    assert!(paused.next().await.is_none());
+    Ok(())
+}
+
+fn unary_utxo_request() -> Result<http::Request<Body>> {
+    let request = utxo_request(1).into_inner();
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(request.encoded_len())?.to_be_bytes());
+    request.encode(&mut frame)?;
+    http::Request::post("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos")
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header(http::header::TE, "trailers")
+        .body(Body::new(Full::new(Bytes::from(frame))))
+        .map_err(Into::into)
+}
+
+#[tokio::test]
+async fn two_unfinished_unary_utxo_bodies_refuse_a_third_but_allow_balance() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    let service = GrpcSendStallLayer::new(Duration::from_hours(1))
+        .layer(fixture.adapter.clone().into_server());
+    let unary = async || {
+        service
+            .clone()
+            .oneshot(unary_utxo_request()?)
+            .await
+            .map_err(eyre::Report::from)
+    };
+    let mut first = unary().await?.into_body();
+    let second = unary().await?.into_body();
+    // Hand off the first body's data and hold its terminal poll. The
+    // second body stays unpolled. Neither body needs a socket buffer.
+    let piece = first
+        .frame()
+        .await
+        .ok_or_else(|| eyre!("no unary data"))??;
+    assert!(piece.is_data());
+    let refusal = unary().await?;
+    let status = Status::from_header_map(refusal.headers())
+        .ok_or_else(|| eyre!("a third unary response was admitted"))?;
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("response limit"));
+
+    let balance = fixture
+        .adapter
+        .get_taddress_balance(balance_request())
+        .await?;
+    assert_eq!(balance.into_inner().value_zat, 3);
+
+    let trailers = first
+        .frame()
+        .await
+        .ok_or_else(|| eyre!("no unary trailers"))??;
+    assert_eq!(
+        trailers
+            .trailers_ref()
+            .and_then(|trailers| trailers.get("grpc-status")),
+        Some(&http::HeaderValue::from_static("0"))
+    );
+    let third = unary().await?;
+    assert!(Status::from_header_map(third.headers()).is_none());
+    drop(second);
+    let fourth = unary().await?;
+    assert!(Status::from_header_map(fourth.headers()).is_none());
+    drop((piece, first, third, fourth));
+    Ok(())
+}
+
+#[tokio::test]
+async fn light_wallet_listener_returns_a_small_unary_utxo_reply() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    with_fixture_client(fixture, async |mut client| {
+        let reply = client.get_address_utxos(utxo_request(1)).await?;
+        let outputs = reply.into_inner().address_utxos;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].address, ADDRESS);
         Ok(())
     })
     .await

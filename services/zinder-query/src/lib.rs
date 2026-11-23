@@ -38,9 +38,7 @@ mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
 #[cfg(test)]
 mod observed_canonical_reader;
-#[cfg(feature = "light-wallet-qualification")]
 mod qualification;
-#[cfg(feature = "light-wallet-qualification")]
 pub use qualification::{QualificationNodeTarget, QualificationWalletQuery};
 mod rocksdb_serving_readers;
 mod serving_read;
@@ -76,7 +74,6 @@ pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
-#[cfg(feature = "light-wallet-qualification")]
 pub use rocksdb_serving_readers::{BlockTransactionDigests, MinedTransactionDigest};
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{

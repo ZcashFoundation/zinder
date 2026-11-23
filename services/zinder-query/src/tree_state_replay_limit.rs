@@ -3,7 +3,6 @@
 
 mod flights;
 mod settled_cache;
-#[cfg(feature = "light-wallet-qualification")]
 pub(crate) use flights::ReadyState;
 pub(crate) use flights::{ReplayKey, Selection, read_missing_height};
 pub(crate) use settled_cache::ReaderGeneration;

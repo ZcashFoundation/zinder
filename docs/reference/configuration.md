@@ -59,6 +59,39 @@ listener on `[::]` or a public address is refused. Arguments after the image
 name replace `--config /etc/zinder/config.toml`, so repeat it when you pass
 your own.
 
+## Light-wallet profile
+
+Set `deployment.profile = "light-wallet"` in both the ingest and
+lightwalletd compatibility TOML files, or set `ZINDER_DEPLOYMENT__PROFILE=light-wallet`
+for both processes. Run `zinder-ingest` and `zinder-compat-lightwalletd` with
+the same network, canonical primary path, and canonical reorg window. Give
+compatibility its own secondary path, the ingest-control endpoint, and one
+archive node with transparent address indexes.
+
+The profile selects complete wallet history, no raw blob retention, and no
+Explorer views for ingest. Compatibility uses canonical data and ingest
+control for local wallet reads and forwards selected reads to the node.
+Use the standalone runtimes for this profile. The bundled wallet-serving
+image starts a wallet projector and native query. Omit
+`ingest.run_overrides.coverage`, `ingest.explorer_views`, `storage.raw_blob_policy`, and
+`compat.serving` when selecting this profile. Matching values are accepted,
+and conflicting values fail at startup. Compatibility requires complete
+block history and a complete subtree-root prefix, and can read a store with
+additional retained blobs. The ingest writer must match the store's original
+retention policy. For ingest and the compatibility listener, `--print-config`
+writes the resolved profile and omits the settings it supplies.
+
+The explicit `compat.serving = "light-wallet"` setting and its
+`light-wallet-qualification` alias apply the same history and subtree requirements.
+Without the profile, both use the reader's configured
+`storage.raw_blob_policy`, which defaults to `transactions`.
+Set it to `none` explicitly to admit a store without transaction bodies. See
+[Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection)
+for method behavior. Light-wallet serving uses fixed per-listener limits for
+[forwarded transactions](lightwalletd-compatibility.md#gettransaction),
+[address history](lightwalletd-compatibility.md#gettaddresstxids-and-gettaddresstransactions),
+and [unspent-output lookups](lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream).
+
 ## How configuration is loaded
 
 Every binary merges four layers. Each layer overrides the one before it:
@@ -96,10 +129,10 @@ such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 
 | Runtime | Sections |
 | --- | --- |
-| `zinder-ingest` | `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
+| `zinder-ingest` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
 | `zinder-projector` | `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
 | `zinder-query` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
-| `zinder-compat-lightwalletd` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
+| `zinder-compat-lightwalletd` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
 | `zinder-explorer` | `network`, `node`, `node_fallbacks.N`, `storage`, `explorer`, `ops`, `security` |
 | `zinder-compat-cipherscan` | `network`, `cipherscan`, `ops`, `security` |
 
@@ -118,6 +151,9 @@ Each runtime uses `[node]` differently:
   stored data and do not advertise broadcast, and compatibility answers
   `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires
   `node.json_rpc_addr`.
+- Light-wallet serving requires one `[node]` and rejects fallbacks. For
+  the methods it forwards, see
+  [Lightwalletd serving modes](lightwalletd-compatibility.md#runtime-serving-selection).
 - Explorer uses it only to report the node's tip in its freshness envelope.
 - The projector, and compatibility with `compat.serving = "compact-blocks"`,
   reject it.
@@ -158,8 +194,9 @@ not check descriptions or defaults.
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
+| `ZINDER_DEPLOYMENT__PROFILE` | zinder-ingest, zinder-compat-lightwalletd | Optional | `deployment.profile` | Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile). |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
-| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader` | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast transactions through it, compatibility also reads the recommended fee for `GetStandardFee` through it, and both start without contacting it. Without it they serve storage only and advertise no broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility rejects every `ZINDER_NODE__*` variable. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running ingest or light-wallet serving, broadcasting, or reading wallet fees` | `node.json_rpc_addr` | Upstream node JSON-RPC URL. Light-wallet serving forwards transparent address reads, omitted transaction bodies, broadcasts, and fee reads to this node. Query and wallet-mode compatibility use a configured node for broadcasts, and wallet-mode compatibility also reads the fee. Compact-blocks serving rejects node settings. Explorer uses the address for upstream tip observation. See [The node sections](#the-node-sections). |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
 | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read at startup and whenever an indexer stream reconnects. |
 | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node.indexer_tls.client_cert_path` | PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. |
@@ -239,7 +276,7 @@ not check descriptions or defaults.
 | `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS` | zinder-query | Optional | `query.trust_proxy_client_address` | Counts each WalletQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
 | `ZINDER_COMPAT__BROWSER_ORIGINS` | zinder-compat-lightwalletd | Optional | `compat.browser_origins` | Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. An empty list disables browser access (the default). Use `*` alone to allow every origin. |
-| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
+| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without a profile. `compact-blocks` rejects wallet and node settings. Prefer `deployment.profile = "light-wallet"` for a coordinated deployment. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY` | zinder-compat-lightwalletd | Optional | `compat.shielded_history.directory` | Follow the local publisher's checkpoint and signed catalog. Mutually exclusive with manifest. |
 | `ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST` | zinder-compat-lightwalletd | Optional | `compat.shielded_history.manifest` | Admit an existing signed catalog before serving. Mutually exclusive with directory. |
@@ -247,8 +284,8 @@ not check descriptions or defaults.
 | `ZINDER_COMPAT__SHIELDED_HISTORY__REQUIRE_FS_VERITY` | zinder-compat-lightwalletd | Optional | `compat.shielded_history.require_fs_verity` | Require Linux fs-verity on every segment. Defaults to false. See [signed settled history](lightwalletd-compatibility.md#signed-settled-history). |
 | `ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS` | zinder-compat-lightwalletd | Optional | `compat.pair_convergence_attempts` | Maximum bounded attempts to converge and admit compatibility's wallet-serving pair or compact-serving canonical secondary. Must be in 1..=64; defaults to 12. |
 | `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must be in 1..=65536; defaults to 100. |
-| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
-| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 1..=256; defaults to 64. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 5000 and defaults to 2000. A value of 0 refuses at once. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | Number of lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot. A rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 64. |
 | `ZINDER_COMPAT__STALE_TIP_LIMIT_MS` | zinder-compat-lightwalletd | Optional | `compat.stale_tip_limit_ms` | Milliseconds the served tip may age, counted from its block time or from when the process first served it, whichever is earlier, while the writer cannot vouch for it because its node is unreachable, behind the network, or ahead of the writer, before lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale tip. A tip the node still reports is never refused. 0 disables it; otherwise at least 300000. Defaults to 1500000 (25 minutes). |
 | `ZINDER_COMPAT__PING_VERY_INSECURE` | zinder-compat-lightwalletd | Optional | `compat.ping_very_insecure` | Answers the lightwalletd `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only on a server you are load testing. Defaults to false, which refuses `Ping` with `FAILED_PRECONDITION`. |
 | `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS` | zinder-compat-lightwalletd | Optional | `compat.trust_proxy_client_address` | Counts each lightwalletd-compatible request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
@@ -261,9 +298,9 @@ not check descriptions or defaults.
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.memtable_budget_bytes` | Materialized-view store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.statistics_level` | Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0006](../adrs/0006-node-source-boundary.md). |
-| `ZINDER_INGEST__EXPLORER_VIEWS` | zinder-ingest | Optional | `ingest.explorer_views` | Boolean request for the complete bundled Explorer materialized-view workload. Defaults to `false` for every coverage. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`; checkpoint heights above zero are rejected before storage mutation. The request appears in `--print-config`; admission evidence appears only after the Explorer store opens successfully. |
+| `ZINDER_INGEST__EXPLORER_VIEWS` | zinder-ingest | Optional | `ingest.explorer_views` | Requests the bundled Explorer materialized views. Defaults to `false`. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`. Without a profile, `--print-config` shows the request. The light-wallet profile disables the views and omits this field. Admission evidence appears after the Explorer store opens successfully. |
 | `ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES` | zinder-ingest | Optional | `ingest.explorer_views_min_free_bytes` | Available bytes on the volume holding `storage.path` below which Explorer view replay, the transparent-address ranking build, and historical view backfills pause, so the views cannot fill the volume canonical ingest and wallet serving need. Replay resumes once at least a tenth more than this is available. Defaults to 10737418240 (10 GiB); `0` disables the guard. |
-| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because native and lightwalletd-compatible transaction and transparent-history methods require retained bytes. Projector, query, and compatibility readers use the same value as an exact admission expectation; Zallet full-block serving requires `all`. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild and blue-green cutover. |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts `none` with the light-wallet profile. Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 1000, Zebra's maximum finalization depth. A larger value raises an existing store's window in place; a smaller one is refused. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT` | zinder-ingest | Optional | `ingest.mempool.max_transaction_count` | Maximum number of transactions admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 8000. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.max_total_raw_transaction_bytes` | Maximum cumulative raw transaction bytes admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 80000000. |

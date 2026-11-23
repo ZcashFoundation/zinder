@@ -8,7 +8,7 @@ Zinder serves public chain data. Keys, trial decryption, note and account state,
 
 Zinder publishes the chain as a sequence of numbered, immutable snapshots called chain epochs. Each time ingest commits new blocks or a reorg, it creates a new epoch, and `zinder-query` starts serving it. An epoch names one visible tip, one settled tip, and the stored data that belongs to that chain.
 
-Every read answers from exactly one epoch. A unary response carries it in `chain_view.chain_epoch`. A range or transparent-address stream sends it once in a leading header message; `FullBlocksInRange` repeats it on every chunk. One response therefore never mixes data from two branches of a reorg.
+Each stored chain lookup answers from exactly one epoch. A unary response carries it in `chain_view.chain_epoch`. A range or transparent-address stream sends it once in a leading header message. `FullBlocksInRange` repeats it on every chunk. One response therefore never mixes data from two branches of a reorg.
 
 To make several reads agree, pin them to one epoch:
 
@@ -113,7 +113,7 @@ At 30 ms per rebuild, about the 99th percentile measured on Testnet, one slot ca
 
 `LatestTreeStateCheckpoint(at_epoch_id)` returns the newest stored checkpoint at or below the visible tip.
 
-`SubtreeRoots(shielded_protocol, start_index, max_entries, at_epoch_id)` returns completed subtree roots in ascending index order. `max_entries` must be 1 to 1,024. Zero fails with `INVALID_ARGUMENT`, and a larger value with `INVALID_ARGUMENT` and `SUBTREE_ROOT_RANGE_TOO_LARGE`. A start index at or past the number of completed subtrees returns an empty list. On a store whose history starts after a checkpoint, a root completed before that checkpoint returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. `root_hash` is raw bytes, not RPC-order hex.
+`SubtreeRoots(shielded_protocol, start_index, max_entries, at_epoch_id)` returns completed subtree roots in ascending index order. `max_entries` must be 1 to 1,024. Zero fails with `INVALID_ARGUMENT`, and a larger value with `INVALID_ARGUMENT` and `SUBTREE_ROOT_RANGE_TOO_LARGE`. A start index at or past the number of completed subtrees returns an empty list. A checkpointed store can serve roots from before its checkpoint when it has complete-prefix coverage. Requesting an earlier root that the store lacks returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. See [Schema admission](storage-backend.md#schema-admission). `root_hash` carries raw bytes.
 
 ## Network-upgrade schedule
 

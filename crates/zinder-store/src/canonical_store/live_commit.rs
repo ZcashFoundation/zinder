@@ -30,9 +30,8 @@ use super::{
         TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{
-        encode_subtree_root_key, encode_subtree_root_value, required_subtree_root_ranges,
-    },
+    stored_set::required_subtree_root_ranges,
+    subtree_load::{encode_subtree_root_key, encode_subtree_root_value},
 };
 
 /// One block-local append prepared for an atomic READY canonical transition.
@@ -291,11 +290,7 @@ impl PreparedLiveAppendCommit {
                 "expected canonical event fence is stale",
             ));
         }
-        validate_live_block(
-            store.workload,
-            store.build_plan.raw_blob_retention(),
-            &append.block,
-        )?;
+        validate_live_block(&store.stored_set, &append.block)?;
         let visible_tip = validate_live_block_extension(&store.ready_evidence, &append.block)?;
         validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;

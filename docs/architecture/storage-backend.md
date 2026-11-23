@@ -51,7 +51,7 @@ use domain operations. Column family names and keys are private to
 | `tree_state_checkpoint` | Commitment tree checkpoint at least every 100 blocks |
 | `subtree_root` | Completed shielded subtree roots |
 | `block_final_note_commitment_roots` | Final commitment roots per block (explorer workload only) |
-| `daily_value_pool_balance` | Daily value pool snapshot (explorer workload only) |
+| `daily_value_pool_balance` | Reserved for daily value-pool evidence. Explorer construction refuses READY publication pending authentication. |
 | `chain_epoch` | Retained chain epochs |
 | `chain_event` | Authenticated append and reorg history |
 | `mempool_event` | Retained mempool history |
@@ -154,7 +154,8 @@ A secondary is a read-only view of a primary that the reader process advances
 by catching up. A secondary:
 
 - never writes the primary;
-- checks the store's identity and schema again after each catch-up;
+- checks the store's identity and schema again after each catch-up, including
+  the manifest version and digest in the canonical READY evidence;
 - reports a failed catch-up, or lag beyond
   `storage.secondary_replica_lag_threshold_chain_epochs` (default 4), to
   readiness, as listed in the [readiness reference](../reference/readiness.md);
@@ -178,10 +179,11 @@ its next publication jumps to the writer's latest chain event. How long a
 replaced pair stays readable is in
 [Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent).
 
-A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream holds a pair
-only while it reads one chunk of at most 1,000 blocks and 2 MiB. The stream
-ends if a chunk does not link by block hash to the previous one. In `compat.serving = "compact-blocks"` mode,
-the adapter alternates two canonical secondaries and keeps no replaced pair.
+A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream uses one
+published view at a time while it reads its next chunk. The stream ends if a
+chunk does not link by block hash to the previous one. In compact-blocks and
+light-wallet modes, the publisher alternates between two canonical
+secondaries. See [Block range methods](../reference/lightwalletd-compatibility.md#getblockrange-and-getblockrangenullifiers).
 
 All generations in one process share one block cache per store. The configured
 `block_cache_bytes` therefore bounds the process, not each generation. Each
@@ -306,10 +308,41 @@ differ from what the process expects:
 
 - the store identity or layout version;
 - the network;
-- the canonical workload or raw-blob retention;
+- the required retained data and its historical floor for a canonical reader;
+- the exact canonical workload and raw-blob retention for a writer or recovery checkpoint;
 - the network-upgrade activations at or below the visible tip;
 - the reorg window;
 - for the wallet store, the canonical source it was built from.
+
+Schema v7 requires every family listed above plus the default control
+family, including physically present families with no rows under the
+admitted workload and blob policy. The construction manifest must bind the
+same workload, blob policy, and build plan as the control record and have
+evidence for the full family inventory. At construction, families outside
+the stored set and families reserved for post-publication writes must report
+zero rows.
+
+`CanonicalStoredSet` derives retained block data and its history floor from
+the build plan and workload. Readers can specify minimum data and a starting
+height with `CanonicalStoreRequirements`. A richer store satisfies these
+requirements when it covers the requested history. Missing data or an
+insufficient history floor returns `CanonicalStoreError::MissingStoredData`.
+The native query and compatibility listeners keep their first admitted
+stored set across generation changes. A running signed-history publisher
+also checks that set when it reopens its secondary. Restart the process to
+admit a different stored set that meets its requirements.
+
+An admitted stored set also carries authenticated subtree-root coverage from
+the construction manifest. A reader can require a complete subtree-root
+prefix from index zero in every pool. A retained-range load meets this
+requirement when its predecessor has no completed roots. Otherwise, a
+complete-prefix load is required. Insufficient coverage returns
+`CanonicalStoreError::IncompleteSubtreeRootPrefix`. Light-wallet serving
+requires this prefix and block history from height one at admission. Native
+wallet query and full-wallet compatibility serve retained-range stores and
+report an unavailable historical root on the affected request. Pool activation still
+governs final roots, and event retention still governs event streams. Serving capabilities also depend on
+the installed handlers and their admitted dependencies.
 
 Only the canonical writer records a new network-upgrade schedule, and readers
 adopt it; see [ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).
