@@ -103,11 +103,11 @@ Method responses and pinning rules are in
   unspent output.
 - The security of both accumulators rests on a heuristic. Zinder treats
   ChaCha12 keyed by a public BLAKE2b root as a random function of the
-  element. With an ideal ChaCha permutation in place of the 12-round one,
-  this hash-then-expand construction behaves like a random oracle up to the
-  root's birthday bound; that argument comes from the project's security
-  review, not from a published result. Nothing proves a 128-bit guarantee
-  for the concrete 12-round permutation.
+  element. The project's security review argues that if both the BLAKE2b
+  root and the ChaCha permutation were ideal, this hash-then-expand
+  construction would behave like a random oracle up to the root's birthday
+  bound. That is an informal argument, not a published result, and nothing
+  proves a 128-bit guarantee for the concrete BLAKE2b and 12-round ChaCha.
 - LtHash16 is weaker than first estimated. Lewi, Kim, Maykov, and Weis
   estimated at least 200 bits of collision security for 1,024 16-bit lanes
   ([ePrint 2019/227](https://eprint.iacr.org/2019/227)). Ding, Gong, Jiang,
@@ -115,14 +115,14 @@ Method responses and pinning rules are in
   parameters that needs about 2^81 element hashes
   ([ePrint 2026/2083](https://eprint.iacr.org/2026/2083)). Its colliding sets
   hold at least 550^8, about 2^72.8, distinct elements.
-- Zinder's stores bound that attack. Row and UTXO counts are checked 64-bit
-  values, so two READY states hold fewer than 2^68 rows together, and keys
-  are unique, so no element repeats. The attack's witness cannot fit. For
-  sets this small, the cheapest known LtHash16 attack is a generalized
-  birthday search of about 2^181 hashes (same paper). The binding generic
-  limit is then the birthday bound of the hashes Zinder compares: 2^128 for
-  the 32-byte display digests and manifest hashes, and 2^176 for the full
-  accumulators, whose elements are expanded from 352-bit roots.
+- Zinder's stores rule out that attack's witness. Row and UTXO counts are
+  checked 64-bit values, so two READY states hold fewer than 2^68 rows
+  together, and keys are unique, so no element repeats. Smaller witnesses
+  are not ruled out, and no published analysis gives a work factor for sets
+  of this size.
+- The hashes Zinder compares have idealized birthday ceilings, not proven
+  security levels: 2^128 for the 32-byte display digests and manifest
+  hashes, and 2^176 for two elements with equal 44-byte roots.
 - Changing the lane count or width changes the problem and needs its own
   analysis.
 - The commitment is not comparable with zcashd's `gettxoutsetinfo`, which
@@ -143,11 +143,14 @@ Method responses and pinning rules are in
   vanishes and crafted collisions are easy.
 - **An ordered digest like `hash_serialized`.** It requires a defined
   iteration order that Zinder's storage does not provide.
-- **BLAKE2X expansion, scheme 1.** It costs 32 BLAKE2b compressions per
-  element and several times as much as the ChaCha12 expansion on every CPU
-  family measured, including CPUs without AVX-512 and Arm.
-- **BLAKE3 output expansion.** Its output is fast only with AVX-512. On AVX2
-  and Arm CPUs it is little faster than BLAKE2X.
+- **BLAKE2X expansion, scheme 1.** A short element costs 33 BLAKE2b
+  compressions, one for the root and 32 for the output blocks. It costs
+  several times as much as the ChaCha12 expansion on every CPU family
+  measured, including CPUs without AVX-512 and Arm.
+- **BLAKE3 output expansion.** Its output is fast only with AVX-512. On a
+  Neoverse V2 Arm CPU it took 2,765 ns per element against 5,229 ns for
+  BLAKE2X and 1,190 ns for ChaCha12, and on AVX2-only CPUs it gained little
+  or lost.
 - **ChaCha8 or ChaCha20.** ChaCha8 leaves half a round of margin over the
   published 7.5-round attacks on the cipher, in a setting where the key is
   public. Eight rounds are already reached by inside-out distinguishers on
