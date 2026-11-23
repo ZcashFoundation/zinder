@@ -620,8 +620,8 @@ async fn node_outage_keeps_canonical_reads_and_readyz_available() -> Result<()> 
 #[tokio::test]
 async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_binary() -> Result<()> {
     let schedule = one_upgrade_per_height()?;
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let tip = served_tip(1)?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let tip = served_tip(2)?;
     let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &schedule)?;
     let primary = writer.canonical_primary()?;
     assert_eq!(
@@ -677,8 +677,9 @@ async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_bina
             .await?
             .into_inner()
             .height,
-        1
+        2
     );
+    assert_binary_block_range(&mut client, 1..=2).await?;
     assert_eq!(
         client
             .get_taddress_balance(balance_request())
@@ -829,21 +830,7 @@ async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result
 async fn assert_checkpointed_wallet_reads(
     client: &mut CompactTxStreamerClient<Channel>,
 ) -> Result<()> {
-    let retained = lightwalletd::BlockId {
-        height: 2,
-        hash: Vec::new(),
-    };
-    let mut blocks = client
-        .get_block_range(lightwalletd::BlockRange {
-            start: Some(retained.clone()),
-            end: Some(retained),
-            pool_types: Vec::new(),
-        })
-        .await?
-        .into_inner();
-    assert_eq!(blocks.message().await?.map(|block| block.height), Some(2));
-    assert!(blocks.message().await?.is_none());
-
+    assert_binary_block_range(client, 2..=2).await?;
     let missing = client
         .get_subtree_roots(lightwalletd::GetSubtreeRootsArg {
             start_index: 0,
@@ -861,6 +848,32 @@ async fn assert_checkpointed_wallet_reads(
             .map(|detail| detail.reason.as_str()),
         Some("ARTIFACT_UNAVAILABLE")
     );
+    Ok(())
+}
+
+async fn assert_binary_block_range(
+    client: &mut CompactTxStreamerClient<Channel>,
+    heights: std::ops::RangeInclusive<u64>,
+) -> Result<()> {
+    let block_id = |height| lightwalletd::BlockId {
+        height,
+        hash: Vec::new(),
+    };
+    let mut blocks = client
+        .get_block_range(lightwalletd::BlockRange {
+            start: Some(block_id(*heights.start())),
+            end: Some(block_id(*heights.end())),
+            pool_types: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    for height in heights {
+        assert_eq!(
+            blocks.message().await?.map(|block| block.height),
+            Some(height)
+        );
+    }
+    assert!(blocks.message().await?.is_none());
     Ok(())
 }
 
