@@ -2166,7 +2166,7 @@ fn parse_network(network: &str) -> Option<Network> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
 
     use serde_json::Value;
@@ -2727,6 +2727,15 @@ mod tests {
             Err(StateBundleError::ManifestContract { .. })
         ));
         Ok(())
+    }
+
+    /// A valid Regtest state-bundle manifest for tests outside this module.
+    pub(crate) fn sample_manifest() -> Result<StateBundleManifest, Box<dyn std::error::Error>> {
+        Ok(StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?)
     }
 
     fn sample_canonical_admission(sequence: u64) -> CanonicalAdmission {

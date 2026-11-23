@@ -313,12 +313,27 @@ fn admit_archive_contents(
 ) -> Result<(RecoveryArchiveManifest, StateBundleManifest), RecoveryArchiveError> {
     let (manifest, _) =
         read_archive_manifest(root, candidate_id, expected_network, expected_sha256)?;
+    let state_bundle = admit_archive_bindings(root, &manifest, expected_network)?;
     let observed_files = collect_payload_files(root, PayloadLayout::SealedArchive)?;
     require_contract(
         observed_files == manifest.payload_files,
         "recovery archive payload bytes do not match the outer manifest",
     )?;
-    let state_bundle = admit_recovery_archive_state_bundle(root, &manifest, expected_network)?;
+    Ok((manifest, state_bundle))
+}
+
+/// Admits the inner state-bundle manifest and its bindings to the outer
+/// manifest by reading only bounded manifest files.
+///
+/// It runs before any payload walk or copy, so an incompatible backup, such as
+/// one from an earlier wallet schema, is refused before it costs payload I/O or
+/// temporary space. The payload check that follows covers the same files.
+fn admit_archive_bindings(
+    root: &Path,
+    manifest: &RecoveryArchiveManifest,
+    expected_network: Network,
+) -> Result<StateBundleManifest, RecoveryArchiveError> {
+    let state_bundle = admit_recovery_archive_state_bundle(root, manifest, expected_network)?;
     let construction_binding = RocksDbCanonicalStore::read_construction_manifest_binding(
         root.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
     )
@@ -334,7 +349,7 @@ fn admit_archive_contents(
             == manifest.wallet_checkpoint_database_identity_sha256,
         "recovery archive wallet checkpoint identity does not match the inner manifest",
     )?;
-    Ok((manifest, state_bundle))
+    Ok(state_bundle)
 }
 
 fn read_archive_manifest(
@@ -1338,6 +1353,101 @@ mod tests {
         )?;
 
         assert!(admit_recovery_archive(&root, "bundle-a", Network::ZcashRegtest).is_err());
+        Ok(())
+    }
+
+    /// Writes an authentic backup of wallet schema 1 whose payload is unreadable.
+    ///
+    /// The inner state-bundle manifest records wallet schema 1, and the payload
+    /// lists a file the backup does not hold. Returns the trusted outer SHA-256.
+    fn schema_1_backup_with_unreadable_payload(
+        archive: &Path,
+    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        fs::create_dir(archive)?;
+        fs::create_dir(archive.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME))?;
+        fs::create_dir(archive.join(WALLET_CHECKPOINT_DIRECTORY_NAME))?;
+        let state_bundle = crate::state_bundle::tests::sample_manifest()?;
+        let mut inner = serde_json::to_value(&state_bundle)?;
+        *inner
+            .pointer_mut("/wallet_checkpoint/schema_version")
+            .ok_or("inner manifest has a wallet schema")? = serde_json::Value::from(1);
+        let inner = serde_json::to_vec(&inner)?;
+        fs::write(archive.join(STATE_BUNDLE_MANIFEST_FILE_NAME), &inner)?;
+        let missing = RecoveryArchiveFile {
+            path: format!("{WALLET_CHECKPOINT_DIRECTORY_NAME}/000001.sst"),
+            byte_length: MAX_RECOVERY_ARCHIVE_FILE_BYTES,
+            sha256: "00".repeat(32),
+        };
+        let outer = RecoveryArchiveManifest::from_state_bundle(
+            &state_bundle,
+            hex::encode(Sha256::digest(&inner)),
+            vec![missing],
+        )?;
+        let outer = serde_json::to_vec(&outer)?;
+        fs::write(archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME), &outer)?;
+        Ok(Sha256::digest(&outer).into())
+    }
+
+    fn require_schema_1_refusal(error: &RecoveryArchiveError) {
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                RecoveryArchiveError::StateBundle {
+                    source: StateBundleError::ManifestContract { .. }
+                }
+            ),
+            "{message}"
+        );
+        assert!(message.contains("wallet schema version 1"), "{message}");
+        assert!(message.contains("rebuild the wallet store"), "{message}");
+    }
+
+    #[test]
+    fn restore_refuses_a_schema_1_backup_before_copying_its_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let archive = temporary.path().join("backup");
+        let expected = schema_1_backup_with_unreadable_payload(&archive)?;
+        let destination = temporary.path().join("restored");
+
+        let error = restore_private_backup(
+            &archive,
+            &destination,
+            Network::ZcashRegtest,
+            &expected,
+            RecoveryValidationBudget::default(),
+        )
+        .err()
+        .ok_or("a schema-1 backup was restored")?;
+
+        require_schema_1_refusal(&error);
+        assert!(!destination.exists());
+        let mut entries = fs::read_dir(temporary.path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort();
+        assert_eq!(entries, ["backup"], "restore left a workspace behind");
+        Ok(())
+    }
+
+    #[test]
+    fn verification_refuses_a_schema_1_backup_before_walking_its_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let archive = temporary.path().join("backup");
+        let expected = schema_1_backup_with_unreadable_payload(&archive)?;
+
+        let error = verify_private_backup(
+            &archive,
+            Network::ZcashRegtest,
+            &expected,
+            RecoveryValidationBudget::default(),
+        )
+        .err()
+        .ok_or("a schema-1 backup was verified")?;
+
+        require_schema_1_refusal(&error);
         Ok(())
     }
 

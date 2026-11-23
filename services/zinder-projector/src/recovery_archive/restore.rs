@@ -11,9 +11,10 @@ use crate::state_bundle::StateBundleError;
 use super::{
     CANONICAL_CHECKPOINT_DIRECTORY_NAME, RECOVERY_ARCHIVE_MANIFEST_FILE_NAME, RecoveryArchiveError,
     RecoveryValidationBudget, STATE_BUNDLE_MANIFEST_FILE_NAME, WALLET_CHECKPOINT_DIRECTORY_NAME,
-    admit_archive_contents, copy_archive_payload, create_private_directory, publish_directory,
-    read_archive_manifest, require_absent, require_contract, resolve_existing_directory,
-    sync_directory, validate_absolute_lexical_path, with_private_workspace,
+    admit_archive_bindings, admit_archive_contents, copy_archive_payload, create_private_directory,
+    publish_directory, read_archive_manifest, require_absent, require_contract,
+    resolve_existing_directory, sync_directory, validate_absolute_lexical_path,
+    with_private_workspace,
 };
 
 /// Verifies a private backup against the independently retained SHA-256 of its outer manifest.
@@ -60,6 +61,8 @@ pub fn verify_private_backup(
 /// Installs a private backup as `canonical/` and `wallet/` in one new deployment directory.
 ///
 /// Both databases pass byte verification and cold admission before publication.
+/// A backup this release cannot restore, such as one written under an earlier
+/// wallet schema, is refused from its manifests before any payload is copied.
 /// The installed canonical store retains its cursor key and history and releases
 /// the previous projector's retention leases. The caller owns the destination
 /// parent, supplies an absent destination, and holds the source archive immutable.
@@ -87,6 +90,7 @@ pub fn restore_private_backup(
     )?;
     let (manifest, encoded) =
         read_archive_manifest(&archive, None, network, Some(expected_sha256))?;
+    admit_archive_bindings(&archive, &manifest, network)?;
     tracing::info!(
         files = manifest.payload_file_count,
         bytes = manifest.payload_byte_length,

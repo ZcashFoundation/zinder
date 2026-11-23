@@ -158,5 +158,8 @@ back. When retention expires, dispose of every stored copy as private key
 material, including any downloaded verification copies.
 
 This workflow uses matching current store schemas and a state bundle with a
-writer-admitted upgrade schedule. A public bootstrap snapshot requires its own
+writer-admitted upgrade schedule. Verification and restore read the backup's
+manifests first. They refuse a backup written under another wallet schema
+before they read or copy its payload, and the error names both schema
+versions. Rebuild the wallet store and take a new backup instead. A public bootstrap snapshot requires its own
 export format and publisher authentication. [Storage and deployment topologies](../adrs/0004-storage-and-deployment-topologies.md)
