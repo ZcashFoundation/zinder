@@ -1,6 +1,0 @@
-kind: fixed
-body: Listeners whose signed settled-history catalog starts above height 1 no longer queue default shielded `GetBlockRange` requests for heights below the catalog behind signed-read permits. Those requests read canonical storage immediately with the normal chunk budget.
-time: 2026-11-23T15:41:19.832800598Z
-custom:
-    Bump: patch
-    PR: "509"

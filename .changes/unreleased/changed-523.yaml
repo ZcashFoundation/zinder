@@ -1,6 +1,0 @@
-kind: changed
-body: Looking up a mined transaction by ID, as `GetTransaction` does, now reads the transaction's location from canonical storage once instead of twice. Responses are unchanged.
-time: 2026-11-23T21:29:26.022529686Z
-custom:
-    Bump: patch
-    PR: "523"
