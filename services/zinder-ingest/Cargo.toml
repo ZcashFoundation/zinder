@@ -50,6 +50,7 @@ async-trait.workspace = true
 eyre.workspace = true
 hex.workspace = true
 metrics-exporter-prometheus.workspace = true
+proptest.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
 secrecy.workspace = true

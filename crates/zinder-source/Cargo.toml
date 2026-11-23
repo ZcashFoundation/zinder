@@ -45,6 +45,7 @@ zinder-proto.workspace = true
 eyre.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"] }
 orchard = { workspace = true, default-features = false }
+proptest.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 sapling.workspace = true
