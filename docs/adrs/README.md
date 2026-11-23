@@ -11,6 +11,11 @@ release policy. When an ADR already covers the domain, update that ADR in
 place instead of adding a sibling. A decision in a new domain takes the next
 number.
 
+Every decision an ADR adds or revises fills in the Evidence section, so a
+reader can tell a measured limit from a chosen tolerance and knows what would
+reopen it. Decisions written before the section existed gain an entry when
+they are next revised.
+
 ## Template
 
 ```markdown
@@ -24,6 +29,15 @@ The problem and the constraints that force a choice. A few short paragraphs.
 ## Decision
 What Zinder does. When the ADR covers several related decisions, number them.
 State each as a rule a reviewer can check.
+
+## Evidence
+What each new or revised decision rests on, as one of:
+- Measured: the number, what it was measured on, and the issue or pull
+  request that holds the receipt.
+- External constraint: the protocol, upstream behavior, advisory, or platform
+  fact that forces it.
+- Judgment: no measurement. When the judgment carries a cost, name the
+  observation that would reopen it.
 
 ## Consequences
 What this costs and what it obliges (operators, contributors, consumers).
