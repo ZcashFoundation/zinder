@@ -453,28 +453,7 @@ impl RocksDbCanonicalSecondary {
                 path: self.primary_path.clone(),
             });
         };
-        if opened_control.build_plan != self.build_plan {
-            return Err(CanonicalStoreError::admission(
-                &self.primary_path,
-                "canonical build identity changed during secondary catch-up",
-            ));
-        }
-        if ready_evidence.construction_manifest_version
-            != self.ready_evidence.construction_manifest_version
-            || ready_evidence.construction_manifest_sha256
-                != self.ready_evidence.construction_manifest_sha256
-        {
-            return Err(CanonicalStoreError::admission(
-                &self.primary_path,
-                "canonical construction manifest changed during secondary catch-up",
-            ));
-        }
-        if opened_control.cursor_auth_key != self.cursor_auth_key {
-            return Err(CanonicalStoreError::admission(
-                &self.primary_path,
-                "canonical cursor authentication key changed during secondary catch-up",
-            ));
-        }
+        self.validate_catch_up_identity(&opened_control, &ready_evidence)?;
         if ready_evidence.visible_event_sequence < self.ready_evidence.visible_event_sequence {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
@@ -524,6 +503,36 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.build_plan.network()
+    }
+
+    fn validate_catch_up_identity(
+        &self,
+        opened_control: &super::control::DecodedStoreControl,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+    ) -> Result<(), CanonicalStoreError> {
+        if opened_control.build_plan != self.build_plan {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                "canonical build identity changed during secondary catch-up",
+            ));
+        }
+        if ready_evidence.construction_manifest_version
+            != self.ready_evidence.construction_manifest_version
+            || ready_evidence.construction_manifest_sha256
+                != self.ready_evidence.construction_manifest_sha256
+        {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                "canonical construction manifest changed during secondary catch-up",
+            ));
+        }
+        if opened_control.cursor_auth_key != self.cursor_auth_key {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                "canonical cursor authentication key changed during secondary catch-up",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the admitted network-upgrade activation identity.
