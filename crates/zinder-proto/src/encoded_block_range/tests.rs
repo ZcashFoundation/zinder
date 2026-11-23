@@ -11,8 +11,10 @@ use tonic::codec::{EncodeBody, SingleMessageCompressionOverride};
 use tonic::codegen::tokio_stream::Stream;
 
 use super::{
-    BATCH_BYTES, Bytes, CompactBlock, EncodedBlock, EncodedBlockBody, EncodedBlockCodec,
-    InvalidEncodedBlock, Status, http,
+    BATCH_BYTES, BlockRange, BoundedChunkRetention, Bytes, COPIED_PIECE_BYTES, CompactBlock,
+    EnabledCompressionEncodings, EncodedBlock, EncodedBlockBody, EncodedBlockCodec,
+    EncodedBlockRange, EncodedBlockRangeStream, Grpc, InvalidEncodedBlock, Request, Response,
+    Status, http, server_streaming,
 };
 
 /// A message stream that reports `Pending` once wherever the script has `None`.
@@ -77,7 +79,11 @@ fn framed(payload: &[u8]) -> eyre::Result<EncodedBlock> {
     let mut message = vec![0];
     message.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
     message.extend_from_slice(payload);
-    Ok(EncodedBlock::from_length_prefixed(message.into())?)
+    let allocation = message.capacity();
+    Ok(EncodedBlock::from_length_prefixed_in(
+        message.into(),
+        allocation,
+    )?)
 }
 
 fn payload(len: usize, tag: u8) -> Vec<u8> {
@@ -310,5 +316,156 @@ fn only_messages_of_at_least_the_batch_size_are_sent_alone() -> eyre::Result<()>
         [small_len + (BATCH_BYTES - 1), small_len, BATCH_BYTES]
     );
     assert_eq!(encoded.frames[2].as_ptr(), at.as_length_prefixed().as_ptr());
+    Ok(())
+}
+
+const CAP: usize = BoundedChunkRetention::MAX_ALLOCATION_BYTES;
+
+/// The frames the body sends for one large message.
+fn large_message_frames(block: EncodedBlock) -> eyre::Result<Vec<Bytes>> {
+    let (encoded, tonic) = both(&[Some(Ok(block))], None)?;
+    assert_eq!(encoded.bytes(), tonic.bytes());
+    assert_eq!(encoded.trailers, tonic.trailers);
+    Ok(encoded.frames)
+}
+
+fn in_allocation(payload: &[u8], allocation: usize) -> eyre::Result<EncodedBlock> {
+    let block = framed(payload)?;
+    Ok(EncodedBlock::from_length_prefixed_in(
+        block.as_length_prefixed().clone(),
+        allocation,
+    )?)
+}
+
+#[test]
+fn a_large_message_in_an_allocation_at_the_bound_is_sent_as_itself() -> eyre::Result<()> {
+    let block = in_allocation(&payload(97_000, 1), CAP)?;
+    let frames = large_message_frames(block.clone())?;
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].as_ptr(), block.as_length_prefixed().as_ptr());
+    Ok(())
+}
+
+#[test]
+fn a_large_message_over_the_bound_or_of_unknown_allocation_is_sent_as_copied_pieces()
+-> eyre::Result<()> {
+    let over = in_allocation(&payload(97_000, 2), CAP + 1)?;
+    let unknown = EncodedBlock::from_length_prefixed(over.as_length_prefixed().clone())?;
+    let oversized = framed(&payload(CAP + 1, 3))?;
+    for block in [over, unknown, oversized] {
+        let frames = large_message_frames(block.clone())?;
+        let message = block.as_length_prefixed();
+        assert_eq!(frames.concat(), message.as_ref());
+        assert_eq!(
+            frames.len(),
+            message.len().div_ceil(COPIED_PIECE_BYTES),
+            "pieces of at most 64 KiB"
+        );
+        assert!(frames.iter().all(|frame| {
+            let range = message.as_ptr_range();
+            frame.len() <= COPIED_PIECE_BYTES && !range.contains(&frame.as_ptr())
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_sent_batch_owns_its_allocation() -> eyre::Result<()> {
+    let script = [
+        Some(Ok(framed(&payload(20_000, 1))?)),
+        Some(Ok(framed(&payload(20_000, 2))?)),
+        Some(Ok(framed(&payload(20_000, 3))?)),
+    ];
+    let mut body = pin!(EncodedBlockBody::new(
+        Box::pin(Scripted(script.into_iter().collect())),
+        None
+    ));
+    let Poll::Ready(Some(frame)) = body
+        .as_mut()
+        .poll_frame(&mut Context::from_waker(Waker::noop()))
+    else {
+        return Err(eyre!("expected a batch"));
+    };
+    let mut batch = frame?
+        .into_data()
+        .map_err(|_| eyre!("expected message bytes"))?;
+    assert_eq!(batch.len(), 2 * (20_000 + EncodedBlock::PREFIX_LEN));
+    assert!(batch.is_unique(), "the body kept a handle on the batch");
+    batch.clear();
+    Ok(())
+}
+
+/// A request body holding one gRPC message.
+struct OneMessage(Option<Bytes>);
+
+impl http_body::Body for OneMessage {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        Poll::Ready(
+            self.get_mut()
+                .0
+                .take()
+                .map(|message| Ok(http_body::Frame::data(message))),
+        )
+    }
+}
+
+/// Serves one empty block, or refuses the call.
+struct OneBlock(bool);
+
+#[tonic::async_trait]
+impl EncodedBlockRange for OneBlock {
+    async fn get_encoded_block_range(
+        &self,
+        _request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockRangeStream>, Status> {
+        if !self.0 {
+            return Err(Status::out_of_range("above the tip"));
+        }
+        let block = EncodedBlock::encode(&CompactBlock::default())
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::once(
+            Ok(block),
+        ))))
+    }
+}
+
+fn served(range: &dyn EncodedBlockRange) -> eyre::Result<http::Response<tonic::body::Body>> {
+    let request = BlockRange::default().encode_to_vec();
+    let mut message = vec![0];
+    message.extend_from_slice(&u32::try_from(request.len())?.to_be_bytes());
+    message.extend_from_slice(&request);
+    let request = http::Request::builder()
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .body(OneMessage(Some(message.into())))?;
+    let mut grpc = Grpc::new(EncodedBlockCodec);
+    let mut call = pin!(server_streaming(
+        &mut grpc,
+        range,
+        request,
+        EnabledCompressionEncodings::default(),
+        None,
+    ));
+    match call.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(response) => Ok(response),
+        Poll::Pending => Err(eyre!("the call did not complete")),
+    }
+}
+
+#[test]
+fn only_the_uncompressed_range_body_carries_the_retention_marker() -> eyre::Result<()> {
+    let marked = |response: &http::Response<tonic::body::Body>| {
+        response
+            .extensions()
+            .get::<BoundedChunkRetention>()
+            .is_some()
+    };
+    assert!(marked(&served(&OneBlock(true))?));
+    assert!(!marked(&served(&OneBlock(false))?));
     Ok(())
 }

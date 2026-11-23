@@ -419,10 +419,13 @@ impl SealedHistory {
             slab[start - EncodedBlock::PREFIX_LEN] = 0;
             starts.push(start);
         }
+        let slab_allocation = slab.capacity();
         let packed = Bytes::from(slab);
         for (row, start) in rows.iter().zip(starts) {
-            let message = EncodedBlock::from_length_prefixed(
+            // Every row of the slab keeps the whole slab alive.
+            let message = EncodedBlock::from_length_prefixed_in(
                 packed.slice(start - EncodedBlock::PREFIX_LEN..start + row.len),
+                slab_allocation,
             )
             .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
             out.push(verify_and_build_block(row, message, self.kernel_verified)?);
