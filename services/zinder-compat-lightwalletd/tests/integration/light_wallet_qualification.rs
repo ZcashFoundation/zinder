@@ -16,7 +16,7 @@ use eyre::{Result, eyre};
 use serde_json::{Value, json};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, transport::Channel};
+use tonic::{Code, Request, Status, transport::Channel};
 use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
@@ -316,9 +316,41 @@ async fn history_deadline_releases_admission_without_polling_a_slow_response() -
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
-    tokio::task::yield_now().await;
     tokio::time::resume();
 
+    let wait_for_admission = async || {
+        loop {
+            match fixture
+                .adapter
+                .get_taddress_txids(history_request(1, 1))
+                .await
+            {
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result,
+            }
+        }
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        let first = wait_for_admission().await?;
+        let second = wait_for_admission().await?;
+        Ok::<_, Status>((first, second))
+    })
+    .await??;
+    for mut history in paused {
+        assert!(
+            matches!(history.next().await, Some(Err(status)) if status.code() == Code::DeadlineExceeded)
+        );
+        assert!(history.next().await.is_none());
+    }
+    drop((first, second));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_a_history_stream_immediately_releases_its_slot() -> Result<()> {
+    let (fixture, _) = history_fixture([])?;
     let first = fixture
         .adapter
         .get_taddress_txids(history_request(1, 1))
@@ -327,13 +359,20 @@ async fn history_deadline_releases_admission_without_polling_a_slow_response() -
         .adapter
         .get_taddress_txids(history_request(1, 1))
         .await?;
-    for mut history in paused {
-        assert!(
-            matches!(history.next().await, Some(Err(status)) if status.code() == Code::DeadlineExceeded)
-        );
-        assert!(history.next().await.is_none());
-    }
-    drop((first, second));
+    let refused = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::ResourceExhausted)
+    );
+    drop(first);
+    let replacement = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    drop((second, replacement));
     Ok(())
 }
 

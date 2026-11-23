@@ -614,6 +614,15 @@ struct NodeAddressHistory {
     block_digests: BlockDigestCache,
 }
 
+#[derive(Clone)]
+struct HistoryAdmission(Arc<parking_lot::Mutex<Option<OwnedSemaphorePermit>>>);
+
+impl Drop for HistoryAdmission {
+    fn drop(&mut self) {
+        self.0.lock().take();
+    }
+}
+
 impl NodeAddressHistory {
     fn into_stream(
         mut self,
@@ -622,10 +631,13 @@ impl NodeAddressHistory {
     ) -> GrpcStream<lightwalletd::RawTransaction> {
         let (demand, mut requests) = mpsc::channel(1);
         let (rows, received) = mpsc::channel(1);
-        // Fetch on demand, but keep the deadline and permit in the worker so
-        // an unpolled response cannot keep node admission after it expires.
+        // The worker can release admission at the deadline even when the
+        // client is not polling. Dropping the response also releases it,
+        // after closing demand so the worker starts no more node work.
+        let admission = HistoryAdmission(Arc::new(parking_lot::Mutex::new(Some(permit))));
+        let worker_admission = admission.clone();
         let task = tokio::spawn(async move {
-            let _permit = permit;
+            let _admission = worker_admission;
             timeout_at(deadline, async {
                 while requests.recv().await.is_some() {
                     let row = tokio::select! {
@@ -646,11 +658,11 @@ impl NodeAddressHistory {
             .map_err(|_| history_deadline_exceeded())?
         });
         Box::pin(try_unfold(
-            (demand, received, task),
-            |(demand, mut received, task)| async move {
+            (demand, received, task, admission),
+            |(demand, mut received, task, admission)| async move {
                 let _ = demand.send(()).await;
                 if let Some(row) = received.recv().await {
-                    return Ok(Some((row, (demand, received, task))));
+                    return Ok(Some((row, (demand, received, task, admission))));
                 }
                 task.await
                     .map_err(|error| Status::internal(error.to_string()))??;
