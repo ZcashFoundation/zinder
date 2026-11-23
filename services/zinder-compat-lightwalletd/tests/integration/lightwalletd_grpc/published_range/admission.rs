@@ -35,18 +35,17 @@ async fn gated_adapter(
     let (gates, reads) = mpsc::unbounded_channel();
     let mut recorder = EpochPinRecorder::new(store.query.clone()).with_later_views(later_views);
     recorder.gated_chunk_reads = Some(gates);
-    recorder.expose_range_fence = true;
+    // Keep requests eligible for signed reads. A failed initial block hash
+    // check sends them to the observable canonical read after admission.
+    recorder.refuse_block_header_reads = true;
     Ok((
         LightwalletdGrpcAdapter::new(recorder).with_published_shielded_history(history),
         reads,
     ))
 }
 
-// Explicit transparent blocks take the published listener's canonical read path.
 fn gated_range(start: u64, end: u64) -> Request<lightwalletd::BlockRange> {
-    let mut request = block_range_request(start, end);
-    request.pool_types = vec![lightwalletd::PoolType::Transparent as i32];
-    Request::new(request)
+    Request::new(block_range_request(start, end))
 }
 
 fn poll_once<F: Future + Unpin>(call: &mut F) -> Poll<F::Output> {
@@ -170,11 +169,10 @@ async fn published_first_and_later_reads_share_the_byte_budget_across_open_strea
     let mut held = Vec::new();
     for (streams, later_budget) in [(16, 2 * 1024 * 1024), (32, 1024 * 1024)] {
         while held.len() < streams - 1 {
-            held.push(
-                adapter
-                    .get_encoded_block_range(Request::new(block_range_request(1, 1)))
-                    .await?,
-            );
+            let mut call = adapter.get_encoded_block_range(gated_range(1, 1));
+            assert!(poll_once(&mut call).is_pending());
+            assert!(next_read(&mut reads).await?.release.send(()).is_ok());
+            held.push(call.await?);
         }
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut call = adapter.get_encoded_block_range(gated_range(1, 3));

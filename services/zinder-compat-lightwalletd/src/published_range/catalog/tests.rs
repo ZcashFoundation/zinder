@@ -1399,8 +1399,8 @@ async fn stream_published(
 }
 
 #[tokio::test]
-async fn a_warm_tail_above_the_catalog_streams_while_every_published_read_permit_is_held()
--> Result<()> {
+async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is_held() -> Result<()>
+{
     use std::time::Duration;
     const TIP: u32 = 2_100;
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
@@ -1442,18 +1442,20 @@ async fn a_warm_tail_above_the_catalog_streams_while_every_published_read_permit
                 .await??;
         assert_eq!(frames, 1_101);
     }
-    let transparent = vec![zinder_proto::compat::lightwalletd::PoolType::Transparent as i32];
-    let frames = tokio::time::timeout(
-        prompt,
-        stream_published(&methods, &reads, &catalog, (1_000, 1_015, transparent)),
-    )
-    .await??;
-    assert_eq!(frames, 16);
+    for (first, last) in [(1, 6), (1_000, 1_015)] {
+        let transparent = vec![zinder_proto::compat::lightwalletd::PoolType::Transparent as i32];
+        let frames = tokio::time::timeout(
+            prompt,
+            stream_published(&methods, &reads, &catalog, (first, last, transparent)),
+        )
+        .await??;
+        assert_eq!(frames as u64, last - first + 1);
+    }
     assert_eq!(
         *reads.rows.lock(),
         vec![span(1_101, 2_100), span(1_000, 1_100)]
     );
-    assert_eq!(*reads.native.lock(), vec![span(1_000, 1_015)]);
+    assert_eq!(*reads.native.lock(), vec![span(1, 6), span(1_000, 1_015)]);
 
     let queued = Duration::from_millis(200);
     for range in [

@@ -98,13 +98,14 @@ impl PublishedRangeRead {
         }
     }
 
-    /// Returns whether reading `chunk` can open signed segment files: it
-    /// starts at or below the catalog's last height. A chunk above the catalog
-    /// reads the live tail or canonical storage, as a standalone listener does.
+    /// Signed files can serve the default shielded projection through the
+    /// catalog's last height.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
-        self.history
-            .as_ref()
-            .is_some_and(|catalog| chunk.start <= catalog.bounds().end)
+        self.shape == CompactBlockShape::DEFAULT_RANGE
+            && self
+                .history
+                .as_ref()
+                .is_some_and(|catalog| chunk.start <= catalog.bounds().end)
     }
 
     fn order(&self) -> HeightOrder {
@@ -206,7 +207,7 @@ impl PublishedRangeRead {
         let coverage = history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
-            && CompactBlockShape::for_range(&[]).ok() == Some(self.shape)
+            && self.shape == CompactBlockShape::DEFAULT_RANGE
     }
 
     async fn resolve_plan<Reads: CompactBlockReads>(
@@ -403,7 +404,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if self.reads_published_files(read.chunk) {
             read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         }
-        if CompactBlockShape::for_range(&[]).ok() != Some(self.shape) {
+        if self.shape != CompactBlockShape::DEFAULT_RANGE {
             return native_chunk(reads, read, convert).await;
         }
         let (epoch, started, plan) = {

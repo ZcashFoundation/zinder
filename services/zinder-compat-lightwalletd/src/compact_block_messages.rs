@@ -54,6 +54,13 @@ impl CompactBlockShape {
         payload: Payload::FullBlock,
     };
 
+    /// The shielded projection stored by the signed history and live tail.
+    pub(crate) const DEFAULT_RANGE: Self = Self {
+        transparent: false,
+        payload: Payload::SelectedPools,
+        ..Self::FULL_BLOCK
+    };
+
     /// `GetBlockNullifiers` retains every stored transaction in nullifier-only
     /// form across every shielded pool, keeping transparent-only transactions
     /// as `{index, txid, fee}` shells.
@@ -106,9 +113,10 @@ impl CompactBlockShape {
             use_default = false;
         }
         if use_default {
-            selected.sapling = true;
-            selected.orchard = true;
-            selected.ironwood = true;
+            return Ok(Self {
+                payload,
+                ..Self::DEFAULT_RANGE
+            });
         }
         Ok(selected)
     }
