@@ -2,11 +2,12 @@
 //! an h2 client that controls exactly when it grants window and when it
 //! changes its settings.
 
-use futures_util::FutureExt as _;
 use h2::client::{Connection, SendRequest};
 use tokio::{net::TcpStream, sync::watch};
 
 use super::*;
+use crate::MAX_CONCURRENT_STREAMS_PER_CONNECTION;
+use eyre::ensure;
 
 /// The client's side of one HTTP/2 connection, with its connection task.
 struct H2Client {
@@ -138,70 +139,76 @@ async fn small_buffer_connection(server: SocketAddr) -> Result<TcpStream> {
     Ok(socket.connect(server).await?)
 }
 
-/// The gap that only an h2 change can close.
+/// The stall deadline for the window-change tests: long enough that the
+/// client's window change and the server's acknowledgement always fall
+/// inside it, which each test checks before it relies on it.
+const WINDOW_CHANGE_STALL: Duration = Duration::from_secs(2);
+
+/// A response whose data waits behind a blocked socket, held back from its
+/// end until h2 has encoded its probe.
+struct WithheldEnd {
+    server: TestServer,
+    proxy: PausableProxy,
+    client: H2Client,
+    body: h2::RecvStream,
+    /// Closes once the server drops the gated response body, which happens
+    /// as its stream task ends.
+    body_dropped: mpsc::Sender<Result<Frame<Bytes>, Status>>,
+    /// Whether the gate let the end go before h2 encoded the probe, as a
+    /// gate without the departure wait does.
+    ended_early: bool,
+}
+
+impl WithheldEnd {
+    /// Fails unless the gate is still waiting for the probe to leave.
+    fn ensure_still_withheld(&self) -> Result<()> {
+        ensure!(!self.ended_early, "the gate released the end at once");
+        ensure!(
+            !self.body_dropped.is_closed(),
+            "the response body was already dropped"
+        );
+        ensure!(!self.server.all_freed(1), "the response's data was freed");
+        Ok(())
+    }
+}
+
+/// Opens a call whose response ends while its data waits for the socket.
 ///
-/// Once the response has ended, a client that takes its window back by
-/// `SETTINGS` strands the data HTTP/2 still queues for it, with the stream,
-/// until the connection closes.
-#[tokio::test]
-async fn a_window_taken_back_after_the_end_holds_the_data_until_the_connection_closes() -> Result<()>
-{
+/// The client stops reading its socket and the server sends 380 KiB, then
+/// ends the response. The window covers it all, so hyper takes the probe, but
+/// h2 cannot encode it while the data ahead of it waits for the socket. The
+/// call returns once the gate has started waiting for the probe to leave, or
+/// once a gate without that wait has released the end.
+async fn withhold_end(send_stall: Duration) -> Result<WithheldEnd> {
     let mut server = serve(Bounds {
+        send_stall,
         send_buffer: Some(4096),
         ..Bounds::default()
     })?;
     let proxy = spawn_pausable_proxy(server.address).await?;
     let client = H2Client::connect(proxy.address, 1024 * 1024).await?;
-    let mut body = client.open_stream().await?;
+    let body = client.open_stream().await?;
     let mut script = server.next_script().await?;
-
-    // The client stops reading its socket, so after a few KiB HTTP/2 keeps
-    // the rest of the response queued. The window covers all of it, so the
-    // probe passes and the response ends: hyper drops its body.
     proxy.flowing.send(false)?;
     let body_dropped = script.frames.clone();
     script.send_message(380 * 1024).await?;
     script.finish().await?;
-    within_wait_limit(body_dropped.closed()).await?;
-    assert_eq!(server.freed.load(Ordering::SeqCst), 0);
-
-    // The client lowers its stream window to zero and reads again. HTTP/2
-    // applies the change as it acknowledges it, before it sends more DATA,
-    // so once the acknowledgement arrives nothing more comes for the stream.
-    assert!(
-        client.set_stream_window(0).await?,
-        "the window change was refused"
-    );
-    proxy.flowing.send(true)?;
-    wait_until_async("the server acknowledges the window change", || {
-        client.set_stream_window(0)
+    let mut departure_waits = server.departure_waits.clone();
+    let ended_early = within_wait_limit(async {
+        tokio::select! {
+            waited = departure_waits.wait_for(|waits| *waits >= 1) => waited.map(|_| false),
+            () = body_dropped.closed() => Ok(true),
+        }
     })
-    .await?;
-    let mut received = 0;
-    while let Some(Some(chunk)) = body.data().now_or_never() {
-        let chunk = chunk?;
-        received += chunk.len();
-        body.flow_control().release_capacity(chunk.len())?;
-    }
-    let sent = message_frame(380 * 1024, 0).len();
-    assert!(received < sent, "the whole response arrived");
-
-    // The stream stays open and its data stays queued, past the send stall
-    // timeout, for as long as the connection is open.
-    tokio::time::sleep(STALL * 3).await;
-    assert!(
-        body.data().now_or_never().is_none(),
-        "the stream ended or received more data"
-    );
-    assert!(!body.is_end_stream(), "the stream ended");
-    assert_eq!(server.freed.load(Ordering::SeqCst), 0, "the data was freed");
-
-    // Closing the connection releases both.
-    proxy.task.abort();
-    client.connection.abort();
-    drop((body, client));
-    wait_until("the stranded data is freed", || server.all_freed(1)).await?;
-    Ok(())
+    .await??;
+    Ok(WithheldEnd {
+        server,
+        proxy,
+        client,
+        body,
+        body_dropped,
+        ended_early,
+    })
 }
 
 /// Runs `probe` until it returns true, within the wait limit.
@@ -218,6 +225,160 @@ where
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     bail!("{what} did not happen within {WAIT_LIMIT:?}")
+}
+
+/// Lowers the client's stream window to zero and waits until the server has
+/// applied it.
+///
+/// h2 applies a peer's setting as it buffers the acknowledgement, which can
+/// need write progress on a blocked connection, and it does so before it
+/// takes more DATA from any stream's queue. The socket flows again so the
+/// acknowledgement can be written; at most the frame already in h2's write
+/// buffer leaves ahead of it.
+async fn take_window_back(withheld: &WithheldEnd) -> Result<()> {
+    ensure!(
+        withheld.client.set_stream_window(0).await?,
+        "the window change was refused"
+    );
+    withheld.proxy.flowing.send(true)?;
+    wait_until_async("the server acknowledges the window change", || {
+        withheld.client.set_stream_window(0)
+    })
+    .await
+}
+
+/// A window taken back before the end leaves the stall timer to reset it.
+///
+/// Once the client takes its window back by `SETTINGS`, the data ahead of the
+/// probe can never be sent, so the probe stays with hyper, and the stall
+/// timer resets the stream: its data and its slot are freed while the
+/// connection stays open.
+#[tokio::test]
+async fn a_window_taken_back_before_the_end_resets_the_stream() -> Result<()> {
+    let withheld = withhold_end(WINDOW_CHANGE_STALL).await?;
+    if !withheld.ended_early {
+        withheld.ensure_still_withheld()?;
+    }
+    take_window_back(&withheld).await?;
+    // The server applied the change while the response was still held, so
+    // a reset can only come after it.
+    if !withheld.ended_early {
+        withheld.ensure_still_withheld()?;
+    }
+
+    let WithheldEnd {
+        mut server,
+        proxy,
+        client,
+        mut body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the stranded data is freed", || server.all_freed(1)).await?;
+    let ended_with = loop {
+        match within_wait_limit(body.data()).await? {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error.reason(),
+            None => break None,
+        }
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+
+    // The reset stream's slot is free again: the connection carries a full
+    // set of new streams at once.
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    drop(proxy);
+    Ok(())
+}
+
+/// The control for the test above: the same withheld end, with the window
+/// left as it was, goes out once the socket flows, and nothing is reset.
+#[tokio::test]
+async fn a_withheld_end_goes_out_once_the_socket_flows() -> Result<()> {
+    let withheld = withhold_end(WINDOW_CHANGE_STALL).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client: _client,
+        mut body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    proxy.flowing.send(true)?;
+    let mut received = 0;
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        let chunk = chunk?;
+        received += chunk.len();
+        body.flow_control().release_capacity(chunk.len())?;
+    }
+    let trailers = within_wait_limit(body.trailers()).await??;
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"));
+    assert_eq!(
+        status.map(http::HeaderValue::as_bytes),
+        Some(b"0".as_slice())
+    );
+    assert_eq!(received, message_frame(380 * 1024, 0).len());
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the response's data is freed", || server.all_freed(1)).await?;
+    Ok(())
+}
+
+/// A client that resets the stream while its end is held back ends the
+/// stream's task without the stall timer, which is out of reach here.
+#[tokio::test]
+async fn a_client_reset_while_the_end_is_held_back_frees_the_stream() -> Result<()> {
+    let withheld = withhold_end(NEVER).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client: _client,
+        body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    // Dropping the client's last handle to the stream resets it with CANCEL.
+    drop(body);
+    within_wait_limit(body_dropped.closed()).await?;
+    // h2 discarded the stream's queue. The frame it had already encoded
+    // leaves with the socket, which is the write stall bound's to limit.
+    proxy.flowing.send(true)?;
+    wait_until("the stream's data is freed", || server.all_freed(1)).await?;
+    Ok(())
+}
+
+/// Closing the connection while a response's end is held back ends the
+/// stream's task and frees its data, with the stall timer out of reach.
+#[tokio::test]
+async fn a_connection_closed_while_the_end_is_held_back_frees_the_stream() -> Result<()> {
+    let withheld = withhold_end(NEVER).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client,
+        body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    proxy.task.abort();
+    client.connection.abort();
+    drop((body, client));
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the stream's data is freed", || server.all_freed(1)).await?;
+    Ok(())
 }
 
 /// Reads a response of eight 64 KiB messages with a 64 KiB window, granting

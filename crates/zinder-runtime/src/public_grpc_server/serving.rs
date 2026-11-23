@@ -37,7 +37,7 @@ use tower::{
 use super::{
     HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_LOCAL_ERROR_RESETS,
     MAX_CONCURRENT_STREAMS_PER_CONNECTION, grpc_timeout,
-    release_gate::ReleaseGate,
+    release_gate::{GateObserver, ReleaseGate},
     stream_reset::{ResettableStreams, resettable},
 };
 use crate::http_listener::{accept_failure_needs_backoff, connection_io::ConnectionIo};
@@ -57,6 +57,7 @@ pub struct PublicGrpcServer<L = Identity> {
     accept_http1: bool,
     send_stall_timeout: Duration,
     write_stall_timeout: Duration,
+    gate_observer: GateObserver,
 }
 
 impl PublicGrpcServer {
@@ -69,6 +70,7 @@ impl PublicGrpcServer {
             accept_http1: false,
             send_stall_timeout,
             write_stall_timeout: send_stall_timeout,
+            gate_observer: GateObserver::default(),
         }
     }
 
@@ -77,6 +79,13 @@ impl PublicGrpcServer {
     #[cfg(test)]
     pub(super) const fn with_write_stall_timeout(mut self, write_stall_timeout: Duration) -> Self {
         self.write_stall_timeout = write_stall_timeout;
+        self
+    }
+
+    /// Reports to `gate_observer` when a response waits for its probe.
+    #[cfg(test)]
+    pub(super) fn with_gate_observer(mut self, gate_observer: GateObserver) -> Self {
+        self.gate_observer = gate_observer;
         self
     }
 }
@@ -100,6 +109,7 @@ impl<L> PublicGrpcServer<L> {
             accept_http1: self.accept_http1,
             send_stall_timeout: self.send_stall_timeout,
             write_stall_timeout: self.write_stall_timeout,
+            gate_observer: self.gate_observer,
         }
     }
 
@@ -225,6 +235,7 @@ impl<L> PublicGrpcRouter<L> {
             builder: connection_builder(self.server.accept_http1, self.server.send_stall_timeout),
             send_stall_timeout: self.server.send_stall_timeout,
             write_stall_timeout: self.server.write_stall_timeout,
+            gate_observer: self.server.gate_observer,
         };
         connections.serve(listener, service, signal).await;
         Ok(())
@@ -236,6 +247,7 @@ struct Connections {
     builder: auto::Builder<ResettableStreams>,
     send_stall_timeout: Duration,
     write_stall_timeout: Duration,
+    gate_observer: GateObserver,
 }
 
 impl Connections {
@@ -290,7 +302,8 @@ impl Connections {
                 remote_addr: Some(remote_addr),
             };
             let io = ConnectionIo::new(TokioIo::new(stream), self.write_stall_timeout, None);
-            let requests = connection_service(service.clone(), connect_info);
+            let requests =
+                connection_service(service.clone(), connect_info, self.gate_observer.clone());
             connections.spawn(resettable(
                 serve_connection(self.builder.clone(), io, requests, drain.clone()),
                 self.send_stall_timeout,
@@ -377,6 +390,7 @@ fn connection_builder(
 fn connection_service<S, ResponseBody>(
     service: S,
     connect_info: TcpConnectInfo,
+    gate_observer: GateObserver,
 ) -> impl hyper::service::Service<
     http::Request<Incoming>,
     Response = http::Response<Body>,
@@ -398,6 +412,7 @@ where
         request.extensions_mut().insert(connect_info.clone());
         let gate = ReleaseGate {
             probe_window: request.version() == http::Version::HTTP_2,
+            observer: gate_observer.clone(),
         };
         let mut service = service.clone();
         async move {

@@ -42,6 +42,15 @@ use tonic_health::{
 };
 use tonic_prost::ProstCodec;
 use tower::Service;
+use zinder_proto::compat::lightwalletd::{
+    Address, AddressList, Balance, BlockId, BlockRange, ChainSpec, CompactBlock, CompactTx,
+    Duration as PingDuration, Empty, EncodedBlock, EncodedBlockRange, EncodedBlockRangeStream,
+    GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList, GetMempoolTxRequest,
+    GetSubtreeRootsArg, LightdInfo, PingResponse, RawTransaction, SendResponse, StandardFee,
+    SubtreeRoot, TransparentAddressBlockFilter, TreeState, TxFilter,
+    compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::{CompactTxStreamer, CompactTxStreamerServer},
+};
 use zinder_runtime::{
     ClientAddressSource, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStallLayer,
     MAX_CONCURRENT_STREAMS_PER_CONNECTION, public_grpc_server_with,
@@ -413,5 +422,392 @@ async fn tonic_s_own_server_keeps_a_stalled_stream_s_slot() -> Result<()> {
         "a slot was freed without a stream reset"
     );
     check.abort();
+    Ok(())
+}
+
+/// `GetBlockRange` responses whose stored blocks the transport slices.
+///
+/// The generated lightwalletd server serves them from encoded blocks whose
+/// allocation the producer vouches for, marks the response, and the send
+/// stall layer then hands HTTP/2 slices of each block instead of copies. A
+/// slice held by a stalled stream keeps its whole block alive, so freeing the
+/// blocks shows the reset reached the pieces themselves.
+#[derive(Clone, Default)]
+struct StalledRanges {
+    produced: Arc<AtomicUsize>,
+    freed: Arc<AtomicUsize>,
+    /// Paused producers that have reached their pause.
+    paused: Arc<AtomicUsize>,
+    /// Finished producers that have reached their end.
+    finished: Arc<AtomicUsize>,
+}
+
+impl StalledRanges {
+    fn all_freed(&self, expected: usize) -> bool {
+        let produced = self.produced.load(Ordering::SeqCst);
+        produced >= expected && self.freed.load(Ordering::SeqCst) == produced
+    }
+
+    /// Whether every stream produced its first block and every paused and
+    /// finished producer reached its pause or end, which happens only once
+    /// the transport has pulled each response past its block.
+    fn reached_tails(&self, streams: usize) -> bool {
+        self.produced.load(Ordering::SeqCst) >= streams
+            && self.paused.load(Ordering::SeqCst) == streams / 3
+            && self.finished.load(Ordering::SeqCst) == streams / 3
+    }
+}
+
+type Replies<T> = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, Status>> + Send>>;
+
+fn unimplemented<T>() -> Result<tonic::Response<T>, Status> {
+    Err(Status::unimplemented("not served by this test"))
+}
+
+#[tonic::async_trait]
+impl EncodedBlockRange for StalledRanges {
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<BlockRange>,
+    ) -> Result<tonic::Response<EncodedBlockRangeStream>, Status> {
+        // The range's start height picks how its producer behaves.
+        let kind = match request.into_inner().start.map_or(0, |start| start.height) {
+            1 => Producer::Paused,
+            2 => Producer::Finished,
+            _ => Producer::Producing,
+        };
+        // A paused or finished stream sends one block just over the stream
+        // window, so the transport pulls the response to its pause or end.
+        let (count, payload) = match kind {
+            Producer::Producing => (usize::MAX, MESSAGE_PAYLOAD),
+            Producer::Paused | Producer::Finished => (1, LAST_MESSAGE_PAYLOAD),
+        };
+        let produced = Arc::clone(&self.produced);
+        let freed = Arc::clone(&self.freed);
+        let blocks = tokio_stream::iter(0..count).map(move |_| {
+            produced.fetch_add(1, Ordering::SeqCst);
+            let message = tracked_message(&freed, payload);
+            let allocation = message.len();
+            EncodedBlock::from_length_prefixed_in(message, allocation)
+                .map_err(|_| Status::internal("the test block is not length-prefixed"))
+        });
+        let paused = Arc::clone(&self.paused);
+        let finished = Arc::clone(&self.finished);
+        let blocks: EncodedBlockRangeStream = match kind {
+            Producer::Producing => Box::pin(blocks.chain(tokio_stream::pending())),
+            Producer::Paused => Box::pin(
+                blocks.chain(
+                    futures_util::stream::once(async move {
+                        paused.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    })
+                    .filter_map(|()| None),
+                ),
+            ),
+            Producer::Finished => Box::pin(
+                blocks.chain(
+                    futures_util::stream::once(async move {
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .filter_map(|()| None),
+                ),
+            ),
+        };
+        Ok(tonic::Response::new(blocks))
+    }
+}
+
+#[tonic::async_trait]
+impl CompactTxStreamer for StalledRanges {
+    type GetBlockRangeStream = Replies<CompactBlock>;
+    type GetBlockRangeNullifiersStream = Replies<CompactBlock>;
+    type GetTaddressTxidsStream = Replies<RawTransaction>;
+    type GetTaddressTransactionsStream = Replies<RawTransaction>;
+    type GetMempoolTxStream = Replies<CompactTx>;
+    type GetMempoolStreamStream = Replies<RawTransaction>;
+    type GetSubtreeRootsStream = Replies<SubtreeRoot>;
+    type GetAddressUtxosStreamStream = Replies<GetAddressUtxosReply>;
+
+    fn encoded_block_range(&self) -> Option<&dyn EncodedBlockRange> {
+        Some(self)
+    }
+
+    async fn get_latest_block(
+        &self,
+        _: Request<ChainSpec>,
+    ) -> Result<tonic::Response<BlockId>, Status> {
+        unimplemented()
+    }
+
+    async fn get_block(
+        &self,
+        _: Request<BlockId>,
+    ) -> Result<tonic::Response<CompactBlock>, Status> {
+        unimplemented()
+    }
+
+    async fn get_block_nullifiers(
+        &self,
+        _: Request<BlockId>,
+    ) -> Result<tonic::Response<CompactBlock>, Status> {
+        unimplemented()
+    }
+
+    async fn get_block_range(
+        &self,
+        _: Request<BlockRange>,
+    ) -> Result<tonic::Response<Self::GetBlockRangeStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_block_range_nullifiers(
+        &self,
+        _: Request<BlockRange>,
+    ) -> Result<tonic::Response<Self::GetBlockRangeNullifiersStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_transaction(
+        &self,
+        _: Request<TxFilter>,
+    ) -> Result<tonic::Response<RawTransaction>, Status> {
+        unimplemented()
+    }
+
+    async fn send_transaction(
+        &self,
+        _: Request<RawTransaction>,
+    ) -> Result<tonic::Response<SendResponse>, Status> {
+        unimplemented()
+    }
+
+    async fn get_taddress_txids(
+        &self,
+        _: Request<TransparentAddressBlockFilter>,
+    ) -> Result<tonic::Response<Self::GetTaddressTxidsStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_taddress_transactions(
+        &self,
+        _: Request<TransparentAddressBlockFilter>,
+    ) -> Result<tonic::Response<Self::GetTaddressTransactionsStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_taddress_balance(
+        &self,
+        _: Request<AddressList>,
+    ) -> Result<tonic::Response<Balance>, Status> {
+        unimplemented()
+    }
+
+    async fn get_taddress_balance_stream(
+        &self,
+        _: Request<tonic::Streaming<Address>>,
+    ) -> Result<tonic::Response<Balance>, Status> {
+        unimplemented()
+    }
+
+    async fn get_mempool_tx(
+        &self,
+        _: Request<GetMempoolTxRequest>,
+    ) -> Result<tonic::Response<Self::GetMempoolTxStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_mempool_stream(
+        &self,
+        _: Request<Empty>,
+    ) -> Result<tonic::Response<Self::GetMempoolStreamStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_tree_state(
+        &self,
+        _: Request<BlockId>,
+    ) -> Result<tonic::Response<TreeState>, Status> {
+        unimplemented()
+    }
+
+    async fn get_latest_tree_state(
+        &self,
+        _: Request<Empty>,
+    ) -> Result<tonic::Response<TreeState>, Status> {
+        unimplemented()
+    }
+
+    async fn get_subtree_roots(
+        &self,
+        _: Request<GetSubtreeRootsArg>,
+    ) -> Result<tonic::Response<Self::GetSubtreeRootsStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_address_utxos(
+        &self,
+        _: Request<GetAddressUtxosArg>,
+    ) -> Result<tonic::Response<GetAddressUtxosReplyList>, Status> {
+        unimplemented()
+    }
+
+    async fn get_address_utxos_stream(
+        &self,
+        _: Request<GetAddressUtxosArg>,
+    ) -> Result<tonic::Response<Self::GetAddressUtxosStreamStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_lightd_info(
+        &self,
+        _: Request<Empty>,
+    ) -> Result<tonic::Response<LightdInfo>, Status> {
+        unimplemented()
+    }
+
+    async fn get_standard_fee(
+        &self,
+        _: Request<Empty>,
+    ) -> Result<tonic::Response<StandardFee>, Status> {
+        unimplemented()
+    }
+
+    async fn ping(
+        &self,
+        _: Request<PingDuration>,
+    ) -> Result<tonic::Response<PingResponse>, Status> {
+        unimplemented()
+    }
+}
+
+struct RangeServer {
+    address: SocketAddr,
+    health: HealthReporter,
+    ranges: StalledRanges,
+    _server: JoinHandle<std::io::Result<()>>,
+}
+
+async fn serve_ranges(connection_loop: ConnectionLoop) -> Result<RangeServer> {
+    let ranges = StalledRanges::default();
+    let (health, health_service) = tonic_health::server::health_reporter();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let slots = NonZeroUsize::new(512).ok_or_else(|| eyre!("slots must be non-zero"))?;
+    let limits = GrpcReceiveLimits::new(slots, Duration::from_secs(30));
+    let service = CompactTxStreamerServer::new(ranges.clone());
+    let server = match connection_loop {
+        ConnectionLoop::Zinder => tokio::spawn(
+            public_grpc_server_with(limits, STALL_TIMEOUT, ClientAddressSource::Connection)
+                .add_service(health_service)
+                .add_service(service)
+                .serve_with_incoming(listener),
+        ),
+        ConnectionLoop::Tonic => tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
+                .layer(GrpcReceiveLimitLayer::new(
+                    limits,
+                    ClientAddressSource::Connection,
+                ))
+                .layer(GrpcSendStallLayer::new(STALL_TIMEOUT))
+                .add_service(health_service)
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .map_err(std::io::Error::other)
+        }),
+    };
+    Ok(RangeServer {
+        address,
+        health,
+        ranges,
+        _server: server,
+    })
+}
+
+/// Fills every stream slot of one connection with a sibling health `Watch`
+/// the client reads and stalled range streams of every kind.
+async fn fill_with_stalled_ranges(
+    channel: &Channel,
+) -> Result<(
+    Vec<tonic::Streaming<CompactBlock>>,
+    tonic::Streaming<HealthCheckResponse>,
+)> {
+    let mut sibling = watch(channel).await?;
+    let first = within_wait_limit(sibling.next())
+        .await?
+        .ok_or_else(|| eyre!("the watch stream ended"))??;
+    assert_eq!(first.status(), WireServingStatus::Serving);
+    let stalled_count = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)? - 1;
+    let stalled = within_wait_limit(try_join_all((0..stalled_count).map(|index| {
+        let mut client = CompactTxStreamerClient::new(channel.clone());
+        let range = BlockRange {
+            start: Some(BlockId {
+                height: u64::try_from(index % 3).unwrap_or(0),
+                hash: Vec::new(),
+            }),
+            ..BlockRange::default()
+        };
+        async move { Ok::<_, Status>(client.get_block_range(range).await?.into_inner()) }
+    })))
+    .await??;
+    Ok((stalled, sibling))
+}
+
+#[tokio::test]
+async fn stalled_range_streams_free_their_sliced_blocks_at_the_deadline() -> Result<()> {
+    let server = serve_ranges(ConnectionLoop::Zinder).await?;
+    let channel = withholding_client(server.address).await?;
+    let (stalled, mut sibling) = fill_with_stalled_ranges(&channel).await?;
+    wait_until(
+        "every range stream reaches its block, pause, or end",
+        || server.ranges.reached_tails(stalled.len()),
+    )
+    .await?;
+
+    // Without the client reading any range stream, the reset frees every
+    // block a slice kept alive, and every slot.
+    wait_until("every stalled range stream's blocks are freed", || {
+        server.ranges.all_freed(stalled.len())
+    })
+    .await?;
+    let watches =
+        within_wait_limit(try_join_all((0..stalled.len()).map(|_| watch(&channel)))).await??;
+    assert_eq!(watches.len(), stalled.len());
+
+    // The connection and the sibling stream stayed open.
+    server
+        .health
+        .set_service_status("", ServingStatus::NotServing)
+        .await;
+    let update = within_wait_limit(sibling.next())
+        .await?
+        .ok_or_else(|| eyre!("the watch stream ended"))??;
+    assert_eq!(update.status(), WireServingStatus::NotServing);
+    Ok(())
+}
+
+/// The control: on tonic's own server, which cannot reset a stream, the
+/// slices HTTP/2 holds keep their blocks alive after the send stall layer
+/// abandons the responses. A copy would have let them go.
+#[tokio::test]
+async fn tonic_s_own_server_keeps_sliced_blocks_of_stalled_range_streams() -> Result<()> {
+    let server = serve_ranges(ConnectionLoop::Tonic).await?;
+    let channel = withholding_client(server.address).await?;
+    let (stalled, _sibling) = fill_with_stalled_ranges(&channel).await?;
+    wait_until(
+        "every range stream reaches its block, pause, or end",
+        || server.ranges.reached_tails(stalled.len()),
+    )
+    .await?;
+    tokio::time::sleep(CONTROL_WAIT).await;
+    assert!(
+        server.ranges.produced.load(Ordering::SeqCst) >= stalled.len(),
+        "fewer blocks were produced than streams opened"
+    );
+    assert!(
+        !server.ranges.all_freed(stalled.len()),
+        "every sliced block was freed without a reset"
+    );
     Ok(())
 }

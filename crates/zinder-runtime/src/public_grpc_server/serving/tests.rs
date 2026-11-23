@@ -42,6 +42,7 @@ use tonic_prost::ProstCodec;
 use tower::Service;
 
 use super::PublicGrpcServer;
+use crate::public_grpc_server::release_gate::GateObserver;
 
 const STALL: Duration = Duration::from_millis(500);
 /// A bound that a test never reaches, so the other bound alone acts.
@@ -211,6 +212,9 @@ struct TestServer {
     scripts: mpsc::UnboundedReceiver<Script>,
     produced: Arc<AtomicUsize>,
     freed: Arc<AtomicUsize>,
+    /// How many times a response has started waiting for h2 to encode its
+    /// probe.
+    departure_waits: tokio::sync::watch::Receiver<usize>,
     server: JoinHandle<std::io::Result<()>>,
 }
 
@@ -269,8 +273,10 @@ fn serve(bounds: Bounds) -> Result<TestServer> {
     socket.bind("127.0.0.1:0".parse()?)?;
     let listener = socket.listen(1024)?;
     let address = listener.local_addr()?;
+    let (gate_observer, departure_waits) = GateObserver::new();
     let server = PublicGrpcServer::new(bounds.send_stall)
         .with_write_stall_timeout(bounds.write_stall)
+        .with_gate_observer(gate_observer)
         .accept_http1(bounds.accept_http1);
     let server = match bounds.admission {
         Some(admission) => tokio::spawn(
@@ -286,6 +292,7 @@ fn serve(bounds: Bounds) -> Result<TestServer> {
         scripts,
         produced,
         freed,
+        departure_waits,
         server,
     })
 }

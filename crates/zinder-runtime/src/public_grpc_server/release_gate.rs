@@ -1,24 +1,25 @@
-//! Ending a response only once the client's window covers the data before it.
+//! Ending a response only once h2 has encoded the data before it.
 //!
 //! hyper finishes an HTTP/2 response's task as soon as it queues the
 //! response's end, and h2 then counts the stream as closed. If DATA queued
-//! before that end still waits for the client's flow-control window, nothing
-//! can reset the stream any more: it keeps that data and its place among the
-//! connection's streams until the client grants window or the connection
-//! closes. The gate keeps that state from arising while the client's window
-//! settings stay as they were. A client that lowers its stream window with
-//! `SETTINGS` after the end can still leave data queued, which only an h2
-//! change can bound.
+//! before that end has not been sent, nothing can reset the stream any more:
+//! it keeps that data and its place among the connection's streams until the
+//! data goes out or the connection closes. Window for the data is not enough,
+//! because a client can take window back with `SETTINGS`. The gate keeps that
+//! state from arising.
 //!
-//! hyper hands a data chunk it holds to h2 only once the stream has send
-//! capacity left after the data already queued, and asks the body for its
-//! next frame only after that. Before the gate ends a response, and whenever
-//! the response pauses because its producer has nothing ready, it hands hyper
-//! the data's last byte on its own, as a probe. hyper asks for the next frame
-//! only once the window covers everything queued before the probe, and only
-//! then does the gate release the end or poll the producer again. Until it
-//! releases the end, the gate reports that it has not ended, because hyper
-//! sends `END_STREAM` with the last data frame of a body that has.
+//! Before the gate ends a response, and whenever the response pauses because
+//! its producer has nothing ready, it hands hyper the data's last byte on its
+//! own, as a probe. hyper hands a chunk it holds to h2 only once the stream
+//! has send capacity left after the data already queued. h2 sends a stream's
+//! DATA in order, and it copies a frame this small into its write buffer and
+//! drops it as it does. Only once the probe is dropped does the gate release
+//! the end or poll the producer again: everything queued before the probe has
+//! then been charged to the window and encoded, which no later `SETTINGS`
+//! change can undo. Until then the transport still holds the probe, so the
+//! stall timer keeps running. Until it releases the end, the gate reports
+//! that it has not ended, because hyper sends `END_STREAM` with the last data
+//! frame of a body that has.
 //!
 //! A producer that yields to the scheduler, as `tokio_stream::iter` does every
 //! 32 items, is ready again as soon as its task runs. The gate therefore waits
@@ -28,8 +29,9 @@
 //! never merged with later data.
 //!
 //! The probe depends on hyper waiting for capacity before it sends a chunk it
-//! holds (`proto::h2::PipeToSendStream` in hyper 1.12). The listener's tests
-//! fail if an upgrade changes that.
+//! holds (`proto::h2::PipeToSendStream` in hyper 1.12), and on h2 dropping a
+//! small DATA frame as it encodes it (`codec::FramedWrite::buffer` in h2
+//! 0.4.20). The listener's tests fail if an upgrade changes either.
 //!
 //! The gate records each piece the transport takes and each time the
 //! transport asks for the next. The task that carries the response resets
@@ -41,21 +43,60 @@
 use std::{
     mem,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
+use futures_util::task::AtomicWaker;
 use http_body::{Body as _, Frame, SizeHint};
 use tonic::{Status, body::Body};
 
 use super::{RELEASE_PROBES_METRIC, stream_reset::TransportReset};
 
 /// How a listener gates the responses it sends.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ReleaseGate {
     /// Whether the response travels on an HTTP/2 stream, whose end the gate
     /// releases only after a probe.
     pub(super) probe_window: bool,
+    pub(super) observer: GateObserver,
+}
+
+/// Lets a test see when a response starts waiting for h2 to encode its
+/// probe. It does nothing outside tests.
+#[derive(Clone, Debug, Default)]
+pub(super) struct GateObserver {
+    #[cfg(test)]
+    departure_waits: Option<tokio::sync::watch::Sender<usize>>,
+}
+
+impl GateObserver {
+    /// An observer and the count of departure waits it reports.
+    #[cfg(test)]
+    pub(super) fn new() -> (Self, tokio::sync::watch::Receiver<usize>) {
+        let (departure_waits, count) = tokio::sync::watch::channel(0);
+        (
+            Self {
+                departure_waits: Some(departure_waits),
+            },
+            count,
+        )
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "the observer reports only in tests")
+    )]
+    fn waiting_for_departure(&self) {
+        #[cfg(test)]
+        if let Some(departure_waits) = &self.departure_waits {
+            departure_waits.send_modify(|waits| *waits += 1);
+        }
+    }
 }
 
 impl ReleaseGate {
@@ -85,6 +126,51 @@ struct ReleaseGatedBody {
     waited_for_producer: bool,
     gate: ReleaseGate,
     transport: TransportReset,
+    /// Reports when h2 has encoded the probe last handed out.
+    departure: Option<Arc<Departure>>,
+}
+
+/// Whether h2 has let go of a probe.
+///
+/// h2 sends a stream's DATA in order and copies a frame this small into its
+/// write buffer, dropping the frame as it does. Once the probe is dropped,
+/// every byte queued ahead of it has been charged to the window and encoded,
+/// so a later `SETTINGS` change cannot leave it queued. h2 also drops the
+/// probe unsent when it resets the stream or the connection ends, and then
+/// there is nothing left to wait for.
+#[derive(Default)]
+struct Departure {
+    departed: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl Departure {
+    fn poll_departed(&self, cx: &Context<'_>) -> bool {
+        if self.departed.load(Ordering::Acquire) {
+            return true;
+        }
+        self.waker.register(cx.waker());
+        self.departed.load(Ordering::Acquire)
+    }
+}
+
+/// The one byte of a probe, which reports when h2 drops it.
+struct ProbeByte {
+    byte: [u8; 1],
+    departure: Arc<Departure>,
+}
+
+impl AsRef<[u8]> for ProbeByte {
+    fn as_ref(&self) -> &[u8] {
+        &self.byte
+    }
+}
+
+impl Drop for ProbeByte {
+    fn drop(&mut self) {
+        self.departure.departed.store(true, Ordering::Release);
+        self.departure.waker.wake();
+    }
 }
 
 enum Next {
@@ -117,6 +203,7 @@ impl ReleaseGatedBody {
             waited_for_producer: false,
             gate,
             transport,
+            departure: None,
         }
     }
 
@@ -143,17 +230,20 @@ impl ReleaseGatedBody {
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
 
-    /// Splits off the last byte of `chunk` as the probe and returns the rest.
-    /// A single byte is its own probe.
+    /// Splits off the last byte of `chunk` as the probe and returns the rest,
+    /// which is empty for a one-byte chunk.
     fn hold_back_probe(&mut self, mut chunk: Bytes) -> Bytes {
         metrics::counter!(RELEASE_PROBES_METRIC).increment(1);
-        if let Some(last) = chunk.len().checked_sub(1).filter(|last| *last > 0) {
-            // A copy, so the probe pins no allocation of the bytes before it.
-            self.probe = Some(Bytes::copy_from_slice(
-                chunk.get(last..).unwrap_or_default(),
-            ));
-            chunk.truncate(last);
-        }
+        let last = chunk.len().saturating_sub(1);
+        // Its own allocation, so the probe pins none of the bytes before it,
+        // and its drop shows when h2 has encoded it.
+        let departure = Arc::new(Departure::default());
+        self.probe = Some(Bytes::from_owner(ProbeByte {
+            byte: [chunk.get(last).copied().unwrap_or_default()],
+            departure: Arc::clone(&departure),
+        }));
+        self.departure = Some(departure);
+        chunk.truncate(last);
         chunk
     }
 
@@ -204,7 +294,13 @@ impl ReleaseGatedBody {
             Poll::Pending => self.next = Next::Paused,
         }
         let rest = self.hold_back_probe(current);
-        self.hand_out(rest)
+        match self.probe.take() {
+            Some(probe) if rest.is_empty() => self.hand_out(probe),
+            probe => {
+                self.probe = probe;
+                self.hand_out(rest)
+            }
+        }
     }
 
     fn release(
@@ -238,6 +334,17 @@ impl http_body::Body for ReleaseGatedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        // Until h2 has encoded the probe, the transport still holds it, so
+        // its stall timer keeps running.
+        if this.probe.is_none()
+            && let Some(departure) = &this.departure
+        {
+            if !departure.poll_departed(cx) {
+                this.gate.observer.waiting_for_departure();
+                return Poll::Pending;
+            }
+            this.departure = None;
+        }
         this.transport.asked_for_next();
         if this.gate.probe_window {
             this.poll_window_gated(cx)
@@ -297,9 +404,12 @@ mod tests {
         ])));
         let frames = resettable(
             async move {
-                let mut body = ReleaseGate { probe_window: true }
-                    .apply(http::Response::new(inner))
-                    .into_body();
+                let mut body = ReleaseGate {
+                    probe_window: true,
+                    observer: GateObserver::default(),
+                }
+                .apply(http::Response::new(inner))
+                .into_body();
                 let first = body.frame().await;
                 let second = body.frame().await;
                 (first, second)

@@ -413,20 +413,22 @@ These limits count all clients together, and a client that opens many
 connections counts as many clients. Limit connections per client in the
 proxy.
 
-A response that the client stops reading, by withholding HTTP/2 flow-control
-window, ends once HTTP/2 has held one piece of it for 60 seconds without the
-client's window growing enough to cover everything queued ahead of that piece
-plus one byte. The listener
-resets the response's HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it starts no further work, and frees
-the data HTTP/2 holds for the response and the stream's place among its
-connection's 200 streams. A read already in flight finishes first, and a
+A response ends once one piece of it has waited 60 seconds to go out. A piece
+waits either for the client's flow-control window to cover everything queued
+ahead of it plus one byte, or, once it has that window, for HTTP/2 to write
+out the data queued ahead of it. The listener then resets the response's
+HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it
+starts no further work. HTTP/2 discards the data it holds for the response,
+and frees the stream's place among its connection's 200 streams, the next
+time it writes to the connection; a connection that cannot write is closed
+by the write rule below. A read already in flight finishes first, and a
 `GetBlockRange` stream returns its range-stream slot once that read is done.
 The connection and its other streams stay open. A response that is waiting
 for the server to produce its next message is reset only if data it already
-sent is still waiting for window.
+sent is still waiting to go out.
 
-A client that reads slowly is reset only when one piece waits 60 seconds this
-way. The shortfall comes from the piece queued just ahead of the waiting one,
+A client that reads slowly is reset when a piece waits 60 seconds for window.
+The shortfall comes from the piece queued just ahead of the waiting one,
 so window updates that arrive often but grant too little in total can still
 end the stream. In the worst case, when the connection's window is not the
 limit and the client's settings do not change, the waiting piece needs a
@@ -438,6 +440,20 @@ its remaining window, roughly a third of the configured window for a steady
 reader. Under those assumptions, a worst-case reader with a 1 MiB window must
 read about 341 KiB within 60 seconds, about 5.7 KiB/s, and one with a 64 KiB
 window must read about 64 KiB, about 1.1 KiB/s.
+
+A piece that has window still waits while the connection cannot write out
+the data ahead of it. Before the server ends a response or waits for its
+producer, it waits for HTTP/2 to encode everything queued ahead of the last
+byte. If that takes 60 seconds, because the client's socket takes data slowly
+or other busy streams on the connection share it, the stream is reset with
+`CANCEL` and counted in `zinder_grpc_response_send_stalls_total`, even while
+the connection writes enough to meet the 16 KiB rule below. As an
+illustration, assume a stream has its 400 KiB send buffer and one 64 KiB
+piece queued ahead of that byte, about 464 KiB (485 KiB for gRPC-Web text),
+and that HTTP/2 shares the socket evenly among busy streams. Then a socket
+that takes less than about 7.7 KiB/s over 60 seconds resets a stream that is
+alone on its connection, and with n busy streams the socket must take about
+n times that.
 
 A client that reads again receives the data that reached it before the
 reset, then the reset. grpc-go, grpc-java, and tonic built with its `server`
@@ -453,19 +469,23 @@ listener also keeps the response chunk it is splitting into pieces until it
 hands out that chunk's last piece; for `GetBlockRange` that chunk is one
 encoded block, or a batch of smaller ones. A gRPC-Web response's trailers
 add a frame of their own. One connection holds at most 200 responses, about
-116 MiB of transport payload, or 128 MiB in gRPC-Web text mode.
+116 MiB of transport payload, or 128 MiB in gRPC-Web text mode. A
+`GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of
+its stored blocks instead of copies, so a stalled range stream can keep up to
+about 2,208 KiB of block allocations alive, and one connection about
+431.25 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)).
+That data is held only until the stream's reset.
 
-The server ends a response only once the client's window covers everything
-it sent. Up to 400 KiB of the response can still be queued at that point,
-because its last byte can fill the send buffer exactly. That data normally
-leaves as fast as the client's socket takes it. A client that then lowers its
-stream window with an HTTP/2 `SETTINGS` frame keeps it queued, with the
-stream's slot, indefinitely: it is released only when the client grants
-window again, resets the stream, or closes the connection. A response
-waiting for its producer is exposed in the same way until the producer
-sends again. Across a connection's 200 streams that is at most 78.125 MiB.
-Zinder sets no process-wide bound on this data, because a client can open
-many connections. Limit connections per client at your proxy.
+The server ends a response, or waits for its producer, only once HTTP/2 has
+encoded every byte sent so far. It sends the last byte as a frame of its own,
+which HTTP/2 encodes only after everything queued ahead of it on the stream.
+A response that has ended therefore waits for nothing but the client's
+socket. A client that lowers its stream window with an HTTP/2 `SETTINGS`
+frame before that point leaves the rest waiting for window again, and the
+stream is reset if that still keeps the rest from being encoded when its
+piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold,
+because a client can open many connections. Limit connections per client at
+your proxy.
 
 Once a write to a connection blocks, the connection must write 16 KiB, or
 finish writing everything it had buffered, within 60 seconds or it is
