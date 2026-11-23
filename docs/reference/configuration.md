@@ -124,10 +124,10 @@ such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 
 | Runtime | Sections |
 | --- | --- |
-| `zinder-ingest` | `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
+| `zinder-ingest` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
 | `zinder-projector` | `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
 | `zinder-query` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
-| `zinder-compat-lightwalletd` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
+| `zinder-compat-lightwalletd` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
 | `zinder-explorer` | `network`, `node`, `node_fallbacks.N`, `storage`, `explorer`, `ops`, `security` |
 | `zinder-compat-cipherscan` | `network`, `cipherscan`, `ops`, `security` |
 
