@@ -3117,7 +3117,7 @@ mod tests {
         let mut harness = LongRangeHarness::start(&baseline).await?;
         let original = harness.slot.capture();
         let mut replacement = zinder_testkit::CanonicalWriterFixture::publish(
-            &baseline.with_history_floor(BlockHeight::new(2)),
+            &baseline.with_history_floor(BlockHeight::new(1)),
             &zinder_testkit::sample_regtest_upgrade_activations(),
         )?;
         replacement.append_live_block(&chain)?;
@@ -3161,6 +3161,22 @@ mod tests {
             ReadinessCause::SchemaMismatch
         );
         assert!(Arc::ptr_eq(&original, &harness.slot.capture()));
+
+        harness.writer.append_live_block(&chain)?;
+        harness.publisher.config.canonical_primary_path =
+            harness.writer.canonical_primary_path().to_path_buf();
+        harness
+            .control
+            .set_writer_status(lifecycle_writer_status(harness.writer.canonical_primary()?));
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        harness.publisher.refresh().await;
+        assert!(
+            harness.readiness.report().is_ready,
+            "a store with the admitted stored set was not adopted"
+        );
+        assert!(!Arc::ptr_eq(&original, &harness.slot.capture()));
 
         drop(original);
         harness.stop().await
