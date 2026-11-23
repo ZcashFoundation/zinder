@@ -297,7 +297,7 @@ impl QualificationWallet {
         response_limit: NonZeroU32,
     ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, OwnedSemaphorePermit)>, Status> {
         if request.addresses.is_empty() {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(None);
         }
         let view = served_view(&self.slot.capture())?;
         let network = view.network;
@@ -386,7 +386,7 @@ impl QualificationWallet {
         .await
         .map_err(|_| history_deadline_exceeded())??;
         if history.page.as_slice().is_empty() && history.pending.is_empty() {
-            return Ok(None);
+            return Ok(Box::pin(stream::empty()));
         }
         Ok(history.into_stream(permit, deadline))
     }
@@ -1071,6 +1071,18 @@ impl compact_tx_streamer_server::CompactTxStreamer
             .query_api
             .utxos(request.into_inner(), self.response_limits.max_address_utxos)
             .await?;
+        let outputs: Self::GetAddressUtxosStreamStream = match outputs {
+            None => Box::pin(stream::empty()),
+            Some((rows, permit)) => Box::pin(try_unfold(
+                (rows.into_iter(), permit),
+                |(mut rows, permit)| async move {
+                    let Some(row) = rows.next() else {
+                        return Ok(None);
+                    };
+                    Ok(Some((utxo_reply(row)?, (rows, permit))))
+                },
+            )),
+        };
         Ok(Response::new(outputs))
     }
 
@@ -1107,18 +1119,6 @@ impl compact_tx_streamer_server::CompactTxStreamer
 #[cfg(test)]
 mod tests {
     use super::*;
-        let outputs: Self::GetAddressUtxosStreamStream = match outputs {
-            None => Box::pin(stream::empty()),
-            Some((rows, permit)) => Box::pin(try_unfold(
-                (rows.into_iter(), permit),
-                |(mut rows, permit)| async move {
-                    let Some(row) = rows.next() else {
-                        return Ok(None);
-                    };
-                    Ok(Some((utxo_reply(row)?, (rows, permit))))
-                },
-            )),
-        };
 
     #[test]
     fn qualification_utxo_limit_applies_to_the_requested_response() {
