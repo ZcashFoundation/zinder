@@ -98,14 +98,20 @@ impl PublishedRangeRead {
         }
     }
 
-    /// Signed files can serve the default shielded projection through the
-    /// catalog's last height.
+    /// Returns whether a read of `chunk`, or of the heights at the end it
+    /// sends first, can open signed segment files. A clipped read or a retry
+    /// of checked heights keeps that end, so an ascending chunk qualifies when
+    /// its start lies in the catalog and a descending one when it overlaps it.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
         self.shape == CompactBlockShape::DEFAULT_RANGE
-            && self
-                .history
-                .as_ref()
-                .is_some_and(|catalog| chunk.start <= catalog.bounds().end)
+            && self.history.as_ref().is_some_and(|catalog| {
+                let coverage = catalog.bounds();
+                if self.is_descending {
+                    chunk.start <= coverage.end && coverage.start <= chunk.end
+                } else {
+                    (coverage.start..=coverage.end).contains(&chunk.start)
+                }
+            })
     }
 
     fn order(&self) -> HeightOrder {
@@ -480,10 +486,7 @@ impl PublishedRangeRead {
         if cancel.is_cancelled() {
             return cancelled_outcome(Some(started.elapsed()));
         }
-        let touches_disk = self
-            .history
-            .as_ref()
-            .is_some_and(|catalog| chunk.start <= catalog.bounds().end);
+        let touches_disk = self.reads_published_files(chunk);
         if !touches_disk && let Some(live) = tail.as_deref() {
             let rows = live.select(chunk, order, max_bytes, true);
             return finish_encoded_rows(epoch, Some(started.elapsed()), Ok(rows), &cancel, convert);

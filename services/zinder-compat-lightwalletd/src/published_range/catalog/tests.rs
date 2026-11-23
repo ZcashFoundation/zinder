@@ -45,10 +45,14 @@ impl Fixture {
     }
 
     fn publisher(&self) -> io::Result<ShieldedCatalogPublisher> {
+        self.publisher_from(BlockHeight::new(1))
+    }
+
+    fn publisher_from(&self, first: BlockHeight) -> io::Result<ShieldedCatalogPublisher> {
         ShieldedCatalogPublisher::open(
             self.directory.path(),
             &self.private,
-            BlockHeight::new(1),
+            first,
             NonZeroU32::new(2).ok_or_else(|| invalid("invalid fixture width"))?,
         )
     }
@@ -1399,8 +1403,8 @@ async fn stream_published(
 }
 
 #[tokio::test]
-async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is_held() -> Result<()>
-{
+async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_permit_is_held()
+-> Result<()> {
     use std::time::Duration;
     const TIP: u32 = 2_100;
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
@@ -1456,6 +1460,7 @@ async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is
         vec![span(1_101, 2_100), span(1_000, 1_100)]
     );
     assert_eq!(*reads.native.lock(), vec![span(1, 6), span(1_000, 1_015)]);
+    below_catalog_streams_without_permits(&methods, &reads, prompt).await?;
 
     let queued = Duration::from_millis(200);
     for range in [
@@ -1479,6 +1484,103 @@ async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is
             tokio::time::timeout(prompt, stream_published(&methods, &reads, &catalog, range))
                 .await??;
         assert_eq!(frames, expected);
+    }
+    Ok(())
+}
+
+async fn below_catalog_streams_without_permits(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    prompt: std::time::Duration,
+) -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = BlockHeight::new(1_000);
+    assert!(
+        fixture
+            .publisher_from(first)?
+            .publish_next(reads.slot.capture().as_ref())?
+    );
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds().start, first);
+    let before = reads.native.lock().len();
+    for (start, end) in [(1, 16), (16, 1)] {
+        let frames = tokio::time::timeout(
+            prompt,
+            stream_published(methods, reads, &catalog, (start, end, Vec::new())),
+        )
+        .await??;
+        assert_eq!(frames, 16);
+    }
+    let expected = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
+    assert_eq!(
+        reads.native.lock().get(before..),
+        Some([expected; 2].as_slice())
+    );
+    Ok(())
+}
+
+#[test]
+fn a_chunk_holds_a_published_read_permit_whenever_a_read_of_its_heights_can_open_signed_files()
+-> Result<()> {
+    use crate::{
+        CanonicalReaderSlot, block_methods::RangeSource, compact_block_messages::CompactBlockShape,
+        published_range::PublishedRangeRead,
+    };
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1_010);
+    let (_store, reader) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    assert!(
+        fixture
+            .publisher_from(BlockHeight::new(1_000))?
+            .publish_next(&reader)?
+    );
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let coverage = catalog.bounds();
+    let heights = 995..=1_006;
+    for is_descending in [false, true] {
+        let range = PublishedRangeRead::new(
+            Some(catalog.clone()),
+            catalog.tail(),
+            CompactBlockShape::for_range(&[])?,
+            is_descending,
+            crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+        );
+        let eligible = |start, end| {
+            let chunk = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+            RangeSource::<CanonicalReaderSlot>::published_read_limit(&range, chunk).is_some()
+        };
+        for start in heights.clone() {
+            for end in start..=*heights.end() {
+                // A read of the whole chunk opens signed files when it starts
+                // inside the catalog, or descends through it from a live tail.
+                let reads_files = (coverage.start.value()..=coverage.end.value()).contains(&start)
+                    || (is_descending
+                        && start < coverage.start.value()
+                        && end > coverage.end.value());
+                assert!(
+                    !reads_files || eligible(start, end),
+                    "({start}, {end}) desc={is_descending}"
+                );
+                // A clipped read or a retry of checked heights keeps the end the
+                // stream sends first and may open files for those heights alone.
+                for inner in start..=end {
+                    let (first, last) = if is_descending {
+                        (inner, end)
+                    } else {
+                        (start, inner)
+                    };
+                    assert!(
+                        !eligible(first, last) || eligible(start, end),
+                        "({first}, {last}) within ({start}, {end}) desc={is_descending}"
+                    );
+                }
+            }
+        }
+        assert!(!eligible(995, 999), "below coverage desc={is_descending}");
+        assert!(
+            !eligible(1_002, 1_006),
+            "above coverage desc={is_descending}"
+        );
     }
     Ok(())
 }
