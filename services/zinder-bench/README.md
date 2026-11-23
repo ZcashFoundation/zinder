@@ -180,16 +180,19 @@ declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
 independent pipeline tuning flags. Canonical construction defaults to
 `--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest with `explicit` coverage.
 Pass `--tree-state-checkpoint-coverage every-block` to measure the cost of
-writing dense checkpoints before READY, as wallet-serving ingest does by default. Report format
-version 5 records the actual constructed coverage in
+writing dense checkpoints before READY, as wallet-serving ingest does by default. Report
+formats 5 and 6 record the actual constructed coverage in
 `resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
 in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
 `cold-certified`), and the persisted row count in
-`canonical_storage_ready.tree_state_checkpoint_count`. The report validator
-recomputes those limits and checkpoint counts for version 5 reports while
-keeping an exact archived version 4 branch for earlier reports when no version 5
-expectation is pinned. Diagnostic parameter sweeps belong to
-`rocksdb-canonical-fixture-replay`.
+`canonical_storage_ready.tree_state_checkpoint_count`. Format 6, which the
+benchmark now writes, also records wallet schema 2 and the `lthash16-chacha12`
+UTXO commitment scheme. The report validator recomputes the limits and
+checkpoint counts for formats 5 and 6. It keeps archived formats 5 and 4 under
+the contract they were produced with, wallet schema 1 and the `lthash16`
+scheme, accepts format 4 only when no coverage or publication mode is pinned,
+and rejects a report whose wallet schema or scheme belongs to another format.
+Diagnostic parameter sweeps belong to `rocksdb-canonical-fixture-replay`.
 
 By default, `--canonical-publication-mode trusted-fresh` uses the same
 prepublication checks as fresh ingest. Use `--canonical-publication-mode
@@ -1327,9 +1330,9 @@ campaign case's `match` list when comparing reports that expose this flag.
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version.
-  `canonical-replay-storage` reports use version 4;
-  `rocksdb-canonical-fixture-replay` and `rocksdb-storage-lifecycle` reports use
-  version 5.
+  `canonical-replay-storage` reports use version 4,
+  `rocksdb-canonical-fixture-replay` reports version 5, and
+  `rocksdb-storage-lifecycle` reports version 6.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1360,7 +1363,7 @@ campaign case's `match` list when comparing reports that expose this flag.
   settings, and the canonical `RocksDB` budget used by the run.
 - Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
   `resource_limits.canonical_publication_mode`, and
-  `canonical_storage_ready.tree_state_checkpoint_count` (version 5): the actual
+  `canonical_storage_ready.tree_state_checkpoint_count` (versions 5 and 6): the actual
   construction checkpoint coverage (`every-block` or `cadence-and-tip`), the
   canonical publication mode (`trusted-fresh` or `cold-certified`), and the
   persisted checkpoint row count (including the predecessor checkpoint).

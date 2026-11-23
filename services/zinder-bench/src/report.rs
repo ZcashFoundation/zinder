@@ -23,7 +23,7 @@ pub const REPORT_FORMAT_VERSION: u32 = 4;
 /// Machine-readable report schema version for `rocksdb-canonical-fixture-replay` reports.
 pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 5;
 /// Machine-readable report schema version for `rocksdb-storage-lifecycle` reports.
-pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 5;
+pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 6;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -2708,7 +2708,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         dense.validate()?;
         let encoded = serde_json::to_value(&dense)?;
-        assert_eq!(encoded["report_format_version"], 5);
+        assert_eq!(encoded["report_format_version"], 6);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "every-block"
@@ -2725,7 +2725,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         sparse.validate()?;
         let encoded = serde_json::to_value(&sparse)?;
-        assert_eq!(encoded["report_format_version"], 5);
+        assert_eq!(encoded["report_format_version"], 6);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "cadence-and-tip"
@@ -2742,11 +2742,15 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         assert!(mismatched.validate().is_err());
 
-        let mut wrong_version = dense;
-        if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
-            inner.report_format_version = 4;
+        // The producer emits only the current format; archived formats 4 and 5
+        // carry the wallet schema 1 contract and are checked by the shell validator.
+        for archived_version in [4, 5] {
+            let mut wrong_version = dense.clone();
+            if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
+                inner.report_format_version = archived_version;
+            }
+            assert!(wrong_version.validate().is_err());
         }
-        assert!(wrong_version.validate().is_err());
         Ok(())
     }
 
