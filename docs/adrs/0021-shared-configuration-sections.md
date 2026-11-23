@@ -54,6 +54,12 @@ Every key, default, and environment variable is listed in
 indexer TLS are explained in
 [Node source boundary](../architecture/node-source-boundary.md).
 
+## Evidence
+
+- Decisions 1 and 3, the `[deployment]` section: judgment. Ingest and
+  lightwalletd compatibility both read the profile, so it follows the rule
+  for sections that several runtimes share.
+
 ## Consequences
 
 - A shared field has one spelling, one default, one environment mapping, and
@@ -81,3 +87,5 @@ indexer TLS are explained in
 ## Revision history
 
 - 2026-11-23. Record `[deployment]` under the shared section convention.
+- 2026-11-23. Evidence records what decisions 1 and 3 rest on for
+  `[deployment]`.
