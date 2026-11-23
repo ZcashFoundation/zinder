@@ -78,8 +78,11 @@ done
 
 mark start_zinder
 stores=$(jq -er '.components[] | select(.kind == "stores") | .mount_path' "$fixture")
-CANONICAL_PATH=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.canonical' "$fixture") \
-WALLET_PATH=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.wallet' "$fixture") \
+canonical_dir=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.canonical' "$fixture")
+wallet_dir=$stores/$(jq -er '.components[] | select(.kind == "stores") | .paths.wallet' "$fixture")
+# Store snapshots may also be root-owned data; the writers open them read-write.
+chown -R zinder:zinder "$canonical_dir" "$wallet_dir"
+CANONICAL_PATH=$canonical_dir WALLET_PATH=$wallet_dir \
   /opt/zfx/stack.sh fixture "$stores/.zfx-run" "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" 0 /run/zebra-cookie/.cookie >&2
 chown zinder:zinder "$stores/.zfx-run"
 systemctl start zfx-fixture-ingest
