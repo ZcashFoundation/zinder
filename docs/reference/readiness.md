@@ -331,6 +331,7 @@ Two dependencies are reported under `degraded` instead of refusing traffic:
 | Input | Used by | When degraded |
 | --- | --- | --- |
 | `node_source` | Transaction broadcast, and `GetStandardFee` in wallet-mode compatibility | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
+| `node_source` in light-wallet serving | [Forwarded wallet calls](lightwalletd-compatibility.md#runtime-serving-selection) | The configured node fails the dependency probe. The report carries its cause under `degraded`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 
 A reader verifies each node endpoint before it broadcasts through it or reads
@@ -338,9 +339,14 @@ the recommended fee from it, as
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 describes.
 
-Compatibility in compact-blocks mode reads only the canonical store, declares
-no dependencies, and rejects every node setting. Its readiness follows the
-same rules for its canonical copy.
+### Canonical-only compatibility readers
+
+Compact-blocks and light-wallet readiness follow the published canonical
+generation and its writer attestation. At admission, both check the writer's
+canonical fence. Light-wallet also checks the writer's admitted upgrade
+schedule and reports the `node_source` and `ingest_control` dependencies under
+`degraded`. Compact-blocks declares neither dependency. See
+[During a node outage](#during-a-node-outage) for how degradation affects calls.
 
 ### Explorer
 
@@ -375,15 +381,20 @@ unreachable.
 | --- | --- | --- | --- |
 | `zinder-ingest` | `node_unavailable` | Its private control API, including writer status. | Committing blocks. The chain tip stops advancing. |
 | `zinder-projector` | `ready` | Its last wallet state. | Nothing new to apply. |
-| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, and `GetStandardFee` in wallet-mode compatibility, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
+| `zinder-query`, wallet-mode compatibility | `ready` while writer attestation holds, with configured `node_source` under `degraded` | Stored blocks, retained transactions, transparent address queries, tree states, and subtree roots. Native query also serves chain events and server info. | Broadcasts and wallet-mode `GetStandardFee` fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. |
+| Light-wallet compatibility | `ready` while writer attestation holds, with `node_source` under `degraded` after the node probe fails | Local block ranges, tree states, subtree roots, and retained transaction bodies. | Calls that need the forwarding node fail with `UNAVAILABLE`, including broadcast. A history stream can fail after delivering rows. See the [method contracts](lightwalletd-compatibility.md#method-behavior). |
+| Compact-blocks compatibility | `ready` while writer attestation holds | Canonical block and range reads. | The tip calls follow the stale-tip rule below. |
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
-Watch `served_epoch_age_seconds` during an outage. It grows while the chain
-stands still, and it is the readiness signal that shows the served view is
-stale. A wallet that builds a transaction on a tip more than about 40 blocks
-behind the network creates one that has already expired, which is why
-lightwalletd tip calls stop answering a tip older than
-`compat.stale_tip_limit_ms` that the node cannot vouch for.
+When ingest loses its live mempool because its node is unavailable, wallet
+and light-wallet compatibility refuse new mempool calls through ingest
+control. Losing only the forwarding node does not withdraw ingest's mempool.
+
+In all three compatibility modes, `GetLatestBlock` and `GetLightdInfo`
+can fail with `UNAVAILABLE` while `/readyz` returns 200. The
+[stale-tip rule](lightwalletd-compatibility.md#stale-tip) applies when the tip
+is too old and the writer's node cannot vouch for it. Watch
+`served_epoch_age_seconds` while the chain stands still.
 
 Readers stop serving in these cases:
 
@@ -397,5 +408,6 @@ Readers stop serving in these cases:
   It then ends the container, so a stuck node client restarts. See
   [Single-volume failure handling](../runbooks/deploying-single-volume.md#failure-handling).
 
-A reader that restarts during a node outage serves again once its pair
-converges, because readers start without contacting a node.
+A reader that restarts during a node outage serves local data once its pair
+or canonical generation converges and the writer attests it. Readers can open
+their local stores without contacting their configured node.

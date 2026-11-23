@@ -60,8 +60,9 @@ projector, query, and compatibility. The Compose Explorer overlay adds
 Explorer. Keep the independent expected-target rules in step with intentional
 topology or scrape-address changes. Monitor the collector from outside it.
 
-A wallet-serving reader answers 200 on `/readyz` during a node outage, so watch
-the dependency gauge and the served-chain age, not only HTTP status.
+Wallet and light-wallet readers can answer 200 on `/readyz` during a node
+outage. Watch the dependency gauge and the served-chain age. See
+[During a node outage](readiness.md#during-a-node-outage).
 
 Other signals that need attention when they keep rising:
 
@@ -318,13 +319,14 @@ missing when the host does not expose its source.
 
 ## zinder-query and zinder-compat-lightwalletd
 
-Both runtimes serve wallet reads through the same code and export the same
-series. Compatibility in compact-blocks mode has no serving pair and no
-broadcast, so it exports none of those series.
+Native query and wallet-mode compatibility share the wallet query engine
+and its serving-pair metrics. Canonical-only compatibility modes serve from
+one canonical generation. Light-wallet also records broadcast attempts
+for its single endpoint at `position="0"`.
 
 ### Wallet RPCs at the listener
 
-Native WalletQuery and both lightwalletd serving modes count each recognized
+Native WalletQuery and all three lightwalletd serving modes count each recognized
 wallet method once. Use `surface` (`wallet_query` or `lightwalletd`) and the
 protobuf `method` for caller traffic. A terminal `grpc_code` is the gRPC code
 in snake case. `error_class` is the typed Zinder wire reason when present and
@@ -435,7 +437,7 @@ bidirectional calls.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `zinder_compat_serving_info` | gauge | `serving` | 1 for the serving mode: `wallet` or `compact-blocks`. |
+| `zinder_compat_serving_info` | gauge | `serving` | 1 for the selected serving mode (`wallet`, `compact-blocks`, or `light-wallet`). |
 | `zinder_compat_block_range_streams_open` | gauge | | Block-range streams holding a slot of `compat.max_concurrent_block_range_streams`. |
 | `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
 | `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when as many requests already waited as the limit has slots. |

@@ -114,7 +114,7 @@ up on its connection after 2 seconds; a client that reads gets its status
 within milliseconds. These limits bound the gRPC drain. The single-volume
 wallet-serving entrypoint gives its processes 20 seconds to exit.
 
-In `compact-blocks` mode, the publisher interrupts pending writer-status
+In `compact-blocks` and `light-wallet` modes, the publisher interrupts pending writer-status
 reads and retry delays when shutdown begins, including during candidate
 convergence. It keeps the published reader and skips refresh-failure
 reporting for the interrupted refresh. RocksDB work already running finishes,
@@ -140,7 +140,12 @@ stopping, so a signal never looks like the server stopping on its own.
 | `zinder-query` | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, and operational endpoint |
 | `zinder-compat-lightwalletd`, wallet serving | Serving-pair publisher, node-readiness probe, ingest-control readiness probe, tip-change publisher, node-tip witness, and operational endpoint |
 | `zinder-compat-lightwalletd`, compact-blocks serving | Compact-block publisher, node-tip witness, and operational endpoint |
+| `zinder-compat-lightwalletd`, light-wallet serving | Canonical publisher, forwarding-node readiness probe, ingest-control readiness probe, tip-change publisher, node-tip witness, and operational endpoint |
 | `zinder-explorer` | Materialized-view catch-up when a view store is open, upstream-observation probe when a node is configured, and operational endpoint when enabled |
+
+The light-wallet probe can report a failed dependency while the publisher
+continues serving local data. See
+[During a node outage](../reference/readiness.md#during-a-node-outage).
 
 A task that had already ended when the runtime started stopping counts as
 failed, even when the runtime stopped for a shutdown request. A publisher
