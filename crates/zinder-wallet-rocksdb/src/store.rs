@@ -4,7 +4,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     mem::size_of,
-    num::{NonZeroU16, NonZeroU64},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    ops::Range,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -19,8 +20,8 @@ use rust_rocksdb::{
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsSequenceDigest, Network,
-    TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
-    ValidatedCanonicalBlockReplay,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentUtxoSetCommitment,
+    UnixTimestampMillis, ValidatedCanonicalBlockReplay,
 };
 use zinder_store::{
     BoundedRocksDbOpen, CanonicalEventFence, CanonicalRetainedEvent, CanonicalStoreError,
@@ -190,6 +191,9 @@ pub(crate) struct ValidatedRocksDbWalletBuild {
 #[derive(Clone, Copy)]
 pub(crate) struct WalletColdValidationConfig {
     pub(crate) max_accounted_reorg_undo_bytes: u64,
+    /// Outpoint key ranges the primary output families are read back in, each
+    /// on its own thread.
+    pub(crate) primary_output_scan_ranges: NonZeroU32,
 }
 
 /// Explicit bounded resources for one independent cold semantic re-derivation.
@@ -2099,6 +2103,67 @@ impl ExpectedReorgUndoSuffix {
     }
 }
 
+/// The expected reorg-undo suffix shared by concurrent primary-output scans.
+///
+/// The suffix's heights are fixed when it is created, so a row outside them
+/// is skipped without taking the lock. Rows inside them update one suffix,
+/// and because each key is admitted once whatever the order, the suffix ends
+/// with the same keys and accounted bytes as after one serial scan.
+#[derive(Debug)]
+struct SharedExpectedReorgUndoSuffix {
+    heights: Range<u64>,
+    suffix: parking_lot::Mutex<ExpectedReorgUndoSuffix>,
+}
+
+impl SharedExpectedReorgUndoSuffix {
+    fn new(suffix: ExpectedReorgUndoSuffix) -> Self {
+        let heights = match (
+            suffix.undo_by_height.first_key_value(),
+            suffix.undo_by_height.last_key_value(),
+        ) {
+            (Some((first, _)), Some((last, _))) => u64::from(*first)..u64::from(*last) + 1,
+            _ => 0..0,
+        };
+        Self {
+            heights,
+            suffix: parking_lot::Mutex::new(suffix),
+        }
+    }
+
+    fn tracks(&self, height: BlockHeight) -> bool {
+        self.heights.contains(&u64::from(height.value()))
+    }
+
+    fn observe_address_transaction(
+        &self,
+        key: WalletAddressTransactionKey,
+        block: zinder_core::BlockId,
+    ) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_address_transaction(key, block)
+    }
+
+    fn observe_created(&self, output: &WalletUnspentOutput) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(output.created_at.block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_created(output)
+    }
+
+    fn observe_spent(&self, spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(spent.spent_at.block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_spent(spent)
+    }
+
+    fn into_inner(self) -> ExpectedReorgUndoSuffix {
+        self.suffix.into_inner()
+    }
+}
+
 fn validate_spent_position(spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
     let created = spent.output.created_at;
     let consumed = spent.spent_at;
@@ -2163,8 +2228,9 @@ fn require_ready_evidence_matches_rows(
 ///
 /// Every family is scanned once in stored key order. The primary output
 /// families, the address-ordered families, and the address-transaction family
-/// are scanned on separate threads, each accumulating its own rows, and the
-/// order-independent partial accumulators are then combined. The scan recomputes the
+/// are scanned on separate threads, the primary output families split into
+/// outpoint key ranges with a thread each. Each scan accumulates its own rows,
+/// and the order-independent partial accumulators are then combined. The scan recomputes the
 /// accumulator and the six row counts and compares them with the values
 /// emitted while the SST files were written, so a row that was lost, altered,
 /// duplicated, or added between SST writing and publication changes the
@@ -2180,11 +2246,11 @@ fn validate_ready_rows_by_readback(
 ) -> Result<WalletColdValidationEvidence, RocksDbWalletError> {
     let counts = evidence.row_counts;
     require_address_index_covers_unspent_outputs(&counts)?;
-    let mut expected_undo = ExpectedReorgUndoSuffix::new(
+    let expected_undo = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
         evidence.settled_tip,
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
-    )?;
+    )?);
     let readback_started = Instant::now();
     let ConcurrentFamilyReadback {
         mut digest,
@@ -2192,8 +2258,15 @@ fn validate_ready_rows_by_readback(
         primary_output_scan,
         address_index_and_balance_readback,
         address_transaction_readback,
-    } = read_back_large_families(bounded_open, network, &counts, &mut expected_undo)?;
+    } = read_back_large_families(
+        bounded_open,
+        network,
+        &counts,
+        &expected_undo,
+        config.primary_output_scan_ranges,
+    )?;
     let concurrent_family_readback = readback_started.elapsed();
+    let expected_undo = expected_undo.into_inner();
 
     let phase_started = Instant::now();
     validate_reorg_undo_rows(
@@ -2235,13 +2308,16 @@ struct ConcurrentFamilyReadback {
 /// Scans the three large families on separate threads and combines their
 /// order-independent partial accumulators.
 ///
-/// The retained reorg-undo suffix is validated afterwards because it depends
-/// on the effects observed by the primary output scan.
+/// The primary output families are scanned in `primary_output_scan_ranges`
+/// outpoint key ranges, each on its own thread. The retained reorg-undo suffix
+/// is validated afterwards because it depends on the effects observed by the
+/// primary output scan.
 fn read_back_large_families(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+    primary_output_scan_ranges: NonZeroU32,
 ) -> Result<ConcurrentFamilyReadback, RocksDbWalletError> {
     let (primary, address_index, address_transactions) = std::thread::scope(|scope| {
         let address_index_worker = scope.spawn(|| {
@@ -2262,16 +2338,14 @@ fn read_back_large_families(
             Ok::<_, RocksDbWalletError>((family_digest, started.elapsed()))
         });
         let started = Instant::now();
-        let mut family_digest = WalletProjectionDigestBuilder::new();
-        let primary = validate_primary_output_rows(
+        let primary = read_back_primary_output_rows(
             bounded_open,
             network,
-            &mut family_digest,
-            None,
             expected_undo,
             counts,
+            primary_output_scan_ranges,
         )
-        .map(|utxo_summary| (family_digest, utxo_summary, started.elapsed()));
+        .map(|(family_digest, utxo_summary)| (family_digest, utxo_summary, started.elapsed()));
         (
             primary,
             address_index_worker
@@ -2330,20 +2404,19 @@ fn validate_ready_rows_by_semantic_rederivation(
             config.max_temporary_file_bytes_per_sorter,
         )?,
     };
-    let mut expected_undo = ExpectedReorgUndoSuffix::new(
+    let expected_undo = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
         evidence.settled_tip,
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
-    )?;
-    let mut digest = WalletProjectionDigestBuilder::new();
-    let utxo_summary = validate_primary_output_rows(
+    )?);
+    let (mut digest, utxo_summary) = validate_primary_output_rows(
         bounded_open,
         network,
-        &mut digest,
         Some(&mut sorters),
-        &mut expected_undo,
+        &expected_undo,
         &counts,
     )?;
+    let expected_undo = expected_undo.into_inner();
     let AddressDerivationSorters {
         index: address_index_sorter,
         transaction: address_transaction_sorter,
@@ -2495,39 +2568,219 @@ struct AddressDerivationSorters {
     transaction: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the ordered two-family merge keeps every derived relation tied to its decoded primary row"
-)]
+/// One contiguous range of outpoint keys, bounded by key prefixes.
+///
+/// A missing bound leaves that end of the key space open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OutpointKeyRange {
+    lower: Option<[u8; 2]>,
+    upper: Option<[u8; 2]>,
+}
+
+impl OutpointKeyRange {
+    const ALL: Self = Self {
+        lower: None,
+        upper: None,
+    };
+
+    fn read_options(&self) -> ReadOptions {
+        let mut options = validation_read_options();
+        if let Some(upper) = self.upper {
+            options.set_iterate_upper_bound(upper.to_vec());
+        }
+        options
+    }
+
+    fn start(&self) -> IteratorMode<'_> {
+        self.lower.as_ref().map_or(IteratorMode::Start, |lower| {
+            IteratorMode::From(lower.as_slice(), Direction::Forward)
+        })
+    }
+}
+
+/// Splits the outpoint key space into `count` contiguous ranges of equal
+/// width by the keys' first two bytes, at most one range per prefix.
+///
+/// Outpoint keys start with a transaction id, a hash, so the ranges hold
+/// about the same number of rows.
+fn outpoint_key_ranges(count: NonZeroU32) -> Vec<OutpointKeyRange> {
+    const PREFIXES: u64 = 1 << 16;
+    let count = u64::from(count.get()).min(PREFIXES);
+    let boundary = |index: u64| {
+        let prefix = u16::try_from(index * PREFIXES / count).unwrap_or(u16::MAX);
+        prefix.to_be_bytes()
+    };
+    (0..count)
+        .map(|index| OutpointKeyRange {
+            lower: (index > 0).then(|| boundary(index)),
+            upper: (index + 1 < count).then(|| boundary(index + 1)),
+        })
+        .collect()
+}
+
+/// Accumulators and totals of the primary output rows in one key range.
+struct PrimaryOutputTotals {
+    digest: WalletProjectionDigestBuilder,
+    unspent_count: u64,
+    spent_count: u64,
+    total_value_zat: u64,
+    commitment: TransparentUtxoSetCommitment,
+}
+
+impl PrimaryOutputTotals {
+    fn new() -> Self {
+        Self {
+            digest: WalletProjectionDigestBuilder::new(),
+            unspent_count: 0,
+            spent_count: 0,
+            total_value_zat: 0,
+            commitment: TransparentUtxoSetCommitment::empty(),
+        }
+    }
+
+    /// Adds the totals of a disjoint key range.
+    fn combine(&mut self, other: &Self) -> Result<(), RocksDbWalletError> {
+        let overflow = |reason| RocksDbWalletError::AdmissionChanged { reason };
+        let unspent_count = self
+            .unspent_count
+            .checked_add(other.unspent_count)
+            .ok_or_else(|| overflow("unspent row count overflow"))?;
+        let spent_count = self
+            .spent_count
+            .checked_add(other.spent_count)
+            .ok_or_else(|| overflow("spent row count overflow"))?;
+        let total_value_zat = self
+            .total_value_zat
+            .checked_add(other.total_value_zat)
+            .ok_or_else(|| overflow("unspent value total overflow"))?;
+        self.digest.combine(&other.digest)?;
+        self.commitment.combine(&other.commitment);
+        self.unspent_count = unspent_count;
+        self.spent_count = spent_count;
+        self.total_value_zat = total_value_zat;
+        Ok(())
+    }
+
+    /// Checks the row counts against the READY evidence and returns the
+    /// digest and the UTXO set summary.
+    fn finish(
+        self,
+        counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+    ) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+        if self.unspent_count != counts.transparent_unspent_output_count {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "unspent row count differs from READY evidence",
+            });
+        }
+        if self.spent_count != counts.transparent_spent_output_count {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "spent row count differs from READY evidence",
+            });
+        }
+        Ok((
+            self.digest,
+            WalletUtxoSetSummary {
+                utxo_count: self.unspent_count,
+                total_value_zat: self.total_value_zat,
+                commitment: self.commitment,
+            },
+        ))
+    }
+}
+
+/// Validates both primary output families in one ordered merged scan and
+/// re-derives their address rows into `address_sorters` when given.
 fn validate_primary_output_rows(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
-    digest: &mut WalletProjectionDigestBuilder,
-    mut address_sorters: Option<&mut AddressDerivationSorters>,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    address_sorters: Option<&mut AddressDerivationSorters>,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
-) -> Result<WalletUtxoSetSummary, RocksDbWalletError> {
+) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+    scan_primary_output_range(
+        bounded_open,
+        network,
+        &OutpointKeyRange::ALL,
+        address_sorters,
+        expected_undo,
+    )?
+    .finish(counts)
+}
+
+/// Reads both primary output families back in `ranges` outpoint key ranges,
+/// each on its own thread, and combines their totals.
+///
+/// Both families share the outpoint key, so each range sees every row of an
+/// outpoint and runs the same per-row checks as one scan of the whole store.
+fn read_back_primary_output_rows(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+    ranges: NonZeroU32,
+) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+    let ranges = outpoint_key_ranges(ranges);
+    let scanned = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(ranges.len());
+        for range in ranges.iter().skip(1) {
+            workers.push(scope.spawn(move || {
+                scan_primary_output_range(bounded_open, network, range, None, expected_undo)
+            }));
+        }
+        let mut scanned = Vec::with_capacity(ranges.len());
+        scanned.push(ranges.first().map_or_else(
+            || Ok(PrimaryOutputTotals::new()),
+            |range| scan_primary_output_range(bounded_open, network, range, None, expected_undo),
+        ));
+        for worker in workers {
+            scanned.push(
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        scanned
+    });
+    let mut totals = PrimaryOutputTotals::new();
+    for range_totals in scanned {
+        totals.combine(&range_totals?)?;
+    }
+    totals.finish(counts)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered two-family merge keeps every derived relation tied to its decoded primary row"
+)]
+fn scan_primary_output_range(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    range: &OutpointKeyRange,
+    mut address_sorters: Option<&mut AddressDerivationSorters>,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+) -> Result<PrimaryOutputTotals, RocksDbWalletError> {
     use zinder_core::wire::UtxoSetCommitmentElement;
 
     let unspent_family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let spent_family = column_family(bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
-    let mut unspent_rows = bounded_open.db.iterator_cf_opt(
-        &unspent_family,
-        validation_read_options(),
-        IteratorMode::Start,
-    );
-    let mut spent_rows = bounded_open.db.iterator_cf_opt(
-        &spent_family,
-        validation_read_options(),
-        IteratorMode::Start,
-    );
+    let mut unspent_rows =
+        bounded_open
+            .db
+            .iterator_cf_opt(&unspent_family, range.read_options(), range.start());
+    let mut spent_rows =
+        bounded_open
+            .db
+            .iterator_cf_opt(&spent_family, range.read_options(), range.start());
     let mut next_unspent = next_validation_row(&mut unspent_rows, "unspent validation scan")?;
     let mut next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
-    let mut unspent_count = 0u64;
-    let mut spent_count = 0u64;
-    let mut total_value_zat = 0u64;
-    let mut commitment = zinder_core::TransparentUtxoSetCommitment::empty();
+    let PrimaryOutputTotals {
+        digest: mut range_digest,
+        mut unspent_count,
+        mut spent_count,
+        mut total_value_zat,
+        mut commitment,
+    } = PrimaryOutputTotals::new();
+    let digest = &mut range_digest;
     while next_unspent.is_some() || next_spent.is_some() {
         let take_unspent = match (&next_unspent, &next_spent) {
             (Some((unspent_key, _)), Some((spent_key, _))) => {
@@ -2628,18 +2881,10 @@ fn validate_primary_output_rows(
             next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
         }
     }
-    if unspent_count != counts.transparent_unspent_output_count {
-        return Err(RocksDbWalletError::AdmissionChanged {
-            reason: "unspent row count differs from READY evidence",
-        });
-    }
-    if spent_count != counts.transparent_spent_output_count {
-        return Err(RocksDbWalletError::AdmissionChanged {
-            reason: "spent row count differs from READY evidence",
-        });
-    }
-    Ok(WalletUtxoSetSummary {
-        utxo_count: unspent_count,
+    Ok(PrimaryOutputTotals {
+        digest: range_digest,
+        unspent_count,
+        spent_count,
         total_value_zat,
         commitment,
     })
@@ -2647,7 +2892,7 @@ fn validate_primary_output_rows(
 
 fn stage_expected_address_transaction(
     sorter: Option<&mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>>,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
     address_script_hash: TransparentAddressScriptHash,
     position: zinder_wallet_projection::WalletTransactionPosition,
 ) -> Result<(), RocksDbWalletError> {
@@ -3083,7 +3328,21 @@ mod tests {
     const fn validation_config() -> WalletColdValidationConfig {
         WalletColdValidationConfig {
             max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+            primary_output_scan_ranges: NonZeroU32::MIN.saturating_add(1),
         }
+    }
+
+    /// Primary output scan range counts the readback tests cover: one range,
+    /// two, and enough to put most fixture outpoints in ranges of their own.
+    const PRIMARY_OUTPUT_SCAN_RANGES: [u32; 4] = [1, 2, 8, 64];
+
+    fn validation_config_with_ranges(
+        ranges: u32,
+    ) -> Result<WalletColdValidationConfig, Box<dyn std::error::Error>> {
+        Ok(WalletColdValidationConfig {
+            primary_output_scan_ranges: NonZeroU32::new(ranges).ok_or("zero scan ranges")?,
+            ..validation_config()
+        })
     }
 
     fn semantic_validation_config(staging_path: &Path) -> WalletSemanticValidationConfig<'_> {
@@ -3472,7 +3731,7 @@ mod tests {
         })
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum SemanticTamper {
         OrphanAddressIndex,
         MissingAddressIndex,
@@ -3841,16 +4100,22 @@ mod tests {
             );
             assert_eq!(admission_reason(semantic)?, tamper.expected_reason());
 
-            let readback = validate_ready_rows_by_readback(
-                &cold.bounded_open,
-                network,
-                &evidence,
-                validation_config(),
-            );
-            if tamper.is_visible_only_to_semantic_rederivation() {
-                readback?;
-            } else {
-                assert_eq!(admission_reason(readback)?, tamper.expected_reason());
+            for ranges in PRIMARY_OUTPUT_SCAN_RANGES {
+                let readback = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                );
+                if tamper.is_visible_only_to_semantic_rederivation() {
+                    readback?;
+                } else {
+                    assert_eq!(
+                        admission_reason(readback)?,
+                        tamper.expected_reason(),
+                        "{tamper:?} with {ranges} ranges"
+                    );
+                }
             }
         }
         Ok(())
@@ -4176,12 +4441,6 @@ mod tests {
             corrupt_stored_family(&builder, family_name, corruption)?;
             let (cold, _) = builder.reopen_for_validation()?;
 
-            let readback = validate_ready_rows_by_readback(
-                &cold.bounded_open,
-                network,
-                &evidence,
-                validation_config(),
-            );
             let semantic = validate_ready_rows_by_semantic_rederivation(
                 &cold.bounded_open,
                 network,
@@ -4192,18 +4451,137 @@ mod tests {
                 semantic.is_err(),
                 "semantic re-derivation admitted {family_name} {corruption:?}"
             );
-            match expected_reason {
-                Some(reason) => assert_eq!(
-                    admission_reason(readback)?,
-                    reason,
-                    "{family_name} {corruption:?}"
-                ),
-                None => assert!(
-                    readback.is_err(),
-                    "digest readback admitted {family_name} {corruption:?}"
-                ),
+            for ranges in PRIMARY_OUTPUT_SCAN_RANGES {
+                let readback = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                );
+                match expected_reason {
+                    Some(reason) => assert_eq!(
+                        admission_reason(readback)?,
+                        reason,
+                        "{family_name} {corruption:?} with {ranges} ranges"
+                    ),
+                    None => assert!(
+                        readback.is_err(),
+                        "digest readback admitted {family_name} {corruption:?} with {ranges} ranges"
+                    ),
+                }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn outpoint_key_ranges_cover_the_key_space_once() -> Result<(), Box<dyn std::error::Error>> {
+        for count in [1, 2, 3, 7, 64, 65_536, 70_000] {
+            let ranges = outpoint_key_ranges(NonZeroU32::new(count).ok_or("zero ranges")?);
+            assert_eq!(ranges.len(), usize::try_from(count.min(65_536))?);
+            assert_eq!(ranges.first().and_then(|range| range.lower), None);
+            assert_eq!(ranges.last().and_then(|range| range.upper), None);
+            for pair in ranges.windows(2) {
+                let [current, next] = pair else {
+                    return Err("windows of two".into());
+                };
+                assert!(current.upper.is_some(), "{count} ranges");
+                assert_eq!(current.upper, next.lower, "{count} ranges");
+                if let (Some(lower), Some(upper)) = (current.lower, current.upper) {
+                    assert!(lower < upper, "{count} ranges");
+                }
+            }
+        }
+        assert_eq!(
+            outpoint_key_ranges(NonZeroU32::MIN.saturating_add(1)),
+            vec![
+                OutpointKeyRange {
+                    lower: None,
+                    upper: Some([0x80, 0x00]),
+                },
+                OutpointKeyRange {
+                    lower: Some([0x80, 0x00]),
+                    upper: None,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_readback_matches_one_range_on_valid_stores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        for retain_tip_undo in [false, true] {
+            let temporary = TempDir::new()?;
+            let (fixture, evidence) = multi_address_fixture(retain_tip_undo)?;
+            let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+            let (cold, _) = builder.reopen_for_validation()?;
+            let single = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(1)?,
+            )?;
+            assert_eq!(single.peak_accounted_reorg_undo_bytes > 0, retain_tip_undo);
+            for ranges in [2, 3, 8, 64, 256] {
+                let partitioned = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                )?;
+                assert_eq!(
+                    partitioned.peak_accounted_reorg_undo_bytes,
+                    single.peak_accounted_reorg_undo_bytes,
+                    "{ranges} ranges"
+                );
+                assert_eq!(partitioned.random_read_count, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_undo_suffix_admits_each_key_once_across_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted_bytes = size_of::<(u32, ExpectedReorgUndoEffects)>()
+            .checked_add(size_of::<WalletOutpointKey>())
+            .ok_or("test reorg undo memory overflow")?;
+        let memory_limit = u64::try_from(admitted_bytes)?;
+        let shared = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
+            settled_tip(),
+            1,
+            memory_limit,
+        )?);
+        let output = sample_output(0x22, 12_345)?;
+        std::thread::scope(|scope| {
+            let observers = (0..4)
+                .map(|_| scope.spawn(|| shared.observe_created(&output)))
+                .collect::<Vec<_>>();
+            observers
+                .into_iter()
+                .map(|observer| {
+                    observer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let outside = sample_output(0x23, 1)?;
+        let mut outside = outside;
+        outside.created_at =
+            WalletTransactionPosition::new(outside.created_at.transaction_id, 0, settled_tip());
+        shared.observe_created(&outside)?;
+
+        let suffix = shared.into_inner();
+        let undo = suffix
+            .undo_by_height
+            .get(&source_position().tip.height.value())
+            .ok_or("test undo suffix disappeared")?;
+        assert_eq!(undo.created_outpoints.len(), 1);
+        assert_eq!(suffix.memory.current, memory_limit);
+        assert_eq!(suffix.memory.peak, memory_limit);
         Ok(())
     }
 

@@ -239,8 +239,10 @@ pub struct RocksDbWalletBuildOptions {
     ///
     /// One hashes on the build's own thread. More hash bounded batches of rows
     /// on that many threads while the build thread drains the sorters and
-    /// writes SST files. The accumulators do not depend on the row order, so
-    /// the published evidence does not change.
+    /// writes SST files. Cold validation also reads the unspent and spent
+    /// output families back in this many outpoint key ranges at once. The
+    /// accumulators do not depend on the row order, so the published evidence
+    /// does not change.
     pub accumulator_hashing_workers: NonZeroU32,
 }
 
@@ -289,7 +291,9 @@ fn accumulator_hashing_workers_for(detected_logical_cpus: Option<NonZeroU32>) ->
 /// primary output, address-index, and address-transaction scans run
 /// concurrently, so their three durations overlap: each is the wall time of
 /// its own scan, and `concurrent_family_readback` is the wall time of all
-/// three together. The reorg-undo scan runs after them.
+/// three together. The primary output scan reads its outpoint key ranges
+/// concurrently, and its duration covers all of them. The reorg-undo scan
+/// runs after them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletColdValidationPhaseDurations {
     /// Merged scan of the unspent and spent primary output families.
@@ -856,6 +860,7 @@ where
             ready_evidence,
             WalletColdValidationConfig {
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+                primary_output_scan_ranges: options.accumulator_hashing_workers,
             },
         )?;
         let cold_validation = phase_started.elapsed();
