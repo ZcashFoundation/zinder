@@ -40,8 +40,10 @@ use zinder_proto::compat::lightwalletd::{
 };
 
 mod counters;
+mod frame_gaps;
 
 use counters::{CounterSource, CountersReport, Selector};
+use frame_gaps::FrameGaps;
 
 use super::transport::{self, TlsOptions};
 
@@ -87,6 +89,9 @@ pub(crate) struct RawRangeProbeArgs {
     /// Write the expected results taken from `--oracle-endpoint` to a new file.
     #[arg(long, value_name = "FILE", requires = "oracle_endpoint")]
     write_oracle: Option<PathBuf>,
+    /// Include each frame's arrival offset in nanoseconds in each request observation.
+    #[arg(long)]
+    record_frame_arrivals: bool,
     /// Concurrent clients. Each opens its own connection.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     clients: u32,
@@ -317,6 +322,7 @@ async fn stream_range(
     start: u64,
     end: u64,
     timeout: Duration,
+    gaps: &mut FrameGaps,
 ) -> Result<Streamed, String> {
     let block = |height| {
         Some(BlockId {
@@ -351,7 +357,9 @@ async fn stream_range(
             .await
             .map_err(|status| status_text(&status))?
         {
-            first_frame.get_or_insert_with(|| started.elapsed());
+            let arrived = started.elapsed();
+            first_frame.get_or_insert(arrived);
+            gaps.observe(nanos(arrived), digest.frames + 1);
             digest.push(&frame);
         }
         let completion = started.elapsed();
@@ -406,6 +414,11 @@ struct Observation {
     started_ns: u64,
     first_frame_ns: u64,
     completion_ns: u64,
+    max_frame_gap_ns: u64,
+    /// One-based ordinal ending the earliest largest positive gap, or zero if none.
+    max_frame_gap_after: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_arrivals_ns: Option<Vec<u64>>,
     /// `verified`, `mismatch`, or `error`.
     outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,6 +435,7 @@ struct Pass {
     jobs: Arc<[OracleJob]>,
     repetitions: u32,
     phase_start: Instant,
+    record_frame_arrivals: bool,
     timeout: Duration,
 }
 
@@ -432,7 +446,9 @@ async fn run_client(client_index: u32, channel: Channel, pass: Pass) -> Vec<Obse
     for repetition in 1..=pass.repetitions {
         for (job_index, job) in pass.jobs.iter().enumerate() {
             let started_ns = nanos(pass.phase_start.elapsed());
-            let outcome = stream_range(&mut client, job.start, job.end, pass.timeout).await;
+            let mut gaps = FrameGaps::new(pass.record_frame_arrivals);
+            let outcome =
+                stream_range(&mut client, job.start, job.end, pass.timeout, &mut gaps).await;
             let mut observation = Observation {
                 client: client_index,
                 repetition,
@@ -445,6 +461,9 @@ async fn run_client(client_index: u32, channel: Channel, pass: Pass) -> Vec<Obse
                 started_ns,
                 first_frame_ns: 0,
                 completion_ns: 0,
+                max_frame_gap_ns: gaps.max_ns,
+                max_frame_gap_after: gaps.ending_frame,
+                frame_arrivals_ns: gaps.arrivals_ns,
                 outcome: "verified",
                 detail: None,
             };
@@ -482,12 +501,14 @@ async fn run_phase(
     jobs: &Arc<[OracleJob]>,
     repetitions: u32,
     timeout: Duration,
+    record_frame_arrivals: bool,
 ) -> Result<Phase, BenchError> {
     let phase_start = Instant::now();
     let pass = Pass {
         jobs: Arc::clone(jobs),
         repetitions,
         phase_start,
+        record_frame_arrivals,
         timeout,
     };
     let handles = channels
@@ -528,7 +549,7 @@ async fn fetch_oracle(
     let mut client = Grpc::new(open_channel(endpoint).await?);
     let mut jobs = Vec::with_capacity(ranges.len());
     for &(start, end) in ranges {
-        let streamed = stream_range(&mut client, start, end, timeout)
+        let streamed = stream_range(&mut client, start, end, timeout, &mut FrameGaps::default())
             .await
             .map_err(|reason| {
                 BenchError::raw_range_probe(format!("oracle range {start}:{end}: {reason}"))
@@ -768,6 +789,14 @@ struct Latency {
 }
 
 impl Latency {
+    fn max_frame_gap<'a>(verified: impl Iterator<Item = &'a Observation>) -> Option<Self> {
+        let gaps: Vec<_> = verified
+            .filter(|request| request.frames >= 2)
+            .map(|request| request.max_frame_gap_ns)
+            .collect();
+        (!gaps.is_empty()).then(|| Self::of(gaps))
+    }
+
     fn of(mut samples_ns: Vec<u64>) -> Self {
         samples_ns.sort_unstable();
         let milliseconds = |rank: Option<&u64>| as_f64(rank.copied().unwrap_or_default()) / 1e6;
@@ -801,6 +830,8 @@ struct Totals {
 struct LatencyReport {
     first_frame: Latency,
     completion: Latency,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_frame_gap: Option<Latency>,
 }
 
 #[derive(Serialize)]
@@ -813,6 +844,8 @@ struct JobReport {
     bytes: u64,
     first_frame_ms: Latency,
     completion_ms: Latency,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_frame_gap_ms: Option<Latency>,
 }
 
 #[derive(Serialize)]
@@ -826,6 +859,7 @@ struct OracleReport {
 
 #[derive(Serialize)]
 struct ConfigReport {
+    record_frame_arrivals: bool,
     clients: u32,
     repetitions: u32,
     warmup_repetitions: u32,
@@ -902,6 +936,7 @@ fn job_reports(jobs: &[OracleJob], observations: &[Observation]) -> Vec<JobRepor
                 bytes: ok().map(|observation| observation.bytes).sum(),
                 first_frame_ms: Latency::of(ok().map(|o| o.first_frame_ns).collect()),
                 completion_ms: Latency::of(ok().map(|o| o.completion_ns).collect()),
+                max_frame_gap_ms: Latency::max_frame_gap(ok()),
             }
         })
         .collect()
@@ -961,7 +996,14 @@ async fn run_timed(
         }
     }
     let client_cpu_before = process_cpu_ms();
-    let phase = run_phase(channels, jobs, args.repetitions, timeout).await?;
+    let phase = run_phase(
+        channels,
+        jobs,
+        args.repetitions,
+        timeout,
+        args.record_frame_arrivals,
+    )
+    .await?;
     let client_cpu_ms = process_cpu_ms() - client_cpu_before;
     let server_after = sample_pid(args.server_pid)?;
     if let (Some(before), Some(after)) = (&server_before, &server_after)
@@ -1030,9 +1072,15 @@ pub(crate) async fn run_raw_range_probe(
         .into_inner();
 
     let warmup = if args.warmup_repetitions > 0 {
-        run_phase(&channels, &jobs, args.warmup_repetitions, timeout)
-            .await?
-            .observations
+        run_phase(
+            &channels,
+            &jobs,
+            args.warmup_repetitions,
+            timeout,
+            args.record_frame_arrivals,
+        )
+        .await?
+        .observations
     } else {
         Vec::new()
     };
@@ -1113,6 +1161,7 @@ fn build_report(
         by_job: job_reports(&oracle.jobs, &phase.observations),
         oracle,
         config: ConfigReport {
+            record_frame_arrivals: args.record_frame_arrivals,
             clients: args.clients,
             repetitions: args.repetitions,
             warmup_repetitions: args.warmup_repetitions,
@@ -1133,6 +1182,7 @@ fn build_report(
         latency_ms: LatencyReport {
             first_frame: latency(|o| o.first_frame_ns),
             completion: latency(|o| o.completion_ns),
+            max_frame_gap: Latency::max_frame_gap(verified_requests.iter().copied()),
         },
         client: ClientReport {
             cpu_ms: client_cpu_ms,
@@ -1167,6 +1217,7 @@ mod tests {
             oracle_endpoint: Some(oracle_endpoint.to_owned()),
             ranges: vec![(10, 20)],
             both_directions: true,
+            record_frame_arrivals: false,
             write_oracle: None,
             clients: 3,
             repetitions: 2,
@@ -1343,6 +1394,8 @@ mod tests {
             "/totals/bytes",
             "/totals/blocks_per_second",
             "/latency_ms/first_frame/p95",
+            "/latency_ms/max_frame_gap/p95",
+            "/by_job/0/max_frame_gap_ms/p95",
             "/latency_ms/completion/p50",
             "/by_job/0/completion_ms/p95",
             "/client/cpu_ms",
@@ -1350,12 +1403,144 @@ mod tests {
             "/server/hwm_kib_after",
             "/warmup/0/framed_sha256",
             "/observations/11/first_frame_ns",
+            "/observations/11/max_frame_gap_ns",
+            "/observations/11/max_frame_gap_after",
         ] {
             assert!(report.pointer(pointer).is_some(), "missing {pointer}");
         }
         assert_eq!(report.pointer("/verified"), Some(&serde_json::json!(true)));
+        assert!(
+            report
+                .pointer("/observations/11/frame_arrivals_ns")
+                .is_none()
+        );
+        assert!(report.pointer("/warmup/0/frame_arrivals_ns").is_none());
+        assert_eq!(report["config"]["record_frame_arrivals"], false);
         // Counters are absent, not zero, when none were requested.
         assert!(report.pointer("/counters").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arrival_offsets_reproduce_each_warmup_and_timed_gap() -> Result<(), Box<dyn Error>> {
+        let reference = serve(mock(&[], &[], RangeEnding::Clean)).await?;
+        let server = serve(mock(&[], &[], RangeEnding::Clean)).await?;
+        let mut options = args(&server.url, &reference.url);
+        options.record_frame_arrivals = true;
+        options.ranges = vec![(10, 10), (12, 10)];
+        let output = run_raw_range_probe(options).await?;
+        output.require_verified()?;
+        assert!(output.report.config.record_frame_arrivals);
+        let eligible = output
+            .report
+            .observations
+            .iter()
+            .filter(|o| o.frames >= 2)
+            .count();
+        assert_eq!(
+            output
+                .report
+                .latency_ms
+                .max_frame_gap
+                .ok_or("missing overall gaps")?
+                .count,
+            u64::try_from(eligible)?
+        );
+        for job in &output.report.by_job {
+            assert_eq!(
+                job.max_frame_gap_ms.map(|gaps| gaps.count),
+                (job.start != job.end).then_some(job.requests)
+            );
+        }
+        for observation in output
+            .report
+            .warmup
+            .iter()
+            .chain(&output.report.observations)
+        {
+            let offsets = observation
+                .frame_arrivals_ns
+                .as_ref()
+                .ok_or("missing arrival offsets")?;
+            assert_eq!(offsets.len(), usize::try_from(observation.frames)?);
+            assert_eq!(offsets.first(), Some(&observation.first_frame_ns));
+            assert!(
+                offsets
+                    .last()
+                    .is_some_and(|last| *last <= observation.completion_ns)
+            );
+            let gaps: Vec<_> = offsets.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            let maximum = gaps.iter().copied().max().unwrap_or_default();
+            let ordinal = gaps
+                .iter()
+                .zip(2_u64..)
+                .find(|(gap, _)| maximum > 0 && **gap == maximum)
+                .map_or(0, |(_, ordinal)| ordinal);
+            assert_eq!(
+                (
+                    observation.max_frame_gap_ns,
+                    observation.max_frame_gap_after
+                ),
+                (maximum, ordinal)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranks_one_maximum_per_verified_multiframe_request() -> Result<(), Box<dyn Error>> {
+        let reference = serve(mock(&[], &[], RangeEnding::Clean)).await?;
+        let server = serve(mock(&[], &[], RangeEnding::Clean)).await?;
+        let mut options = args(&server.url, &reference.url);
+        options.clients = 1;
+        options.both_directions = false;
+        options.warmup_repetitions = 0;
+        options.repetitions = 23;
+        let mut report = run_raw_range_probe(options).await?.report;
+        for (index, observation) in (0_u64..).zip(&mut report.observations) {
+            observation.max_frame_gap_ns = index * 1_000_000;
+        }
+        let observations = &mut report.observations;
+        observations[20].frames = 1;
+        observations[21].frames = 0;
+        observations[22].outcome = "mismatch";
+        let jobs = super::job_reports(&report.oracle.jobs, observations);
+        let gaps = jobs[0].max_frame_gap_ms.ok_or("missing gap summary")?;
+        assert_eq!(gaps.count, 20);
+        assert_eq!(
+            [gaps.min, gaps.p50, gaps.p95, gaps.max],
+            [0.0, 9.0, 18.0, 19.0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_stream_has_no_gap_and_an_empty_requested_trace() -> Result<(), Box<dyn Error>> {
+        let reference = serve(mock(&[], &[], RangeEnding::Clean)).await?;
+        let server = serve(mock(&[], &[], RangeEnding::Empty)).await?;
+        let mut options = args(&server.url, &reference.url);
+        options.record_frame_arrivals = true;
+        let output = run_raw_range_probe(options).await?;
+        assert!(!output.report.verified);
+        let report = serde_json::to_value(&output.report)?;
+        assert!(report.pointer("/latency_ms/max_frame_gap").is_none());
+        assert!(report.pointer("/by_job/0/max_frame_gap_ms").is_none());
+        for observation in &output.report.observations {
+            assert_eq!(observation.outcome, "mismatch");
+            assert_eq!(
+                (
+                    observation.max_frame_gap_ns,
+                    observation.max_frame_gap_after
+                ),
+                (0, 0)
+            );
+            assert!(
+                observation
+                    .frame_arrivals_ns
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+            );
+        }
         Ok(())
     }
 
@@ -1392,15 +1577,18 @@ mod tests {
             output.report.problems
         );
         let failing = serve(mock(&[], &[], RangeEnding::Status(tonic::Code::Internal))).await?;
-        let output = run_raw_range_probe(args(&failing.url, &reference.url)).await?;
+        let mut options = args(&failing.url, &reference.url);
+        options.record_frame_arrivals = true;
+        let output = run_raw_range_probe(options).await?;
         assert!(!output.report.verified);
-        assert!(
-            output
-                .report
-                .observations
-                .iter()
-                .all(|o| o.outcome == "error")
-        );
+        assert!(output.report.latency_ms.max_frame_gap.is_none());
+        assert!(output.report.observations.iter().all(|observation| {
+            observation.outcome == "error"
+                && observation
+                    .frame_arrivals_ns
+                    .as_ref()
+                    .is_some_and(|offsets| offsets.len() == 11)
+        }));
         Ok(())
     }
 

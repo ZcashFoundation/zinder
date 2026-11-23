@@ -1262,7 +1262,7 @@ The report (`schema` `zinder-bench/raw-range-probe/v1`) records:
 - `totals`: verified and failed request counts, blocks, bytes, `wall_ns`,
   `blocks_per_second`, and `mib_per_second`.
 - `latency_ms`, overall and per range in `by_job`: nearest-rank minimum, `p50`,
-  `p95`, and maximum for the first frame and for completion.
+  `p95`, and maximum for the first frame, completion, and largest frame gap.
 - `client.cpu_ms`, and with `--server-pid` a `server` object: CPU over the timed
   interval and per MiB, and resident memory with the process's lifetime
   high-water mark before and after. The server is sampled read-only from
@@ -1281,6 +1281,42 @@ The report (`schema` `zinder-bench/raw-range-probe/v1`) records:
   no numbers, never zeros. An example witness for a full wallet serving pair is
   `zinder_wallet_serving_pair_publisher_refresh_total{status=ok}`.
 - `warmup` and `observations`: every request as measured, including its digest.
+
+Each request in `warmup` and `observations` reports `max_frame_gap_ns`,
+the longest interval between two consecutive frames at the probe.
+`max_frame_gap_after` is the **one-based ordinal of the frame ending that
+interval**, in delivery order for either direction. A gap ending at frame 237
+spans frames 236 and 237. The earliest maximum wins a tie. Both fields are
+zero when fewer than two frames arrive or all observed offsets are equal.
+Read these alongside `first_frame_ns` and `completion_ns`. The gap excludes the
+wait for the first frame and the time from the last frame to stream completion.
+Client scheduling and frame processing contribute to the observed interval.
+
+To check the gap against the full sequence, run one request per job with
+an oracle for the range and direction you want to inspect. Use a new report path.
+
+```bash
+zinder-bench raw-range-probe --endpoint "$ENDPOINT" --oracle "$ORACLE" \
+  --record-frame-arrivals --report "$REPORT"
+jq '.observations[] | {start, end, outcome, max_frame_gap_ns, max_frame_gap_after}' "$REPORT"
+```
+
+With `--record-frame-arrivals`, each request also records `frame_arrivals_ns`
+as offsets from request start, including frames received before a stream error.
+Subtract adjacent integer nanosecond offsets to reproduce the gap. To display
+milliseconds, divide the integer gap by 1,000,000 and round once to the nearest
+0.0001 ms. The default records the maximum with constant space per request.
+The flag retains one offset per received frame, including warmups. Use matching
+flag settings when comparing readers.
+
+For a paired policy, use `/latency_ms/max_frame_gap/p95` in milliseconds with
+`lower_is_better`. Each verified timed request with at least two frames
+contributes one maximum, including a genuine zero when the offsets coincide.
+Warmups, failed requests, and requests with fewer than two frames contribute
+no samples. The summary uses nearest rank and is absent without eligible
+requests. For the first oracle job, the pointer is
+`/by_job/0/max_frame_gap_ms/p95`. Add `/config/record_frame_arrivals` to the
+campaign case's `match` list when comparing reports that expose this flag.
 
 ## Report fields
 
