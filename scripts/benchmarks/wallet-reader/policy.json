@@ -1,0 +1,31 @@
+{
+  "baseline": "baseline",
+  "candidate": "candidate",
+  "min_pairs": 4,
+  "metrics": [
+    {
+      "name": "reader CPU ms/MiB",
+      "pointer": "/server/cpu_ms_per_mib",
+      "direction": "lower_is_better",
+      "tolerance_relative": 0.05
+    },
+    {
+      "name": "blocks/s",
+      "pointer": "/totals/blocks_per_second",
+      "direction": "higher_is_better",
+      "tolerance_relative": 0.05
+    },
+    {
+      "name": "first frame p95 ms",
+      "pointer": "/latency_ms/first_frame/p95",
+      "direction": "lower_is_better",
+      "tolerance_relative": 0.05
+    },
+    {
+      "name": "completion p95 ms",
+      "pointer": "/latency_ms/completion/p95",
+      "direction": "lower_is_better",
+      "tolerance_relative": 0.05
+    }
+  ]
+}

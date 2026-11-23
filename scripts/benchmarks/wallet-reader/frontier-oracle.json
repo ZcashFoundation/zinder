@@ -1,0 +1,19 @@
+{
+  "schema": "zinder-bench/raw-range-oracle/v1",
+  "jobs": [
+    {
+      "start": 4643892,
+      "end": 4644091,
+      "blocks": 200,
+      "bytes": 39020,
+      "framed_sha256": "9424a401c6fa6775071212b2a81b5fa8d21d158ac5fa2528f0a79363b8ab45cf"
+    },
+    {
+      "start": 4644091,
+      "end": 4643892,
+      "blocks": 200,
+      "bytes": 39020,
+      "framed_sha256": "872a48d69d6ccd32f6f1f8771d50736a35eb2d905090f8c3d780676c74d2cafe"
+    }
+  ]
+}

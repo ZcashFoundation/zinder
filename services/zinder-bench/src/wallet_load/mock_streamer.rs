@@ -345,7 +345,14 @@ impl CompactTxStreamer for MockStreamer {
             RangeEnding::ExtraBlock => vec![Ok(block(end + 1))],
             RangeEnding::Status(code) => vec![Err(Status::new(code, "stream failed at its end"))],
         };
-        let replies = (start..=last_reply)
+        // A start above the end streams descending, as lightwalletd does.
+        let heights = if start <= end {
+            (start..=last_reply).collect::<Vec<_>>()
+        } else {
+            (end..=start).rev().collect()
+        };
+        let replies = heights
+            .into_iter()
             .map(|height| {
                 let mut cb = self.range_block(height);
                 if self.shielded_heights.contains(&height) {

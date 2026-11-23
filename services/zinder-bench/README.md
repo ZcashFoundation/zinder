@@ -817,6 +817,8 @@ separate recompression run on copies.
 
 ## 7. Drive wallet-shaped load at an endpoint
 
+For a two-binary A/B comparison on a private fixture, follow [Wallet performance qualification](../../docs/runbooks/wallet-performance-qualification.md).
+
 `lightwalletd-wallet-load` syncs a height range from a running
 lightwalletd-compatible endpoint the way a real wallet engine does, for many
 simulated wallets at once. The endpoint can be `zinder-compat-lightwalletd`, Go
@@ -1211,6 +1213,74 @@ completion over a span with no new note commitments. On a populated chain,
 subtree boundaries and discovered transactions change which ranges
 PepperSync prioritizes. Wallets with history can trigger additional lookups.
 [PepperSync sync loop](https://github.com/zingolabs/zingolib/blob/81d799775f11e882896e8710e8af12d6d4d29a41/pepper-sync/src/sync.rs)
+
+### Verify raw block-range frames
+
+`raw-range-probe` requests `GetBlockRange` from a running lightwalletd-compatible
+server and checks the bytes it puts on the wire. Each response frame is hashed
+as the raw protobuf payload, without decoding it. The digest is the SHA-256 of
+every frame in stream order, each frame written as its payload length as a
+big-endian `u32` followed by the payload. A server that reorders, drops, adds, or
+changes a block fails the request even when a wallet would still parse it.
+
+Every request is compared with an oracle of frame count, payload bytes, and
+digest. The oracle comes from a file, or from a different reference server read
+before the run. The probe rejects two URLs resolving to a common host and port. For listeners behind proxies, supply a known independent source or a trusted oracle file. A `START:END`
+range with `START` above `END` streams descending.
+
+```bash
+# Record the oracle from a reference server, then probe the server under test.
+zinder-bench raw-range-probe \
+  --endpoint http://127.0.0.1:9067 \
+  --oracle-endpoint http://127.0.0.1:9068 \
+  --range 4598001:4600000 --both-directions \
+  --write-oracle .tmp/oracle.json \
+  --clients 4 --repetitions 32 --warmup-repetitions 1 \
+  --server-pid "$READER_PID" --server-executable "$READER_BINARY" \
+  --report .tmp/raw-range-probe.json
+
+# Later runs reuse the recorded oracle.
+zinder-bench raw-range-probe --endpoint http://127.0.0.1:9067 --oracle .tmp/oracle.json
+```
+
+An oracle file is `{"schema": "zinder-bench/raw-range-oracle/v1", "jobs": [...]}`,
+and each job is `{"start", "end", "blocks", "bytes", "framed_sha256"}` with a
+lowercase hex digest. Any tool can write one.
+
+Each client opens its own HTTP/2 connection. After the connections open, the
+warmup passes run untimed but verified, then every client's passes run together
+as the timed interval. The probe exits non-zero when any request differs from
+the oracle, after writing the report, so a campaign can require
+`/verified` to be `true`.
+
+The report (`schema` `zinder-bench/raw-range-probe/v1`) records:
+
+- `verified`, `problems`, and `oracle` with its `source` and `sha256`.
+- `chain`: the endpoint's `GetLightdInfo` identity and the `GetLatestBlock` tip
+  before and after the timed interval, with hashes in display (RPC byte) order
+  and `tip_unchanged`. Both reads sit outside the timed interval.
+- `totals`: verified and failed request counts, blocks, bytes, `wall_ns`,
+  `blocks_per_second`, and `mib_per_second`.
+- `latency_ms`, overall and per range in `by_job`: nearest-rank minimum, `p50`,
+  `p95`, and maximum for the first frame and for completion.
+- `client.cpu_ms`, and with `--server-pid` a `server` object: CPU over the timed
+  interval and per MiB, and resident memory with the process's lifetime
+  high-water mark before and after. The server is sampled read-only from
+  `/proc`, in whole clock ticks, and its high-water mark is never reset.
+- `counters`: with `--server-metrics-url`, `--server-freshness-counter`, and
+  `--server-counter` or `--rocksdb-multiget-counters`, each series' increase
+  over the timed interval in `increases`, summed over every label the selector
+  leaves out. A selector is `[ALIAS=]NAME[{label=value,...}]`. Each selector
+  needs a unique report key (its alias, or the whole selector if omitted).
+  `--rocksdb-multiget-counters` reports the canonical secondary's
+  `multiget_get`, `multiget_keys_read`, and `multiget_bytes_read` tickers. A
+  server may publish these tickers on a timer, so each read waits, outside the
+  timed interval, for the witness series to advance and for every counter to
+  appear in that same scrape (up to `--server-counter-wait-secs`). When it does
+  not, or a counter went backwards, `available` is `false` with a `reason` and
+  no numbers, never zeros. An example witness for a full wallet serving pair is
+  `zinder_wallet_serving_pair_publisher_refresh_total{status=ok}`.
+- `warmup` and `observations`: every request as measured, including its digest.
 
 ## Report fields
 

@@ -600,7 +600,7 @@ fn counter_value(increase: f64) -> u64 {
 }
 
 /// Reads the Prometheus exposition at an `http://host:port/path` URL.
-async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
+pub(super) async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
     scrape_within(url, SCRAPE_TIMEOUT, MAX_SCRAPE_BYTES).await
 }
 

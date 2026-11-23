@@ -22,7 +22,7 @@ metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
-rustix = { workspace = true, features = ["time"] }
+rustix = { workspace = true, features = ["param", "time"] }
 rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
