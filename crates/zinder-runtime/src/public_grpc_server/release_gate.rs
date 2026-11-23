@@ -5,7 +5,10 @@
 //! before that end still waits for the client's flow-control window, nothing
 //! can reset the stream any more: it keeps that data and its place among the
 //! connection's streams until the client grants window or the connection
-//! closes. The gate keeps that state from arising.
+//! closes. The gate keeps that state from arising while the client's window
+//! settings stay as they were. A client that lowers its stream window with
+//! `SETTINGS` after the end can still leave data queued, which only an h2
+//! change can bound.
 //!
 //! hyper hands a data chunk it holds to h2 only once the stream has send
 //! capacity left after the data already queued, and asks the body for its

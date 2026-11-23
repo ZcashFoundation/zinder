@@ -452,20 +452,20 @@ window, and the next piece. These are estimates of transport payload. The
 listener also keeps the response chunk it is splitting into pieces until it
 hands out that chunk's last piece; for `GetBlockRange` that chunk is one
 encoded block, or a batch of smaller ones. A gRPC-Web response's trailers
-add a frame of their own. The server ends a response only once the client's
-window covers everything it sent. After that, the response holds less than
-400 KiB, which only the client's socket holds back. One connection holds at
-most 200 responses, about 116 MiB of transport payload, or 128 MiB in
-gRPC-Web text mode.
+add a frame of their own. One connection holds at most 200 responses, about
+116 MiB of transport payload, or 128 MiB in gRPC-Web text mode.
 
-The window can still shrink after a response ends. A client that lowers its
-stream window with an HTTP/2 `SETTINGS` frame after the server ended a
-response leaves up to 400 KiB of that response, and its stream slot, with
-HTTP/2 until the connection closes. A response waiting for its producer
-keeps that data until the producer sends again. One connection can hold
-about 78 MiB this way. Zinder sets no process-wide bound on this data,
-because a client can open many connections. Limit connections per client at
-your proxy.
+The server ends a response only once the client's window covers everything
+it sent. Up to 400 KiB of the response can still be queued at that point,
+because its last byte can fill the send buffer exactly. That data normally
+leaves as fast as the client's socket takes it. A client that then lowers its
+stream window with an HTTP/2 `SETTINGS` frame keeps it queued, with the
+stream's slot, indefinitely: it is released only when the client grants
+window again, resets the stream, or closes the connection. A response
+waiting for its producer is exposed in the same way until the producer
+sends again. Across a connection's 200 streams that is at most 78.125 MiB.
+Zinder sets no process-wide bound on this data, because a client can open
+many connections. Limit connections per client at your proxy.
 
 Once a write to a connection blocks, the connection must write 16 KiB, or
 finish writing everything it had buffered, within 60 seconds or it is

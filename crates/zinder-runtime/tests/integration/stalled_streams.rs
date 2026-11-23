@@ -346,15 +346,16 @@ async fn stalled_streams_free_every_slot_while_the_connection_and_a_sibling_stay
     let (mut stalled, mut sibling) = fill_with_stalled_streams(&channel).await?;
     let check = queued_check(&channel);
 
-    // Once every stalled stream has produced its message, every slot is
-    // still taken, unless filling the connection was so slow that the first
-    // streams may already have reached their deadline.
+    // Once every stalled stream has produced its message, their messages
+    // are still held, unless filling the connection was so slow that the
+    // first streams may already have reached their deadline. That the slots
+    // stay taken without a reset is the tonic control test's to show; here
+    // the check below completes only once the resets free one.
     wait_until("every stalled stream has produced its message", || {
         server.stalled.produced.load(Ordering::SeqCst) >= stalled.len()
     })
     .await?;
     if opened.elapsed() < STALL_TIMEOUT / 2 {
-        assert!(!check.is_finished(), "a slot was free before any timeout");
         assert!(
             !server.stalled.all_freed(stalled.len()),
             "messages were freed early"
