@@ -128,9 +128,9 @@ pub use public_grpc_server::{
     ClientAddressSource, DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT,
     DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTermination, GrpcCallTerminationLayer,
     GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
-    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcServer,
-    WalletRpcMetrics, WalletRpcMetricsLayer, public_grpc_reflection, public_grpc_server,
-    public_grpc_server_with,
+    HTTP2_MAX_LOCAL_ERROR_RESETS, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcServer, WalletRpcMetrics, WalletRpcMetricsLayer,
+    public_grpc_reflection, public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, FollowWaitReason, IngestPhase, NodeUnavailableDetail, Readiness,

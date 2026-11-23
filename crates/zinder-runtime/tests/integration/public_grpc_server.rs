@@ -506,6 +506,72 @@ async fn unread_reflection_answers(
     Ok((sender, answers))
 }
 
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HEADERS_FRAME: u8 = 0x1;
+const SETTINGS_FRAME: u8 = 0x4;
+const GOAWAY_FRAME: u8 = 0x7;
+const END_STREAM_AND_HEADERS: u8 = 0x1 | 0x4;
+const ENHANCE_YOUR_CALM: u32 = 0xb;
+/// An HPACK block holding only `:method: POST`. A request without `:scheme`
+/// and `:path` is malformed, so the server resets its stream.
+const METHOD_ONLY_HEADER_BLOCK: &[u8] = &[0x83];
+
+fn http2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    let length = u32::try_from(payload.len())?.to_be_bytes();
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    frame.extend_from_slice(length.get(1..).unwrap_or_default());
+    frame.extend_from_slice(&[kind, flags]);
+    frame.extend_from_slice(&stream_id.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Reads frames until the server sends `GOAWAY`, and returns its error code.
+async fn goaway_error_code(connection: &mut tokio::net::TcpStream) -> Result<u32> {
+    use tokio::io::AsyncReadExt as _;
+
+    loop {
+        let mut header = [0; 9];
+        connection.read_exact(&mut header).await?;
+        let [l0, l1, l2, kind, ..] = header;
+        let length = u32::from_be_bytes([0, l0, l1, l2]);
+        let mut payload = vec![0; usize::try_from(length)?];
+        connection.read_exact(&mut payload).await?;
+        if kind == GOAWAY_FRAME {
+            let code = payload
+                .get(4..8)
+                .and_then(|code| <[u8; 4]>::try_from(code).ok())
+                .ok_or_else(|| eyre!("GOAWAY frame without an error code"))?;
+            return Ok(u32::from_be_bytes(code));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_whose_protocol_errors_keep_resetting_streams_loses_its_connection() -> Result<()>
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let mut connection = tokio::net::TcpStream::connect(server.address).await?;
+    let mut frames = HTTP2_PREFACE.to_vec();
+    frames.extend(http2_frame(SETTINGS_FRAME, 0, 0, &[])?);
+    let malformed_requests = u32::try_from(zinder_runtime::HTTP2_MAX_LOCAL_ERROR_RESETS)? + 16;
+    for request in 0..malformed_requests {
+        frames.extend(http2_frame(
+            HEADERS_FRAME,
+            END_STREAM_AND_HEADERS,
+            2 * request + 1,
+            METHOD_ONLY_HEADER_BLOCK,
+        )?);
+    }
+    connection.write_all(&frames).await?;
+
+    let code = within_wait_limit(goaway_error_code(&mut connection)).await??;
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_request_message_above_the_decoding_limit_is_refused() -> Result<()> {
     let server = serve(1, Duration::from_secs(30)).await?;

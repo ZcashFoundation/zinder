@@ -7,7 +7,9 @@
 //! - at most [`MAX_CONCURRENT_STREAMS_PER_CONNECTION`] streams on one HTTP/2
 //!   connection;
 //! - an HTTP/2 keepalive ping after a minute without a frame, closing the
-//!   connection when the ping goes unanswered for 20 seconds; and
+//!   connection when the ping goes unanswered for 20 seconds;
+//! - a connection closed once the client's protocol errors have made the
+//!   server reset [`HTTP2_MAX_LOCAL_ERROR_RESETS`] of its streams;
 //! - a server-wide bound on requests whose message is still arriving
 //!   ([`GrpcReceiveLimitLayer`]); and
 //! - an end to any response whose client stops reading it
@@ -101,6 +103,14 @@ const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_mins(1);
 /// closes the connection and ends the streams on it, so a client that
 /// vanished stops holding stream slots.
 const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Streams the server may reset because of the client's protocol errors
+/// before it closes the connection with `ENHANCE_YOUR_CALM`.
+///
+/// This is h2's own default. tonic replaces it with no limit unless a
+/// server sets one, which would let a client make the server generate
+/// resets without end.
+pub const HTTP2_MAX_LOCAL_ERROR_RESETS: usize = 1024;
 
 /// Requests each receive pool admits at once across every connection.
 ///
@@ -214,6 +224,7 @@ pub(crate) fn public_grpc_transport() -> Server {
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+        .http2_max_local_error_reset_streams(Some(HTTP2_MAX_LOCAL_ERROR_RESETS))
 }
 
 /// Assembles a supervised listener that serves `application_service`
