@@ -57,9 +57,9 @@ impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRange + '_)
 ///
 /// Unless the server is configured to compress responses, a message of at
 /// least 32 KiB leaves the generated server as this buffer, without the copy
-/// into tonic's encode buffer, when the allocation behind it is known and at
-/// most [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`]. Otherwise it leaves
-/// as copied pieces.
+/// into tonic's encode buffer, when the allocation behind it is known, at most
+/// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`], and at most twice the
+/// message. Otherwise it leaves as copied pieces.
 #[derive(Clone, Debug)]
 pub struct EncodedBlock {
     message: Bytes,
@@ -76,7 +76,8 @@ impl PartialEq for EncodedBlock {
 impl Eq for EncodedBlock {}
 
 /// Response extension on a `GetBlockRange` response whose body keeps, behind
-/// every data chunk, an allocation of at most [`Self::MAX_ALLOCATION_BYTES`].
+/// every data chunk, an allocation of at most [`Self::MAX_ALLOCATION_BYTES`]
+/// and at most twice the chunk.
 ///
 /// A response layer may then hand slices of the chunks to the transport
 /// instead of copies, because a slice held by a stalled stream pins at most
@@ -156,8 +157,9 @@ impl EncodedBlock {
     ///
     /// The server can then hand the message to the transport without a copy
     /// when that allocation is at most
-    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`]. The caller vouches for
-    /// `allocation_len`, because it bounds what a stalled client can pin.
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`] and at most twice the
+    /// message. The caller vouches for `allocation_len`, because it bounds
+    /// what a stalled client can pin.
     ///
     /// # Errors
     ///
@@ -178,10 +180,14 @@ impl EncodedBlock {
     }
 
     /// Returns whether the message's known allocation fits the bound a
-    /// transport may retain without copying.
+    /// transport may retain without copying: at most
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`], and at most twice the
+    /// message, so a slice never pins much more than it carries.
     fn may_be_sliced(&self) -> bool {
-        self.allocation_len
-            .is_some_and(|len| len <= BoundedChunkRetention::MAX_ALLOCATION_BYTES)
+        self.allocation_len.is_some_and(|len| {
+            len <= BoundedChunkRetention::MAX_ALLOCATION_BYTES
+                && len <= self.message.len().saturating_mul(2)
+        })
     }
 
     /// Returns the whole message, gRPC prefix included.
@@ -334,9 +340,10 @@ const COPIED_PIECE_BYTES: usize = 64 * 1024;
 /// after the messages already sent.
 ///
 /// Every data chunk keeps at most [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`]
-/// alive: a batch is an allocation of its own of under twice [`BATCH_BYTES`],
-/// a large message within the bound is sent as its own buffer, and any other
-/// large message is copied into pieces of at most [`COPIED_PIECE_BYTES`].
+/// and at most twice its own bytes alive: a batch is an allocation of its own
+/// of under twice [`BATCH_BYTES`], a large message within both bounds is sent
+/// as its own buffer, and any other large message is copied into pieces of at
+/// most [`COPIED_PIECE_BYTES`].
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,

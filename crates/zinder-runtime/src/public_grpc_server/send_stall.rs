@@ -159,22 +159,22 @@ enum Pieces {
     /// Copies, so a held piece pins only itself.
     Copied,
     /// Slices of the handler's chunks, each of which pins at most
-    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`].
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`] and at most twice its
+    /// bytes.
     Sliced,
 }
 
 impl Pieces {
-    /// Slices only a native gRPC response that zinder-proto's range body
-    /// marked. Other encodings, such as base64 gRPC-Web, rewrite chunks into
-    /// allocations the marker does not bound.
+    /// Slices only a response that zinder-proto's range body marked.
+    ///
+    /// Layers outside this one, such as gRPC-Web, see the slices: binary
+    /// gRPC-Web passes them on unchanged, and base64 gRPC-Web re-encodes each
+    /// into a buffer of its own and drops it.
     fn for_response<B>(response: &http::Response<B>) -> Self {
-        let native = response.headers().get(http::header::CONTENT_TYPE)
-            == Some(&tonic::metadata::GRPC_CONTENT_TYPE);
-        if native
-            && response
-                .extensions()
-                .get::<BoundedChunkRetention>()
-                .is_some()
+        if response
+            .extensions()
+            .get::<BoundedChunkRetention>()
+            .is_some()
         {
             Self::Sliced
         } else {
@@ -537,7 +537,8 @@ mod tests {
         let handler_body = Body::new(StreamBody::new(
             tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
         ));
-        let mut body = SendStallBoundBody::new(handler_body, Duration::from_hours(1), None);
+        let mut body =
+            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Copied);
 
         let first = body
             .frame()

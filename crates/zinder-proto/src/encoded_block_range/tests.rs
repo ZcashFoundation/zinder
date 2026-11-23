@@ -338,11 +338,14 @@ fn in_allocation(payload: &[u8], allocation: usize) -> eyre::Result<EncodedBlock
 }
 
 #[test]
-fn a_large_message_in_an_allocation_at_the_bound_is_sent_as_itself() -> eyre::Result<()> {
-    let block = in_allocation(&payload(97_000, 1), CAP)?;
-    let frames = large_message_frames(block.clone())?;
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].as_ptr(), block.as_length_prefixed().as_ptr());
+fn a_large_message_in_an_allocation_at_the_bounds_is_sent_as_itself() -> eyre::Result<()> {
+    let at_cap = in_allocation(&payload(CAP / 2, 1), CAP)?;
+    let at_twice = in_allocation(&payload(40_000, 2), 2 * (40_000 + EncodedBlock::PREFIX_LEN))?;
+    for block in [at_cap, at_twice] {
+        let frames = large_message_frames(block.clone())?;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_ptr(), block.as_length_prefixed().as_ptr());
+    }
     Ok(())
 }
 
@@ -352,7 +355,12 @@ fn a_large_message_over_the_bound_or_of_unknown_allocation_is_sent_as_copied_pie
     let over = in_allocation(&payload(97_000, 2), CAP + 1)?;
     let unknown = EncodedBlock::from_length_prefixed(over.as_length_prefixed().clone())?;
     let oversized = framed(&payload(CAP + 1, 3))?;
-    for block in [over, unknown, oversized] {
+    let sparse_len = 40_000;
+    let sparse = in_allocation(
+        &payload(sparse_len, 4),
+        2 * (sparse_len + EncodedBlock::PREFIX_LEN) + 1,
+    )?;
+    for block in [over, unknown, oversized, sparse] {
         let frames = large_message_frames(block.clone())?;
         let message = block.as_length_prefixed();
         assert_eq!(frames.concat(), message.as_ref());
