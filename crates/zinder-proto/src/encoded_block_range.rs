@@ -340,14 +340,16 @@ const COPIED_PIECE_BYTES: usize = 64 * 1024;
 /// after the messages already sent.
 ///
 /// Every data chunk keeps at most [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`]
-/// and at most twice its own bytes alive: a batch is an allocation of its own
-/// of under twice [`BATCH_BYTES`], a large message within both bounds is sent
-/// as its own buffer, and any other large message is copied into pieces of at
-/// most [`COPIED_PIECE_BYTES`].
+/// and at most twice its own bytes alive: a batch is copied into an allocation
+/// of exactly its length, a large message within both bounds is sent as its
+/// own buffer, and any other large message is copied into pieces of at most
+/// [`COPIED_PIECE_BYTES`].
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,
-    batch: Vec<u8>,
+    /// Short messages waiting to be copied into one batch.
+    batch: Vec<Bytes>,
+    batch_len: usize,
     /// The unsent part of a large message, sent after the batch.
     large: Bytes,
     /// Whether `large` is sent as copied pieces instead of as itself.
@@ -362,6 +364,7 @@ impl EncodedBlockBody {
             messages,
             max_message_size,
             batch: Vec::new(),
+            batch_len: 0,
             large: Bytes::new(),
             copy_large: false,
             status: None,
@@ -370,21 +373,25 @@ impl EncodedBlockBody {
     }
 
     fn take_batch(&mut self) -> Frame<Bytes> {
-        // A batch sent early, while the source waits, would otherwise keep
-        // its whole reservation alive for a few bytes. A full batch already
-        // fills at least half of it.
-        if self.batch.len() < BATCH_BYTES {
-            self.batch.shrink_to_fit();
+        // The source can yield early, so a batch's length is known only now.
+        // Copying the queued messages once into an exact allocation avoids
+        // both a reservation per batch and a shrink of an early one.
+        let mut batch = Vec::with_capacity(self.batch_len);
+        for message in self.batch.drain(..) {
+            batch.extend_from_slice(&message);
         }
-        Frame::data(Bytes::from(mem::take(&mut self.batch)))
+        self.batch_len = 0;
+        Frame::data(Bytes::from(batch))
     }
 
-    fn add_to_batch(&mut self, message: &[u8]) {
-        if self.batch.capacity() == 0 {
-            // Each batch is one allocation that later messages never share.
-            self.batch.reserve_exact(2 * BATCH_BYTES);
-        }
-        self.batch.extend_from_slice(message);
+    fn add_to_batch(&mut self, message: Bytes) {
+        self.batch_len += message.len();
+        self.batch.push(message);
+    }
+
+    fn clear_batch(&mut self) {
+        self.batch.clear();
+        self.batch_len = 0;
     }
 
     fn take_large(&mut self) -> Frame<Bytes> {
@@ -451,7 +458,7 @@ impl http_body::Body for EncodedBlockBody {
             if let Err(status) = this.check_size(&block) {
                 // tonic drops the messages it has batched but not yet sent
                 // when one fails to encode.
-                this.batch.clear();
+                this.clear_batch();
                 this.status = Some(status);
                 break;
             }
@@ -463,8 +470,8 @@ impl http_body::Body for EncodedBlockBody {
                 }
                 return Poll::Ready(Some(Ok(this.take_batch())));
             }
-            this.add_to_batch(&block.message);
-            if this.batch.len() >= BATCH_BYTES {
+            this.add_to_batch(block.message);
+            if this.batch_len >= BATCH_BYTES {
                 return Poll::Ready(Some(Ok(this.take_batch())));
             }
         }

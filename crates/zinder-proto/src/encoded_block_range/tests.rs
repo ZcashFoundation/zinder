@@ -378,28 +378,37 @@ fn a_large_message_over_the_bound_or_of_unknown_allocation_is_sent_as_copied_pie
 }
 
 #[test]
-fn a_sent_batch_owns_its_allocation() -> eyre::Result<()> {
+fn a_sent_batch_owns_an_allocation_of_its_length() -> eyre::Result<()> {
+    // A full batch, then one sent early while the source waits.
     let script = [
         Some(Ok(framed(&payload(20_000, 1))?)),
         Some(Ok(framed(&payload(20_000, 2))?)),
-        Some(Ok(framed(&payload(20_000, 3))?)),
+        Some(Ok(framed(&payload(300, 3))?)),
+        None,
     ];
     let mut body = pin!(EncodedBlockBody::new(
         Box::pin(Scripted(script.into_iter().collect())),
         None
     ));
-    let Poll::Ready(Some(frame)) = body
-        .as_mut()
-        .poll_frame(&mut Context::from_waker(Waker::noop()))
-    else {
-        return Err(eyre!("expected a batch"));
-    };
-    let mut batch = frame?
-        .into_data()
-        .map_err(|_| eyre!("expected message bytes"))?;
-    assert_eq!(batch.len(), 2 * (20_000 + EncodedBlock::PREFIX_LEN));
-    assert!(batch.is_unique(), "the body kept a handle on the batch");
-    batch.clear();
+    for expected_len in [
+        2 * (20_000 + EncodedBlock::PREFIX_LEN),
+        300 + EncodedBlock::PREFIX_LEN,
+    ] {
+        let Poll::Ready(Some(frame)) = body
+            .as_mut()
+            .poll_frame(&mut Context::from_waker(Waker::noop()))
+        else {
+            return Err(eyre!("expected a batch"));
+        };
+        let batch = frame?
+            .into_data()
+            .map_err(|_| eyre!("expected message bytes"))?;
+        assert_eq!(batch.len(), expected_len);
+        let owned = batch
+            .try_into_mut()
+            .map_err(|_| eyre!("the body kept a handle on the batch"))?;
+        assert_eq!(owned.capacity(), expected_len);
+    }
     Ok(())
 }
 

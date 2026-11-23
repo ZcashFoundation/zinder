@@ -383,10 +383,12 @@ that is waiting for the server to produce its next message is not affected.
 
 Abandoning a response does not release what HTTP/2 holds for it: up to about
 528 KiB of response data (the 400 KiB send buffer, one piece queued past it,
-and one waiting for flow-control window) and the stream's place among its
+and one waiting for flow-control window), held in up to about 592 KiB of
+buffers because a partly sent piece still owns its whole buffer, and the
+stream's place among its
 connection's 200 streams. These stay until the client reads them, resets the
 stream, or closes the connection. A client that keeps answering keepalive
-pings keeps its connection open, so one connection can keep about 103 MiB
+pings keeps its connection open, so one connection can keep about 116 MiB
 this way with no time limit, and the proxy's per-client connection limit is
 the only bound across the listener. A `GetBlockRange` response on the
 lightwalletd listener hands HTTP/2 slices of its stored blocks instead of
