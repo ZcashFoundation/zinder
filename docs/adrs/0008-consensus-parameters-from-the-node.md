@@ -13,7 +13,7 @@ The table also changes over time. A node release can announce a future upgrade, 
 ## Decision
 
 1. **The running node is the source of truth on every network**, Mainnet and Testnet included. Zinder reads the table from the node's `getblockchaininfo.upgrades` and carries upgrade names verbatim, so a new upgrade needs no Zinder code change. Production code never consults library-default activation constants.
-2. **Only the canonical writer asks the node.** Ingest reads the table at startup, after it has checked that the node's genesis block matches the configured network.
+2. **Only the canonical writer admits the table.** Ingest reads the table at startup, after it has checked that the node's genesis block matches the configured network. A reader that verifies a node endpoint for broadcast or node-backed reads also reads that node's table, only to compare it with the admitted schedule.
 3. **Consumers receive the table when they are built.** No component falls back to the pre-Overwinter branch id when the table is missing. A misconfigured component refuses to start instead of reporting branch id 0 forever.
 4. **The writer admits each new table as a revision.** The table fingerprinted at construction stays immutable. When ingest opens a ready store, it compares the node's table with the store:
    - Before the first revision, the node's table must extend the construction table with entries that activate above the visible tip.
@@ -42,3 +42,7 @@ The table also changes over time. A node release can announce a future upgrade, 
 - **Rewriting the construction fingerprint.** The construction manifest binds that fingerprint, so the store would stop matching the manifest it was published with. A separate revision journal keeps construction identity fixed.
 - **Letting each reader accept its own node's table.** Readers attached to different nodes could serve different future activations, and checkpoints would have no single schedule identity.
 - **Comparing switch targets without upgrade names.** Admission at store open compares names, so a restart could refuse an endpoint that the running writer had accepted. One plain-equality rule keeps startup and switching consistent.
+
+## Revision history
+
+- 2026-11-23. Decision 2 says readers read a node's table only to verify an endpoint.
