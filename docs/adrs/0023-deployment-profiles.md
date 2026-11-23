@@ -53,7 +53,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 ## Consequences
 
 - An operator sets one value for ingest and compatibility instead of several settings that must agree.
-- Forwarding suits shielded scanning and not transparent-heavy wallets. Forwarded address history costs node calls that grow with the number of returned rows, and concurrent history requests are admitted one at a time. A deployment whose wallets are transparent-heavy runs the wallet deployment instead. [#378](https://github.com/ZcashFoundation/zinder/issues/378) records the measurements.
+- Forwarding suits shielded scanning and not transparent-heavy wallets. Forwarded address history costs node calls that grow with the number of returned rows. Each listener [bounds concurrent requests and the time each can hold a slot](../reference/lightwalletd-compatibility.md#gettaddresstxids-and-gettaddresstransactions). A deployment whose wallets are transparent-heavy runs the wallet deployment instead. [#378](https://github.com/ZcashFoundation/zinder/issues/378) records the measurements.
 - Node-backed answers are bound to the served tip, not pinned, and address history is best-effort ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7). [ADR-0016](0016-wallet-serving-readiness.md) describes what a light-wallet reader serves during a node outage.
 - The profile runs from the release's standalone binaries and needs no new executable ([ADR-0022](0022-release-artifacts.md)). The bundled wallet-serving image runs the wallet deployment and does not take a profile.
 - Because a store records no profile, a reader that needs less can open a richer store. A writer that should store less needs a new store.
@@ -70,3 +70,4 @@ A name for a deployment shape must not become a second source of truth. Capabili
 
 - 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.
 - 2026-11-23. Decision 4 distinguishes the wallet deployment's node calls from the Explorer's tip observation.
+- 2026-11-23. The consequences describe bounded forwarded history concurrency and request time.

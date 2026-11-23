@@ -87,7 +87,10 @@ Without the profile, both use the reader's configured
 `storage.raw_blob_policy`, which defaults to `transactions`.
 Set it to `none` explicitly to admit a store without transaction bodies. See
 [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection)
-for method behavior.
+for method behavior. Light-wallet serving uses fixed per-listener limits for
+[forwarded transactions](lightwalletd-compatibility.md#gettransaction),
+[address history](lightwalletd-compatibility.md#gettaddresstxids-and-gettaddresstransactions),
+and [unspent-output lookups](lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream).
 
 ## How configuration is loaded
 

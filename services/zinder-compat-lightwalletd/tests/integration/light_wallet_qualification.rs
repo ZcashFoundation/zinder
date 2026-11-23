@@ -259,56 +259,104 @@ fn verbose_reply(txid: &Value, height: u32) -> RpcReply {
 }
 
 #[tokio::test]
-async fn history_aliases_share_admission_until_the_stream_drains_or_is_dropped() -> Result<()> {
-    let tip = served_tip(4)?;
+async fn two_of_four_concurrent_history_requests_complete_while_a_reader_pauses() -> Result<()> {
     let (fixture, _) = history_fixture([
-        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1)),
-        method("getaddressutxos").reply_with(move |_| utxos_at(tip, &json!([]))),
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
     ])?;
-    let concurrent = fixture.adapter.clone();
-    for drain in [true, false] {
+    let adapter = &fixture.adapter;
+    let requests = (0..4).map(|index| async move {
+        if index % 2 == 0 {
+            adapter
+                .get_taddress_transactions(history_request(1, 1))
+                .await
+        } else {
+            adapter.get_taddress_txids(history_request(1, 1)).await
+        }
+    });
+    let mut streams = Vec::new();
+    for outcome in futures_util::future::join_all(requests).await {
+        match outcome {
+            Ok(response) => streams.push(response.into_inner()),
+            Err(status) => {
+                assert_eq!(status.code(), Code::ResourceExhausted);
+                assert!(status.message().contains("retry with backoff"));
+            }
+        }
+    }
+    let admitted = streams.len();
+    if let Some(mut slow) = streams.pop() {
+        assert!(slow.next().await.transpose()?.is_some());
+        for mut other in streams {
+            assert!(other.next().await.transpose()?.is_some());
+            assert!(other.next().await.transpose()?.is_some());
+            assert!(other.next().await.is_none());
+        }
+        assert!(slow.next().await.transpose()?.is_some());
+        assert!(slow.next().await.is_none());
+    }
+    assert_eq!(admitted, 2, "completed history requests out of four");
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_deadline_releases_admission_without_polling_a_slow_response() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
+    ])?;
+    let mut paused = Vec::new();
+    for _ in 0..2 {
         let mut history = fixture
             .adapter
             .get_taddress_transactions(history_request(1, 1))
             .await?
             .into_inner();
         assert!(history.next().await.transpose()?.is_some());
-        let before = fixture.node.requests()?.len();
-        let refused = concurrent
-            .get_taddress_txids(history_request(1, 1))
-            .await
-            .err()
-            .ok_or_else(|| eyre!("a second request bypassed history admission"))?;
-        assert_eq!(refused.code(), Code::ResourceExhausted);
-        assert_eq!(fixture.node.requests()?.len(), before);
-        concurrent.get_address_utxos(utxo_request(0)).await?;
-
-        if drain {
-            assert!(history.next().await.transpose()?.is_some());
-            assert!(history.next().await.is_none());
-        } else {
-            drop(history);
-        }
-        concurrent.get_taddress_txids(history_request(1, 1)).await?;
+        paused.push(history);
     }
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+
+    let first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    let second = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    for mut history in paused {
+        assert!(
+            matches!(history.next().await, Some(Err(status)) if status.code() == Code::DeadlineExceeded)
+        );
+        assert!(history.next().await.is_none());
+    }
+    drop((first, second));
     Ok(())
 }
 
 #[tokio::test]
 async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
-    let page_requested = Arc::new(tokio::sync::Notify::new());
-    let received = Arc::clone(&page_requested);
+    let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (resume_node, paused_node) = std::sync::mpsc::channel::<()>();
     let paused_node = parking_lot::Mutex::new(paused_node);
     let (fixture, _) = history_fixture([method("getaddresstxids").reply_with(move |_| {
-        received.notify_one();
+        let _ = entered.send(());
         let _ = paused_node.lock().recv();
         RpcReply::result(json!([]))
     })])?;
-    let mut pending = fixture.adapter.get_taddress_txids(history_request(1, 1));
-    tokio::select! {
-        _ = &mut pending => return Err(eyre!("first history request completed before cancellation")),
-        () = page_requested.notified() => {}
+    let mut first = fixture.adapter.get_taddress_txids(history_request(1, 1));
+    let mut second = fixture.adapter.get_taddress_txids(history_request(1, 1));
+    for _ in 0..2 {
+        tokio::select! {
+            _ = &mut first => return Err(eyre!("first history request completed before cancellation")),
+            _ = &mut second => return Err(eyre!("second history request completed before cancellation")),
+            arrived = arrivals.recv() => {
+                arrived.ok_or_else(|| eyre!("node stopped before receiving the page request"))?;
+            }
+        }
     }
     let before = fixture.node.requests()?.len();
     let refused = fixture
@@ -316,11 +364,12 @@ async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
         .get_taddress_transactions(history_request(1, 1))
         .await
         .err()
-        .ok_or_else(|| eyre!("history stream bypassed a pending page fetch"))?;
+        .ok_or_else(|| eyre!("history stream bypassed two pending page fetches"))?;
     assert_eq!(refused.code(), Code::ResourceExhausted);
     assert_eq!(fixture.node.requests()?.len(), before);
-    drop(pending);
+    drop(first);
     drop(resume_node);
+    second.await?;
     fixture
         .adapter
         .get_taddress_transactions(history_request(1, 1))
@@ -1310,37 +1359,35 @@ async fn a_node_that_supplies_the_complete_utxo_page_needs_one_read() -> Result<
 }
 
 #[tokio::test]
-async fn utxo_admission_is_shared_until_the_stream_drains_or_is_dropped() -> Result<()> {
+async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance() -> Result<()> {
     let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
-    let concurrent = fixture.adapter.clone();
+    let adapter = &fixture.adapter;
     for cancel in [false, true] {
-        let mut stream = fixture
-            .adapter
+        let mut first = adapter
             .get_address_utxos_stream(utxo_request(2))
             .await?
             .into_inner();
-        assert!(stream.next().await.transpose()?.is_some());
+        assert!(first.next().await.transpose()?.is_some());
+        let second = adapter.get_address_utxos_stream(utxo_request(2)).await?;
         let before = fixture.node.requests_for("getaddressutxos")?.len();
-        let refused = concurrent
+        let refused = adapter
             .get_address_utxos(utxo_request(2))
             .await
             .err()
-            .ok_or_else(|| eyre!("a second request bypassed UTXO admission"))?;
+            .ok_or_else(|| eyre!("a third request bypassed UTXO response admission"))?;
         assert_eq!(refused.code(), Code::ResourceExhausted);
-        let balance = concurrent
-            .get_taddress_balance(balance_request())
-            .await
-            .err()
-            .ok_or_else(|| eyre!("a balance bypassed UTXO admission"))?;
-        assert_eq!(balance.code(), Code::ResourceExhausted);
+        assert!(refused.message().contains("retry with backoff"));
         assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), before);
+        let balance = adapter.get_taddress_balance(balance_request()).await?;
+        assert_eq!(balance.into_inner().value_zat, 3);
         if cancel {
-            drop(stream);
+            drop(first);
         } else {
-            assert!(stream.next().await.transpose()?.is_some());
-            assert!(stream.next().await.is_none());
+            assert!(first.next().await.transpose()?.is_some());
+            assert!(first.next().await.is_none());
         }
         populated_wallet_utxos(&fixture, 2).await?;
+        drop(second);
     }
     Ok(())
 }

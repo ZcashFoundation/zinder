@@ -168,3 +168,29 @@ async fn default_client_streams_every_wallet_ordered_utxo() -> Result<()> {
     })
     .await
 }
+
+#[tokio::test]
+async fn a_slow_utxo_stream_leaves_node_admission_for_another_client() -> Result<()> {
+    with_client(async |mut client, script| {
+        let mut slow = client
+            .get_address_utxos_stream(request())
+            .await?
+            .into_inner();
+        let first = wallet_outputs(script)
+            .next()
+            .ok_or_else(|| eyre!("missing fixture output"))?;
+        assert_eq!(slow.message().await?, Some(first.clone()));
+        let fast = client
+            .clone()
+            .get_address_utxos(GetAddressUtxosArg {
+                max_entries: 1,
+                ..request()
+            })
+            .await?
+            .into_inner();
+        assert_eq!(fast.address_utxos, [first]);
+        assert_eq!(slow.message().await?, wallet_outputs(script).nth(1));
+        Ok(())
+    })
+    .await
+}

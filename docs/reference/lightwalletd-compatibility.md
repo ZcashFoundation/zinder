@@ -293,6 +293,8 @@ Wallet serving pins the history to one epoch. It reads 1,000 entries at a time a
 
 Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it checks the reported block and bytes against the local canonical location and replay digest, checks canonical order, and confirms the tip before sending the row. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
 
+A light-wallet listener admits up to two forwarded history requests across both methods. When both slots are in use, another request returns `RESOURCE_EXHAUSTED` and can retry with backoff. Each admitted request has 60 seconds from the start of node verification, including time spent waiting for the client to read. At that deadline it releases its slot and ends with `DEADLINE_EXCEEDED`.
+
 A failure can end either kind of stream after it has delivered rows. For forwarded history, a lost tip or unreachable node can return `UNAVAILABLE`, and a digest mismatch returns `DATA_LOSS`. Treat any stream that ends with an error as incomplete and request the range again.
 
 ### `GetTaddressBalance` and `GetTaddressBalanceStream`
@@ -315,6 +317,8 @@ One response returns at most 100,000 outputs. The handling of an oversized respo
 - In wallet serving, `GetAddressUtxos` reads every row before it answers. A request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
 - In wallet serving, `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. A later failure such as `CHAIN_EPOCH_PIN_UNAVAILABLE` also ends the stream after the rows already sent. Treat a stream that ends with an error as incomplete.
 - In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order.
+
+A light-wallet listener runs one node lookup at a time across the unspent-output and balance methods. Once it finishes fetching and checking the node's results, it releases the node slot so another lookup can start while a client reads its outputs. Two unspent-output responses can hold rows at a time, within the per-response row limit. When the node slot or both unspent-output response slots are in use, the affected request returns `RESOURCE_EXHAUSTED` and can retry with backoff.
 
 In wallet serving, both methods read each distinct address at one chain epoch and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
 

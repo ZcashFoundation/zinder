@@ -3,7 +3,10 @@
 use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter};
 
 use futures_util::{TryStreamExt as _, stream::try_unfold};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    time::{Instant, timeout_at},
+};
 use tokio_stream::{self as stream, Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address;
@@ -42,6 +45,9 @@ use crate::block_methods::{self, RequestedBlock, requested_block};
 use crate::compact_block_messages::CompactBlockShape;
 
 const FORWARDED_TRANSACTION_SLOTS: usize = 8;
+const FORWARDED_HISTORY_SLOTS: usize = 2;
+const FORWARDED_HISTORY_DEADLINE: Duration = Duration::from_secs(60);
+const FORWARDED_UTXO_RESPONSE_SLOTS: usize = 2;
 
 /// The canonical reader and node-backed methods for light-wallet serving.
 #[derive(Clone)]
@@ -49,6 +55,7 @@ pub struct QualificationWallet {
     slot: CanonicalReaderSlot,
     query: QualificationWalletQuery,
     utxo_slots: Arc<Semaphore>,
+    utxo_response_slots: Arc<Semaphore>,
     history_slots: Arc<Semaphore>,
     transaction_slots: Arc<Semaphore>,
     block_digests: BlockDigestCache,
@@ -111,7 +118,8 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             slot,
             query,
             utxo_slots: Arc::new(Semaphore::new(1)),
-            history_slots: Arc::new(Semaphore::new(1)),
+            utxo_response_slots: Arc::new(Semaphore::new(FORWARDED_UTXO_RESPONSE_SLOTS)),
+            history_slots: Arc::new(Semaphore::new(FORWARDED_HISTORY_SLOTS)),
             transaction_slots: Arc::new(Semaphore::new(FORWARDED_TRANSACTION_SLOTS)),
             block_digests: BlockDigestCache::default(),
         })
@@ -306,10 +314,16 @@ impl QualificationWallet {
             u32::try_from(request.start_height)
                 .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?,
         );
-        let permit = self.utxo_permit()?;
-        let node = self.node(&view).await?;
-        let mut rows =
-            wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?;
+        let response_permit = Arc::clone(&self.utxo_response_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted("node UTXO response limit reached; retry with backoff")
+            })?;
+        let mut rows = {
+            let _node_permit = self.utxo_permit()?;
+            let node = self.node(&view).await?;
+            wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?
+        };
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         if count == 0 {
             return Ok(Box::pin(stream::empty()));
@@ -324,12 +338,12 @@ impl QualificationWallet {
         rows.truncate(count);
         rows.shrink_to_fit();
         Ok(Box::pin(try_unfold(
-            (rows.into_iter(), permit),
-            |(mut rows, permit)| async move {
+            (rows.into_iter(), response_permit),
+            |(mut rows, response_permit)| async move {
                 let Some(row) = rows.next() else {
                     return Ok(None);
                 };
-                Ok(Some((utxo_reply(row)?, (rows, permit))))
+                Ok(Some((utxo_reply(row)?, (rows, response_permit))))
             },
         )))
     }
@@ -354,26 +368,34 @@ impl QualificationWallet {
             .try_acquire_owned()
             .map_err(|_| {
                 Status::resource_exhausted(
-                    "a node address history response is in progress; retry with backoff",
+                    "forwarded address history limit reached; retry with backoff",
                 )
             })?;
         let view = served_view(&reader)?;
         drop(reader);
-        let node = self.node(&view).await?;
-        NodeAddressHistory {
-            node: node.clone(),
-            slot: self.slot.clone(),
-            lookup,
-            pending: vec![(range.start_height, range.end_height)],
-            served: view.tip,
-            page: IntoIter::default(),
-            page_range: (range.start_height, range.end_height),
-            last_position: None,
-            block_digests: self.block_digests.clone(),
-            _permit: permit,
-        }
-        .into_stream()
+        let deadline = Instant::now() + FORWARDED_HISTORY_DEADLINE;
+        let history = timeout_at(deadline, async {
+            let node = self.node(&view).await?;
+            let mut history = NodeAddressHistory {
+                node: node.clone(),
+                slot: self.slot.clone(),
+                lookup,
+                pending: vec![(range.start_height, range.end_height)],
+                served: view.tip,
+                page: IntoIter::default(),
+                page_range: (range.start_height, range.end_height),
+                last_position: None,
+                block_digests: self.block_digests.clone(),
+            };
+            history.read_page().await?;
+            Ok::<_, Status>(history)
+        })
         .await
+        .map_err(|_| history_deadline_exceeded())??;
+        if history.page.as_slice().is_empty() && history.pending.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+        Ok(history.into_stream(permit, deadline))
     }
 }
 
@@ -573,16 +595,51 @@ struct NodeAddressHistory {
     page_range: (BlockHeight, BlockHeight),
     last_position: Option<(BlockHeight, u32)>,
     block_digests: BlockDigestCache,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl NodeAddressHistory {
-    async fn into_stream(mut self) -> Result<GrpcStream<lightwalletd::RawTransaction>, Status> {
-        self.read_page().await?;
-        if self.page.as_slice().is_empty() && self.pending.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-        Ok(Box::pin(try_unfold(self, Self::next)))
+    fn into_stream(
+        mut self,
+        permit: OwnedSemaphorePermit,
+        deadline: Instant,
+    ) -> GrpcStream<lightwalletd::RawTransaction> {
+        let (demand, mut requests) = mpsc::channel(1);
+        let (rows, received) = mpsc::channel(1);
+        // Fetch on demand, but keep the deadline and permit in the worker so
+        // an unpolled response cannot keep node admission after it expires.
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            timeout_at(deadline, async {
+                while requests.recv().await.is_some() {
+                    let row = tokio::select! {
+                        biased;
+                        () = rows.closed() => return Ok::<_, Status>(()),
+                        row = self.next() => row?,
+                    };
+                    let Some(row) = row else {
+                        return Ok(());
+                    };
+                    if rows.send(row).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| history_deadline_exceeded())?
+        });
+        Box::pin(try_unfold(
+            (demand, received, task),
+            |(demand, mut received, task)| async move {
+                let _ = demand.send(()).await;
+                if let Some(row) = received.recv().await {
+                    return Ok(Some((row, (demand, received, task))));
+                }
+                task.await
+                    .map_err(|error| Status::internal(error.to_string()))??;
+                Ok(None)
+            },
+        ))
     }
 
     async fn read_page(&mut self) -> Result<(), Status> {
@@ -653,7 +710,7 @@ impl NodeAddressHistory {
         self.block_digests.digest_of(&reader, location).await
     }
 
-    async fn next(mut self) -> Result<Option<(lightwalletd::RawTransaction, Self)>, Status> {
+    async fn next(&mut self) -> Result<Option<lightwalletd::RawTransaction>, Status> {
         loop {
             if let Some(id) = self.page.next() {
                 let reported = self
@@ -680,7 +737,7 @@ impl NodeAddressHistory {
                 self.verify_served_tip().await?;
                 self.last_position = Some(position);
                 self.page_range.0 = position.0;
-                return Ok(Some((row, self)));
+                return Ok(Some(row));
             }
             if self.pending.is_empty() {
                 self.verify_served_tip().await?;
@@ -689,6 +746,10 @@ impl NodeAddressHistory {
             self.read_page().await?;
         }
     }
+}
+
+fn history_deadline_exceeded() -> Status {
+    Status::deadline_exceeded("forwarded address history deadline exceeded; retry with backoff")
 }
 
 fn history_changed() -> Status {
