@@ -1532,15 +1532,19 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
     let (_store, reader) = reader(&chain)?;
     let reader = Arc::new(reader);
     let reads = CanonicalReaderSlot::new(Arc::clone(&reader));
-    for (first, heights) in [(1, 1..=7), (1_000, 995..=1_006)] {
+    // One- and two-segment catalogs, at the chain start and above it.
+    for (first, segments, heights) in [
+        (1, 1, 1..=7),
+        (1_000, 1, 995..=1_006),
+        (1_000, 2, 995..=1_008),
+    ] {
         let fixture = Fixture::new()?;
-        assert!(
-            fixture
-                .publisher_from(BlockHeight::new(first))?
-                .publish_next(&reader)?
-        );
+        let mut publisher = fixture.publisher_from(BlockHeight::new(first))?;
+        for _ in 0..segments {
+            assert!(publisher.publish_next(&reader)?);
+        }
         let catalog = Arc::new(fixture.catalog(None)?);
-        assert_eq!(catalog.bounds(), test_span(first, first + 1));
+        assert_eq!(catalog.bounds(), test_span(first, first + 2 * segments - 1));
         // Test every read against a contiguous live tail as well as the
         // signed catalog. An unfilled tail can only reduce what can use files.
         fill_tail(&catalog, &reader, test_span(first, 2_010)).await?;
@@ -1552,7 +1556,7 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
                 is_descending,
                 BlockRangeStreamLimit::new(NonZeroU32::MIN),
             );
-            if first == 1_000 && is_descending {
+            if first == 1_000 && segments == 1 && is_descending {
                 let mut chunks = BlockRangeChunks::new(test_span(999, 1_999), true);
                 chunks.advance(998);
                 assert_eq!(chunks.next_chunk(), Some(test_span(999, 1_001)));
@@ -1568,7 +1572,9 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
                     let first = BlockRangeChunks::new(chunk, is_descending);
                     assert_eq!(first.checked_heights(), None);
                     assert_published_read_admission(&range, &reads, first).await?;
-                    for previously_checked in [0, 1, 2, 3] {
+                    // Short earlier reads leave up to five checked heights,
+                    // enough for a retry that spans the whole catalog.
+                    for previously_checked in 0..=5 {
                         let kept = zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
                             - previously_checked;
                         let previous_range = if is_descending {
