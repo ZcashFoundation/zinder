@@ -1,23 +1,25 @@
 use std::time::Duration;
 
 use eyre::{Result, eyre};
+use http_body_util::{BodyExt as _, Full};
 use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{
-    Code,
-    transport::{Channel, Endpoint},
-};
+use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tonic::{Code, Status, body::Body, codegen::Bytes, transport::Channel};
+use tower::{Layer as _, ServiceExt as _};
 use zinder_core::{BlockId, Network, TransactionId, wire::encode_rpc_transaction_id_hex};
 use zinder_proto::compat::lightwalletd::{
-    AddressList, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList,
-    compact_tx_streamer_client::CompactTxStreamerClient,
+    GetAddressUtxosArg, GetAddressUtxosReply, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer as _,
 };
-use zinder_runtime::{ClientAddressSource, public_grpc_server};
+use zinder_runtime::{ClientAddressSource, GrpcSendStallLayer, public_grpc_server};
 use zinder_testkit::{ChainFixture, RpcReply, method};
 
-use super::{ADDRESS, Fixture, one_upgrade_per_height, utxos_at};
+use super::{
+    ADDRESS, Fixture, UtxoNode, balance_request, one_upgrade_per_height, populated_utxo_fixture,
+    utxo_request, utxos_at,
+};
 
 const HEIGHTS: u8 = 100;
 const OUTPUTS_PER_TX: i32 = 500;
@@ -98,25 +100,26 @@ fn wallet_outputs(script: &[u8]) -> impl Iterator<Item = GetAddressUtxosReply> {
 async fn with_client(
     check: impl AsyncFnOnce(CompactTxStreamerClient<Channel>, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    with_channel(async |channel, script| check(CompactTxStreamerClient::new(channel), script).await)
-        .await
-}
-
-async fn with_channel(check: impl AsyncFnOnce(Channel, &[u8]) -> Result<()>) -> Result<()> {
     let script = zinder_source::parse_transparent_address(ADDRESS)?.script();
     let fixture = fixture(script.as_raw_bytes())?;
+    with_fixture_client(fixture, async |client| {
+        check(client, script.as_raw_bytes()).await
+    })
+    .await
+}
+
+async fn with_fixture_client(
+    fixture: Fixture,
+    check: impl AsyncFnOnce(CompactTxStreamerClient<Channel>) -> Result<()>,
+) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
     let server = public_grpc_server(ClientAddressSource::Connection)
         .add_service(fixture.adapter.into_server())
         .serve_with_incoming(TcpListenerStream::new(listener));
     let request = async {
-        let channel = Endpoint::new(endpoint)?
-            .initial_stream_window_size(Some(64 * 1024))
-            .initial_connection_window_size(Some(16 * 1024 * 1024))
-            .connect()
-            .await?;
-        check(channel, script.as_raw_bytes()).await
+        let client = CompactTxStreamerClient::connect(endpoint).await?;
+        check(client).await
     };
     tokio::select! {
         stopped = server => Err(eyre!("gRPC server stopped during UTXO request: {stopped:?}")),
@@ -181,92 +184,101 @@ async fn default_client_streams_every_wallet_ordered_utxo() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_slow_utxo_stream_leaves_node_admission_for_another_client() -> Result<()> {
-    with_client(async |mut client, script| {
-        let mut slow = client
-            .get_address_utxos_stream(request())
-            .await?
-            .into_inner();
-        let first = wallet_outputs(script)
-            .next()
-            .ok_or_else(|| eyre!("missing fixture output"))?;
-        assert_eq!(slow.message().await?, Some(first.clone()));
-        let fast = client
-            .clone()
-            .get_address_utxos(GetAddressUtxosArg {
-                max_entries: 1,
-                ..request()
-            })
-            .await?
-            .into_inner();
-        assert_eq!(fast.address_utxos, [first]);
-        assert_eq!(slow.message().await?, wallet_outputs(script).nth(1));
-        Ok(())
-    })
-    .await
+async fn a_paused_utxo_stream_leaves_node_admission_for_another_call() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    let mut paused = fixture
+        .adapter
+        .get_address_utxos_stream(utxo_request(2))
+        .await?
+        .into_inner();
+    let first = paused
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| eyre!("missing first output"))?;
+    let fast = fixture
+        .adapter
+        .get_address_utxos(utxo_request(1))
+        .await?
+        .into_inner();
+    assert_eq!(fast.address_utxos, [first]);
+    assert!(paused.next().await.transpose()?.is_some());
+    assert!(paused.next().await.is_none());
+    Ok(())
+}
+
+fn unary_utxo_request() -> Result<http::Request<Body>> {
+    let request = utxo_request(1).into_inner();
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(request.encoded_len())?.to_be_bytes());
+    request.encode(&mut frame)?;
+    http::Request::post("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos")
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header(http::header::TE, "trailers")
+        .body(Body::new(Full::new(Bytes::from(frame))))
+        .map_err(Into::into)
 }
 
 #[tokio::test]
-async fn two_backpressured_unary_utxo_replies_refuse_a_third_but_allow_balance() -> Result<()> {
-    with_channel(async |channel, _| {
-        let mut raw_client =
-            tonic::client::Grpc::new(channel.clone()).max_decoding_message_size(16 * 1024 * 1024);
-        let mut replies = Vec::new();
-        for _ in 0..2 {
-            raw_client.ready().await?;
-            // Receive the unary call's headers without consuming its one
-            // message. Its data exceeds the HTTP/2 stream window.
-            let response = raw_client
-                .server_streaming::<_, GetAddressUtxosReplyList, _>(
-                    tonic::Request::new(request()),
-                    http::uri::PathAndQuery::from_static(
-                        "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos",
-                    ),
-                    tonic_prost::ProstCodec::default(),
-                )
-                .await?;
-            replies.push(response.into_inner());
-        }
-
-        let mut client = CompactTxStreamerClient::new(channel);
-        let small_request = || GetAddressUtxosArg {
-            max_entries: 1,
-            ..request()
-        };
-        let refused = client
-            .get_address_utxos(small_request())
+async fn two_unfinished_unary_utxo_bodies_refuse_a_third_but_allow_balance() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    let service = GrpcSendStallLayer::new(Duration::from_hours(1))
+        .layer(fixture.adapter.clone().into_server());
+    let unary = async || {
+        service
+            .clone()
+            .oneshot(unary_utxo_request()?)
             .await
-            .err()
-            .ok_or_else(|| eyre!("a third unary UTXO response was admitted"))?;
-        assert_eq!(refused.code(), Code::ResourceExhausted);
-        assert!(refused.message().contains("response limit"));
+            .map_err(eyre::Report::from)
+    };
+    let mut first = unary().await?.into_body();
+    let second = unary().await?.into_body();
+    // Hand off the first body's data and hold its terminal poll. The
+    // second body stays unpolled. Neither body needs a socket buffer.
+    let piece = first
+        .frame()
+        .await
+        .ok_or_else(|| eyre!("no unary data"))??;
+    assert!(piece.is_data());
+    let refusal = unary().await?;
+    let status = Status::from_header_map(refusal.headers())
+        .ok_or_else(|| eyre!("a third unary response was admitted"))?;
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("response limit"));
 
-        let balance = client
-            .get_taddress_balance(AddressList {
-                addresses: vec![ADDRESS.to_owned()],
-            })
-            .await?
-            .into_inner();
-        assert!(balance.value_zat > 0);
+    let balance = fixture
+        .adapter
+        .get_taddress_balance(balance_request())
+        .await?;
+    assert_eq!(balance.into_inner().value_zat, 3);
 
-        let mut first = replies
-            .pop()
-            .ok_or_else(|| eyre!("missing unary response"))?;
-        let rows = first
-            .message()
-            .await?
-            .ok_or_else(|| eyre!("missing unary reply"))?;
-        assert!(rows.encoded_len() > DEFAULT_DECODE_BYTES);
-        assert!(first.message().await?.is_none());
-        assert_eq!(
-            client
-                .get_address_utxos(small_request())
-                .await?
-                .into_inner()
-                .address_utxos
-                .len(),
-            1
-        );
+    let trailers = first
+        .frame()
+        .await
+        .ok_or_else(|| eyre!("no unary trailers"))??;
+    assert_eq!(
+        trailers
+            .trailers_ref()
+            .and_then(|trailers| trailers.get("grpc-status")),
+        Some(&http::HeaderValue::from_static("0"))
+    );
+    let third = unary().await?;
+    assert!(Status::from_header_map(third.headers()).is_none());
+    drop(second);
+    let fourth = unary().await?;
+    assert!(Status::from_header_map(fourth.headers()).is_none());
+    drop((piece, first, third, fourth));
+    Ok(())
+}
+
+#[tokio::test]
+async fn light_wallet_listener_returns_a_small_unary_utxo_reply() -> Result<()> {
+    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    with_fixture_client(fixture, async |mut client| {
+        let reply = client.get_address_utxos(utxo_request(1)).await?;
+        let outputs = reply.into_inner().address_utxos;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].address, ADDRESS);
         Ok(())
     })
     .await

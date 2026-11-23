@@ -148,10 +148,13 @@ async fn forwarded_transaction_admission() -> Result<()> {
     let (fixture, _) = mined_without_retention(id, timeout, |served| {
         [method("getrawtransaction").reply_with(move |_| {
             let _ = entered.send(());
-            let (released, ready) = &*node_gate;
-            let mut released = released.lock();
-            ready.wait_while_for(&mut released, |released| !*released, timeout);
-            if *released {
+            let released_in_time = {
+                let (released, ready) = &*node_gate;
+                let mut released = released.lock();
+                ready.wait_while_for(&mut released, |released| !*released, timeout);
+                *released
+            };
+            if released_in_time {
                 mined_reply(id, served, "55")
             } else {
                 RpcReply::error("test node gate did not release")
