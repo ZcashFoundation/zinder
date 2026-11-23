@@ -437,6 +437,10 @@ impl BlockMethods {
     }
 }
 
+fn chunk_budget(limit: Option<&BlockRangeStreamLimit>, max_bytes: usize) -> usize {
+    limit.map_or(max_bytes, |limit| limit.published_chunk_budget(max_bytes))
+}
+
 async fn published_read_permit(
     limit: Option<&BlockRangeStreamLimit>,
 ) -> Result<Option<OwnedSemaphorePermit>, Status> {
@@ -480,8 +484,9 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     let chunks = BlockRangeChunks::new(block_range, is_descending);
     let published_limit = chunks
         .next_chunk()
-        .and_then(|chunk| conversion.published_read_limit(chunk));
+        .and_then(|chunk| conversion.published_read_limit(chunk, None));
     let (view, read_permit) = first_chunk_view(reads, block_range.end, published_limit).await?;
+    let max_bytes = chunk_budget(published_limit, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES);
     let first_cancel = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
     let first_read = read_first_chunk(
@@ -489,6 +494,7 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         view,
         chunks,
         conversion.clone(),
+        max_bytes,
         first_cancel,
     );
     let (first_messages, later_chunks) = stream_slot
@@ -679,9 +685,13 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     type Block: RangeBlock + Send + 'static;
     type Message: Send + 'static;
 
-    /// Returns the published-read limit `chunk` waits on, when reading it can
-    /// open signed segment files.
-    fn published_read_limit(&self, _chunk: BlockHeightRange) -> Option<&BlockRangeStreamLimit> {
+    /// Returns the published-read limit if the offered chunk or its possible
+    /// retry can open signed segment files.
+    fn published_read_limit(
+        &self,
+        _chunk: BlockHeightRange,
+        _retry: Option<BlockHeightRange>,
+    ) -> Option<&BlockRangeStreamLimit> {
         None
     }
 
@@ -787,6 +797,7 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     view: Reads::View,
     mut chunks: BlockRangeChunks,
     conversion: Source,
+    max_bytes: usize,
     cancel: CancellationToken,
 ) -> Result<(ChunkMessages<Source::Message>, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
@@ -795,7 +806,7 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
-        max_bytes: BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
+        max_bytes,
         view: ChunkView::Captured(view),
         cancel,
     };
@@ -861,10 +872,12 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
         else {
             return;
         };
+        let checked = chunks.checked_heights();
+        let limit = conversion.published_read_limit(chunk, checked.map(|(range, _)| range));
         let read_permit = tokio::select! {
             biased;
             () = sink.closed() => return,
-            admission = published_read_permit(conversion.published_read_limit(chunk)) => match admission {
+            admission = published_read_permit(limit) => match admission {
                 Ok(permit) => permit,
                 Err(status) => { room.fill(vec![Err(status)]); return; }
             }
@@ -873,25 +886,26 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
             drop(read_permit);
             return;
         }
+        let max_bytes = chunk_budget(limit, BLOCK_RANGE_CHUNK_MAX_BYTES);
         let mut outcome = read_later_chunk(
             &reads,
             chunk,
             chunks,
             continuity,
-            (conversion.clone(), cancel.clone()),
+            (conversion.clone(), max_bytes, cancel.clone()),
         )
         .await;
         if let Err(status) = &outcome
             && status.code() == Code::NotFound
             && !sink.is_closed()
-            && let Some((checked, only_checked)) = chunks.checked_heights()
+            && let Some((checked, only_checked)) = checked
         {
             outcome = read_later_chunk(
                 &reads,
                 checked,
                 only_checked,
                 continuity,
-                (conversion.clone(), cancel.clone()),
+                (conversion.clone(), max_bytes, cancel.clone()),
             )
             .await;
         }
@@ -923,7 +937,7 @@ async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     chunk: BlockHeightRange,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    (conversion, cancel): (Source, CancellationToken),
+    (conversion, max_bytes, cancel): (Source, usize, CancellationToken),
 ) -> Result<
     (
         BlockRangeChunks,
@@ -935,7 +949,7 @@ async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
-        max_bytes: BLOCK_RANGE_CHUNK_MAX_BYTES,
+        max_bytes,
         view: ChunkView::Current,
         cancel,
     };

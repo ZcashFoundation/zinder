@@ -98,19 +98,16 @@ impl PublishedRangeRead {
         }
     }
 
-    /// Returns whether a read of `chunk`, or of the heights at the end it
-    /// sends first, can open signed segment files. A clipped read or a retry
-    /// of checked heights keeps that end, so an ascending chunk qualifies when
-    /// its start lies in the catalog and a descending one when it overlaps it.
+    /// Checks the whole offer. A descending offer that starts below the
+    /// catalog can join it only from a live tail above the catalog.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
         self.shape == CompactBlockShape::DEFAULT_RANGE
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
-                if self.is_descending {
-                    chunk.start <= coverage.end && coverage.start <= chunk.end
-                } else {
-                    (coverage.start..=coverage.end).contains(&chunk.start)
-                }
+                (coverage.start..=coverage.end).contains(&chunk.start)
+                    || (self.is_descending
+                        && chunk.start < coverage.start
+                        && coverage.end < chunk.end)
             })
     }
 
@@ -280,6 +277,35 @@ impl PublishedRangeRead {
         .await
     }
 
+    #[cfg(test)]
+    pub(super) async fn plan_can_read_signed_files<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        mut chunk: BlockHeightRange,
+    ) -> Result<bool, Status> {
+        let view = reads.capture_view().await?;
+        let plan = self
+            .resolve_plan(
+                reads,
+                (
+                    &view,
+                    Reads::view_chain_epoch(&view),
+                    reads.range_fence(&view),
+                    &CancellationToken::new(),
+                ),
+                (&mut chunk, usize::MAX),
+            )
+            .await;
+        match plan {
+            AnchorPlan::UseEncoded(_) => Ok(self.history.as_ref().is_some_and(|catalog| {
+                let bounds = catalog.bounds();
+                chunk.start <= bounds.end && bounds.start <= chunk.end
+            })),
+            AnchorPlan::FallbackNative => Ok(false),
+            AnchorPlan::Failed(status) => Err(status),
+        }
+    }
+
     async fn plan_with_tail<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
@@ -377,8 +403,11 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     fn published_read_limit(
         &self,
         chunk: BlockHeightRange,
+        retry: Option<BlockHeightRange>,
     ) -> Option<&crate::block_range::BlockRangeStreamLimit> {
-        self.reads_published_files(chunk).then_some(&self.limits)
+        (self.reads_published_files(chunk)
+            || retry.is_some_and(|checked| self.reads_published_files(checked)))
+        .then_some(&self.limits)
     }
 
     fn messages(&self, mut blocks: Vec<ReadBlock>) -> Result<ChunkMessages<EncodedBlock>, Status> {
@@ -406,9 +435,6 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
-        }
-        if self.reads_published_files(read.chunk) {
-            read.max_bytes = self.limits.published_chunk_budget(read.max_bytes);
         }
         if self.shape != CompactBlockShape::DEFAULT_RANGE {
             return native_chunk(reads, read, convert).await;
