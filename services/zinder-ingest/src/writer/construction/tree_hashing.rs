@@ -8,13 +8,13 @@
 //! so blocks reach the store in height order with the trees and checkpoints a
 //! serial loader produces.
 
-use std::{
-    collections::VecDeque,
-    num::NonZeroU32,
-    sync::mpsc::{Receiver, sync_channel},
-};
+use std::{collections::VecDeque, num::NonZeroU32};
 
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::{
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, oneshot},
+};
+use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulatorError,
     CommitmentTreeCheckpoint, CommitmentTreeSnapshot,
@@ -29,6 +29,9 @@ const MAX_PENDING_BLOCKS: usize = 64;
 /// Worker threads and the blocks whose checkpoints they are still deriving.
 pub(super) struct TreeHashers {
     workers: rayon::ThreadPool,
+    /// The runtime the loader's blocking thread waits on, so a wait for a
+    /// worker also ends when construction is cancelled.
+    runtime: Handle,
     /// Appended blocks in height order. An entry that failed to append ends
     /// the queue, so the blocks before it still reach the store first.
     pending: VecDeque<Result<PendingBuildBlock, CanonicalConstructionError>>,
@@ -38,7 +41,10 @@ pub(super) struct TreeHashers {
 impl TreeHashers {
     /// Starts `workers` hashing threads, or returns `None` for one worker,
     /// which hashes on the loader thread.
-    pub(super) fn start(workers: NonZeroU32) -> Result<Option<Self>, CanonicalConstructionError> {
+    pub(super) fn start(
+        workers: NonZeroU32,
+        runtime: Handle,
+    ) -> Result<Option<Self>, CanonicalConstructionError> {
         let threads = usize::try_from(workers.get()).unwrap_or(usize::MAX);
         if threads == 1 {
             return Ok(None);
@@ -64,6 +70,7 @@ impl TreeHashers {
             )?;
         Ok(Some(Self {
             workers,
+            runtime,
             pending: VecDeque::new(),
             max_pending: threads.saturating_mul(2).min(MAX_PENDING_BLOCKS),
         }))
@@ -119,12 +126,15 @@ impl TreeHashers {
     }
 
     fn spawn_job(&self, job: impl FnOnce() -> TreeWorkOutput + Send + 'static) -> PendingTreeWork {
-        let (sender, receiver) = sync_channel(1);
+        let (sender, receiver) = oneshot::channel();
         self.workers.spawn(move || {
             // The loader drops the receiver only when construction stops.
             let _loader_stopped = sender.send(job());
         });
-        PendingTreeWork { receiver }
+        PendingTreeWork {
+            receiver,
+            runtime: self.runtime.clone(),
+        }
     }
 }
 
@@ -145,7 +155,8 @@ pub(super) struct PendingBuildBlock {
 }
 
 pub(super) struct PendingTreeWork {
-    receiver: Receiver<TreeWorkOutput>,
+    receiver: oneshot::Receiver<TreeWorkOutput>,
+    runtime: Handle,
 }
 
 /// A block's checkpoint and final roots, derived on a worker.
@@ -156,14 +167,25 @@ pub(super) struct TreeWorkOutput {
 }
 
 impl PendingTreeWork {
-    /// Waits for the worker deriving this block's tree work.
-    pub(super) fn wait(self) -> Result<TreeWorkOutput, CanonicalConstructionError> {
-        self.receiver
-            .recv()
-            .map_err(|_| CanonicalConstructionError::LoaderTaskFailed {
-                reason: "a commitment-tree hashing worker stopped before finishing a block"
-                    .to_owned(),
-            })
+    /// Waits for the worker deriving this block's tree work, or until
+    /// `cancel` fires.
+    ///
+    /// Call it only from a blocking thread, never from async code.
+    pub(super) fn wait(
+        self,
+        cancel: &CancellationToken,
+    ) -> Result<TreeWorkOutput, CanonicalConstructionError> {
+        let Self { receiver, runtime } = self;
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(CanonicalConstructionError::Cancelled),
+                output = receiver => output.map_err(|_| CanonicalConstructionError::LoaderTaskFailed {
+                    reason: "a commitment-tree hashing worker stopped before finishing a block"
+                        .to_owned(),
+                }),
+            }
+        })
     }
 }
 
@@ -185,16 +207,25 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use tokio_util::sync::CancellationToken;
+
     use super::{CanonicalConstructionError, NonZeroU32, TreeHashers, TreeWorkOutput};
 
-    fn two_workers() -> Result<TreeHashers, Box<dyn std::error::Error>> {
-        TreeHashers::start(NonZeroU32::new(2).ok_or("two is non-zero")?)?
-            .ok_or_else(|| "two workers start a pool".into())
+    /// Starts two workers whose waits run on `runtime`.
+    fn two_workers(
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<TreeHashers, Box<dyn std::error::Error>> {
+        TreeHashers::start(
+            NonZeroU32::new(2).ok_or("two is non-zero")?,
+            runtime.handle().clone(),
+        )?
+        .ok_or_else(|| "two workers start a pool".into())
     }
 
     #[test]
-    fn one_worker_hashes_on_the_loader_thread() -> Result<(), CanonicalConstructionError> {
-        assert!(TreeHashers::start(NonZeroU32::MIN)?.is_none());
+    fn one_worker_hashes_on_the_loader_thread() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        assert!(TreeHashers::start(NonZeroU32::MIN, runtime.handle().clone())?.is_none());
         Ok(())
     }
 
@@ -202,24 +233,27 @@ mod tests {
     #[allow(clippy::panic, reason = "the test injects a worker panic")]
     fn a_panicking_worker_fails_its_block_instead_of_the_process()
     -> Result<(), Box<dyn std::error::Error>> {
-        let tree_hashers = two_workers()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let tree_hashers = two_workers(&runtime)?;
+        let cancel = CancellationToken::new();
         assert!(matches!(
             tree_hashers
                 .spawn_job(|| std::panic::panic_any("injected worker failure"))
-                .wait(),
+                .wait(&cancel),
             Err(CanonicalConstructionError::LoaderTaskFailed { .. })
         ));
         // The pool keeps running the next block's work.
         let next = tree_hashers.spawn_job(TreeWorkOutput::default);
         drop(tree_hashers);
-        assert!(next.wait().is_ok());
+        assert!(next.wait(&cancel).is_ok());
         Ok(())
     }
 
     #[test]
     fn stopping_while_a_worker_hashes_returns_without_waiting_for_it()
     -> Result<(), Box<dyn std::error::Error>> {
-        let tree_hashers = two_workers()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let tree_hashers = two_workers(&runtime)?;
         let inside_job = Arc::new(Barrier::new(2));
         let release_job = Arc::new(Barrier::new(2));
         let pending = {
@@ -239,6 +273,50 @@ mod tests {
         drop(tree_hashers);
         assert!(stopped_at.elapsed() < Duration::from_secs(1));
         release_job.wait();
+        Ok(())
+    }
+
+    #[test]
+    fn a_loader_waiting_on_a_held_worker_stops_when_construction_is_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let tree_hashers = two_workers(&runtime)?;
+        let inside_job = Arc::new(Barrier::new(2));
+        let release_job = Arc::new(Barrier::new(2));
+        let oldest = {
+            let inside_job = Arc::clone(&inside_job);
+            let release_job = Arc::clone(&release_job);
+            tree_hashers.spawn_job(move || {
+                inside_job.wait();
+                release_job.wait();
+                TreeWorkOutput::default()
+            })
+        };
+        inside_job.wait();
+        let cancel = CancellationToken::new();
+        let (waiting_sender, waiting) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                let _test_listening = waiting_sender.send(());
+                oldest.wait(&cancel)
+            }
+        });
+        waiting.recv()?;
+        // The loader is in, or about to enter, its wait for the held job.
+        std::thread::sleep(Duration::from_millis(50));
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let waited = loader.join().map_err(|_| "loader thread panicked")?;
+        assert!(
+            matches!(waited, Err(CanonicalConstructionError::Cancelled)),
+            "a cancelled wait must report cancellation"
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        // The worker still holds the oldest job, and finishing it after the
+        // loader stopped is harmless.
+        release_job.wait();
+        drop(tree_hashers);
         Ok(())
     }
 }

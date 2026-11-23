@@ -882,7 +882,7 @@ where
         tree_hashing_workers,
         cancel,
     } = settings;
-    let tree_hashers = TreeHashers::start(tree_hashing_workers)?;
+    let tree_hashers = TreeHashers::start(tree_hashing_workers, tokio::runtime::Handle::current())?;
     let predecessor = builder.build_plan().history_predecessor();
     let predecessor_tip_metadata = predecessor.tip_metadata();
     let commitment_tree_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
@@ -1175,7 +1175,7 @@ impl CanonicalBuildBlockReceiver {
             return Ok(canonical_build_block(positioned, None, None));
         };
         let waited_at = Instant::now();
-        let output = tree_work.wait()?;
+        let output = tree_work.wait(&self.cancel)?;
         if work.checkpoint_required {
             self.stage_timers
                 .tree_hashing_checkpoint
