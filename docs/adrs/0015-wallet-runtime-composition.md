@@ -31,6 +31,10 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 [Wallet data plane](../architecture/wallet-data-plane.md) describes pinning and pair publication. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) lists the block-range outcomes.
 
+## Evidence
+
+- Decision 1, deployment profiles and serving settings are not capability evidence: judgment. The rejected alternative on capability profiles records the reason.
+
 ## Consequences
 
 - Operators choose a deployment profile, retention, and endpoints, and none of them is a capability claim. Invalid capability claims cannot be constructed.
@@ -66,3 +70,4 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - 2026-11-21. Specified trusted bootstrap and automatic catalog adoption for the single-host wallet Compose deployment.
 - 2026-11-23. Decision 1 separates deployment profiles, which select a composition, from capability evidence.
 - 2026-11-23. Decision 11 links the current signed settled-history section.
+- 2026-11-23. Evidence records what decision 1 rests on.
