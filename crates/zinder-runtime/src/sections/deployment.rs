@@ -71,3 +71,59 @@ impl DeploymentToml {
         self.profile.is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use eyre::{Result, eyre};
+    use zinder_core::{BlockHeight, Network};
+    use zinder_store::{CanonicalStoredData, RocksDbCanonicalSecondary, RocksDbResourceBudget};
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
+    };
+
+    use super::{DeploymentProfile, DeploymentSection};
+
+    #[test]
+    fn deployment_section_deserializes_light_wallet() -> Result<()> {
+        let section: DeploymentSection = toml::from_str("profile = \"light-wallet\"")?;
+        assert_eq!(section.profile, Some(DeploymentProfile::LightWallet));
+        Ok(())
+    }
+
+    #[test]
+    fn light_wallet_reader_admits_a_published_store_built_with_its_profile() -> Result<()> {
+        let profile = DeploymentProfile::LightWallet;
+        let stored_set = profile.canonical_stored_set();
+        let first = stored_set
+            .first_height(CanonicalStoredData::BlockHistory)
+            .ok_or_else(|| eyre!("the light-wallet profile needs block history"))?;
+        assert_eq!(first, BlockHeight::new(1));
+        assert_eq!(
+            stored_set.raw_blob_retention(),
+            zinder_store::RawBlobRetention::None
+        );
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(stored_set.raw_blob_retention())
+            .extend_blocks(2);
+        let activations = sample_regtest_upgrade_activations();
+        let writer =
+            CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+        let primary = writer.canonical_primary()?;
+        assert_eq!(
+            primary.build_plan().stored_set(primary.workload()),
+            stored_set
+        );
+        let directory = tempfile::tempdir()?;
+        let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+            writer.canonical_primary_path(),
+            directory.path(),
+            Network::ZcashRegtest,
+            profile.canonical_requirement(),
+            primary.reorg_policy(),
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reader.event_fence(), primary.event_fence());
+        assert!(reader.stored_set().subtree_root_coverage().is_some());
+        Ok(())
+    }
+}
