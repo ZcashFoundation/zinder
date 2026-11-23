@@ -38,6 +38,8 @@ type Replies<Reply> = BoxStream<'static, Result<Reply, Status>>;
 pub(super) enum RangeEnding {
     /// Nothing: the stream ends with an OK status.
     Clean,
+    /// Return OK without sending a block.
+    Empty,
     /// One more block, the height after the requested end.
     ExtraBlock,
     /// A failed status.
@@ -342,6 +344,7 @@ impl CompactTxStreamer for MockStreamer {
                 vec![Err(Status::deadline_exceeded("fixture stream interrupted"))]
             }
             RangeEnding::Clean => Vec::new(),
+            RangeEnding::Empty => return Ok(Response::new(stream::empty().boxed())),
             RangeEnding::ExtraBlock => vec![Ok(block(end + 1))],
             RangeEnding::Status(code) => vec![Err(Status::new(code, "stream failed at its end"))],
         };
