@@ -1573,9 +1573,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       value hashes batches of about 256 KiB of rows on that many threads while \
                       the build thread drains its sorters and writes SST files. At most twice \
                       that many batches, and never more than 64, are held at once. Cold \
-                      validation also reads the unspent and spent output families back in \
-                      that many outpoint key ranges at once. The published rows, digest, and \
-                      commitment do not change. Must be greater than zero.",
+                      validation also reads the unspent and spent output families back in up \
+                      to that many outpoint key ranges at once, at most one per 65,536 of \
+                      their rows. The published rows, digest, and commitment do not change. \
+                      Must be between 1 and 64; the projector refuses a larger value at \
+                      startup.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",

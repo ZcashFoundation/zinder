@@ -134,9 +134,13 @@ do not depend on the order rows are hashed in. Construction hashes rows on
 `projector.build.accumulator_hashing_workers` threads, in batches of about
 256 KiB, while the build thread drains its sorters and writes SST files. At
 most twice the worker count of batches, and never more than 64, are held at
-once. Cold validation reads the unspent and spent output families back in the
-same number of outpoint key ranges, each on its own thread, and checks every
-row as one scan would. Any worker count publishes the same rows and evidence.
+once. Cold validation reads the unspent and spent output families back in up
+to the same number of outpoint key ranges, at most one per 65,536 of their
+rows, each on its own thread, and checks every row as one scan would. The
+setting is at most 64; a build that asks for more is refused before it creates
+any wallet state. A thread that cannot start fails the build like any other
+error, so its lease is released. Any worker count publishes the same rows and
+evidence.
 
 **Following.** The projector applies each canonical chain event as one atomic
 write batch that also advances the wallet's source position. A transition that

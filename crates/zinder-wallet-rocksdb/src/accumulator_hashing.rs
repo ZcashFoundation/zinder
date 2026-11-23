@@ -150,6 +150,12 @@ impl HashingWorkers {
         network: Network,
         batch_target_bytes: usize,
     ) -> Result<Option<Self>, RocksDbWalletError> {
+        if workers.get() > crate::MAX_ACCUMULATOR_HASHING_WORKERS {
+            return Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+                workers: workers.get(),
+                maximum: crate::MAX_ACCUMULATOR_HASHING_WORKERS,
+            });
+        }
         let threads = usize::try_from(workers.get()).unwrap_or(usize::MAX);
         if threads == 1 {
             return Ok(None);

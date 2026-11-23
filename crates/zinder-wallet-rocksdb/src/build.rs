@@ -30,11 +30,18 @@ use crate::{
     projection_load::{
         PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
     },
-    store::{RocksDbWalletBuilder, WalletColdValidationConfig},
+    store::{MIN_PRIMARY_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
 const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
 const AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING: u32 = 4;
+
+/// Most accumulator hashing threads a wallet build uses.
+///
+/// Cold validation reads the primary output families in at most this many key
+/// ranges as well, so the setting also bounds its threads. A build that asks
+/// for more is refused before it creates any wallet state.
+pub const MAX_ACCUMULATOR_HASHING_WORKERS: u32 = 64;
 const BUILD_STAGE_DURATION_METRIC: &str = "zinder_wallet_projection_build_stage_duration_seconds";
 
 /// Read-only canonical source sufficient for one fixed-tip wallet projection build.
@@ -240,9 +247,9 @@ pub struct RocksDbWalletBuildOptions {
     /// One hashes on the build's own thread. More hash bounded batches of rows
     /// on that many threads while the build thread drains the sorters and
     /// writes SST files. Cold validation also reads the unspent and spent
-    /// output families back in this many outpoint key ranges at once. The
-    /// accumulators do not depend on the row order, so the published evidence
-    /// does not change.
+    /// output families back in up to this many outpoint key ranges at once.
+    /// The accumulators do not depend on the row order, so the published
+    /// evidence does not change. At most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
     pub accumulator_hashing_workers: NonZeroU32,
 }
 
@@ -573,7 +580,7 @@ pub struct RocksDbWalletBuildOutcome {
 /// delegates authorization to its compare-exact lease boundary. A stale owner,
 /// generation, or expiry therefore cannot clear a lease acquired by another
 /// build after a recovery race.
-struct FailedWalletBuildLeaseCleanup {
+pub(crate) struct FailedWalletBuildLeaseCleanup {
     wallet_path: PathBuf,
     network: Network,
     resource_budget: RocksDbResourceBudget,
@@ -582,7 +589,7 @@ struct FailedWalletBuildLeaseCleanup {
 }
 
 impl FailedWalletBuildLeaseCleanup {
-    fn new(
+    pub(crate) fn new(
         wallet_path: &Path,
         network: Network,
         resource_budget: RocksDbResourceBudget,
@@ -597,7 +604,7 @@ impl FailedWalletBuildLeaseCleanup {
         }
     }
 
-    fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
+    pub(crate) fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
         self.lease = Some(lease);
         self.now = now;
     }
@@ -638,7 +645,7 @@ impl FailedWalletBuildLeaseCleanup {
     }
 }
 
-fn finish_failed_wallet_build<T>(
+pub(crate) fn finish_failed_wallet_build<T>(
     cleanup: &mut FailedWalletBuildLeaseCleanup,
     build_error: RocksDbWalletError,
 ) -> Result<T, RocksDbWalletError> {
@@ -745,6 +752,12 @@ where
     let lease_request = execution.lease_request();
     let now = execution.initial_now();
     let total_started = Instant::now();
+    if options.accumulator_hashing_workers.get() > MAX_ACCUMULATOR_HASHING_WORKERS {
+        return Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: options.accumulator_hashing_workers.get(),
+            maximum: MAX_ACCUMULATOR_HASHING_WORKERS,
+        });
+    }
     let wallet_path = wallet_path.as_ref();
     let build_lock = WalletBuildLock::acquire(wallet_path)?;
     remove_abandoned_build_paths(wallet_path, &build_lock)?;
@@ -861,6 +874,7 @@ where
             WalletColdValidationConfig {
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
                 primary_output_scan_ranges: options.accumulator_hashing_workers,
+                min_primary_rows_per_scan_range: MIN_PRIMARY_ROWS_PER_SCAN_RANGE,
             },
         )?;
         let cold_validation = phase_started.elapsed();

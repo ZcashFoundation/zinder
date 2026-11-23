@@ -950,6 +950,30 @@ fn acquire_owner_canonical_lease(
 }
 
 #[test]
+fn an_over_limit_hashing_worker_count_is_refused_before_building_state_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-over-limit-workers");
+    let options = RocksDbWalletBuildOptions {
+        accumulator_hashing_workers: std::num::NonZeroU32::new(65)
+            .ok_or("the test worker count must be nonzero")?,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+
+    assert!(matches!(
+        build_wallet_from_canonical(&canonical_store, &wallet_path, options),
+        Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: 65,
+            maximum: 64,
+        })
+    ));
+    assert!(!wallet_path.exists());
+    Ok(())
+}
+
+#[test]
 fn pre_promotion_error_releases_its_exact_lease_for_immediate_discard_and_retry()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

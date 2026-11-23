@@ -7,7 +7,10 @@ use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     ops::Range,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use zinder_rocksdb_bulk_load::{SortedVariableValues, VariableValueSorter};
@@ -191,10 +194,21 @@ pub(crate) struct ValidatedRocksDbWalletBuild {
 #[derive(Clone, Copy)]
 pub(crate) struct WalletColdValidationConfig {
     pub(crate) max_accounted_reorg_undo_bytes: u64,
-    /// Outpoint key ranges the primary output families are read back in, each
-    /// on its own thread.
+    /// Requested outpoint key ranges the primary output families are read
+    /// back in, each on its own thread.
     pub(crate) primary_output_scan_ranges: NonZeroU32,
+    /// Fewest primary output rows each requested range must cover; smaller
+    /// stores use fewer ranges.
+    pub(crate) min_primary_rows_per_scan_range: NonZeroU64,
 }
+
+/// Fewest primary output rows a production cold-validation range covers.
+///
+/// A store with fewer rows than this reads its primary families on one thread.
+pub(crate) const MIN_PRIMARY_ROWS_PER_SCAN_RANGE: NonZeroU64 = match NonZeroU64::new(1 << 16) {
+    Some(rows) => rows,
+    None => NonZeroU64::MIN,
+};
 
 /// Explicit bounded resources for one independent cold semantic re-derivation.
 #[derive(Clone, Copy)]
@@ -2263,7 +2277,7 @@ fn validate_ready_rows_by_readback(
         network,
         &counts,
         &expected_undo,
-        config.primary_output_scan_ranges,
+        primary_output_scan_range_count(&config, &counts),
     )?;
     let concurrent_family_readback = readback_started.elapsed();
     let expected_undo = expected_undo.into_inner();
@@ -2320,14 +2334,14 @@ fn read_back_large_families(
     primary_output_scan_ranges: NonZeroU32,
 ) -> Result<ConcurrentFamilyReadback, RocksDbWalletError> {
     let (primary, address_index, address_transactions) = std::thread::scope(|scope| {
-        let address_index_worker = scope.spawn(|| {
+        let address_index_worker = spawn_validation_scan(scope, || {
             let started = Instant::now();
             let mut family_digest = WalletProjectionDigestBuilder::new();
             let balance_total_zat =
                 read_back_address_index_and_balance_rows(bounded_open, &mut family_digest, counts)?;
             Ok::<_, RocksDbWalletError>((family_digest, balance_total_zat, started.elapsed()))
-        });
-        let address_transaction_worker = scope.spawn(|| {
+        })?;
+        let address_transaction_worker = spawn_validation_scan(scope, || {
             let started = Instant::now();
             let mut family_digest = WalletProjectionDigestBuilder::new();
             read_back_address_transaction_rows(
@@ -2336,7 +2350,7 @@ fn read_back_large_families(
                 counts.transparent_address_transaction_count,
             )?;
             Ok::<_, RocksDbWalletError>((family_digest, started.elapsed()))
-        });
+        })?;
         let started = Instant::now();
         let primary = read_back_primary_output_rows(
             bounded_open,
@@ -2346,16 +2360,12 @@ fn read_back_large_families(
             primary_output_scan_ranges,
         )
         .map(|(family_digest, utxo_summary)| (family_digest, utxo_summary, started.elapsed()));
-        (
+        Ok::<_, RocksDbWalletError>((
             primary,
-            address_index_worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            address_transaction_worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-        )
-    });
+            join_validation_scan(address_index_worker),
+            join_validation_scan(address_transaction_worker),
+        ))
+    })?;
     let (mut digest, utxo_summary, primary_output_scan) = primary?;
     let (address_index_digest, indexed_balance_zat, address_index_and_balance_readback) =
         address_index?;
@@ -2374,6 +2384,50 @@ fn read_back_large_families(
         address_index_and_balance_readback,
         address_transaction_readback,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to refuse a cold-validation thread started from this
+    /// thread, as an operating system does when it has no thread left. It
+    /// holds how many more starts succeed before the refused one.
+    static REFUSED_VALIDATION_THREAD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Starts one cold-validation scan on its own thread in `scope`.
+///
+/// A refused thread start is an error, not a panic, so the build fails through
+/// its ordinary error path and releases its lease.
+fn spawn_validation_scan<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    scan: impl FnOnce() -> T + Send + 'scope,
+) -> Result<std::thread::ScopedJoinHandle<'scope, T>, RocksDbWalletError> {
+    #[cfg(test)]
+    match REFUSED_VALIDATION_THREAD.get() {
+        Some(0) => {
+            REFUSED_VALIDATION_THREAD.set(None);
+            return Err(RocksDbWalletError::ColdValidationThreadUnavailable {
+                reason: "thread start refused by the test".to_owned(),
+            });
+        }
+        Some(remaining) => REFUSED_VALIDATION_THREAD.set(Some(remaining - 1)),
+        None => {}
+    }
+    std::thread::Builder::new()
+        .name("zinder-wallet-validate".to_owned())
+        .spawn_scoped(scope, scan)
+        .map_err(
+            |source| RocksDbWalletError::ColdValidationThreadUnavailable {
+                reason: source.to_string(),
+            },
+        )
+}
+
+fn join_validation_scan<T>(worker: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    worker
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Re-derives the address-ordered families from the primary output rows through
@@ -2697,14 +2751,36 @@ fn validate_primary_output_rows(
     expected_undo: &SharedExpectedReorgUndoSuffix,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
 ) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
-    scan_primary_output_range(
-        bounded_open,
-        network,
-        &OutpointKeyRange::ALL,
-        address_sorters,
-        expected_undo,
-    )?
-    .finish(counts)
+    let range = PrimaryScanRange {
+        keys: &OutpointKeyRange::ALL,
+        stop: None,
+    };
+    scan_primary_output_range(bounded_open, network, range, address_sorters, expected_undo)?
+        .ok_or(RocksDbWalletError::AdmissionChanged {
+            reason: "an unstoppable primary output scan stopped",
+        })?
+        .finish(counts)
+}
+
+/// Returns how many outpoint key ranges cold validation reads the primary
+/// output families in.
+///
+/// The count is the requested one, at most
+/// [`crate::MAX_ACCUMULATOR_HASHING_WORKERS`], and at most one range per
+/// `min_primary_rows_per_scan_range` primary rows, so a small store starts few
+/// threads whatever the setting.
+fn primary_output_scan_range_count(
+    config: &WalletColdValidationConfig,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+) -> NonZeroU32 {
+    let primary_rows = counts
+        .transparent_unspent_output_count
+        .saturating_add(counts.transparent_spent_output_count);
+    let ranges_by_rows = primary_rows / config.min_primary_rows_per_scan_range;
+    let ranges = u64::from(config.primary_output_scan_ranges.get())
+        .min(u64::from(crate::MAX_ACCUMULATOR_HASHING_WORKERS))
+        .min(ranges_by_rows);
+    NonZeroU32::new(u32::try_from(ranges).unwrap_or(u32::MAX)).unwrap_or(NonZeroU32::MIN)
 }
 
 /// Reads both primary output families back in `ranges` outpoint key ranges,
@@ -2712,6 +2788,8 @@ fn validate_primary_output_rows(
 ///
 /// Both families share the outpoint key, so each range sees every row of an
 /// outpoint and runs the same per-row checks as one scan of the whole store.
+/// Once one range fails, or a range thread cannot start, the others stop at
+/// their next row, and the first failure is returned.
 fn read_back_primary_output_rows(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
@@ -2720,57 +2798,101 @@ fn read_back_primary_output_rows(
     ranges: NonZeroU32,
 ) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
     let ranges = outpoint_key_ranges(ranges);
-    let scanned = std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(ranges.len());
-        for range in ranges.iter().skip(1) {
-            workers.push(scope.spawn(move || {
-                scan_primary_output_range(bounded_open, network, range, None, expected_undo)
-            }));
-        }
-        let mut scanned = Vec::with_capacity(ranges.len());
-        scanned.push(ranges.first().map_or_else(
-            || Ok(PrimaryOutputTotals::new()),
-            |range| scan_primary_output_range(bounded_open, network, range, None, expected_undo),
-        ));
-        for worker in workers {
-            scanned.push(
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            );
+    let stop = AtomicBool::new(false);
+    let scan = |keys: &OutpointKeyRange| {
+        let range = PrimaryScanRange {
+            keys,
+            stop: Some(&stop),
+        };
+        let scanned = scan_primary_output_range(bounded_open, network, range, None, expected_undo);
+        if scanned.is_err() {
+            stop.store(true, Ordering::Relaxed);
         }
         scanned
-    });
+    };
+    let scanned = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(ranges.len());
+        let mut start_failure = None;
+        for keys in ranges.iter().skip(1) {
+            match spawn_validation_scan(scope, move || scan(keys)) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    stop.store(true, Ordering::Relaxed);
+                    start_failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut scanned = Vec::with_capacity(ranges.len());
+        if start_failure.is_none() {
+            scanned.push(
+                ranges
+                    .first()
+                    .map_or_else(|| Ok(Some(PrimaryOutputTotals::new())), scan),
+            );
+        }
+        for worker in workers {
+            scanned.push(join_validation_scan(worker));
+        }
+        start_failure.map_or(Ok(scanned), Err)
+    })?;
     let mut totals = PrimaryOutputTotals::new();
+    let mut stopped = false;
     for range_totals in scanned {
-        totals.combine(&range_totals?)?;
+        match range_totals? {
+            Some(range_totals) => totals.combine(&range_totals)?,
+            None => stopped = true,
+        }
+    }
+    if stopped {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "a primary output scan range stopped without a failing range",
+        });
     }
     totals.finish(counts)
+}
+
+/// One key range of a primary output scan and the flag that stops it early.
+#[derive(Clone, Copy)]
+struct PrimaryScanRange<'scan> {
+    keys: &'scan OutpointKeyRange,
+    /// Set once another range has failed, so this one stops at its next row.
+    stop: Option<&'scan AtomicBool>,
+}
+
+impl PrimaryScanRange<'_> {
+    fn stopped(&self) -> bool {
+        self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+    }
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the ordered two-family merge keeps every derived relation tied to its decoded primary row"
 )]
+/// Scans both primary output families over one key range, or returns `None`
+/// when another range's failure stopped it first.
 fn scan_primary_output_range(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
-    range: &OutpointKeyRange,
+    range: PrimaryScanRange<'_>,
     mut address_sorters: Option<&mut AddressDerivationSorters>,
     expected_undo: &SharedExpectedReorgUndoSuffix,
-) -> Result<PrimaryOutputTotals, RocksDbWalletError> {
+) -> Result<Option<PrimaryOutputTotals>, RocksDbWalletError> {
     use zinder_core::wire::UtxoSetCommitmentElement;
 
     let unspent_family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let spent_family = column_family(bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
-    let mut unspent_rows =
-        bounded_open
-            .db
-            .iterator_cf_opt(&unspent_family, range.read_options(), range.start());
-    let mut spent_rows =
-        bounded_open
-            .db
-            .iterator_cf_opt(&spent_family, range.read_options(), range.start());
+    let mut unspent_rows = bounded_open.db.iterator_cf_opt(
+        &unspent_family,
+        range.keys.read_options(),
+        range.keys.start(),
+    );
+    let mut spent_rows = bounded_open.db.iterator_cf_opt(
+        &spent_family,
+        range.keys.read_options(),
+        range.keys.start(),
+    );
     let mut next_unspent = next_validation_row(&mut unspent_rows, "unspent validation scan")?;
     let mut next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
     let PrimaryOutputTotals {
@@ -2782,6 +2904,9 @@ fn scan_primary_output_range(
     } = PrimaryOutputTotals::new();
     let digest = &mut range_digest;
     while next_unspent.is_some() || next_spent.is_some() {
+        if range.stopped() {
+            return Ok(None);
+        }
         let take_unspent = match (&next_unspent, &next_spent) {
             (Some((unspent_key, _)), Some((spent_key, _))) => {
                 match unspent_key.as_ref().cmp(spent_key.as_ref()) {
@@ -2881,13 +3006,13 @@ fn scan_primary_output_range(
             next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
         }
     }
-    Ok(PrimaryOutputTotals {
+    Ok(Some(PrimaryOutputTotals {
         digest: range_digest,
         unspent_count,
         spent_count,
         total_value_zat,
         commitment,
-    })
+    }))
 }
 
 fn stage_expected_address_transaction(
@@ -3329,6 +3454,7 @@ mod tests {
         WalletColdValidationConfig {
             max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
             primary_output_scan_ranges: NonZeroU32::MIN.saturating_add(1),
+            min_primary_rows_per_scan_range: NonZeroU64::MIN,
         }
     }
 
@@ -4472,6 +4598,120 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_refused_validation_thread_fails_the_build_and_releases_its_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let wallet_path = temporary.path().join("wallet");
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let builder = cold_store_for(&wallet_path, &fixture)?;
+        let lease = builder.lease();
+        let (cold, _) = builder.reopen_for_validation()?;
+
+        REFUSED_VALIDATION_THREAD.set(Some(0));
+        let refused = cold.validate_rows(evidence, validation_config());
+        REFUSED_VALIDATION_THREAD.set(None);
+        let Err(build_error) = refused else {
+            return Err("a refused validation thread must fail cold validation".into());
+        };
+        assert!(matches!(
+            build_error,
+            RocksDbWalletError::ColdValidationThreadUnavailable { .. }
+        ));
+
+        let other_owner = WalletProjectionBuildOwner::from_bytes([0x66; 16]);
+        let now = UnixTimestampMillis::new(1);
+        assert!(
+            RocksDbWalletBuildStore::open(&wallet_path, Network::ZcashRegtest, test_budget())?
+                .discard_unpublished(other_owner, now)
+                .is_err(),
+            "the failed build's live lease must block another owner until it is released"
+        );
+        let mut cleanup = crate::build::FailedWalletBuildLeaseCleanup::new(
+            &wallet_path,
+            Network::ZcashRegtest,
+            test_budget(),
+            now,
+        );
+        cleanup.arm(lease, now);
+        assert!(matches!(
+            crate::build::finish_failed_wallet_build::<()>(&mut cleanup, build_error),
+            Err(RocksDbWalletError::ColdValidationThreadUnavailable { .. })
+        ));
+        RocksDbWalletBuildStore::open(&wallet_path, Network::ZcashRegtest, test_budget())?
+            .discard_unpublished(other_owner, now)?;
+        assert!(!wallet_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_range_thread_fails_validation_with_a_typed_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        // The two address-family threads start first; the fifth start is the
+        // third primary range thread.
+        for refused_start in [2, 4] {
+            REFUSED_VALIDATION_THREAD.set(Some(refused_start));
+            let refused = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                Network::ZcashRegtest,
+                &evidence,
+                validation_config_with_ranges(8)?,
+            );
+            REFUSED_VALIDATION_THREAD.set(None);
+            assert!(
+                matches!(
+                    refused,
+                    Err(RocksDbWalletError::ColdValidationThreadUnavailable { .. })
+                ),
+                "refused start {refused_start}"
+            );
+        }
+        validate_ready_rows_by_readback(
+            &cold.bounded_open,
+            Network::ZcashRegtest,
+            &evidence,
+            validation_config_with_ranges(8)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn scan_ranges_are_capped_by_the_maximum_and_the_row_count() {
+        let ranges = |requested: u32, primary_rows: u64, min_rows: u64| {
+            let config = WalletColdValidationConfig {
+                max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+                primary_output_scan_ranges: NonZeroU32::new(requested).unwrap_or(NonZeroU32::MIN),
+                min_primary_rows_per_scan_range: NonZeroU64::new(min_rows)
+                    .unwrap_or(NonZeroU64::MIN),
+            };
+            let counts = WalletProjectionFamilyRowCounts {
+                transparent_unspent_output_count: primary_rows / 2,
+                transparent_spent_output_count: primary_rows - primary_rows / 2,
+                ..WalletProjectionFamilyRowCounts::default()
+            };
+            primary_output_scan_range_count(&config, &counts).get()
+        };
+        let production = MIN_PRIMARY_ROWS_PER_SCAN_RANGE.get();
+        assert_eq!(ranges(4, 17_086_503, production), 4);
+        assert_eq!(ranges(64, 10, production), 1);
+        assert_eq!(ranges(64, 0, production), 1);
+        assert_eq!(ranges(64, 3 * production, production), 3);
+        assert_eq!(ranges(64, u64::MAX, production), 64);
+        assert_eq!(
+            ranges(u32::MAX, u64::MAX, 1),
+            crate::MAX_ACCUMULATOR_HASHING_WORKERS
+        );
+        assert_eq!(ranges(8, 3, 1), 3);
+    }
+
+    fn test_budget() -> RocksDbResourceBudget {
+        RocksDbResourceBudget::for_local_tests()
     }
 
     #[test]

@@ -20,7 +20,7 @@ use zinder_runtime::{
     resolve_wallet_projection_writer_rocksdb_budget, section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
-use zinder_wallet_rocksdb::RocksDbWalletBuildOptions;
+use zinder_wallet_rocksdb::{MAX_ACCUMULATOR_HASHING_WORKERS, RocksDbWalletBuildOptions};
 
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
 const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
@@ -555,11 +555,14 @@ fn resolve_build_config(raw: &ProjectorBuildSection) -> Result<ProjectorBuildCon
             "projector.build.max_accounted_reorg_undo_bytes",
         )?,
         accumulator_hashing_workers: match raw.accumulator_hashing_workers {
-            Some(workers) => NonZeroU32::new(workers).ok_or_else(|| {
-                ConfigError::invalid(
-                    "projector.build.accumulator_hashing_workers must be greater than zero",
-                )
-            })?,
+            Some(workers) => NonZeroU32::new(workers)
+                .filter(|workers| workers.get() <= MAX_ACCUMULATOR_HASHING_WORKERS)
+                .ok_or_else(|| {
+                    ConfigError::invalid(format!(
+                        "projector.build.accumulator_hashing_workers must be between 1 and \
+                         {MAX_ACCUMULATOR_HASHING_WORKERS}"
+                    ))
+                })?,
             None => RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
         },
     })
@@ -984,6 +987,24 @@ mod tests {
                 .to_string()
                 .contains("projector.build.accumulator_hashing_workers")
         }));
+    }
+
+    #[test]
+    fn accumulator_hashing_workers_refuse_values_above_the_maximum()
+    -> Result<(), zinder_runtime::ConfigError> {
+        assert_eq!(
+            resolve_build_config(&build_section(Some(64)))?
+                .accumulator_hashing_workers
+                .get(),
+            64
+        );
+        let refused = resolve_build_config(&build_section(Some(65)));
+        assert!(refused.is_err_and(|error| {
+            let message = error.to_string();
+            message.contains("projector.build.accumulator_hashing_workers")
+                && message.contains("64")
+        }));
+        Ok(())
     }
 
     #[test]
