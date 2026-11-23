@@ -10,7 +10,6 @@
 set -euo pipefail
 name=$1 root=$2 owner=$3 off=$4 cookie=$5
 bin=${ZFX_BIN:-/opt/zfx/bin}
-cfg=/etc/zfx/$name; sec=$root/.control; mkdir -p "$cfg"
 canonical=${CANONICAL_PATH:-$root/canonical} wallet=${WALLET_PATH:-$root/wallet}
 # Every role must use the window the stores were built with.
 reorg=${REORG_WINDOW_BLOCKS:-1000}
@@ -18,6 +17,13 @@ reorg=${REORG_WINDOW_BLOCKS:-1000}
 history_dir=${HISTORY_DIRECTORY:-} history_key=${HISTORY_PUBLISHER_KEY:-} history_verity=${HISTORY_REQUIRE_FS_VERITY:-false}
 [[ -n $history_dir$history_key && ( -z $history_dir || -z $history_key ) ]] && { echo "set both HISTORY_DIRECTORY and HISTORY_PUBLISHER_KEY, or neither" >&2; exit 1; }
 [[ $history_verity == true || $history_verity == false ]] || { echo "HISTORY_REQUIRE_FS_VERITY must be true or false" >&2; exit 1; }
+[[ $name =~ ^[a-z][a-z0-9-]*$ ]] || { echo "stack name must be lowercase letters, digits, and hyphens" >&2; exit 1; }
+# Paths go into TOML basic strings verbatim, so they may not hold a quote,
+# a backslash, or a control character. Spaces are fine.
+for path in "$root" "$canonical" "$wallet" "$cookie" "$bin" "$history_dir" "$history_key"; do
+  [[ $path != *[\"\\]* && $path != *[[:cntrl:]]* ]] || { echo "path cannot appear in TOML as is: $path" >&2; exit 1; }
+done
+cfg=/etc/zfx/$name; sec=$root/.control; mkdir -p "$cfg"
 p() { echo $(( $1 + off )); }
 install -d -o zinder -g zinder -m 0700 "$sec" "$root/checkpoints" "$root/projector" "$root/query" "$root/compat"
 for t in ingest checkpoint; do

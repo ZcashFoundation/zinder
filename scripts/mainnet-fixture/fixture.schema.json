@@ -145,7 +145,7 @@
       }
     },
     "signed_history": {
-      "description": "Signed history catalog on this component. A restored lightwalletd-compatible reader follows the publisher directory, trusts only the named key, and must serve historical block ranges from it. Requires fs-verity on every segment when the component's filesystem is ext4-verity.",
+      "description": "Signed history catalog on this component. A restored lightwalletd-compatible reader follows the publisher directory, trusts only the named key, and must serve historical block ranges from it. Requires fs-verity on every segment when the component's filesystem is ext4-verity. A fixture with signed_history must also set stage_sha256, and every component that names a catalog must carry this object.",
       "type": "object",
       "required": ["directory", "publisher_key", "manifest_sha256", "publisher_key_sha256", "segment_count", "highest_height"],
       "additionalProperties": false,
@@ -163,11 +163,15 @@
           "$ref": "#/$defs/sha256"
         },
         "publisher_key_sha256": { "$ref": "#/$defs/sha256" },
-        "segment_count": { "type": "integer", "minimum": 1 },
-        "highest_height": {
-          "description": "Last height the catalog covers. It must be below the chain's settled height so a range above it exists.",
+        "segment_count": {
+          "description": "Segments the manifest lists. The restore compares it with the manifest.",
           "type": "integer",
-          "minimum": 200
+          "minimum": 1
+        },
+        "highest_height": {
+          "description": "Last height the catalog covers, which the restore compares with the manifest. It must be below the chain's visible height so the height above it can be probed.",
+          "type": "integer",
+          "minimum": 1
         }
       }
     }

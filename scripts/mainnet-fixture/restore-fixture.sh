@@ -26,12 +26,17 @@ Options:
   --machine-type TYPE     Default c4-standard-16, with one thread per core.
   --hours N               Host deletes itself after N hours (default 12, at most 36).
   --receipt FILE          Where to write the JSON receipt (default ./restore-receipt-VM.json).
+                          The path and FILE.failed must not exist yet.
+  --guest-timeout SECONDS Fail when the guest restore has not finished this long
+                          after launch (default 10800).
+  --poll-seconds N        Seconds between guest status checks (default 20).
   -h, --help              Show this help.
 EOF
 }
 
 fixture="" stage="" name="" profile=fast verify=stores
 project=zfnd-dev-zinder zone=us-east1-c machine=c4-standard-16 hours=12 receipt=""
+guest_timeout=10800 poll=20
 subnet=projects/zfnd-dev-net-spoke-0/regions/us-east1/subnetworks/dev-default-ue1
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -46,6 +51,8 @@ while [[ $# -gt 0 ]]; do
     --machine-type) machine=$2; shift 2 ;;
     --hours) hours=$2; shift 2 ;;
     --receipt) receipt=$2; shift 2 ;;
+    --guest-timeout) guest_timeout=$2; shift 2 ;;
+    --poll-seconds) poll=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -61,9 +68,14 @@ case $profile in
 esac
 case $verify in none|stores|all) ;; *) die "--verify-hashes must be none, stores, or all" ;; esac
 if ! [[ $hours =~ ^[0-9]+$ ]] || (( hours < 1 || hours > 36 )); then die "--hours must be 1 to 36"; fi
+[[ $guest_timeout =~ ^[1-9][0-9]*$ && $poll =~ ^[1-9][0-9]*$ ]] || die "--guest-timeout and --poll-seconds must be positive integers"
 receipt=${receipt:-./restore-receipt-$name.json}
-schema=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixture.schema.json
-for tool in gcloud jq; do command -v "$tool" >/dev/null || die "missing $tool"; done
+# A receipt path is used once, so an old success cannot outlive a later failure.
+[[ ! -e $receipt && ! -e $receipt.failed ]] || die "$receipt or $receipt.failed already exists; choose a new --receipt path"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+schema=$here/fixture.schema.json gate=$here/guest/fixture-gate.py
+for tool in gcloud jq python3; do command -v "$tool" >/dev/null || die "missing $tool"; done
+attempt=$name-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 
 # IAP connections drop now and then. Retry when ssh itself fails (exit 255);
 # standard input is buffered so a retry resends it.
@@ -83,7 +95,7 @@ gssh() {
 }
 ts() { date -u +%FT%T.%3NZ; }
 declare -A at
-mark() { at[$1]=$(ts); echo "$(date -u +%T) $1" >&2; }
+mark() { current=$1; at[$1]=$(ts); echo "$(date -u +%T) $1" >&2; }
 
 mark preflight
 jq -e '.format_version == 1 and (.components | length) > 0 and .chain.visible_block_hash and
@@ -102,18 +114,10 @@ jq -e --arg verify "$verify" '
   ($verify == "none" or all(.components[] | select($verify == "all" or .kind == "stores");
     (.files_listing | type == "string") and (.files_sha256 | test("^[0-9a-f]{64}$"))))' "$fixture" >/dev/null \
   || die "fixture is missing fields the restore needs (component names, snapshots, sizes, mount paths, store paths, or listings for --verify-hashes $verify)"
-# A catalog the restore cannot describe would leave the reader on canonical
-# storage while every check still passes, so it is refused here.
-jq -e 'all(.components[]; ((.kind == "catalog" or .paths.catalog or .paths.publisher_key) | not) or .signed_history != null)' "$fixture" >/dev/null \
-  || die "a component names a signed history catalog without a signed_history description; see fixture.schema.json"
-jq -e '([.components[] | select(.signed_history)] | length <= 1) and
-  all(.components[] | select(.signed_history) | .signed_history;
-    (.directory | type == "string") and (.publisher_key | type == "string") and
-    (.manifest_sha256 | test("^[0-9a-f]{64}$")) and (.publisher_key_sha256 | test("^[0-9a-f]{64}$")) and
-    (.segment_count | type == "number" and . >= 1) and (.highest_height | type == "number" and . >= 200)) and
-  all(.components[] | select(.signed_history); .signed_history.highest_height < $chain.settled_height)' \
-  --argjson chain "$(jq -c .chain "$fixture")" "$fixture" >/dev/null \
-  || die "signed_history must appear on at most one component and give its directory, key, both SHA-256 values, segment count, and a highest height from 200 up to below the settled height"
+# A catalog the restore cannot describe, or a stage that predates signed
+# history, would leave the reader on canonical storage while every other check
+# passed, so both are refused here. The guest applies the same rules.
+python3 -I "$gate" preflight "$fixture" || die "the fixture's signed history cannot be served and proven"
 if command -v python3 >/dev/null && python3 -c 'import jsonschema' 2>/dev/null; then
   python3 -c 'import json, sys, jsonschema
 jsonschema.Draft202012Validator(json.load(open(sys.argv[1]))).validate(json.load(open(sys.argv[2])))' \
@@ -130,6 +134,16 @@ stage_sha=$(gcloud storage cat "$stage.sha256" | awk '{print $1}')
 want_stage=$(jq -r '.stage_sha256 // empty' "$fixture")
 [[ -z $want_stage || $stage_sha == "$want_stage" ]] || die "stage $stage is $stage_sha; the fixture pins $want_stage"
 
+# From here on, every failure leaves FILE.failed with the reason.
+finished=false
+fail_receipt() {
+  local step=$1 reason=$2 outcome=${3:-null}
+  jq -e . >/dev/null 2>&1 <<< "$outcome" || outcome=null
+  jq -n --arg attempt "$attempt" --arg step "$step" --arg reason "$reason" --argjson outcome "$outcome" \
+    '{status: "failed", attempt: $attempt, workstation_step: $step, reason: $reason, guest_outcome: $outcome}' > "$receipt.failed.partial"
+  mv "$receipt.failed.partial" "$receipt.failed"
+}
+trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"' EXIT
 mark create_host
 labels="purpose=benchmark-fixture,issue=476,fixture=$(jq -r .fixture_id "$fixture" | tr '.' '-' | cut -c1-63)"
 disk_args=()
@@ -159,31 +173,52 @@ gssh "trap 'sudo rm -f /root/.gcs-token' EXIT; set -e
 gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"
 
 mark guest_restore
-# The guest restore runs as its own unit, so a dropped ssh session cannot stop it.
-# Idempotent, so an ssh retry after the unit already started cannot fail or relaunch it.
-gssh "systemctl is-active -q zfx-restore-guest || sudo test -e /var/log/zfx/restore-receipt.json \\
-  || sudo test -e /var/log/zfx/restore-receipt.json.failed \\
-  || sudo systemd-run --unit zfx-restore-guest --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json" < /dev/null
-until gssh 'sudo test -s /var/log/zfx/restore-receipt.json || ! systemctl is-active -q zfx-restore-guest' < /dev/null; do sleep 20; done
-gssh 'sudo test -s /var/log/zfx/restore-receipt.json' < /dev/null \
-  || { gssh 'sudo cat /var/log/zfx/restore-receipt.json.failed 2>/dev/null' < /dev/null > "$receipt.failed" || true
-       gssh 'sudo journalctl -u zfx-restore-guest -o cat --no-pager | tail -20' < /dev/null >&2
-       die "guest restore failed; any partial guest receipt is in $receipt.failed"; }
-mark finished
-guest=$(gssh 'sudo cat /var/log/zfx/restore-receipt.json' < /dev/null)
+# The guest restore runs as its own unit, so a dropped ssh session cannot stop
+# it. A repeated launch is harmless: the guest refuses an attempt directory
+# that exists and a host that already ran an attempt.
+gssh "sudo systemd-run --unit zfx-restore-$attempt --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/attempts/$attempt" < /dev/null >&2 || true
+deadline=$((SECONDS + guest_timeout)) gone=0 outcome=""
+while :; do
+  status=$(gssh "sudo cat /var/log/zfx/attempts/$attempt/outcome.json 2>/dev/null || { systemctl is-active -q zfx-restore-$attempt && echo RUNNING || echo GONE; }" < /dev/null 2>/dev/null) || status=""
+  if jq -e 'type == "object" and (.status == "succeeded" or .status == "failed")' >/dev/null 2>&1 <<< "$status"; then
+    outcome=$status; break
+  fi
+  # The unit writes its outcome before it exits, so one GONE can race it.
+  if [[ $status == GONE ]]; then gone=$((gone + 1)); else gone=0; fi
+  if (( gone >= 2 )); then fail_receipt guest_restore "the guest unit ended without writing an outcome; the stage may predate attempt outcomes"; die "guest restore ended without an outcome"; fi
+  if (( SECONDS >= deadline )); then fail_receipt guest_restore "the guest restore did not finish within $guest_timeout seconds"; die "guest restore timed out"; fi
+  sleep "$poll"
+done
+if [[ $(jq -r .status <<< "$outcome") != succeeded ]]; then
+  gssh "sudo journalctl -u zfx-restore-$attempt -o cat --no-pager | tail -20" < /dev/null >&2 || true
+  fail_receipt guest_restore "guest failed at $(jq -r .step <<< "$outcome"): $(jq -r .reason <<< "$outcome")" "$outcome"
+  die "guest restore failed; see $receipt.failed"
+fi
+mark accept
+guest_file=$(mktemp); trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"; rm -f "$guest_file"' EXIT
+jq .receipt <<< "$outcome" > "$guest_file"
+if ! reasons=$(python3 -I "$gate" accept "$fixture" "$guest_file" 2>&1); then
+  fail_receipt accept "${reasons//$'\n'/; }" "$outcome"
+  die "the guest receipt does not prove what the fixture requires: $reasons"
+fi
 
 steps=$(for k in "${!at[@]}"; do printf '%s\t%s\n' "$k" "${at[$k]}"; done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
-jq -n --argjson guest "$guest" --argjson steps "$steps" --arg name "$name" --arg project "$project" \
+jq -n --slurpfile guest "$guest_file" --argjson steps "$steps" --arg name "$name" --arg project "$project" \
   --arg zone "$zone" --arg machine "$machine" --arg profile "$profile" --argjson iops $iops \
-  --argjson throughput $throughput --arg stage "$stage" --arg stage_sha "$stage_sha" \
+  --argjson throughput $throughput --arg stage "$stage" --arg stage_sha "$stage_sha" --arg attempt "$attempt" \
   --arg fixture_sha "$(sha256sum "$fixture" | cut -d' ' -f1)" \
   '{host: {name: $name, project: $project, zone: $zone, machine_type: $machine, threads_per_core: 1},
+    attempt: $attempt,
     profile: {name: $profile, component_disk_iops: $iops, component_disk_throughput_mib_s: $throughput},
     fixture_sha256: $fixture_sha, stage: {object: $stage, sha256: $stage_sha},
     workstation_steps_utc: $steps,
-    nothing_to_reader_seconds: ((($steps.finished | sub("\\.[0-9]+Z$"; "Z") | fromdate) - ($steps.preflight | sub("\\.[0-9]+Z$"; "Z") | fromdate))),
-    guest: $guest}' > "$receipt"
+    nothing_to_reader_seconds: ((($steps.accept | sub("\\.[0-9]+Z$"; "Z") | fromdate) - ($steps.preflight | sub("\\.[0-9]+Z$"; "Z") | fromdate))),
+    accepted: true,
+    guest: $guest[0]}' > "$receipt.partial"
+mv "$receipt.partial" "$receipt"
+finished=true
 echo "receipt: $receipt" >&2
 jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip, wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture,
-  signed_history: (.guest.signed_history | if . == null then "none declared; ranges served from canonical storage"
-    else {passed, open_segment_files: .admission.open_segment_files, highest_height_served_from_segments} end)}' "$receipt"
+  signed_history: (.guest.signed_history | if . == null then "none declared"
+    else {proof, passed, manifest_sha256, segment_count, first_height, last_height,
+      open_segment_files: .admission.open_segment_files} end)}' "$receipt"

@@ -20,7 +20,8 @@ defines that file. Each fixture records:
 - for the component that holds a signed history catalog, a `signed_history`
   entry: the publisher directory, the publisher key, the SHA-256 of the
   catalog's `current.json` and of the key, the segment count, and the highest
-  height the catalog covers.
+  height the catalog covers. Such a fixture also pins the exact stage tarball
+  in `stage_sha256`, because an older stage would restore without the catalog.
 
 | Component kind | Holds |
 | --- | --- |
@@ -34,11 +35,14 @@ or wallet schema needs a new fixture, built by that release.
 
 ## Before you start
 
-- Use a workstation with `gcloud`, `jq`, Docker, `curl`, and `zstd`, and
-  access to the fixture project.
+- Use a workstation with `gcloud`, `jq`, Python 3, Docker, `curl`, and
+  `zstd`, and access to the fixture project.
 - Have the fixture's `fixture.json`.
-- Have Zinder release binaries for the release you will serve with. The
-  `release-binaries` target of `deploy/Dockerfile` produces them:
+- Have Zinder release binaries for the release you will serve with. When the
+  fixture pins binaries in `verified_with_release.binaries`, use exactly that
+  set, for example from the archive its `executables` field names; the guest
+  refuses any other. Otherwise the `release-binaries` target of
+  `deploy/Dockerfile` produces them:
 
   ```bash
   docker buildx build -f deploy/Dockerfile --target release-binaries \
@@ -53,7 +57,8 @@ or wallet schema needs a new fixture, built by that release.
 
 The stage tarball holds everything the host runs: the Zinder binaries, the
 pinned Zebra binary, `jq`, `grpcurl`, the guest scripts, and the protocol
-files. Build it once per release and upload it with its SHA-256.
+files. Build it once per release and upload it with its SHA-256. For a fixture
+with a catalog, set `stage_sha256` in `fixture.json` to that SHA-256.
 
 ```bash
 scripts/mainnet-fixture/build-stage.sh --binaries .tmp/release-binaries/bin \
@@ -75,8 +80,10 @@ scripts/mainnet-fixture/restore-fixture.sh \
 
 The script performs these steps:
 
-1. It checks that every component snapshot is `READY` and that the stage has
-   a published SHA-256.
+1. It checks the fixture, including its signed history and stage pin, that
+   every component snapshot is `READY`, and that the stage has a published
+   SHA-256 equal to any pin. The receipt path and the path with `.failed`
+   added must not exist yet.
 2. It creates a `c4-standard-16` host with one thread per core, no service
    account, no external address, and a termination time. The default
    termination time is 12 hours, and `--hours` allows up to 36.
@@ -86,65 +93,90 @@ The script performs these steps:
    token, and checks the stage and binary hashes. The guest steps run from
    the stage, so the stage SHA-256 in the receipt identifies the code that
    ran.
-5. It mounts each component, with `catalog` and `oracle` disks read-only.
-   With `--verify-hashes stores` or `all`, it reads every listed file and
-   compares it with the component's listing. The listing itself must match
-   the SHA-256 in `fixture.json`. This read also fetches every block of the
-   restored disk, so later timings do not include first-read latency.
-6. When the fixture describes a signed history catalog, it checks the
-   catalog's `current.json` and publisher key against the SHA-256 values in
-   `fixture.json`, whatever `--verify-hashes` is set to.
-7. It starts Zebra with no peers, then ingest, projector, query, and
+5. It starts the guest restore as a systemd unit named for this attempt. The
+   guest records the attempt on the host and refuses any second attempt, so
+   a retried launch cannot rerun on disks the first attempt changed.
+6. The guest mounts each component, with `catalog` and `oracle` disks
+   read-only. With `--verify-hashes stores` or `all`, it reads every listed
+   file of the selected components and compares it with the component's
+   listing. The listing itself must match the SHA-256 in `fixture.json`.
+   Reading the files fetches the restored disk blocks that hold them, so
+   later timings do not include their first-read latency. `stores` does not
+   read a separate `catalog` component.
+7. With a catalog, the guest hashes the catalog's `current.json` and
+   publisher key once and compares them with `fixture.json`, whatever
+   `--verify-hashes` is set to. From those verified manifest bytes it derives
+   the first and last height and the segment files, which must match the
+   fixture's segment count and highest height.
+8. It starts Zebra with no peers, then ingest, projector, query, and
    lightwalletd compatibility, with fresh control tokens and a fresh
    projector owner identity. With a catalog, the compatibility reader
    follows the publisher directory and trusts only the fixture's key, as
-   single-host Compose configures it. It requires fs-verity on every segment
-   when the component's filesystem is `ext4-verity`.
-8. It waits for the compatibility reader's `/readyz`. It then checks that
+   single-host Compose configures it. Unlike Compose, it requires fs-verity on
+   every segment when the component's filesystem is `ext4-verity`.
+9. It waits for the compatibility reader's `/readyz`. It then checks that
    `GetLatestBlock` returns the fixture's visible height and hash, and records
    a fixed set of wallet responses.
-9. With a catalog, it runs the route check described below.
-10. It writes a JSON receipt with each step's start time, the profile, the
-    stage and fixture hashes, the served tip, the wallet sample digest, and
-    the route check result.
+10. With a catalog, it runs the route check described below.
+11. The guest writes its outcome for this attempt once, on success or at any
+    failing step. The workstation polls for it until `--guest-timeout`
+    (three hours by default), then checks the guest receipt against the
+    fixture and writes the receipt.
 
-A fixture without a `signed_history` entry restores as before: the reader
-serves every block range from the canonical store, the guest log says so, and
-the receipt's `signed_history` is `null`. The preflight refuses a fixture that
-has a `catalog` component, or a component path named `catalog` or
-`publisher_key`, without a `signed_history` entry. Such a restore would serve
-from canonical storage while every other check passed.
+A fixture without a `signed_history` entry restores as before. Its reader
+serves block ranges from the canonical store and from its in-memory live tail,
+the guest log says so, and the receipt's `signed_history` is `null`. The
+preflight refuses a fixture whose `catalog` component, or whose component path
+named `catalog` or `publisher_key`, lacks a `signed_history` object. Such a
+restore would serve from canonical storage while every other check passed.
 
 ### Route check
 
 Identical wallet responses do not show which route served them, so the
-restore checks the route directly, using signals the reader already exposes.
-It passes when all of these hold:
+restore checks the route directly. The check is an external proof. The pinned
+reader exports no identity for the catalog generation it admitted, so the
+check infers admission from the files the reader process holds open, and the
+route from the reader's canonical storage counters. It passes when all of
+these hold:
 
-- **Admission.** The reader process holds one open file for each of the
-  catalog's segments, and the count equals `signed_history.segment_count`.
-- **Covered ranges.** `GetBlockRange` over heights 1,730,000 to 1,730,099
-  (for a catalog that ends below them, the 100 heights before its last 100),
-  and over the 100 heights that end at the catalog's highest height, returns
-  every height. Segment file pages, evicted from the page cache before each
-  request, are read again. The canonical secondary's MultiGet and iterator
-  read counters do not change. The 1,730,000 range's response equals the
-  wallet sample's copy, which the fixture's sample digest pins.
-- **Uncovered range.** The 100 heights above the catalog's highest height add
-  canonical MultiGet reads, which shows that the counters catch a canonical
-  read.
+- **Admission.** The reader process holds open exactly the segment files the
+  verified manifest lists, and `current.json` still has the hash verified
+  before the reader started.
+- **Covered range.** `GetBlockRange` over heights 1,730,000 to 1,730,099
+  returns every height and adds no canonical MultiGet or iterator reads. When
+  the catalog does not hold those heights, the check uses its first 100
+  heights instead.
+- **Catalog end.** The catalog's last height, requested alone, adds no
+  canonical reads. The height above it, requested alone, adds at least one
+  canonical MultiGet key. A live tail that already held that height would
+  fail this probe, never pass it; the restore makes no request that fills the
+  tail that far down.
+- **Canonical control.** The covered range requested with explicit
+  transparent, Sapling, and Orchard pools adds at least one MultiGet key per
+  height. The reader serves any selection other than the default from
+  canonical storage, so this shows that the counters see canonical reads.
 - **Trust identity.** The same reader configuration with a different, valid
   publisher key exits before it serves, with `shielded range manifest
   signature verification failed`.
 
-The counters reach `/metrics` only when the wallet serving pair refreshes,
-about once a second, so each request is bracketed by two refreshes. The
-catalog follower also makes a few canonical point lookups when it checks its
-anchor. The check reports them, with an idle interval for comparison, but
-does not count them as block reads.
+When the fixture pins a wallet sample and the catalog holds heights 1,730,000
+to 1,730,099, the covered response must also equal the sample's copy. The
+fixture recorded those bytes from a reader without the catalog. Otherwise the
+check makes no byte comparison, and the receipt says so.
 
-If any part fails, the guest writes `restore-receipt.json.failed` with the
-check's report, and the restore exits with an error.
+The counters reach `/metrics` only when the wallet serving pair refreshes,
+about once a second, so each request is bracketed by two refreshes. Every
+counter the check uses must be present and must not decrease. The check also
+reports, without using them for its verdict, the canonical point lookups that
+the catalog follower's anchor check makes, and the segment pages present in
+the page cache after eviction advice. Page residency can stay unchanged after
+a correct read, or change because of unrelated reads, so it is supporting
+evidence only. The check evicts the catalog's pages, so a benchmark that
+starts right after a restore begins with a cold catalog.
+
+If any part fails, the guest stops the compatibility reader, and the restore
+exits with an error and writes the receipt path with `.failed` added, holding
+the failing step, the reason, and the guest's report.
 
 | Profile | Component disk IOPS | Component disk throughput |
 | --- | --- | --- |
@@ -157,22 +189,24 @@ the load client.
 
 ## Check the result
 
-The script exits with an error if any check fails, and keeps any partial
-guest receipt beside the receipt path with a `.failed` suffix. On success,
-the receipt shows the served tip, `wallet_sample_matches_fixture`, and the
-route check:
+The script exits with an error if any check fails. The receipt then exists
+only with a `.failed` suffix. On success, the receipt shows the served tip,
+`wallet_sample_matches_fixture`, and the route proof:
 
 ```bash
 jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip,
   wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture,
-  open_segment_files: .guest.signed_history.admission.open_segment_files,
-  highest_height_served_from_segments: .guest.signed_history.highest_height_served_from_segments}' \
+  route: (.guest.signed_history | if . == null then null else
+    {proof, passed, manifest_sha256, segment_count, first_height, last_height,
+     open_segment_files: .admission.open_segment_files} end)}' \
   restore-receipt-zfx-bench-1.json
 ```
 
 `wallet_sample_matches_fixture` is `true` when the 21 recorded wallet
 responses match the fixture byte for byte, and `null` when the fixture
-records no sample digest.
+records no sample digest. The workstation writes a success receipt only when
+the route proof's manifest hash, key hash, segment count, and last height
+equal the fixture's.
 
 ## Clean up
 
