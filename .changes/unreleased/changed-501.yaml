@@ -1,0 +1,6 @@
+kind: changed
+body: The lightwalletd listener now hands `GetBlockRange` response data to HTTP/2 without copying it in the send-stall bound when every chunk keeps at most 512 KiB alive, which holds for every stored Mainnet block so far. A client that stops reading a range stream can therefore keep up to about 2 MiB of stored blocks in memory per stalled stream, instead of about 528 KiB of copies. gRPC-Web responses and other methods are unchanged. `zinder-proto` adds `BoundedChunkRetention` and `EncodedBlock::from_length_prefixed_in`; a large message built with `EncodedBlock::from_length_prefixed` is now copied in 64 KiB pieces.
+time: 2026-11-23T14:01:14.475222798Z
+custom:
+    Bump: minor
+    PR: "501"
