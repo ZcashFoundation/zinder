@@ -644,7 +644,16 @@ struct NodeAddressHistory {
 }
 
 #[derive(Clone)]
-struct HistoryAdmission(Arc<parking_lot::Mutex<Option<OwnedSemaphorePermit>>>);
+struct HistoryAdmission(Arc<parking_lot::Mutex<Option<Arc<OwnedSemaphorePermit>>>>);
+
+impl HistoryAdmission {
+    fn reserve_evidence(&self) -> Result<Arc<OwnedSemaphorePermit>, Status> {
+        self.0
+            .lock()
+            .clone()
+            .ok_or_else(|| Status::cancelled("forwarded address history cancelled"))
+    }
+}
 
 impl Drop for HistoryAdmission {
     fn drop(&mut self) {
@@ -660,19 +669,18 @@ impl NodeAddressHistory {
     ) -> GrpcStream<lightwalletd::RawTransaction> {
         let (demand, mut requests) = mpsc::channel(1);
         let (rows, received) = mpsc::channel(1);
-        // The worker can release admission at the deadline even when the
-        // client is not polling. Dropping the response also releases it,
-        // after closing demand so the worker starts no more node work.
-        let admission = HistoryAdmission(Arc::new(parking_lot::Mutex::new(Some(permit))));
+        // Either owner can release stream admission. A blocking evidence
+        // read keeps its own reference until the read actually finishes.
+        let admission = HistoryAdmission(Arc::new(parking_lot::Mutex::new(Some(Arc::new(permit)))));
         let worker_admission = admission.clone();
         let task = tokio::spawn(async move {
-            let _admission = worker_admission;
+            let admission = worker_admission;
             timeout_at(deadline, async {
                 while requests.recv().await.is_some() {
                     let row = tokio::select! {
                         biased;
                         () = rows.closed() => return Ok::<_, Status>(()),
-                        row = self.next() => row?,
+                        row = self.next(&admission) => row?,
                     };
                     let Some(row) = row else {
                         return Ok(());
@@ -746,29 +754,36 @@ impl NodeAddressHistory {
         }
     }
 
-    /// Reads where the served chain mines `id` from a reader that still holds
-    /// the served tip, without keeping that reader across node calls.
-    async fn served_location(&self, id: TransactionId) -> Result<MinedTransactionDigest, Status> {
+    /// Reads the canonical evidence without keeping the reader across node calls.
+    async fn served_location(
+        &self,
+        id: TransactionId,
+        admission: &HistoryAdmission,
+    ) -> Result<MinedTransactionDigest, Status> {
+        let permit = admission.reserve_evidence()?;
         let reader = self.slot.capture();
-        let epoch = reader.chain_epoch();
-        if BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash) != self.served
-            && reader
-                .block_hash_lookup(self.served.hash)
-                .await
-                .map_err(storage_status)?
-                != BlockHashLookup::Resolved(self.served)
-        {
-            return Err(history_changed());
-        }
-        let location = reader
-            .mined_transaction_location(id)
-            .await
-            .map_err(storage_status)?
-            .ok_or_else(history_changed)?;
-        self.block_digests.digest_of(&reader, location).await
+        let served = self.served;
+        let digests = self.block_digests.clone();
+        let span = tracing::Span::current();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            span.in_scope(|| {
+                read_on_blocking_thread(history_transaction_evidence(&reader, &digests, served, id))
+            })
+        });
+        tracing::trace!(
+            target: "zinder::compat_lightwalletd",
+            "queued forwarded address history evidence"
+        );
+        task.await.map_err(|error| {
+            Status::unavailable(format!("address history evidence read failed: {error}"))
+        })?
     }
 
-    async fn next(&mut self) -> Result<Option<lightwalletd::RawTransaction>, Status> {
+    async fn next(
+        &mut self,
+        admission: &HistoryAdmission,
+    ) -> Result<Option<lightwalletd::RawTransaction>, Status> {
         loop {
             if let Some(id) = self.page.next() {
                 let reported = self
@@ -781,7 +796,7 @@ impl NodeAddressHistory {
                 if reported.0.height < start || reported.0.height > end {
                     return Err(history_changed());
                 }
-                let mined = self.served_location(id).await?;
+                let mined = self.served_location(id, admission).await?;
                 let position = (
                     mined.location.block_height,
                     mined.location.tx_index_in_block,
@@ -804,6 +819,30 @@ impl NodeAddressHistory {
             self.read_page().await?;
         }
     }
+}
+
+async fn history_transaction_evidence(
+    reader: &RocksDbCanonicalReader,
+    digests: &BlockDigestCache,
+    served: BlockId,
+    id: TransactionId,
+) -> Result<MinedTransactionDigest, Status> {
+    let epoch = reader.chain_epoch();
+    if BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash) != served
+        && reader
+            .block_hash_lookup(served.hash)
+            .await
+            .map_err(storage_status)?
+            != BlockHashLookup::Resolved(served)
+    {
+        return Err(history_changed());
+    }
+    let location = reader
+        .mined_transaction_location(id)
+        .await
+        .map_err(storage_status)?
+        .ok_or_else(history_changed)?;
+    digests.digest_of(reader, location).await
 }
 
 fn history_deadline_exceeded() -> Status {

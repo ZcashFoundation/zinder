@@ -376,6 +376,88 @@ async fn dropping_a_history_stream_immediately_releases_its_slot() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn dropped_and_expired_history_streams_keep_in_flight_evidence_admitted() -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(history_evidence_admission())
+}
+
+async fn history_evidence_admission() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
+    ])?;
+    let logs = zinder_testkit::LogCapture::install_for_target("zinder::compat_lightwalletd");
+    let mut first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?
+        .into_inner();
+    let mut second = fixture
+        .adapter
+        .get_taddress_transactions(history_request(1, 1))
+        .await?
+        .into_inner();
+
+    let (occupied, entered_blocking_pool) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let blocking_slot = tokio::task::spawn_blocking(move || {
+        let _ = occupied.send(());
+        let _ = blocked.blocking_recv();
+    });
+    entered_blocking_pool.await?;
+    let mut first_row = Box::pin(first.next());
+    let mut second_row = Box::pin(second.next());
+    tokio::select! {
+        _ = &mut first_row => return Err(eyre!("first history read passed the blocking gate")),
+        _ = &mut second_row => return Err(eyre!("second history read passed the blocking gate")),
+        queued = tokio::time::timeout(Duration::from_secs(10), async {
+            while logs.events().iter().filter(|event| {
+                event.message() == "queued forwarded address history evidence"
+            }).count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        }) => queued?,
+    }
+
+    drop(first_row);
+    drop(first);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let expired = tokio::time::timeout(Duration::from_secs(1), second_row).await;
+    tokio::time::resume();
+    assert!(matches!(expired?, Some(Err(status)) if status.code() == Code::DeadlineExceeded));
+    drop(second);
+
+    let refused = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await;
+    assert_eq!(
+        refused.err().map(|status| status.code()),
+        Some(Code::ResourceExhausted)
+    );
+    release
+        .send(())
+        .map_err(|()| eyre!("blocking pool gate closed early"))?;
+    blocking_slot.await?;
+    // The sole blocking worker completes both admitted reads before this marker.
+    tokio::task::spawn_blocking(|| ()).await?;
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 2);
+    let first = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    let second = fixture
+        .adapter
+        .get_taddress_txids(history_request(1, 1))
+        .await?;
+    drop((first, second));
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
     let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
