@@ -39,8 +39,8 @@ use zinder_wallet_projection::{
 };
 
 use crate::{
-    RocksDbWalletError, WalletBuildLeaseHeartbeat, WalletColdValidationPhaseDurations,
-    WalletTransitionFootprint, build_lock::WalletBuildLock,
+    RocksDbWalletError, WalletBuildLeaseHeartbeat, WalletColdReopenPhaseDurations,
+    WalletColdValidationPhaseDurations, WalletTransitionFootprint, build_lock::WalletBuildLock,
     projection_load::PreparedWalletProjectionLoad,
 };
 
@@ -587,7 +587,8 @@ impl RocksDbWalletBuilder {
     /// Flushes, closes, and cold-reopens a complete BUILDING store.
     pub(crate) fn reopen_for_validation(
         self,
-    ) -> Result<ColdRocksDbWalletBuild, RocksDbWalletError> {
+    ) -> Result<(ColdRocksDbWalletBuild, WalletColdReopenPhaseDurations), RocksDbWalletError> {
+        let close_started = Instant::now();
         flush_complete_build(&self.bounded_open)?;
         let database_identity = self
             .bounded_open
@@ -599,7 +600,9 @@ impl RocksDbWalletBuilder {
         let expected_control = self.control.clone();
         let lease = self.lease;
         drop(self);
+        let flush_and_close = close_started.elapsed();
 
+        let reopen_started = Instant::now();
         require_exact_column_families(&store_path)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::ExistingPrimary { path: &store_path },
@@ -621,11 +624,17 @@ impl RocksDbWalletBuilder {
                 reason: "BUILDING control changed before cold publication validation",
             });
         }
-        Ok(ColdRocksDbWalletBuild {
-            bounded_open,
-            control: reopened_control,
-            lease,
-        })
+        Ok((
+            ColdRocksDbWalletBuild {
+                bounded_open,
+                control: reopened_control,
+                lease,
+            },
+            WalletColdReopenPhaseDurations {
+                flush_and_close,
+                cold_reopen: reopen_started.elapsed(),
+            },
+        ))
     }
 }
 
@@ -2176,6 +2185,7 @@ fn validate_ready_rows_by_readback(
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
     )?;
+    let readback_started = Instant::now();
     let ConcurrentFamilyReadback {
         mut digest,
         utxo_summary,
@@ -2183,6 +2193,7 @@ fn validate_ready_rows_by_readback(
         address_index_and_balance_readback,
         address_transaction_readback,
     } = read_back_large_families(bounded_open, network, &counts, &mut expected_undo)?;
+    let concurrent_family_readback = readback_started.elapsed();
 
     let phase_started = Instant::now();
     validate_reorg_undo_rows(
@@ -2205,6 +2216,7 @@ fn validate_ready_rows_by_readback(
             primary_output_scan,
             address_index_and_balance_readback,
             address_transaction_readback,
+            concurrent_family_readback,
             reorg_undo_readback,
         },
     })
@@ -3819,7 +3831,7 @@ mod tests {
                 RocksDbResourceBudget::for_local_tests(),
             )?;
             load_semantic_validation_fixture(&builder, &prepared)?;
-            let cold = builder.reopen_for_validation()?;
+            let (cold, _) = builder.reopen_for_validation()?;
 
             let semantic = validate_ready_rows_by_semantic_rederivation(
                 &cold.bounded_open,
@@ -4019,7 +4031,7 @@ mod tests {
             let temporary = TempDir::new()?;
             let builder =
                 cold_store_for(temporary.path().join(format!("wallet-{index}")), &fixture)?;
-            let cold = builder.reopen_for_validation()?;
+            let (cold, _) = builder.reopen_for_validation()?;
 
             validate_ready_rows_by_semantic_rederivation(
                 &cold.bounded_open,
@@ -4162,7 +4174,7 @@ mod tests {
             let builder =
                 cold_store_for(temporary.path().join(format!("wallet-{index}")), &fixture)?;
             corrupt_stored_family(&builder, family_name, corruption)?;
-            let cold = builder.reopen_for_validation()?;
+            let (cold, _) = builder.reopen_for_validation()?;
 
             let readback = validate_ready_rows_by_readback(
                 &cold.bounded_open,
@@ -4278,6 +4290,7 @@ mod tests {
         assert!(matches!(
             builder
                 .reopen_for_validation()?
+                .0
                 .validate_rows(evidence, config),
             Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit { .. })
         ));
@@ -4316,6 +4329,7 @@ mod tests {
         let evidence = ready_evidence(network, &unspent, &spent, balance)?;
         let store = builder
             .reopen_for_validation()?
+            .0
             .validate_rows(evidence.clone(), validation_config())?
             .publish_ready_at(UnixTimestampMillis::new(1))?;
 
@@ -4377,6 +4391,7 @@ mod tests {
         drop(
             builder
                 .reopen_for_validation()?
+                .0
                 .validate_rows(ready, validation_config())?
                 .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
@@ -4477,6 +4492,7 @@ mod tests {
         drop(
             builder
                 .reopen_for_validation()?
+                .0
                 .validate_rows(evidence.clone(), validation_config())?
                 .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
@@ -4537,6 +4553,7 @@ mod tests {
         let evidence = zero_value_ready_evidence(network, &unspent)?;
         let store = builder
             .reopen_for_validation()?
+            .0
             .validate_rows(evidence.clone(), validation_config())?
             .publish_ready_at(UnixTimestampMillis::new(1))?;
 

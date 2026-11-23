@@ -15,7 +15,8 @@ use thiserror::Error;
 mod variable_value_sort;
 
 pub use variable_value_sort::{
-    SortedVariableValues, VariableValueRecord, VariableValueSortEvidence, VariableValueSorter,
+    SortedVariableValues, VariableValueRecord, VariableValueSortDurations,
+    VariableValueSortEvidence, VariableValueSorter,
 };
 
 pub(super) const MAX_MERGE_FAN_IN: usize = 64;

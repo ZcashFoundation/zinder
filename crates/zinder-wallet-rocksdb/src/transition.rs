@@ -2835,6 +2835,7 @@ mod tests {
         };
         wallet_builder
             .reopen_for_validation()?
+            .0
             .validate_rows(
                 ready_evidence,
                 WalletColdValidationConfig {

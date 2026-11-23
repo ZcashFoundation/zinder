@@ -7,6 +7,7 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     mem::size_of,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use tempfile::{Builder as TemporaryDirectoryBuilder, TempDir};
 
@@ -42,6 +43,23 @@ pub struct VariableValueSortEvidence {
     pub max_temporary_file_bytes: u64,
     /// Bytes occupied by the final sorted run, or zero for empty input.
     pub final_run_file_bytes: u64,
+}
+
+/// Wall time one variable-value sort spent sorting, writing, and merging runs.
+///
+/// The parts do not overlap. `initial_run_spill` passes inside
+/// [`VariableValueSorter::push`] while records are still arriving, so it is
+/// part of the caller's time spent pushing them. The other two pass inside
+/// [`VariableValueSorter::finish`]. Reading the final run back is the
+/// consumer's time and is not included.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VariableValueSortDurations {
+    /// Sorting and writing the runs that `push` flushed at the memory ceiling.
+    pub initial_run_spill: Duration,
+    /// Sorting and writing the records still staged when `finish` began.
+    pub final_run_flush: Duration,
+    /// Merge passes that reduced several runs to one; zero for one run.
+    pub merge: Duration,
 }
 
 #[derive(Debug)]
@@ -147,6 +165,7 @@ pub struct VariableValueSorter<const KEY_LEN: usize> {
     merge_pass_count: u64,
     peak_accounted_memory_bytes: u64,
     temporary_files: TemporaryFileBudget,
+    durations: VariableValueSortDurations,
 }
 
 impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
@@ -194,6 +213,7 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             merge_pass_count: 0,
             peak_accounted_memory_bytes: 0,
             temporary_files: TemporaryFileBudget::new(max_temporary_file_bytes),
+            durations: VariableValueSortDurations::default(),
         })
     }
 
@@ -211,8 +231,13 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             .checked_add(record_bytes)
             .ok_or_else(|| BulkLoadError::invalid("accounted record bytes exceed u64::MAX"))?;
         if required_bytes > self.max_accounted_memory_bytes {
+            let spill_started = Instant::now();
             self.flush_run()
                 .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
+            self.durations.initial_run_spill = self
+                .durations
+                .initial_run_spill
+                .saturating_add(spill_started.elapsed());
         }
 
         self.staged_records.try_reserve_exact(1).map_err(|source| {
@@ -245,14 +270,20 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
 
     /// Finishes all runs and opens a bounded streaming reader over sorted records.
     pub fn finish(mut self) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        let flush_started = Instant::now();
         self.flush_run()?;
+        self.durations.final_run_flush = flush_started.elapsed();
         let mut runs = std::mem::take(&mut self.runs);
-        while runs.len() > 1 {
-            runs = self.merge_pass(runs)?;
-            self.merge_pass_count = self
-                .merge_pass_count
-                .checked_add(1)
-                .ok_or_else(|| BulkLoadError::invalid("merge pass count exceeds u64::MAX"))?;
+        if runs.len() > 1 {
+            let merge_started = Instant::now();
+            while runs.len() > 1 {
+                runs = self.merge_pass(runs)?;
+                self.merge_pass_count = self
+                    .merge_pass_count
+                    .checked_add(1)
+                    .ok_or_else(|| BulkLoadError::invalid("merge pass count exceeds u64::MAX"))?;
+            }
+            self.durations.merge = merge_started.elapsed();
         }
         let final_run = runs.pop();
         let final_run_file_bytes = final_run.as_ref().map_or(0, |run| run.file_bytes);
@@ -278,6 +309,7 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             run: final_run,
             reader,
             evidence,
+            durations: self.durations,
             max_accounted_memory_bytes: self.max_accounted_memory_bytes,
             previous_key: None,
             emitted_record_count: 0,
@@ -463,6 +495,7 @@ pub struct SortedVariableValues<const KEY_LEN: usize> {
     run: Option<RunFile>,
     reader: Option<BufReader<File>>,
     evidence: VariableValueSortEvidence,
+    durations: VariableValueSortDurations,
     max_accounted_memory_bytes: u64,
     previous_key: Option<[u8; KEY_LEN]>,
     emitted_record_count: u64,
@@ -475,6 +508,12 @@ impl<const KEY_LEN: usize> SortedVariableValues<KEY_LEN> {
     #[must_use]
     pub const fn evidence(&self) -> VariableValueSortEvidence {
         self.evidence
+    }
+
+    /// Returns the run spill, final flush, and merge time fixed when sorting completed.
+    #[must_use]
+    pub const fn durations(&self) -> VariableValueSortDurations {
+        self.durations
     }
 
     /// Reads the next key and value without retaining earlier records.
@@ -744,6 +783,43 @@ mod tests {
         assert_eq!(sorted_records.evidence().initial_run_count, 4);
         assert_eq!(sorted_records.evidence().record_count, 4);
         assert!(!final_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn durations_separate_spills_final_flush_and_merge() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let memory_limit = one_record_memory_limit::<2>(1);
+        let mut staged_sort =
+            VariableValueSorter::<2>::new(temporary.path(), "timed", memory_limit, 1_024)?;
+        staged_sort.push([1, 0], &[1])?;
+        assert_eq!(staged_sort.durations, VariableValueSortDurations::default());
+        staged_sort.push([3, 0], &[3])?;
+        staged_sort.push([2, 0], &[2])?;
+        let sorted_records = staged_sort.finish()?;
+        let durations = sorted_records.durations();
+
+        assert_eq!(sorted_records.evidence().initial_run_count, 3);
+        assert!(durations.initial_run_spill > Duration::ZERO);
+        assert!(durations.final_run_flush > Duration::ZERO);
+        assert!(durations.merge > Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn one_run_sort_records_no_spill_or_merge_time() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let mut staged_sort =
+            VariableValueSorter::<1>::new(temporary.path(), "one-run", 1_024, 1_024)?;
+        staged_sort.push([2], b"b")?;
+        staged_sort.push([1], b"a")?;
+        let sorted_records = staged_sort.finish()?;
+        let durations = sorted_records.durations();
+
+        assert_eq!(sorted_records.evidence().initial_run_count, 1);
+        assert_eq!(durations.initial_run_spill, Duration::ZERO);
+        assert_eq!(durations.merge, Duration::ZERO);
+        assert!(durations.final_run_flush > Duration::ZERO);
         Ok(())
     }
 

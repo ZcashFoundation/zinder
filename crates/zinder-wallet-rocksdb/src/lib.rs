@@ -14,9 +14,11 @@ mod transition;
 pub use build::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
     WalletBuildLeaseHeartbeat, WalletBuildLeasePhase, WalletBuildPhaseDurations,
-    WalletColdValidationPhaseDurations, WalletProjectionBuildLeaseExecution,
-    WalletProjectionReplaySource, build_wallet_from_canonical,
-    build_wallet_from_canonical_with_lease, build_wallet_from_canonical_with_lease_and_heartbeat,
+    WalletBuildStageDuration, WalletColdReopenPhaseDurations, WalletColdValidationPhaseDurations,
+    WalletProjectionBuildLeaseExecution, WalletProjectionReplaySource,
+    WalletSecondaryRowDerivationPhaseDurations, WalletSstWriteDurations,
+    build_wallet_from_canonical, build_wallet_from_canonical_with_lease,
+    build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };
 pub use error::RocksDbWalletError;

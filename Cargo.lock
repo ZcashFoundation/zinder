@@ -6723,6 +6723,7 @@ dependencies = [
 name = "zinder-wallet-rocksdb"
 version = "0.23.0"
 dependencies = [
+ "metrics",
  "prost",
  "rust-rocksdb",
  "tempfile",

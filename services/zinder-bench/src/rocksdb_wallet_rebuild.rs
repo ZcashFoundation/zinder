@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::Args;
 use serde::Serialize;
-use zinder_bench::BenchError;
+use zinder_bench::{BenchError, report::WalletBuildStageSeconds};
 use zinder_core::wire::decode_zinder_native_chain_name;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -86,6 +86,7 @@ pub(crate) struct RocksDbWalletRebuildReport {
     cold_validation_reorg_undo_readback_seconds: f64,
     ready_publication_seconds: f64,
     total_seconds: f64,
+    build_stages: Vec<WalletBuildStageSeconds>,
 }
 
 /// Rebuilds one wallet projection from the exact admitted canonical fence.
@@ -182,6 +183,7 @@ fn rebuild_report(
             .as_secs_f64(),
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
+        build_stages: WalletBuildStageSeconds::from_report(report),
     }
 }
 

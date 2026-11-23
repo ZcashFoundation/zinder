@@ -14,8 +14,8 @@ use zinder_core::{
     TransactionId, TransparentUtxoSetCommitment, ValidatedCanonicalBlockReplay,
 };
 use zinder_rocksdb_bulk_load::{
-    OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortEvidence,
-    VariableValueSorter,
+    BulkLoadError, OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortDurations,
+    VariableValueSortEvidence, VariableValueSorter,
 };
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
@@ -27,7 +27,7 @@ use zinder_wallet_projection::{
 };
 
 use crate::{
-    RocksDbWalletError,
+    RocksDbWalletError, WalletSecondaryRowDerivationPhaseDurations, WalletSstWriteDurations,
     store::{
         REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
         TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
@@ -78,6 +78,8 @@ pub(crate) struct WalletProjectionLoadPhaseDurations {
     pub(crate) outpoint_sort: Duration,
     pub(crate) outpoint_merge: Duration,
     pub(crate) secondary_row_derivation: Duration,
+    pub(crate) secondary_row_derivation_phases: WalletSecondaryRowDerivationPhaseDurations,
+    pub(crate) sst_write: WalletSstWriteDurations,
     pub(crate) logical_evidence: Duration,
 }
 
@@ -103,6 +105,9 @@ pub(crate) struct PreparedWalletProjectionLoad {
     pub(crate) outpoint_sort_evidence: VariableValueSortEvidence,
     pub(crate) address_index_sort_evidence: VariableValueSortEvidence,
     pub(crate) address_transaction_sort_evidence: VariableValueSortEvidence,
+    pub(crate) outpoint_sort_durations: VariableValueSortDurations,
+    pub(crate) address_index_sort_durations: VariableValueSortDurations,
+    pub(crate) address_transaction_sort_durations: VariableValueSortDurations,
     pub(crate) logical_row_bytes: u64,
     pub(crate) sst_file_bytes: u64,
     pub(crate) sst_file_count: u64,
@@ -442,6 +447,7 @@ pub(crate) fn write_projection_ssts(
     let phase_started = Instant::now();
     let mut sorted_outpoints = outpoint_sorter.finish()?;
     let outpoint_sort_evidence = sorted_outpoints.evidence();
+    let outpoint_sort_durations = sorted_outpoints.durations();
     let outpoint_sort = phase_started.elapsed();
 
     let phase_started = Instant::now();
@@ -485,13 +491,17 @@ pub(crate) fn write_projection_ssts(
         &mut total_value_zat,
         &mut commitment,
     )?;
-    let unspent_files = unspent_writer.finish()?;
-    let spent_files = spent_writer.finish()?;
+    let (unspent_files, unspent_write) = unspent_writer.finish()?;
+    let (spent_files, spent_write) = spent_writer.finish()?;
     let outpoint_merge = phase_started.elapsed();
 
     let phase_started = Instant::now();
+    let step_started = Instant::now();
     let mut sorted_address_index = address_index_sorter.finish()?;
     let address_index_sort_evidence = sorted_address_index.evidence();
+    let address_index_sort_durations = sorted_address_index.durations();
+    let address_index_sort = step_started.elapsed();
+    let step_started = Instant::now();
     let mut address_index_writer = ordered_writer(
         config,
         WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
@@ -509,11 +519,16 @@ pub(crate) fn write_projection_ssts(
         &mut digest,
         &mut sst_evidence,
     )?;
-    let address_index_files = address_index_writer.finish()?;
-    let address_balance_files = address_balance_writer.finish()?;
+    let (address_index_files, address_index_write) = address_index_writer.finish()?;
+    let (address_balance_files, address_balance_write) = address_balance_writer.finish()?;
+    let address_index_drain = step_started.elapsed();
 
+    let step_started = Instant::now();
     let mut sorted_address_transactions = address_transaction_sorter.finish()?;
     let address_transaction_sort_evidence = sorted_address_transactions.evidence();
+    let address_transaction_sort_durations = sorted_address_transactions.durations();
+    let address_transaction_sort = step_started.elapsed();
+    let step_started = Instant::now();
     let mut address_transaction_writer = ordered_writer(
         config,
         WalletProjectionRowFamily::TransparentAddressTransaction,
@@ -526,8 +541,11 @@ pub(crate) fn write_projection_ssts(
         &mut digest,
         &mut sst_evidence,
     )?;
-    let address_transaction_files = address_transaction_writer.finish()?;
+    let (address_transaction_files, address_transaction_write) =
+        address_transaction_writer.finish()?;
+    let address_transaction_drain = step_started.elapsed();
 
+    let step_started = Instant::now();
     let mut reorg_undo_writer = ordered_writer(
         config,
         WalletProjectionRowFamily::ReorgUndo,
@@ -546,7 +564,8 @@ pub(crate) fn write_projection_ssts(
             &encoded_value,
         )?;
     }
-    let reorg_undo_files = reorg_undo_writer.finish()?;
+    let (reorg_undo_files, reorg_undo_write) = reorg_undo_writer.finish()?;
+    let reorg_undo_write_step = step_started.elapsed();
     let secondary_row_derivation = phase_started.elapsed();
 
     let phase_started = Instant::now();
@@ -600,11 +619,28 @@ pub(crate) fn write_projection_ssts(
             outpoint_sort,
             outpoint_merge,
             secondary_row_derivation,
+            secondary_row_derivation_phases: WalletSecondaryRowDerivationPhaseDurations {
+                address_index_sort,
+                address_index_drain,
+                address_transaction_sort,
+                address_transaction_drain,
+                reorg_undo_write: reorg_undo_write_step,
+            },
+            sst_write: WalletSstWriteDurations {
+                primary_outputs: unspent_write.saturating_add(spent_write),
+                address_index_and_balance: address_index_write
+                    .saturating_add(address_balance_write),
+                address_transaction: address_transaction_write,
+                reorg_undo: reorg_undo_write,
+            },
             logical_evidence,
         },
         outpoint_sort_evidence,
         address_index_sort_evidence,
         address_transaction_sort_evidence,
+        outpoint_sort_durations,
+        address_index_sort_durations,
+        address_transaction_sort_durations,
         logical_row_bytes: sst_evidence.logical_row_bytes,
         sst_file_bytes,
         sst_file_count,
@@ -619,8 +655,8 @@ pub(crate) fn write_projection_ssts(
 fn drain_outpoint_events(
     network: Network,
     sorted: &mut SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
-    unspent_writer: &mut OrderedSstWriter<'_>,
-    spent_writer: &mut OrderedSstWriter<'_>,
+    unspent_writer: &mut TimedSstWriter<'_>,
+    spent_writer: &mut TimedSstWriter<'_>,
     address_index_sorter: &mut VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
     address_transaction_sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
     digest: &mut WalletProjectionDigestBuilder,
@@ -735,8 +771,8 @@ fn accept_outpoint_event(
 
 fn drain_address_index(
     sorted: &mut SortedVariableValues<ADDRESS_UNSPENT_KEY_BYTES>,
-    index_writer: &mut OrderedSstWriter<'_>,
-    balance_writer: &mut OrderedSstWriter<'_>,
+    index_writer: &mut TimedSstWriter<'_>,
+    balance_writer: &mut TimedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
     evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
@@ -787,7 +823,7 @@ fn drain_address_index(
 fn write_balance(
     address: zinder_core::TransparentAddressScriptHash,
     balance_zat: u64,
-    writer: &mut OrderedSstWriter<'_>,
+    writer: &mut TimedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
     evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
@@ -810,7 +846,7 @@ fn write_balance(
 
 fn drain_address_transactions(
     sorted: &mut SortedVariableValues<ADDRESS_TRANSACTION_KEY_BYTES>,
-    writer: &mut OrderedSstWriter<'_>,
+    writer: &mut TimedSstWriter<'_>,
     retained_undo: &mut RetainedUndo,
     digest: &mut WalletProjectionDigestBuilder,
     evidence: &mut WalletProjectionSstEvidence,
@@ -874,7 +910,7 @@ fn stage_address_transaction(
     reason = "one row must update its physical writer and both pieces of logical evidence together"
 )]
 fn append_row(
-    writer: &mut OrderedSstWriter<'_>,
+    writer: &mut TimedSstWriter<'_>,
     digest: &mut WalletProjectionDigestBuilder,
     evidence: &mut WalletProjectionSstEvidence,
     family: WalletProjectionRowFamily,
@@ -890,13 +926,40 @@ fn ordered_writer<'options>(
     config: WalletProjectionLoadConfig<'options>,
     family: WalletProjectionRowFamily,
     artifact_label: &'static str,
-) -> Result<OrderedSstWriter<'options>, RocksDbWalletError> {
-    Ok(OrderedSstWriter::new(
-        config.staging_path,
-        artifact_label,
-        config.options.for_family(family),
-        config.sst_target_logical_bytes,
-    )?)
+) -> Result<TimedSstWriter<'options>, RocksDbWalletError> {
+    Ok(TimedSstWriter {
+        writer: OrderedSstWriter::new(
+            config.staging_path,
+            artifact_label,
+            config.options.for_family(family),
+            config.sst_target_logical_bytes,
+        )?,
+        write_duration: Duration::ZERO,
+    })
+}
+
+/// Ordered SST writer that keeps the wall time spent inside it.
+///
+/// The time covers each row's encoding, file rotation, and the final file
+/// close, so the build can separate SST writing from the drain that feeds it.
+struct TimedSstWriter<'options> {
+    writer: OrderedSstWriter<'options>,
+    write_duration: Duration,
+}
+
+impl TimedSstWriter<'_> {
+    fn put(&mut self, key: &[u8], encoded_value: &[u8]) -> Result<(), BulkLoadError> {
+        let started = Instant::now();
+        let outcome = self.writer.put(key, encoded_value);
+        self.write_duration = self.write_duration.saturating_add(started.elapsed());
+        outcome
+    }
+
+    fn finish(self) -> Result<(SstFileSet, Duration), BulkLoadError> {
+        let started = Instant::now();
+        let files = self.writer.finish()?;
+        Ok((files, self.write_duration.saturating_add(started.elapsed())))
+    }
 }
 
 fn prepare_families(

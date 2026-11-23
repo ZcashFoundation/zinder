@@ -11,7 +11,7 @@ use zinder_core::{
     BlockId, CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, Network,
     UnixTimestampMillis,
 };
-use zinder_rocksdb_bulk_load::VariableValueSortEvidence;
+use zinder_rocksdb_bulk_load::{VariableValueSortDurations, VariableValueSortEvidence};
 use zinder_store::{
     CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
+const BUILD_STAGE_DURATION_METRIC: &str = "zinder_wallet_projection_build_stage_duration_seconds";
 
 /// Read-only canonical source sufficient for one fixed-tip wallet projection build.
 ///
@@ -253,8 +254,9 @@ impl RocksDbWalletBuildOptions {
 ///
 /// Cold validation reads every durable row once, in stored key order. The
 /// primary output, address-index, and address-transaction scans run
-/// concurrently, so these durations overlap: each is the wall time of its own
-/// scan and none exceeds [`WalletBuildPhaseDurations::cold_validation`].
+/// concurrently, so their three durations overlap: each is the wall time of
+/// its own scan, and `concurrent_family_readback` is the wall time of all
+/// three together. The reorg-undo scan runs after them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletColdValidationPhaseDurations {
     /// Merged scan of the unspent and spent primary output families.
@@ -263,8 +265,58 @@ pub struct WalletColdValidationPhaseDurations {
     pub address_index_and_balance_readback: Duration,
     /// Scan of the address-transaction family.
     pub address_transaction_readback: Duration,
+    /// Wall time of the three concurrent family scans above, start to last join.
+    pub concurrent_family_readback: Duration,
     /// Scan of the retained reorg-undo suffix.
     pub reorg_undo_readback: Duration,
+}
+
+/// Sequential steps of [`WalletBuildPhaseDurations::secondary_row_derivation`].
+///
+/// The steps run one after another and do not overlap. Each sort is the
+/// sorter's final run flush and merge passes; each drain reads the sorted run
+/// back and writes its families' SST files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletSecondaryRowDerivationPhaseDurations {
+    /// Final sort of the address-unspent index rows.
+    pub address_index_sort: Duration,
+    /// Address-unspent index and address-balance rows drained into SST files.
+    pub address_index_drain: Duration,
+    /// Final sort of the address-transaction rows.
+    pub address_transaction_sort: Duration,
+    /// Address-transaction rows deduplicated and drained into SST files.
+    pub address_transaction_drain: Duration,
+    /// Retained reorg-undo rows encoded and written to SST files.
+    pub reorg_undo_write: Duration,
+}
+
+/// Wall time spent inside the ordered SST writers, by the phase that drove them.
+///
+/// Each value covers row encoding, file rotation, and the final file close,
+/// and is part of the phase named on its field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletSstWriteDurations {
+    /// Unspent and spent output writers, inside
+    /// [`WalletBuildPhaseDurations::outpoint_merge`].
+    pub primary_outputs: Duration,
+    /// Address-unspent index and address-balance writers, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::address_index_drain`].
+    pub address_index_and_balance: Duration,
+    /// Address-transaction writer, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::address_transaction_drain`].
+    pub address_transaction: Duration,
+    /// Reorg-undo writer, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::reorg_undo_write`].
+    pub reorg_undo: Duration,
+}
+
+/// Sequential steps of [`WalletBuildPhaseDurations::flush_and_cold_reopen`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletColdReopenPhaseDurations {
+    /// Blocking memtable flush, WAL sync, and close of the BUILDING store.
+    pub flush_and_close: Duration,
+    /// Reopen of the closed store and its identity and control checks.
+    pub cold_reopen: Duration,
 }
 
 /// Wall-clock duration of each observable fresh-build phase.
@@ -280,12 +332,18 @@ pub struct WalletBuildPhaseDurations {
     pub outpoint_merge: Duration,
     /// Secondary sorting, deduplication, balances, history, and retained undo.
     pub secondary_row_derivation: Duration,
+    /// Breakdown of `secondary_row_derivation` into its sequential steps.
+    pub secondary_row_derivation_phases: WalletSecondaryRowDerivationPhaseDurations,
+    /// SST writer time inside `outpoint_merge` and the secondary steps.
+    pub sst_write: WalletSstWriteDurations,
     /// Row-count and full order-independent accumulator finalization.
     pub logical_evidence: Duration,
     /// External SST ingestion into the unpublished BUILDING store.
     pub row_load: Duration,
     /// Blocking flush, close, and cold BUILDING reopen.
     pub flush_and_cold_reopen: Duration,
+    /// Breakdown of `flush_and_cold_reopen` into close and reopen.
+    pub flush_and_cold_reopen_phases: WalletColdReopenPhaseDurations,
     /// Digest and row-count readback against the candidate READY evidence.
     pub cold_validation: Duration,
     /// Breakdown of `cold_validation` by scanned row family.
@@ -329,6 +387,12 @@ pub struct RocksDbWalletBuildReport {
     pub address_index_sort: VariableValueSortEvidence,
     /// Exact bounded-work evidence for the address-history secondary sorter.
     pub address_transaction_sort: VariableValueSortEvidence,
+    /// Run spill, final flush, and merge time of the outpoint event sorter.
+    pub outpoint_sort_durations: VariableValueSortDurations,
+    /// Run spill, final flush, and merge time of the address-unspent sorter.
+    pub address_index_sort_durations: VariableValueSortDurations,
+    /// Run spill, final flush, and merge time of the address-history sorter.
+    pub address_transaction_sort_durations: VariableValueSortDurations,
     /// Highest explicitly accounted retained reorg-undo footprint.
     pub peak_accounted_reorg_undo_bytes: u64,
     /// Caller-supplied retained reorg-undo ceiling.
@@ -349,6 +413,15 @@ pub struct RocksDbWalletBuildReport {
     pub phase_durations: WalletBuildPhaseDurations,
 }
 
+/// One named, non-overlapping stage of a fresh wallet build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalletBuildStageDuration {
+    /// Stable stage name, also the `stage` label of the build-stage histogram.
+    pub stage: &'static str,
+    /// Wall time spent in the stage.
+    pub duration: Duration,
+}
+
 impl RocksDbWalletBuildReport {
     /// Returns the exact source identity required to reopen this wallet store.
     #[must_use]
@@ -358,6 +431,94 @@ impl RocksDbWalletBuildReport {
             self.source_sequence_digest,
             self.settled_tip,
         )
+    }
+
+    /// Returns the build's non-overlapping stages in execution order.
+    ///
+    /// Sorter run spills and SST writer time are taken out of the phase they
+    /// ran inside and reported as stages of their own, so no interval counts
+    /// twice and the sum never exceeds [`WalletBuildPhaseDurations::total`].
+    /// The difference from the total is untimed bookkeeping between stages.
+    /// The three concurrent cold-validation family scans form one stage, their
+    /// combined wall time.
+    #[must_use]
+    pub fn stage_durations(&self) -> Vec<WalletBuildStageDuration> {
+        let phases = self.phase_durations;
+        let secondary = phases.secondary_row_derivation_phases;
+        let sst_write = phases.sst_write;
+        let reopen = phases.flush_and_cold_reopen_phases;
+        let validation = phases.cold_validation_phases;
+        let outpoint_spill = self.outpoint_sort_durations.initial_run_spill;
+        let address_index_spill = self.address_index_sort_durations.initial_run_spill;
+        let address_transaction_spill = self.address_transaction_sort_durations.initial_run_spill;
+        let outpoint_drain = phases
+            .outpoint_merge
+            .saturating_sub(sst_write.primary_outputs)
+            .saturating_sub(address_index_spill)
+            .saturating_sub(address_transaction_spill);
+        [
+            ("store_initialization", phases.store_initialization),
+            (
+                "canonical_scan",
+                phases.canonical_scan.saturating_sub(outpoint_spill),
+            ),
+            ("outpoint_run_spill", outpoint_spill),
+            ("outpoint_sort", phases.outpoint_sort),
+            ("outpoint_drain", outpoint_drain),
+            ("primary_sst_write", sst_write.primary_outputs),
+            ("address_index_run_spill", address_index_spill),
+            ("address_transaction_run_spill", address_transaction_spill),
+            ("address_index_sort", secondary.address_index_sort),
+            (
+                "address_index_drain",
+                secondary
+                    .address_index_drain
+                    .saturating_sub(sst_write.address_index_and_balance),
+            ),
+            (
+                "address_index_sst_write",
+                sst_write.address_index_and_balance,
+            ),
+            (
+                "address_transaction_sort",
+                secondary.address_transaction_sort,
+            ),
+            (
+                "address_transaction_drain",
+                secondary
+                    .address_transaction_drain
+                    .saturating_sub(sst_write.address_transaction),
+            ),
+            (
+                "address_transaction_sst_write",
+                sst_write.address_transaction,
+            ),
+            ("reorg_undo_write", secondary.reorg_undo_write),
+            ("logical_evidence", phases.logical_evidence),
+            ("row_load", phases.row_load),
+            ("flush_and_close", reopen.flush_and_close),
+            ("cold_reopen", reopen.cold_reopen),
+            (
+                "cold_validation_family_readback",
+                validation.concurrent_family_readback,
+            ),
+            (
+                "cold_validation_reorg_undo_readback",
+                validation.reorg_undo_readback,
+            ),
+            ("ready_publication", phases.ready_publication),
+        ]
+        .into_iter()
+        .map(|(stage, duration)| WalletBuildStageDuration { stage, duration })
+        .collect()
+    }
+}
+
+/// Records each completed build stage once in the build-stage histogram.
+fn record_build_stage_durations(report: &RocksDbWalletBuildReport) {
+    for stage in report.stage_durations() {
+        metrics::histogram!(BUILD_STAGE_DURATION_METRIC, "stage" => stage.stage)
+            .record(stage.duration.as_secs_f64());
     }
 }
 
@@ -634,6 +795,9 @@ where
         let outpoint_sort = prepared.outpoint_sort_evidence;
         let address_index_sort = prepared.address_index_sort_evidence;
         let address_transaction_sort = prepared.address_transaction_sort_evidence;
+        let outpoint_sort_durations = prepared.outpoint_sort_durations;
+        let address_index_sort_durations = prepared.address_index_sort_durations;
+        let address_transaction_sort_durations = prepared.address_transaction_sort_durations;
         let logical_row_bytes = prepared.logical_row_bytes;
         let sst_file_bytes = prepared.sst_file_bytes;
         let sst_file_count = prepared.sst_file_count;
@@ -650,7 +814,7 @@ where
         lease_cleanup.arm(builder.lease(), loaded_heartbeat.now());
 
         let phase_started = Instant::now();
-        let cold_build = builder.reopen_for_validation()?;
+        let (cold_build, flush_and_cold_reopen_phases) = builder.reopen_for_validation()?;
         let flush_and_cold_reopen = phase_started.elapsed();
 
         let phase_started = Instant::now();
@@ -702,6 +866,9 @@ where
             outpoint_sort,
             address_index_sort,
             address_transaction_sort,
+            outpoint_sort_durations,
+            address_index_sort_durations,
+            address_transaction_sort_durations,
             peak_accounted_reorg_undo_bytes: counters.peak_accounted_reorg_undo_bytes,
             max_accounted_reorg_undo_bytes: counters.max_accounted_reorg_undo_bytes,
             cold_validation_peak_accounted_reorg_undo_bytes: validation_evidence
@@ -718,15 +885,19 @@ where
                 outpoint_sort: load_durations.outpoint_sort,
                 outpoint_merge: load_durations.outpoint_merge,
                 secondary_row_derivation: load_durations.secondary_row_derivation,
+                secondary_row_derivation_phases: load_durations.secondary_row_derivation_phases,
+                sst_write: load_durations.sst_write,
                 logical_evidence: load_durations.logical_evidence,
                 row_load,
                 flush_and_cold_reopen,
+                flush_and_cold_reopen_phases,
                 cold_validation,
                 cold_validation_phases: validation_evidence.phase_durations,
                 ready_publication,
                 total,
             },
         };
+        record_build_stage_durations(&report);
         Ok(RocksDbWalletBuildOutcome { store, report })
     })();
 
