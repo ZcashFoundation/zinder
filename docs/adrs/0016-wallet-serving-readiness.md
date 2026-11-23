@@ -25,6 +25,10 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 
 [Readiness](../reference/readiness.md#readiness-causes) lists the causes and report fields. [Service operations](../architecture/service-operations.md#recovery) describes recovery.
 
+## Evidence
+
+- Decision 1, readiness without checkpoint coverage: judgment. Admission answers whether the served chain is correct, and a store between checkpoints still answers every tree-state read correctly by replay. Its cost is restore latency on stores that are not yet dense, measured in the consequences. A decision on [#500](https://github.com/ZcashFoundation/zinder/issues/500) to report coverage reopens it.
+
 ## Consequences
 
 - Through a node outage, a syncing node, or an ingest-control outage within the staleness ceiling, readers keep serving stored data, as [Readiness](../reference/readiness.md#during-a-node-outage) lists. Wallets keep scanning.
@@ -38,6 +42,7 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 - Native query never reports a node or ingest-control cause as its own. Those causes appear only under `degraded`.
 - Wallet-mode compatibility admits ingest control at startup, so it fails to start against an ingest of another network or contract revision.
 - An ingest restart during a node outage leaves readers refusing, because ingest needs the node to open its store and confirm its tip.
+- READY does not imply restore capacity. Readiness follows the serving pair, not tree-state checkpoint coverage, so a store with a checkpoint every 100 blocks reports READY while a fresh reader replays up to 99 blocks for each tree-state request between checkpoints. On Mainnet, 16 concurrent wallet restores over a dense historical window took about 62 seconds for their first period on such a store, against about 5.5 seconds with a checkpoint at every block ([#500](https://github.com/ZcashFoundation/zinder/issues/500)). Such stores include stores built before the dense construction default and upgraded in place, and stores built with Explorer coverage, until the background pass densifies them. Operators follow that pass through `zinder_ingest_tree_state_densification_watermark_height` and `zinder_ingest_tree_state_densification_remaining_strides`, and the share of tree-state reads answered from stored checkpoints through the `source` label of `zinder_query_tree_state_reads_total` ([Metrics](../reference/metrics.md)). Whether readiness reports incomplete coverage under `degraded` is not decided ([#500](https://github.com/ZcashFoundation/zinder/issues/500)).
 
 ## Alternatives rejected
 
@@ -58,3 +63,4 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 
 - 2026-11-20. Bound how long a caught-up mempool stream can wait for a replacement generation.
 - 2026-11-20. Decision 9 ties the node-outage budget to ingest’s current wait reason.
+- 2026-11-23. The consequences state that READY does not imply tree-state checkpoint coverage, with its measured restore cost and the signals that show densification progress.
