@@ -1518,3 +1518,69 @@ async fn below_catalog_streams_without_permits(
     );
     Ok(())
 }
+
+#[test]
+fn a_chunk_holds_a_published_read_permit_whenever_a_read_of_its_heights_can_open_signed_files()
+-> Result<()> {
+    use crate::{
+        CanonicalReaderSlot, block_methods::RangeSource, compact_block_messages::CompactBlockShape,
+        published_range::PublishedRangeRead,
+    };
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1_010);
+    let (_store, reader) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    assert!(
+        fixture
+            .publisher_from(BlockHeight::new(1_000))?
+            .publish_next(&reader)?
+    );
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let coverage = catalog.bounds();
+    let heights = 995..=1_006;
+    for is_descending in [false, true] {
+        let range = PublishedRangeRead::new(
+            Some(catalog.clone()),
+            catalog.tail(),
+            CompactBlockShape::for_range(&[])?,
+            is_descending,
+            crate::block_range::BlockRangeStreamLimit::new(NonZeroU32::MIN),
+        );
+        let eligible = |start, end| {
+            let chunk = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+            RangeSource::<CanonicalReaderSlot>::published_read_limit(&range, chunk).is_some()
+        };
+        for start in heights.clone() {
+            for end in start..=*heights.end() {
+                // A read of the whole chunk opens signed files when it starts
+                // inside the catalog, or descends through it from a live tail.
+                let reads_files = (coverage.start.value()..=coverage.end.value()).contains(&start)
+                    || (is_descending
+                        && start < coverage.start.value()
+                        && end > coverage.end.value());
+                assert!(
+                    !reads_files || eligible(start, end),
+                    "({start}, {end}) desc={is_descending}"
+                );
+                // A clipped read or a retry of checked heights keeps the end the
+                // stream sends first and may open files for those heights alone.
+                for inner in start..=end {
+                    let (first, last) = if is_descending {
+                        (inner, end)
+                    } else {
+                        (start, inner)
+                    };
+                    assert!(
+                        !eligible(first, last) || eligible(start, end),
+                        "({first}, {last}) within ({start}, {end}) desc={is_descending}"
+                    );
+                }
+            }
+        }
+        assert!(!eligible(995, 999), "below coverage desc={is_descending}");
+        assert!(
+            !eligible(1_002, 1_006),
+            "above coverage desc={is_descending}"
+        );
+    }
+    Ok(())
+}

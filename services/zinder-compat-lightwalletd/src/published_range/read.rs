@@ -98,16 +98,19 @@ impl PublishedRangeRead {
         }
     }
 
-    /// Signed reads start inside the catalog or descend into it from a
-    /// contiguous live tail. Other chunks use the canonical reader or tail.
+    /// Returns whether a read of `chunk`, or of the heights at the end it
+    /// sends first, can open signed segment files. A clipped read or a retry
+    /// of checked heights keeps that end, so an ascending chunk qualifies when
+    /// its start lies in the catalog and a descending one when it overlaps it.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
         self.shape == CompactBlockShape::DEFAULT_RANGE
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
-                (coverage.start..=coverage.end).contains(&chunk.start)
-                    || (self.is_descending
-                        && chunk.start < coverage.start
-                        && coverage.end < chunk.end)
+                if self.is_descending {
+                    chunk.start <= coverage.end && coverage.start <= chunk.end
+                } else {
+                    (coverage.start..=coverage.end).contains(&chunk.start)
+                }
             })
     }
 
