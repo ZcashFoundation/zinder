@@ -503,6 +503,7 @@ where
         tree_state_checkpoint_selection = ?config.tree_state_checkpoint_selection,
         "started canonical construction"
     );
+    warn_if_every_block_construction_lacks_qualified_cpus(config.tree_state_checkpoint_selection);
     let loaded =
         load_fresh_canonical_until_cancelled(builder, source, &config.construction, cancel)
             .await
@@ -739,6 +740,40 @@ fn install_staged_store(
             source,
         }
     })
+}
+
+/// CPUs on which every-block construction was qualified to reach Mainnet
+/// READY within the three-hour budget of ADR-0009.
+const EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS: usize = 8;
+
+/// Warns when a fresh construction stores every block's checkpoint on fewer
+/// CPUs than its Mainnet READY qualification used.
+fn warn_if_every_block_construction_lacks_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+) {
+    let Ok(available_cpus) = std::thread::available_parallelism().map(std::num::NonZeroUsize::get)
+    else {
+        return;
+    };
+    if every_block_construction_below_qualified_cpus(selection, available_cpus) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "every_block_construction_below_qualified_cpus",
+            available_cpus,
+            qualified_cpus = EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS,
+            "every-block construction reaches Mainnet READY within three hours on 8 CPUs and takes longer on this host; set ingest.tree_state_densification.selection = \"commitment-budget\" or during_construction = false for a faster first sync"
+        );
+    }
+}
+
+/// Whether a fresh construction stores every block's checkpoint on fewer
+/// CPUs than that qualification used.
+fn every_block_construction_below_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+    available_cpus: usize,
+) -> bool {
+    selection == Some(TreeStateCheckpointSelection::EveryBlock)
+        && available_cpus < EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS
 }
 
 #[cfg(test)]
@@ -1621,5 +1656,25 @@ mod tests {
         discard_unpublished_block_load_staging(&tempdir.path().join("store.building"))?;
 
         Ok(())
+    }
+
+    #[test]
+    fn only_every_block_construction_on_fewer_than_eight_cpus_warns() {
+        use zinder_store::TreeStateCheckpointSelection::{CommitmentBudget, EveryBlock};
+
+        let budget = std::num::NonZeroU32::new(256).map(CommitmentBudget);
+        for (selection, cpus, warns) in [
+            (Some(EveryBlock), 2, true),
+            (Some(EveryBlock), 7, true),
+            (Some(EveryBlock), 8, false),
+            (budget, 2, false),
+            (None, 2, false),
+        ] {
+            assert_eq!(
+                super::every_block_construction_below_qualified_cpus(selection, cpus),
+                warns,
+                "{selection:?} on {cpus} CPUs"
+            );
+        }
     }
 }

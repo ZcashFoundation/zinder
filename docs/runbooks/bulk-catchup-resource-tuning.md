@@ -57,6 +57,36 @@ Startup rejects a configuration in which `source_fetch_max_in_flight_bytes` is
 smaller than one node response, or `source_segment_target_response_bytes` is
 larger than the largest `max_response_bytes` across all endpoints.
 
+### First sync on fewer than 8 CPUs
+
+Wallet-serving ingest stores a tree-state checkpoint at every height during a
+fresh sync by default. On Mainnet that costs about 40% more writer CPU than a
+sparse sync. On 8 physical cores, the chain store still reaches READY within
+the three-hour budget. On fewer cores the sync takes longer, and ingest logs
+`every_block_construction_below_qualified_cpus` when it starts one.
+
+These Mainnet estimates come from the measured writer CPU of each policy and
+the measured core-count scaling of a 2,000-block Mainnet slice. They exclude
+the node's own CPU use, which a shared host adds.
+
+| CPUs | Every block, the default | `commitment-budget` at 256 | Sparse |
+| ---: | --- | --- | --- |
+| 4 | About 2.7 to 3.3 hours | About 2.0 to 2.9 hours | About 2.2 to 3.1 hours |
+| 2 | About 4.8 to 5.6 hours | About 3.6 to 4.9 hours | About 3.4 to 5.3 hours |
+
+To reach READY sooner on a small host, choose one of these before the first
+sync. Neither changes an existing store.
+
+- Set `ingest.tree_state_densification.selection = "commitment-budget"`. Ingest
+  then stores a checkpoint each time `commitment_budget` note commitments
+  (1,024 by default) have accumulated, so a read between checkpoints replays
+  fewer commitments than the budget. With a budget of 256, writer CPU was
+  within 7% of a sparse sync, and hashing still runs on every CPU.
+- Set `ingest.tree_state_densification.during_construction = false` for a
+  sparse store. Reads then replay up to 99 blocks until the background pass
+  fills the history after READY, which takes an estimated 4 to 5 CPU-hours on
+  Mainnet.
+
 ## RocksDB budgets
 
 `[storage.canonical.rocksdb]` sets the canonical store's block cache, WAL

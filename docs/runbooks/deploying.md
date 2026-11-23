@@ -58,7 +58,7 @@ its own disk on top of the figures below.
 | Network | Disk | Memory | First sync |
 | --- | --- | --- | --- |
 | Mainnet | About 465 GB in use, including Explorer views. Wallet construction also needs about 130 GB free for temporary files when it starts. | Compose container limits: ingest 14 GiB, projector 10 GiB, query 4 GiB, compatibility 4 GiB | Between about 6 and 16 hours. See the note below. |
-| Testnet | Not measured | Compose container limits: ingest 8 GiB, projector 6 GiB, query 2 GiB, compatibility 2 GiB | Not measured. It fits the default construction deadlines of 3 hours for the chain store and 2 hours for the wallet store. |
+| Testnet | Not measured | Compose container limits: ingest 8 GiB, projector 6 GiB, query 2 GiB, compatibility 2 GiB | Not measured. A sparse build fits the default construction deadlines of 3 hours for the chain store and 2 hours for the wallet store. The every-block wallet-serving default has not been timed on Testnet. |
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
@@ -109,8 +109,12 @@ Peak disk use during a first sync has not been measured.
 
 Plan for up to about 16 hours for a Mainnet first sync. One measured build
 took about four hours for the chain store and more than two hours for the
-wallet store. Builds on earlier releases took about 16 hours in total. No full
-build has been timed on the current release.
+wallet store. Builds on earlier releases took about 16 hours in total. On 8
+physical cores, the wallet-serving chain store, with a checkpoint at every
+height, reached READY in 1 h 51 min. Smaller hosts take longer; see
+[First sync on fewer than 8 CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-cpus).
+No full first sync, including the wallet store, has been timed on the current
+release.
 
 ## Choose a deployment
 

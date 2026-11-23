@@ -203,8 +203,13 @@ construction checkpoint coverage and the background densification pass:
 When construction stores checkpoints beyond the cadence and build tip,
 `ingest.construction.tree_hashing_workers` defaults to the CPU count, at most
 16. Full Mainnet construction reaches READY within the three-hour budget of
-[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md) on an 8-core
-host with `every-block`, and with `commitment-budget` at a budget of 256.
+[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md) on 8 physical
+cores with `every-block`, and with `commitment-budget` at a budget of 256.
+Fewer cores take longer, and ingest logs
+`every_block_construction_below_qualified_cpus` when every-block construction
+starts on fewer than 8 CPUs.
+[Bulk-catchup resource tuning](../runbooks/bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-cpus)
+gives estimates and faster settings for smaller hosts.
 
 Live following already stores one checkpoint per block. Once ingest follows
 the tip, and Explorer views have caught up when they are enabled, the

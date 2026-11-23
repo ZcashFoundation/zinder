@@ -1710,7 +1710,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. Full Mainnet time to READY is qualified for `every-block` construction and for `commitment-budget` at a budget of 256. Changing this setting leaves stored checkpoints in place.",
+        description: "Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. On Mainnet, `every-block` and 256-commitment-budget construction reach READY within three hours on 8 CPUs; smaller hosts take longer, as the bulk-catchup tuning runbook describes. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
