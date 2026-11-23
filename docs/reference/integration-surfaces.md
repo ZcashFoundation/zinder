@@ -4,6 +4,15 @@ This page tells you how to connect a client to Zinder: which endpoint to use, th
 
 ## Choose a path
 
+You make two independent choices: which protocol your client speaks, and which Zcash network it reads.
+
+### Choose a protocol
+
+Zinder serves two wallet protocols on separate endpoints. A client speaks one of them.
+
+- **You have a lightwalletd wallet or SDK.** Keep it. It speaks `CompactTxStreamer`, and `zinder-compat-lightwalletd` serves that protocol unchanged.
+- **You are writing a new client.** Use the native `zinder.v1.wallet.WalletQuery` API, served by `zinder-query`. It adds reads pinned to one chain snapshot and a resumable event stream, which [Use cases](../use-cases.md) describes for wallets, backends, and payment tracking. The Rust `zinder-client` crate is a typed wrapper over this same API, so it needs a native endpoint.
+
 | You have | Use | Service | Compose port |
 | --- | --- | --- | --- |
 | An existing lightwalletd client or SDK | `CompactTxStreamer` | `zinder-compat-lightwalletd` | 9067 |
@@ -14,6 +23,28 @@ This page tells you how to connect a client to Zinder: which endpoint to use, th
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
 The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-compose.explorer.yml`, bound to host loopback. Your operator may publish different ones.
+
+### Choose a network
+
+Each endpoint serves one Zcash network, and the two networks are separate chains with separate funds.
+
+- **Mainnet** carries real ZEC. Use it for production chain data.
+- **Testnet** is its own chain with test coins that have no value. Use it to build and test an integration.
+
+Regtest is a private chain for local development and exists only on a Zinder you run yourself.
+
+### Endpoints
+
+Use the endpoint that matches both choices. On your own deployment, that is the Compose port from the protocol table. Compose adds 10000 to each port on Testnet and 20000 on Regtest. [Deploying Zinder](../runbooks/deploying.md) starts a deployment beside your own node.
+
+The Zcash Foundation runs these endpoints for a pilot:
+
+| Protocol | Mainnet | Testnet |
+| --- | --- | --- |
+| lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
+| Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
+
+The pilot endpoints admit specific clients and are not open to the public. Use one only after the Foundation admits your client. Otherwise, run your own Zinder and use its address.
 
 ## What every client must handle
 
@@ -168,13 +199,7 @@ The endpoint and the network are separate arguments, and the client checks that 
 Error: NetworkMismatch { expected: ZcashTestnet, actual: "zcash-mainnet" }
 ```
 
-| Endpoint | Network | Who can use it |
-| --- | --- | --- |
-| `http://127.0.0.1:9102` | The network of your own deployment. Compose adds 10000 to the port on Testnet and 20000 on Regtest. | Anyone who runs Zinder. [Deploying Zinder](../runbooks/deploying.md) starts one. |
-| `https://zinder.zfnd.org:443` | `Network::ZcashMainnet` | Clients the Zcash Foundation has admitted to its pilot. |
-| `https://testnet.zinder.zfnd.org:443` | `Network::ZcashTestnet` | Clients the Zcash Foundation has admitted to its pilot. |
-
-The two Foundation endpoints serve a restricted pilot and are not open to the public. Use one only after the Foundation admits your client. Otherwise, run your own Zinder beside your own node and use its address.
+For a local endpoint, pass the network of your own deployment. For a Foundation pilot endpoint, pass `Network::ZcashMainnet` or `Network::ZcashTestnet` to match the column you took the address from in [Endpoints](#endpoints).
 
 ### TLS
 
