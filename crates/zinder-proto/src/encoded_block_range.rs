@@ -273,6 +273,9 @@ const FIRST_BATCH_BYTES: usize = 8 * 1024;
 ///
 /// Its first data frame differs from tonic's by design: the first batch is
 /// sent at [`FIRST_BATCH_BYTES`], and the next ends where tonic's first would.
+/// So when a message over the size limit follows in tonic's first batch, the
+/// messages of the capped first frame have already been sent, where tonic
+/// would drop them with the rest of its unsent batch.
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,

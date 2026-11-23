@@ -207,6 +207,31 @@ fn a_refused_message_drops_the_unsent_batch_as_tonic_does() -> eyre::Result<()> 
 }
 
 #[test]
+fn a_refused_message_after_the_capped_first_frame_keeps_only_that_frame() -> eyre::Result<()> {
+    let limit = 1_000;
+    let mut script = Vec::new();
+    for tag in 0..30_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    script.push(Some(Ok(framed(&payload(limit + 1, 30))?)));
+    let (encoded, tonic) = both(&script, Some(limit))?;
+    // tonic drops its whole unsent batch; this body has already sent the
+    // first 21 messages and drops only the 9 after them.
+    assert_eq!(tonic.frames, Vec::<Bytes>::new());
+    assert_eq!(encoded.frames.len(), 1);
+    assert_eq!(
+        encoded.frames[0].len(),
+        21 * (400 + EncodedBlock::PREFIX_LEN)
+    );
+    assert_eq!(encoded.trailers, tonic.trailers);
+    assert_eq!(
+        grpc_status(&encoded).map(|status| status.code()),
+        Some(tonic::Code::OutOfRange)
+    );
+    Ok(())
+}
+
+#[test]
 fn encoding_keeps_compact_block_bytes_including_unknown_fields() -> eyre::Result<()> {
     // Height 42 followed by an unknown field, which decoding and re-encoding would discard.
     let stored: &'static [u8] = &[0x10, 42, 0x78, 1];
