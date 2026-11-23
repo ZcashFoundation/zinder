@@ -1755,8 +1755,7 @@ impl WalletServingPairPublisher {
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
         let requirements =
-            CanonicalStoreRequirements::for_blob_retention(self.config.expected_raw_blob_retention)
-                .with_complete_subtree_root_prefix();
+            CanonicalStoreRequirements::for_blob_retention(self.config.expected_raw_blob_retention);
         let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
         let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;

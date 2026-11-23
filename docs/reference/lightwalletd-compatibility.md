@@ -220,7 +220,7 @@ lightwalletd treats `maxEntries = 0` as "every root", and Zinder does the same: 
 
 If that epoch is retired before the last page, the stream ends with `UNAVAILABLE` after the roots already sent. A stream that has already sent its last completed root ends with `OK` without another read. To retry after `UNAVAILABLE`, restart from the original `startIndex`, or resume after a root whose `completingBlockHash` the wallet has verified on the new chain. Resuming at the index after the last delivered root is unsafe, because a reorg that replaced that root's completing block also replaces the root, and the resumed stream would skip its replacement and combine roots from two forks.
 
-Wallet and light-wallet serving require every completed root from index zero in each pool before the listener starts. A retained-range build satisfies the requirement when its checkpoint predecessor has completed no roots. A checkpointed wallet store with complete-prefix coverage also serves roots completed below its retained block history. See [Schema admission](../architecture/storage-backend.md#schema-admission). `completingBlockHash` is in RPC byte order.
+Light-wallet serving requires every completed root from index zero in each pool at admission. Full-wallet serving can open a checkpointed pair with retained-range coverage. A request for a root completed before the retained block history returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE` if the store lacks that root. A complete-prefix build also serves those earlier roots. See [Schema admission](../architecture/storage-backend.md#schema-admission). `completingBlockHash` is in RPC byte order.
 
 ### `GetTransaction`
 

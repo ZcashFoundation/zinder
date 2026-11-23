@@ -768,10 +768,25 @@ async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() ->
 }
 
 #[tokio::test]
-async fn wallet_binary_refuses_missing_root_prefix_while_compact_blocks_serve() -> Result<()> {
-    let writer = super::lightwalletd_grpc::floor_with_completed_subtree_writer()?;
+async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result<()> {
+    use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
+
+    let writer = super::lightwalletd_grpc::floor_with_completed_subtree_writer(
+        zinder_store::RawBlobRetention::Transactions,
+    )?;
     let primary = writer.canonical_primary()?;
     let files = tempfile::tempdir()?;
+    let wallet_path = files.path().join("wallet-primary");
+    let reorg_window = primary.reorg_policy().reorg_window_blocks();
+    let projection = build_wallet_from_canonical(
+        primary,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: reorg_window,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    drop(projection.store);
     let cancel = CancellationToken::new();
     let _cancel_on_exit = cancel.clone().drop_guard();
     let control =
@@ -779,56 +794,66 @@ async fn wallet_binary_refuses_missing_root_prefix_while_compact_blocks_serve() 
     let reservation = TcpListener::bind("127.0.0.1:0")?;
     let addr = reservation.local_addr()?;
     drop(reservation);
-    let command = |serving: &str| {
-        let mut process =
-            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"));
-        process
+    let log_path = files.path().join("wallet.stderr");
+    let mut wallet =
+        tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
             .env_clear()
             .env("ZINDER_NETWORK__NAME", "zcash-regtest")
             .env("ZINDER_INGEST_CONTROL__ADDR", &control)
-            .env("ZINDER_COMPAT__SERVING", serving)
-            .env("ZINDER_COMPAT__STALE_TIP_LIMIT_MS", "0")
-            .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
-            .env("ZINDER_COMPAT__LISTEN_ADDR", addr.to_string())
+            .env("ZINDER_COMPAT__SERVING", "wallet")
             .env(
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
-                primary.reorg_policy().reorg_window_blocks().to_string(),
+                reorg_window.to_string(),
             )
+            .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+            .env("ZINDER_COMPAT__LISTEN_ADDR", addr.to_string())
             .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
-            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "none")
-            .env("ZINDER_STORAGE__SECONDARY_PATH", files.path().join(serving))
-            .kill_on_drop(true);
-        process
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                files.path().join("canonical-secondary"),
+            )
+            .env("ZINDER_WALLET__PATH", wallet_path)
+            .env(
+                "ZINDER_WALLET__SECONDARY_PATH",
+                files.path().join("wallet-secondary"),
+            )
+            .kill_on_drop(true)
+            .stderr(File::create(&log_path)?)
+            .spawn()?;
+    let mut client = wait_for_compat(&mut wallet, addr, &log_path).await?;
+    let retained = lightwalletd::BlockId {
+        height: 2,
+        hash: Vec::new(),
     };
-    let mut wallet = command("wallet");
-    wallet
-        .env("ZINDER_WALLET__PATH", files.path().join("wallet-primary"))
-        .env(
-            "ZINDER_WALLET__SECONDARY_PATH",
-            files.path().join("wallet-secondary"),
-        );
-    let output = tokio::time::timeout(Duration::from_secs(10), wallet.output()).await??;
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("lacks the required complete subtree-root prefix"),
-        "{stderr}"
-    );
+    let mut blocks = client
+        .get_block_range(lightwalletd::BlockRange {
+            start: Some(retained.clone()),
+            end: Some(retained),
+            pool_types: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(blocks.message().await?.map(|block| block.height), Some(2));
+    assert!(blocks.message().await?.is_none());
 
-    let log_path = files.path().join("compact.stderr");
-    let mut compact = command("compact-blocks")
-        .stderr(File::create(&log_path)?)
-        .spawn()?;
-    let mut client = wait_for_compat(&mut compact, addr, &log_path).await?;
+    let missing = client
+        .get_subtree_roots(lightwalletd::GetSubtreeRootsArg {
+            start_index: 0,
+            shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+            max_entries: 1,
+        })
+        .await
+        .err()
+        .ok_or_else(|| eyre!("the missing root unexpectedly opened a stream"))?;
+    assert_eq!(missing.code(), Code::NotFound);
     assert_eq!(
-        client
-            .get_latest_block(lightwalletd::ChainSpec {})
-            .await?
-            .into_inner()
-            .height,
-        2
+        missing
+            .get_error_details()
+            .error_info()
+            .map(|detail| detail.reason.as_str()),
+        Some("ARTIFACT_UNAVAILABLE")
     );
-    compact.kill().await?;
+    wallet.kill().await?;
     Ok(())
 }
 
