@@ -90,6 +90,12 @@ TAMPERED = {
     'a payload counter is missing': lambda route, receipt: route['covered']['canonical_payload_read_delta'].pop('rocksdb.db.iter.bytes.read'),
     'admission count differs': set_path(['admission', 'open_segment_files'], 876),
     'covered heights incomplete': set_path(['covered', 'complete'], False),
+    # Review summary: a lower bound moved past the sample skipped the byte comparison.
+    'lower bound moved past the sample': lambda route, receipt: route.update(
+        first_height=1730100, covered=dict(route['covered'], range=[1730100, 1730199], byte_reference=None, matches_reference=False),
+        canonical_control=dict(route['canonical_control'], range=[1730100, 1730199])),
+    'reader did not require fs-verity': set_path(['require_fs_verity'], False),
+    'catalog served from another directory': set_path(['directory'], '/srv/elsewhere/catalog'),
 }
 
 
@@ -116,7 +122,7 @@ case "$1 $2" in
 esac
 cmd=""; while [[ $# -gt 0 ]]; do [[ $1 == --command ]] && cmd=$2; shift; done
 case $cmd in
-  true) exit 0 ;;
+  true) sleep "${STUB_SSH_TRUE_DELAY:-0}"; exit 0 ;;
   *"storage cp"*) exit 0 ;;
   *"/dev/stdin /root/.gcs-token"*) cat > /dev/null; exit 0 ;;
   *"tee /tmp/zfx-stage/fixture.json"*) cat > /dev/null; exit 0 ;;
@@ -365,6 +371,26 @@ exit 1
                 self.assertIn('signed_history must be an object', done.stderr)
                 self.assertFalse((self.stub / 'calls').exists())
 
+    def test_catalog_without_a_first_height_is_refused(self):
+        """Review summary item 1: the lower bound must come from the fixture."""
+        fixture = copy(GENUINE_FIXTURE)
+        del stores(fixture)['signed_history']['first_height']
+        done = run([sys.executable, '-I', GATE, 'preflight', write_json(self.tmp / 'no-first.json', fixture)])
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('first_height', done.stderr)
+
+    def test_unreachable_host_fails_within_the_host_wait(self):
+        """Review summary item 2: no extra ssh check runs after the host-wait budget."""
+        started = time.monotonic()
+        done, receipt = self.restore(outcome=genuine_outcome(), extra=['--host-wait-seconds', '3'],
+                                     env_extra={'STUB_SSH_TRUE_DELAY': '60'})
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(done.returncode, 1)
+        failed = self.failure(receipt)
+        self.assertEqual(failed['workstation_step'], 'host_running')
+        self.assertIn('did not accept ssh within 3 seconds', failed['reason'])
+        self.assertEqual(self.launches(), 0)
+
     def test_catalog_ending_at_the_settled_tip_is_accepted(self):
         """Finding 4: only the visible tip bounds the catalog."""
         fixture = copy(GENUINE_FIXTURE)
@@ -466,9 +492,10 @@ def catalog_fixture(mount, manifest, key, last, segments, visible):
     fixture['chain']['visible_height'] = visible
     component = stores(fixture)
     component['mount_path'] = str(mount)
+    first = json.loads(json.loads(manifest)['manifest'])['segments'][0]['first']
     component['signed_history'].update(manifest_sha256=hashlib.sha256(manifest).hexdigest(),
                                        publisher_key_sha256=hashlib.sha256(key).hexdigest(),
-                                       segment_count=segments, highest_height=last)
+                                       segment_count=segments, first_height=first, highest_height=last)
     return fixture
 
 
@@ -498,6 +525,14 @@ class ManifestGate(Workspace):
         done = self.verify(catalog_fixture(self.mount, self.manifest, self.key, self.last - 1, 3, self.last + 500))
         self.assertEqual(done.returncode, 1)
         self.assertIn('manifest ends at 1149', done.stderr)
+
+    def test_declared_lower_bound_must_equal_the_manifest(self):
+        """Review summary item 1: the fixture's first height is checked against the manifest too."""
+        fixture = catalog_fixture(self.mount, self.manifest, self.key, self.last, 3, self.last + 500)
+        stores(fixture)['signed_history']['first_height'] = 1001
+        done = self.verify(fixture)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('manifest starts at 1000', done.stderr)
 
     def test_changed_manifest_or_key_is_refused(self):
         fixture = catalog_fixture(self.mount, self.manifest, self.key, self.last, 3, self.last + 500)

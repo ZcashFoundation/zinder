@@ -19,9 +19,12 @@ defines that file. Each fixture records:
   `sha256sum` listing of its files;
 - for the component that holds a signed history catalog, a `signed_history`
   entry: the publisher directory, the publisher key, the SHA-256 of the
-  catalog's `current.json` and of the key, the segment count, and the highest
-  height the catalog covers. Such a fixture also pins the exact stage tarball
-  in `stage_sha256`, because an older stage would restore without the catalog.
+  catalog's `current.json` and of the key, the segment count, and the first
+  and highest heights the catalog covers. The restore checks the counts and
+  heights against the catalog's manifest, and judges the route proof only
+  against these recorded values. Such a fixture also pins the exact stage
+  tarball in `stage_sha256`, because an older stage would restore without the
+  catalog.
 
 | Component kind | Holds |
 | --- | --- |
@@ -59,6 +62,11 @@ The stage tarball holds everything the host runs: the Zinder binaries, the
 pinned Zebra binary, `jq`, `grpcurl`, the guest scripts, and the protocol
 files. Build it once per release and upload it with its SHA-256. For a fixture
 with a catalog, set `stage_sha256` in `fixture.json` to that SHA-256.
+
+A `signed_history` entry written before `first_height` was required fails
+the preflight. Add the catalog's first height, which is the first segment's
+`first` in its manifest and 1 for the 905dac4e fixture, then rebuild the stage
+and set `stage_sha256` as above.
 
 A stage built before the restore recorded a per-attempt outcome cannot be used
 with the current `restore-fixture.sh`, even for a fixture without a catalog.
@@ -131,8 +139,9 @@ The script performs these steps:
     failing step. The workstation polls for it until `--guest-timeout`
     (three hours by default), then checks the guest receipt against the
     fixture and writes the receipt. Every `gcloud` and ssh call ends within
-    15 minutes, and the launch, status, and diagnostic calls also end at
-    `--guest-timeout`.
+    15 minutes, the new host must accept ssh within `--host-wait-seconds`
+    (ten minutes by default), and the launch, status, and diagnostic calls
+    also end at `--guest-timeout`.
 
 A fixture without a `signed_history` entry restores as before. Its reader
 serves block ranges from the canonical store and from its in-memory live tail,

@@ -83,7 +83,9 @@ def history_errors(fixture):
                 errors.append(f'{name}: signed_history.{field} must be a lowercase SHA-256')
         if not is_int(history.get('segment_count')) or history['segment_count'] < 1:
             errors.append(f'{name}: signed_history.segment_count must be a positive integer')
-        highest = history.get('highest_height')
+        highest, first = history.get('highest_height'), history.get('first_height')
+        if not is_int(first) or first < 1 or (is_int(highest) and first > highest):
+            errors.append(f'{name}: signed_history.first_height must be a positive integer no greater than highest_height')
         if not is_int(highest) or highest < 1:
             errors.append(f'{name}: signed_history.highest_height must be a positive integer')
         elif not is_int(visible) or highest >= visible:
@@ -119,7 +121,8 @@ def checked_history(fixture):
                     'require_fs_verity': component.get('filesystem') == 'ext4-verity',
                     'manifest_sha256': history['manifest_sha256'],
                     'publisher_key_sha256': history['publisher_key_sha256'],
-                    'segment_count': history['segment_count'], 'highest_height': history['highest_height']}
+                    'segment_count': history['segment_count'], 'first_height': history['first_height'],
+                    'highest_height': history['highest_height']}
     return None
 
 
@@ -170,6 +173,8 @@ def verify_manifest(fixture, out):
         raise GateError(f"manifest lists {bounds['segments']} segments, the fixture records {history['segment_count']}")
     if bounds['last_height'] != history['highest_height']:
         raise GateError(f"manifest ends at {bounds['last_height']}, the fixture records {history['highest_height']}")
+    if bounds['first_height'] != history['first_height']:
+        raise GateError(f"manifest starts at {bounds['first_height']}, the fixture records {history['first_height']}")
     missing = [name for name in bounds['segment_files'] if not (directory / name).is_file()]
     if missing:
         raise GateError(f'{len(missing)} manifest segments are missing, first {missing[0]}')
@@ -257,12 +262,15 @@ def accept_errors(fixture, outcome, attempt, verify):
     if not isinstance(route, dict):
         return errors + ['the fixture declares signed history, but the guest receipt has no route proof; '
                          'the stage may predate signed history']
-    for field in ('manifest_sha256', 'publisher_key_sha256', 'segment_count'):
-        if route.get(field) != history[field]:
-            errors.append(f'route proof {field} is {route.get(field)!r}, the fixture records {history[field]!r}')
-    if route.get('last_height') != history['highest_height']:
-        errors.append(f"route proof last_height is {route.get('last_height')!r}, the fixture records {history['highest_height']}")
-    errors += route_failures(route, {'first': route.get('first_height'), 'last': history['highest_height'],
+    # Every expectation comes from the fixture, never from the report.
+    expected = {'manifest_sha256': history['manifest_sha256'], 'publisher_key_sha256': history['publisher_key_sha256'],
+                'segment_count': history['segment_count'], 'first_height': history['first_height'],
+                'last_height': history['highest_height'], 'directory': history['directory'],
+                'require_fs_verity': history['require_fs_verity']}
+    for field, value in expected.items():
+        if route.get(field) != value:
+            errors.append(f'route proof {field} is {route.get(field)!r}, the fixture requires {value!r}')
+    errors += route_failures(route, {'first': history['first_height'], 'last': history['highest_height'],
                                      'segment_count': history['segment_count'],
                                      'sample_pinned': isinstance(sample, dict), 'refusal': True})
     return errors

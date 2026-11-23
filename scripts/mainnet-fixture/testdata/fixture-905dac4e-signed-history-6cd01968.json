@@ -88,6 +88,7 @@
         "manifest_sha256": "8c484066261906c7dedb0a8f184ffb2663fd86eb5f143a563e6c7122d94364d5",
         "publisher_key_sha256": "442d3d478e59ad218f57e4ac8ea6e8bb8291cc6c3d402f52f0af758e41c1dd22",
         "segment_count": 877,
+        "first_height": 1,
         "highest_height": 3592192
       }
     }

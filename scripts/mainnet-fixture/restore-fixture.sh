@@ -31,13 +31,15 @@ Options:
   --guest-timeout SECONDS Fail when the guest restore has not finished this long
                           after launch (default 10800).
   --poll-seconds N        Seconds between guest status checks (default 20).
+  --host-wait-seconds N   Fail when the new host has not accepted ssh this long
+                          after it was created (default 600).
   -h, --help              Show this help.
 EOF
 }
 
 fixture="" stage="" name="" profile=fast verify=stores
 project=zfnd-dev-zinder zone=us-east1-c machine=c4-standard-16 hours=12 receipt=""
-guest_timeout=10800 poll=20
+guest_timeout=10800 poll=20 host_wait=600
 subnet=projects/zfnd-dev-net-spoke-0/regions/us-east1/subnetworks/dev-default-ue1
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --receipt) receipt=$2; shift 2 ;;
     --guest-timeout) guest_timeout=$2; shift 2 ;;
     --poll-seconds) poll=$2; shift 2 ;;
+    --host-wait-seconds) host_wait=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -69,7 +72,8 @@ case $profile in
 esac
 case $verify in none|stores|all) ;; *) die "--verify-hashes must be none, stores, or all" ;; esac
 if ! [[ $hours =~ ^[0-9]+$ ]] || (( hours < 1 || hours > 36 )); then die "--hours must be 1 to 36"; fi
-[[ $guest_timeout =~ ^[1-9][0-9]*$ && $poll =~ ^[1-9][0-9]*$ ]] || die "--guest-timeout and --poll-seconds must be positive integers"
+[[ $guest_timeout =~ ^[1-9][0-9]*$ && $poll =~ ^[1-9][0-9]*$ && $host_wait =~ ^[1-9][0-9]*$ ]] \
+  || die "--guest-timeout, --poll-seconds, and --host-wait-seconds must be positive integers"
 receipt=${receipt:-./restore-receipt-$name.json}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 schema=$here/fixture.schema.json gate=$here/guest/fixture-gate.py
@@ -179,11 +183,16 @@ gc compute instances create "$name" --project "$project" --zone "$zone" \
   --create-disk="name=$name-boot,boot=yes,auto-delete=yes,size=64,type=hyperdisk-balanced,provisioned-iops=3000,provisioned-throughput=140,image=$image,device-name=boot,interface=NVME" \
   "${disk_args[@]}" >&2
 mark host_running
-# The new host gets ten minutes to accept ssh.
-gssh_deadline=$((SECONDS + 600))
-for _ in $(seq 1 60); do gssh true < /dev/null 2>/dev/null && break; (( SECONDS < gssh_deadline )) || break; sleep 10; done
+# The new host gets --host-wait-seconds to accept ssh; when it has not, the
+# restore fails then, with no further check outside that budget.
+gssh_deadline=$((SECONDS + host_wait)) reachable=false
+while (( SECONDS < gssh_deadline )); do
+  gssh true < /dev/null 2>/dev/null && { reachable=true; break; }
+  remaining=$((gssh_deadline - SECONDS))
+  (( remaining <= 0 )) || sleep "$(( remaining < 10 ? remaining : 10 ))"
+done
 gssh_deadline=""
-gssh true < /dev/null
+[[ $reachable == true ]] || die "host $name did not accept ssh within $host_wait seconds"
 
 mark stage
 gc auth print-access-token | gssh 'sudo install -m 0600 /dev/stdin /root/.gcs-token'
