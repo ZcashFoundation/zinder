@@ -464,11 +464,12 @@ fn node_response_byte_range(
         )
 }
 
-fn available_logical_core_count() -> NonZeroU32 {
-    let logical_core_count =
-        std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
-    NonZeroU32::new(u32::try_from(logical_core_count).unwrap_or(u32::MAX))
-        .unwrap_or(NonZeroU32::MIN)
+/// The logical CPUs this process may use, or `None` when the platform
+/// cannot tell.
+fn detected_logical_core_count() -> Option<NonZeroU32> {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|cpus| NonZeroU32::new(u32::try_from(cpus.get()).unwrap_or(u32::MAX)))
 }
 
 #[allow(
@@ -482,11 +483,28 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
     let (smallest_node_response_bytes, largest_node_response_bytes) =
         node_response_byte_range(&node_target, &node_fallbacks);
-    let resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
+    let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
+    let explorer_views = resolve_explorer_views(
+        config.ingest.explorer_views,
+        config.ingest.run_overrides.checkpoint_height,
+    )?;
+    let mut densification = config.ingest.tree_state_densification;
+    if matches!(coverage, IngestCoverage::WalletServing) && !explorer_views {
+        densification.during_construction.get_or_insert(true);
+    }
+    let tree_state_densification = resolve_tree_state_densification(densification)?;
+    let detected_logical_cores = detected_logical_core_count();
+    let logical_core_count =
+        detected_logical_cores.unwrap_or_else(|| NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN));
+    let mut resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
         container_memory_budget_bytes().and_then(NonZeroU64::new),
-        available_logical_core_count(),
+        logical_core_count,
         largest_node_response_bytes,
     );
+    if tree_state_densification.construction_selection().is_some() {
+        resolved_pipeline_limits =
+            resolved_pipeline_limits.with_checkpoint_hashing(detected_logical_cores);
+    }
     let node_source_text = config
         .ingest
         .source
@@ -611,12 +629,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         ConfigError::invalid("ingest.follow.max_replacement_bytes must be greater than zero")
     })?;
 
-    let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
-    let explorer_views = resolve_explorer_views(
-        config.ingest.explorer_views,
-        config.ingest.run_overrides.checkpoint_height,
-    )?;
     let explorer_views_min_free_bytes = require_field(
         config.ingest.explorer_views_min_free_bytes,
         "ingest.explorer_views_min_free_bytes",
@@ -640,8 +653,6 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         checkpoint_staging_root: ingest_control_checkpoint_staging_root,
     } = resolve_ingest_control_writer(config.ingest_control)?;
     let retention = resolve_retention(config.retention)?;
-    let tree_state_densification =
-        resolve_tree_state_densification(config.ingest.tree_state_densification)?;
     let tree_state_verification =
         resolve_tree_state_verification(config.ingest.tree_state_verification)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;

@@ -88,7 +88,7 @@ zinder-bench rocksdb-canonical-fixture-replay \
 The canonical store path must be fresh and disjoint from the fixture. Defaults
 are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile, use
 the canonical writer resource budget, and persist checkpoints at the predecessor,
-every 100 blocks, and at the build tip. This matches fresh ingest defaults.
+every 100 blocks, and at the build tip. This matches fresh ingest with `explicit` coverage.
 Pass `--tree-state-checkpoint-coverage every-block` to measure dense construction.
 The report records the constructed coverage in
 `resource_limits.tree_state_checkpoint_coverage` and verifies
@@ -178,9 +178,9 @@ zinder-bench rocksdb-storage-lifecycle \
 The closed lifecycle derives its source and block-preparation limits from the
 declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
 independent pipeline tuning flags. Canonical construction defaults to
-`--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest defaults.
-Pass `--tree-state-checkpoint-coverage every-block` to measure the opt-in cost of
-writing dense checkpoints before READY. Report format
+`--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest with `explicit` coverage.
+Pass `--tree-state-checkpoint-coverage every-block` to measure the cost of
+writing dense checkpoints before READY, as wallet-serving ingest does by default. Report format
 version 5 records the actual constructed coverage in
 `resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
 in `resource_limits.canonical_publication_mode` (`trusted-fresh` or

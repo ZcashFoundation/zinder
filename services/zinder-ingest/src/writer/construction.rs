@@ -66,6 +66,7 @@ const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * MIB;
 const MIN_PIPELINE_MEMORY_WATERMARK_BYTES: u64 = 128 * MIB;
 const PIPELINE_MEMORY_BUDGET_DIVISOR: u64 = 64;
 const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
+const AUTOMATIC_TREE_HASHING_WORKERS_CEILING: u32 = 8;
 const CONSTRUCTION_PHASE_DURATION_METRIC: &str =
     "zinder_ingest_canonical_construction_phase_duration_seconds";
 const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
@@ -136,17 +137,32 @@ impl CanonicalPipelineLimits {
             )
             .unwrap_or(NonZeroU32::MIN),
             source_fetch_max_in_flight_bytes,
-            block_prepare_concurrency: NonZeroU32::new(
-                logical_core_count
-                    .get()
-                    .min(BLOCK_PREPARE_CONCURRENCY_CEILING),
-            )
-            .unwrap_or(NonZeroU32::MIN),
+            block_prepare_concurrency: core_bounded_concurrency(logical_core_count),
             block_prepare_memory_watermark_bytes: pipeline_memory_watermark(
                 memory_budget_bytes,
                 FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES,
             ),
             tree_hashing_workers: NonZeroU32::MIN,
+        }
+    }
+
+    /// Returns these limits with one tree-hashing thread per detected logical
+    /// CPU, at most 8, or with one thread when the CPU count is unknown.
+    ///
+    /// Construction that stores checkpoints beyond the cadence and build tip
+    /// spends most of its loader time hashing, so it defaults to this. Sparse
+    /// construction keeps hashing on the loader thread, where extra threads
+    /// slowed hosts with two cores. Eight is the most workers a full Mainnet
+    /// build has measured, including its peak memory: each worker lets two
+    /// more prepared blocks wait with their memory permits.
+    #[must_use]
+    pub fn with_checkpoint_hashing(self, detected_logical_cpus: Option<NonZeroU32>) -> Self {
+        let ceiling =
+            NonZeroU32::new(AUTOMATIC_TREE_HASHING_WORKERS_CEILING).unwrap_or(NonZeroU32::MIN);
+        Self {
+            tree_hashing_workers: detected_logical_cpus
+                .map_or(NonZeroU32::MIN, |cpus| cpus.min(ceiling)),
+            ..self
         }
     }
 
@@ -214,6 +230,11 @@ pub enum CanonicalPipelineLimitsError {
         /// Maximum response accepted from the node.
         max_response_bytes: NonZeroU64,
     },
+}
+
+fn core_bounded_concurrency(logical_core_count: NonZeroU32) -> NonZeroU32 {
+    logical_core_count
+        .min(NonZeroU32::new(BLOCK_PREPARE_CONCURRENCY_CEILING).unwrap_or(NonZeroU32::MIN))
 }
 
 fn pipeline_memory_watermark(
@@ -1496,6 +1517,27 @@ mod tests {
     }
 
     const MIB: u64 = 1_024 * 1_024;
+
+    #[test]
+    fn checkpoint_hashing_uses_detected_cpus_up_to_eight_and_one_when_unknown() {
+        let limits = CanonicalPipelineLimits::resolve(
+            None,
+            NonZeroU32::MIN,
+            NonZeroU64::new(64 * MIB).unwrap_or(NonZeroU64::MIN),
+        );
+        assert_eq!(limits.tree_hashing_workers, NonZeroU32::MIN);
+        for (detected, expected) in [(Some(2), 2), (Some(8), 8), (Some(64), 8), (None, 1)] {
+            let detected = detected.and_then(NonZeroU32::new);
+            assert_eq!(
+                limits
+                    .with_checkpoint_hashing(detected)
+                    .tree_hashing_workers
+                    .get(),
+                expected,
+                "detected {detected:?}"
+            );
+        }
+    }
 
     #[test]
     fn pipeline_limits_resolve_from_runtime_resources() {

@@ -1,0 +1,6 @@
+kind: changed
+body: 'Fresh wallet-serving stores with Explorer views off now store a tree-state checkpoint at every height before READY, so wallets read historical tree states from stored checkpoints as soon as the store is published. When construction stores these extra checkpoints, `ingest.construction.tree_hashing_workers` defaults to the detected logical CPU count, at most 8, or to 1 when the count cannot be detected. In the measured Mainnet build, with 6 hashing workers on 8 physical cores and one thread per core, this first sync reached READY within three hours. Hosts with fewer logical CPUs take longer, and ingest logs `every_block_construction_below_qualified_cpus` when it starts such a build; set `ingest.tree_state_densification.selection = "commitment-budget"` or `during_construction = false` before the first sync for an earlier READY. A wallet-serving configuration that sets only `selection = "commitment-budget"` or `commitment_budget` used to build a sparse store and now applies the budget before READY. Existing stores reopen without a rebuild, and a sparse store keeps being densified by the background pass.'
+time: 2026-11-23T02:04:25.255620687Z
+custom:
+    Bump: minor
+    PR: "487"

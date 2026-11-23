@@ -45,7 +45,7 @@ environment variable are listed in
 | The node answers slowly or times out | `source_fetch_max_in_flight_requests` | 12 | Lower it to reduce load on the node. Raise it only when the node has spare capacity |
 | The node rejects large responses | `source_segment_target_response_bytes` | `min(node.max_response_bytes, 32 MiB)`, using the smallest `max_response_bytes` across all endpoints when fallbacks are configured | Keep it below the node's own limit, which is 50 MiB by default on Zebra 7.1.0 and Zakura 1.8.6. It cannot exceed the largest `max_response_bytes` across all endpoints |
 | CPUs are idle and the node keeps up | `block_prepare_concurrency` | `min(available CPUs, 16)` | Raise it together with `block_prepare_memory_watermark_bytes`. More slots without more bytes only add contention |
-| CPUs are idle and the `tree_hashing_*` stages of `zinder_ingest_canonical_block_load_stage_duration_seconds` dominate block load, as with `during_construction = true` | `tree_hashing_workers` | 1 | Raise it toward the CPUs that preparation leaves idle. The loader hashes commitment trees on that many threads and stores the same rows. It cannot shorten a build that has no idle CPU |
+| CPUs are idle and the `tree_hashing_*` stages of `zinder_ingest_canonical_block_load_stage_duration_seconds` dominate block load | `tree_hashing_workers` | `min(available logical CPUs, 8)` when construction stores checkpoints beyond the cadence and build tip, otherwise 1. It is also 1 when the CPU count cannot be detected | Raise it toward the CPUs that preparation leaves idle, or lower it to leave CPUs to preparation. The loader hashes commitment trees on that many threads and stores the same rows. It cannot shorten a build that has no idle CPU |
 | RocksDB compaction falls behind and the host has spare CPU and disk | `storage.canonical.rocksdb.max_background_jobs` or `wallet.rocksdb.max_background_jobs` | 2 | Raise it. More flush and compaction work runs in parallel |
 
 `source_segment_max_blocks` caps the blocks in one node request. It defaults
@@ -56,6 +56,44 @@ response Zinder accepts, not a request size.
 Startup rejects a configuration in which `source_fetch_max_in_flight_bytes` is
 smaller than one node response, or `source_segment_target_response_bytes` is
 larger than the largest `max_response_bytes` across all endpoints.
+
+### First sync on fewer than 8 logical CPUs
+
+Wallet-serving ingest stores a tree-state checkpoint at every height during a
+fresh sync by default. On Mainnet that costs about 40% more writer CPU than a
+sparse sync. The measured every-block build, with 6 hashing workers on 8
+physical cores and one thread per core, reached READY within the three-hour
+budget. A host with fewer logical CPUs takes longer, and ingest logs
+`every_block_construction_below_qualified_cpus` when it starts such a build.
+The warning counts logical CPUs, so a host with 4 physical cores and 8
+hardware threads gets none, even though it is likely slower than the measured
+host. Ingest does not change the policy on its own; the operator chooses.
+
+These Mainnet estimates come from the measured writer CPU of each policy and
+the measured core-count scaling of a 2,000-block Mainnet slice. They exclude
+the node's own CPU use, which a shared host adds.
+
+| CPUs | Every block, the default | `commitment-budget` at 256 | Sparse |
+| ---: | --- | --- | --- |
+| 4 | About 2.7 to 3.3 hours | About 2.0 to 2.9 hours | About 2.2 to 3.1 hours |
+| 2 | About 4.8 to 5.6 hours | About 3.6 to 4.9 hours | About 3.4 to 5.3 hours |
+
+To reach READY sooner on a small host, choose one of these before the first
+sync. Both keep an existing store's checkpoints. Changing the selection also
+changes what the background pass adds and restarts its coverage scan.
+
+- Set `ingest.tree_state_densification.selection = "commitment-budget"`.
+  Ingest then stores a checkpoint each time `commitment_budget` note
+  commitments (1,024 by default) have accumulated, so a read between
+  checkpoints replays fewer commitments than the budget. With a budget of 256,
+  writer CPU was within 7% of a sparse sync, and hashing still runs on up to 8
+  workers. Under wallet-serving coverage, setting only this selection or only
+  `commitment_budget` now applies the budget before READY. It used to build a
+  sparse store and leave the budget to the background pass.
+- Set `ingest.tree_state_densification.during_construction = false` for a
+  sparse store. Reads then replay up to 99 blocks until the background pass
+  fills the history after READY, which takes an estimated 4 to 5 CPU-hours on
+  Mainnet.
 
 ## RocksDB budgets
 
