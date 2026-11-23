@@ -135,8 +135,14 @@ async fn main() -> ExitCode {
 )]
 fn run_print_config(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
-    let render_result = config::load_lightwalletd_config(config_path, cli.into())
-        .and_then(|cfg| config::lightwalletd_config_toml(&cfg));
+    let publishing = matches!(cli.command, Some(Command::PublishShieldedHistory(_)));
+    let overrides = cli.into();
+    let render_result = if publishing {
+        config::load_history_publisher_config(config_path, overrides).and_then(|cfg| cfg.to_toml())
+    } else {
+        config::load_lightwalletd_config(config_path, overrides)
+            .and_then(|cfg| config::lightwalletd_config_toml(&cfg))
+    };
 
     match render_result {
         Ok(rendered_toml) => {

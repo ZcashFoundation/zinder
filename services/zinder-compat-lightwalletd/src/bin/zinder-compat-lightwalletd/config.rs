@@ -27,8 +27,8 @@ use zinder_runtime::{
     DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
     NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
     ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
+    RuntimeService, SecuritySection, SecurityToml, StorageRoleToml, guard_optional_serving_bind,
+    guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_ingest_control_reader, resolve_ops_listen_addr,
     resolve_wallet_projection_reader_rocksdb_budget,
@@ -209,6 +209,42 @@ pub(super) struct HistoryPublisherConfig {
     pub(super) secondary_path: PathBuf,
     pub(super) canonical_rocksdb_budget: RocksDbResourceBudget,
     pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
+}
+
+impl HistoryPublisherConfig {
+    pub(super) fn to_toml(&self) -> Result<String, LightwalletdConfigError> {
+        let rendered = HistoryPublisherToml {
+            network: NetworkToml::from_network(self.network),
+            storage: HistoryPublisherStorageToml {
+                path: &self.primary_path,
+                secondary_path: &self.secondary_path,
+                canonical: StorageRoleToml::from_resolved(self.canonical_rocksdb_budget),
+            },
+            compat: HistoryPublisherCompatToml {
+                reorg_window_blocks: self.canonical_reorg_policy.reorg_window_blocks(),
+            },
+        };
+        Ok(toml::to_string(&rendered).map_err(|source| ConfigError::Render { source })?)
+    }
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherToml<'a> {
+    network: NetworkToml,
+    storage: HistoryPublisherStorageToml<'a>,
+    compat: HistoryPublisherCompatToml,
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherStorageToml<'a> {
+    path: &'a Path,
+    secondary_path: &'a Path,
+    canonical: StorageRoleToml,
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherCompatToml {
+    reorg_window_blocks: u32,
 }
 
 pub(super) fn load_history_publisher_config(

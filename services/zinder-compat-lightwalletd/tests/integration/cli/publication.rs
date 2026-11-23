@@ -20,15 +20,73 @@ use zinder_testkit::{
 use crate::common::shielded_catalog_keys;
 
 #[test]
-fn history_configuration_requires_one_location_and_an_independent_key() -> Result<()> {
+fn history_publisher_prints_its_effective_configuration() -> Result<()> {
     let base =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/history-publisher.toml");
+    let render = |path: &Path, setup: &[(&str, &str)]| {
+        super::zinder_compat_command()
+            .args(["--print-config", "--config"])
+            .arg(path)
+            .envs(setup.iter().copied())
+            .args([
+                "publish-shielded-history",
+                "--directory",
+                "/unused/catalog",
+                "--signing-key",
+                "/unused/publisher.key",
+            ])
+            .output()
+    };
+    let output = render(
+        &base,
+        &[
+            ("ZINDER_NETWORK__NAME", "zcash-regtest"),
+            ("ZINDER_DEPLOYMENT__PROFILE", "light-wallet"),
+            ("ZINDER_COMPAT__REORG_WINDOW_BLOCKS", "200"),
+            ("ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES", "64"),
+        ],
+    )?;
+    assert!(output.status.success(), "{output:?}");
+    let printed = String::from_utf8(output.stdout)?;
+    let settings: toml::Table = toml::from_str(&printed)?;
+    assert_eq!(settings.len(), 3);
+    for field in [
+        "name = \"zcash-regtest\"",
+        "path = \"/var/lib/zinder/canonical\"",
+        "secondary_path = \"/tmp/secondary\"",
+        "[storage.canonical.rocksdb]",
+        "max_open_files = 64",
+        "reorg_window_blocks = 200",
+    ] {
+        assert!(printed.lines().any(|line| line == field), "{printed}");
+    }
+    let directory = tempfile::tempdir()?;
+    let copy = directory.path().join("publisher.toml");
+    fs::write(&copy, &printed)?;
+    let output = render(&copy, &[])?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8(output.stdout)?, printed);
+    Ok(())
+}
+
+#[test]
+fn listener_history_configuration_requires_one_location_and_an_independent_key() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let base = files.path().join("listener.toml");
+    fs::write(
+        &base,
+        r#"[storage]
+path = "/unused/canonical"
+secondary_path = "/unused/secondary"
+[compat]
+serving = "compact-blocks"
+"#,
+    )?;
     let render = |location: &[(&str, &str)]| {
         super::zinder_compat_command()
             .args(["--print-config", "--config"])
             .arg(&base)
             .env("ZINDER_NETWORK__NAME", "zcash-regtest")
-            .env("ZINDER_COMPAT__SERVING", "compact-blocks")
             .env(
                 "ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY",
                 "/trusted/key",
