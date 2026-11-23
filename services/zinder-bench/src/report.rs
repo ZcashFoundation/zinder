@@ -1214,7 +1214,7 @@ pub struct WalletVariableValueSortEvidence {
     pub peak_temporary_file_bytes: u64,
     /// Caller-supplied temporary-file ceiling.
     pub max_temporary_file_bytes: u64,
-    /// Bytes in the final merged run before its consumer removes it.
+    /// Bytes in the runs the consumer reads, which it removes as it finishes.
     pub final_run_file_bytes: u64,
 }
 

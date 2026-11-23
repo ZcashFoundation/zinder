@@ -31,7 +31,7 @@ pub struct VariableValueSortEvidence {
     pub record_count: u64,
     /// Initial sorted runs written before merge passes.
     pub initial_run_count: u64,
-    /// Multi-run merge passes required to reach one final run.
+    /// Merge passes that wrote merged runs before the reader's streamed merge.
     pub merge_pass_count: u64,
     /// Highest accounted in-memory key, index, and value byte count.
     pub peak_accounted_memory_bytes: u64,
@@ -41,7 +41,7 @@ pub struct VariableValueSortEvidence {
     pub peak_temporary_file_bytes: u64,
     /// Caller-supplied ceiling for temporary-run bytes.
     pub max_temporary_file_bytes: u64,
-    /// Bytes occupied by the final sorted run, or zero for empty input.
+    /// Bytes of the runs left for the reader, or zero for empty input.
     pub final_run_file_bytes: u64,
 }
 
@@ -58,7 +58,8 @@ pub struct VariableValueSortDurations {
     pub initial_run_spill: Duration,
     /// Sorting and writing the records still staged when `finish` began.
     pub final_run_flush: Duration,
-    /// Merge passes that reduced several runs to one; zero for one run.
+    /// Merge passes that wrote merged runs; zero for at most 64 runs, which
+    /// the reader merges as it is read.
     pub merge: Duration,
 }
 
@@ -115,11 +116,13 @@ impl TemporaryFileBudget {
 
     /// Reserves one more initial run of a sort that already holds a run.
     ///
-    /// Finishing a sort with two or more runs ends in one merge that writes
-    /// every record again while all of its input runs still exist, so the sort
-    /// needs at least twice its total run bytes. Refusing here, before the run
-    /// is written, stops a sort that cannot finish while records are still
-    /// arriving instead of after the whole input has been spilled.
+    /// A sort that ends with more than `MAX_MERGE_FAN_IN` runs merges them in
+    /// passes that write every record again while the input runs still exist,
+    /// so admission keeps room for twice the total run bytes. A sort that ends
+    /// with fewer runs streams its final merge and stays under that
+    /// reservation. Refusing here, before the run is written, stops a sort that
+    /// cannot finish while records are still arriving instead of after the
+    /// whole input has been spilled.
     fn reserve_merged_run(&mut self, bytes: u64) -> Result<(), BulkLoadError> {
         let required_bytes = self
             .bytes_in_use
@@ -150,7 +153,7 @@ impl TemporaryFileBudget {
 /// Allocator metadata and the fixed per-run buffered-I/O overhead are not part
 /// of that caller-selected ceiling; merge fan-in caps the latter independently.
 /// Temporary-file admission accounts for both input and output runs while a
-/// merge is in progress, and refuses a new run as soon as the final merge
+/// merge pass is in progress, and refuses a new run as soon as a merge pass
 /// could no longer fit under the ceiling. Duplicate keys remain adjacent for the domain caller
 /// to accept or reject.
 pub struct VariableValueSorter<const KEY_LEN: usize> {
@@ -269,14 +272,18 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
     }
 
     /// Finishes all runs and opens a bounded streaming reader over sorted records.
+    ///
+    /// Merge passes write merged runs only while more than `MAX_MERGE_FAN_IN`
+    /// runs remain. The reader merges the remaining runs as it is read, so the
+    /// last merge never writes a run and reads it back.
     pub fn finish(mut self) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
         let flush_started = Instant::now();
         self.flush_run()?;
         self.durations.final_run_flush = flush_started.elapsed();
         let mut runs = std::mem::take(&mut self.runs);
-        if runs.len() > 1 {
+        if runs.len() > MAX_MERGE_FAN_IN {
             let merge_started = Instant::now();
-            while runs.len() > 1 {
+            while runs.len() > MAX_MERGE_FAN_IN {
                 runs = self.merge_pass(runs)?;
                 self.merge_pass_count = self
                     .merge_pass_count
@@ -285,16 +292,12 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             }
             self.durations.merge = merge_started.elapsed();
         }
-        let final_run = runs.pop();
-        let final_run_file_bytes = final_run.as_ref().map_or(0, |run| run.file_bytes);
-        let reader = final_run
-            .as_ref()
-            .map(|run| {
-                File::open(&run.path)
-                    .map(BufReader::new)
-                    .map_err(|source| path_unavailable(&run.path, source))
-            })
-            .transpose()?;
+        let final_run_file_bytes = runs.iter().try_fold(0_u64, |total, run| {
+            total
+                .checked_add(run.file_bytes)
+                .ok_or_else(|| BulkLoadError::invalid("final run bytes exceed u64::MAX"))
+        })?;
+        let source = SortedRunSource::open(runs)?;
         let evidence = VariableValueSortEvidence {
             record_count: self.record_count,
             initial_run_count: self.initial_run_count,
@@ -306,8 +309,7 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             final_run_file_bytes,
         };
         Ok(SortedVariableValues {
-            run: final_run,
-            reader,
+            source,
             evidence,
             durations: self.durations,
             max_accounted_memory_bytes: self.max_accounted_memory_bytes,
@@ -488,12 +490,11 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
 
 /// Streaming reader for a completed variable-value sort.
 ///
-/// Dropping this reader removes its final temporary run. Records with equal
+/// Dropping this reader removes its final temporary runs. Records with equal
 /// keys are adjacent, but their relative value order is intentionally not a
 /// contract.
 pub struct SortedVariableValues<const KEY_LEN: usize> {
-    run: Option<RunFile>,
-    reader: Option<BufReader<File>>,
+    source: SortedRunSource<KEY_LEN>,
     evidence: VariableValueSortEvidence,
     durations: VariableValueSortDurations,
     max_accounted_memory_bytes: u64,
@@ -521,30 +522,14 @@ impl<const KEY_LEN: usize> SortedVariableValues<KEY_LEN> {
         if self.finished {
             return Ok(None);
         }
-        let Some(reader) = self.reader.as_mut() else {
+        let Some((head, run_index)) = self.source.next_head()? else {
             if self.emitted_record_count != self.evidence.record_count {
                 return Err(BulkLoadError::invalid(
                     "completed variable run ended before its admitted record count",
                 ));
             }
             self.finished = true;
-            self.workspace = None;
-            return Ok(None);
-        };
-        let path = self
-            .run
-            .as_ref()
-            .map(|run| run.path.as_path())
-            .ok_or_else(|| BulkLoadError::invalid("sorted reader has no owned run"))?;
-        let Some(head) = read_run_head::<KEY_LEN>(reader, path)? else {
-            if self.emitted_record_count != self.evidence.record_count {
-                return Err(BulkLoadError::invalid(
-                    "completed variable run ended before its admitted record count",
-                ));
-            }
-            self.finished = true;
-            self.reader = None;
-            self.run = None;
+            self.source = SortedRunSource::Drained;
             self.workspace = None;
             return Ok(None);
         };
@@ -578,9 +563,7 @@ impl<const KEY_LEN: usize> SortedVariableValues<KEY_LEN> {
                 source,
             })?;
         encoded_value.resize(value_len, 0);
-        reader
-            .read_exact(&mut encoded_value)
-            .map_err(|source| path_unavailable(path, source))?;
+        self.source.read_value(run_index, &mut encoded_value)?;
         self.previous_key = Some(head.key);
         self.emitted_record_count = self
             .emitted_record_count
@@ -590,6 +573,133 @@ impl<const KEY_LEN: usize> SortedVariableValues<KEY_LEN> {
             key: head.key,
             encoded_value,
         }))
+    }
+
+    #[cfg(test)]
+    fn run_paths(&self) -> Vec<PathBuf> {
+        match &self.source {
+            SortedRunSource::Drained => Vec::new(),
+            SortedRunSource::Single { run, .. } => vec![run.path.clone()],
+            SortedRunSource::Merging { runs, .. } => {
+                runs.iter().map(|run| run.path.clone()).collect()
+            }
+        }
+    }
+}
+
+/// Runs a completed sort hands to its reader.
+enum SortedRunSource<const KEY_LEN: usize> {
+    /// No run remains, because the input was empty or every record was read.
+    Drained,
+    /// One run, read front to back.
+    Single {
+        run: RunFile,
+        reader: BufReader<File>,
+    },
+    /// At most `MAX_MERGE_FAN_IN` runs, merged by smallest key as they are read.
+    Merging {
+        runs: Vec<RunFile>,
+        readers: Vec<BufReader<File>>,
+        heads: BinaryHeap<Reverse<([u8; KEY_LEN], usize, u64)>>,
+        pending_run: Option<usize>,
+    },
+}
+
+impl<const KEY_LEN: usize> SortedRunSource<KEY_LEN> {
+    fn open(mut runs: Vec<RunFile>) -> Result<Self, BulkLoadError> {
+        if runs.len() > MAX_MERGE_FAN_IN {
+            return Err(BulkLoadError::invalid(
+                "variable merge exceeded its fixed file-descriptor fan-in",
+            ));
+        }
+        if runs.len() <= 1 {
+            return Ok(match runs.pop() {
+                None => Self::Drained,
+                Some(run) => {
+                    let reader = File::open(&run.path)
+                        .map(BufReader::new)
+                        .map_err(|source| path_unavailable(&run.path, source))?;
+                    Self::Single { run, reader }
+                }
+            });
+        }
+        let mut readers = Vec::with_capacity(runs.len());
+        let mut heads = BinaryHeap::new();
+        for (run_index, run) in runs.iter().enumerate() {
+            let file =
+                File::open(&run.path).map_err(|source| path_unavailable(&run.path, source))?;
+            let mut reader = BufReader::new(file);
+            if let Some(head) = read_run_head::<KEY_LEN>(&mut reader, &run.path)? {
+                heads.push(Reverse((head.key, run_index, head.value_len)));
+            }
+            readers.push(reader);
+        }
+        Ok(Self::Merging {
+            runs,
+            readers,
+            heads,
+            pending_run: None,
+        })
+    }
+
+    /// Returns the smallest remaining record head and the run its value follows in.
+    fn next_head(&mut self) -> Result<Option<(RunHead<KEY_LEN>, usize)>, BulkLoadError> {
+        match self {
+            Self::Drained => Ok(None),
+            Self::Single { run, reader } => {
+                Ok(read_run_head::<KEY_LEN>(reader, &run.path)?.map(|head| (head, 0)))
+            }
+            Self::Merging {
+                runs,
+                readers,
+                heads,
+                pending_run,
+            } => {
+                if let Some(run_index) = pending_run.take() {
+                    let (Some(reader), Some(run)) =
+                        (readers.get_mut(run_index), runs.get(run_index))
+                    else {
+                        return Err(BulkLoadError::invalid("merged run index is unavailable"));
+                    };
+                    if let Some(head) = read_run_head::<KEY_LEN>(reader, &run.path)? {
+                        heads.push(Reverse((head.key, run_index, head.value_len)));
+                    }
+                }
+                Ok(heads.pop().map(|Reverse((key, run_index, value_len))| {
+                    (RunHead { key, value_len }, run_index)
+                }))
+            }
+        }
+    }
+
+    /// Reads the value that follows the head `next_head` just returned.
+    fn read_value(
+        &mut self,
+        run_index: usize,
+        encoded_value: &mut [u8],
+    ) -> Result<(), BulkLoadError> {
+        let (reader, path) = match self {
+            Self::Drained => {
+                return Err(BulkLoadError::invalid("drained sort has no value to read"));
+            }
+            Self::Single { run, reader } => (reader, run.path.as_path()),
+            Self::Merging {
+                runs,
+                readers,
+                pending_run,
+                ..
+            } => {
+                *pending_run = Some(run_index);
+                let (Some(reader), Some(run)) = (readers.get_mut(run_index), runs.get(run_index))
+                else {
+                    return Err(BulkLoadError::invalid("merged run index is unavailable"));
+                };
+                (reader, run.path.as_path())
+            }
+        };
+        reader
+            .read_exact(encoded_value)
+            .map_err(|source| path_unavailable(path, source))
     }
 }
 
@@ -762,11 +872,8 @@ mod tests {
             staged_sort.push(key, &[key[0]])?;
         }
         let mut sorted_records = staged_sort.finish()?;
-        let final_path = sorted_records
-            .run
-            .as_ref()
-            .map(|run| run.path.clone())
-            .ok_or("sorted run must exist")?;
+        let final_paths = sorted_records.run_paths();
+        assert_eq!(final_paths.len(), 4);
         let mut observed = Vec::new();
         while let Some(record) = sorted_records.next_record()? {
             observed.push((record.key, record.encoded_value));
@@ -782,12 +889,13 @@ mod tests {
         );
         assert_eq!(sorted_records.evidence().initial_run_count, 4);
         assert_eq!(sorted_records.evidence().record_count, 4);
-        assert!(!final_path.exists());
+        assert_eq!(sorted_records.evidence().merge_pass_count, 0);
+        assert!(final_paths.iter().all(|path| !path.exists()));
         Ok(())
     }
 
     #[test]
-    fn durations_separate_spills_final_flush_and_merge() -> Result<(), Box<dyn std::error::Error>> {
+    fn durations_separate_spills_from_the_final_flush() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let memory_limit = one_record_memory_limit::<2>(1);
         let mut staged_sort =
@@ -802,7 +910,7 @@ mod tests {
         assert_eq!(sorted_records.evidence().initial_run_count, 3);
         assert!(durations.initial_run_spill > Duration::ZERO);
         assert!(durations.final_run_flush > Duration::ZERO);
-        assert!(durations.merge > Duration::ZERO);
+        assert_eq!(durations.merge, Duration::ZERO);
         Ok(())
     }
 
@@ -869,14 +977,12 @@ mod tests {
 
         assert_eq!(observed_keys, expected_keys);
         assert_eq!(evidence.initial_run_count, 65);
-        assert_eq!(evidence.merge_pass_count, 2);
-        assert_eq!(
-            evidence.peak_temporary_file_bytes,
-            evidence
-                .final_run_file_bytes
-                .checked_mul(2)
-                .ok_or("test byte overflow")?
-        );
+        // One pass merges 64 runs into one; the reader streams the last two.
+        assert_eq!(evidence.merge_pass_count, 1);
+        assert!(sorted_records.durations().merge > Duration::ZERO);
+        let one_run_bytes = encoded_run_record_bytes::<2>(1)?;
+        assert_eq!(evidence.final_run_file_bytes, one_run_bytes * 65);
+        assert_eq!(evidence.peak_temporary_file_bytes, one_run_bytes * 129);
         Ok(())
     }
 
@@ -993,9 +1099,8 @@ mod tests {
         staged_sort.push([1], b"data")?;
         let mut sorted_records = staged_sort.finish()?;
         let run_path = sorted_records
-            .run
-            .as_ref()
-            .map(|run| run.path.clone())
+            .run_paths()
+            .pop()
             .ok_or("sorted run must exist")?;
         File::options().write(true).open(&run_path)?.set_len(9)?;
 
@@ -1016,9 +1121,8 @@ mod tests {
         staged_sort.push([1], b"data")?;
         let mut sorted_records = staged_sort.finish()?;
         let run_path = sorted_records
-            .run
-            .as_ref()
-            .map(|run| run.path.clone())
+            .run_paths()
+            .pop()
             .ok_or("sorted run must exist")?;
         let mut run = File::options().write(true).open(&run_path)?;
         run.write_all(&[1])?;
@@ -1049,9 +1153,8 @@ mod tests {
         staged_sort.push([2], b"b")?;
         let mut sorted_records = staged_sort.finish()?;
         let run_path = sorted_records
-            .run
-            .as_ref()
-            .map(|run| run.path.clone())
+            .run_paths()
+            .pop()
             .ok_or("sorted run must exist")?;
         let mut run = File::options().write(true).open(&run_path)?;
         run.seek(SeekFrom::Start(1))?;

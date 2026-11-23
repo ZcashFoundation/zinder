@@ -1476,7 +1476,8 @@ mod tests {
         )?;
 
         assert!(prepared.outpoint_sort_evidence.initial_run_count > 1);
-        assert!(prepared.outpoint_sort_evidence.merge_pass_count > 0);
+        // At most 64 runs merge inside the reader without a written pass.
+        assert_eq!(prepared.outpoint_sort_evidence.merge_pass_count, 0);
         assert_eq!(prepared.row_counts.transparent_unspent_output_count, 3);
         assert_eq!(prepared.utxo_summary.total_value_zat, 6);
         Ok(())

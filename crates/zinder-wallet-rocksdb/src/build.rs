@@ -274,8 +274,8 @@ pub struct WalletColdValidationPhaseDurations {
 /// Sequential steps of [`WalletBuildPhaseDurations::secondary_row_derivation`].
 ///
 /// The steps run one after another and do not overlap. Each sort is the
-/// sorter's final run flush and merge passes; each drain reads the sorted run
-/// back and writes its families' SST files.
+/// sorter's final run flush and any merge passes that write runs; each drain
+/// merges and reads the sorted runs back and writes its families' SST files.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletSecondaryRowDerivationPhaseDurations {
     /// Final sort of the address-unspent index rows.
