@@ -346,8 +346,12 @@ impl CompactBlockPublisher {
                 }
                 let deadline = self.writer_attestation.stale_deadline();
                 let admission = self.readiness.inputs.canonical_admission().clone();
-                refresh_within_stale_deadline(deadline, &admission, self.refresh_once(&cancel))
-                    .await;
+                refresh_within_stale_deadline(
+                    deadline,
+                    &admission,
+                    Box::pin(self.refresh_once(&cancel)),
+                )
+                .await;
                 if cancel.is_cancelled() {
                     break;
                 }

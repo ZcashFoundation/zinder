@@ -7072,20 +7072,32 @@ mod tests {
         assert!(Arc::ptr_eq(&original, &slot.capture()));
         assert_eq!(publisher.candidate_preparations.cold, 2);
 
+        assert_stored_set_backoff(&mut publisher, &readiness).await;
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        query.full_block_at(first_height, None).await?;
+        writer_control.shutdown().await
+    }
+
+    /// Refreshes inside the stored-set backoff open no candidate, and the
+    /// first refresh after it opens one that is refused again.
+    async fn assert_stored_set_backoff(
+        publisher: &mut WalletServingPairPublisher,
+        readiness: &zinder_runtime::Readiness,
+    ) {
+        use zinder_runtime::ReadinessCause;
+
+        let cold = publisher.candidate_preparations.cold;
         for _ in 0..3 {
             publisher.refresh_and_record().await;
             assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
-            assert_eq!(publisher.candidate_preparations.cold, 2);
+            assert_eq!(publisher.candidate_preparations.cold, cold);
         }
         tokio::time::pause();
         tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
         tokio::time::resume();
         publisher.refresh_and_record().await;
         assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
-        assert_eq!(publisher.candidate_preparations.cold, 3);
-        assert!(Arc::ptr_eq(&original, &slot.capture()));
-        query.full_block_at(first_height, None).await?;
-        writer_control.shutdown().await
+        assert_eq!(publisher.candidate_preparations.cold, cold + 1);
     }
 
     /// A burst of blocks keeps an epoch pinned before it answering until its
