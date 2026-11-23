@@ -87,5 +87,3 @@ indexer TLS are explained in
 ## Revision history
 
 - 2026-11-23. Record `[deployment]` under the shared section convention.
-- 2026-11-23. Evidence records what decisions 1 and 3 rest on for
-  `[deployment]`.
