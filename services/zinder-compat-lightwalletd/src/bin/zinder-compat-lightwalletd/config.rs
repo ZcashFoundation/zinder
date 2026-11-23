@@ -456,11 +456,11 @@ fn resolve_lightwalletd_config(
         bearer_token_path: ingest_control_bearer_token_path,
         bearer_token: ingest_control_bearer_token,
     } = resolve_ingest_control_reader(config.ingest_control)?;
+    let canonical_reorg_policy = resolve_reorg_policy(&config.compat)?;
     let listen_addr_string = require_field(config.compat.listen_addr, "compat.listen_addr")?;
     let listen_addr = parse_socket_addr("compat.listen_addr", &listen_addr_string)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
-    let canonical_reorg_policy = resolve_reorg_policy(&config.compat)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.compat.pair_convergence_attempts)?;
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
