@@ -5,6 +5,12 @@ consumers. It keeps generated protobuf messages and transport status values
 behind `ChainIndex`, `ChainSnapshot`, `EndpointBackedIndex`, `ServerInfo`, and
 `IndexerError`.
 
+The [quickstart](https://github.com/ZcashFoundation/zinder/blob/main/docs/reference/integration-surfaces.md#quickstart)
+builds a complete program with this crate: the `Cargo.toml` dependencies, a
+`main` function, the endpoint and network to pass, and the output to expect.
+The SDK speaks Zinder's native `WalletQuery` protocol, so it needs a
+`zinder-query` endpoint, not a lightwalletd one.
+
 Connect to a native `WalletQuery` endpoint and pin related reads to one chain
 epoch:
 
