@@ -282,6 +282,7 @@ jobs:
           python3 -B scripts/test-compare-benchmark-campaign.py
           scripts/test-observability-smoke-safety.sh
           python3 scripts/test-publication-delay.py
+          python3 -B scripts/test-mainnet-fixture.py
           python3 scripts/test-wallet-lifecycle.py
           python3 scripts/wallet-clients/test-wallet-fixture.py
           env \

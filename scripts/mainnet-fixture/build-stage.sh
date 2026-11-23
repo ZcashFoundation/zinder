@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -d $binaries && -n $out ]] || { echo "usage: build-stage.sh --binaries DIR --out FILE.tar.zst [--upload gs://...]" >&2; exit 2; }
-for tool in docker curl zstd sha256sum tar; do command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }; done
+for tool in docker curl zstd sha256sum tar timeout; do command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }; done
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
@@ -39,25 +39,26 @@ for b in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd 
 done
 (cd "$stage/bin" && sha256sum zinder-* > "$stage/binaries.sha256")
 
-docker pull -q "$ZEBRA_IMAGE" >/dev/null
+timeout -k 10 1800 docker pull -q "$ZEBRA_IMAGE" >/dev/null
 cid=$(docker create "$ZEBRA_IMAGE")
 docker cp "$cid:/usr/local/bin/zebrad" "$stage/tools/zebrad"
 docker rm "$cid" >/dev/null
-curl -fsSL -o "$stage/tools/jq" "$JQ_URL"
+curl -fsSL --max-time 300 -o "$stage/tools/jq" "$JQ_URL"
 echo "$JQ_SHA256  $stage/tools/jq" | sha256sum --quiet -c
-curl -fsSL -o "$work/grpcurl.tgz" "$GRPCURL_URL"
+curl -fsSL --max-time 300 -o "$work/grpcurl.tgz" "$GRPCURL_URL"
 echo "$GRPCURL_SHA256  $work/grpcurl.tgz" | sha256sum --quiet -c
 tar -xzf "$work/grpcurl.tgz" -C "$stage/tools" grpcurl
 chmod 0755 "$stage/tools/"*
 (cd "$stage/tools" && sha256sum zebrad jq grpcurl > tools.sha256)
 
-cp "$repo"/scripts/mainnet-fixture/guest/* "$stage/guest/"
+# Regular source files only: a local check can leave a bytecode cache here.
+find "$repo/scripts/mainnet-fixture/guest" -maxdepth 1 -type f ! -name '*.pyc' -exec cp {} "$stage/guest/" \;
 cp -r "$repo"/crates/zinder-proto/proto/. "$stage/proto-all/"
 
 tar -C "$work" -cf - zfx-stage | zstd -q -T0 -3 > "$out"
 sha256sum "$out" | cut -d' ' -f1 > "$out.sha256"
 echo "stage: $out ($(stat -c %s "$out") bytes, sha256 $(cat "$out.sha256"))"
 if [[ -n $upload ]]; then
-  gcloud storage cp "$out" "$upload"
-  gcloud storage cp "$out.sha256" "$upload.sha256"
+  timeout -k 10 1800 gcloud storage cp "$out" "$upload"
+  timeout -k 10 300 gcloud storage cp "$out.sha256" "$upload.sha256"
 fi

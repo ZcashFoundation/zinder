@@ -1,0 +1,49 @@
+{
+  "fixture_id": "zinder-fx-m3593347-s7-905dac4e",
+  "network": "zcash-mainnet",
+  "guest_steps_utc": {
+    "wait_ready": "2026-11-23T02:16:40.931Z",
+    "wallet_request": "2026-11-23T02:16:40.942Z",
+    "start_node": "2026-11-23T02:02:29.166Z",
+    "bootstrap": "2026-11-23T01:43:45.473Z",
+    "wallet_sample": "2026-11-23T02:16:40.958Z",
+    "start_zinder": "2026-11-23T02:02:40.075Z",
+    "finished": "2026-11-23T02:16:44.141Z",
+    "mount": "2026-11-23T01:43:45.956Z",
+    "verify_hashes": "2026-11-23T01:43:46.358Z"
+  },
+  "verify_hashes": "stores",
+  "verified_components": [
+    "stores"
+  ],
+  "served_tip": {
+    "height": 3593347,
+    "hash": "00000000012407f887b96d34c09ec5982db59a81d5a527de3c27bea41496ed70"
+  },
+  "compat_readyz": {
+    "status": "ready",
+    "cause": "ready",
+    "current_height": 3593347,
+    "target_height": 3593347,
+    "served_epoch_age_seconds": 13074,
+    "degraded": [
+      {
+        "input": "node_source",
+        "dependency_cause": {
+          "upstream_not_ready": {
+            "upstream_committed_height": 3593347,
+            "upstream_estimated_height": 3601942,
+            "upstream_verification_progress": 0.9976137872292224,
+            "upstream_health": {
+              "source": "verification_progress_fallback",
+              "reason": "verification_progress_below_floor"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "wallet_sample_sha256sums_sha256": "1d9c89bd1f6f92ab46f48ee5b3455bb9128f49103ccebc86244ba7cd91bb3963",
+  "wallet_sample_matches_fixture": true,
+  "binaries_listing_sha256": "ba6d6c8684c61aaf905e77d4b61dfaded7a59cbbc992ef23f5e03c6ad0df5f59"
+}
