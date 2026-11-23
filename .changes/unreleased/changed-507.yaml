@@ -1,0 +1,6 @@
+kind: changed
+body: Readers no longer adopt a canonical store replaced at the same path while running when its workload, raw-blob retention, first retained block height, subtree-root coverage mode, or first retained subtree-root index of any shielded pool differs. Earlier releases adopted a replacement with a different first retained block height or subtree-root coverage without a restart. Compact-blocks and light-wallet compatibility now report `schema_mismatch`, and native query and wallet-mode compatibility report `storage_unavailable`, until you restart the reader, which then admits the new store if it meets the reader's requirements.
+time: 2026-11-23T17:30:03.927393158Z
+custom:
+    Bump: minor
+    PR: "507"
