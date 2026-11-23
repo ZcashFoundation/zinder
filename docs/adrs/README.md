@@ -52,7 +52,7 @@ stop the debate from being repeated.
 | [0013](0013-chain-event-streams.md) | Chain event streams | Event streams start at an explicit position and resume across reorgs. |
 | [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Native wallets read one consumer-neutral data plane from stored artifacts. Only the light-wallet lightwalletd composition forwards indexed reads to the node. |
 | [0015](0015-wallet-runtime-composition.md) | Wallet runtime composition | Wallet runtimes advertise only the capabilities their composition proves. |
-| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair. |
+| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair, compact-blocks and light-wallet serving follow the canonical generation, and dependencies degrade instead of refusing traffic. |
 | [0017](0017-transparent-wallet-queries.md) | Transparent wallet queries | Only consumer-owned transparent methods are served, and wallet spend status comes from the wallet projection. |
 | [0018](0018-transaction-facts-status-and-broadcast.md) | Transaction facts, status, and broadcast | Transactions are parsed once, "not found" is a typed proof, and broadcast outcomes are typed. |
 | [0019](0019-explorer-plane.md) | Explorer plane | The Explorer is an optional runtime over canonical data with explicit freshness and typed privacy refusals. |
