@@ -767,6 +767,27 @@ live mempool composition.
 
 ## Specialized procedures
 
+### Canonical schema v7 interoperability
+
+Run this gate from a committed candidate checkout when changing canonical v7
+construction, admission, or stored rows. It runs outside the default CI
+profile and uses a local host with the Rust toolchain, nextest, and enough
+space for two scoped builds.
+
+```bash
+scripts/test-canonical-v7-interop.sh
+```
+
+The script checks out `00030603` and the candidate's committed `HEAD` with
+separate build directories. Each revision publishes fixture stores for
+`none`, `transactions`, and `all` retention and the other opens each store
+as a writer and secondary. The test checks typed reads and fingerprints a
+representative row in each populated family. It also verifies the empty
+families dictated by the workload and retention. The script writes results to
+standard output and standard error, and removes its checkouts and fixtures
+on exit.
+
+
 ### Reorg sweep
 
 `live::reorg_sweep` starts the production canonical writer, invalidates the
