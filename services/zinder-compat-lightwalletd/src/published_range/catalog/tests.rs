@@ -1541,6 +1541,9 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
         );
         let catalog = Arc::new(fixture.catalog(None)?);
         assert_eq!(catalog.bounds(), test_span(first, first + 1));
+        // Test every read against a contiguous live tail as well as the
+        // signed catalog. An unfilled tail can only reduce what can use files.
+        fill_tail(&catalog, &reader, test_span(first, 2_010)).await?;
         for is_descending in [false, true] {
             let range = PublishedRangeRead::new(
                 Some(catalog.clone()),
