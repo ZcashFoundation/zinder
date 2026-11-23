@@ -53,47 +53,97 @@ fn node_unavailable(status: &Status) {
     );
 }
 
+/// A fixture whose served block 1 mines `id` without retaining its bytes.
+fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcStub>>(
+    id: TransactionId,
+    replies: impl FnOnce(zinder_core::BlockId) -> Replies,
+) -> Result<(Fixture, zinder_core::BlockId)> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .blocks()
+        .first()
+        .ok_or_else(|| eyre!("missing block"))?;
+    let served = zinder_core::BlockId::new(block.height, block.hash);
+    let rows = FixtureTransactionRows::coinbase(id, block.height, block.hash, vec![0x55]);
+    let fixture = Fixture::from_chain(
+        &chain.with_transaction_rows(rows),
+        &super::one_upgrade_per_height()?,
+        replies(served),
+        Duration::from_secs(2),
+    )?;
+    Ok((fixture, served))
+}
+
+fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> RpcReply {
+    RpcReply::result(json!({
+        "hex": hex,
+        "txid": zinder_core::wire::encode_rpc_transaction_id_hex(id),
+        "height": block.height.value(),
+        "blockhash": encode_rpc_block_hash_hex(block.hash),
+    }))
+}
+
 #[tokio::test]
-async fn get_transaction_forwards_mined_pending_and_missing_without_retention() -> Result<()> {
-    let fixture = Fixture::new([method("getrawtransaction").reply_with(|params| {
-        if params[0] == "03".repeat(32) {
-            RpcReply::error_with_code(-5, "No such mempool or main chain transaction")
-        } else if params[1] == 0 {
-            RpcReply::result(json!("1221"))
-        } else if params[0] == "01".repeat(32) {
-            RpcReply::result(json!({"height": 1, "blockhash": "45".repeat(32)}))
-        } else {
-            RpcReply::result(json!({}))
-        }
-    })])?;
-    for (id, height) in [(1, 1), (2, 0)] {
-        let reply = fixture
-            .adapter
-            .get_transaction(transaction(TransactionId::from_bytes([id; 32])))
-            .await?
-            .into_inner();
-        assert_eq!((reply.height, reply.data), (height, vec![0x12, 0x21]));
-    }
-    let id = TransactionId::from_bytes([3; 32]);
-    assert_eq!(
+async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_location()
+-> Result<()> {
+    let mined = TransactionId::from_bytes([0x55; 32]);
+    let other = zinder_core::BlockId::new(
+        BlockHeight::new(1),
+        zinder_core::BlockHash::from_bytes([0x45; 32]),
+    );
+    let (fixture, _) = mined_without_retention(mined, |served| {
+        [
+            method("getrawtransaction").reply(mined_reply(mined, served, "55")),
+            method("getrawtransaction").reply(mined_reply(mined, other, "55")),
+            // The served block and ID, with bytes ingest did not commit there.
+            method("getrawtransaction").reply(mined_reply(mined, served, "56")),
+        ]
+    })?;
+    let epoch = fixture.slot.capture().chain_epoch();
+    let pending = MempoolEntry::new(
+        TransactionId::from_bytes([0x22; 32]),
+        None,
+        RawTransactionBytes::new(vec![0x22]),
+        CompactTransactionData::default(),
+        MempoolObservation {
+            first_seen_chain_epoch: epoch,
+            first_seen_unix_millis: epoch.created_at,
+        },
+    )?;
+    let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    control.set_mempool_entries(std::slice::from_ref(&pending));
+    let adapter =
         fixture
             .adapter
-            .get_transaction(transaction(id))
-            .await
-            .err()
-            .ok_or_else(|| eyre!("expected an RPC refusal"))?
-            .code(),
+            .clone()
+            .with_mempool_surface(Arc::new(IngestControlMempoolSurface::new(
+                control.endpoint().to_owned(),
+            )));
+    for (id, height, bytes) in [
+        (mined, 1, vec![0x55]),
+        (pending.transaction_id(), 0, vec![0x22]),
+    ] {
+        let reply = adapter.get_transaction(transaction(id)).await?.into_inner();
+        assert_eq!((reply.height, reply.data), (height, bytes));
+    }
+    let refusal =
+        |result: Result<_, Status>| result.err().ok_or_else(|| eyre!("expected an RPC refusal"));
+    node_unavailable(&refusal(adapter.get_transaction(transaction(mined)).await)?);
+    assert_eq!(
+        refusal(adapter.get_transaction(transaction(mined)).await)?.code(),
+        Code::DataLoss
+    );
+    let missing = TransactionId::from_bytes([3; 32]);
+    assert_eq!(
+        refusal(fixture.adapter.get_transaction(transaction(missing)).await)?.code(),
         Code::NotFound
     );
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 3);
     drop(fixture.node);
-    node_unavailable(
-        &fixture
-            .adapter
-            .get_transaction(transaction(id))
-            .await
-            .err()
-            .ok_or_else(|| eyre!("expected an RPC refusal"))?,
-    );
+    node_unavailable(&refusal(
+        adapter.get_transaction(transaction(missing)).await,
+    )?);
+    control.shutdown().await?;
     Ok(())
 }
 
@@ -311,6 +361,7 @@ async fn cold_and_expired_discovery_timeouts_are_shared_until_a_fresh_request() 
     let stalled = Arc::new(AtomicBool::new(true));
     let discovery = Arc::clone(&stalled);
     let fixture = Fixture::with_node_timeout(
+        1,
         [
             method("rpc.discover").reply_with(move |_| {
                 let reply = RpcReply::result(json!({"methods": [{"name":"sendrawtransaction"}]}));
@@ -500,10 +551,12 @@ async fn verification_lookup_and_submission_leave_generations_recyclable() -> Re
         fixture.adapter.get_transaction(transaction(id)),
     )
     .await?;
-    let fixture = Fixture::new([
-        method("getrawtransaction").reply(slow()),
-        method("sendrawtransaction").reply(slow()),
-    ])?;
+    let (fixture, _) = mined_without_retention(id, |_| {
+        [
+            method("getrawtransaction").reply(slow()),
+            method("sendrawtransaction").reply(slow()),
+        ]
+    })?;
     assert_unleased_during(
         &fixture,
         "getrawtransaction",
@@ -789,4 +842,57 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
         assert_eq!(latest.height, u64::from(tip));
         Ok(())
     })
+}
+
+#[tokio::test]
+async fn transactions_of_one_block_share_its_recorded_digests() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .blocks()
+        .first()
+        .ok_or_else(|| eyre!("missing block"))?;
+    let served = zinder_core::BlockId::new(block.height, block.hash);
+    let block = served;
+    let coinbase = TransactionId::from_bytes([0x55; 32]);
+    let spend = TransactionId::from_bytes([0x56; 32]);
+    let chain = chain
+        .with_transaction_rows(FixtureTransactionRows::coinbase(
+            coinbase,
+            block.height,
+            block.hash,
+            vec![0x55],
+        ))
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            spend,
+            block.height,
+            block.hash,
+            1,
+            vec![0x56],
+        ));
+    let fixture = Fixture::from_chain(
+        &chain,
+        &super::one_upgrade_per_height()?,
+        [
+            method("getrawtransaction").reply(mined_reply(coinbase, served, "55")),
+            method("getrawtransaction").reply(mined_reply(spend, served, "56")),
+            method("getrawtransaction").reply(mined_reply(spend, served, "57")),
+        ],
+        Duration::from_secs(2),
+    )?;
+    for (id, body) in [(coinbase, 0x55), (spend, 0x56)] {
+        let reply = fixture
+            .adapter
+            .get_transaction(transaction(id))
+            .await?
+            .into_inner();
+        assert_eq!((reply.height, reply.data), (1, vec![body]));
+    }
+    let status = fixture
+        .adapter
+        .get_transaction(transaction(spend))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted bytes the block's digests do not record"))?;
+    assert_eq!(status.code(), Code::DataLoss);
+    Ok(())
 }

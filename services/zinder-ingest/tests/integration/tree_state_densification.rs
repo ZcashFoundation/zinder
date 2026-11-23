@@ -164,6 +164,52 @@ async fn commitment_budget_pass_stores_a_checkpoint_where_each_budget_fills() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_constructed_store_needs_new_rows_only_for_the_smaller_budget() -> eyre::Result<()>
+{
+    let construction = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(20).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let tighter = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(10).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP);
+    let harness = Harness::publish_with_coverage(&chain, None, Some(construction))?;
+    let before = harness.with_primary(|primary| {
+        let scan =
+            primary.scan_tree_state_strides(BlockHeight::new(0), construction, NonZeroU32::MAX)?;
+        eyre::ensure!(scan.examined == 3 && scan.incomplete.is_empty() && scan.damaged.is_empty());
+        stored_checkpoint_heights(primary, 0, DENSIFIED_THROUGH)
+    })?;
+    eyre::ensure!(
+        before.len() > 4,
+        "construction must include budget checkpoints"
+    );
+    let commits = harness
+        .run_pass_to_completion(construction, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        commits.is_empty(),
+        "the same budget wrote more rows: {commits:?}"
+    );
+
+    let commits = harness
+        .run_pass_to_completion(tighter, &Hooks::default())
+        .await?;
+    eyre::ensure!(commits.len() == 3 && commits.iter().all(|commit| commit.rows_written > 0));
+    harness.with_primary(|primary| {
+        let after = stored_checkpoint_heights(primary, 0, DENSIFIED_THROUGH)?;
+        eyre::ensure!(
+            after.len() > before.len() && before.iter().all(|height| after.contains(height))
+        );
+        let scan =
+            primary.scan_tree_state_strides(BlockHeight::new(0), tighter, NonZeroU32::MAX)?;
+        eyre::ensure!(scan.examined == 3 && scan.incomplete.is_empty() && scan.damaged.is_empty());
+        Ok(())
+    })?;
+    harness.assert_reads_match_the_chain(1..=BASELINE_TIP)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_every_block_pass_completes_strides_an_earlier_budget_pass_densified() -> eyre::Result<()>
 {
     let harness = Harness::new()?;
@@ -961,7 +1007,7 @@ impl Harness {
         Self::publish_with_coverage(
             &ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP),
             None,
-            true,
+            Some(EVERY_BLOCK),
         )
     }
 
@@ -980,13 +1026,13 @@ impl Harness {
     }
 
     fn publish(chain: &ChainFixture, history_floor: Option<BlockHeight>) -> eyre::Result<Self> {
-        Self::publish_with_coverage(chain, history_floor, false)
+        Self::publish_with_coverage(chain, history_floor, None)
     }
 
     fn publish_with_coverage(
         chain: &ChainFixture,
         history_floor: Option<BlockHeight>,
-        every_block_tree_state_checkpoints: bool,
+        selection: Option<TreeStateCheckpointSelection>,
     ) -> eyre::Result<Self> {
         let activations = sample_regtest_upgrade_activations();
         let chain = with_note_commitments(chain, &activations)?;
@@ -997,8 +1043,8 @@ impl Harness {
             Some(floor) => baseline.with_history_floor(floor),
             None => baseline,
         };
-        let baseline = if every_block_tree_state_checkpoints {
-            baseline.with_every_block_tree_state_checkpoints()
+        let baseline = if let Some(selection) = selection {
+            baseline.with_tree_state_checkpoint_selection(selection)
         } else {
             baseline
         };

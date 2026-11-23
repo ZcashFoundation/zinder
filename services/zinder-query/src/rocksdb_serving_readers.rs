@@ -110,6 +110,115 @@ impl RocksDbCanonicalReader {
         let secondary = Arc::clone(&self.secondary);
         off_reactor(move || read(&secondary).map_err(canonical_read_error)).await
     }
+
+    /// Reads where the served chain mines `transaction_id`, answering `None`
+    /// only for a proven absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageReadError::CanonicalHistoryUnavailable`] for a miss
+    /// below a checkpointed store's history floor.
+    #[cfg(feature = "light-wallet-qualification")]
+    pub async fn mined_transaction_location(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<zinder_core::TransactionLocation>, StorageReadError> {
+        self.read(move |secondary| secondary.transaction_location_or_proven_absence(transaction_id))
+            .await
+    }
+
+    /// Reads the digests ingest recorded for every transaction of `block`, in
+    /// block position order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageReadError::ArtifactUnavailable`] when the served
+    /// chain holds no canonical facts for `block`.
+    #[cfg(feature = "light-wallet-qualification")]
+    pub async fn block_transaction_digests(
+        &self,
+        block: zinder_core::BlockId,
+    ) -> Result<BlockTransactionDigests, StorageReadError> {
+        let digests = self
+            .read(move |secondary| {
+                Ok(secondary
+                    .block_replay_facts_at(block.height)?
+                    .filter(|facts| facts.block_header.block_hash == block.hash)
+                    .map(|facts| {
+                        facts
+                            .transactions
+                            .iter()
+                            .map(|transaction| {
+                                (
+                                    transaction.public_facts.transaction_id,
+                                    transaction.serialized_bytes_digest,
+                                )
+                            })
+                            .collect()
+                    }))
+            })
+            .await?
+            .ok_or(StorageReadError::ArtifactUnavailable {
+                family: ArtifactFamily::BlockHeader,
+                key: ArtifactKey::BlockHeight(block.height),
+            })?;
+        Ok(BlockTransactionDigests { block, digests })
+    }
+}
+
+/// The digests ingest recorded for one served block's transactions.
+#[cfg(feature = "light-wallet-qualification")]
+#[derive(Clone, Debug)]
+pub struct BlockTransactionDigests {
+    block: zinder_core::BlockId,
+    digests: Vec<(TransactionId, zinder_core::SerializedBytesDigest)>,
+}
+
+#[cfg(feature = "light-wallet-qualification")]
+impl BlockTransactionDigests {
+    /// The block these digests belong to.
+    #[must_use]
+    pub const fn block(&self) -> zinder_core::BlockId {
+        self.block
+    }
+
+    /// Returns the location with its digest when this block lists the
+    /// location's transaction at its position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageReadError::ArtifactUnavailable`] when the location
+    /// names another block, or this block lists another transaction there.
+    pub fn digest_of(
+        &self,
+        location: zinder_core::TransactionLocation,
+    ) -> Result<MinedTransactionDigest, StorageReadError> {
+        let listed = (zinder_core::BlockId::new(location.block_height, location.block_hash)
+            == self.block)
+            .then(|| usize::try_from(location.tx_index_in_block).ok())
+            .flatten()
+            .and_then(|index| self.digests.get(index))
+            .filter(|(transaction_id, _)| *transaction_id == location.transaction_id);
+        let (_, serialized_bytes_digest) = listed.ok_or(StorageReadError::ArtifactUnavailable {
+            family: ArtifactFamily::TransactionLocation,
+            key: ArtifactKey::TransactionId(location.transaction_id),
+        })?;
+        Ok(MinedTransactionDigest {
+            location,
+            serialized_bytes_digest: *serialized_bytes_digest,
+        })
+    }
+}
+
+/// Where the served chain mines a transaction and the digest of the bytes
+/// ingest committed for it.
+#[cfg(feature = "light-wallet-qualification")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MinedTransactionDigest {
+    /// The transaction's canonical location.
+    pub location: zinder_core::TransactionLocation,
+    /// The digest of the transaction's serialized bytes.
+    pub serialized_bytes_digest: zinder_core::SerializedBytesDigest,
 }
 
 #[async_trait]

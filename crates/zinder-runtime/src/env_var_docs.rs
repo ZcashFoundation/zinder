@@ -1651,6 +1651,25 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__CONSTRUCTION__TREE_HASHING_WORKERS",
+        toml_path: "ingest.construction.tree_hashing_workers",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Threads that hash note-commitment trees for the ordered construction \
+                      loader. Defaults to the detected logical CPU count, at most 8, when \
+                      fresh construction stores checkpoints beyond the 100-block cadence and \
+                      build tip, and to 1 otherwise or when the CPU count cannot be detected. \
+                      With 1, hashing runs on the loader thread. The automatic count reserves \
+                      no CPU for a node or projector on the same host; in one measured Mainnet \
+                      build, 8 workers sharing 8 cores with a node pinned to 2 of them reached \
+                      READY in 1 h 40 min 30 s. An explicit value may exceed 8. A higher value \
+                      hashes each block's pools and large commitment batches in parallel, and \
+                      derives the checkpoints of up to twice that many blocks, at most 64, \
+                      while the loader writes earlier blocks. The stored trees, checkpoints, and \
+                      subtree roots do not change. Must be greater than zero.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS",
         toml_path: "ingest.follow.poll_interval_ms",
         used_by: &["zinder-ingest"],
@@ -1694,7 +1713,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Defaults to `false`: fresh construction stores checkpoints every 100 blocks and at the build tip. Set to `true` before a fresh sync to store every block before READY when densification is enabled and the selection is `every-block`. Full Mainnet time to READY and disk growth for this mode are unqualified. Changing this setting leaves stored checkpoints in place.",
+        description: "Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. In the measured Mainnet runs, with 6 hashing workers on 8 physical cores and one thread per core, `every-block` and 256-commitment-budget construction reached READY within three hours; hosts with fewer logical CPUs take longer, as the bulk-catchup tuning runbook describes. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",
@@ -1702,7 +1721,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Which settled checkpoints the background pass adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint each time `commitment_budget` commitments accumulate and is the default when only that budget is set. Changing selection retains existing rows.",
+        description: "Which checkpoints densification adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint when at least `commitment_budget` note commitments have accumulated since the previous checkpoint. Setting only the budget selects this policy. Changing selection retains existing rows.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",

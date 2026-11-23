@@ -410,6 +410,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("lag_threshold_blocks ="));
     assert!(stdout.contains("[ingest.run_overrides]"));
     assert!(stdout.contains("coverage = \"explicit\""));
+    assert!(stdout.contains("during_construction = false"));
 
     Ok(())
 }
@@ -492,7 +493,11 @@ fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
     let storage_path = tempdir.path().join("round-trip-store");
     let source_config_path = tempdir.path().join("source.toml");
     let rendered_config_path = tempdir.path().join("rendered.toml");
-    fs::write(&source_config_path, ingest_config_toml(&storage_path)?)?;
+    let config = format!(
+        "{}\n[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\ncommitment_budget = 256\n",
+        ingest_config_toml(&storage_path)?
+    );
+    fs::write(&source_config_path, config)?;
 
     let first_output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&source_config_path)?])
@@ -508,6 +513,22 @@ fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
         ])
         .output()?;
     assert!(second_output.status.success(), "{second_output:?}");
+
+    for rendered in [first_output.stdout, second_output.stdout] {
+        let config: toml::Table = toml::from_str(std::str::from_utf8(&rendered)?)?;
+        let densification = &config["ingest"]["tree_state_densification"];
+        assert_eq!(
+            densification
+                .get("during_construction")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            densification["selection"].as_str(),
+            Some("commitment-budget")
+        );
+        assert_eq!(densification["commitment_budget"].as_integer(), Some(256));
+    }
 
     Ok(())
 }
@@ -742,6 +763,62 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
         "{stdout}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_serving_explorer()
+-> Result<(), Box<dyn Error>> {
+    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config");
+    let temporary = tempdir()?;
+    let token = temporary.path().join("fixture.token");
+    fs::write(&token, "fixture-token\n")?;
+    let core_bounded_workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8);
+
+    for file in ["ingest.toml", "wallet-serving/ingest.toml"] {
+        for (setting, dense) in [
+            (None, true),
+            (Some(("ZINDER_INGEST__EXPLORER_VIEWS", "true")), false),
+            (
+                Some((
+                    "ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION",
+                    "false",
+                )),
+                false,
+            ),
+        ] {
+            let output = zinder_ingest_command()
+                .args(["--print-config", "--config"])
+                .arg(configs.join(file))
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+                .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token)
+                .env(
+                    "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+                    &token,
+                )
+                .envs(setting)
+                .output()?;
+            assert!(output.status.success(), "{file}: {output:?}");
+            let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+            let policy = &config["ingest"]["tree_state_densification"];
+            assert_eq!(policy["enabled"].as_bool(), Some(true), "{file}");
+            assert_eq!(policy["selection"].as_str(), Some("every-block"), "{file}");
+            assert_eq!(
+                policy["during_construction"].as_bool(),
+                Some(dense),
+                "{file}, override={setting:?}"
+            );
+            let expected_workers = if dense { core_bounded_workers } else { 1 };
+            assert_eq!(
+                config["ingest"]["construction"]["tree_hashing_workers"].as_integer(),
+                Some(i64::try_from(expected_workers)?),
+                "{file}, override={setting:?}"
+            );
+        }
+    }
     Ok(())
 }
 

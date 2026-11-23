@@ -92,7 +92,7 @@ containers. It derives source and preparation concurrency from the envelope and
 Zebra shares the Docker engine and is not measured.
 
 Canonical construction uses `cadence-and-tip` tree-state checkpoint coverage by
-default, matching fresh ingest defaults. Set
+default, matching fresh ingest with `explicit` coverage. Set
 `ZINDER_STORAGE_LIFECYCLE_TREE_STATE_CHECKPOINT_COVERAGE=every-block` to
 measure dense construction before READY. Report format
 version 5 records the chosen coverage in

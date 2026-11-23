@@ -17,7 +17,7 @@ use zinder_store::{
     CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReadyStoreSummary,
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
     CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateCheckpointSelection,
 };
 
 use crate::{
@@ -53,10 +53,8 @@ pub struct CanonicalWriterConfig {
     /// Reorg window depth, which also places fresh construction's build tip,
     /// and so the baseline settled tip, this far below the node's tip.
     pub reorg_window_blocks: u32,
-    /// Whether fresh construction stores a tree-state checkpoint for every
-    /// loaded block instead of only on the 100-block cadence and at the build
-    /// tip.
-    pub every_block_tree_state_checkpoints: bool,
+    /// Optional checkpoints beyond the 100-block cadence and the build tip.
+    pub tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
     /// Continuous follower policy.
     pub follow: CanonicalFollowConfig,
 }
@@ -502,9 +500,10 @@ where
         event = "canonical_fresh_construction_started",
         staging_path = %staging_path.display(),
         fixed_tip_height = build_tip.height.value(),
-        every_block_tree_state_checkpoints = config.every_block_tree_state_checkpoints,
+        tree_state_checkpoint_selection = ?config.tree_state_checkpoint_selection,
         "started canonical construction"
     );
+    warn_if_every_block_construction_lacks_qualified_cpus(config.tree_state_checkpoint_selection);
     let loaded =
         load_fresh_canonical_until_cancelled(builder, source, &config.construction, cancel)
             .await
@@ -552,8 +551,8 @@ fn create_fresh_canonical_builder(
         build_plan,
         config.resource_budget,
     )?;
-    if config.every_block_tree_state_checkpoints {
-        builder.with_every_block_tree_state_checkpoints()
+    if let Some(selection) = config.tree_state_checkpoint_selection {
+        builder.with_tree_state_checkpoint_selection(selection)
     } else {
         Ok(builder)
     }
@@ -741,6 +740,49 @@ fn install_staged_store(
             source,
         }
     })
+}
+
+/// Logical CPUs of the measured run in which every-block construction reached
+/// Mainnet READY within the three-hour budget of ADR-0009: 8 physical cores
+/// with one thread per core.
+const EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS: usize = 8;
+
+/// Warns when a fresh construction stores every block's checkpoint on fewer
+/// logical CPUs than its Mainnet READY measurement used, or cannot count them.
+fn warn_if_every_block_construction_lacks_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+) {
+    let Ok(available_logical_cpus) =
+        std::thread::available_parallelism().map(std::num::NonZeroUsize::get)
+    else {
+        if selection.is_some() {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "construction_cpu_count_unavailable",
+                "could not detect the logical CPU count; construction hashes commitment trees on one thread unless ingest.construction.tree_hashing_workers is set"
+            );
+        }
+        return;
+    };
+    if every_block_construction_below_qualified_cpus(selection, available_logical_cpus) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "every_block_construction_below_qualified_cpus",
+            available_logical_cpus,
+            qualified_logical_cpus = EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS,
+            "every-block construction reached Mainnet READY within three hours when measured with 6 hashing workers on 8 physical cores, one thread per core; this host reports fewer logical CPUs and will take longer; set ingest.tree_state_densification.selection = \"commitment-budget\" or during_construction = false for a faster first sync"
+        );
+    }
+}
+
+/// Whether a fresh construction stores every block's checkpoint on fewer
+/// logical CPUs than that measurement used.
+fn every_block_construction_below_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+    available_logical_cpus: usize,
+) -> bool {
+    selection == Some(TreeStateCheckpointSelection::EveryBlock)
+        && available_logical_cpus < EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS
 }
 
 #[cfg(test)]
@@ -1262,7 +1304,7 @@ mod tests {
             checkpoint_height: None,
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_window_blocks: 1,
-            every_block_tree_state_checkpoints: false,
+            tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
@@ -1442,7 +1484,7 @@ mod tests {
             checkpoint_height: Some(BlockHeight::new(0)),
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             reorg_window_blocks: 100,
-            every_block_tree_state_checkpoints: false,
+            tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
@@ -1623,5 +1665,25 @@ mod tests {
         discard_unpublished_block_load_staging(&tempdir.path().join("store.building"))?;
 
         Ok(())
+    }
+
+    #[test]
+    fn only_every_block_construction_on_fewer_than_eight_cpus_warns() {
+        use zinder_store::TreeStateCheckpointSelection::{CommitmentBudget, EveryBlock};
+
+        let budget = std::num::NonZeroU32::new(256).map(CommitmentBudget);
+        for (selection, cpus, warns) in [
+            (Some(EveryBlock), 2, true),
+            (Some(EveryBlock), 7, true),
+            (Some(EveryBlock), 8, false),
+            (budget, 2, false),
+            (None, 2, false),
+        ] {
+            assert_eq!(
+                super::every_block_construction_below_qualified_cpus(selection, cpus),
+                warns,
+                "{selection:?} on {cpus} CPUs"
+            );
+        }
     }
 }

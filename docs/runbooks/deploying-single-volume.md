@@ -82,10 +82,12 @@ These variables are optional:
 | `INGEST_CONTROL_BEARER_TOKEN`, `CHECKPOINT_BEARER_TOKEN` | The internal control tokens. The container generates them at startup when unset. |
 | `RUST_LOG` | Log filter. Default `info`. A value that does not parse stops the container. |
 
-The default deadlines fit Testnet. For Mainnet, set at least `86400` (24
-hours) and `43200` (12 hours) before the first deployment, and more on slower
-disks or a slower node, because the defaults end a Mainnet build from an
-empty volume.
+The default deadlines fit a sparse Testnet build; the every-block default has
+not been timed on Testnet. For Mainnet, set at least `86400` (24 hours) and
+`43200` (12 hours) before the first deployment, and more on slower disks or a
+slower node, because the defaults end a Mainnet build from an empty volume.
+On fewer than 8 logical CPUs, also consider the faster settings in
+[First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 
 Any other variable from the
 [configuration reference](../reference/configuration.md#environment-variables)

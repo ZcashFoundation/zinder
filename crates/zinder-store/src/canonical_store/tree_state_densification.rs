@@ -57,6 +57,38 @@ pub enum TreeStateCheckpointSelection {
 }
 
 impl TreeStateCheckpointSelection {
+    /// Returns whether the selection calls for a checkpoint after the given
+    /// tree sizes advance from the previous checkpoint.
+    #[must_use]
+    pub fn requires_checkpoint_since(
+        self,
+        previous: ChainTipMetadata,
+        current: ChainTipMetadata,
+    ) -> bool {
+        self.requires_checkpoint(
+            commitment_count(current).saturating_sub(commitment_count(previous)),
+        )
+    }
+
+    /// Checks whether the last miss before `next` stayed below the selection.
+    pub(super) fn gap_satisfies(
+        self,
+        previous: BlockHeight,
+        next: BlockHeight,
+        reads: &mut u32,
+        mut tree_sizes: impl FnMut(BlockHeight) -> Result<ChainTipMetadata, CanonicalStoreError>,
+    ) -> Result<bool, CanonicalStoreError> {
+        let gap_end = BlockHeight::new(next.value() - 1);
+        if gap_end <= previous {
+            return Ok(true);
+        }
+        if self == Self::EveryBlock {
+            return Ok(false);
+        }
+        *reads = reads.saturating_add(2);
+        Ok(!self.requires_checkpoint_since(tree_sizes(previous)?, tree_sizes(gap_end)?))
+    }
+
     /// Returns whether a gap that starts after `committed_since_checkpoint`
     /// commitments still needs a checkpoint before its next stored one.
     fn requires_checkpoint(self, committed_since_checkpoint: u64) -> bool {
@@ -518,18 +550,10 @@ fn stride_satisfies_counting_reads(
     }
     let mut previous = stride.seed_height;
     for height in stored_heights {
-        let gap_end = height.value() - 1;
-        if gap_end > previous.value() {
-            if selection == TreeStateCheckpointSelection::EveryBlock {
-                return Ok(false);
-            }
-            *reads = reads.saturating_add(2);
-            let anchored = commitment_count(stored_tree_sizes(store, stride, previous)?);
-            let reached =
-                commitment_count(stored_tree_sizes(store, stride, BlockHeight::new(gap_end))?);
-            if selection.requires_checkpoint(reached.saturating_sub(anchored)) {
-                return Ok(false);
-            }
+        if !selection.gap_satisfies(previous, height, reads, |height| {
+            stored_tree_sizes(store, stride, height)
+        })? {
+            return Ok(false);
         }
         previous = height;
     }
@@ -578,12 +602,13 @@ fn stored_tree_sizes(
     if height == predecessor.block_id.height {
         return Ok(predecessor.tip_metadata());
     }
-    let compact_block = read_compact_block_at(store, height)?.ok_or_else(|| {
-        stride_mismatch(
-            stride,
-            format!("compact block at height {} is absent", height.value()),
-        )
-    })?;
+    let compact_block =
+        read_compact_block_at(&store.serving_open().db, height)?.ok_or_else(|| {
+            stride_mismatch(
+                stride,
+                format!("compact block at height {} is absent", height.value()),
+            )
+        })?;
     Ok(recorded_tree_sizes(&compact_block))
 }
 

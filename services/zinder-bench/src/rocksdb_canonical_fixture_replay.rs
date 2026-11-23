@@ -111,6 +111,9 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Aggregate canonical preparation memory watermark.
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Threads hashing the ordered loader's commitment trees.
+    #[arg(long = "tree-hashing-workers")]
+    tree_hashing_workers: Option<u32>,
     /// Tree-state checkpoint coverage persisted during canonical construction.
     #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
@@ -415,6 +418,9 @@ fn apply_pipeline_overrides(
         limits.block_prepare_memory_watermark_bytes =
             require_nonzero_u64(bytes, "block-prepare-memory-watermark-bytes")?;
     }
+    if let Some(workers) = args.tree_hashing_workers {
+        limits.tree_hashing_workers = require_nonzero_u32(workers, "tree-hashing-workers")?;
+    }
     Ok(())
 }
 
@@ -476,6 +482,7 @@ fn resource_limits(
             .pipeline_limits
             .block_prepare_memory_watermark_bytes
             .get(),
+        tree_hashing_workers: validated.pipeline_limits.tree_hashing_workers.get(),
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay_millis: u64::try_from(validated.source_segment_delay.as_millis())
             .unwrap_or(u64::MAX),
@@ -719,6 +726,8 @@ mod tests {
             "7",
             "--block-prepare-memory-watermark-bytes",
             "268435456",
+            "--tree-hashing-workers",
+            "3",
         ]))?;
         let limits = cli.replay.validate()?.pipeline_limits;
 
@@ -735,6 +744,7 @@ mod tests {
             limits.block_prepare_memory_watermark_bytes.get(),
             268_435_456
         );
+        assert_eq!(limits.tree_hashing_workers.get(), 3);
         Ok(())
     }
 
@@ -750,6 +760,7 @@ mod tests {
             "--source-fetch-max-in-flight-bytes",
             "--block-prepare-concurrency",
             "--block-prepare-memory-watermark-bytes",
+            "--tree-hashing-workers",
         ] {
             let cli = TestCli::try_parse_from(arguments(&[flag, "0"]))?;
             let error = cli
