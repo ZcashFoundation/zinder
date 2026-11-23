@@ -14,7 +14,7 @@ Fresh construction also needs more than one block per call. A round trip per blo
 2. **`zinder-proto` owns every service protocol.** It holds the native wallet, Explorer, ingest control, and operations protobufs and the vendored lightwalletd protocol. `zinder-core` exposes no generated protobuf types. `zinder-store` exposes protobuf codecs only for the messages it persists or streams, such as the stored `CompactBlock` ([ADR-0002](0002-serialization-and-byte-order.md)).
 3. **Capabilities are discovered by behavior.** An adapter reports what the node can do, such as serving full history or a mempool stream. A version string is diagnostic, not the compatibility contract. Ingest refuses a node that lacks a required capability, which is how it refuses a pruned node.
 4. **Consensus bytes are parsed with `zebra-chain`.** Raw blocks and transactions are decoded with Zebra's primitives, so Zinder and the node agree on consensus encoding.
-5. **Readers never use the node as a fallback for indexed data.** Query and compatibility runtimes serve blocks, tree states, and activations from Zinder's stores. They call the node only to broadcast transactions, to read the recommended fee for `GetStandardFee`, to verify each broadcast endpoint, to probe node health for readiness, and for the node-backed reads a deployment profile declares ([ADR-0023](0023-deployment-profiles.md)). Those reads are checked against the served tip ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7). No node answer stands in for data a store is meant to hold. When stored data is missing, the request fails explicitly.
+5. **Readers never use the node as a fallback for indexed data.** Query and compatibility runtimes serve blocks, tree states, and activations from Zinder's stores. They call the node only to broadcast transactions, to read the recommended fee for `GetStandardFee`, to verify each broadcast endpoint, to probe node health for readiness, and, in the light-wallet compatibility composition, for its node-backed reads ([ADR-0023](0023-deployment-profiles.md)). Those reads are checked against the served tip ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7). No node answer stands in for data a store is meant to hold. When stored data is missing, the request fails explicitly.
 6. **Historical fetches are bounded segments.** A segment request carries a cursor, a maximum block count, and a maximum response size. Every adapter must:
    - observe the node's tip before choosing its range;
    - return a revert when the cursor block is no longer on the node's selected chain;
@@ -46,4 +46,4 @@ Continuous following uses one block update at a time rather than treating a hist
 
 ## Revision history
 
-- 2026-11-23. Decision 5 adds the node-backed reads a deployment profile declares to the reasons a reader calls the node.
+- 2026-11-23. Decision 5 adds the light-wallet composition's node-backed reads to the reasons a reader calls the node.
