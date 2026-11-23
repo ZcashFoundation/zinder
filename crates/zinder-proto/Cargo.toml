@@ -19,6 +19,7 @@ include = [
 ]
 
 [dependencies]
+http-body.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true

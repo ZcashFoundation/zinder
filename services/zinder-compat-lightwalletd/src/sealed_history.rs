@@ -14,7 +14,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, Network,
     wire::{decode_internal_block_hash, encode_internal_block_hash},
 };
-use zinder_proto::compat::lightwalletd;
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
 use zinder_store::HeightOrder;
 
@@ -24,6 +24,9 @@ use crate::compact_block_messages::CompactBlockShape;
 const MAGIC: &[u8; 8] = b"ZSHRNG02";
 const HEADER_LEN: usize = 52;
 const LENGTHS_LEN: usize = 8;
+// A row's length field ends with its big-endian payload length, so its last
+// bytes can carry the gRPC message prefix.
+const _: () = assert!(LENGTHS_LEN >= EncodedBlock::PREFIX_LEN);
 const INDEX_LEN: usize = 112;
 mod index;
 pub(crate) mod verity;
@@ -264,7 +267,7 @@ pub(crate) struct SealedBlock {
     pub(crate) id: BlockId,
     pub(crate) parent: BlockHash,
     pub(crate) native_bytes: usize,
-    pub(crate) payload: Bytes,
+    pub(crate) message: EncodedBlock,
 }
 
 pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
@@ -404,14 +407,24 @@ impl SealedHistory {
         &self,
         out: &mut Vec<SealedBlock>,
         rows: &[IndexedBlock],
-        slab: Vec<u8>,
+        mut slab: Vec<u8>,
     ) -> io::Result<()> {
-        let packed = Bytes::from(slab);
         let first_frame = rows[0].offset - LENGTHS_LEN as u64;
+        let mut starts = Vec::with_capacity(rows.len());
         for row in rows {
-            let start = verified_row_start(row, &packed, first_frame)?;
-            let payload = packed.slice(start..start + row.len);
-            out.push(verify_and_build_block(row, payload, self.kernel_verified)?);
+            let start = verified_row_start(row, &slab, first_frame)?;
+            // The checked length field becomes the gRPC message prefix, so the
+            // row is sent from the slab without a copy.
+            slab[start - EncodedBlock::PREFIX_LEN] = 0;
+            starts.push(start);
+        }
+        let packed = Bytes::from(slab);
+        for (row, start) in rows.iter().zip(starts) {
+            let message = EncodedBlock::from_length_prefixed(
+                packed.slice(start - EncodedBlock::PREFIX_LEN..start + row.len),
+            )
+            .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
+            out.push(verify_and_build_block(row, message, self.kernel_verified)?);
         }
         Ok(())
     }
@@ -437,16 +450,16 @@ fn verified_row_start(row: &IndexedBlock, raw: &[u8], first_frame: u64) -> io::R
 
 fn verify_and_build_block(
     row: &IndexedBlock,
-    payload: Bytes,
+    message: EncodedBlock,
     kernel_verified: bool,
 ) -> io::Result<SealedBlock> {
-    row.verify_payload(&payload, kernel_verified)
+    row.verify_payload(&message.payload(), kernel_verified)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(SealedBlock {
         id: row.id,
         parent: row.parent,
         native_bytes: row.native_bytes,
-        payload,
+        message,
     })
 }
 
