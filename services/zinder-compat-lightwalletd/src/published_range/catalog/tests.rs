@@ -1532,7 +1532,6 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
     let (_store, reader) = reader(&chain)?;
     let reader = Arc::new(reader);
     let reads = CanonicalReaderSlot::new(Arc::clone(&reader));
-    let mut found_retry_only = false;
     for (first, heights) in [(1, 1..=7), (1_000, 995..=1_006)] {
         let fixture = Fixture::new()?;
         assert!(
@@ -1541,6 +1540,7 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
                 .publish_next(&reader)?
         );
         let catalog = Arc::new(fixture.catalog(None)?);
+        assert_eq!(catalog.bounds(), test_span(first, first + 1));
         for is_descending in [false, true] {
             let range = PublishedRangeRead::new(
                 Some(catalog.clone()),
@@ -1549,13 +1549,23 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
                 is_descending,
                 BlockRangeStreamLimit::new(NonZeroU32::MIN),
             );
+            if first == 1_000 && is_descending {
+                let mut chunks = BlockRangeChunks::new(test_span(999, 1_999), true);
+                chunks.advance(998);
+                assert_eq!(chunks.next_chunk(), Some(test_span(999, 1_001)));
+                assert_eq!(
+                    chunks.checked_heights().map(|(retry, _)| retry),
+                    Some(test_span(1_000, 1_001))
+                );
+                assert!(assert_published_read_admission(&range, &reads, chunks).await?);
+            }
             for start in heights.clone() {
                 for end in start..=*heights.end() {
                     let chunk = test_span(start, end);
                     let first = BlockRangeChunks::new(chunk, is_descending);
                     assert_eq!(first.checked_heights(), None);
                     assert_published_read_admission(&range, &reads, first).await?;
-                    for previously_checked in [0, 1, 3] {
+                    for previously_checked in [0, 1, 2, 3] {
                         let kept = zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
                             - previously_checked;
                         let previous_range = if is_descending {
@@ -1568,9 +1578,7 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
                         let mut later = BlockRangeChunks::new(previous_range, is_descending);
                         later.advance(usize::try_from(kept)?);
                         assert_eq!(later.next_chunk(), Some(chunk));
-                        let retry_only =
-                            assert_published_read_admission(&range, &reads, later).await?;
-                        found_retry_only |= retry_only;
+                        assert_published_read_admission(&range, &reads, later).await?;
                         if let Some((_, only_checked)) = later.checked_heights() {
                             assert_eq!(only_checked.checked_heights(), None);
                             assert_published_read_admission(&range, &reads, only_checked).await?;
@@ -1580,10 +1588,6 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
             }
         }
     }
-    assert!(
-        found_retry_only,
-        "the sequence must reach a signed checked-height retry"
-    );
     Ok(())
 }
 
