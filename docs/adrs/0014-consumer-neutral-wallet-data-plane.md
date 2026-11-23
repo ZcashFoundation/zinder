@@ -29,6 +29,8 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 ## Evidence
 
 - Decision 8: measured. Sending stored wire bytes cut warm range-read CPU per block by 71 to 74 percent against converting canonical rows; [ADR-0002](0002-serialization-and-byte-order.md#evidence) gives the figures and the receipt. The storage cost is in the consequences.
+- Decision 2, the scope of epoch binding: judgment, as [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 1 records.
+- Decision 4, no forwarded indexed reads in native `WalletQuery`: judgment. Native consumers rely on epoch-pinned reads and on typed absence ([ADR-0018](0018-transaction-facts-status-and-broadcast.md)), and a forwarded read offers neither. Its cost is that a native consumer that needs transparent reads runs the wallet deployment. A native consumer that needs forwarded reads reopens it, and would also need its own capability. The light-wallet exception rests on [ADR-0023](0023-deployment-profiles.md) decision 4.
 
 ## Consequences
 
@@ -67,3 +69,4 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - 2026-11-23. Decision 8 assigns the signed settled-history projection to the compatibility adapter and coverage and chain identity to canonical storage, and the consequences record the second copy of settled compact blocks it costs.
 - 2026-11-23. Decision 7 and its consequences follow the wallet-serving dense construction default and its measured Mainnet READY time and disk growth.
 - 2026-11-23. The record covers the native data plane. Decisions 2 and 4 confine node-backed reads to the light-wallet lightwalletd composition, which ADR-0003 governs. Native `WalletQuery` forwards no indexed read.
+- 2026-11-23. Evidence records what decisions 2 and 4 rest on.
