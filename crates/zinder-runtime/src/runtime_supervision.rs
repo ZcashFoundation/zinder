@@ -70,7 +70,7 @@ pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The tonic router type that [`SupervisedRuntime::public_grpc_router`]
 /// returns.
-pub type SupervisedGrpcRouter<L = Identity> = tonic::transport::server::Router<
+pub type SupervisedGrpcRouter<L = Identity> = crate::PublicGrpcRouter<
     Stack<
         Stack<
             GrpcSendStallLayer,
@@ -94,6 +94,7 @@ pub struct SupervisedRuntime {
     serving_drained: CancellationToken,
     open_calls: Arc<OpenGrpcCalls>,
     grpc_drain_timeout: Duration,
+    grpc_send_stall_timeout: Duration,
 }
 
 impl SupervisedRuntime {
@@ -108,6 +109,7 @@ impl SupervisedRuntime {
             serving_drained: CancellationToken::new(),
             open_calls: Arc::new(OpenGrpcCalls::default()),
             grpc_drain_timeout: GRPC_SERVER_DRAIN_TIMEOUT,
+            grpc_send_stall_timeout: DEFAULT_GRPC_SEND_STALL_TIMEOUT,
         }
     }
 
@@ -118,6 +120,16 @@ impl SupervisedRuntime {
     #[must_use]
     pub const fn with_grpc_drain_timeout(mut self, grpc_drain_timeout: Duration) -> Self {
         self.grpc_drain_timeout = grpc_drain_timeout;
+        self
+    }
+
+    /// Replaces the send stall timeout of the listener this runtime builds.
+    ///
+    /// Production runtimes keep [`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]. This
+    /// form exists so tests can reach a stalled response's end quickly.
+    #[must_use]
+    pub const fn with_grpc_send_stall_timeout(mut self, grpc_send_stall_timeout: Duration) -> Self {
+        self.grpc_send_stall_timeout = grpc_send_stall_timeout;
         self
     }
 
@@ -222,7 +234,7 @@ impl SupervisedRuntime {
         (application_service, descriptor_set): (S, &'static [u8]),
         client_address: ClientAddressSource,
         readiness: &Readiness,
-        transport: impl FnOnce(tonic::transport::Server) -> tonic::transport::Server<L>,
+        transport: impl FnOnce(crate::PublicGrpcServer) -> crate::PublicGrpcServer<L>,
     ) -> Result<SupervisedGrpcRouter<L>, tonic_reflection::server::Error>
     where
         L: Clone,
@@ -239,14 +251,15 @@ impl SupervisedRuntime {
         ResponseBody:
             http_body::Body<Data = bytes::Bytes, Error: Into<axum::BoxError>> + Send + 'static,
     {
-        let server = transport(crate::public_grpc_server::public_grpc_transport()).layer(
-            supervised_grpc_layers(
-                Arc::clone(&self.open_calls),
-                GrpcReceiveLimits::default(),
-                DEFAULT_GRPC_SEND_STALL_TIMEOUT,
-                client_address,
-            ),
-        );
+        let server = transport(crate::public_grpc_server::public_grpc_transport(
+            self.grpc_send_stall_timeout,
+        ))
+        .layer(supervised_grpc_layers(
+            Arc::clone(&self.open_calls),
+            GrpcReceiveLimits::default(),
+            self.grpc_send_stall_timeout,
+            client_address,
+        ));
         supervised_router(
             server,
             application_service,
@@ -289,7 +302,7 @@ impl SupervisedRuntime {
         publish_shutting_down: impl FnOnce(),
     ) -> Result<(), RuntimeSupervisionError>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         let service = self.service.binary_name();
         let mut running = tasks.start(&self.stopping);
@@ -348,9 +361,9 @@ impl SupervisedRuntime {
         &self,
         mut server: Pin<&mut Server>,
         server_stopped: bool,
-    ) -> Result<(), tonic::transport::Error>
+    ) -> Result<(), std::io::Error>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         let drained = if server_stopped {
             Some(Ok(()))
@@ -380,9 +393,9 @@ impl SupervisedRuntime {
     async fn drain_grpc_server<Server>(
         &self,
         server: Pin<&mut Server>,
-    ) -> Option<Result<(), tonic::transport::Error>>
+    ) -> Option<Result<(), std::io::Error>>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         if let Ok(server_outcome) = tokio::time::timeout(self.grpc_drain_timeout, server).await {
             return Some(server_outcome);
@@ -402,9 +415,9 @@ impl SupervisedRuntime {
     async fn close_grpc_server<Server>(
         &self,
         server: Pin<&mut Server>,
-    ) -> Result<(), tonic::transport::Error>
+    ) -> Result<(), std::io::Error>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_CLOSE_TIMEOUT, server).await {
             return server_outcome;
@@ -441,7 +454,7 @@ struct TaskExit {
 
 enum RuntimeExit {
     ShutdownRequested,
-    GrpcServer(Result<(), tonic::transport::Error>),
+    GrpcServer(Result<(), std::io::Error>),
     Task(TaskExit),
 }
 
@@ -466,7 +479,7 @@ fn log_task_exit(service: &'static str, task: &'static str, failure: Option<&Run
     }
 }
 
-fn log_server_drain_failure(service: &'static str, error: &tonic::transport::Error) {
+fn log_server_drain_failure(service: &'static str, error: &std::io::Error) {
     tracing::error!(
         target: "zinder::runtime",
         event = "runtime_grpc_drain_failed",
@@ -699,7 +712,7 @@ pub enum RuntimeSupervisionError {
     GrpcServer {
         /// The transport failure.
         #[source]
-        source: tonic::transport::Error,
+        source: std::io::Error,
     },
 }
 

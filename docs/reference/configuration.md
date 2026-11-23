@@ -378,7 +378,8 @@ transport policy.
 | Client-streaming and bidirectional calls open, per process | 32 | `UNAVAILABLE` |
 | Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
 | Time a client stream may go without sending a whole message | 20 s | `DEADLINE_EXCEEDED` |
-| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` after the data already sent, if it reads again |
+| Time a response may wait for its client to read it | 60 s | Stream reset with `CANCEL`, after the data already sent; most clients report `CANCELLED` |
+| Time a connection has to write 16 KiB once a write blocks | 60 s | Connection closed |
 | HTTP/2 keepalive | Ping after 60 s without a frame; close if unanswered for 20 s | Connection closed |
 | Streams the server resets because of the client's protocol errors, per HTTP/2 connection | 1,024 | Connection closed with `ENHANCE_YOUR_CALM` |
 | Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`) | 1,024 | `RESOURCE_EXHAUSTED` |
@@ -413,27 +414,69 @@ connections counts as many clients. Limit connections per client in the
 proxy.
 
 A response that the client stops reading, by withholding HTTP/2 flow-control
-window, is abandoned after 60 seconds. The listener drops the call's handler
-and the response data it has not yet handed to HTTP/2, so the call starts no
-further work. A read already in flight finishes first, and a `GetBlockRange`
-stream returns its range-stream slot once that read is done. A client that reads again
-receives the data HTTP/2 already holds, then `DEADLINE_EXCEEDED`. A response
-that is waiting for the server to produce its next message is not affected.
+window, ends once HTTP/2 has held one piece of it for 60 seconds without the
+client's window growing enough to cover everything queued ahead of that piece
+plus one byte. The listener
+resets the response's HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it starts no further work, and frees
+the data HTTP/2 holds for the response and the stream's place among its
+connection's 200 streams. A read already in flight finishes first, and a
+`GetBlockRange` stream returns its range-stream slot once that read is done.
+The connection and its other streams stay open. A response that is waiting
+for the server to produce its next message is reset only if data it already
+sent is still waiting for window.
 
-Abandoning a response does not release what HTTP/2 holds for it: up to about
-528 KiB of response data (the 400 KiB send buffer, one piece queued past it,
-and one waiting for flow-control window), held in up to about 592 KiB of
-buffers because a partly sent piece still owns its whole buffer, and the
-stream's place among its
-connection's 200 streams. These stay until the client reads them, resets the
-stream, or closes the connection. A client that keeps answering keepalive
-pings keeps its connection open, so one connection can keep about 116 MiB
-this way with no time limit, and the proxy's per-client connection limit is
-the only bound across the listener. A `GetBlockRange` response on the
-lightwalletd listener hands HTTP/2 slices of its stored blocks instead of
-copies, so a stalled range stream can keep up to about 2 MiB alive and one
-connection about 406 MiB
-([lightwalletd compatibility](lightwalletd-compatibility.md)).
+A client that reads slowly is reset only when one piece waits 60 seconds this
+way. The shortfall comes from the piece queued just ahead of the waiting one,
+so window updates that arrive often but grant too little in total can still
+end the stream. In the worst case, when the connection's window is not the
+limit and the client's settings do not change, the waiting piece needs a
+whole piece of new window: 64 KiB for gRPC and binary gRPC-Web, or 87,384
+bytes for gRPC-Web text. Shorter pieces need less. How fast a client must
+then read depends on how it grants window. Rust's h2, which tonic and hyper
+use, sends a window update once the capacity it has released reaches half of
+its remaining window, roughly a third of the configured window for a steady
+reader. Under those assumptions, a worst-case reader with a 1 MiB window must
+read about 341 KiB within 60 seconds, about 5.7 KiB/s, and one with a 64 KiB
+window must read about 64 KiB, about 1.1 KiB/s.
+
+A client that reads again receives the data that reached it before the
+reset, then the reset. grpc-go, grpc-java, and tonic built with its `server`
+feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports
+`UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it
+differently.
+
+While a response is open, the transport holds less than about 592 KiB of
+its payload, or 656 KiB and 8 bytes for a gRPC-Web text response: the
+400 KiB HTTP/2 send buffer, the piece queued past it, the piece waiting for
+window, and the next piece. These are estimates of transport payload. The
+listener also keeps the response chunk it is splitting into pieces until it
+hands out that chunk's last piece; for `GetBlockRange` that chunk is one
+encoded block, or a batch of smaller ones. A gRPC-Web response's trailers
+add a frame of their own. The server ends a response only once the client's
+window covers everything it sent. After that, the response holds less than
+400 KiB, which only the client's socket holds back. One connection holds at
+most 200 responses, about 116 MiB of transport payload, or 128 MiB in
+gRPC-Web text mode.
+
+The window can still shrink after a response ends. A client that lowers its
+stream window with an HTTP/2 `SETTINGS` frame after the server ended a
+response leaves up to 400 KiB of that response, and its stream slot, with
+HTTP/2 until the connection closes. A response waiting for its producer
+keeps that data until the producer sends again. One connection can hold
+about 78 MiB this way. Zinder sets no process-wide bound on this data,
+because a client can open many connections. Limit connections per client at
+your proxy.
+
+Once a write to a connection blocks, the connection must write 16 KiB, or
+finish writing everything it had buffered, within 60 seconds or it is
+closed. This closes a connection whose client has stopped
+reading every stream on it, which not even a reset can reach. A client that
+reads its socket a few bytes at a time stays within the memory bounds above
+but has no deadline: its connection stays open while it reads 16 KiB a
+minute, and HTTP/2 frees a reset stream's data only when it next writes to
+that connection. An HTTP/1.1 connection, which gRPC-Web uses when
+`compat.browser_origins` is set, carries one response at a time, so a
+stalled response closes its connection.
 [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
 records this policy.
 
@@ -507,7 +550,7 @@ and the Cipherscan adapter use one hardened HTTP/1 listener.
 | --- | --- | --- |
 | Time to receive a complete request head, and idle keep-alive | 10 s | 10 s |
 | Time to receive a request body | 30 s | 30 s |
-| Time a write may stall behind a client that is not reading | 30 s | 30 s |
+| Time a connection has to write 16 KiB once a write blocks | 30 s | 30 s |
 | Open connections | 2,048 | 64 |
 | Request body size | 2 MiB | 4 KiB |
 

@@ -7,7 +7,6 @@ use std::{net::SocketAddr, sync::Arc};
 
 use eyre::Result;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 use tonic_health::pb::health_check_response::ServingStatus;
 use zinder_core::Network;
@@ -47,10 +46,7 @@ async fn native_listener_health_follows_readyz_through_readiness_and_shutdown() 
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    let server = router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    );
+    let server = router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown());
     let shutdown = runtime.shutdown_request();
     let supervised = tokio::spawn({
         let serving_readiness = serving_readiness.clone();
@@ -145,10 +141,7 @@ async fn supervisor_grpc_healthcheck_preserves_the_proxy_fallback_counter() -> R
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let server = router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    );
+    let server = router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown());
     let shutdown = runtime.shutdown_request();
     let supervised = tokio::spawn(runtime.supervise(server, SupervisedTasks::new(), || {}));
     let before = missing_proxy_header_count(ops).await?;

@@ -62,12 +62,14 @@ async-trait.workspace = true
 base64.workspace = true
 eyre.workspace = true
 http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util.workspace = true
 metrics-exporter-prometheus.workspace = true
 prost-types.workspace = true
 reqwest.workspace = true
 rust-rocksdb.workspace = true
 secrecy.workspace = true
-tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic-health.workspace = true
 zcash_address = { workspace = true, features = ["std"] }

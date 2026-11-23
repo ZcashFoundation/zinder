@@ -9,7 +9,7 @@ use eyre::{OptionExt as _, Result, eyre};
 use prost::Message as _;
 use prost_types::{FileDescriptorProto, FileDescriptorSet};
 use tokio::{net::TcpListener, sync::mpsc};
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic_reflection::pb::v1::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
@@ -53,9 +53,7 @@ async fn compat_listener() -> Result<Channel> {
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         let _store_fixture = store_fixture;
-        router
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
+        router.serve_with_incoming(listener).await
     });
     Ok(Channel::from_shared(format!("http://{addr}"))?
         .connect()

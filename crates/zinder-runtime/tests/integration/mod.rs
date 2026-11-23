@@ -8,4 +8,5 @@ mod proxy_client_address_contract;
 mod public_grpc_health;
 mod public_grpc_server;
 mod runtime_supervision;
+mod stalled_streams;
 mod startup_phase;

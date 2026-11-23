@@ -16,10 +16,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
-use tokio_stream::{
-    Stream, StreamExt as _,
-    wrappers::{ReceiverStream, TcpListenerStream},
-};
+use tokio_stream::{Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{
     Code, Request, Status,
     body::Body,
@@ -62,7 +59,7 @@ struct TestServer {
     address: SocketAddr,
     channel: Channel,
     health: HealthReporter,
-    _server: JoinHandle<Result<(), tonic::transport::Error>>,
+    _server: JoinHandle<Result<(), std::io::Error>>,
 }
 
 impl TestServer {
@@ -106,7 +103,7 @@ async fn serve_with(
         )
         .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
         .add_service(reflection)
-        .serve_with_incoming(TcpListenerStream::new(listener)),
+        .serve_with_incoming(listener),
     );
     let channel = Endpoint::new(format!("http://{address}"))?
         .connect()
@@ -373,8 +370,8 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     })
     .await?;
 
-    // Reading again delivers what the transport already held, then the
-    // stream ends with DEADLINE_EXCEEDED instead of further answers.
+    // Reading again delivers what reached the client before the server reset
+    // the stream, then the reset, which the client sees as CANCELLED.
     let mut answers = 0;
     let ended_with = loop {
         match within_wait_limit(stalled.next()).await? {
@@ -386,8 +383,49 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     assert!(answers < 3, "the stalled stream delivered every answer");
     assert_eq!(
         ended_with.map(|status| status.code()),
-        Some(Code::DeadlineExceeded)
+        Some(Code::Cancelled)
     );
+    drop(sender);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stalled_reflection_stream_waiting_for_its_next_request_returns_its_slot() -> Result<()> {
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let channel = small_stream_window_connection(&server).await?;
+    let (sender, receiver) = mpsc::channel(1);
+    let _answers = ServerReflectionClient::new(channel.clone())
+        .server_reflection_info(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    // One answer larger than the window: reflection hands it on and waits
+    // for the next request, which never comes.
+    sender
+        .send(ServerReflectionRequest {
+            host: "x".repeat(256 * 1024),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        })
+        .await?;
+
+    // Well before the 30-second receive timeout, the reset ends the request
+    // stream too, so reflection lets go of the only client-stream slot.
+    wait_until("the stalled reflection stream returns its slot", || {
+        let channel = channel.clone();
+        async move {
+            match ServerReflectionClient::new(channel)
+                .server_reflection_info(tokio_stream::once(list_services()))
+                .await
+            {
+                Ok(probe) => probe
+                    .into_inner()
+                    .next()
+                    .await
+                    .is_some_and(|reply| reply.is_ok()),
+                Err(_) => false,
+            }
+        }
+    })
+    .await?;
     drop(sender);
     Ok(())
 }
@@ -750,10 +788,8 @@ async fn a_supervised_wallet_listener_tells_clients_behind_a_trusted_proxy_apart
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    let _server = tokio::spawn(router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    ));
+    let _server =
+        tokio::spawn(router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown()));
     let proxy = spawn_proxy(listener_address).await?;
     let attacker = connect_through(proxy).await?;
     let victim = connect_through(proxy).await?;

@@ -10,6 +10,12 @@
 //! after the stall timeout, drops the handler's body. Dropping it unwinds the
 //! handler the way a client cancellation does.
 //!
+//! A public listener whose transport can be reset watches stalls at the
+//! transport instead ([`super::stream_reset`]): there, a stall resets the
+//! HTTP/2 stream or HTTP/1.1 connection, which also drops this body and the
+//! handler. This layer then starts no stall watchdog of its own and watches
+//! only for a [`ResponseCancellation`].
+//!
 //! Data chunks are handed to hyper in pieces of at most
 //! [`RESPONSE_PIECE_BYTES`], so a slow but steady client is polled often
 //! enough that it never looks stalled. A piece is a copy, so the bytes hyper
@@ -40,7 +46,7 @@ use tonic::{Status, body::Body};
 use tower::{Layer, Service};
 use zinder_proto::compat::lightwalletd::BoundedChunkRetention;
 
-use super::SEND_STALLS_METRIC;
+use super::{SEND_STALLS_METRIC, stream_reset::TransportReset};
 
 /// Largest piece of a response data chunk handed to the transport at once.
 const RESPONSE_PIECE_BYTES: usize = 64 * 1024;
@@ -139,12 +145,16 @@ where
         self.inner
             .call(request)
             .map_ok(move |response| {
+                // The response future resolves inside the task that carries
+                // the response, where a resettable transport is in scope.
+                let watch_stalls = TransportReset::current().is_none();
                 let pieces = Pieces::for_response(&response);
                 response.map(|body| {
                     Body::new(SendStallBoundBody::new(
                         body,
                         send_stall_timeout,
                         cancellation,
+                        watch_stalls,
                         pieces,
                     ))
                 })
@@ -189,6 +199,9 @@ struct SendStallBoundBody {
     send_stall_timeout: Duration,
     /// Shared with the watchdog when it starts.
     cancellation: Option<ResponseCancellation>,
+    /// Whether this body ends its response when the transport stalls, which
+    /// it does only when the transport cannot be reset.
+    watch_stalls: bool,
     /// Stops the watchdog when the response ends. Set once the first data
     /// piece is handed out, or at once for a cancellable response.
     watchdog: Option<DropGuard>,
@@ -221,6 +234,7 @@ impl SendStallBoundBody {
         inner: Body,
         send_stall_timeout: Duration,
         cancellation: Option<ResponseCancellation>,
+        watch_stalls: bool,
         pieces: Pieces,
     ) -> Self {
         let cancellable = cancellation.is_some();
@@ -235,6 +249,7 @@ impl SendStallBoundBody {
             })),
             send_stall_timeout,
             cancellation,
+            watch_stalls,
             watchdog: None,
         };
         if cancellable {
@@ -244,7 +259,7 @@ impl SendStallBoundBody {
     }
 
     fn start_watchdog(&mut self) {
-        if self.watchdog.is_some() {
+        if self.watchdog.is_some() || (!self.watch_stalls && self.cancellation.is_none()) {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -256,6 +271,7 @@ impl SendStallBoundBody {
             self.send_stall_timeout,
             finished.clone(),
             self.cancellation.clone(),
+            self.watch_stalls,
         ));
         self.watchdog = Some(finished.drop_guard());
     }
@@ -315,12 +331,14 @@ impl Sending {
 }
 
 /// Drops the handler's body once the transport has held the last piece for
-/// `send_stall_timeout`, or at once when `cancellation` fires.
+/// `send_stall_timeout`, when `watch_stalls` is set, or at once when
+/// `cancellation` fires.
 async fn abandon_when_stalled_or_cancelled(
     sending: Weak<Mutex<Sending>>,
     send_stall_timeout: Duration,
     finished: CancellationToken,
     cancellation: Option<ResponseCancellation>,
+    watch_stalls: bool,
 ) {
     let (cancelled, cancel_status) = match cancellation {
         Some(ResponseCancellation { token, status, .. }) => (token, status),
@@ -338,7 +356,7 @@ async fn abandon_when_stalled_or_cancelled(
         let stalled = tokio::select! {
             () = finished.cancelled() => return,
             () = cancelled.cancelled() => false,
-            () = tokio::time::sleep_until(checked_at + send_stall_timeout) => true,
+            () = tokio::time::sleep_until(checked_at + send_stall_timeout), if watch_stalls => true,
         };
         let Some(shared) = sending.upgrade() else {
             return;
@@ -497,6 +515,7 @@ mod tests {
                 cancelled.clone(),
                 Status::unavailable("evicted"),
             )),
+            true,
             Pieces::Copied,
         );
         let (polled_sender, polled) = oneshot::channel();
@@ -537,8 +556,13 @@ mod tests {
         let handler_body = Body::new(StreamBody::new(
             tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
         ));
-        let mut body =
-            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Copied);
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_hours(1),
+            None,
+            true,
+            Pieces::Copied,
+        );
 
         let first = body
             .frame()
@@ -579,6 +603,7 @@ mod tests {
                 cancelled.clone(),
                 Status::unavailable("evicted"),
             )),
+            true,
             Pieces::Copied,
         );
 
@@ -632,8 +657,13 @@ mod tests {
     /// whether that piece still keeps the chunk alive.
     async fn held_piece_pins_chunk(len: usize) -> Result<bool, Box<dyn std::error::Error>> {
         let (handler_body, mut freed) = one_tracked_chunk(len);
-        let mut body =
-            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Sliced);
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_hours(1),
+            None,
+            true,
+            Pieces::Sliced,
+        );
         let held_piece = first_piece(&mut body).await?;
         assert_eq!(held_piece.len(), RESPONSE_PIECE_BYTES);
 
@@ -663,8 +693,13 @@ mod tests {
     async fn handing_out_the_last_slice_leaves_the_layer_holding_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         let (handler_body, mut freed) = one_tracked_chunk(RESPONSE_PIECE_BYTES + 1);
-        let mut body =
-            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Sliced);
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_hours(1),
+            None,
+            true,
+            Pieces::Sliced,
+        );
         let first = first_piece(&mut body).await?;
         let last = first_piece(&mut body).await?;
         assert_eq!(last.len(), 1);
@@ -682,5 +717,39 @@ mod tests {
             .body(())
             .unwrap_or_default();
         assert_eq!(Pieces::for_response(&response), Pieces::Copied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_response_on_a_resettable_transport_leaves_stalls_to_the_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (freed_sender, mut freed) = oneshot::channel();
+        let chunk = Bytes::from_owner(TrackedChunk {
+            bytes: vec![0; 4 * 1024 * 1024],
+            _freed: freed_sender,
+        });
+        let handler_body = Body::new(StreamBody::new(
+            tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
+        ));
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_secs(60),
+            None,
+            false,
+            Pieces::Copied,
+        );
+
+        // The transport takes one piece and never asks for the next.
+        let held_piece = body
+            .frame()
+            .await
+            .ok_or("the response ended before its first piece")??;
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        assert_eq!(
+            freed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty),
+            "the layer ended a response whose transport bounds its stalls"
+        );
+        drop((held_piece, body));
+        Ok(())
     }
 }

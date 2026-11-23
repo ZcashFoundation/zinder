@@ -19,8 +19,8 @@ config.workspace = true
 futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+hyper = { workspace = true, features = ["http2"] }
+hyper-util = { workspace = true, features = ["http2", "server-auto"] }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
@@ -60,6 +60,7 @@ x86_64.workspace = true
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }
 eyre.workspace = true
+h2.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util = { workspace = true, features = ["http2"] }

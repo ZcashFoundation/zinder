@@ -1,7 +1,8 @@
 use std::{convert::Infallible, future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version, header};
-use tonic::{Status, body::Body, server::NamedService, transport::server::TcpIncoming};
+use tokio::net::TcpListener;
+use tonic::{Status, body::Body, server::NamedService};
 use tonic_web::GrpcWebLayer;
 use tower::{Layer, Service, ServiceBuilder};
 use tower_http::{
@@ -12,22 +13,21 @@ use zinder_proto::compat::lightwalletd::compact_tx_streamer_server::SERVICE_NAME
 
 use super::config::{LightwalletdConfig, LightwalletdConfigError};
 
-pub(super) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), LightwalletdConfigError> {
+pub(super) fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), LightwalletdConfigError> {
     let listen_error = |source| LightwalletdConfigError::Listen { addr, source };
-    // Tonic's address-based server enables TCP_NODELAY on accepted sockets.
-    let incoming = TcpIncoming::bind(addr)
-        .map_err(listen_error)?
-        .with_nodelay(Some(true));
-    let bound_addr = incoming.local_addr().map_err(listen_error)?;
-    Ok((incoming, bound_addr))
+    let listener = std::net::TcpListener::bind(addr).map_err(listen_error)?;
+    listener.set_nonblocking(true).map_err(listen_error)?;
+    let listener = TcpListener::from_std(listener).map_err(listen_error)?;
+    let bound_addr = listener.local_addr().map_err(listen_error)?;
+    Ok((listener, bound_addr))
 }
 
-type GrpcServer = Pin<Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>>;
+type GrpcServer = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
 
 pub(super) fn serve<S>(
     runtime: &zinder_runtime::SupervisedRuntime,
     wallet_service: S,
-    incoming: TcpIncoming,
+    incoming: TcpListener,
     config: &LightwalletdConfig,
     readiness: &zinder_runtime::Readiness,
 ) -> Result<GrpcServer, tonic_reflection::server::Error>
@@ -40,15 +40,43 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let browser_origins = &config.browser_origins;
-    let enabled = !browser_origins.is_empty();
-    let transport = transport_layers(browser_origins);
+    let listener = BrowserListener {
+        browser_origins: &config.browser_origins,
+        client_address: config.client_address_source,
+    };
+    serve_listener(runtime, wallet_service, incoming, &listener, readiness)
+}
+
+/// The settings of the compatibility listener that its transport reads.
+pub(super) struct BrowserListener<'a> {
+    pub(super) browser_origins: &'a [HeaderValue],
+    pub(super) client_address: zinder_runtime::ClientAddressSource,
+}
+
+pub(super) fn serve_listener<S>(
+    runtime: &zinder_runtime::SupervisedRuntime,
+    wallet_service: S,
+    incoming: TcpListener,
+    listener: &BrowserListener<'_>,
+    readiness: &zinder_runtime::Readiness,
+) -> Result<GrpcServer, tonic_reflection::server::Error>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
+        + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let enabled = !listener.browser_origins.is_empty();
+    let transport = transport_layers(listener.browser_origins);
     let router = runtime.public_grpc_router_with_transport(
         (
             wallet_service,
             zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
         ),
-        config.client_address_source,
+        listener.client_address,
         readiness,
         |server| server.accept_http1(enabled).layer(transport),
     )?;
@@ -200,6 +228,9 @@ impl ValidateRequest<Body> for UnsupportedBrowserCall {
 
 #[cfg(test)]
 mod receive_tests;
+
+#[cfg(test)]
+mod stall_tests;
 
 #[cfg(test)]
 mod tests {

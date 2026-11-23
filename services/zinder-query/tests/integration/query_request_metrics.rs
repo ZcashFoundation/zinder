@@ -33,7 +33,6 @@ const FIRST_CHAIN_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 #[tokio::test]
 async fn native_listener_counts_readiness_refusals_and_completed_ranges_once() -> eyre::Result<()> {
     use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
     use wallet::wallet_query_client::WalletQueryClient;
     use zinder_runtime::{
         ClientAddressSource, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
@@ -61,10 +60,8 @@ async fn native_listener_counts_readiness_refusals_and_completed_ranges_once() -
     )?;
     let incoming = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", incoming.local_addr()?);
-    let server = tokio::spawn(router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(incoming),
-        runtime.grpc_server_shutdown(),
-    ));
+    let server =
+        tokio::spawn(router.serve_with_incoming_shutdown(incoming, runtime.grpc_server_shutdown()));
     let mut client = WalletQueryClient::connect(endpoint).await?;
     let baseline = handle.render();
     assert!(baseline.contains(r#"zinder_wallet_rpc_readiness_refusals_total{surface="wallet_query",method="CompactBlocksInRange"} 0"#), "{baseline}");

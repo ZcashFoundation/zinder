@@ -164,7 +164,7 @@ def endpoint(engine, commit=RELEASE["commit"], anchor=None):
                 "network": "zcash-regtest", "network_verified": True,
                 "anchor_verified": True, "anchor_height": 150,
                 "expected_height": 150, "anchor_hash": anchor,
-                "expected_hash": anchor, "contract_revision": 14,
+                "expected_hash": anchor, "contract_revision": 15,
                 "service_name": "zinder-query"},
             "anchor_verified": True}
 
