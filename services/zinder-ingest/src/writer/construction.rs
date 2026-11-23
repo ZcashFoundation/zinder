@@ -1033,7 +1033,8 @@ impl BlockLoaderStageTimers {
             tree_hashing_append: stage("tree_hashing_append"),
             position: stage("position"),
             tree_hashing_checkpoint: stage("tree_hashing_checkpoint"),
-            tree_hashing_final_roots: (workload == CanonicalStoreWorkload::Explorer)
+            tree_hashing_final_roots: workload
+                .derives_final_roots()
                 .then(|| stage("tree_hashing_final_roots")),
         }
     }
@@ -1155,7 +1156,7 @@ impl CanonicalBuildBlockReceiver {
         let positioned = self.position_block(prepared)?;
         let work = TreeWork {
             checkpoint_required: self.select_checkpoint(height, positioned.tip_metadata),
-            final_roots_required: self.workload == CanonicalStoreWorkload::Explorer,
+            final_roots_required: self.workload.derives_final_roots(),
         };
         let tree_work = (work.checkpoint_required || work.final_roots_required)
             .then(|| {
@@ -1350,7 +1351,7 @@ impl CanonicalBuildBlockReceiver {
         &mut self,
         block_hash: zinder_core::BlockHash,
     ) -> Option<zinder_core::BlockFinalNoteCommitmentRoots> {
-        if self.workload != CanonicalStoreWorkload::Explorer {
+        if !self.workload.derives_final_roots() {
             return None;
         }
         let started_at = Instant::now();

@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 /// Raw-blob retention fixed by the primary writer after the first canonical commit.
 ///
-/// Readers use this persisted value for capability discovery. Changing it on a
-/// non-empty store would make that capability lie about historical coverage,
-/// so opening with a different value fails closed and requires a rebuild.
+/// Readers use this persisted value to check required coverage and derive
+/// capabilities. A writer must open with the persisted profile and rebuild
+/// the store to change blob retention.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RawBlobRetention {
@@ -40,18 +40,6 @@ impl RawBlobRetention {
             Self::Transactions => "transactions",
             Self::All => "all",
         }
-    }
-
-    /// Whether full block blobs are retained.
-    #[must_use]
-    pub const fn retains_block_blobs(self) -> bool {
-        matches!(self, Self::All)
-    }
-
-    /// Whether transaction blobs are retained.
-    #[must_use]
-    pub const fn retains_transaction_blobs(self) -> bool {
-        matches!(self, Self::Transactions | Self::All)
     }
 }
 

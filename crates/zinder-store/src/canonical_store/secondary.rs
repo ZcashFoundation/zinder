@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
+use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, Options};
 use zinder_core::{
     BlockHeight, BlockHeightRange, CanonicalBlockFacts, CanonicalHistoryBounds, Network,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
@@ -16,7 +16,8 @@ use crate::{
 use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
+    CanonicalStoreReadyEvidence, CanonicalStoreRequirements, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{
         CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at,
@@ -29,9 +30,10 @@ use super::{
     publication::{follow_ready_replay_tail, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
-        CANONICAL_DATA_COLUMN_FAMILIES, CanonicalStoreAdmissionExpectation,
+        CanonicalStoreAdmissionExpectation, StoredDataAdmission,
         canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
     },
+    stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, validate_exact_column_families},
 };
 
 /// Result of one explicit canonical-secondary catch-up barrier.
@@ -101,7 +103,7 @@ impl RocksDbCanonicalSecondary {
         }
     }
 
-    /// Opens one exactly admitted secondary and catches it up to the primary's current state.
+    /// Opens a secondary requiring at least the selected workload and blob coverage.
     ///
     /// `expected_network_upgrade_activations` is a node-observed table: it
     /// must agree with the writer-admitted schedule through the visible tip,
@@ -109,8 +111,7 @@ impl RocksDbCanonicalSecondary {
     /// A reader that has no node of its own opens with
     /// [`Self::open_ready_adopting_writer_schedule`] instead.
     ///
-    /// The expected raw-blob retention is an immutable store identity, not a
-    /// request to infer coverage from currently present rows. A
+    /// Coverage is derived from the store control record. A
     /// [`RocksDbResourceBudget`] opens the secondary on a block cache of its
     /// own; [`RocksDbOpenResources::with_shared_block_cache`] opens it on a
     /// cache other secondaries of the same store read through.
@@ -127,13 +128,36 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready_requiring(
+            primary_path,
+            secondary_path,
+            expected_network_upgrade_activations,
+            CanonicalStoreRequirements::from_legacy(expected_workload, expected_raw_blob_retention),
+            expected_reorg_policy,
+            resources,
+        )
+    }
+
+    /// Opens a secondary with explicit minimum retained data and history.
+    /// See [`Self::open_ready`] for schedule admission.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
+    )]
+    pub fn open_ready_requiring(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        expected_network_upgrade_activations: &NetworkUpgradeActivations,
+        requirements: CanonicalStoreRequirements,
+        expected_reorg_policy: super::CanonicalReorgPolicy,
+        resources: impl Into<RocksDbOpenResources>,
+    ) -> Result<Self, CanonicalStoreError> {
         Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
                 expected_network_upgrade_activations,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(requirements),
                 expected_reorg_policy,
             ),
             resources.into(),
@@ -141,7 +165,7 @@ impl RocksDbCanonicalSecondary {
         )
     }
 
-    /// Opens one exactly admitted secondary of a `expected_network` store and
+    /// Opens a secondary requiring at least the selected workload and blob coverage, and
     /// adopts the network-upgrade schedule its canonical writer admitted.
     ///
     /// The reader brings no activation table of its own, so it needs no node:
@@ -164,13 +188,36 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready_adopting_writer_schedule_requiring(
+            primary_path,
+            secondary_path,
+            expected_network,
+            CanonicalStoreRequirements::from_legacy(expected_workload, expected_raw_blob_retention),
+            expected_reorg_policy,
+            resources,
+        )
+    }
+
+    /// Opens a secondary with explicit minimum retained data and history.
+    /// See [`Self::open_ready_adopting_writer_schedule`] for schedule admission.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
+    )]
+    pub fn open_ready_adopting_writer_schedule_requiring(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        expected_network: Network,
+        requirements: CanonicalStoreRequirements,
+        expected_reorg_policy: super::CanonicalReorgPolicy,
+        resources: impl Into<RocksDbOpenResources>,
+    ) -> Result<Self, CanonicalStoreError> {
         Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
                 expected_network,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(requirements),
                 expected_reorg_policy,
             ),
             resources.into(),
@@ -219,7 +266,7 @@ impl RocksDbCanonicalSecondary {
                 operation: "initial canonical secondary catch-up",
                 source,
             })?;
-        require_exact_secondary_column_families(&bounded_open, &primary_path)?;
+        validate_exact_column_families(&primary_path, &bounded_open.db.cf_names())?;
         let opened_control =
             validate_open_store_control(&bounded_open.db, &primary_path, expectation)?;
         validate_mempool_lifecycle_admission(
@@ -385,7 +432,7 @@ impl RocksDbCanonicalSecondary {
                 operation: "canonical secondary catch-up",
                 source,
             })?;
-        require_exact_secondary_column_families(&self.bounded_open, &self.primary_path)?;
+        validate_exact_column_families(&self.primary_path, &self.bounded_open.db.cf_names())?;
         let opened_control = validate_open_store_control(
             &self.bounded_open.db,
             &self.primary_path,
@@ -483,6 +530,12 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
         self.reorg_policy
+    }
+
+    /// Returns the retained block data and historical floor.
+    #[must_use]
+    pub const fn stored_set(&self) -> super::CanonicalStoredSet {
+        self.build_plan.stored_set(self.workload)
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.
@@ -607,16 +660,6 @@ impl RocksDbCanonicalSecondary {
     }
 }
 
-fn required_canonical_column_family_names() -> Vec<String> {
-    let mut expected = CANONICAL_DATA_COLUMN_FAMILIES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
-    expected.sort_unstable();
-    expected
-}
-
 fn require_exact_primary_column_family_metadata(
     primary_path: &Path,
 ) -> Result<(), CanonicalStoreError> {
@@ -626,29 +669,5 @@ fn require_exact_primary_column_family_metadata(
             format!("canonical column-family metadata discovery failed: {source}"),
         )
     })?;
-    require_exact_column_family_names(primary_path, observed)
-}
-
-fn require_exact_secondary_column_families(
-    bounded_open: &BoundedRocksDbOpen,
-    primary_path: &Path,
-) -> Result<(), CanonicalStoreError> {
-    require_exact_column_family_names(primary_path, bounded_open.db.cf_names())
-}
-
-fn require_exact_column_family_names(
-    primary_path: &Path,
-    mut observed: Vec<String>,
-) -> Result<(), CanonicalStoreError> {
-    let expected = required_canonical_column_family_names();
-    observed.sort_unstable();
-    if observed != expected {
-        return Err(CanonicalStoreError::admission(
-            primary_path,
-            format!(
-                "column families {observed:?} do not exactly match required canonical set {expected:?}"
-            ),
-        ));
-    }
-    Ok(())
+    validate_exact_column_families(primary_path, &observed)
 }

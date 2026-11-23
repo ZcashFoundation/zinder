@@ -31,6 +31,7 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod served_tree_state;
+mod stored_set;
 #[cfg(test)]
 mod stored_tree_state_roots_tests;
 mod subtree_load;
@@ -68,6 +69,8 @@ use zinder_testkit::process_crash::crash_point;
 const fn crash_point(_name: &str) {}
 
 pub use activation_schedule::{CanonicalActivationSchedule, InadmissibleActivationSchedule};
+pub use stored_set::{CanonicalStoreRequirements, CanonicalStoredData, CanonicalStoredSet};
+
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
     CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
@@ -310,6 +313,16 @@ impl CanonicalStoreBuildPlan {
         &self,
     ) -> NetworkUpgradeActivationsFingerprint {
         self.network_upgrade_activations_fingerprint
+    }
+
+    /// Returns the stored data policy for this construction plan and workload.
+    #[must_use]
+    pub const fn stored_set(&self, workload: CanonicalStoreWorkload) -> CanonicalStoredSet {
+        CanonicalStoredSet::new(
+            workload,
+            self.raw_blob_retention,
+            self.history_bounds.first_available_height(),
+        )
     }
 
     /// Returns the immutable raw-blob retention contract.
@@ -760,6 +773,21 @@ pub enum CanonicalStoreError {
         path: PathBuf,
         /// Exact incompatibility observed during admission.
         reason: String,
+    },
+
+    /// The admitted store lacks data or history required by a reader.
+    #[error(
+        "canonical store at {path:?} lacks required {kind:?} coverage (required from {required_from:?}, available from {available_from:?})"
+    )]
+    MissingStoredData {
+        /// Canonical primary path.
+        path: PathBuf,
+        /// Required block data.
+        kind: CanonicalStoredData,
+        /// Earliest height requested, if specified.
+        required_from: Option<BlockHeight>,
+        /// Earliest retained height, or `None` if the data is absent.
+        available_from: Option<BlockHeight>,
     },
 
     /// A serving store open encountered an unpublished BUILDING store.

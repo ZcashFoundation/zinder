@@ -1026,7 +1026,7 @@ fn owner_checkpoint_reopens_at_the_visible_epoch() -> Result<(), Box<dyn std::er
 }
 
 #[test]
-fn secondary_admission_reports_and_requires_the_persisted_raw_blob_retention()
+fn v7_publication_and_readmission_cover_each_retained_blob_set()
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
     for retention in [
@@ -1043,7 +1043,14 @@ fn secondary_admission_reports_and_requires_the_persisted_raw_blob_retention()
             BlockHeight::new(2),
             retention,
         )?;
+        assert_eq!(crate::CANONICAL_STORE_SCHEMA_VERSION, 7);
         assert_eq!(store.raw_blob_retention(), retention);
+        let expected_set = store.stored_set();
+        let expected_fence = store.ready_evidence();
+        drop(store);
+        let store = open_store_with_retention(&store_path, &activations, REORG_WINDOW, retention)?;
+        assert_eq!(store.ready_evidence(), expected_fence);
+        assert_eq!(store.stored_set(), expected_set);
 
         let mut secondary = open_secondary(
             &store_path,
@@ -1054,24 +1061,74 @@ fn secondary_admission_reports_and_requires_the_persisted_raw_blob_retention()
         secondary.try_catch_up()?;
         assert_eq!(secondary.raw_blob_retention(), retention);
 
-        let mismatched = if retention == RawBlobRetention::All {
-            RawBlobRetention::None
-        } else {
-            RawBlobRetention::All
-        };
-        let error = open_secondary(
+        // Any retained set admits a reader that only requires block history.
+        let core = RocksDbCanonicalSecondary::open_ready_requiring(
             &store_path,
-            temporary.path().join("mismatched-secondary"),
+            temporary.path().join("core-secondary"),
             &activations,
-            mismatched,
-        )?
-        .err()
-        .ok_or("a secondary expecting another raw-blob retention must be refused")?;
-        assert!(
-            matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
-            "unexpected retention-mismatch error for {retention:?}: {error:?}"
-        );
+            crate::CanonicalStoreRequirements::default(),
+            CanonicalReorgPolicy::new(REORG_WINDOW)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(core.stored_set(), store.stored_set());
+
+        if retention != RawBlobRetention::All {
+            let error = RocksDbCanonicalSecondary::open_ready_requiring(
+                &store_path,
+                temporary.path().join("full-secondary"),
+                &activations,
+                crate::CanonicalStoreRequirements::new(&[crate::CanonicalStoredData::BlockBodies]),
+                CanonicalReorgPolicy::new(REORG_WINDOW)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+            .err()
+            .ok_or("missing block bodies must refuse admission")?;
+            assert!(matches!(
+                error,
+                CanonicalStoreError::MissingStoredData {
+                    kind: crate::CanonicalStoredData::BlockBodies,
+                    available_from: None,
+                    ..
+                }
+            ));
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn secondary_refuses_a_required_height_below_the_checkpointed_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let _store = super::live_replacement_tests::published_note_commitment_store(
+        &path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+        Some(BlockHeight::new(1)),
+    )?;
+    let requested = BlockHeight::new(1);
+    let error = RocksDbCanonicalSecondary::open_ready_requiring(
+        &path,
+        temporary.path().join("secondary"),
+        &activations,
+        crate::CanonicalStoreRequirements::default().from_height(requested),
+        CanonicalReorgPolicy::new(REORG_WINDOW)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("checkpointed history cannot serve the predecessor block")?;
+    assert!(matches!(
+        error,
+        CanonicalStoreError::MissingStoredData {
+            kind: crate::CanonicalStoredData::BlockHistory,
+            required_from: Some(required),
+            available_from: Some(available),
+            ..
+        } if required == requested && available == BlockHeight::new(2)
+    ));
     Ok(())
 }
 

@@ -51,7 +51,7 @@ use domain operations. Column family names and keys are private to
 | `tree_state_checkpoint` | Commitment tree checkpoint at least every 100 blocks |
 | `subtree_root` | Completed shielded subtree roots |
 | `block_final_note_commitment_roots` | Final commitment roots per block (explorer workload only) |
-| `daily_value_pool_balance` | Daily value pool snapshot (explorer workload only) |
+| `daily_value_pool_balance` | Reserved for daily value-pool evidence. Explorer construction refuses READY publication pending authentication. |
 | `chain_epoch` | Retained chain epochs |
 | `chain_event` | Authenticated append and reorg history |
 | `mempool_event` | Retained mempool history |
@@ -306,10 +306,26 @@ differ from what the process expects:
 
 - the store identity or layout version;
 - the network;
-- the canonical workload or raw-blob retention;
+- the required retained data and its historical floor for a canonical reader;
+- the exact canonical workload and raw-blob retention for a writer or recovery checkpoint;
 - the network-upgrade activations at or below the visible tip;
 - the reorg window;
 - for the wallet store, the canonical source it was built from.
+
+Schema v7 requires every family listed above plus the default control
+family, including physically present families with no rows under the
+admitted workload and blob policy. The construction manifest must bind the
+same workload, blob policy, and build plan as the control record and have
+evidence for the full family inventory.
+
+`CanonicalStoredSet` derives retained block data and its history floor from
+the build plan and workload. Readers can specify minimum data and a starting
+height with `CanonicalStoreRequirements`. A richer store satisfies these
+requirements when it covers the requested history. Missing data or an
+insufficient history floor returns `CanonicalStoreError::MissingStoredData`.
+Artifact-specific checks still apply, such as pool activation for final roots
+and event retention for event streams. Serving capabilities also depend on
+the installed handlers and their admitted dependencies.
 
 Only the canonical writer records a new network-upgrade schedule, and readers
 adopt it; see [ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).

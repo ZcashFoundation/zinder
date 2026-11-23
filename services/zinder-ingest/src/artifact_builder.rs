@@ -45,11 +45,11 @@ impl RawBlobPolicy {
     }
 
     const fn writes_block_blobs(self) -> bool {
-        matches!(self, Self::All)
+        self.to_retention().retains_block_blobs()
     }
 
     const fn writes_transaction_blobs(self) -> bool {
-        matches!(self, Self::Transactions | Self::All)
+        self.to_retention().retains_transaction_blobs()
     }
 
     /// Maps the configured policy to the immutable store retention contract

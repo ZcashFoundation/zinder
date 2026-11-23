@@ -135,6 +135,12 @@ impl RocksDbCanonicalBuilder {
         self.workload
     }
 
+    /// Returns the retained block data and historical floor.
+    #[must_use]
+    pub const fn stored_set(&self) -> super::CanonicalStoredSet {
+        self.build_plan.stored_set(self.workload)
+    }
+
     /// Returns the immutable raw-blob retention persisted by this build.
     #[must_use]
     pub const fn raw_blob_retention(&self) -> crate::RawBlobRetention {
@@ -370,7 +376,7 @@ impl RocksDbCanonicalBuilder {
     pub fn record_resource_gauges(&self) {
         self.bounded_open.record_resource_gauges(
             crate::StoreRole::CanonicalPrimary,
-            &super::rocksdb::CANONICAL_DATA_COLUMN_FAMILIES,
+            &super::stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
         );
     }
 
@@ -500,11 +506,12 @@ mod tests {
         note_commitment_trees_tests::NoteCommitmentTrees,
         publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
-            BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
-            CANONICAL_DATA_COLUMN_FAMILIES, CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY,
-            COMPACT_BLOCK_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
             TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         },
+        stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
     };
     use crate::{
         CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RawBlobRetention,
