@@ -104,9 +104,10 @@ impl PublishedRangeRead {
         self.shape == CompactBlockShape::DEFAULT_RANGE
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
-                chunk.start <= coverage.end
-                    && (coverage.start <= chunk.start
-                        || (self.is_descending && coverage.end < chunk.end))
+                (coverage.start..=coverage.end).contains(&chunk.start)
+                    || (self.is_descending
+                        && chunk.start < coverage.start
+                        && coverage.end < chunk.end)
             })
     }
 
