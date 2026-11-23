@@ -735,8 +735,14 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QualificationWa
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
-        self.read_encoded_block_range(&self.query_api.slot, request.into_inner())
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range(&self.query_api.slot, &request.into_inner(), range)
             .await
+            .map(Response::new)
     }
 }
 
