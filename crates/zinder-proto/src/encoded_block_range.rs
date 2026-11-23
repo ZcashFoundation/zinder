@@ -353,7 +353,11 @@ impl http_body::Body for EncodedBlockBody {
         }
         while this.status.is_none() {
             let block = match this.messages.as_mut().poll_next(cx) {
-                Poll::Pending if this.batch.is_empty() => return Poll::Pending,
+                Poll::Pending if this.batch.is_empty() => {
+                    // tonic would end its batch here, so the next starts afresh.
+                    this.sent_of_batch = 0;
+                    return Poll::Pending;
+                }
                 Poll::Pending => return Poll::Ready(Some(Ok(this.take_batch()))),
                 Poll::Ready(None) => {
                     this.status = Some(Status::ok(""));

@@ -339,6 +339,22 @@ fn a_first_message_over_the_cap_is_the_first_frame() -> eyre::Result<()> {
 }
 
 #[test]
+fn a_pause_right_after_the_capped_first_frame_starts_a_full_batch() -> eyre::Result<()> {
+    // 21 messages of 405 framed bytes reach the cap exactly at the pause.
+    let mut script = Vec::new();
+    for tag in 0..21_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    script.push(None);
+    for tag in 21..120_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    let (encoded, tonic) = both(&script, None)?;
+    assert_eq!(encoded, tonic);
+    Ok(())
+}
+
+#[test]
 fn only_messages_of_at_least_the_batch_size_are_sent_alone() -> eyre::Result<()> {
     let below = framed(&payload(BATCH_BYTES - EncodedBlock::PREFIX_LEN - 1, 1))?;
     let at = framed(&payload(BATCH_BYTES - EncodedBlock::PREFIX_LEN, 2))?;
