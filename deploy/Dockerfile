@@ -21,7 +21,18 @@
 # invocation and keeps Cargo registry, git, and target artifacts in BuildKit
 # cache mounts, so rebuilding one service warms the shared cache for every
 # other service image. The benchmark compiles in its own stage against the
-# same cache and is not part of that invocation.
+# same cache and is not part of that invocation. `RELEASE_CACHE_SCOPE` names
+# the target cache and defaults to `shared`.
+#
+# Cargo decides whether a workspace crate is up to date from file modification
+# times, and a source tree from `git archive` or a tarball carries its commit
+# time on every file. So that a cache holding another tree's build cannot pass
+# as fresh, every cargo step that mounts the target cache first sets the
+# modification time of every copied source file to the build time. Workspace
+# crates then always recompile, while third-party crates, which Cargo
+# fingerprints by version, stay cached. The release proves this does not
+# change the output: it builds each platform twice from checkouts with
+# different file times and compares the bytes.
 #
 # The release packages its images from the reproduced binary archive instead
 # of compiling again. DIR/zinder-binaries/ holds the extracted archive binaries:
@@ -101,7 +112,8 @@ ARG ZINDER_PASTA_ASM=0
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
-    rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    find . -path ./target -prune -o -type f -exec touch {} + \
+    && rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
     && case "${ZINDER_PASTA_ASM}" in \
         0|1) ;; \
         *) printf '%s\n' "ZINDER_PASTA_ASM must be 0 or 1, got '${ZINDER_PASTA_ASM}'" >&2; exit 1 ;; \
@@ -131,7 +143,8 @@ ARG RELEASE_CACHE_SCOPE=shared
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
-    rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    find . -path ./target -prune -o -type f -exec touch {} + \
+    && rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
     && rustup target add "$rust_target" \
     && cargo auditable build --locked --release --target "$rust_target" --bin zinder-bench \
     && mkdir -p /zinder-bench \
@@ -165,10 +178,16 @@ COPY . .
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
-    cargo test --locked --release -p zinder-ingest --test acceptance --no-run \
+    find . -path ./target -prune -o -type f -exec touch {} + \
     && mkdir -p /zinder-live-tests \
-    && test_binary="$(find /workspace/target/release/deps -maxdepth 1 -type f -name 'acceptance-*' -perm /111 -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f 2-)" \
+    && cargo test --locked --release -p zinder-ingest --test acceptance --no-run \
+        --message-format=json-render-diagnostics > /zinder-live-tests/cargo-messages.json \
+    && test_binary="$(grep '"reason":"compiler-artifact"' /zinder-live-tests/cargo-messages.json \
+        | grep '"kind":\["test"\]' | grep '"name":"acceptance"' \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p')" \
+    && rm /zinder-live-tests/cargo-messages.json \
     && test -n "$test_binary" \
+    && test "$(printf '%s\n' "$test_binary" | wc -l)" -eq 1 \
     && cp "$test_binary" /zinder-live-tests/zinder-ingest-acceptance
 
 # Per-service release images run one binary on distroless cc, which carries

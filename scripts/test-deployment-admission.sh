@@ -1080,6 +1080,49 @@ expect_rejected_because \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$bench_compile_dockerfile"
 
+unrefreshed_bench_dockerfile="$temporary_directory/unrefreshed-bench.Dockerfile"
+sed '/^FROM zinder-release-source AS zinder-bench-binary$/,/^FROM / {
+  /^    find \. -path \.\/target -prune -o -type f -exec touch {} + \\$/d
+  s/^    && rust_target=/    rust_target=/
+}' "$repository_root/deploy/Dockerfile" > "$unrefreshed_bench_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$unrefreshed_bench_dockerfile" \
+  && fail "the unrefreshed benchmark fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose benchmark build can reuse another tree's workspace crates" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unrefreshed_bench_dockerfile"
+
+late_refresh_dockerfile="$temporary_directory/late-refresh.Dockerfile"
+awk '
+  /^FROM zinder-release-source AS zinder-binaries$/ { in_stage = 1 }
+  in_stage && /^    find \. -path \.\/target -prune -o -type f -exec touch \{\} \+ \\$/ { next }
+  in_stage && /^    && rust_target=/ { sub(/^    && /, "    ") }
+  { print }
+  in_stage && $0 == "        --bin zinder-explorer \\" {
+    print "    && find . -path ./target -prune -o -type f -exec touch {} + \\"
+    in_stage = 0
+  }
+' "$repository_root/deploy/Dockerfile" > "$late_refresh_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$late_refresh_dockerfile" \
+  && fail "the late-refresh fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose release compile refreshes sources only after cargo runs" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$late_refresh_dockerfile"
+
+newest_test_binary_dockerfile="$temporary_directory/newest-test-binary.Dockerfile"
+sed 's/ --message-format=json-render-diagnostics / /' \
+  "$repository_root/deploy/Dockerfile" > "$newest_test_binary_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$newest_test_binary_dockerfile" \
+  && fail "the newest-test-binary fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose live-test stage does not read cargo's artifact messages" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$newest_test_binary_dockerfile"
+
 compiling_image_dockerfile="$temporary_directory/compiling-image.Dockerfile"
 sed 's#^COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query #COPY --from=zinder-binaries /zinder-binaries/zinder-query #' \
   "$repository_root/deploy/Dockerfile" > "$compiling_image_dockerfile"
