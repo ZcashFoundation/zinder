@@ -29,7 +29,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
    - `GetTaddressTxids` and `GetTaddressTransactions`; and
    - `GetTaddressBalance` and `GetAddressUtxos`, with their stream forms.
 
-   The wallet deployment, compact-blocks serving, and the Explorer never forward indexed reads. Their node calls are limited to those [ADR-0006](0006-node-source-boundary.md) decision 5 lists, such as broadcast and the fee. Native `WalletQuery` forwards no indexed read ([ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 4).
+   The wallet deployment, compact-blocks serving, and the Explorer never forward indexed reads. The wallet deployment's readers use the node for calls [ADR-0006](0006-node-source-boundary.md) decision 5 lists, such as broadcast and the fee. The Explorer observes the upstream tip. Native `WalletQuery` forwards no indexed read ([ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 4).
 5. **A profile omits data only when its trust checks still hold.**
    - A composition that forwards mined transaction bytes needs, for every mined transaction in its history, the location and byte digest the writer recorded. The store keeps both.
    - Current certification reads the full replay history. Omitting settled replay requires authenticated evidence for the settled prefix at cold admission and at restore, and enough retained replay for reorg replacement and for every consumer that reads it, as the wallet projector and Explorer views do.
@@ -69,3 +69,4 @@ A name for a deployment shape must not become a second source of truth. Capabili
 ## Revision history
 
 - 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.
+- 2026-11-23. Decision 4 distinguishes the wallet deployment's node calls from the Explorer's tip observation.

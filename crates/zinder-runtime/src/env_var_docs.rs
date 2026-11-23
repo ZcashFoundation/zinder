@@ -1243,9 +1243,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot \
-                      before it is refused with `UNAVAILABLE`. Wallet serving only; \
-                      compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at \
-                      once; defaults to 2000.",
+                      before it is refused with `UNAVAILABLE`. Applies to wallet and light-wallet \
+                      serving. Compact-blocks serving rejects it. Accepts 0 to 5000 and defaults \
+                      to 2000. A value of 0 refuses at once.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
@@ -1253,10 +1253,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; \
-                      a rebuild that finds every waiting place taken fails at once with \
-                      `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. \
-                      Must be in 1..=256; defaults to 64.",
+        description: "Number of lightwalletd `GetTreeState` rebuilds that may wait for each rebuild \
+                      slot. A rebuild that finds every waiting place taken fails at once with \
+                      `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks \
+                      serving rejects it. Accepts 1 to 256 and defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
