@@ -210,7 +210,11 @@ Optional target and hard-limit pairs are
 `--wallet-storage-ready-hard-limit-secs`. The report contains the fixed source
 fence, all storage contract identities, effective source and RocksDB limits,
 phase durations, row and digest evidence, external-sort evidence, physical
-bytes, and peak process RSS. It certifies storage readiness only; it does not
+bytes, and peak process RSS. Its wallet section, like the
+`rocksdb-wallet-rebuild` report, lists `build_stages`: the wallet build's
+non-overlapping stages in order, the same stages the projector records in
+`zinder_wallet_projection_build_stage_duration_seconds`, so the stage seconds
+add up to at most the build's total. It certifies storage readiness only; it does not
 claim query compatibility, service startup, live following, or reorg execution.
 
 ## 3. Compare canonical-replay storage engines

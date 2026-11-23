@@ -120,7 +120,8 @@ A process that starts and exits between scrapes needs lifecycle event evidence.
 For the single-volume image use the ingest cgroup series once per container.
 Ingest's existing `zinder_ingest_process_rss_*` series also sample its own process.
 
-The projector exports only these series. Its wallet store exports no
+Besides these series, the projector exports only its
+[wallet build stages](#zinder-projector). Its wallet store exports no
 `zinder_store_*` metrics.
 
 ## zinder-ingest
@@ -316,6 +317,12 @@ missing when the host does not expose its source.
 | `zinder_ingest_process_rss_anon_bytes` | gauge | | Process anonymous resident memory. |
 | `zinder_ingest_memory_pressure_ratio` | gauge | | Anonymous memory divided by `memory.high`, or `memory.max` when unset. |
 | `zinder_ingest_memory_current_pressure_ratio` | gauge | | `memory.current` divided by the same limit. |
+
+## zinder-projector
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_wallet_projection_build_stage_duration_seconds` | histogram | `stage` | Wall time of each stage of a fresh wallet build, recorded once when the build publishes READY. The stages run in this order and do not overlap: `store_initialization`, `canonical_scan`, `outpoint_run_spill`, `outpoint_sort`, `outpoint_drain`, `primary_sst_write`, `address_index_run_spill`, `address_transaction_run_spill`, `address_index_sort`, `address_index_drain`, `address_index_sst_write`, `address_transaction_sort`, `address_transaction_drain`, `address_transaction_sst_write`, `reorg_undo_write`, `logical_evidence`, `row_load`, `flush_and_close`, `cold_reopen`, `cold_validation_family_readback`, `cold_validation_reorg_undo_readback`, and `ready_publication`. A `*_run_spill` stage is the time a sorter spent writing runs while records were still arriving, and a `*_sst_write` stage is the SST writer time inside a drain; each is taken out of the stage it ran inside. A `*_sort` stage is a sorter's final run flush and any merge passes that write runs; a sorter that ends with at most 64 runs merges them while its drain reads them. `cold_validation_family_readback` is the wall time of the three concurrent family scans. The sum is at most the build's total, and the rest is bookkeeping between stages. |
 
 ## zinder-query and zinder-compat-lightwalletd
 

@@ -1,0 +1,6 @@
+kind: added
+body: '`zinder-projector` exports `zinder_wallet_projection_build_stage_duration_seconds`, a histogram labeled by `stage` with the wall time of each non-overlapping stage of a fresh wallet build, recorded when the build publishes READY. The stages are listed in the metrics reference.'
+time: 2026-11-23T21:29:31.508185181Z
+custom:
+    Bump: minor
+    PR: "524"

@@ -1214,7 +1214,7 @@ pub struct WalletVariableValueSortEvidence {
     pub peak_temporary_file_bytes: u64,
     /// Caller-supplied temporary-file ceiling.
     pub max_temporary_file_bytes: u64,
-    /// Bytes in the final merged run before its consumer removes it.
+    /// Bytes in the runs the consumer reads, which it removes as it finishes.
     pub final_run_file_bytes: u64,
 }
 
@@ -1280,6 +1280,30 @@ pub struct WalletStoragePhaseDurations {
     pub total_seconds: f64,
 }
 
+/// One non-overlapping wallet build stage in report-safe seconds.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WalletBuildStageSeconds {
+    /// Stable stage name shared with the projector's build-stage histogram.
+    pub stage: &'static str,
+    /// Wall time spent in the stage.
+    pub seconds: f64,
+}
+
+impl WalletBuildStageSeconds {
+    /// Converts a builder report's stages, in execution order.
+    #[must_use]
+    pub fn from_report(report: &zinder_wallet_rocksdb::RocksDbWalletBuildReport) -> Vec<Self> {
+        report
+            .stage_durations()
+            .into_iter()
+            .map(|stage| Self {
+                stage: stage.stage,
+                seconds: stage.duration.as_secs_f64(),
+            })
+            .collect()
+    }
+}
+
 /// Wallet version-1 durable evidence after publication and cold admission.
 #[derive(Clone, Debug, Serialize)]
 pub struct WalletStorageReadySummary {
@@ -1309,6 +1333,8 @@ pub struct WalletStorageReadySummary {
     pub construction: WalletStorageConstructionEvidence,
     /// Detailed public builder phase durations.
     pub phase_durations: WalletStoragePhaseDurations,
+    /// Non-overlapping builder stages, in execution order.
+    pub build_stages: Vec<WalletBuildStageSeconds>,
     /// Final bytes owned below the wallet store path.
     pub physical_store_bytes: u64,
     /// Whether a new process-equivalent open admitted the exact READY evidence.
@@ -3389,6 +3415,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                     ready_publication_seconds: 0.1,
                     total_seconds: 1.5,
                 },
+                build_stages: Vec::new(),
                 physical_store_bytes: 4_096,
                 cold_reopen_evidence_match: true,
                 canonical_fence_match: true,

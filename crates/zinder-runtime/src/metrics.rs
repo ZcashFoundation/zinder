@@ -54,6 +54,15 @@ const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
     0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
 ];
 
+/// Histogram bucket boundaries (in seconds) for the wallet build-stage
+/// histogram, which records each stage once per build.
+///
+/// A stage takes milliseconds on a small store and more than an hour on a
+/// Mainnet build from genesis, so the buckets run from 0.01 s to four hours.
+const WALLET_BUILD_STAGE_DURATION_SECONDS_BUCKETS: &[f64] = &[
+    0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 180.0, 600.0, 1_800.0, 3_600.0, 7_200.0, 14_400.0,
+];
+
 const GENERATION_WAIT_METRIC: &str =
     "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds";
 
@@ -214,6 +223,10 @@ fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
         .set_buckets_for_metric(
             Matcher::Full("zinder_startup_phase_duration_seconds".to_owned()),
             STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("zinder_wallet_projection_build_stage_duration_seconds".to_owned()),
+            WALLET_BUILD_STAGE_DURATION_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full(crate::public_grpc_server::RANGE_DURATION.to_owned()),

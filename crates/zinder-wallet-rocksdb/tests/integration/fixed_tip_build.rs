@@ -34,8 +34,8 @@ use zinder_wallet_projection::{
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildStore,
-    RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
+    RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
     WALLET_ROCKSDB_SCHEMA_VERSION, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
     WalletProjectionBuildLeaseExecution, WalletRecoveryAdmissionConfig,
     build_wallet_from_canonical, build_wallet_from_canonical_with_lease_and_heartbeat,
@@ -1758,6 +1758,55 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
         + phases.ready_publication;
     assert!(measured_phase_total <= phases.total);
     assert!(!phases.total.is_zero());
+    assert_phase_breakdowns_fit_their_parents(&outcome.report);
+}
+
+fn assert_phase_breakdowns_fit_their_parents(report: &RocksDbWalletBuildReport) {
+    let phases = report.phase_durations;
+    let secondary = phases.secondary_row_derivation_phases;
+    assert!(
+        secondary.address_index_sort
+            + secondary.address_index_drain
+            + secondary.address_transaction_sort
+            + secondary.address_transaction_drain
+            + secondary.reorg_undo_write
+            <= phases.secondary_row_derivation
+    );
+    let sst_write = phases.sst_write;
+    assert!(sst_write.primary_outputs <= phases.outpoint_merge);
+    assert!(sst_write.address_index_and_balance <= secondary.address_index_drain);
+    assert!(sst_write.address_transaction <= secondary.address_transaction_drain);
+    assert!(sst_write.reorg_undo <= secondary.reorg_undo_write);
+    let reopen = phases.flush_and_cold_reopen_phases;
+    assert!(reopen.flush_and_close + reopen.cold_reopen <= phases.flush_and_cold_reopen);
+    let validation = phases.cold_validation_phases;
+    for scan in [
+        validation.primary_output_scan,
+        validation.address_index_and_balance_readback,
+        validation.address_transaction_readback,
+    ] {
+        assert!(scan <= validation.concurrent_family_readback);
+    }
+    assert!(
+        validation.concurrent_family_readback + validation.reorg_undo_readback
+            <= phases.cold_validation
+    );
+    assert!(report.outpoint_sort_durations.initial_run_spill <= phases.canonical_scan);
+    assert!(
+        report.outpoint_sort_durations.final_run_flush + report.outpoint_sort_durations.merge
+            <= phases.outpoint_sort
+    );
+
+    let stages = report.stage_durations();
+    let mut stage_names = stages.iter().map(|stage| stage.stage).collect::<Vec<_>>();
+    stage_names.sort_unstable();
+    stage_names.dedup();
+    assert_eq!(stage_names.len(), stages.len());
+    let stage_total = stages
+        .iter()
+        .map(|stage| stage.duration)
+        .sum::<std::time::Duration>();
+    assert!(stage_total <= phases.total);
 }
 
 fn assert_store(
