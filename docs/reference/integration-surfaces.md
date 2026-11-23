@@ -191,11 +191,12 @@ The URL scheme selects the transport. An `http://` endpoint uses plaintext HTTP/
 - Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
 - The client checks the server's streams. A stream that breaks its contract, such as a repeated event cursor or a missing range header, fails with `IndexerError::MalformedResponse`. Reconnect from the last accepted cursor.
 
-To follow the chain, open a `ChainEvents` stream, store the cursor from each event, and resume from it after a disconnect. [Chain events](../architecture/chain-events.md#resume-with-a-cursor) describes the contract. The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint, with the endpoint, the network, and a transparent address to watch:
+To follow the chain, open a `ChainEvents` stream, store the cursor from each event, and resume from it after a disconnect. [Chain events](../architecture/chain-events.md#resume-with-a-cursor) describes the contract. The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint. It takes the endpoint, the network as `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, and a transparent address to watch. This command uses the Compose Regtest port. Set `ADDRESS` to your own address first:
 
 ```bash
+ADDRESS='your-transparent-address'
 cargo run -p zinder-client --example observe_transparent_address -- \
-    http://127.0.0.1:9102 zcash-regtest <t-address>
+    http://127.0.0.1:29102 zcash-regtest "$ADDRESS"
 ```
 
 ## Explorer and analytics backends
