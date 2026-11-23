@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -7,7 +8,7 @@ use std::{
 use http_body::Frame;
 use prost::{
     Message,
-    bytes::{BufMut, Bytes, BytesMut},
+    bytes::{Buf as _, BufMut, Bytes},
 };
 use tonic::{
     Request, Response, Status,
@@ -56,10 +57,45 @@ impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRange + '_)
 ///
 /// Unless the server is configured to compress responses, a message of at
 /// least 32 KiB leaves the generated server as this buffer, without the copy
-/// into tonic's encode buffer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// into tonic's encode buffer, when the allocation behind it is known, at most
+/// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`], and at most twice the
+/// message. Otherwise it leaves as copied pieces.
+#[derive(Clone, Debug)]
 pub struct EncodedBlock {
     message: Bytes,
+    /// Bytes of the allocation `message` keeps alive, when known.
+    allocation_len: Option<usize>,
+}
+
+impl PartialEq for EncodedBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+    }
+}
+
+impl Eq for EncodedBlock {}
+
+/// Response extension on a `GetBlockRange` response whose body keeps, behind
+/// every data chunk, an allocation of at most [`Self::MAX_ALLOCATION_BYTES`]
+/// and at most twice the chunk.
+///
+/// A response layer may then hand slices of the chunks to the transport
+/// instead of copies, because a slice held by a stalled stream pins at most
+/// that much. Only this crate creates the marker, and only on the uncompressed
+/// path of the generated server, where [`EncodedBlock`] messages with a
+/// larger or unknown allocation are copied into pieces of their own.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedChunkRetention(());
+
+impl BoundedChunkRetention {
+    /// The largest allocation one data chunk of a marked response keeps alive.
+    ///
+    /// The largest stored `CompactBlock` in the signed Mainnet catalog through
+    /// height 3,592,192 is 265,677 bytes (height 1,723,203), and no row exceeds
+    /// 512 KiB. A row stored alone fills a slab of its own, so this bound lets
+    /// every observed large row go out without a copy, with about twice the
+    /// largest as margin. A larger row is copied in 64 KiB pieces instead.
+    pub const MAX_ALLOCATION_BYTES: usize = 512 * 1024;
 }
 
 /// A buffer that is not an uncompressed gRPC length-prefixed message.
@@ -86,6 +122,7 @@ impl EncodedBlock {
         // writes into a vector sized from one `encoded_len`.
         block.encode_raw(&mut message);
         Ok(Self {
+            allocation_len: Some(message.capacity()),
             message: message.into(),
         })
     }
@@ -109,7 +146,48 @@ impl EncodedBlock {
         if !message.starts_with(&prefix) {
             return Err(InvalidEncodedBlock);
         }
-        Ok(Self { message })
+        Ok(Self {
+            message,
+            allocation_len: None,
+        })
+    }
+
+    /// Accepts a length-prefixed message, as [`Self::from_length_prefixed`]
+    /// does, that keeps an allocation of `allocation_len` bytes alive.
+    ///
+    /// The server can then hand the message to the transport without a copy
+    /// when that allocation is at most
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`] and at most twice the
+    /// message. The caller vouches for `allocation_len`, because it bounds
+    /// what a stalled client can pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidEncodedBlock`] for an invalid message or an
+    /// `allocation_len` shorter than the message.
+    pub fn from_length_prefixed_in(
+        message: Bytes,
+        allocation_len: usize,
+    ) -> Result<Self, InvalidEncodedBlock> {
+        if allocation_len < message.len() {
+            return Err(InvalidEncodedBlock);
+        }
+        let block = Self::from_length_prefixed(message)?;
+        Ok(Self {
+            allocation_len: Some(allocation_len),
+            ..block
+        })
+    }
+
+    /// Returns whether the message's known allocation fits the bound a
+    /// transport may retain without copying: at most
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`], and at most twice the
+    /// message, so a slice never pins much more than it carries.
+    fn may_be_sliced(&self) -> bool {
+        self.allocation_len.is_some_and(|len| {
+            len <= BoundedChunkRetention::MAX_ALLOCATION_BYTES
+                && len <= self.message.len().saturating_mul(2)
+        })
     }
 
     /// Returns the whole message, gRPC prefix included.
@@ -202,7 +280,8 @@ where
         .await;
     match messages {
         Some(messages) => {
-            let (parts, _) = response.into_parts();
+            let (mut parts, _) = response.into_parts();
+            parts.extensions.insert(BoundedChunkRetention(()));
             let body = EncodedBlockBody::new(messages, max_message_size);
             http::Response::from_parts(parts, Body::new(body))
         }
@@ -251,6 +330,9 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
 /// it is shorter than this.
 const BATCH_BYTES: usize = 32 * 1024;
 
+/// The largest piece a message over the retention bound is copied into.
+const COPIED_PIECE_BYTES: usize = 64 * 1024;
+
 /// The first batch is sent once it holds at least this many bytes.
 ///
 /// A client behind a gateway that forwards whole HTTP/2 frames can decode the
@@ -271,6 +353,12 @@ const FIRST_BATCH_BYTES: usize = 8 * 1024;
 /// messages before it, or `OUT_OF_RANGE` for a message over the size limit
 /// after the messages already sent.
 ///
+/// Every data chunk keeps at most [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`]
+/// and at most twice its own bytes alive: a batch is copied into an allocation
+/// of exactly its length, a large message within both bounds is sent as its
+/// own buffer, and any other large message is copied into pieces of at most
+/// [`COPIED_PIECE_BYTES`].
+///
 /// Its first data frame differs from tonic's by design: the first batch is
 /// sent at [`FIRST_BATCH_BYTES`], and the next ends where tonic's first would.
 /// So when a message over the size limit follows in tonic's first batch, the
@@ -279,8 +367,13 @@ const FIRST_BATCH_BYTES: usize = 8 * 1024;
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,
-    batch: BytesMut,
-    after_batch: Option<Bytes>,
+    /// Short messages waiting to be copied into one batch.
+    batch: Vec<Bytes>,
+    batch_len: usize,
+    /// The unsent part of a large message, sent after the batch.
+    large: Bytes,
+    /// Whether `large` is sent as copied pieces instead of as itself.
+    copy_large: bool,
     /// Whether any data frame has been sent.
     sent_data: bool,
     /// Bytes of tonic's current batch already sent as a capped first frame.
@@ -294,8 +387,10 @@ impl EncodedBlockBody {
         Self {
             messages,
             max_message_size,
-            batch: BytesMut::new(),
-            after_batch: None,
+            batch: Vec::new(),
+            batch_len: 0,
+            large: Bytes::new(),
+            copy_large: false,
             sent_data: false,
             sent_of_batch: 0,
             status: None,
@@ -304,15 +399,49 @@ impl EncodedBlockBody {
     }
 
     fn take_batch(&mut self) -> Frame<Bytes> {
+        // The source can yield early, so a batch's length is known only now.
+        // Copying the queued messages once into an exact allocation avoids
+        // both a reservation per batch and a shrink of an early one.
         self.sent_data = true;
         self.sent_of_batch = 0;
-        Frame::data(self.batch.split().freeze())
+        let mut batch = Vec::with_capacity(self.batch_len);
+        for message in self.batch.drain(..) {
+            batch.extend_from_slice(&message);
+        }
+        self.batch_len = 0;
+        Frame::data(Bytes::from(batch))
+    }
+
+    fn add_to_batch(&mut self, message: Bytes) {
+        self.batch_len += message.len();
+        self.batch.push(message);
+    }
+
+    fn clear_batch(&mut self) {
+        self.batch.clear();
+        self.batch_len = 0;
+    }
+
+    fn take_large(&mut self) -> Frame<Bytes> {
+        self.sent_data = true;
+        self.sent_of_batch = 0;
+        if !self.copy_large {
+            return Frame::data(mem::take(&mut self.large));
+        }
+        let piece_len = self.large.len().min(COPIED_PIECE_BYTES);
+        let piece = Bytes::copy_from_slice(&self.large[..piece_len]);
+        if piece_len == self.large.len() {
+            self.large = Bytes::new();
+        } else {
+            self.large.advance(piece_len);
+        }
+        Frame::data(piece)
     }
 
     /// Returns the batch once it is due, as tonic would send it, except that
     /// the first is sent early at [`FIRST_BATCH_BYTES`].
     fn take_due_batch(&mut self) -> Option<Frame<Bytes>> {
-        let len = self.batch.len();
+        let len = self.batch_len;
         if !self.sent_data && (FIRST_BATCH_BYTES..BATCH_BYTES).contains(&len) {
             let frame = self.take_batch();
             self.sent_of_batch = len;
@@ -351,8 +480,8 @@ impl http_body::Body for EncodedBlockBody {
         if this.is_end_stream {
             return Poll::Ready(None);
         }
-        if let Some(message) = this.after_batch.take() {
-            return Poll::Ready(Some(Ok(Frame::data(message))));
+        if !this.large.is_empty() {
+            return Poll::Ready(Some(Ok(this.take_large())));
         }
         while this.status.is_none() {
             let block = match this.messages.as_mut().poll_next(cx) {
@@ -375,20 +504,19 @@ impl http_body::Body for EncodedBlockBody {
             if let Err(status) = this.check_size(&block) {
                 // tonic drops the messages it has batched but not yet sent
                 // when one fails to encode.
-                this.batch.clear();
+                this.clear_batch();
                 this.status = Some(status);
                 break;
             }
             if block.message.len() >= BATCH_BYTES {
+                this.copy_large = !block.may_be_sliced();
+                this.large = block.message;
                 if this.batch.is_empty() {
-                    this.sent_data = true;
-                    this.sent_of_batch = 0;
-                    return Poll::Ready(Some(Ok(Frame::data(block.message))));
+                    return Poll::Ready(Some(Ok(this.take_large())));
                 }
-                this.after_batch = Some(block.message);
                 return Poll::Ready(Some(Ok(this.take_batch())));
             }
-            this.batch.extend_from_slice(&block.message);
+            this.add_to_batch(block.message);
             if let Some(frame) = this.take_due_batch() {
                 return Poll::Ready(Some(Ok(frame)));
             }

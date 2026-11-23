@@ -10,10 +10,12 @@
 //! after the stall timeout, drops the handler's body. Dropping it unwinds the
 //! handler the way a client cancellation does.
 //!
-//! Data chunks are handed to hyper as copies of at most
-//! [`RESPONSE_PIECE_BYTES`], so the bytes hyper itself keeps for a stalled
-//! stream stay small and pin none of the handler's buffers, and a slow but
-//! steady client is polled often enough that it never looks stalled.
+//! Data chunks are handed to hyper in pieces of at most
+//! [`RESPONSE_PIECE_BYTES`], so a slow but steady client is polled often
+//! enough that it never looks stalled. A piece is a copy, so the bytes hyper
+//! keeps for a stalled stream pin none of the handler's buffers, unless the
+//! response carries [`BoundedChunkRetention`]: then pieces are slices of
+//! chunks whose allocations its producer bounds.
 //!
 //! An outer layer can also end a response early by attaching a
 //! [`ResponseCancellation`] to its request. The receive limit uses it for a
@@ -36,6 +38,7 @@ use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Status, body::Body};
 use tower::{Layer, Service};
+use zinder_proto::compat::lightwalletd::BoundedChunkRetention;
 
 use super::SEND_STALLS_METRIC;
 
@@ -136,15 +139,47 @@ where
         self.inner
             .call(request)
             .map_ok(move |response| {
+                let pieces = Pieces::for_response(&response);
                 response.map(|body| {
                     Body::new(SendStallBoundBody::new(
                         body,
                         send_stall_timeout,
                         cancellation,
+                        pieces,
                     ))
                 })
             })
             .boxed()
+    }
+}
+
+/// How the layer hands a response's data chunks to the transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pieces {
+    /// Copies, so a held piece pins only itself.
+    Copied,
+    /// Slices of the handler's chunks, each of which pins at most
+    /// [`BoundedChunkRetention::MAX_ALLOCATION_BYTES`] and at most twice its
+    /// bytes.
+    Sliced,
+}
+
+impl Pieces {
+    /// Slices only a response that zinder-proto's range body marked.
+    ///
+    /// Layers outside this one, such as gRPC-Web, see the slices: binary
+    /// gRPC-Web passes them on unchanged, and base64 gRPC-Web re-encodes each
+    /// into a buffer of its own and drops it.
+    fn for_response<B>(response: &http::Response<B>) -> Self {
+        if response
+            .extensions()
+            .get::<BoundedChunkRetention>()
+            .is_some()
+        {
+            Self::Sliced
+        } else {
+            Self::Copied
+        }
     }
 }
 
@@ -161,6 +196,9 @@ struct SendStallBoundBody {
 
 struct Sending {
     source: Source,
+    pieces: Pieces,
+    /// Whether the pieces of `unsent` are slices of it.
+    slice_unsent: bool,
     /// The part of the handler's last data chunk not yet handed out.
     unsent: Bytes,
     /// When the transport took the last data piece, until it polls again.
@@ -183,11 +221,14 @@ impl SendStallBoundBody {
         inner: Body,
         send_stall_timeout: Duration,
         cancellation: Option<ResponseCancellation>,
+        pieces: Pieces,
     ) -> Self {
         let cancellable = cancellation.is_some();
         let mut body = Self {
             sending: Arc::new(Mutex::new(Sending {
                 source: Source::Handler(inner),
+                pieces,
+                slice_unsent: false,
                 unsent: Bytes::new(),
                 handed_out_at: None,
                 waker: None,
@@ -221,14 +262,28 @@ impl SendStallBoundBody {
 }
 
 impl Sending {
-    /// Copies the next piece of `unsent` into an allocation of its own.
+    fn take_chunk(&mut self, chunk: Bytes) {
+        // A chunk longer than the bound cannot sit in an allocation within it.
+        self.slice_unsent = self.pieces == Pieces::Sliced
+            && chunk.len() <= BoundedChunkRetention::MAX_ALLOCATION_BYTES;
+        self.unsent = chunk;
+    }
+
+    /// Hands out the next piece of `unsent`.
     ///
     /// A slice of `unsent` would share the handler's allocation, often
-    /// tonic's whole encode buffer, so the one piece hyper keeps for a
-    /// stalled stream would keep that buffer alive after the handler's body
-    /// is dropped.
+    /// tonic's whole encode buffer, so the piece hyper keeps for a stalled
+    /// stream would keep that buffer alive after the handler's body is
+    /// dropped. A piece is therefore a copy, unless the response's producer
+    /// bounds that allocation.
     fn hand_out_piece(&mut self) -> Bytes {
         let piece_len = self.unsent.len().min(RESPONSE_PIECE_BYTES);
+        if self.slice_unsent {
+            // Splitting off the last piece leaves `unsent` holding nothing.
+            let piece = self.unsent.split_to(piece_len);
+            self.handed_out_at = Some(Instant::now());
+            return piece;
+        }
         let piece = Bytes::copy_from_slice(self.unsent.get(..piece_len).unwrap_or_default());
         self.unsent.advance(piece_len);
         if self.unsent.is_empty() {
@@ -344,7 +399,7 @@ impl http_body::Body for SendStallBoundBody {
         let final_trailers = match Pin::new(handler_body).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(chunk) => {
-                    sending.unsent = chunk;
+                    sending.take_chunk(chunk);
                     let piece = sending.hand_out_piece();
                     drop(sending);
                     this.start_watchdog();
@@ -411,7 +466,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tonic::{Status, body::Body};
 
-    use super::{RESPONSE_PIECE_BYTES, ResponseCancellation, SendStallBoundBody};
+    use super::{
+        BoundedChunkRetention, Pieces, RESPONSE_PIECE_BYTES, ResponseCancellation,
+        SendStallBoundBody,
+    };
 
     /// A response chunk that reports when its allocation is freed.
     struct TrackedChunk {
@@ -439,6 +497,7 @@ mod tests {
                 cancelled.clone(),
                 Status::unavailable("evicted"),
             )),
+            Pieces::Copied,
         );
         let (polled_sender, polled) = oneshot::channel();
         let transport = tokio::spawn(async move {
@@ -478,7 +537,8 @@ mod tests {
         let handler_body = Body::new(StreamBody::new(
             tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
         ));
-        let mut body = SendStallBoundBody::new(handler_body, Duration::from_hours(1), None);
+        let mut body =
+            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Copied);
 
         let first = body
             .frame()
@@ -519,6 +579,7 @@ mod tests {
                 cancelled.clone(),
                 Status::unavailable("evicted"),
             )),
+            Pieces::Copied,
         );
 
         // The transport takes one piece and keeps it, as hyper does while
@@ -539,5 +600,87 @@ mod tests {
         );
         assert_eq!(held_piece.len(), RESPONSE_PIECE_BYTES);
         Ok(())
+    }
+
+    /// A handler body that sends one tracked chunk of `len` bytes, then
+    /// stays pending, and the receiver that reports the chunk freed.
+    fn one_tracked_chunk(len: usize) -> (Body, oneshot::Receiver<()>) {
+        let (freed_sender, freed) = oneshot::channel();
+        let chunk = Bytes::from_owner(TrackedChunk {
+            bytes: vec![0; len],
+            _freed: freed_sender,
+        });
+        let handler_body = Body::new(StreamBody::new(
+            tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
+        ));
+        (handler_body, freed)
+    }
+
+    async fn first_piece(
+        body: &mut SendStallBoundBody,
+    ) -> Result<Bytes, Box<dyn std::error::Error>> {
+        Ok(body
+            .frame()
+            .await
+            .ok_or("the response ended before its first piece")??
+            .into_data()
+            .map_err(|_| "the first frame carried no data")?)
+    }
+
+    /// Drops a stalled response of one `len`-byte chunk, and with it the
+    /// handler's body, while the transport holds its first piece, and reports
+    /// whether that piece still keeps the chunk alive.
+    async fn held_piece_pins_chunk(len: usize) -> Result<bool, Box<dyn std::error::Error>> {
+        let (handler_body, mut freed) = one_tracked_chunk(len);
+        let mut body =
+            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Sliced);
+        let held_piece = first_piece(&mut body).await?;
+        assert_eq!(held_piece.len(), RESPONSE_PIECE_BYTES);
+
+        drop(body);
+        let pinned = freed.try_recv() == Err(oneshot::error::TryRecvError::Empty);
+        drop(held_piece);
+        assert_eq!(freed.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+        Ok(pinned)
+    }
+
+    #[tokio::test]
+    async fn a_held_slice_pins_a_chunk_within_the_bound_and_nothing_larger()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bound = BoundedChunkRetention::MAX_ALLOCATION_BYTES;
+        assert!(
+            held_piece_pins_chunk(bound).await?,
+            "a chunk within the bound is sliced"
+        );
+        assert!(
+            !held_piece_pins_chunk(bound + 1).await?,
+            "a chunk over the bound is copied"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handing_out_the_last_slice_leaves_the_layer_holding_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handler_body, mut freed) = one_tracked_chunk(RESPONSE_PIECE_BYTES + 1);
+        let mut body =
+            SendStallBoundBody::new(handler_body, Duration::from_hours(1), None, Pieces::Sliced);
+        let first = first_piece(&mut body).await?;
+        let last = first_piece(&mut body).await?;
+        assert_eq!(last.len(), 1);
+        drop((first, last));
+        // The handler is still running and the layer still exists.
+        assert_eq!(freed.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+        drop(body);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unmarked_response_is_copied() {
+        let response = http::Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap_or_default();
+        assert_eq!(Pieces::for_response(&response), Pieces::Copied);
     }
 }
