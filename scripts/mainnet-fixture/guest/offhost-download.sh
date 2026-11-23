@@ -18,13 +18,17 @@ umask 077
   || { echo "$dest must be owned by $(id -un) and closed to other users" >&2; exit 1; }
 cd "$dest"
 obj_get "$prefix/$name.manifest.json" "$name.manifest.json"
-obj_get "$prefix/$name.SHA256SUMS" "$name.SHA256SUMS"
-obj_get "$prefix/$name.SHA256SUMS.sha256" "$name.SHA256SUMS.sha256"
+# The manifest names the payload prefix and checksum list it vouches for.
+payload=$(jq -er '.bundle.prefix' "$name.manifest.json")
+sums_key=$(jq -er '.bundle.sha256sums' "$name.manifest.json")
+[[ $payload == bundle/"$name"/* && $sums_key != */* ]] || { echo "manifest names an unexpected payload" >&2; exit 1; }
+obj_get "$prefix/$sums_key" "$name.SHA256SUMS"
+obj_get "$prefix/$sums_key.sha256" "$name.SHA256SUMS.sha256"
 want=$(jq -er .bundle.sha256sums_sha256 "$name.manifest.json")
 [[ $(sha256sum "$name.SHA256SUMS" | cut -d' ' -f1) == "$want" && $(cat "$name.SHA256SUMS.sha256") == "$want" ]] \
   || { echo "checksum list does not match the manifest" >&2; exit 1; }
 t0=$(date +%s.%N)
-obj_get_dir "$prefix/bundle/$name/" "$name"
+obj_get_dir "$prefix/$payload" "$name"
 t1=$(date +%s.%N)
 if [[ ${CHECK_FILES:-1} != 0 ]]; then
   (cd "$name" && sha256sum --quiet -c "../$name.SHA256SUMS")

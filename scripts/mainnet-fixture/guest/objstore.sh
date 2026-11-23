@@ -36,7 +36,7 @@ if [[ -n ${R2_ACCOUNT_ID:-} ]]; then
   obj_get_dir() { r2_aws s3 cp --only-show-errors --recursive "$(obj_url "$1")" "$2"; }
 else
   : "${GCS_BUCKET:?set GCS_BUCKET or the R2_* variables}"
-  _g() { gcloud storage --access-token-file=/root/.gcs-token "$@"; }
+  _g() { gcloud storage --access-token-file="${GCS_TOKEN_FILE:-/root/.gcs-token}" "$@"; }
   obj_url() { echo "gs://$GCS_BUCKET/$1"; }
   obj_exists() {
     local out
