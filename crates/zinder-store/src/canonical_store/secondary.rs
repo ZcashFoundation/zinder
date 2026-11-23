@@ -563,6 +563,26 @@ impl RocksDbCanonicalSecondary {
         self.stored_set
     }
 
+    /// Requires a replacement to hold the same data as the serving reader.
+    ///
+    /// # Errors
+    /// Returns an admission refusal when the stored sets differ.
+    pub fn require_stored_set(
+        &self,
+        expected: super::CanonicalStoredSet,
+    ) -> Result<(), CanonicalStoreError> {
+        if self.stored_set != expected {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                format!(
+                    "canonical stored set changed from {expected:?} to {:?}",
+                    self.stored_set
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the immutable raw-blob retention authenticated at admission.
     #[must_use]
     pub const fn raw_blob_retention(&self) -> RawBlobRetention {

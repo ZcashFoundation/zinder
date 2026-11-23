@@ -531,6 +531,15 @@ impl CompactBlockPublisher {
                 return;
             }
         };
+        if let Err(error) = candidate.require_stored_set(active.secondary().stored_set()) {
+            tracing::warn!(%error, "refusing compact-block replacement generation");
+            close_unpublished_generation(Some(candidate)).await;
+            self.record_failure(
+                ReadinessCause::SchemaMismatch,
+                active.event_fence().visible_tip().height.value(),
+            );
+            return;
+        }
         let admitted = admit_generation(candidate).await;
         if shutdown.is_cancelled() {
             close_unpublished_generation(admitted.ok()).await;

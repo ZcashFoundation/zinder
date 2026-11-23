@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::ShieldedCatalogPublisher;
 use zinder_core::BlockHeight;
 use zinder_query::{RocksDbCanonicalReader, StorageReadError};
-use zinder_store::{CanonicalStoreError, CanonicalStoreRequirements, RocksDbCanonicalSecondary};
+use zinder_store::{
+    CanonicalStoreError, CanonicalStoreRequirements, CanonicalStoredSet, RocksDbCanonicalSecondary,
+};
 
 use super::config::{HistoryPublisherConfig, LightwalletdConfigError};
 
@@ -47,13 +49,15 @@ impl PublishHistory {
             &config.primary_path,
         )?;
         let mut generation: Option<PublicationReader> = None;
+        let mut admitted_stored_set = None;
         let mut publisher = None;
         loop {
             let candidate = generation.take().map_or_else(
-                || PublicationReader::open(config, &scratch),
+                || PublicationReader::open(config, &scratch, admitted_stored_set),
                 PublicationReader::catch_up,
             );
             let publication = candidate.and_then(|current| {
+                admitted_stored_set.get_or_insert_with(|| current.reader.secondary().stored_set());
                 let publisher = match &mut publisher {
                     Some(resumed) => resumed,
                     None => publisher.insert(self.open_publisher(&current.reader)?),
@@ -107,7 +111,11 @@ struct PublicationReader {
 }
 
 impl PublicationReader {
-    fn open(config: &HistoryPublisherConfig, reservation: &PublicationScratch) -> io::Result<Self> {
+    fn open(
+        config: &HistoryPublisherConfig,
+        reservation: &PublicationScratch,
+        admitted_stored_set: Option<CanonicalStoredSet>,
+    ) -> io::Result<Self> {
         let scratch = reservation.generation()?;
         let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
             &config.primary_path,
@@ -118,6 +126,11 @@ impl PublicationReader {
             config.canonical_rocksdb_budget,
         )
         .map_err(io::Error::other)?;
+        if let Some(expected) = admitted_stored_set {
+            secondary
+                .require_stored_set(expected)
+                .map_err(io::Error::other)?;
+        }
         Ok(Self {
             reader: RocksDbCanonicalReader::new(secondary).map_err(io::Error::other)?,
             scratch,
