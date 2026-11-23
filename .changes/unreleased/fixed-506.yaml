@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallet and compact-blocks listeners with a signed settled-history catalog no longer queue `GetBlockRange` requests that select transparent data, or any pool set other than the default shielded projection, behind signed-read permits. These requests read canonical storage immediately with the normal chunk budget.
+time: 2026-11-23T14:48:53.641276365Z
+custom:
+    Bump: patch
+    PR: "506"
