@@ -1571,10 +1571,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       logical CPUs the projector may use, at most 4, and to 1 when that count \
                       cannot be detected. With 1, hashing runs on the build thread. A higher \
                       value hashes batches of rows on that many threads while the build thread \
-                      drains its sorters and writes SST files. Each batch is a fixed 512 KiB \
-                      allocation, and at most twice that many batches, never more than 64, \
-                      plus two on the build thread exist at once: 5 MiB at 4 threads and 33 \
-                      MiB at 64. A row larger than a batch is hashed on the build thread. Cold \
+                      drains its sorters and writes SST files. Each batch is allocated once and \
+                      takes at most 512 KiB, and at most twice that many batches, never more \
+                      than 64, plus two on the build thread exist at once: at most 5 MiB at 4 \
+                      threads and 33 MiB at 64. A row larger than a batch is hashed on the \
+                      build thread. Cold \
                       validation also reads the unspent and spent output families back in up \
                       to that many outpoint key ranges at once, at most one per 65,536 of \
                       their rows. The published rows, digest, and commitment do not change. \

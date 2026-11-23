@@ -623,13 +623,21 @@ mod tests {
     }
 
     #[test]
-    fn one_batch_allocates_half_a_mebibyte() {
+    fn one_batch_allocates_at_most_half_a_mebibyte() {
         // The configuration reference and the storage architecture page state
-        // this figure and the bound built from it.
-        let batch_allocation_bytes = BATCH_PAYLOAD_BYTES
-            + MAX_BATCH_ROWS * size_of::<BatchedRow>()
-            + MAX_BATCH_UNSPENT_OUTPUTS * size_of::<BatchedUnspentOutput>();
-        assert_eq!(batch_allocation_bytes, 524_288);
+        // this bound. The descriptors hold pointer-sized offsets, so a batch is
+        // exactly 512 KiB on 64-bit targets and smaller on 32-bit ones.
+        let batch = RowBatch::with_capacity(BATCH_PAYLOAD_BYTES);
+        let batch_allocation_bytes = batch.bytes.capacity()
+            + batch.rows.capacity() * size_of::<BatchedRow>()
+            + batch.unspent_outputs.capacity() * size_of::<BatchedUnspentOutput>();
+        assert!(
+            batch_allocation_bytes <= 512 * 1024,
+            "{batch_allocation_bytes} bytes"
+        );
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(batch_allocation_bytes, 512 * 1024);
+        }
     }
 
     #[test]
