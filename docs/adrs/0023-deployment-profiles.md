@@ -24,7 +24,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
    - Canonical storage certifies the coverage of compact blocks, nullifiers, tree states, subtree roots, and the tip. A signed settled-history catalog can supply compact-range payloads ([ADR-0015](0015-wallet-runtime-composition.md) decision 11).
    - Mempool methods go through ingest control.
    - The reads in decision 4 go to one node that keeps transparent address indexes.
-4. **Only the light-wallet composition forwards indexed reads to the node.** This holds whether the profile or the explicit compatibility serving setting, including its earlier alias, selects the composition. Its node-backed reads follow [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7:
+4. **Only the light-wallet composition forwards indexed reads to the node.** This holds whether the profile or the explicit compatibility serving setting, including its alias, selects the composition. Its node-backed reads follow [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7:
    - `GetTransaction` for a mined transaction, when the admitted store retains no transaction bodies;
    - `GetTaddressTxids` and `GetTaddressTransactions`; and
    - `GetTaddressBalance` and `GetAddressUtxos`, with their stream forms.
