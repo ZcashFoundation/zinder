@@ -27,6 +27,10 @@ The table also changes over time. A node release can announce a future upgrade, 
 
 [Chain ingestion](../architecture/chain-ingestion.md) describes startup checks and admission, and [Upgrading the node](../runbooks/upgrading-the-node.md) describes the operator procedure.
 
+## Evidence
+
+- Decision 2: judgment. One admitting writer gives every reader one schedule identity, as the alternatives explain. A reader uses a node's own table only to refuse an endpoint that disagrees with the admitted schedule. The revision corrects the order of ingest's startup checks to match the code.
+
 ## Consequences
 
 - A node release that announces a future upgrade needs an ingest restart, not a rebuild.
@@ -47,3 +51,4 @@ The table also changes over time. A node release can announce a future upgrade, 
 
 - 2026-11-23. Decision 2 says readers read a node's table only to verify an endpoint.
 - 2026-11-23. Decision 2 orders ingest's table fetch and genesis check before endpoint admission.
+- 2026-11-23. Evidence records what decision 2 rests on.
