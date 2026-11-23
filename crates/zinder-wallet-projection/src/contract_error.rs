@@ -47,8 +47,8 @@ pub enum WalletProjectionContractError {
         /// Durable list whose ordering was invalid.
         field: &'static str,
     },
-    /// A durable identity marker does not match the version-1 contract.
-    #[error("{field} identity does not match version 1")]
+    /// A durable record does not begin with the wallet store identity.
+    #[error("{field} does not begin with the wallet store identity \"wallet\"")]
     DurableIdentityMismatch {
         /// Durable contract being decoded.
         field: &'static str,

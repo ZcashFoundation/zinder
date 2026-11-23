@@ -1059,10 +1059,7 @@ impl WalletAdmission {
             store_identity == WALLET_PROJECTION_STORE_IDENTITY,
             "wallet checkpoint identity must be exactly wallet",
         )?;
-        require_manifest_value(
-            schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
-        )?;
+        require_wallet_checkpoint_schema(schema_version)?;
         if let Some(database_identity) = checkpoint_database_identity {
             require_manifest_value(
                 !database_identity.is_empty(),
@@ -1572,10 +1569,7 @@ impl WalletCheckpointManifest {
             self.store_identity == "wallet",
             "wallet checkpoint identity must be exactly wallet",
         )?;
-        require_manifest_value(
-            self.schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
-        )?;
+        require_wallet_checkpoint_schema(self.schema_version)?;
         require_manifest_value(
             self.cold_admitted,
             "wallet checkpoint was not cold-admitted",
@@ -1618,10 +1612,15 @@ impl WalletCheckpointManifest {
             &self.utxo_commitment_sha256,
             "wallet UTXO commitment SHA-256",
         )?;
-        require_manifest_value(
-            self.utxo_commitment_scheme == UtxoSetCommitmentScheme::LtHash16ChaCha12.id(),
-            "wallet UTXO commitment scheme must be 2",
-        )?;
+        let supported_scheme = UtxoSetCommitmentScheme::LtHash16ChaCha12.id();
+        if self.utxo_commitment_scheme != supported_scheme {
+            return Err(StateBundleError::manifest_contract(format!(
+                "wallet checkpoint uses UTXO commitment scheme {}, and this release reads only \
+                 scheme {supported_scheme}; rebuild the wallet store from the canonical store \
+                 and capture a new state bundle",
+                self.utxo_commitment_scheme
+            )));
+        }
         self.row_counts.validate()
     }
 }
@@ -1717,6 +1716,19 @@ fn validate_capture_candidate(
         "temporary state-bundle manifest",
     )?;
     validate_root_entries(&root, &[CANONICAL_CHECKPOINT_DIRECTORY_NAME])
+}
+
+/// Refuses a wallet checkpoint written under a wallet schema this release does
+/// not read, naming the observed and supported versions and the rebuild.
+fn require_wallet_checkpoint_schema(schema_version: u16) -> Result<(), StateBundleError> {
+    if schema_version == WALLET_ROCKSDB_SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(StateBundleError::manifest_contract(format!(
+        "wallet checkpoint uses wallet schema version {schema_version}, and this release reads \
+         only version {WALLET_ROCKSDB_SCHEMA_VERSION}; rebuild the wallet store from the \
+         canonical store and capture a new state bundle"
+    )))
 }
 
 fn validate_complete_layout(
@@ -2300,6 +2312,67 @@ mod tests {
             lowered.effective_reorg_window_blocks = Some(not_raised);
             assert!(CanonicalCheckpointAdmissionEvidence::try_from(lowered).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_admission_names_the_unsupported_wallet_schema_and_the_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let valid = serde_json::to_value(manifest)?;
+        for (pointer, observed) in [
+            (
+                "/wallet_checkpoint/schema_version",
+                "wallet schema version 1",
+            ),
+            (
+                "/wallet_checkpoint/utxo_commitment_scheme",
+                "UTXO commitment scheme 1",
+            ),
+        ] {
+            let mut stale = valid.clone();
+            *stale
+                .pointer_mut(pointer)
+                .ok_or("test mutation pointer must resolve")? = Value::from(1);
+            let decoded = serde_json::from_value::<StateBundleManifest>(stale)?;
+            let message = decoded
+                .validate(Network::ZcashRegtest)
+                .err()
+                .ok_or("a schema-1 wallet checkpoint was admitted")?
+                .to_string();
+            assert!(message.contains(observed), "{message}");
+            assert!(message.contains("this release reads only"), "{message}");
+            assert!(message.contains("rebuild the wallet store"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_evidence_names_the_unsupported_wallet_schema_and_the_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted = sample_wallet_admission(7)?;
+        let message = WalletAdmission::from_ready(
+            Network::ZcashRegtest,
+            &admitted.ready,
+            WALLET_PROJECTION_STORE_IDENTITY,
+            1,
+            None,
+        )
+        .err()
+        .ok_or("a schema-1 wallet checkpoint was admitted")?
+        .to_string();
+        assert!(message.contains("wallet schema version 1"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "this release reads only version {WALLET_ROCKSDB_SCHEMA_VERSION}"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("rebuild the wallet store"), "{message}");
         Ok(())
     }
 

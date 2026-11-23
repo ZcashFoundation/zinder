@@ -658,10 +658,14 @@ impl<'a> WalletControlDecoder<'a> {
         let source_position = self.read_source_position()?;
         let source_sequence_digest = self.read_source_sequence_digest()?;
         let settled_tip = self.read_block_id()?;
-        self.require_u16(
-            "wallet projection accumulator version",
-            WALLET_PROJECTION_ACCUMULATOR_VERSION,
-        )?;
+        let accumulator_version = self.read_u16()?;
+        if accumulator_version != WALLET_PROJECTION_ACCUMULATOR_VERSION {
+            return Err(
+                WalletProjectionContractError::UnsupportedProjectionAccumulatorVersion {
+                    encoded: u64::from(accumulator_version),
+                },
+            );
+        }
         let projection_accumulator = WalletProjectionAccumulator::from_bytes(
             self.read_bytes(WALLET_PROJECTION_ACCUMULATOR_LEN)?,
         )?;
@@ -1135,6 +1139,52 @@ mod tests {
             )
         );
         assert_eq!(WalletStoreControlRecord::decode(&encoded), Ok(control));
+    }
+
+    #[test]
+    fn identity_mismatch_names_the_expected_store_identity() {
+        let control = sample_control(WalletProjectionBuildState::Building(
+            WalletProjectionBuildPlan::complete_history(sample_source_position(1)),
+        ));
+        let mut encoded = control
+            .encode()
+            .unwrap_or_else(|error| unreachable!("valid building control: {error}"));
+        encoded[..WALLET_PROJECTION_STORE_IDENTITY.len()].copy_from_slice(b"canonx");
+        let message = WalletStoreControlRecord::decode(&encoded)
+            .err()
+            .unwrap_or_else(|| unreachable!("a foreign identity was admitted"))
+            .to_string();
+        assert_eq!(
+            message,
+            "wallet store control does not begin with the wallet store identity \"wallet\""
+        );
+    }
+
+    #[test]
+    fn ready_decode_names_an_unsupported_accumulator_version() {
+        let evidence = ready_evidence();
+        let control = sample_control(WalletProjectionBuildState::Ready(evidence.clone()));
+        let mut encoded = control
+            .encode()
+            .unwrap_or_else(|error| unreachable!("valid ready control: {error}"));
+        let mut versioned_accumulator =
+            WALLET_PROJECTION_ACCUMULATOR_VERSION.to_be_bytes().to_vec();
+        versioned_accumulator.extend_from_slice(evidence.projection_accumulator.as_bytes());
+        let offset = encoded
+            .windows(versioned_accumulator.len())
+            .position(|window| window == versioned_accumulator.as_slice())
+            .unwrap_or_else(|| unreachable!("encoded READY evidence holds its accumulator"));
+        encoded[offset..offset + 2].copy_from_slice(&1_u16.to_be_bytes());
+
+        // The schema is current, so only the READY accumulator version is stale.
+        assert_eq!(
+            WalletStoreControlRecord::decode(&encoded),
+            Err(
+                WalletProjectionContractError::UnsupportedProjectionAccumulatorVersion {
+                    encoded: 1
+                }
+            )
+        );
     }
 
     #[test]

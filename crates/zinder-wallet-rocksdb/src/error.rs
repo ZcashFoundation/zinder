@@ -113,7 +113,7 @@ pub enum RocksDbWalletError {
     },
     /// The database does not contain exactly the wallet families.
     #[error(
-        "wallet RocksDB column families do not match version 1; expected {expected:?}, observed {observed:?}"
+        "wallet RocksDB column families are not the wallet store's families; expected {expected:?}, observed {observed:?}"
     )]
     ColumnFamilyContractMismatch {
         /// Exact required family names.
@@ -341,5 +341,23 @@ impl RocksDbWalletError {
 
     pub(crate) fn rocksdb(operation: &'static str, source: rust_rocksdb::Error) -> Self {
         Self::RocksDbOperation { operation, source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_family_mismatch_names_the_expected_and_observed_families() {
+        let error = RocksDbWalletError::ColumnFamilyContractMismatch {
+            expected: vec!["default".to_owned(), "reorg_undo".to_owned()],
+            observed: vec!["default".to_owned()],
+        };
+        assert_eq!(
+            error.to_string(),
+            "wallet RocksDB column families are not the wallet store's families; \
+             expected [\"default\", \"reorg_undo\"], observed [\"default\"]"
+        );
     }
 }
