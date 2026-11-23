@@ -242,6 +242,8 @@ Wallet SDKs treat height 0 as pending and `NOT_FOUND` as an unknown id, so a jus
 
 Light-wallet serving uses the admitted store's persisted retention. A missing body in a store that retains transaction bodies returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. If the store omits transaction bodies, Zinder looks up the transaction's canonical location and fetches the body from the verified node. The mined block must match the local location, and the bytes must match the digest recorded in replay. A digest mismatch returns `DATA_LOSS`. A transaction absent from the captured canonical view goes through the ingest mempool lookup after node verification when the store omits transaction bodies.
 
+Each light-wallet listener admits up to eight forwarded transaction lookups at once. Additional lookups fail with `RESOURCE_EXHAUSTED` before reading transaction evidence or calling the node. Retry with backoff. Reads of retained transaction bodies use the local path.
+
 ### `SendTransaction`
 
 Wallet serving uses the native `BroadcastTransaction` path, including endpoint verification on first contact, failover across `[node_fallbacks.N]`, and the 16 MiB in-flight byte budget. A wallet listener without `[node]` returns `FAILED_PRECONDITION` with `ENDPOINT_CAPABILITY_UNAVAILABLE`. See [Wallet data plane](../architecture/wallet-data-plane.md).

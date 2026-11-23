@@ -41,13 +41,16 @@ use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
 use crate::compact_block_messages::CompactBlockShape;
 
-/// The feature-gated canonical reader and forwarded wallet methods used in qualification.
+const FORWARDED_TRANSACTION_SLOTS: usize = 8;
+
+/// The canonical reader and node-backed methods for light-wallet serving.
 #[derive(Clone)]
 pub struct QualificationWallet {
     slot: CanonicalReaderSlot,
     query: QualificationWalletQuery,
     utxo_slots: Arc<Semaphore>,
     history_slots: Arc<Semaphore>,
+    transaction_slots: Arc<Semaphore>,
     block_digests: BlockDigestCache,
 }
 
@@ -109,6 +112,7 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             query,
             utxo_slots: Arc::new(Semaphore::new(1)),
             history_slots: Arc::new(Semaphore::new(1)),
+            transaction_slots: Arc::new(Semaphore::new(FORWARDED_TRANSACTION_SLOTS)),
             block_digests: BlockDigestCache::default(),
         })
     }
@@ -172,6 +176,15 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
         reader: Arc<RocksDbCanonicalReader>,
         id: TransactionId,
     ) -> Result<lightwalletd::RawTransaction, Status> {
+        let _permit = self
+            .query_api
+            .transaction_slots
+            .try_acquire()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "forwarded transaction lookup limit reached; retry with backoff",
+                )
+            })?;
         let view = served_view(&reader)?;
         let miss = match reader.mined_transaction_location(id).await {
             Ok(Some(location)) => {

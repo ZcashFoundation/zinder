@@ -100,6 +100,7 @@ fn node_unavailable(status: &Status) {
 /// A fixture whose served block 1 mines `id` without retaining its bytes.
 fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcStub>>(
     id: TransactionId,
+    timeout: Duration,
     replies: impl FnOnce(zinder_core::BlockId) -> Replies,
 ) -> Result<(Fixture, zinder_core::BlockId)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
@@ -113,7 +114,7 @@ fn mined_without_retention<Replies: IntoIterator<Item = zinder_testkit::JsonRpcS
         &chain.with_transaction_rows(rows),
         &super::one_upgrade_per_height()?,
         replies(served),
-        Duration::from_secs(2),
+        timeout,
     )?;
     Ok((fixture, served))
 }
@@ -128,6 +129,53 @@ fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> Rpc
 }
 
 #[tokio::test]
+async fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Result<()> {
+    use parking_lot::{Condvar, Mutex};
+
+    let id = TransactionId::from_bytes([0x55; 32]);
+    let timeout = Duration::from_secs(15);
+    let (entered, mut calls) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let node_gate = Arc::clone(&gate);
+    let (fixture, _) = mined_without_retention(id, timeout, |served| {
+        [method("getrawtransaction").reply_with(move |_| {
+            let _ = entered.send(());
+            let (released, ready) = &*node_gate;
+            ready.wait_while_for(&mut released.lock(), |released| !*released, timeout);
+            mined_reply(id, served, "55")
+        })]
+    })?;
+
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let adapter = fixture.adapter.clone();
+        pending.spawn(async move { adapter.get_transaction(transaction(id)).await });
+    }
+    for _ in 0..8 {
+        tokio::time::timeout(timeout, calls.recv())
+            .await?
+            .ok_or_else(|| eyre!("forwarded lookup did not reach the node"))?;
+    }
+    let extra = fixture.adapter.get_transaction(transaction(id)).await;
+    let (released, ready) = &*gate;
+    *released.lock() = true;
+    ready.notify_all();
+
+    let status = extra
+        .err()
+        .ok_or_else(|| eyre!("ninth lookup was admitted"))?;
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("retry with backoff"));
+    while let Some(reply) = pending.join_next().await {
+        assert_eq!(reply??.into_inner().data, [0x55]);
+    }
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 8);
+    let reply = fixture.adapter.get_transaction(transaction(id)).await?;
+    assert_eq!(reply.into_inner().data, [0x55]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_location()
 -> Result<()> {
     let mined = TransactionId::from_bytes([0x55; 32]);
@@ -135,7 +183,7 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
         BlockHeight::new(1),
         zinder_core::BlockHash::from_bytes([0x45; 32]),
     );
-    let (fixture, _) = mined_without_retention(mined, |served| {
+    let (fixture, _) = mined_without_retention(mined, Duration::from_secs(2), |served| {
         [
             method("getrawtransaction").reply(mined_reply(mined, served, "55")),
             method("getrawtransaction").reply(mined_reply(mined, other, "55")),
@@ -595,7 +643,7 @@ async fn verification_lookup_and_submission_leave_generations_recyclable() -> Re
         fixture.adapter.get_transaction(transaction(id)),
     )
     .await?;
-    let (fixture, _) = mined_without_retention(id, |_| {
+    let (fixture, _) = mined_without_retention(id, Duration::from_secs(2), |_| {
         [
             method("getrawtransaction").reply(slow()),
             method("sendrawtransaction").reply(slow()),
