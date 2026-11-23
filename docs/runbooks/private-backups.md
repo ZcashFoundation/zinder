@@ -79,6 +79,20 @@ offline verification and restore on the replacement host.
 | Temporary file space per sorter | 192 GiB | `--max-temporary-file-bytes-per-sorter` |
 | Accounted reorg undo data | 512 MiB | `--max-accounted-reorg-undo-bytes` |
 
+The wallet check re-derives the address-ordered rows with two external
+sorts and needs temporary space for them. Each command writes this
+scratch in a different place:
+
+- Backup writes it inside the archive's working directory, on the
+  archive's filesystem.
+- Verify writes it under `TMPDIR`.
+- Restore writes it inside the destination's working directory, on the
+  destination filesystem.
+
+The archive is about the combined size of both stores. Reserve that space
+plus the scratch for backup. Restore needs space for both stores plus the
+scratch on the destination filesystem.
+
 ## Restore on an empty host
 
 Download the archive to a directory where only the recovery operator can

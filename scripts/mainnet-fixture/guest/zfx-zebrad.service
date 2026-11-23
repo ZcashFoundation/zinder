@@ -1,0 +1,18 @@
+[Unit]
+Description=zfx frozen Mainnet Zebra (no peers)
+RequiresMountsFor=/srv/node
+[Service]
+Type=simple
+User=zinder
+Group=zinder
+RuntimeDirectory=zebra-cookie
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/bin/zebrad -c /etc/zfx-zebrad.toml start
+Restart=no
+LimitNOFILE=65536
+AllowedCPUs=0-1
+StandardOutput=append:/var/log/zfx/zebrad.log
+StandardError=append:/var/log/zfx/zebrad.log
+[Install]
+WantedBy=multi-user.target

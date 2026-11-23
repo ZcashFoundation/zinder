@@ -72,6 +72,7 @@ how each kind of client connects.
   tests
 - [Releasing](runbooks/releasing.md)
 - [Capturing node fixtures](runbooks/capturing-node-fixtures.md)
+- [Restoring the Mainnet benchmark fixture](runbooks/mainnet-benchmark-fixture.md)
 - [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
 
 ## Keeping the documentation useful
