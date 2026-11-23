@@ -1,6 +1,0 @@
-kind: changed
-body: A `GetBlockRange` response now sends its first frame once it holds 8 KiB of blocks, so behind a gateway that forwards whole HTTP/2 frames a wallet receives the first block in the first round trip of a connection that has been idle, unless the blocks in that frame are large enough to need more than one round trip on their own. Response bytes and later frames are unchanged.
-time: 2026-11-23T20:46:09.356685377Z
-custom:
-    Bump: patch
-    PR: "521"

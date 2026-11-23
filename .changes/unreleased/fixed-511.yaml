@@ -1,6 +1,0 @@
-kind: fixed
-body: A descending `GetBlockRange` that overlaps the signed settled-history catalog but cannot read signed segments, such as one that runs from inside the catalog to below it, no longer waits for a signed-read permit. It reads canonical storage immediately with the normal chunk budget.
-time: 2026-11-23T16:42:10.821551792Z
-custom:
-    Bump: patch
-    PR: "511"

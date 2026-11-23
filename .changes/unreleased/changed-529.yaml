@@ -1,6 +1,0 @@
-kind: changed
-body: First sync and live ingest now parse each block once. Transaction identifiers come from the block parse instead of a second parse of every version 5 and 6 transaction, and transaction byte ranges are recorded during the parse instead of serializing each transaction again. On a dense Mainnet range at four cores, time to READY fell by about 40% in local tests. Stored data is unchanged, and no operator action is needed.
-time: 2026-11-23T22:49:25.052904601Z
-custom:
-    Bump: patch
-    PR: "529"

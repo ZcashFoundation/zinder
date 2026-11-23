@@ -1,6 +1,0 @@
-kind: added
-body: Operators can compare two wallet reader binaries on the same private fixture, verify block-range response bytes against an independent oracle, and evaluate paired results against their own performance tolerances.
-time: 2026-11-22T19:38:43.813233905Z
-custom:
-    Bump: minor
-    PR: "469"

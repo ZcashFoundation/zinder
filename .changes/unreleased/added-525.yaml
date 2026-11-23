@@ -1,6 +1,0 @@
-kind: added
-body: '`projector.build.accumulator_hashing_workers` (`ZINDER_PROJECTOR__BUILD__ACCUMULATOR_HASHING_WORKERS`) sets how many threads a fresh wallet build uses to hash rows into its projection digest and UTXO set commitment, and how many key ranges cold validation reads the unspent and spent output families in. It defaults to the logical CPUs the projector may use, at most 4, and accepts 1 to 64; the projector refuses a larger value at startup. A build therefore uses more CPU by default: a full Testnet wallet build finished about 48% sooner on 4 cores and 29% sooner on 2, with about 5% more total CPU time and the same memory and temporary disk. Set it to 1 to hash on the build thread as before. The published wallet is the same at any value. `zinder-core` adds `TransparentUtxoSetCommitment::combine`.'
-time: 2026-11-23T21:29:37.079394884Z
-custom:
-    Bump: minor
-    PR: "525"

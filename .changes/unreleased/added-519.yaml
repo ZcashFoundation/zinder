@@ -1,6 +1,0 @@
-kind: added
-body: The wallet range probe reports pauses between successive blocks so operators can compare the longest pause across verified requests and inspect the individual frame arrivals.
-time: 2026-11-23T20:26:23.071866545Z
-custom:
-    Bump: minor
-    PR: "519"
