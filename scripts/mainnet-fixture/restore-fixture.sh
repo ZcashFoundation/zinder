@@ -26,7 +26,8 @@ Options:
   --machine-type TYPE     Default c4-standard-16, with one thread per core.
   --hours N               Host deletes itself after N hours (default 12, at most 36).
   --receipt FILE          Where to write the JSON receipt (default ./restore-receipt-VM.json).
-                          The path and FILE.failed must not exist yet.
+                          FILE, FILE.failed, and FILE.reservation must not
+                          exist yet; the restore reserves the path first.
   --guest-timeout SECONDS Fail when the guest restore has not finished this long
                           after launch (default 10800).
   --poll-seconds N        Seconds between guest status checks (default 20).
@@ -70,24 +71,37 @@ case $verify in none|stores|all) ;; *) die "--verify-hashes must be none, stores
 if ! [[ $hours =~ ^[0-9]+$ ]] || (( hours < 1 || hours > 36 )); then die "--hours must be 1 to 36"; fi
 [[ $guest_timeout =~ ^[1-9][0-9]*$ && $poll =~ ^[1-9][0-9]*$ ]] || die "--guest-timeout and --poll-seconds must be positive integers"
 receipt=${receipt:-./restore-receipt-$name.json}
-# A receipt path is used once, so an old success cannot outlive a later failure.
-[[ ! -e $receipt && ! -e $receipt.failed ]] || die "$receipt or $receipt.failed already exists; choose a new --receipt path"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 schema=$here/fixture.schema.json gate=$here/guest/fixture-gate.py
-for tool in gcloud jq python3; do command -v "$tool" >/dev/null || die "missing $tool"; done
+for tool in gcloud jq python3 timeout; do command -v "$tool" >/dev/null || die "missing $tool"; done
 attempt=$name-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
+# A receipt path is used once, so an old success cannot outlive a later
+# failure. FILE.reservation is created atomically before any cloud call, so of
+# two restores given one path, only one proceeds.
+[[ ! -e $receipt && ! -e $receipt.failed ]] || die "$receipt or $receipt.failed already exists; choose a new --receipt path"
+( set -o noclobber; printf '%s\n' "$attempt" > "$receipt.reservation" ) 2>/dev/null \
+  || die "$receipt.reservation exists: another restore holds this receipt path; choose a new --receipt path"
 
 # IAP connections drop now and then. Retry when ssh itself fails (exit 255);
-# standard input is buffered so a retry resends it.
+# standard input is buffered so a retry resends it. While gssh_deadline (a
+# SECONDS value) is set, every call, retry, and wait ends by then, and a call
+# cut off by it returns 124.
+gssh_deadline=""
 gssh() {
-  local input rc attempt
+  local input rc=124 attempt budget
   input=$(mktemp)
   cat > "$input"
   for attempt in 1 2 3 4 5; do
-    gcloud compute ssh "$name" --project "$project" --zone "$zone" --tunnel-through-iap --quiet \
+    budget=86400
+    if [[ -n $gssh_deadline ]]; then
+      budget=$((gssh_deadline - SECONDS))
+      (( budget > 0 )) || { rc=124; break; }
+    fi
+    timeout -k 5 "$budget" gcloud compute ssh "$name" --project "$project" --zone "$zone" --tunnel-through-iap --quiet \
       --command "$1" < "$input" && rc=0 || rc=$?
     [[ $rc -ne 255 ]] && break
     echo "ssh attempt $attempt failed; retrying" >&2
+    [[ -z $gssh_deadline ]] || (( gssh_deadline - SECONDS > 10 )) || { rc=124; break; }
     sleep 10
   done
   rm -f "$input"
@@ -140,8 +154,8 @@ fail_receipt() {
   local step=$1 reason=$2 outcome=${3:-null}
   jq -e . >/dev/null 2>&1 <<< "$outcome" || outcome=null
   jq -n --arg attempt "$attempt" --arg step "$step" --arg reason "$reason" --argjson outcome "$outcome" \
-    '{status: "failed", attempt: $attempt, workstation_step: $step, reason: $reason, guest_outcome: $outcome}' > "$receipt.failed.partial"
-  mv "$receipt.failed.partial" "$receipt.failed"
+    '{status: "failed", attempt: $attempt, workstation_step: $step, reason: $reason, guest_outcome: $outcome}' > "$receipt.failed.$attempt.partial"
+  mv "$receipt.failed.$attempt.partial" "$receipt.failed"
 }
 trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"' EXIT
 mark create_host
@@ -178,6 +192,7 @@ mark guest_restore
 # that exists and a host that already ran an attempt.
 gssh "sudo systemd-run --unit zfx-restore-$attempt --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/attempts/$attempt" < /dev/null >&2 || true
 deadline=$((SECONDS + guest_timeout)) gone=0 outcome=""
+gssh_deadline=$deadline
 while :; do
   status=$(gssh "sudo cat /var/log/zfx/attempts/$attempt/outcome.json 2>/dev/null || { systemctl is-active -q zfx-restore-$attempt && echo RUNNING || echo GONE; }" < /dev/null 2>/dev/null) || status=""
   if jq -e 'type == "object" and (.status == "succeeded" or .status == "failed")' >/dev/null 2>&1 <<< "$status"; then
@@ -185,19 +200,24 @@ while :; do
   fi
   # The unit writes its outcome before it exits, so one GONE can race it.
   if [[ $status == GONE ]]; then gone=$((gone + 1)); else gone=0; fi
-  if (( gone >= 2 )); then fail_receipt guest_restore "the guest unit ended without writing an outcome; the stage may predate attempt outcomes"; die "guest restore ended without an outcome"; fi
+  if (( gone >= 2 )); then fail_receipt guest_restore "the guest unit ended without writing an outcome; a stage built before attempt outcomes cannot restore with this script, so rebuild the stage from this checkout"; die "guest restore ended without an outcome"; fi
   if (( SECONDS >= deadline )); then fail_receipt guest_restore "the guest restore did not finish within $guest_timeout seconds"; die "guest restore timed out"; fi
-  sleep "$poll"
+  sleep "$(( deadline - SECONDS < poll ? deadline - SECONDS : poll ))"
 done
+gssh_deadline=""
 if [[ $(jq -r .status <<< "$outcome") != succeeded ]]; then
   gssh "sudo journalctl -u zfx-restore-$attempt -o cat --no-pager | tail -20" < /dev/null >&2 || true
   fail_receipt guest_restore "guest failed at $(jq -r .step <<< "$outcome"): $(jq -r .reason <<< "$outcome")" "$outcome"
   die "guest restore failed; see $receipt.failed"
 fi
 mark accept
-guest_file=$(mktemp); trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"; rm -f "$guest_file"' EXIT
-jq .receipt <<< "$outcome" > "$guest_file"
-if ! reasons=$(python3 -I "$gate" accept "$fixture" "$guest_file" 2>&1); then
+guest_file=$(mktemp) outcome_file=$(mktemp)
+trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"; rm -f "$guest_file" "$outcome_file"' EXIT
+printf '%s\n' "$outcome" > "$outcome_file"
+jq .receipt "$outcome_file" > "$guest_file"
+# The outcome must belong to this attempt and this verification request, and
+# its route proof is judged again from its measurements.
+if ! reasons=$(python3 -I "$gate" accept "$fixture" "$outcome_file" "$attempt" "$verify" 2>&1); then
   fail_receipt accept "${reasons//$'\n'/; }" "$outcome"
   die "the guest receipt does not prove what the fixture requires: $reasons"
 fi
@@ -214,8 +234,8 @@ jq -n --slurpfile guest "$guest_file" --argjson steps "$steps" --arg name "$name
     workstation_steps_utc: $steps,
     nothing_to_reader_seconds: ((($steps.accept | sub("\\.[0-9]+Z$"; "Z") | fromdate) - ($steps.preflight | sub("\\.[0-9]+Z$"; "Z") | fromdate))),
     accepted: true,
-    guest: $guest[0]}' > "$receipt.partial"
-mv "$receipt.partial" "$receipt"
+    guest: $guest[0]}' > "$receipt.$attempt.partial"
+mv "$receipt.$attempt.partial" "$receipt"
 finished=true
 echo "receipt: $receipt" >&2
 jq '{nothing_to_reader_seconds, served_tip: .guest.served_tip, wallet_sample_matches_fixture: .guest.wallet_sample_matches_fixture,

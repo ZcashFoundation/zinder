@@ -23,35 +23,13 @@ mkdir -p "$(dirname "$out")"
 # A second launch of the same attempt finds its directory and leaves it alone.
 mkdir "$out" 2>/dev/null || { echo "attempt $out already exists; not starting it again" >&2; exit 0; }
 attempt=$(basename "$out")
-step=launch finished=false
+step=launch finished=false serving_started=false
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$out/guest.log" >&2; }
 now() { date -u +%FT%T.%3NZ; }
 declare -A at
 mark() { step=$1; at[$1]=$(now); log "step $1"; }
-write_outcome() {
-  python3 -I - "$out" "$attempt" "$1" "$2" "$3" "$4" <<'EOF'
-import json, os, sys
-out, attempt, status, step, reason, receipt_path = sys.argv[1:]
-receipt = None
-if receipt_path and os.path.exists(receipt_path):
-    try:
-        receipt = json.load(open(receipt_path))
-    except ValueError:
-        receipt = None
-outcome = {'attempt': attempt, 'status': status, 'step': step or None, 'reason': reason or None, 'receipt': receipt}
-with open(os.path.join(out, 'outcome.json.partial'), 'w') as f:
-    json.dump(outcome, f)
-    f.write('\n')
-os.replace(os.path.join(out, 'outcome.json.partial'), os.path.join(out, 'outcome.json'))
-EOF
-}
-on_exit() {
-  local code=$?
-  [[ $finished == true ]] && return
-  # A host that failed its checks must not keep serving wallets.
-  [[ ${at[start_zinder]+set} ]] && systemctl stop zfx-fixture-compat 2>/dev/null || true
-  write_outcome failed "$step" "$(tail -n 1 "$out/guest.log" 2>/dev/null | cut -d' ' -f2-) (exit $code)" "$out/receipt.json.partial"
-}
+# shellcheck source=SCRIPTDIR/outcome.sh
+source "$here/outcome.sh"
 trap on_exit EXIT
 
 mark launch
@@ -175,6 +153,7 @@ HISTORY_DIRECTORY=$history_dir HISTORY_PUBLISHER_KEY=$history_key HISTORY_REQUIR
 REORG_WINDOW_BLOCKS=$(jq -r '.chain.reorg_window_blocks // 1000' "$fixture") \
   /opt/zfx/stack.sh fixture "$stores/.zfx-run" "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" 0 /run/zebra-cookie/.cookie >&2
 chown zinder:zinder "$stores/.zfx-run"
+serving_started=true
 systemctl start zfx-fixture-ingest
 for _ in $(seq 1 120); do curl -sf 127.0.0.1:9105/readyz >/dev/null && break; sleep 2; done
 systemctl start zfx-fixture-projector zfx-fixture-query zfx-fixture-compat
@@ -199,13 +178,11 @@ want_sample=$(jq -r '.wallet_sample.sha256sums_sha256 // empty' "$fixture")
 route_report=""
 if [[ $history != null ]]; then
   mark route_check
-  # The sample's 100-block range is the covered probe when the catalog holds
-  # it and the fixture pins the sample, so its signed-segment response must
-  # equal bytes the fixture recorded from a canonical-only reader.
+  # When the fixture pins the sample and the catalog holds its 100-block
+  # range, that range is the covered probe, and its signed-segment response
+  # must equal bytes the fixture recorded from a canonical-only reader.
   reference=()
-  if [[ -n $want_sample ]] && jq -e '.first_height <= 1730000 and 1730099 <= .last_height' "$out/history-bounds.json" >/dev/null; then
-    reference=(--reference-range 1730000:1730099 --reference "$out/wallet-sample/block-range-1730000-1730099.json")
-  fi
+  [[ -z $want_sample ]] || reference=(--sample-reference "$out/wallet-sample/block-range-1730000-1730099.json")
   route_report=$out/route-check/route-check.json
   /opt/zfx/route-check.py --grpc 127.0.0.1:9067 --ops 127.0.0.1:9107 \
     --pid "$(systemctl show -p MainPID --value zfx-fixture-compat)" --bounds "$out/history-bounds.json" \
@@ -239,9 +216,9 @@ if [[ -n $want_sample && $sample_digest != "$want_sample" ]]; then
   exit 1
 fi
 if [[ -n $route_report ]]; then
-  verdict=$(python3 -I /opt/zfx/fixture-gate.py route-verdict "$route_report" 2>&1) \
+  # Judge the exact report embedded in the receipt, from its measurements.
+  verdict=$(printf '%s' "$route" | python3 -I /opt/zfx/fixture-gate.py route-verdict "$fixture" "$out/history-bounds.json" - 2>&1) \
     || { log "the fixture declares signed history, but the route check failed: ${verdict//$'\n'/; }"; exit 1; }
 fi
-finished=true
-write_outcome succeeded "" "" "$out/receipt.json.partial"
+finish_success "$out/receipt.json.partial"
 cat "$out/outcome.json"

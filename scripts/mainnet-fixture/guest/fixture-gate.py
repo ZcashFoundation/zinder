@@ -12,29 +12,32 @@ usage:
       Hashes the catalog's current.json and publisher key once, compares them
       with the fixture, derives the catalog bounds and segment files from the
       verified manifest bytes, and writes them to OUT.
-  fixture-gate.py route-verdict REPORT
-      Exits 0 only when route-check.py's report shows every required part.
-  fixture-gate.py accept FIXTURE GUEST_RECEIPT
-      Exits 0 only when the guest receipt proves what the fixture requires.
+  fixture-gate.py route-verdict FIXTURE BOUNDS REPORT
+      Exits 0 only when route-check.py's report, read from REPORT or from
+      standard input for -, passes every part when judged from its recorded
+      measurements against the verified BOUNDS.
+  fixture-gate.py accept FIXTURE OUTCOME ATTEMPT VERIFY
+      Exits 0 only when the guest OUTCOME of attempt ATTEMPT, restored with
+      --verify-hashes VERIFY, proves what the fixture requires.
+
+Route decisions come from route_proof.py, the predicates route-check.py uses,
+applied to the recorded measurements; a part's own passed flag is not trusted.
 
 The route proof is external: the pinned reader exports no identity for the
 catalog generation it admitted, so admission is inferred from the segment
 files the reader process holds open.
 """
-import hashlib, json, re, sys
+import hashlib, json, os, re, sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from route_proof import failures as route_failures, is_int  # noqa: E402
+
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
-ROUTE_PARTS = ('admission', 'covered', 'boundary_last', 'boundary_next', 'canonical_control', 'refusal')
-PROOF = 'external'
 
 
 class GateError(Exception):
     pass
-
-
-def is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def relative_path(value):
@@ -171,56 +174,74 @@ def verify_manifest(fixture, out):
     return report
 
 
-def route_errors(report):
-    if not isinstance(report, dict):
-        return ['the route report is not an object']
-    errors = [] if report.get('passed') is True and report.get('failed') == [] else ['the route report did not pass']
-    for part in ROUTE_PARTS:
-        if not (isinstance(report.get(part), dict) and report[part].get('passed') is True):
-            errors.append(f'route part {part} is missing or failed')
-    if report.get('proof') != PROOF:
-        errors.append('the route report does not declare its proof kind')
+def route_verdict(fixture, bounds, report):
+    """Judges a route report from its measurements against the bounds verified before startup."""
+    errors = route_failures(report, {'first': bounds.get('first_height'), 'last': bounds.get('last_height'),
+                                     'segment_count': bounds.get('segments'),
+                                     'sample_pinned': isinstance(fixture.get('wallet_sample'), dict), 'refusal': True})
+    if isinstance(report, dict):
+        for field in ('manifest_sha256', 'publisher_key_sha256'):
+            if report.get(field) != bounds.get(field):
+                errors.append(f'route report {field} differs from the hash verified before startup')
     return errors
 
 
-def accept_errors(fixture, receipt):
-    """Returns the reasons a guest receipt does not prove what the fixture requires."""
+def verified_components(fixture, verify):
+    components = [c for c in fixture.get('components', []) if isinstance(c, dict)]
+    if verify == 'all':
+        return sorted(c.get('name') for c in components)
+    if verify == 'stores':
+        return sorted(c.get('name') for c in components if c.get('kind') == 'stores')
+    return []
+
+
+def accept_errors(fixture, outcome, attempt, verify):
+    """Returns the reasons a guest outcome does not prove what the fixture and the request require."""
+    if not isinstance(outcome, dict) or outcome.get('status') != 'succeeded':
+        return ['the guest outcome is not a success']
+    receipt = outcome.get('receipt')
     if not isinstance(receipt, dict):
-        return ['the guest receipt is not an object']
+        return ['the guest outcome has no receipt']
     errors = []
+    if outcome.get('attempt') != attempt or receipt.get('attempt') != attempt:
+        errors.append(f"the guest outcome is for attempt {outcome.get('attempt')!r} and its receipt for "
+                      f"{receipt.get('attempt')!r}, not this restore's {attempt!r}")
+    if receipt.get('verify_hashes') != verify:
+        errors.append(f"the guest verified with {receipt.get('verify_hashes')!r}, the restore requested {verify!r}")
+    components = receipt.get('verified_components')
+    if not isinstance(components, list) or sorted(map(str, components)) != verified_components(fixture, verify):
+        errors.append(f'the guest verified components {components!r}, --verify-hashes {verify} requires '
+                      f'{verified_components(fixture, verify)!r}')
     chain = fixture.get('chain', {})
     if receipt.get('fixture_id') != fixture.get('fixture_id'):
         errors.append('the guest receipt names another fixture')
     tip = receipt.get('served_tip') if isinstance(receipt.get('served_tip'), dict) else {}
     if tip.get('height') != chain.get('visible_height') or tip.get('hash') != chain.get('visible_block_hash'):
         errors.append('the served tip differs from the fixture')
-    if isinstance(fixture.get('wallet_sample'), dict) and receipt.get('wallet_sample_matches_fixture') is not True:
-        errors.append('the wallet sample does not match the fixture')
+    sample = fixture.get('wallet_sample')
+    if isinstance(sample, dict) and (receipt.get('wallet_sample_matches_fixture') is not True
+                                     or receipt.get('wallet_sample_sha256sums_sha256') != sample.get('sha256sums_sha256')):
+        errors.append('the wallet sample listing does not match the fixture')
     try:
         history = checked_history(fixture)
     except GateError as error:
         return errors + [str(error)]
     route = receipt.get('signed_history')
     if history is None:
-        if route not in (None, {}) and not (isinstance(route, dict) and route.get('declared') is False):
+        if route not in (None, {}):
             errors.append('the fixture declares no signed history, but the receipt reports one')
         return errors
     if not isinstance(route, dict):
         return errors + ['the fixture declares signed history, but the guest receipt has no route proof; '
                          'the stage may predate signed history']
-    errors += route_errors(route)
     for field in ('manifest_sha256', 'publisher_key_sha256', 'segment_count'):
         if route.get(field) != history[field]:
             errors.append(f'route proof {field} is {route.get(field)!r}, the fixture records {history[field]!r}')
     if route.get('last_height') != history['highest_height']:
         errors.append(f"route proof last_height is {route.get('last_height')!r}, the fixture records {history['highest_height']}")
-    admission = route.get('admission') if isinstance(route.get('admission'), dict) else {}
-    if admission.get('open_segment_files') != history['segment_count'] or admission.get('matches_manifest') is not True:
-        errors.append('the reader does not hold exactly the manifest segments open')
-    for part, height in (('boundary_last', history['highest_height']), ('boundary_next', history['highest_height'] + 1)):
-        probe = route.get(part) if isinstance(route.get(part), dict) else {}
-        if probe.get('range') != [height, height]:
-            errors.append(f'route part {part} did not probe height {height}')
+    errors += route_failures(route, {'first': route.get('first_height'), 'last': history['highest_height'],
+                                     'segment_count': history['segment_count'],
+                                     'sample_pinned': isinstance(sample, dict), 'refusal': True})
     return errors
 
 
@@ -238,14 +259,15 @@ def main(argv):
         elif command == 'verify-manifest' and len(args) == 2:
             print(json.dumps({k: v for k, v in verify_manifest(load(args[0]), args[1]).items() if k != 'segment_files'}))
             return 0
-        elif command == 'route-verdict' and len(args) == 1:
-            errors = route_errors(load(args[0]))
-        elif command == 'accept' and len(args) == 2:
-            errors = accept_errors(load(args[0]), load(args[1]))
+        elif command == 'route-verdict' and len(args) == 3:
+            report = json.load(sys.stdin) if args[2] == '-' else load(args[2])
+            errors = route_verdict(load(args[0]), load(args[1]), report)
+        elif command == 'accept' and len(args) == 4:
+            errors = accept_errors(load(args[0]), load(args[1]), args[2], args[3])
         else:
             print(__doc__, file=sys.stderr)
             return 2
-    except (GateError, OSError) as error:
+    except (GateError, OSError, ValueError) as error:
         print(f'fixture-gate: {error}', file=sys.stderr)
         return 1
     for error in errors:

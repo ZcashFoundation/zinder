@@ -2,7 +2,7 @@
 """Prove which route a restored lightwalletd-compatible reader serves block ranges from.
 
 usage: route-check.py --grpc ADDR --ops ADDR --pid PID --bounds FILE --tip T --out DIR
-                      [--reference-range START:END --reference FILE]
+                      [--sample-reference FILE]
                       [--refusal-binary BIN --refusal-config FILE [--run-as USER]]
 
 --bounds is the JSON that `fixture-gate.py verify-manifest` wrote before the
@@ -17,8 +17,10 @@ the reader holds open and infers the route from its storage counters:
   admission          The reader holds open exactly the manifest's segment
                      files, and current.json still has the verified hash.
   covered            GetBlockRange over a covered range adds no canonical
-                     MultiGet or iterator reads. With --reference, the
-                     response equals that file byte for byte.
+                     MultiGet or iterator reads. With --sample-reference, the
+                     pinned wallet sample's copy of heights 1,730,000 to
+                     1,730,099, and a catalog that holds them, the range is
+                     those heights and the response equals that file.
   boundary_last      The catalog's last height alone adds no canonical
                      payload reads.
   boundary_next      The height above it adds at least one canonical
@@ -34,25 +36,20 @@ the reader holds open and infers the route from its storage counters:
 Counters reach /metrics only when the wallet serving pair refreshes, so each
 probe is bracketed by two refreshes, and every counter used must be present
 and must not decrease. Segment page residency (mincore after eviction advice)
-and point lookups are reported as supporting evidence only. Writes
-route-check.json to --out and exits 1 when any part fails.
+and point lookups are reported as supporting evidence only. The pass and fail
+decisions come from route_proof.py, which fixture-gate.py applies again to the
+recorded measurements. Writes route-check.json to --out and exits 1 when any
+part fails.
 """
 import argparse, ctypes, hashlib, json, mmap, os, pwd, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
-# A canonical block-range chunk reads compact block rows with MultiGet; scans
-# would show as iterator reads. Each counter is checked on its own.
-PAYLOAD_READ_TICKERS = (
-    'rocksdb.number.multiget.keys.read', 'rocksdb.number.multiget.bytes.read',
-    'rocksdb.db.iter.bytes.read', 'rocksdb.number.db.seek', 'rocksdb.number.db.next')
-MULTIGET_KEYS = 'rocksdb.number.multiget.keys.read'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from route_proof import NATIVE_POOLS, PAYLOAD_READ_TICKERS, PROOF, covered_range, part_errors, reference_range  # noqa: E402
+
 # Point lookups, which the catalog follower's anchor check also makes.
 POINT_READ_TICKERS = ('rocksdb.bytes.read', 'rocksdb.block.cache.data.hit', 'rocksdb.block.cache.data.miss')
 REFRESH = 'zinder_wallet_serving_pair_publisher_refresh_total'
-PROBE_BLOCKS = 100
-# Explicit transparent, Sapling, and Orchard pools differ from the default
-# shielded projection, so the reader serves them from canonical storage.
-NATIVE_POOLS = [1, 2, 3]
 
 
 class ProbeError(Exception):
@@ -160,15 +157,11 @@ def open_files(pid, directory):
     return held
 
 
-def plan(first, last, tip, reference_range=None):
+def plan(first, last, tip, sample_pinned):
     """Chooses the probe ranges from the catalog's verified bounds."""
-    if not first <= last < tip:
+    if not 1 <= first <= last < tip:
         raise ProbeError(f'catalog {first}..{last} must end below the tip {tip}')
-    if reference_range and first <= reference_range[0] <= reference_range[1] <= last:
-        covered, reference = tuple(reference_range), True
-    else:
-        covered, reference = (first, min(first + PROBE_BLOCKS - 1, last)), False
-    return {'covered': covered, 'reference': reference,
+    return {'covered': tuple(covered_range(first, last, sample_pinned)),
             'boundary_last': (last, last), 'boundary_next': (last + 1, last + 1)}
 
 
@@ -210,10 +203,6 @@ def probe(args, name, span, files, pools=None):
     return report
 
 
-def no_payload_reads(report):
-    return all(value == 0 for value in report['canonical_payload_read_delta'].values())
-
-
 def free_port():
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0))
@@ -248,8 +237,7 @@ def refusal(args, trusted_key):
         reason = next((line for line in log.read_text(errors='replace').splitlines()
                        if 'shielded range admission failed' in line), '')
         return {'exit_code': code, 'seconds': round(time.monotonic() - started, 1),
-                'admission_failure': reason[-400:], 'log': str(log.relative_to(args.out)),
-                'passed': code not in (0, 124) and 'signature verification failed' in reason}
+                'admission_failure': reason[-400:], 'log': str(log.relative_to(args.out))}
     finally:
         for path in work.iterdir():
             if path.is_dir():
@@ -262,9 +250,9 @@ def run(args):
     bounds = json.loads(Path(args.bounds).read_text())
     directory = bounds['directory']
     files = [os.path.join(directory, name) for name in bounds['segment_files']]
-    reference_range = tuple(int(h) for h in args.reference_range.split(':')) if args.reference_range else None
-    chosen = plan(bounds['first_height'], bounds['last_height'], args.tip, reference_range)
-    report = {'proof': 'external',
+    sample_pinned = bool(args.sample_reference)
+    chosen = plan(bounds['first_height'], bounds['last_height'], args.tip, sample_pinned)
+    report = {'proof': PROOF,
               'proof_note': 'The pinned reader exports no identity for the catalog generation it admitted. '
                             'Admission is inferred from the segment files the reader process holds open, '
                             'and the route from its canonical storage counters.',
@@ -287,24 +275,22 @@ def run(args):
     report['canonical_control'] = probe(args, 'canonical-control', chosen['covered'], files, NATIVE_POOLS)
     unchanged = hashlib.sha256((Path(directory) / 'current.json').read_bytes()).hexdigest() == bounds['manifest_sha256']
     report['admission']['manifest_unchanged'] = unchanged
-    report['admission']['passed'] = report['admission']['matches_manifest'] and unchanged
-    for name in ('covered', 'boundary_last'):
-        report[name]['passed'] = report[name]['complete'] and no_payload_reads(report[name])
     covered = report['covered']
-    if chosen['reference']:
-        covered['byte_reference'] = args.reference
-        covered['matches_reference'] = (Path(args.out) / covered['response']).read_bytes() == Path(args.reference).read_bytes()
-        covered['passed'] = covered['passed'] and covered['matches_reference']
-    else:
-        covered['byte_reference'] = None
-    span = chosen['covered'][1] - chosen['covered'][0] + 1
-    for name, minimum in (('boundary_next', 1), ('canonical_control', span)):
-        p = report[name]
-        p['passed'] = p['complete'] and p['canonical_payload_read_delta'][MULTIGET_KEYS] >= minimum
+    covered['byte_reference'] = None
+    if reference_range(bounds['first_height'], bounds['last_height'], sample_pinned):
+        covered['byte_reference'] = args.sample_reference
+        covered['matches_reference'] = (Path(args.out) / covered['response']).read_bytes() == Path(args.sample_reference).read_bytes()
     if args.refusal_binary:
         report['refusal'] = refusal(args, bounds['publisher_key'])
-    parts = ['admission', 'covered', 'boundary_last', 'boundary_next', 'canonical_control'] + (['refusal'] if args.refusal_binary else [])
-    report['failed'] = [part for part in parts if not report[part]['passed']]
+    errors = part_errors(report, {'first': bounds['first_height'], 'last': bounds['last_height'],
+                                  'segment_count': bounds['segments'], 'sample_pinned': sample_pinned,
+                                  'refusal': bool(args.refusal_binary)})
+    parts = [part for part in errors if part != 'refusal' or args.refusal_binary]
+    for part in parts:
+        report[part]['passed'] = not errors[part]
+        if errors[part]:
+            report[part]['errors'] = errors[part]
+    report['failed'] = [part for part in parts if errors[part]]
     report['passed'] = not report['failed']
     return report
 
@@ -315,15 +301,12 @@ def main():
         parser.add_argument(flag, required=True)
     for flag in ('--pid', '--tip'):
         parser.add_argument(flag, required=True, type=int)
-    parser.add_argument('--reference-range')
-    parser.add_argument('--reference')
+    parser.add_argument('--sample-reference')
     parser.add_argument('--refusal-binary')
     parser.add_argument('--refusal-config')
     parser.add_argument('--run-as')
     parser.add_argument('--refusal-timeout', type=int, default=900)
     args = parser.parse_args()
-    if bool(args.reference_range) != bool(args.reference):
-        parser.error('--reference-range and --reference go together')
     Path(args.out).mkdir(parents=True, exist_ok=True)
     try:
         report = run(args)

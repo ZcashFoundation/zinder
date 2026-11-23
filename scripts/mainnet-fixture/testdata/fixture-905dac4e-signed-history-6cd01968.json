@@ -1,0 +1,118 @@
+{
+  "format_version": 1,
+  "fixture_id": "zinder-fx-m3593347-s7-905dac4e",
+  "network": "zcash-mainnet",
+  "chain": {
+    "visible_height": 3593347,
+    "visible_block_hash": "00000000012407f887b96d34c09ec5982db59a81d5a527de3c27bea41496ed70",
+    "settled_height": 3592347,
+    "settled_block_hash": "00000000005cdc651bbf8432b74c6eaea5b6c4cbb996c985db1bb21170bb5d03",
+    "reorg_window_blocks": 1000
+  },
+  "schemas": {
+    "canonical_store": 7,
+    "wallet_store": 1,
+    "artifact": 20,
+    "node_database_format": "29",
+    "tree_state_layout": "sparse"
+  },
+  "building_release": {
+    "version": "zinder 0.22.0 (main)",
+    "commit": "905dac4e4a122de5108b46bac7791e309d83a4ab"
+  },
+  "verified_with_release": {
+    "version": "zinder 0.22.0 (main)",
+    "commit": "905dac4e4a122de5108b46bac7791e309d83a4ab",
+    "binaries": {
+      "zinder-ingest": "292830fe89b1169c31d4d05df97c71770f5e22301c09c33ea4b33e404ce9bddf",
+      "zinder-projector": "8f29c6b2fe233d9b51ca0df5aacc3a239d744aa497ebba53bb3caa5516811320",
+      "zinder-query": "597e1271eb416d2a252fd3eca538e475a8ec8af4d358e2662b6115dce64e2a1e",
+      "zinder-compat-lightwalletd": "e3c28d52366ecf4eefd63cfa2f7d36ead5713fd65aeb9b821f88508a66db0867",
+      "zinder-explorer": "ad6bd9df93ec9c903c3abc3501d5a128d9f4a1123edf65b7c8b9517d55c8d9ea"
+    }
+  },
+  "executables": {
+    "uri": "gs://zfnd-dev-zinder-wallet-fixtures/mainnet/frozen-3593347/executables-905dac4e/3c37ee7878285e2992afb458fb58ff1b1c2d5d0daeb2508b43498fe4c3d9d977.tar.zst#1795380762133745",
+    "sha256": "3c37ee7878285e2992afb458fb58ff1b1c2d5d0daeb2508b43498fe4c3d9d977",
+    "listing": "pinned-executables.sha256 in the #470 evidence"
+  },
+  "digests": {
+    "canonical_sequence_sha256": "25764a867f4851bd98f8e05cb9929fe842dab83c8095de1f857a732e65cb4be5",
+    "canonical_settled_sequence_sha256": "8f0169eb5e4eb0b7a92d145268b2f9a43b16c015ef902e6282bb8cde698215eb",
+    "wallet_projection_digest": "c39ac116d4bf0004c70ba787170362d74e0003af106f5a1f434afd6159251c65",
+    "wallet_projection_accumulator_sha256": "2b5e4c7acbacf0a4e0a7059ccc9d6d00873eb7930bda6a14226696e861cab60d",
+    "wallet_utxo_commitment_sha256": "e69b2fb3ec5bc3abc6634d5a5851b59f0f1e9308ab3765b30b812d60fbb97e43",
+    "network_upgrade_schedule_fingerprint": "d58889eecb8bdf97d5b5a619f2d15a359651baaeb9146b0955eaef65529690d5"
+  },
+  "wallet_sample": {
+    "sha256sums_sha256": "1d9c89bd1f6f92ab46f48ee5b3455bb9128f49103ccebc86244ba7cd91bb3963",
+    "transparent_address": "t1TVdjqU1APVQmCRRnzbqfjz6wR2qtBnnoc",
+    "responses": 21
+  },
+  "components": [
+    {
+      "name": "node",
+      "kind": "node-state",
+      "snapshot": "zinder-fx-m3593347-node-zebra-v29-20261122",
+      "project": "zfnd-dev-zinder",
+      "disk_size_gb": 512,
+      "filesystem": "ext4",
+      "mount_path": "/srv/node",
+      "paths": {
+        "zebra_cache": "."
+      },
+      "file_count": 18340,
+      "files_sha256": "9c278e4bd2d1775966ae4a77ac5f02a326fdb3d130e23036735b62154f43bb49",
+      "files_listing": "SHA256SUMS"
+    },
+    {
+      "name": "stores",
+      "kind": "stores",
+      "snapshot": "zinder-fx-m3593347-stores-905dac4e-20261122",
+      "project": "zfnd-dev-zinder",
+      "disk_size_gb": 2048,
+      "filesystem": "ext4-verity",
+      "mount_path": "/srv/gates",
+      "paths": {
+        "canonical": "canonical",
+        "wallet": "wallet",
+        "catalog": "catalog",
+        "publisher_key": "publisher.pub"
+      },
+      "file_count": 2700,
+      "files_sha256": "960e2f81fcc08d06e19917041b1ea7dc0c4abef82ffc598d2058be1c925b70b3",
+      "files_listing": "fixture.sha256",
+      "signed_history": {
+        "directory": "catalog",
+        "publisher_key": "publisher.pub",
+        "manifest_sha256": "8c484066261906c7dedb0a8f184ffb2663fd86eb5f143a563e6c7122d94364d5",
+        "publisher_key_sha256": "442d3d478e59ad218f57e4ac8ea6e8bb8291cc6c3d402f52f0af758e41c1dd22",
+        "segment_count": 877,
+        "highest_height": 3592192
+      }
+    }
+  ],
+  "off_host_copies": [
+    {
+      "kind": "oracle",
+      "location": "gs://zfnd-dev-zinder-wallet-fixtures/mainnet/z375-3593347/0596c14e4514081b06809cf43a552501fd4474b77e283bde16d2cb493bd9b979/response-windows.tar.zst#1795378282657050",
+      "manifest_sha256": "0596c14e4514081b06809cf43a552501fd4474b77e283bde16d2cb493bd9b979",
+      "bytes": 387053555
+    },
+    {
+      "kind": "node-state",
+      "location": "gs://zfnd-dev-zinder-fixture-backups/zinder/mainnet/20261122-m3593347-node-zebra-v29/",
+      "manifest_sha256": "eaa14ec280f7d80a0b85d6969a0fb70f9f8f387184addd8ff257d98ff0023078",
+      "bytes": 284178949592
+    }
+  ],
+  "created_at": "2026-11-23T01:35:00Z",
+  "notes": [
+    "Stores, wallet, and the signed catalog (877 fs-verity segments, heights 1 to 3,592,192) were built by #470 at 905dac4e; admission receipt integrated-primary-restore.json in the #470 evidence.",
+    "Canonical and wallet digests equal the v0.20.0 generation; the wallet sample digest is expected to match it too.",
+    "The private state bundle in gs://zfnd-dev-zinder-fixture-backups belongs to the v0.20.0 generation.",
+    "signed_history added for #490 from the #470 admission receipt (integrated-primary-restore.json): catalog_manifest_sha256, publisher_key_sha256, segment_count, and catalog.last.",
+    "stage_sha256 pins the #490 stage built from 6cd01968 with the pinned 905dac4e executables."
+  ],
+  "stage_sha256": "1f292608836279f8302b46c14569217fe8710b0210a44dc673699a027cac4e3d"
+}

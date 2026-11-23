@@ -60,6 +60,13 @@ pinned Zebra binary, `jq`, `grpcurl`, the guest scripts, and the protocol
 files. Build it once per release and upload it with its SHA-256. For a fixture
 with a catalog, set `stage_sha256` in `fixture.json` to that SHA-256.
 
+A stage built before the restore recorded a per-attempt outcome cannot be used
+with the current `restore-fixture.sh`, even for a fixture without a catalog.
+The older guest writes a single receipt file instead of the attempt outcome
+the workstation waits for, so the restore fails after the host is created,
+with a reason that says to rebuild the stage. Rebuild every stage from the
+current checkout, with the same binaries.
+
 ```bash
 scripts/mainnet-fixture/build-stage.sh --binaries .tmp/release-binaries/bin \
   --out .tmp/zfx-stage.tar.zst \
@@ -82,8 +89,9 @@ The script performs these steps:
 
 1. It checks the fixture, including its signed history and stage pin, that
    every component snapshot is `READY`, and that the stage has a published
-   SHA-256 equal to any pin. The receipt path and the path with `.failed`
-   added must not exist yet.
+   SHA-256 equal to any pin. The receipt path, with and without `.failed`
+   and `.reservation` added, must not exist yet, and the script reserves it
+   before it creates anything.
 2. It creates a `c4-standard-16` host with one thread per core, no service
    account, no external address, and a termination time. The default
    termination time is 12 hours, and `--hours` allows up to 36.
@@ -148,9 +156,12 @@ these hold:
   heights instead.
 - **Catalog end.** The catalog's last height, requested alone, adds no
   canonical reads. The height above it, requested alone, adds at least one
-  canonical MultiGet key. A live tail that already held that height would
-  fail this probe, never pass it; the restore makes no request that fills the
-  tail that far down.
+  canonical MultiGet key, which shows that the reader read storage rather
+  than a segment, not which code path built the response. A live tail that
+  already held that height would fail this probe, never pass it. Before the
+  probes, the wallet sample requests the 100 heights below the visible tip,
+  so for a catalog that ends within those heights the probe can fail and the
+  restore with it.
 - **Canonical control.** The covered range requested with explicit
   transparent, Sapling, and Orchard pools adds at least one MultiGet key per
   height. The reader serves any selection other than the default from
@@ -171,12 +182,26 @@ reports, without using them for its verdict, the canonical point lookups that
 the catalog follower's anchor check makes, and the segment pages present in
 the page cache after eviction advice. Page residency can stay unchanged after
 a correct read, or change because of unrelated reads, so it is supporting
-evidence only. The check evicts the catalog's pages, so a benchmark that
-starts right after a restore begins with a cold catalog.
+evidence only.
+
+The restore makes no promise about cache state. The check advises the kernel
+to drop the catalog's pages, but the kernel can keep them, as it does on
+tmpfs, and the probes, the wallet sample, and the hash read leave other
+pages of the catalog, the stores, and the node in memory. The reader's live
+tail also holds the top of the chain after the wallet sample. A benchmark
+that needs a cold or a warm start must establish that state itself and
+measure it before it records results.
+
+The workstation does not trust the report's own pass flags. It recomputes
+every part from the recorded measurements with the same predicates the check
+uses, and it accepts the guest's outcome only for this attempt and for the
+`--verify-hashes` mode and components requested.
 
 If any part fails, the guest stops the compatibility reader, and the restore
 exits with an error and writes the receipt path with `.failed` added, holding
-the failing step, the reason, and the guest's report.
+the failing step, the reason, and the guest's report. The restore reserves the
+receipt path before it creates the host, by writing the path with
+`.reservation` added, so two restores cannot share one receipt path.
 
 | Profile | Component disk IOPS | Component disk throughput |
 | --- | --- | --- |

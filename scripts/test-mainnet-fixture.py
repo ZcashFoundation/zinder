@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 
@@ -29,6 +30,11 @@ ROUTE = ROOT / 'guest' / 'route-check.py'
 STACK = ROOT / 'guest' / 'stack.sh'
 FIXTURE = json.loads((ROOT / 'testdata' / 'fixture-905dac4e-signed-history.json').read_text())
 OLD_RECEIPT = json.loads((ROOT / 'testdata' / 'guest-receipt-476-zfx476-d.json').read_text())
+# The fresh Mainnet restore of #490: its fixture, with the stage it pinned, and
+# the guest outcome it wrote, with every route measurement.
+GENUINE_FIXTURE = json.loads((ROOT / 'testdata' / 'fixture-905dac4e-signed-history-6cd01968.json').read_text())
+GENUINE_OUTCOME = json.loads((ROOT / 'testdata' / 'guest-outcome-fx490-m2.json').read_text())
+OUTCOME_SH = ROOT / 'guest' / 'outcome.sh'
 TICKERS = ('rocksdb.number.multiget.keys.read', 'rocksdb.number.multiget.bytes.read', 'rocksdb.db.iter.bytes.read',
            'rocksdb.number.db.seek', 'rocksdb.number.db.next', 'rocksdb.bytes.read',
            'rocksdb.block.cache.data.hit', 'rocksdb.block.cache.data.miss')
@@ -47,18 +53,44 @@ def run(command, **kwargs):
     return subprocess.run([str(c) for c in command], capture_output=True, text=True, **kwargs)
 
 
-def passing_route(fixture):
-    history = stores(fixture)['signed_history']
-    last = history['highest_height']
-    part = {'passed': True}
-    return {
-        'declared': True, 'proof': 'external', 'passed': True, 'failed': [],
-        'manifest_sha256': history['manifest_sha256'], 'publisher_key_sha256': history['publisher_key_sha256'],
-        'segment_count': history['segment_count'], 'first_height': 1, 'last_height': last,
-        'admission': {'passed': True, 'open_segment_files': history['segment_count'], 'matches_manifest': True},
-        'covered': dict(part, range=[1730000, 1730099]), 'boundary_last': dict(part, range=[last, last]),
-        'boundary_next': dict(part, range=[last + 1, last + 1]), 'canonical_control': dict(part),
-        'refusal': dict(part)}
+def copy(value):
+    return json.loads(json.dumps(value))
+
+
+def genuine_outcome(edit=None):
+    """The genuine guest outcome, optionally changed by edit(route, receipt)."""
+    outcome = copy(GENUINE_OUTCOME)
+    if edit:
+        edit(outcome['receipt']['signed_history'], outcome['receipt'])
+    return outcome
+
+
+def set_path(path, value):
+    def edit(route, receipt):
+        target = route
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+    return edit
+
+
+KEYS = 'rocksdb.number.multiget.keys.read'
+# Receipts that a part's own passed flag would accept, but whose measurements
+# or contents contradict the route.
+TAMPERED = {
+    'covered read 100 canonical keys': set_path(['covered', 'canonical_payload_read_delta', KEYS], 100),
+    'covered holds only passed': set_path(['covered'], {'passed': True}),
+    'covered bytes differ from the sample': set_path(['covered', 'matches_reference'], False),
+    'first height above the last': set_path(['first_height'], 3592193),
+    'last height read canonical storage': set_path(['boundary_last', 'canonical_payload_read_delta', KEYS], 1),
+    'height above the catalog read nothing': set_path(['boundary_next', 'canonical_payload_read_delta', KEYS], 0),
+    'control used the default pools': set_path(['canonical_control', 'pool_types'], None),
+    'control range differs': set_path(['canonical_control', 'range'], [1, 100]),
+    'wrong key was not refused': set_path(['refusal', 'exit_code'], 0),
+    'a payload counter is missing': lambda route, receipt: route['covered']['canonical_payload_read_delta'].pop('rocksdb.db.iter.bytes.read'),
+    'admission count differs': set_path(['admission', 'open_segment_files'], 876),
+    'covered heights incomplete': set_path(['covered', 'complete'], False),
+}
 
 
 class Workspace(unittest.TestCase):
@@ -89,7 +121,13 @@ case $cmd in
   *"/dev/stdin /root/.gcs-token"*) cat > /dev/null; exit 0 ;;
   *"tee /tmp/zfx-stage/fixture.json"*) cat > /dev/null; exit 0 ;;
   *systemd-run*) echo launch >> "$d/launches"; exit 0 ;;
-  *outcome.json*) if [[ -f $d/outcome.json ]]; then cat "$d/outcome.json"; else cat "$d/status" 2>/dev/null || echo RUNNING; fi; exit 0 ;;
+  *outcome.json*)
+    sleep "${STUB_STATUS_DELAY:-0}"
+    attempt=$(sed -E 's#.*/attempts/([^/ ]+)/outcome\.json.*#\1#' <<< "$cmd")
+    if [[ -f $d/outcome.json && -n ${STUB_KEEP_ATTEMPT:-} ]]; then cat "$d/outcome.json"
+    elif [[ -f $d/outcome.json ]]; then jq -c --arg a "$attempt" '.attempt = $a | if (.receipt | type) == "object" then .receipt.attempt = $a else . end' "$d/outcome.json"
+    else cat "$d/status" 2>/dev/null || echo RUNNING; fi
+    exit 0 ;;
   *journalctl*) echo "journal tail"; exit 0 ;;
 esac
 exit 1
@@ -103,22 +141,27 @@ exit 1
         (self.bin / 'gcloud').chmod(0o755)
         self.stub = self.tmp / 'stub'
         self.stub.mkdir()
-        (self.stub / 'stage.sha256').write_text(FIXTURE['stage_sha256'] + '\n')
+        (self.stub / 'stage.sha256').write_text(GENUINE_FIXTURE['stage_sha256'] + '\n')
 
-    def restore(self, fixture=FIXTURE, outcome=None, status=None, extra=(), receipt=None, hide_jsonschema=False):
+    def restore(self, fixture=GENUINE_FIXTURE, outcome=None, status=None, extra=(), receipt=None, hide_jsonschema=False,
+                env_extra=None, stub=None):
+        stub = stub or self.stub
         if outcome is not None:
-            write_json(self.stub / 'outcome.json', outcome)
+            write_json(stub / 'outcome.json', outcome)
         if status is not None:
-            (self.stub / 'status').write_text(status + '\n')
+            (stub / 'status').write_text(status + '\n')
         if hide_jsonschema:
             python = self.bin / 'python3'
             python.write_text('#!/bin/sh\ncase "$*" in *jsonschema*) exit 1 ;; esac\nexec %s "$@"\n' % sys.executable)
             python.chmod(0o755)
         receipt = receipt or self.tmp / 'receipt.json'
-        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', STUB_DIR=str(self.stub))
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', STUB_DIR=str(stub), **(env_extra or {}))
         done = run([RESTORE, '--fixture', write_json(self.tmp / 'fixture.json', fixture), '--stage', 'gs://stub/stage.tar.zst',
                     '--name', 'fx490-test', '--receipt', receipt, '--poll-seconds', '1', *extra], env=env, timeout=600)
         return done, receipt
+
+    def failure(self, receipt):
+        return json.loads(Path(f'{receipt}.failed').read_text())
 
     def launches(self):
         path = self.stub / 'launches'
@@ -148,37 +191,69 @@ exit 1
         self.assertEqual(self.launches(), 0)
 
     def test_catalog_fixture_without_stage_pin_is_refused(self):
-        fixture = json.loads(json.dumps(FIXTURE))
+        fixture = copy(GENUINE_FIXTURE)
         del fixture['stage_sha256']
         done, _ = self.restore(fixture=fixture)
         self.assertEqual(done.returncode, 1)
         self.assertIn('must pin stage_sha256', done.stderr)
 
-    def test_passing_route_proof_is_accepted(self):
-        receipt_body = dict(OLD_RECEIPT, signed_history=passing_route(FIXTURE))
-        done, receipt = self.restore(outcome={'status': 'succeeded', 'receipt': receipt_body})
+    def test_genuine_route_proof_is_accepted(self):
+        """Finding 1 of the re-check: the positive case carries the real Mainnet measurements."""
+        done, receipt = self.restore(outcome=genuine_outcome())
         self.assertEqual(done.returncode, 0, done.stderr)
         written = json.loads(receipt.read_text())
         self.assertTrue(written['accepted'])
-        self.assertEqual(written['guest']['signed_history']['last_height'], 3592192)
+        route = written['guest']['signed_history']
+        self.assertEqual(route['covered']['canonical_payload_read_delta'][KEYS], 0)
+        self.assertEqual(route['canonical_control']['canonical_payload_read_delta'][KEYS], 119)
+        self.assertEqual(written['guest']['attempt'], written['attempt'])
         self.assertEqual(self.launches(), 1)
+
+    def test_tampered_measurements_are_rejected(self):
+        """Re-check item 1: the workstation judges the measurements, not the passed flags."""
+        for name, edit in TAMPERED.items():
+            with self.subTest(name=name):
+                receipt = self.tmp / f'receipt-{len(name)}-{abs(hash(name))}.json'
+                done, _ = self.restore(outcome=genuine_outcome(edit), receipt=receipt)
+                self.assertEqual(done.returncode, 1, name)
+                self.assertFalse(receipt.exists())
+                self.assertEqual(self.failure(receipt)['workstation_step'], 'accept')
 
     def test_route_proof_must_match_the_fixture(self):
         for field, value in (('manifest_sha256', '0' * 64), ('segment_count', 876), ('last_height', 3592191)):
             with self.subTest(field=field):
-                route = dict(passing_route(FIXTURE), **{field: value})
                 receipt = self.tmp / f'receipt-{field}.json'
-                done, _ = self.restore(outcome={'status': 'succeeded', 'receipt': dict(OLD_RECEIPT, signed_history=route)},
-                                       receipt=receipt)
+                done, _ = self.restore(outcome=genuine_outcome(set_path([field], value)), receipt=receipt)
                 self.assertEqual(done.returncode, 1)
                 self.assertIn(field, Path(f'{receipt}.failed').read_text())
 
-    def test_failed_route_report_fails(self):
-        route = dict(passing_route(FIXTURE), passed=False, failed=['boundary_next'])
-        route['boundary_next'] = dict(route['boundary_next'], passed=False)
-        done, receipt = self.restore(outcome={'status': 'succeeded', 'receipt': dict(OLD_RECEIPT, signed_history=route)})
+    def test_receipt_must_belong_to_this_attempt(self):
+        """Re-check item 2: a genuine receipt from another attempt is refused."""
+        done, receipt = self.restore(outcome=genuine_outcome(), env_extra={'STUB_KEEP_ATTEMPT': '1'})
         self.assertEqual(done.returncode, 1)
-        self.assertIn('boundary_next', Path(f'{receipt}.failed').read_text())
+        self.assertIn('fx490-m2-20261123T104101Z-169', self.failure(receipt)['reason'])
+
+    def test_verification_mode_must_match(self):
+        """Re-check item 2: a stores-only receipt does not satisfy --verify-hashes all."""
+        done, receipt = self.restore(outcome=genuine_outcome(), extra=['--verify-hashes', 'all'])
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('--verify-hashes all', self.failure(receipt)['reason'])
+
+    def test_wallet_listing_digest_must_match(self):
+        """Re-check item 2: the receipt's sample listing must be the one the fixture pins."""
+        def edit(route, receipt):
+            receipt['wallet_sample_sha256sums_sha256'] = '0' * 64
+        done, receipt = self.restore(outcome=genuine_outcome(edit))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('wallet sample listing', self.failure(receipt)['reason'])
+
+    def test_failed_route_report_fails(self):
+        def edit(route, receipt):
+            route.update(passed=False, failed=['boundary_next'])
+            route['boundary_next']['passed'] = False
+        done, receipt = self.restore(outcome=genuine_outcome(edit))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('failure its measurements do not explain', Path(f'{receipt}.failed').read_text())
 
     def test_failed_guest_outcome_is_recorded(self):
         """Finding 5: a guest failure leaves a nonempty failure receipt with the step."""
@@ -194,6 +269,41 @@ exit 1
         self.assertEqual(done.returncode, 1)
         self.assertIn('did not finish within 2 seconds', Path(f'{receipt}.failed').read_text())
 
+    def test_blocked_status_call_respects_the_deadline(self):
+        """Re-check item 3: a status call that blocks past the deadline is cut off and fails."""
+        started = time.monotonic()
+        done, receipt = self.restore(outcome=genuine_outcome(), extra=['--guest-timeout', '2'],
+                                     env_extra={'STUB_STATUS_DELAY': '30'})
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(receipt.exists())
+        self.assertIn('did not finish within 2 seconds', self.failure(receipt)['reason'])
+
+    def test_concurrent_restores_reserve_the_receipt_path(self):
+        """Re-check item 4: of two restores given one path, only one proceeds."""
+        receipt = self.tmp / 'shared.json'
+        stubs = []
+        for label, outcome in (('a', genuine_outcome()), ('b', {'status': 'failed', 'step': 'check_history', 'reason': 'stub', 'receipt': None})):
+            stub = self.tmp / f'stub-{label}'
+            stub.mkdir()
+            (stub / 'stage.sha256').write_text(GENUINE_FIXTURE['stage_sha256'] + '\n')
+            write_json(stub / 'outcome.json', outcome)
+            stubs.append(stub)
+        fixture = write_json(self.tmp / 'fixture.json', GENUINE_FIXTURE)
+        processes = [subprocess.Popen([str(RESTORE), '--fixture', str(fixture), '--stage', 'gs://stub/stage.tar.zst',
+                                       '--name', f'fx490-{i}', '--receipt', str(receipt), '--poll-seconds', '1'],
+                                      env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', STUB_DIR=str(stub),
+                                               STUB_STATUS_DELAY='1'),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for i, stub in enumerate(stubs)]
+        results = [(p.wait(timeout=600), p.stderr.read()) for p in processes]
+        refused = [i for i, (_, err) in enumerate(results) if 'holds this receipt path' in err or 'already exists' in err]
+        self.assertEqual(len(refused), 1, results)
+        self.assertFalse((stubs[refused[0]] / 'calls').exists())
+        self.assertNotEqual(receipt.exists(), Path(f'{receipt}.failed').exists())
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir() if p.name.startswith('shared.json')),
+                         sorted(['shared.json.reservation', 'shared.json' if receipt.exists() else 'shared.json.failed']))
+
     def test_existing_receipt_path_is_refused(self):
         """Finding 5: an old success at the receipt path cannot survive a later failure."""
         receipt = self.tmp / 'receipt.json'
@@ -207,7 +317,7 @@ exit 1
         """Finding 2: the mandatory preflight, not the optional schema check, refuses it."""
         for value in (False, 'catalog', None):
             with self.subTest(value=value):
-                fixture = json.loads(json.dumps(FIXTURE))
+                fixture = copy(GENUINE_FIXTURE)
                 stores(fixture)['signed_history'] = value
                 done, _ = self.restore(fixture=fixture, hide_jsonschema=True, receipt=self.tmp / f'r-{value}.json')
                 self.assertEqual(done.returncode, 1)
@@ -216,20 +326,53 @@ exit 1
 
     def test_catalog_ending_at_the_settled_tip_is_accepted(self):
         """Finding 4: only the visible tip bounds the catalog."""
-        fixture = json.loads(json.dumps(FIXTURE))
+        fixture = copy(GENUINE_FIXTURE)
         stores(fixture)['signed_history']['highest_height'] = fixture['chain']['settled_height']
-        route = passing_route(fixture)
-        done, _ = self.restore(fixture=fixture, outcome={'status': 'succeeded', 'receipt': dict(OLD_RECEIPT, signed_history=route)})
+        done = run([sys.executable, '-I', GATE, 'preflight', write_json(self.tmp / 'settled.json', fixture)])
         self.assertEqual(done.returncode, 0, done.stderr)
+        stores(fixture)['signed_history']['highest_height'] = fixture['chain']['visible_height']
+        done = run([sys.executable, '-I', GATE, 'preflight', write_json(self.tmp / 'visible.json', fixture)])
+        self.assertEqual(done.returncode, 1)
 
-    def test_fixture_without_a_catalog_accepts_a_receipt_without_a_route(self):
-        fixture = json.loads(json.dumps(FIXTURE))
+    def no_catalog_fixture(self):
+        fixture = copy(GENUINE_FIXTURE)
         component = stores(fixture)
         del component['signed_history']
         for key in ('catalog', 'publisher_key'):
             del component['paths'][key]
-        done, _ = self.restore(fixture=fixture, outcome={'status': 'succeeded', 'receipt': OLD_RECEIPT})
+        return fixture
+
+    def test_fixture_without_a_catalog_accepts_a_receipt_without_a_route(self):
+        done, _ = self.restore(fixture=self.no_catalog_fixture(), outcome={'status': 'succeeded', 'receipt': OLD_RECEIPT})
         self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_old_stage_for_a_no_catalog_fixture_names_the_migration(self):
+        """Re-check item 7: an older stage writes no attempt outcome; the failure says to rebuild it."""
+        done, receipt = self.restore(fixture=self.no_catalog_fixture(), status='GONE')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('rebuild the stage', self.failure(receipt)['reason'])
+
+
+class GenuineReplay(Workspace):
+    """fixture-gate.py accept replays the fresh Mainnet outcome and its tampered variants."""
+
+    def accept(self, outcome, attempt=GENUINE_OUTCOME['attempt'], verify='stores'):
+        return run([sys.executable, '-I', GATE, 'accept', write_json(self.tmp / 'fixture.json', GENUINE_FIXTURE),
+                    write_json(self.tmp / 'outcome.json', outcome), attempt, verify])
+
+    def test_genuine_outcome_passes(self):
+        done = self.accept(genuine_outcome())
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_tampered_outcomes_fail(self):
+        for name, edit in TAMPERED.items():
+            with self.subTest(name=name):
+                done = self.accept(genuine_outcome(edit))
+                self.assertEqual(done.returncode, 1, name)
+
+    def test_request_binding(self):
+        self.assertEqual(self.accept(genuine_outcome(), attempt='fx490-other').returncode, 1)
+        self.assertEqual(self.accept(genuine_outcome(), verify='all').returncode, 1)
 
 
 def make_catalog(directory, first, blocks_per_segment, segments):
@@ -366,8 +509,11 @@ class RouteCheck(Workspace):
 
     def setUp(self):
         super().setUp()
-        self.mount = self.tmp / 'mount'
-        manifest, self.last = make_catalog(self.mount / 'catalog', 1000, 50, 3)
+        self.build(self.tmp / 'mount', 1000)
+
+    def build(self, mount, first):
+        self.mount = mount
+        manifest, self.last = make_catalog(self.mount / 'catalog', first, 50, 3)
         key = os.urandom(32)
         (self.mount / 'publisher.pub').write_bytes(key)
         self.fixture = catalog_fixture(self.mount, manifest, key, self.last, 3, self.last + 500)
@@ -385,7 +531,7 @@ class RouteCheck(Workspace):
         fake = FakeReader(self.tmp, self.bounds['first_height'], self.last, files, **reader)
         self.addCleanup(fake.close)
         out = self.tmp / 'route'
-        extra = ['--reference-range', reference[0], '--reference', reference[1]] if reference else []
+        extra = ['--sample-reference', reference] if reference else []
         done = run([sys.executable, '-I', ROUTE, '--grpc', 'fake:0', '--ops', fake.ops, '--pid', fake.process.pid,
                     '--bounds', self.tmp / 'bounds.json', '--tip', self.last + 500, '--out', out,
                     '--refusal-binary', self.refusal, '--refusal-config', '/dev/null', '--refusal-timeout', '120', *extra],
@@ -393,7 +539,8 @@ class RouteCheck(Workspace):
         return done, json.loads((out / 'route-check.json').read_text())
 
     def gate(self, report):
-        return run([sys.executable, '-I', GATE, 'route-verdict', write_json(self.tmp / 'report.json', report)])
+        return run([sys.executable, '-I', GATE, 'route-verdict', self.tmp / 'f.json', self.tmp / 'bounds.json',
+                    write_json(self.tmp / 'report.json', report)])
 
     def test_correct_reader_passes_without_page_residency(self):
         """Finding 6: the verdict rests on counters; the fake reader never reads segment pages."""
@@ -445,15 +592,17 @@ class RouteCheck(Workspace):
         self.assertNotIn('canonical_payload_reads', report['covered'])
 
     def test_reference_bytes_are_compared(self):
+        self.build(self.tmp / 'mount-sample', 1729950)
         reference = self.tmp / 'reference.json'
         reference.write_text('not the response')
-        done, report = self.check(reference=('1000:1099', reference))
+        done, report = self.check(reference=reference)
+        self.assertEqual(report['covered']['range'], [1730000, 1730099])
         self.assertIn('covered', report['failed'])
         self.assertFalse(report['covered']['matches_reference'])
 
     def test_reference_outside_the_catalog_falls_back_to_its_first_heights(self):
         """Finding 4: a catalog that starts above the sample range still gets a covered probe."""
-        done, report = self.check(reference=('1730000:1730099', self.tmp / 'unused.json'))
+        done, report = self.check(reference=self.tmp / 'unused.json')
         self.assertEqual(done.returncode, 0, report)
         self.assertEqual(report['covered']['range'], [1000, 1099])
         self.assertIsNone(report['covered']['byte_reference'])
@@ -470,7 +619,7 @@ class RouteCheck(Workspace):
         """Finding 7: a report that says passed but lacks a part does not pass."""
         report = {'proof': 'external', 'passed': True, 'failed': [], 'admission': {'passed': True}}
         self.assertEqual(self.gate(report).returncode, 1)
-        unreadable = run([sys.executable, '-I', GATE, 'route-verdict', self.tmp / 'missing.json'])
+        unreadable = run([sys.executable, '-I', GATE, 'route-verdict', self.tmp / 'f.json', self.tmp / 'bounds.json', self.tmp / 'missing.json'])
         self.assertEqual(unreadable.returncode, 1)
 
 
@@ -510,6 +659,51 @@ class GuestEarlyExit(Workspace):
         done, outcome = self.guest(FIXTURE, 'a2')
         self.assertEqual((outcome['status'], outcome['step']), ('failed', 'launch'))
         self.assertIn('already ran attempt a1', outcome['reason'])
+
+
+@unittest.skipIf(os.geteuid() == 0, 'file permissions do not bind root')
+class GuestOutcome(Workspace):
+    """outcome.sh, as restore-guest.sh sources it, records success only once it is on disk."""
+
+    SCRIPT = r'''set -euo pipefail
+out=$1 attempt=a1 step=verdict finished=false serving_started=true
+log() { :; }
+source "$2"
+trap on_exit EXIT
+echo '{"fixture_id": "x"}' > "$out/receipt.json.partial"
+[[ -z ${READ_ONLY:-} ]] || chmod 0555 "$out"
+finish_success "$out/receipt.json.partial"
+echo reached-the-end
+'''
+
+    def finish(self, read_only):
+        out = self.tmp / 'attempt'
+        out.mkdir()
+        stub = self.tmp / 'bin'
+        stub.mkdir()
+        (stub / 'systemctl').write_text(f'#!/bin/sh\necho "$*" >> {self.tmp}/systemctl.log\n')
+        (stub / 'systemctl').chmod(0o755)
+        script = write_json(self.tmp / 'x', None).with_name('finish.sh')
+        script.write_text(self.SCRIPT)
+        env = dict(os.environ, PATH=f'{stub}:{os.environ["PATH"]}', **({'READ_ONLY': '1'} if read_only else {}))
+        done = run(['bash', script, out, OUTCOME_SH], env=env)
+        out.chmod(0o755)
+        stops = (self.tmp / 'systemctl.log').read_text() if (self.tmp / 'systemctl.log').exists() else ''
+        return done, out, stops
+
+    def test_success_is_recorded_without_stopping_the_reader(self):
+        done, out, stops = self.finish(read_only=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads((out / 'outcome.json').read_text())['status'], 'succeeded')
+        self.assertEqual(stops, '')
+
+    def test_failed_success_write_stops_the_reader(self):
+        """Re-check item 5: if the success outcome cannot be written, the exit trap still stops the reader."""
+        done, out, stops = self.finish(read_only=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn('reached-the-end', done.stdout)
+        self.assertFalse((out / 'outcome.json').exists())
+        self.assertIn('stop zfx-fixture-compat', stops)
 
 
 class StackConfig(Workspace):
