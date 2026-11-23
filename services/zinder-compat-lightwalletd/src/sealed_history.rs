@@ -372,30 +372,32 @@ impl SealedHistory {
         let len = relative_frame_offset(last, first_frame)?
             .checked_add(last.len)
             .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
-        let mut out = Vec::with_capacity(selected.len());
+        let mut plan = Vec::new();
         if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
-            let mut slab = vec![0; len];
-            read_exact_at(&self.file, &mut slab, first_frame)?;
-            self.append_slab(&mut out, selected, slab)?;
+            plan.push((selected, len));
         } else {
-            let mut slabs = Vec::new();
             let mut start = 0;
             let mut bytes = 0;
             for (index, row) in selected.iter().enumerate() {
                 let frame_len = LENGTHS_LEN + row.len;
                 if bytes != 0 && bytes + frame_len > SLAB_TARGET_BYTES {
-                    slabs.push((&selected[start..index], vec![0; bytes]));
+                    plan.push((&selected[start..index], bytes));
                     start = index;
                     bytes = 0;
                 }
                 bytes += frame_len;
             }
-            slabs.push((&selected[start..], vec![0; bytes]));
-            let buffers = slabs.iter_mut().map(|(_, slab)| slab.as_mut_slice());
-            read_slabs_at(&self.file, buffers, first_frame)?;
-            for (rows, slab) in slabs {
-                self.append_slab(&mut out, rows, slab)?;
-            }
+            plan.push((&selected[start..], bytes));
+        }
+        let mut offset = first_frame;
+        let mut slabs = Vec::with_capacity(plan.len());
+        for (rows, len) in plan {
+            slabs.push((rows, read_slab_at(&self.file, len, offset)?));
+            offset += len as u64;
+        }
+        let mut out = Vec::with_capacity(selected.len());
+        for (rows, slab) in slabs {
+            self.append_slab(&mut out, rows, slab)?;
         }
         Ok(out)
     }
@@ -450,51 +452,34 @@ fn verify_and_build_block(
     })
 }
 
-#[cfg(target_os = "linux")]
-fn read_slabs_at<'a>(
-    file: &File,
-    buffers: impl Iterator<Item = &'a mut [u8]>,
-    mut offset: u64,
-) -> io::Result<()> {
-    use std::io::IoSliceMut;
+/// Reads `len` bytes at `offset` into a new slab.
+#[cfg(unix)]
+fn read_slab_at(file: &File, len: usize, mut offset: u64) -> io::Result<Vec<u8>> {
+    use rustix::{
+        buffer::spare_capacity,
+        io::{pread, retry_on_intr},
+    };
 
-    use rustix::io::{preadv, retry_on_intr};
-
-    let mut buffers: Vec<_> = buffers.map(IoSliceMut::new).collect();
-    let mut remaining = buffers.as_mut_slice();
-    while !remaining.is_empty() {
-        // rustix caps each preadv at the platform iovec limit.
-        let count = retry_on_intr(|| preadv(file, remaining, offset))?;
+    let mut slab = Vec::with_capacity(len);
+    while slab.len() < len {
+        // Reading into spare capacity spares the slab a zero fill that the read
+        // would overwrite.
+        let count = retry_on_intr(|| pread(file, spare_capacity(&mut slab), offset))?;
         if count == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        IoSliceMut::advance_slices(&mut remaining, count);
         offset += count as u64;
     }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_slabs_at<'a>(
-    file: &File,
-    buffers: impl Iterator<Item = &'a mut [u8]>,
-    mut offset: u64,
-) -> io::Result<()> {
-    for buffer in buffers {
-        read_exact_at(file, buffer, offset)?;
-        offset += buffer.len() as u64;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
+    // A capacity above `len` may read bytes past the slab.
+    slab.truncate(len);
+    Ok(slab)
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+fn read_slab_at(file: &File, len: usize, mut offset: u64) -> io::Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
+    let mut slab = vec![0; len];
+    let mut buffer = slab.as_mut_slice();
     while !buffer.is_empty() {
         let count = file.seek_read(buffer, offset)?;
         if count == 0 {
@@ -503,7 +488,7 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Res
         offset += count as u64;
         buffer = &mut buffer[count..];
     }
-    Ok(())
+    Ok(slab)
 }
 
 fn validate_lengths(native_bytes: usize, payload_len: usize) -> io::Result<()> {
