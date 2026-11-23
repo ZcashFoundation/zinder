@@ -221,8 +221,11 @@ the load client.
 
 ## Check the result
 
-The script exits with an error if any check fails. The receipt then exists
-only with a `.failed` suffix. On success, the receipt shows the served tip,
+The script exits with an error if any check fails. Once it has reserved the
+receipt path, including for a failed fixture check, snapshot lookup, or stage
+pin, the receipt then exists only with a `.failed` suffix, which names the
+failing step, the reason, and the attempt recorded in the reservation. A
+retry needs a new `--receipt` path. On success, the receipt shows the served tip,
 `wallet_sample_matches_fixture`, and the route proof:
 
 ```bash

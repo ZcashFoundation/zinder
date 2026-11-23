@@ -106,7 +106,7 @@ class WorkstationRestore(Workspace):
 d=$STUB_DIR
 printf '%s\n' "$*" >> "$d/calls"
 case "$1 $2" in
-  "compute snapshots") echo READY; exit 0 ;;
+  "compute snapshots") [[ -z ${STUB_SNAPSHOT_MISSING:-} ]] || exit 1; echo READY; exit 0 ;;
   "storage cat") cat "$d/stage.sha256"; exit 0 ;;
   "compute images") echo https://example.invalid/image; exit 0 ;;
   "compute instances") exit 0 ;;
@@ -185,10 +185,32 @@ exit 1
     def test_stage_pin_rejects_another_stage(self):
         """Finding 1: a catalog fixture pins its stage."""
         (self.stub / 'stage.sha256').write_text('6' * 64 + '\n')
-        done, _ = self.restore(outcome={'status': 'succeeded', 'receipt': OLD_RECEIPT})
+        done, receipt = self.restore(outcome={'status': 'succeeded', 'receipt': OLD_RECEIPT})
         self.assertEqual(done.returncode, 1)
         self.assertIn('the fixture pins', done.stderr)
         self.assertEqual(self.launches(), 0)
+        self.assert_early_failure(receipt, 'the fixture pins')
+
+    def test_snapshot_lookup_failure_writes_a_failure_receipt(self):
+        """Review summary item 1: a preflight failure after the reservation still leaves a failure receipt."""
+        done, receipt = self.restore(outcome=genuine_outcome(), env_extra={'STUB_SNAPSHOT_MISSING': '1'})
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('not found', done.stderr)
+        self.assert_early_failure(receipt, 'not found')
+
+    def assert_early_failure(self, receipt, reason):
+        """FILE.failed names the step, the reason, and the attempt that holds the reservation, and the path is not reused."""
+        failed = self.failure(receipt)
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(failed['workstation_step'], 'preflight')
+        self.assertIn(reason, failed['reason'])
+        reservation = Path(f'{receipt}.reservation').read_text().strip()
+        self.assertEqual(failed['attempt'], reservation)
+        self.assertFalse(receipt.exists())
+        again, _ = self.restore(outcome=genuine_outcome(), receipt=receipt)
+        self.assertEqual(again.returncode, 1)
+        self.assertIn('already exists', again.stderr)
+        self.assertEqual(self.failure(receipt), failed)
 
     def test_catalog_fixture_without_stage_pin_is_refused(self):
         fixture = copy(GENUINE_FIXTURE)
@@ -600,7 +622,9 @@ class RouteCheck(Workspace):
         self.assertEqual(report['boundary_last']['range'], [self.last, self.last])
         self.assertEqual(report['boundary_next']['range'], [self.last + 1, self.last + 1])
         self.assertEqual(report['covered']['range'], [1000, 1099])
-        self.assertEqual(report['covered']['supporting_segment_resident_bytes'], [0, 0])
+        # Residency is supporting evidence; tmpfs, for one, keeps pages after eviction advice.
+        residency = report['covered']['supporting_segment_resident_bytes']
+        self.assertTrue(len(residency) == 2 and all(isinstance(v, int) and v >= 0 for v in residency), residency)
         self.assertEqual(report['manifest_sha256'], self.bounds['manifest_sha256'])
         self.assertEqual(report['proof'], 'external')
 

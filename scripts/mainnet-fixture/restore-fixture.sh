@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
-die() { echo "restore-fixture: $*" >&2; exit 1; }
+die() { fail_reason="$*"; echo "restore-fixture: $*" >&2; exit 1; }
 [[ -n $fixture && -n $stage && -n $name ]] || { usage >&2; exit 2; }
 [[ -f $fixture ]] || die "fixture file $fixture not found"
 [[ $name =~ ^[a-z][a-z0-9-]{0,61}$ ]] || die "--name must be a lowercase GCP instance name"
@@ -81,6 +81,17 @@ attempt=$name-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 [[ ! -e $receipt && ! -e $receipt.failed ]] || die "$receipt or $receipt.failed already exists; choose a new --receipt path"
 ( set -o noclobber; printf '%s\n' "$attempt" > "$receipt.reservation" ) 2>/dev/null \
   || die "$receipt.reservation exists: another restore holds this receipt path; choose a new --receipt path"
+# From the reservation on, every failure leaves FILE.failed with the step and
+# the reason. The path stays used: a retry needs a new --receipt path.
+finished=false current=reserve
+fail_receipt() {
+  local step=$1 reason=$2 outcome=${3:-null}
+  jq -e . >/dev/null 2>&1 <<< "$outcome" || outcome=null
+  jq -n --arg attempt "$attempt" --arg step "$step" --arg reason "$reason" --argjson outcome "$outcome" \
+    '{status: "failed", attempt: $attempt, workstation_step: $step, reason: $reason, guest_outcome: $outcome}' > "$receipt.failed.$attempt.partial"
+  mv "$receipt.failed.$attempt.partial" "$receipt.failed"
+}
+trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "$current" "${fail_reason:-restore-fixture.sh exited early}"' EXIT
 
 # Every cloud call ends: a gcloud or ssh call that runs longer than
 # call_seconds is killed and fails with 124.
@@ -151,16 +162,6 @@ stage_sha=$(gc storage cat "$stage.sha256" | awk '{print $1}')
 want_stage=$(jq -r '.stage_sha256 // empty' "$fixture")
 [[ -z $want_stage || $stage_sha == "$want_stage" ]] || die "stage $stage is $stage_sha; the fixture pins $want_stage"
 
-# From here on, every failure leaves FILE.failed with the reason.
-finished=false
-fail_receipt() {
-  local step=$1 reason=$2 outcome=${3:-null}
-  jq -e . >/dev/null 2>&1 <<< "$outcome" || outcome=null
-  jq -n --arg attempt "$attempt" --arg step "$step" --arg reason "$reason" --argjson outcome "$outcome" \
-    '{status: "failed", attempt: $attempt, workstation_step: $step, reason: $reason, guest_outcome: $outcome}' > "$receipt.failed.$attempt.partial"
-  mv "$receipt.failed.$attempt.partial" "$receipt.failed"
-}
-trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"' EXIT
 mark create_host
 labels="purpose=benchmark-fixture,issue=476,fixture=$(jq -r .fixture_id "$fixture" | tr '.' '-' | cut -c1-63)"
 disk_args=()
@@ -220,7 +221,7 @@ fi
 gssh_deadline=""
 mark accept
 guest_file=$(mktemp) outcome_file=$(mktemp)
-trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"; rm -f "$guest_file" "$outcome_file"' EXIT
+trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "$current" "${fail_reason:-restore-fixture.sh exited early}"; rm -f "$guest_file" "$outcome_file"' EXIT
 printf '%s\n' "$outcome" > "$outcome_file"
 jq .receipt "$outcome_file" > "$guest_file"
 # The outcome must belong to this attempt and this verification request, and
