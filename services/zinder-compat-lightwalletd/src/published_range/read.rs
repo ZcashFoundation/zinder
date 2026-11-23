@@ -98,14 +98,16 @@ impl PublishedRangeRead {
         }
     }
 
-    /// Signed files can serve the default shielded projection through the
-    /// catalog's last height.
+    /// Signed reads start inside the catalog or descend into it from a
+    /// contiguous live tail. Other chunks use the canonical reader or tail.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
         self.shape == CompactBlockShape::DEFAULT_RANGE
-            && self
-                .history
-                .as_ref()
-                .is_some_and(|catalog| chunk.start <= catalog.bounds().end)
+            && self.history.as_ref().is_some_and(|catalog| {
+                let coverage = catalog.bounds();
+                chunk.start <= coverage.end
+                    && (coverage.start <= chunk.start
+                        || (self.is_descending && coverage.end < chunk.end))
+            })
     }
 
     fn order(&self) -> HeightOrder {
@@ -480,10 +482,7 @@ impl PublishedRangeRead {
         if cancel.is_cancelled() {
             return cancelled_outcome(Some(started.elapsed()));
         }
-        let touches_disk = self
-            .history
-            .as_ref()
-            .is_some_and(|catalog| chunk.start <= catalog.bounds().end);
+        let touches_disk = self.reads_published_files(chunk);
         if !touches_disk && let Some(live) = tail.as_deref() {
             let rows = live.select(chunk, order, max_bytes, true);
             return finish_encoded_rows(epoch, Some(started.elapsed()), Ok(rows), &cancel, convert);

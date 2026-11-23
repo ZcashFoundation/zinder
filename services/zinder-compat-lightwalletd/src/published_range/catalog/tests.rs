@@ -45,10 +45,14 @@ impl Fixture {
     }
 
     fn publisher(&self) -> io::Result<ShieldedCatalogPublisher> {
+        self.publisher_from(BlockHeight::new(1))
+    }
+
+    fn publisher_from(&self, first: BlockHeight) -> io::Result<ShieldedCatalogPublisher> {
         ShieldedCatalogPublisher::open(
             self.directory.path(),
             &self.private,
-            BlockHeight::new(1),
+            first,
             NonZeroU32::new(2).ok_or_else(|| invalid("invalid fixture width"))?,
         )
     }
@@ -1399,8 +1403,8 @@ async fn stream_published(
 }
 
 #[tokio::test]
-async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is_held() -> Result<()>
-{
+async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_permit_is_held()
+-> Result<()> {
     use std::time::Duration;
     const TIP: u32 = 2_100;
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
@@ -1456,6 +1460,7 @@ async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is
         vec![span(1_101, 2_100), span(1_000, 1_100)]
     );
     assert_eq!(*reads.native.lock(), vec![span(1, 6), span(1_000, 1_015)]);
+    below_catalog_streams_without_permits(&methods, &reads, prompt).await?;
 
     let queued = Duration::from_millis(200);
     for range in [
@@ -1480,5 +1485,36 @@ async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is
                 .await??;
         assert_eq!(frames, expected);
     }
+    Ok(())
+}
+
+async fn below_catalog_streams_without_permits(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    prompt: std::time::Duration,
+) -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = BlockHeight::new(1_000);
+    assert!(
+        fixture
+            .publisher_from(first)?
+            .publish_next(reads.slot.capture().as_ref())?
+    );
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds().start, first);
+    let before = reads.native.lock().len();
+    for (start, end) in [(1, 16), (16, 1)] {
+        let frames = tokio::time::timeout(
+            prompt,
+            stream_published(methods, reads, &catalog, (start, end, Vec::new())),
+        )
+        .await??;
+        assert_eq!(frames, 16);
+    }
+    let expected = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
+    assert_eq!(
+        reads.native.lock().get(before..),
+        Some([expected; 2].as_slice())
+    );
     Ok(())
 }
