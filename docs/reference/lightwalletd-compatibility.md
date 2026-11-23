@@ -25,8 +25,7 @@ Select the [light-wallet profile](configuration.md#light-wallet-profile) to conf
 
 - `wallet` serves every method in the table below. It reads the canonical store and the wallet store as one consistent pair and needs ingest to retain transaction blobs (`raw_blob_policy` of `transactions` or `all`); with `none`, the process fails before it binds its listener. It uses `[node]` and `[node_fallbacks.N]` only for `SendTransaction` and `GetStandardFee`, and connects to ingest control for the mempool methods.
 - `compact-blocks` serves `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the canonical store and answers them as wallet serving does, except that `taddrSupport` is `false`. Every other method except `Ping` returns `UNIMPLEMENTED`. It never contacts a node, so it refuses to start with a `[wallet]` section, a `[node]` or `[node_fallbacks.N]` section, `--node-json-rpc-addr`, or any `ZINDER_NODE__*` or `ZINDER_NODE_FALLBACKS__*` variable.
-
-- `light-wallet` serves the wallet methods from the canonical store, ingest control, and one configured node. The node handles transparent address reads and supplies transaction bodies when the store omits them. Mined transaction bodies are verified against the local canonical location and replay-derived digest. Transparent address history is bounded to the captured tip and best-effort. See [Light-wallet serving qualification](../runbooks/testing.md#light-wallet-serving-qualification) for request limits and failure behavior.
+- `light-wallet` serves the wallet methods from the canonical store, ingest control, and one configured node. The node handles transparent address reads, supplies omitted transaction bodies, accepts broadcasts, and provides the recommended fee. See [During a node outage](readiness.md#during-a-node-outage) for the behavior of the listener and its dependencies.
 
 By default, `Ping` is refused with `FAILED_PRECONDITION`, as reference lightwalletd refuses it. Setting `compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or `--ping-very-insecure`) makes it answer as `lightwalletd --ping-very-insecure` does. The response's `entry` and `exit` report the calls in flight, and the call sleeps `interval_us` microseconds, wrapping on overflow as Go's `time.Duration` does. Each call holds a server task as long as the client asks, so enable it only on a server under load test. A call still sleeping at shutdown ends with `UNAVAILABLE`.
 
@@ -55,7 +54,7 @@ Light-wallet serving supports the methods in the Wallet serving column, with nod
 | `GetStandardFee` | Served when a configured node implements `getstandardfee` | `UNIMPLEMENTED` | See [`GetStandardFee`](#getstandardfee) |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
 
-A handler that makes several storage reads pins them to the chain epoch of the tip it reads first, so one response never mixes two branches of a reorg. Block-range streams instead follow the chain, as described below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
+Local wallet reads that span several lookups use the chain epoch captured by the handler. Block-range streams follow the chain under the continuity rules below. Light-wallet's forwarded reads follow the method-specific checks below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
 
 ## Method behavior
 
@@ -90,7 +89,7 @@ While the writer's node is reachable, reports itself in sync, and has no block a
 
 A node counts as behind the network when Zebra's `/ready` reports `syncing`, `insufficient peers`, or `no tip`, which come from its peers and its syncer. Zebra's other not-ready reports, `tip_age=…` and `lag=…`, and both reports of the JSON-RPC health fallback are computed from how old the node's tip is. A quiet chain raises them too, so they do not stop the node vouching, and a node that has stalled but keeps one peer, which reports only `tip_age=…`, looks the same as a quiet chain. On Testnet and Regtest, Zebra's `/ready` reports ready unless `enforce_on_test_networks` is set. Without a node health probe, only the node's reachability and its tip count.
 
-The process reads the writer's status from ingest control every `storage.secondary_catchup_interval_ms`, 1 second by default. A writer that reaches its node reports the node's committed tip there and reports none while the node is unreachable. A reading vouches for 30 seconds or three reading intervals, whichever is longer, so a stopped ingest control stops vouching within that time. Readings that fail or report no node tip stop the vouching once they have lasted 5 seconds or two reading intervals, whichever is longer, and never more than a minute, so one failed reading does not refuse a quiet chain's tip unless readings are a minute or more apart. Once the node reports a block above a tip, that tip keeps vouching for 10 seconds or three reading intervals, whichever is longer, while the reader catches up, and further blocks in that time do not shorten it. The tip calls answer again as soon as the node reports the served tip or a newer tip is served. Every other method keeps serving stored data. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
+The process reads the writer's status from ingest control every `storage.secondary_catchup_interval_ms`, 1 second by default. A writer that reaches its node reports the node's committed tip there and reports none while the node is unreachable. A reading vouches for 30 seconds or three reading intervals, whichever is longer, so a stopped ingest control stops vouching within that time. Readings that fail or report no node tip stop the vouching once they have lasted 5 seconds or two reading intervals, whichever is longer, and never more than a minute, so one failed reading does not refuse a quiet chain's tip unless readings are a minute or more apart. Once the node reports a block above a tip, that tip keeps vouching for 10 seconds or three reading intervals, whichever is longer, while the reader catches up, and further blocks in that time do not shorten it. The tip calls answer again as soon as the node reports the served tip or a newer tip is served. A stale-tip refusal can occur while `/readyz` returns 200. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
 
 - The limit defaults to 25 minutes on every network. On a quiet Regtest chain, which mines on demand, the reachable node vouches for the tip.
 - 0 turns the limit off, for a private deployment that wants its wallets to keep syncing through a long outage. Its wallets then build transactions that expire on arrival once the tip is about 50 minutes old. Any other value must be at least 5 minutes.
@@ -168,7 +167,7 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 #### Signed settled history and standalone live-tail buffer
 
-Both serving modes can answer the default shielded `GetBlockRange` projection from an in-memory tail, including before the first signed segment is available. A chunk that reaches the visible tip can fill the tail. Ascending fills and prepends read at most the chunk’s ordinary byte budget, including the single oversized first-block exception. If the returned rows stop before the tip or the cached suffix, the listener sends them directly and leaves the shared tail unchanged. A chunk that reaches the lowest cached row can extend the tail downward by its own missing heights. Other chunks read canonical storage without changing the tail. A short request below the tail reads only the heights it asks for. A stream can cross from signed segments to the tail, and a tail hit needs no blocking conversion. Other pool selections read canonical storage.
+All three serving modes can answer the default shielded `GetBlockRange` projection from an in-memory tail, including before the first signed segment is available. A chunk that reaches the visible tip can fill the tail. Ascending fills and prepends read at most the chunk’s ordinary byte budget, including the single oversized first-block exception. If the returned rows stop before the tip or the cached suffix, the listener sends them directly and leaves the shared tail unchanged. A chunk that reaches the lowest cached row can extend the tail downward by its own missing heights. Other chunks read canonical storage without changing the tail. A short request below the tail reads only the heights it asks for. A stream can cross from signed segments to the tail, and a tail hit needs no blocking conversion. Other pool selections read canonical storage.
 
 Each tail belongs to the admitted generation that supplied its rows. The epoch, canonical sequence digest, tip, and retention bounds must also match. Two stores can agree on block hashes and still hold different compact bytes. Republishing the serving pair during a read discards the rows, even if its epoch identifier stays the same. A miss on a stale view reads canonical storage. A request waiting for another fill can wait up to the listener’s block-range admission timeout, then reads canonical storage. A zero timeout falls back immediately on contention. A view that becomes stale during a fill can finish its own request, while only the current view can update the shared tail. If the fill fails, canonical reads report any fault at the affected chunk.
 
@@ -221,7 +220,7 @@ lightwalletd treats `maxEntries = 0` as "every root", and Zinder does the same: 
 
 If that epoch is retired before the last page, the stream ends with `UNAVAILABLE` after the roots already sent. A stream that has already sent its last completed root ends with `OK` without another read. To retry after `UNAVAILABLE`, restart from the original `startIndex`, or resume after a root whose `completingBlockHash` the wallet has verified on the new chain. Resuming at the index after the last delivered root is unsafe, because a reorg that replaced that root's completing block also replaces the root, and the resumed stream would skip its replacement and combine roots from two forks.
 
-An absent root under retained-range coverage is `NOT_FOUND`, which includes a root below the history floor of a checkpointed store that was not loaded with its roots. A store loaded with complete-prefix subtree-root coverage retains the roots below its floor and serves them. `completingBlockHash` is in RPC byte order, as lightwalletd sends it.
+Wallet and light-wallet serving require every completed root from index zero in each pool before the listener starts. A retained-range build satisfies the requirement when its checkpoint predecessor has completed no roots. A checkpointed wallet store with complete-prefix coverage also serves roots completed below its retained block history. See [Schema admission](../architecture/storage-backend.md#schema-admission). `completingBlockHash` is in RPC byte order.
 
 ### `GetTransaction`
 
@@ -234,9 +233,13 @@ The request must carry a transaction id; an empty hash is `INVALID_ARGUMENT`. Zi
 
 Wallet SDKs treat height 0 as pending and `NOT_FOUND` as an unknown id, so a just-broadcast transaction reads as pending.
 
+In light-wallet serving with transaction bodies omitted, Zinder looks up the transaction's canonical location and fetches the body from the verified node. The mined block must match the local location, and the bytes must match the digest recorded in replay. A digest mismatch returns `DATA_LOSS`. A transaction absent from the captured canonical view goes through the ingest mempool lookup after node verification.
+
 ### `SendTransaction`
 
-`SendTransaction` uses the same broadcast path as native `BroadcastTransaction`, including endpoint verification on first contact, failover across `[node_fallbacks.N]`, and the 16 MiB in-flight byte budget, described in [Wallet data plane](../architecture/wallet-data-plane.md). Until an endpoint passes verification, a send fails with `UNAVAILABLE` and reaches no node. Without `[node]`, a send fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`.
+Wallet serving uses the native `BroadcastTransaction` path, including endpoint verification on first contact, failover across `[node_fallbacks.N]`, and the 16 MiB in-flight byte budget. A wallet listener without `[node]` returns `FAILED_PRECONDITION` with `ENDPOINT_CAPABILITY_UNAVAILABLE`. See [Wallet data plane](../architecture/wallet-data-plane.md).
+
+Light-wallet serving uses the same byte budget and sends through its one configured node after verification against the current reader. If the served fence or schedule changes during verification, the send fails with `UNAVAILABLE`. During a node outage, the call fails with `UNAVAILABLE`. Zinder has no queue for later submission.
 
 The typed outcome maps to `SendResponse.errorCode`. When the node supplied a code, Zinder forwards it; otherwise it uses these defaults:
 
@@ -255,7 +258,7 @@ When an earlier endpoint was unreachable, a later duplicate or queued answer ret
 
 `GetStandardFee` returns the ZIP 317 marginal fee per logical action and the estimator version, both as the node's `getstandardfee` RPC reports them. An omitted estimator version is `0`. Zinder does not compute a fee itself, and it does not pass on a zero fee, which a node that follows ZIP 317 never reports.
 
-The call uses the same verified endpoints and failover order as `SendTransaction`, and applies the same admission check against the pair being served, so it never asks an endpoint that has not passed first-contact verification or whose network-upgrade table disagrees with the served schedule at the next block. It moves to the next endpoint when one is unreachable or does not implement the RPC, and it does not change the preferred broadcast endpoint.
+Wallet serving uses the same verified endpoints and failover order as `SendTransaction`. It moves to the next endpoint when one is unreachable or lacks the RPC, without changing the preferred broadcast endpoint. Light-wallet serving verifies its single node against the captured canonical view and asks that node for the fee.
 
 | Situation | Status |
 | --- | --- |
@@ -277,13 +280,15 @@ Both methods resolve `range` the way lightwalletd does on Zebra:
 
 lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end to the tip and serves it, because wallets such as WebZjs send `end = u64::MAX`.
 
-All reads of one request are pinned to one epoch. The server reads the history 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client, so memory does not grow with the address's history.
+Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
 
-A failure after the first transaction ends the stream with its status, after the transactions already sent, as lightwalletd does when a transaction read fails. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`, which a client that reads a long history slowly can meet. A client must treat a stream that ends with an error as incomplete and request the range again.
+Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it checks the reported block and bytes against the local canonical location and replay digest, checks canonical order, and confirms the tip before sending the row. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
+
+A failure can end either kind of stream after it has delivered rows. For forwarded history, a lost tip or unreachable node can return `UNAVAILABLE`, and a digest mismatch returns `DATA_LOSS`. Treat any stream that ends with an error as incomplete and request the range again.
 
 ### `GetTaddressBalance` and `GetTaddressBalanceStream`
 
-Both methods return the confirmed balance, the sum of unspent outputs, of up to 256 distinct addresses at one chain epoch. A repeated address counts once. Mempool state is not included.
+Both methods return the confirmed balance, the sum of unspent outputs, of up to 256 distinct addresses. Wallet serving reads at one chain epoch. Light-wallet serving sums the outputs reported by its node at the captured canonical tip. A repeated address counts once. Mempool state is excluded.
 
 - An empty list is `INVALID_ARGUMENT`.
 - The 257th distinct address is `INVALID_ARGUMENT` with `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`. The streaming method refuses as soon as that address arrives, without waiting for the client to finish. lightwalletd bounds the streaming method at 10,000 addresses.
@@ -296,12 +301,13 @@ Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent ou
 
 A request that lists an address more than once gets that address's rows once, as lightwalletd v0.6.2 does. A wallet that adds up the rows counts each output once, and duplicate rows never use up `maxEntries`.
 
-One response returns at most 100,000 outputs, the same cap Zebra puts on `getaddressutxos`. Zinder never drops rows silently, because wallets add these rows up as the address balance. lightwalletd on Zebra instead returns `OK` with an empty list in this case.
+One response returns at most 100,000 outputs. The handling of an oversized response depends on the serving mode.
 
-- `GetAddressUtxos` reads every row before it answers, so a request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
-- `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. Any other failure after the first row also ends the stream with its status after the rows already sent, such as `CHAIN_EPOCH_PIN_UNAVAILABLE` for a client still reading one minute after a new block replaces the request's epoch. A wallet must treat a stream that ends with an error as incomplete and must not add up its rows.
+- In wallet serving, `GetAddressUtxos` reads every row before it answers. A request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
+- In wallet serving, `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. A later failure such as `CHAIN_EPOCH_PIN_UNAVAILABLE` also ends the stream after the rows already sent. Treat a stream that ends with an error as incomplete.
+- In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order.
 
-Both methods read each distinct address once, at one chain epoch, and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
+In wallet serving, both methods read each distinct address at one chain epoch and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
 
 A request holds at most about twice the rows it has sent, plus 2 outputs and one first page for each distinct address. Its first pages together hold at most 8,192 outputs, or 16 for each distinct address when it lists more than 512. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
 

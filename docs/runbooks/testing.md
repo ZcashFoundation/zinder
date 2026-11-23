@@ -485,10 +485,9 @@ new schedule revision, or a change to the upgrade active at the next block
 requires fresh discovery. If discovery fails, concurrent callers waiting for it
 return the refusal or a retryable error. The next request can retry immediately.
 
-Forwarded transaction, balance, and UTXO answers describe the served tip
-captured for the request, or the call fails. Address history is bounded to
-that tip but is best-effort, as the next paragraph explains. A node on another
-chain fails the tip check.
+Use the forwarded read contracts in
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#method-behavior)
+to check results. A node on another chain fails the tip check.
 The node answers UTXO lookups at its own tip and reports that tip, so
 qualification keeps an answer only when every page names the served tip. The
 balance is the sum of the unspent outputs the node reports at the served tip,
@@ -499,22 +498,6 @@ succeeds once ingest serves the newer blocks. A balance over more than
 height of a bounded UTXO request must repeat, in order, every output an
 earlier read returned at that height, and must not name an output an earlier
 read placed below it. Otherwise the call returns `UNAVAILABLE`.
-
-Forwarded address history is best-effort and bounded to the served tip, not
-an exact history. Two limits remain. First, neither node reports the chain a
-`getaddresstxids` answer describes. Qualification reads the node's hash at
-the served tip's height immediately before and after each request, and keeps
-the answer only when both reads name the served tip. Each row must be a
-transaction the served chain mines, in the block the node reports, after the
-previous row in canonical position order, and its bytes must match the digest
-ingest recorded. A history answer can still omit transactions if the node
-leaves the served chain and returns to it during a single `getaddresstxids`
-request, between the two hash reads. Second, the answer relies on the node's
-address index being correct: the position and byte checks prove where each
-returned transaction was mined, not that the list is complete for the
-address. An exact history needs either a local address index, as wallet
-serving keeps, or a node reply that binds the list to a chain tip, which
-[zebra#12575](https://github.com/ZcashFoundation/zebra/issues/12575) requests.
 
 The node orders UTXOs within a block by position. Qualification needs every
 matching output in the last block of a wallet's request to sort them by wallet
