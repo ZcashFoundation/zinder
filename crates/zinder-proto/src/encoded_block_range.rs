@@ -82,9 +82,9 @@ impl EncodedBlock {
         let prefix = message_prefix(payload_len)?;
         let mut message = Vec::with_capacity(Self::PREFIX_LEN + payload_len);
         message.extend_from_slice(&prefix);
-        block
-            .encode(&mut message)
-            .map_err(|_| InvalidEncodedBlock)?;
+        // `encode` would measure the block again; this is how `encode_to_vec`
+        // writes into a vector sized from one `encoded_len`.
+        block.encode_raw(&mut message);
         Ok(Self {
             message: message.into(),
         })
