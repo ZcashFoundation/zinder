@@ -30,9 +30,8 @@ use super::{
         TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{
-        encode_subtree_root_key, encode_subtree_root_value, required_subtree_root_ranges,
-    },
+    stored_set::required_subtree_root_ranges,
+    subtree_load::{encode_subtree_root_key, encode_subtree_root_value},
 };
 
 /// One block-local append prepared for an atomic READY canonical transition.

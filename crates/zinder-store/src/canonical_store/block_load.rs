@@ -689,17 +689,7 @@ pub(super) struct IngestedCanonicalBlockLoad {
 }
 
 pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
-    for name in [
-        BLOCK_HEADER_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY,
-        BLOCK_REPLAY_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY,
-        BLOCK_BLOB_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-        BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-    ] {
+    for name in super::stored_set::CANONICAL_STAGED_SST_FAMILIES {
         let column_family = db.cf_handle(name).ok_or_else(|| {
             CanonicalStoreError::block_load_sequence(format!("{name} column family is absent"))
         })?;
@@ -1043,9 +1033,7 @@ fn validate_persisted_block_final_note_commitment_roots(
                 "block_final_note_commitment_roots has an invalid height key: {source}"
             ))
         })?;
-        if height < build_plan.history_bounds().first_available_height()
-            || height > build_plan.build_tip().height
-        {
+        if height < build_plan.first_retained_height() || height > build_plan.build_tip().height {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "block_final_note_commitment_roots height {} is outside retained history",
                 height.value()

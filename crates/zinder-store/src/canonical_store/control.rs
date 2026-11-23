@@ -627,7 +627,7 @@ impl<'encoded> Decoder<'encoded> {
             && visible_tip_height == build_tip.height.value()
             && visible_tip_hash == build_tip.hash.as_bytes();
         let live_pointer_is_exact = visible_epoch > 1 && visible_event_sequence == visible_epoch;
-        if first_height != history_bounds.first_available_height().value()
+        if first_height != super::CanonicalStoredSet::history_floor(history_bounds).value()
             || !(baseline_pointer_is_exact || live_pointer_is_exact)
             || expected_block_count != Some(visible_block_count)
         {

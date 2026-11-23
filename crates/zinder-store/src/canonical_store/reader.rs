@@ -918,7 +918,7 @@ fn read_transaction_location_or_proven_absence(
     let history_bounds = store.serving_build_plan().history_bounds();
     if location.is_none() && history_bounds.intentionally_excludes(BlockHeight::new(1)) {
         return Err(CanonicalStoreError::CanonicalHistoryUnavailable {
-            first_available_height: history_bounds.first_available_height(),
+            first_available_height: super::CanonicalStoredSet::history_floor(history_bounds),
         });
     }
     Ok(location)

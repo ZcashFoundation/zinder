@@ -1,12 +1,16 @@
 //! Canonical v7 physical inventory and retained block data.
 
-use std::path::Path;
+use std::{num::NonZeroU32, path::Path};
 
 use rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
-use zinder_core::{BlockHeight, ChainTipMetadata, ShieldedProtocol};
+use zinder_core::{
+    BlockHeight, CanonicalHistoryBounds, ChainTipMetadata, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange,
+};
 
 use super::{
-    CanonicalStoreError, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadCoverage,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -132,6 +136,30 @@ impl CanonicalStoreRequirements {
     }
 }
 
+impl CanonicalStoreBuildPlan {
+    /// Returns the stored data policy for this construction plan and workload.
+    #[must_use]
+    pub const fn stored_set(&self, workload: CanonicalStoreWorkload) -> CanonicalStoredSet {
+        CanonicalStoredSet::new(
+            workload,
+            self.raw_blob_retention(),
+            self.first_retained_height(),
+        )
+    }
+
+    pub(super) const fn first_retained_height(&self) -> BlockHeight {
+        CanonicalStoredSet::history_floor(self.history_bounds())
+    }
+
+    pub(super) fn subtree_root_ranges(
+        &self,
+        coverage: CanonicalSubtreeRootLoadCoverage,
+        tip: ChainTipMetadata,
+    ) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
+        subtree_root_ranges(coverage, self.history_predecessor().tip_metadata(), tip)
+    }
+}
+
 /// Retention, historical floor, and any admitted subtree-root evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoredSet {
@@ -153,6 +181,10 @@ impl CanonicalStoredSet {
             first_height,
             subtree_root_coverage: None,
         }
+    }
+
+    pub(super) const fn history_floor(bounds: CanonicalHistoryBounds) -> BlockHeight {
+        bounds.first_available_height()
     }
 
     /// Returns the historical floor for a retained data kind.
@@ -241,6 +273,52 @@ impl CanonicalStoredSet {
     pub(super) const fn requires_daily_value_pool_evidence(self) -> bool {
         matches!(self.workload, CanonicalStoreWorkload::Explorer)
     }
+}
+
+impl CanonicalSubtreeRootLoadCoverage {
+    pub(super) const fn includes_preceding_roots(self) -> bool {
+        matches!(self, Self::CompletePrefix)
+    }
+}
+
+pub(super) fn required_subtree_root_ranges(
+    previous_tip: ChainTipMetadata,
+    next_tip: ChainTipMetadata,
+) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
+    subtree_root_ranges(
+        CanonicalSubtreeRootLoadCoverage::RetainedRange,
+        previous_tip,
+        next_tip,
+    )
+}
+
+fn subtree_root_ranges(
+    coverage: CanonicalSubtreeRootLoadCoverage,
+    predecessor_tip_metadata: ChainTipMetadata,
+    build_tip_metadata: ChainTipMetadata,
+) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
+    let mut ranges = Vec::with_capacity(3);
+    for protocol in [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ] {
+        let start_index = first_subtree_root_index(coverage, predecessor_tip_metadata, protocol);
+        let completed_at_tip = build_tip_metadata.completed_subtree_count(protocol);
+        let root_count = completed_at_tip.checked_sub(start_index).ok_or_else(|| {
+            CanonicalStoreError::subtree_root_sequence(format!(
+                "{protocol:?} completed-subtree count regressed from {start_index} to {completed_at_tip}"
+            ))
+        })?;
+        if let Some(max_entries) = NonZeroU32::new(root_count) {
+            ranges.push(SubtreeRootRange::new(
+                protocol,
+                SubtreeRootIndex::new(start_index),
+                max_entries,
+            ));
+        }
+    }
+    Ok(ranges)
 }
 
 pub(super) fn first_subtree_root_index(

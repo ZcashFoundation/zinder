@@ -23,7 +23,7 @@ use super::{
     },
     subtree_load::{
         CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence,
-        load_complete_subtree_root_prefix, load_subtree_roots, required_subtree_root_ranges,
+        load_complete_subtree_root_prefix, load_subtree_roots,
     },
 };
 
@@ -288,8 +288,8 @@ impl RocksDbCanonicalBuilder {
             .canonical_block_evidence
             .as_ref()
             .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
-        required_subtree_root_ranges(
-            self.build_plan.history_predecessor().tip_metadata(),
+        self.build_plan.subtree_root_ranges(
+            super::CanonicalSubtreeRootLoadCoverage::RetainedRange,
             block_evidence.tip_metadata,
         )
     }
@@ -391,7 +391,7 @@ fn validate_block_load_range(
     build_plan: &CanonicalStoreBuildPlan,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
-    let expected_first_height = build_plan.history_bounds().first_available_height();
+    let expected_first_height = build_plan.first_retained_height();
     if evidence.first_height != expected_first_height {
         return Err(CanonicalStoreError::block_load_sequence(format!(
             "expected first available height {}, observed {}",

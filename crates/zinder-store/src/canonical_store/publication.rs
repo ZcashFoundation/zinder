@@ -478,7 +478,7 @@ fn validate_trusted_fresh_tip_points(
 ) -> Result<(), CanonicalStoreError> {
     let first = BlockId::new(evidence.first_height, evidence.first_hash);
     let tip = BlockId::new(evidence.tip_height, evidence.tip_hash);
-    if first.height != build_plan.history_bounds().first_available_height()
+    if first.height != build_plan.first_retained_height()
         || tip != build_plan.build_tip()
         || retained_block_hash(db, first.height)? != first.hash
         || retained_block_hash(db, tip.height)? != tip.hash
@@ -1215,10 +1215,7 @@ fn live_transition_is_valid(
     chain_epoch: DecodedChainEpoch,
     chain_event: DecodedChainEvent,
 ) -> Result<bool, CanonicalStoreError> {
-    if !epoch_bounds_are_valid(
-        build_plan.history_bounds().first_available_height(),
-        chain_epoch,
-    ) {
+    if !epoch_bounds_are_valid(build_plan.first_retained_height(), chain_epoch) {
         return Ok(false);
     }
     if chain_event.kind == COMMITTED_EVENT {

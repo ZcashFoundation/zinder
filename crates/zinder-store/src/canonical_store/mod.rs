@@ -291,7 +291,7 @@ impl CanonicalStoreBuildPlan {
                 });
             }
         }
-        let first_available_height = self.history_bounds.first_available_height();
+        let first_available_height = self.first_retained_height();
         if self.build_tip.height.value() < first_available_height.value() {
             return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
                 build_tip: self.build_tip.height.value(),
@@ -313,16 +313,6 @@ impl CanonicalStoreBuildPlan {
         &self,
     ) -> NetworkUpgradeActivationsFingerprint {
         self.network_upgrade_activations_fingerprint
-    }
-
-    /// Returns the stored data policy for this construction plan and workload.
-    #[must_use]
-    pub const fn stored_set(&self, workload: CanonicalStoreWorkload) -> CanonicalStoredSet {
-        CanonicalStoredSet::new(
-            workload,
-            self.raw_blob_retention,
-            self.history_bounds.first_available_height(),
-        )
     }
 
     /// Returns the immutable raw-blob retention contract.

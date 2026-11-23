@@ -37,7 +37,8 @@ use super::{
         SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
         TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{encode_subtree_root_key, required_subtree_root_ranges},
+    stored_set::required_subtree_root_ranges,
+    subtree_load::encode_subtree_root_key,
     tree_state_replay::append_compact_block_commitments,
 };
 

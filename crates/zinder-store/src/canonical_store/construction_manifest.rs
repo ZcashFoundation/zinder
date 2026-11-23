@@ -566,7 +566,7 @@ impl PersistedBuildPlan {
                 .as_bytes(),
             raw_blob_retention: plan.raw_blob_retention(),
             reorg_window_blocks: plan.reorg_policy().reorg_window_blocks(),
-            first_available_height: plan.history_bounds().first_available_height().value(),
+            first_available_height: plan.first_retained_height().value(),
             history_predecessor: PersistedCheckpoint::from_checkpoint(plan.history_predecessor()),
             build_tip: PersistedBlockId::from_block_id(plan.build_tip()),
             digest_sha256: [0; 32],
