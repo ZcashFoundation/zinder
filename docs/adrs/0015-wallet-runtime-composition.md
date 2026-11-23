@@ -16,7 +16,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Decision
 
-1. **One composition, one capability set.** The native wallet runtime has one production composition. After composition and admission it derives an immutable capability set from concrete evidence: the pair's persisted raw-blob retention, the methods the query implements, the configured node endpoints, and the admitted ingest-control methods. There are no profiles, setters, or support flags. The protocol's capability registry defines identifiers and versions, not which subset a process supports. `WalletQuery.ServerInfo` and the ops endpoint publish the same value. Each protocol adapter derives its own set, because a shared domain method is not a claim that a given adapter supports it.
+1. **One composition, one capability set.** The native wallet runtime has one production composition. After composition and admission it derives an immutable capability set from concrete evidence: the pair's persisted raw-blob retention, the methods the query implements, the configured node endpoints, and the admitted ingest-control methods. A deployment profile selects which runtimes and compositions a deployment runs ([ADR-0023](0023-deployment-profiles.md)), but it is not capability evidence. There are no capability profiles, setters, or support flags. The protocol's capability registry defines identifiers and versions, not which subset a process supports. `WalletQuery.ServerInfo` and the ops endpoint publish the same value. Each protocol adapter derives its own set, because a shared domain method is not a claim that a given adapter supports it.
 2. **Adapters enforce what they advertise.** Every native RPC except `ServerInfo` checks its capability before it touches storage or a dependency. An advertised range method still has enforced limits.
 3. **Support is fixed for the process lifetime.** A supported operation stays advertised while a dependency is down. Only requests that call the dependency fail ([ADR-0016](0016-wallet-serving-readiness.md)). Discovery is not a health check.
 4. **Ingest control is admitted once.** Before opening storage or binding traffic, the reader connects to `IngestControl` once and requires the `zinder-ingest` identity, the same network and contract revision, and the methods it needs. Every component shares that channel.
@@ -33,7 +33,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Consequences
 
-- Operators configure retention and endpoints, not a support profile. Invalid capability claims cannot be constructed.
+- Operators choose a deployment profile, retention, and endpoints, and none of them is a capability claim. Invalid capability claims cannot be constructed.
 - A misconfigured node endpoint is still advertised. Every broadcast through it fails with the retryable `NODE_UNAVAILABLE`, and the operator sees a degraded dependency instead of a missing capability.
 - A client that read `ServerInfo` early never loses a capability later.
 - Changing raw-blob retention needs a new store, not a restart.
@@ -44,7 +44,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Alternatives rejected
 
-- **Configurable or renamed profiles, or per-capability booleans.** They keep a shadow model that can disagree with the composed service.
+- **Capability profiles, or per-capability booleans.** A name or flag that declares capabilities keeps a shadow model that can disagree with the composed service. A deployment profile avoids this because capabilities still derive from the composition it selects.
 - **Derive support from the registry alone.** The registry cannot prove that storage retained an artifact or that a provider was wired.
 - **A generic capability-provider framework.** There is one composition root, so it adds indirection without removing any evidence binding.
 - **Advertise broadcast only after verification.** The capability set would change at runtime, and clients that cached it would never see broadcast.
@@ -64,3 +64,4 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.
 - 2026-11-21. Bound the compact segment index and the optional kernel measurement to the signed catalog.
 - 2026-11-21. Specified trusted bootstrap and automatic catalog adoption for the single-host wallet Compose deployment.
+- 2026-11-23. Decision 1 separates deployment profiles, which select a composition, from capability evidence.
