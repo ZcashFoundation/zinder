@@ -44,7 +44,9 @@ The Zcash Foundation runs these public endpoints, which any client can use:
 | lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
 | Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
 
-Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser that opens it gets no page.
+Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser that opens it gets an empty 404 response.
+
+On the Mainnet endpoints, wallets that share one public IP address share a bandwidth limit.
 
 ## What every client must handle
 
