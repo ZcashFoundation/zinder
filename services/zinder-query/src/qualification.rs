@@ -19,6 +19,25 @@ use crate::{
     wallet_serving_query::{canonical_subtree_roots, tree_state_response},
 };
 
+/// The canonical fence and upgrade schedule of one captured reader, which a
+/// forwarded read requires the node to serve.
+///
+/// A request captures it once, so node admission checks the chain view the
+/// request answers for even after the served reader changes.
+pub struct QualificationNodeTarget(crate::node_broadcast::VerificationTarget);
+
+impl QualificationNodeTarget {
+    /// Captures the tip and schedule `reader` serves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::SourceProtocolMismatch`] when the reader has no
+    /// writer-admitted upgrade schedule.
+    pub fn of(reader: &RocksDbCanonicalReader) -> Result<Self, SourceError> {
+        crate::node_broadcast::VerificationTarget::from_canonical(reader).map(Self)
+    }
+}
+
 /// Reads for a qualification-only lightwalletd server with one canonical store and one node.
 #[derive(Clone)]
 pub struct QualificationWalletQuery {
@@ -46,19 +65,29 @@ impl QualificationWalletQuery {
         }
     }
 
-    /// Verifies the configured node against the writer-admitted schedule and tip before forwarding.
-    pub async fn verified_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
-        let target =
-            crate::node_broadcast::VerificationTarget::from_canonical((self.capture)().as_ref())?;
-        self.verification.verify(&self.source, &target).await?;
-        if !target.still_served_by((self.capture)().as_ref()) {
+    /// Verifies the configured node against the schedule and tip of `target`,
+    /// the reader generation a forwarded read answers for.
+    pub async fn verified_node(
+        &self,
+        target: &QualificationNodeTarget,
+    ) -> Result<&ZebraJsonRpcSource, SourceError> {
+        self.verification.verify(&self.source, &target.0).await?;
+        Ok(&self.source)
+    }
+
+    /// Verifies the configured node against the currently served reader, and
+    /// refuses when that reader changes during verification.
+    pub(crate) async fn verified_current_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
+        let target = QualificationNodeTarget::of((self.capture)().as_ref())?;
+        let node = self.verified_node(&target).await?;
+        if !target.0.still_served_by((self.capture)().as_ref()) {
             return Err(SourceError::NodeUnavailable {
                 reason:
                     "served canonical fence or upgrade schedule changed during node verification"
                         .to_owned(),
             });
         }
-        Ok(&self.source)
+        Ok(node)
     }
 
     /// Submits a transaction through the verified endpoint under the wallet broadcast byte budget.
@@ -73,7 +102,10 @@ impl QualificationWalletQuery {
             });
         }
         let reservation = BroadcastByteBudget::process().try_reserve(bytes.len())?;
-        let node = self.verified_node().await.map_err(QueryError::Node)?;
+        let node = self
+            .verified_current_node()
+            .await
+            .map_err(QueryError::Node)?;
         reservation
             .hold_during(async {
                 let outcome = node.broadcast_transaction(bytes).await;

@@ -475,16 +475,46 @@ control. Both `compact-blocks` and `light-wallet-qualification` check the
 writer's canonical fence when admitting a reader. Qualification also requires
 the writer to attest the reader's upgrade schedule. It uses the node for
 transparent balances, UTXOs, address history, transaction submission, and the
-recommended fee. Each forwarded request checks
-that the node holds the served tip on its best chain. If the canonical fence or
-schedule revision changes during verification, the request returns `UNAVAILABLE`.
+recommended fee. Each forwarded read checks that the node holds, on its best
+chain, the tip of the reader the request captured. A broadcast checks the
+currently served reader instead, and returns `UNAVAILABLE` if the canonical
+fence or schedule revision changes during verification.
 Requests share evidence of broadcast support and agreement with the writer's
 schedule through the next block for up to one minute. A failed tip check, a
 new schedule revision, or a change to the upgrade active at the next block
 requires fresh discovery. If discovery fails, concurrent callers waiting for it
 return the refusal or a retryable error. The next request can retry immediately.
-The node can advance while answering. Compare forwarded
-answers with wallet serving while the node stays at the same hash and height.
+
+Forwarded transaction, balance, and UTXO answers describe the served tip
+captured for the request, or the call fails. Address history is bounded to
+that tip but is best-effort, as the next paragraph explains. A node on another
+chain fails the tip check.
+The node answers UTXO lookups at its own tip and reports that tip, so
+qualification keeps an answer only when every page names the served tip. The
+balance is the sum of the unspent outputs the node reports at the served tip,
+because `getaddressbalance` does not report the tip it answered at. While the
+node is ahead of the served tip, balance and UTXO calls fail, and a retry
+succeeds once ingest serves the newer blocks. A balance over more than
+100,000 unspent outputs returns `RESOURCE_EXHAUSTED`. Each reread of the last
+height of a bounded UTXO request must repeat, in order, every output an
+earlier read returned at that height, and must not name an output an earlier
+read placed below it. Otherwise the call returns `UNAVAILABLE`.
+
+Forwarded address history is best-effort and bounded to the served tip, not
+an exact history. Two limits remain. First, neither node reports the chain a
+`getaddresstxids` answer describes. Qualification reads the node's hash at
+the served tip's height immediately before and after each request, and keeps
+the answer only when both reads name the served tip. Each row must be a
+transaction the served chain mines, in the block the node reports, after the
+previous row in canonical position order, and its bytes must match the digest
+ingest recorded. A history answer can still omit transactions if the node
+leaves the served chain and returns to it during a single `getaddresstxids`
+request, between the two hash reads. Second, the answer relies on the node's
+address index being correct: the position and byte checks prove where each
+returned transaction was mined, not that the list is complete for the
+address. An exact history needs either a local address index, as wallet
+serving keeps, or a node reply that binds the list to a chain tip, which
+[zebra#12575](https://github.com/ZcashFoundation/zebra/issues/12575) requests.
 
 The node orders UTXOs within a block by position. Qualification needs every
 matching output in the last block of a wallet's request to sort them by wallet
@@ -499,7 +529,8 @@ order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
 32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
 
 Each qualification instance admits one nonempty UTXO request and one
-address-history request at a time. `GetTaddressTxids` and
+address-history request at a time. Balance requests read the node's UTXOs and
+share the UTXO slot. `GetTaddressTxids` and
 `GetTaddressTransactions` share the history slot. Each request holds its slot
 while it reads from the node and while the client drains the stream. A request
 for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
@@ -543,15 +574,20 @@ closes admission until the publisher verifies the recovered writer's fence.
 
 Both mempool methods use ingest control. If an address-history lookup
 exceeds a row or byte limit, qualification splits it into disjoint height ranges.
-Before looking up transaction IDs, the stream records the hash at the end of
-the requested range. Each page is read in order. For each transaction, one
-verbose node call obtains its bytes and mined height, then a block-hash
-lookup checks the range before the wallet receives the row. The stream also
-checks the hash for empty pages and before reporting completion. A replacement
-returns `UNAVAILABLE`, and cancelling the stream stops further calls. If one
+Each page is read in order. For each transaction, one verbose node call
+obtains its bytes and mined block, then a block-hash lookup checks that the
+node still holds the served tip before the wallet receives the row. The stream
+also checks the served tip before reporting completion. A replacement returns
+`UNAVAILABLE`, bytes that differ from the recorded digest return `DATA_LOSS`,
+and cancelling the stream stops further calls. If one
 height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
-With `none`, `GetTransaction` fetches the bytes from
-the node. To exercise local mined-transaction reads, repeat with fresh store
+With `none`, `GetTransaction` finds the transaction's block in the canonical
+store and fetches only its bytes from the node. The node must report the same
+block, and the bytes must match the digest ingest recorded for that
+transaction, which every blob-retention policy keeps. Other bytes return
+`DATA_LOSS`. A transaction the served chain does not mine is looked up in the
+ingest mempool, as wallet serving does, even when the node has mined it in a
+later block. To exercise local mined-transaction reads, repeat with fresh store
 paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
 projector or wallet store. The feature is for qualification only. Release
 builds accept `wallet` and `compact-blocks`.
