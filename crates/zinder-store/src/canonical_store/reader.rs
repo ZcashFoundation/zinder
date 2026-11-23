@@ -278,9 +278,10 @@ macro_rules! impl_canonical_typed_reads {
 
             /// Reads one retained raw transaction at its authenticated location.
             ///
-            /// The read first checks `location` against the store's location
-            /// row for its transaction, so a location from another epoch, such
-            /// as one a reorg replaced, answers `None`.
+            /// The read first compares `location` with the store's current
+            /// location row for its transaction, and answers `None` when that
+            /// row is missing or differs in any field. A location saved before
+            /// later commits still returns bytes while the row is unchanged.
             pub fn transaction_blob(
                 &self,
                 location: TransactionLocation,
@@ -997,9 +998,10 @@ fn read_transaction_blob(
 /// Reads the raw transaction at `location`, which the caller read from this
 /// store's location row.
 ///
-/// A store handle does not change while it is borrowed: a commit consumes the
-/// primary, and catching a secondary up borrows it mutably. Reading the
-/// location row again through the same borrow could not answer differently.
+/// Successful reads through one borrowed handle see the same canonical
+/// transaction mapping: a commit consumes the primary, and catching a
+/// secondary up borrows it mutably. Reading the location row again through the
+/// same borrow could not answer differently.
 fn read_located_transaction_blob(
     store: &impl CanonicalServingRead,
     location: TransactionLocation,

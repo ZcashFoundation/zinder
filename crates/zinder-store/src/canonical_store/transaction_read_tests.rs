@@ -277,7 +277,11 @@ fn a_by_id_read_reads_the_location_row_once() -> TestResult {
     store.transaction_location_and_blob_or_proven_absence(mined_at(3))?;
     assert_eq!(keys_read(&store) - before, 2);
 
-    // A miss stops at the location row.
+    // A miss stops at the location row, through either by-ID read.
+    let before = keys_read(&store);
+    store.transaction_location_and_blob(never_mined())?;
+    assert_eq!(keys_read(&store) - before, 1);
+
     let before = keys_read(&store);
     store.transaction_location_and_blob_or_proven_absence(never_mined())?;
     assert_eq!(keys_read(&store) - before, 1);
