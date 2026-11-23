@@ -1,0 +1,6 @@
+kind: changed
+body: A fresh wallet build's sorters that end with at most 64 runs now merge them while the build reads them, instead of writing a merged run to disk first. A full Testnet wallet build finished about 11% sooner and needed half the peak temporary files for its address sorts. The temporary-file limits refuse a build at the same settings as before, and the published wallet is unchanged.
+time: 2026-11-23T21:29:31.516609926Z
+custom:
+    Bump: patch
+    PR: "524"
