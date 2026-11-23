@@ -28,7 +28,7 @@ comparison, but do not decide the result. Segment pages are evicted from the
 page cache before each probe so that pages present afterwards were read by it.
 Writes route-check.json to --out and exits 1 when any part fails.
 """
-import argparse, glob, json, os, pwd, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
+import argparse, ctypes, glob, json, mmap, os, pwd, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
 # A canonical block-range chunk reads compact block rows with MultiGet; scans
@@ -91,12 +91,35 @@ def evict(files):
             os.close(fd)
 
 
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIBC.mmap.restype = ctypes.c_void_p
+LIBC.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long)
+LIBC.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+LIBC.munmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+
+
 def resident_bytes(files):
-    total = 0
-    for start in range(0, len(files), 200):
-        out = subprocess.run(['fincore', '--bytes', '--noheadings', '--output', 'RES', *files[start:start + 200]],
-                             check=True, capture_output=True, text=True).stdout
-        total += sum(int(line) for line in out.split())
+    """Sums the page-cache bytes of files with mincore(2), as fincore does, without faulting pages in."""
+    page, total = os.sysconf('SC_PAGE_SIZE'), 0
+    for path in files:
+        size = os.path.getsize(path)
+        if size == 0:
+            continue
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            addr = LIBC.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+            if addr in (None, ctypes.c_void_p(-1).value):
+                raise OSError(ctypes.get_errno(), f'mmap {path}')
+            try:
+                pages = (size + page - 1) // page
+                vector = (ctypes.c_ubyte * pages)()
+                if LIBC.mincore(addr, size, vector) != 0:
+                    raise OSError(ctypes.get_errno(), f'mincore {path}')
+                total += sum(v & 1 for v in vector) * page
+            finally:
+                LIBC.munmap(addr, size)
+        finally:
+            os.close(fd)
     return total
 
 
