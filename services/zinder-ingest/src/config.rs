@@ -464,11 +464,12 @@ fn node_response_byte_range(
         )
 }
 
-fn available_logical_core_count() -> NonZeroU32 {
-    let logical_core_count =
-        std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
-    NonZeroU32::new(u32::try_from(logical_core_count).unwrap_or(u32::MAX))
-        .unwrap_or(NonZeroU32::MIN)
+/// The logical CPUs this process may use, or `None` when the platform
+/// cannot tell.
+fn detected_logical_core_count() -> Option<NonZeroU32> {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|cpus| NonZeroU32::new(u32::try_from(cpus.get()).unwrap_or(u32::MAX)))
 }
 
 #[allow(
@@ -492,7 +493,9 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         densification.during_construction.get_or_insert(true);
     }
     let tree_state_densification = resolve_tree_state_densification(densification)?;
-    let logical_core_count = available_logical_core_count();
+    let detected_logical_cores = detected_logical_core_count();
+    let logical_core_count =
+        detected_logical_cores.unwrap_or_else(|| NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN));
     let mut resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
         container_memory_budget_bytes().and_then(NonZeroU64::new),
         logical_core_count,
@@ -500,7 +503,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     );
     if tree_state_densification.construction_selection().is_some() {
         resolved_pipeline_limits =
-            resolved_pipeline_limits.with_checkpoint_hashing(logical_core_count);
+            resolved_pipeline_limits.with_checkpoint_hashing(detected_logical_cores);
     }
     let node_source_text = config
         .ingest

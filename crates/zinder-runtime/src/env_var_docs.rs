@@ -1657,10 +1657,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Threads that hash note-commitment trees for the ordered construction \
-                      loader. Defaults to the logical CPU count, at most 16, when fresh \
-                      construction stores checkpoints beyond the 100-block cadence and build \
-                      tip, and to 1 otherwise. With 1, hashing runs on the loader thread. A \
-                      higher value \
+                      loader. Defaults to the detected logical CPU count, at most 8, when \
+                      fresh construction stores checkpoints beyond the 100-block cadence and \
+                      build tip, and to 1 otherwise or when the CPU count cannot be detected. \
+                      With 1, hashing runs on the loader thread. The automatic count reserves \
+                      no CPU for a node or projector on the same host; in one measured Mainnet \
+                      build, 8 workers sharing 8 cores with a node pinned to 2 of them reached \
+                      READY in 1 h 40 min 30 s. An explicit value may exceed 8. A higher value \
                       hashes each block's pools and large commitment batches in parallel, and \
                       derives the checkpoints of up to twice that many blocks, at most 64, \
                       while the loader writes earlier blocks. The stored trees, checkpoints, and \
@@ -1710,7 +1713,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. On Mainnet, `every-block` and 256-commitment-budget construction reach READY within three hours on 8 CPUs; smaller hosts take longer, as the bulk-catchup tuning runbook describes. Changing this setting leaves stored checkpoints in place.",
+        description: "Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. In the measured Mainnet runs, with 6 hashing workers on 8 physical cores and one thread per core, `every-block` and 256-commitment-budget construction reached READY within three hours; hosts with fewer logical CPUs take longer, as the bulk-catchup tuning runbook describes. Changing this setting leaves stored checkpoints in place.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION",

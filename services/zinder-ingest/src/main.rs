@@ -1927,8 +1927,8 @@ source = "zebra-json-rpc"
         ];
         let core_bounded_workers = std::num::NonZeroU32::new(
             std::thread::available_parallelism()
-                .map_or(8, std::num::NonZeroUsize::get)
-                .min(16)
+                .map_or(1, std::num::NonZeroUsize::get)
+                .min(8)
                 .try_into()?,
         )
         .ok_or("no logical cores")?;

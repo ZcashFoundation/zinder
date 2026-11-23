@@ -109,10 +109,10 @@ Peak disk use during a first sync has not been measured.
 
 Plan for up to about 16 hours for a Mainnet first sync. One measured build
 took about four hours for the chain store and more than two hours for the
-wallet store. Builds on earlier releases took about 16 hours in total. On 8
-physical cores, the wallet-serving chain store, with a checkpoint at every
-height, reached READY in 1 h 51 min. Smaller hosts take longer; see
-[First sync on fewer than 8 CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-cpus).
+wallet store. Builds on earlier releases took about 16 hours in total. With 6
+hashing workers on 8 physical cores, the wallet-serving chain store, with a
+checkpoint at every height, reached READY in 1 h 51 min. Smaller hosts take longer; see
+[First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 No full first sync, including the wallet store, has been timed on the current
 release.
 

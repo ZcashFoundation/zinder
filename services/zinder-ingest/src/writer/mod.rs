@@ -742,38 +742,47 @@ fn install_staged_store(
     })
 }
 
-/// CPUs on which every-block construction was qualified to reach Mainnet
-/// READY within the three-hour budget of ADR-0009.
+/// Logical CPUs of the measured run in which every-block construction reached
+/// Mainnet READY within the three-hour budget of ADR-0009: 8 physical cores
+/// with one thread per core.
 const EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS: usize = 8;
 
 /// Warns when a fresh construction stores every block's checkpoint on fewer
-/// CPUs than its Mainnet READY qualification used.
+/// logical CPUs than its Mainnet READY measurement used, or cannot count them.
 fn warn_if_every_block_construction_lacks_qualified_cpus(
     selection: Option<TreeStateCheckpointSelection>,
 ) {
-    let Ok(available_cpus) = std::thread::available_parallelism().map(std::num::NonZeroUsize::get)
+    let Ok(available_logical_cpus) =
+        std::thread::available_parallelism().map(std::num::NonZeroUsize::get)
     else {
+        if selection.is_some() {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "construction_cpu_count_unavailable",
+                "could not detect the logical CPU count; construction hashes commitment trees on one thread unless ingest.construction.tree_hashing_workers is set"
+            );
+        }
         return;
     };
-    if every_block_construction_below_qualified_cpus(selection, available_cpus) {
+    if every_block_construction_below_qualified_cpus(selection, available_logical_cpus) {
         tracing::warn!(
             target: "zinder::ingest",
             event = "every_block_construction_below_qualified_cpus",
-            available_cpus,
-            qualified_cpus = EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS,
-            "every-block construction reaches Mainnet READY within three hours on 8 CPUs and takes longer on this host; set ingest.tree_state_densification.selection = \"commitment-budget\" or during_construction = false for a faster first sync"
+            available_logical_cpus,
+            qualified_logical_cpus = EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS,
+            "every-block construction reached Mainnet READY within three hours when measured with 6 hashing workers on 8 physical cores, one thread per core; this host reports fewer logical CPUs and will take longer; set ingest.tree_state_densification.selection = \"commitment-budget\" or during_construction = false for a faster first sync"
         );
     }
 }
 
 /// Whether a fresh construction stores every block's checkpoint on fewer
-/// CPUs than that qualification used.
+/// logical CPUs than that measurement used.
 fn every_block_construction_below_qualified_cpus(
     selection: Option<TreeStateCheckpointSelection>,
-    available_cpus: usize,
+    available_logical_cpus: usize,
 ) -> bool {
     selection == Some(TreeStateCheckpointSelection::EveryBlock)
-        && available_cpus < EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS
+        && available_logical_cpus < EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS
 }
 
 #[cfg(test)]

@@ -774,8 +774,8 @@ fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_servin
     let token = temporary.path().join("fixture.token");
     fs::write(&token, "fixture-token\n")?;
     let core_bounded_workers = std::thread::available_parallelism()
-        .map_or(8, std::num::NonZeroUsize::get)
-        .min(16);
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8);
 
     for file in ["ingest.toml", "wallet-serving/ingest.toml"] {
         for (setting, dense) in [
