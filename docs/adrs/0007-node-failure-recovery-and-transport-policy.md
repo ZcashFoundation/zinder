@@ -25,6 +25,10 @@ Public listeners accept clients Zinder does not control, and an advisory against
 
 [Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover) describes switching, [Node source boundary](../architecture/node-source-boundary.md) describes failure classes and indexer TLS, and [Configuration](../reference/configuration.md) lists listener limits and the internal dial bound.
 
+## Evidence
+
+- Decision 10, what an abandoned response keeps: external constraint. hyper 1.12 does not poll a response body while that body's last chunk waits for flow-control window, so nothing the send-stall bound returns after the deadline reaches HTTP/2. On a real HTTP/2 connection whose client never replenished its 65,535-byte window, the abandoned body was polled zero times and no stream reset was sent ([#503](https://github.com/ZcashFoundation/zinder/issues/503)). An HTTP/2 server that lets a service reset a stream waiting for window would reopen it.
+
 ## Consequences
 
 - Once following, ingest stays alive through node outages, and operators see the failure class and outage duration without reading logs.
