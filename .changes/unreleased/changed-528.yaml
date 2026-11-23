@@ -1,0 +1,6 @@
+kind: changed
+body: The public gRPC listeners of zinder-query, zinder-compat-lightwalletd, and zinder-explorer now reset a stalled response stream after the 60 s send-stall timeout, freeing the response data and HTTP/2 stream slot it held while the connection and its other streams stay open. Before, a client that answered keepalive pings but stopped granting flow-control window kept them until it disconnected. A stalled client now sees a stream reset (CANCELLED in grpc-go, grpc-java, and tonic; UNAVAILABLE in gRPC Swift) instead of DEADLINE_EXCEEDED. A connection that writes less than 16 KiB within the timeout once a write blocks is closed. The native contract revision is now 15, so upgrade zinder-ingest together with zinder-query and wallet-mode zinder-compat-lightwalletd. A client that lowers its stream window with SETTINGS after a response's last byte can still hold up to 400 KiB per stream until it disconnects; the configuration reference describes the bound.
+time: 2026-11-23T22:17:03.118313296Z
+custom:
+    Bump: minor
+    PR: "528"
