@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter};
 
-use futures_util::{TryStreamExt as _, stream::try_unfold};
+use futures_util::stream::try_unfold;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::{Instant, timeout_at},
@@ -24,6 +24,7 @@ use zinder_query::{
     QualificationWalletQuery, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
     parse_receivable_transparent_address, status_from_query_error,
 };
+use zinder_runtime::hold_grpc_response_permit;
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
     TransactionBroadcaster as _, TransparentAddressLookup, TransparentAddressRowLimit,
@@ -294,7 +295,7 @@ impl QualificationWallet {
         &self,
         request: lightwalletd::GetAddressUtxosArg,
         response_limit: NonZeroU32,
-    ) -> Result<GrpcStream<lightwalletd::GetAddressUtxosReply>, Status> {
+    ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, OwnedSemaphorePermit)>, Status> {
         if request.addresses.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
@@ -326,7 +327,7 @@ impl QualificationWallet {
         };
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         if count == 0 {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(None);
         }
         rows.sort_unstable_by_key(|row| {
             (
@@ -337,15 +338,7 @@ impl QualificationWallet {
         });
         rows.truncate(count);
         rows.shrink_to_fit();
-        Ok(Box::pin(try_unfold(
-            (rows.into_iter(), response_permit),
-            |(mut rows, response_permit)| async move {
-                let Some(row) = rows.next() else {
-                    return Ok(None);
-                };
-                Ok(Some((utxo_reply(row)?, (rows, response_permit))))
-            },
-        )))
+        Ok(Some((rows, response_permit)))
     }
 
     async fn history(
@@ -393,7 +386,7 @@ impl QualificationWallet {
         .await
         .map_err(|_| history_deadline_exceeded())??;
         if history.page.as_slice().is_empty() && history.pending.is_empty() {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(None);
         }
         Ok(history.into_stream(permit, deadline))
     }
@@ -1054,15 +1047,18 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::GetAddressUtxosArg>,
     ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
-        let address_utxos = self
+        let outputs = self
             .query_api
             .utxos(request.into_inner(), self.response_limits.max_address_utxos)
-            .await?
-            .try_collect()
             .await?;
-        Ok(Response::new(lightwalletd::GetAddressUtxosReplyList {
-            address_utxos,
-        }))
+        let Some((rows, permit)) = outputs else {
+            return Ok(Response::new(
+                lightwalletd::GetAddressUtxosReplyList::default(),
+            ));
+        };
+        let address_utxos = rows.into_iter().map(utxo_reply).collect::<Result<_, _>>()?;
+        let response = Response::new(lightwalletd::GetAddressUtxosReplyList { address_utxos });
+        Ok(hold_grpc_response_permit(response, permit))
     }
 
     type GetAddressUtxosStreamStream = GrpcStream<lightwalletd::GetAddressUtxosReply>;
@@ -1111,6 +1107,18 @@ impl compact_tx_streamer_server::CompactTxStreamer
 #[cfg(test)]
 mod tests {
     use super::*;
+        let outputs: Self::GetAddressUtxosStreamStream = match outputs {
+            None => Box::pin(stream::empty()),
+            Some((rows, permit)) => Box::pin(try_unfold(
+                (rows.into_iter(), permit),
+                |(mut rows, permit)| async move {
+                    let Some(row) = rows.next() else {
+                        return Ok(None);
+                    };
+                    Ok(Some((utxo_reply(row)?, (rows, permit))))
+                },
+            )),
+        };
 
     #[test]
     fn qualification_utxo_limit_applies_to_the_requested_response() {

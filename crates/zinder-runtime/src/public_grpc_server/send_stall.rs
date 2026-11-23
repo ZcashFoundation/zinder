@@ -32,7 +32,7 @@ use bytes::{Buf as _, Bytes};
 use futures_util::{FutureExt as _, TryFutureExt as _, future::BoxFuture};
 use http_body::{Frame, SizeHint};
 use parking_lot::Mutex;
-use tokio::time::Instant;
+use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Status, body::Body};
 use tower::{Layer, Service};
@@ -74,6 +74,27 @@ impl ResponseCancellation {
     fn failure(&self) -> Option<Status> {
         self.failure.lock().clone()
     }
+}
+
+#[derive(Clone)]
+struct ResponsePermit {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+/// Holds `permit` until the public gRPC transport finishes or discards the response.
+///
+/// Use with a server that installs [`GrpcSendStallLayer`], as
+/// [`super::public_grpc_server`] does. This keeps an admission slot charged
+/// while the layer still holds encoded response bytes.
+#[must_use]
+pub fn hold_grpc_response_permit<T>(
+    mut response: tonic::Response<T>,
+    permit: OwnedSemaphorePermit,
+) -> tonic::Response<T> {
+    response.extensions_mut().insert(ResponsePermit {
+        _permit: Arc::new(permit),
+    });
+    response
 }
 
 /// Tower layer that ends a response stream once its client has stopped
@@ -135,10 +156,11 @@ where
         let cancellation = request.extensions().get::<ResponseCancellation>().cloned();
         self.inner
             .call(request)
-            .map_ok(move |response| {
+            .map_ok(move |mut response| {
+                let permit = response.extensions_mut().remove::<ResponsePermit>();
                 response.map(|body| {
                     Body::new(SendStallBoundBody::new(
-                        body,
+                        HandlerResponse { body, permit },
                         send_stall_timeout,
                         cancellation,
                     ))
@@ -170,8 +192,13 @@ struct Sending {
     waker: Option<Waker>,
 }
 
+struct HandlerResponse {
+    body: Body,
+    permit: Option<ResponsePermit>,
+}
+
 enum Source {
-    Handler(Body),
+    Handler(HandlerResponse),
     /// The handler's body was dropped; the stream ends with this status.
     Abandoned(Status),
     /// The abandoned stream reported its status.
@@ -180,7 +207,7 @@ enum Source {
 
 impl SendStallBoundBody {
     fn new(
-        inner: Body,
+        inner: HandlerResponse,
         send_stall_timeout: Duration,
         cancellation: Option<ResponseCancellation>,
     ) -> Self {
@@ -247,7 +274,7 @@ impl Sending {
     /// Drops what the response still holds and records `status` for the
     /// transport. Returns the handler's body and the transport's waker, so
     /// the caller drops the one and wakes the other unlocked.
-    fn abandon(&mut self, status: Status) -> (Option<Body>, Option<Waker>) {
+    fn abandon(&mut self, status: Status) -> (Option<HandlerResponse>, Option<Waker>) {
         self.unsent = Bytes::new();
         match mem::replace(&mut self.source, Source::Abandoned(status)) {
             Source::Handler(body) => (Some(body), self.waker.take()),
@@ -341,7 +368,7 @@ impl http_body::Body for SendStallBoundBody {
             }
             Source::Reported => return Poll::Ready(None),
         };
-        let final_trailers = match Pin::new(handler_body).poll_frame(cx) {
+        let final_trailers = match Pin::new(&mut handler_body.body).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(chunk) => {
                     sending.unsent = chunk;
@@ -362,6 +389,9 @@ impl http_body::Body for SendStallBoundBody {
                 return Poll::Pending;
             }
             failed @ Poll::Ready(Some(Err(_))) => {
+                if handler_body.permit.is_some() {
+                    sending.source = Source::Reported;
+                }
                 return failed;
             }
         };
@@ -371,8 +401,10 @@ impl http_body::Body for SendStallBoundBody {
             .cancellation
             .as_ref()
             .and_then(ResponseCancellation::failure);
-        if let Some(status) = receive_failure {
+        if handler_body.permit.is_some() || receive_failure.is_some() {
             sending.source = Source::Reported;
+        }
+        if let Some(status) = receive_failure {
             drop(sending);
             return Poll::Ready(Some(trailers_reporting(&status)));
         }
@@ -384,7 +416,7 @@ impl http_body::Body for SendStallBoundBody {
         let sending = self.sending.lock();
         sending.unsent.is_empty()
             && match &sending.source {
-                Source::Handler(handler_body) => handler_body.is_end_stream(),
+                Source::Handler(handler_body) => handler_body.body.is_end_stream(),
                 Source::Abandoned(_) => false,
                 Source::Reported => true,
             }
@@ -393,7 +425,9 @@ impl http_body::Body for SendStallBoundBody {
     fn size_hint(&self) -> SizeHint {
         let sending = self.sending.lock();
         match &sending.source {
-            Source::Handler(handler_body) if sending.unsent.is_empty() => handler_body.size_hint(),
+            Source::Handler(handler_body) if sending.unsent.is_empty() => {
+                handler_body.body.size_hint()
+            }
             Source::Handler(_) | Source::Abandoned(_) | Source::Reported => SizeHint::default(),
         }
     }
@@ -401,17 +435,20 @@ impl http_body::Body for SendStallBoundBody {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use bytes::Bytes;
     use http_body::{Body as _, Frame};
     use http_body_util::{BodyExt as _, StreamBody};
-    use tokio::sync::oneshot;
+    use tokio::sync::{Semaphore, oneshot};
     use tokio_stream::StreamExt as _;
     use tokio_util::sync::CancellationToken;
     use tonic::{Status, body::Body};
 
-    use super::{RESPONSE_PIECE_BYTES, ResponseCancellation, SendStallBoundBody};
+    use super::{
+        HandlerResponse, RESPONSE_PIECE_BYTES, ResponseCancellation, ResponsePermit,
+        SendStallBoundBody,
+    };
 
     /// A response chunk that reports when its allocation is freed.
     struct TrackedChunk {
@@ -432,8 +469,15 @@ mod tests {
             Result<Frame<Bytes>, Status>,
         >()));
         let cancelled = CancellationToken::new();
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).try_acquire_owned()?;
         let mut body = SendStallBoundBody::new(
-            handler_body,
+            HandlerResponse {
+                body: handler_body,
+                permit: Some(ResponsePermit {
+                    _permit: Arc::new(permit),
+                }),
+            },
             Duration::from_hours(1),
             Some(ResponseCancellation::new(
                 cancelled.clone(),
@@ -450,15 +494,17 @@ mod tests {
                 }
                 next
             });
-            next_frame.await
+            (next_frame.await, body)
         });
         assert!(polled.await?, "the handler body was not pending");
+        assert_eq!(slots.available_permits(), 0);
 
         cancelled.cancel();
-        let frame = tokio::time::timeout(Duration::from_secs(5), transport)
+        let (frame, _body) = tokio::time::timeout(Duration::from_secs(5), transport)
             .await
-            .map_err(|_| "the transport was never woken")??
-            .ok_or("the response ended without a status")??;
+            .map_err(|_| "the transport was never woken")??;
+        assert_eq!(slots.available_permits(), 1);
+        let frame = frame.ok_or("the response ended without a status")??;
         let status = frame
             .trailers_ref()
             .and_then(|trailers| trailers.get("grpc-status"))
@@ -478,7 +524,14 @@ mod tests {
         let handler_body = Body::new(StreamBody::new(
             tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
         ));
-        let mut body = SendStallBoundBody::new(handler_body, Duration::from_hours(1), None);
+        let mut body = SendStallBoundBody::new(
+            HandlerResponse {
+                body: handler_body,
+                permit: None,
+            },
+            Duration::from_hours(1),
+            None,
+        );
 
         let first = body
             .frame()
@@ -513,7 +566,10 @@ mod tests {
         ));
         let cancelled = CancellationToken::new();
         let mut body = SendStallBoundBody::new(
-            handler_body,
+            HandlerResponse {
+                body: handler_body,
+                permit: None,
+            },
             Duration::from_hours(1),
             Some(ResponseCancellation::new(
                 cancelled.clone(),

@@ -7,12 +7,14 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
     Code,
-    transport::{Channel, Server},
+    transport::{Channel, Endpoint},
 };
 use zinder_core::{BlockId, Network, TransactionId, wire::encode_rpc_transaction_id_hex};
 use zinder_proto::compat::lightwalletd::{
-    GetAddressUtxosArg, GetAddressUtxosReply, compact_tx_streamer_client::CompactTxStreamerClient,
+    AddressList, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList,
+    compact_tx_streamer_client::CompactTxStreamerClient,
 };
+use zinder_runtime::{ClientAddressSource, public_grpc_server};
 use zinder_testkit::{ChainFixture, RpcReply, method};
 
 use super::{ADDRESS, Fixture, one_upgrade_per_height, utxos_at};
@@ -96,16 +98,25 @@ fn wallet_outputs(script: &[u8]) -> impl Iterator<Item = GetAddressUtxosReply> {
 async fn with_client(
     check: impl AsyncFnOnce(CompactTxStreamerClient<Channel>, &[u8]) -> Result<()>,
 ) -> Result<()> {
+    with_channel(async |channel, script| check(CompactTxStreamerClient::new(channel), script).await)
+        .await
+}
+
+async fn with_channel(check: impl AsyncFnOnce(Channel, &[u8]) -> Result<()>) -> Result<()> {
     let script = zinder_source::parse_transparent_address(ADDRESS)?.script();
     let fixture = fixture(script.as_raw_bytes())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
-    let server = Server::builder()
+    let server = public_grpc_server(ClientAddressSource::Connection)
         .add_service(fixture.adapter.into_server())
         .serve_with_incoming(TcpListenerStream::new(listener));
     let request = async {
-        let client = CompactTxStreamerClient::connect(endpoint).await?;
-        check(client, script.as_raw_bytes()).await
+        let channel = Endpoint::new(endpoint)?
+            .initial_stream_window_size(Some(64 * 1024))
+            .initial_connection_window_size(Some(16 * 1024 * 1024))
+            .connect()
+            .await?;
+        check(channel, script.as_raw_bytes()).await
     };
     tokio::select! {
         stopped = server => Err(eyre!("gRPC server stopped during UTXO request: {stopped:?}")),
@@ -190,6 +201,72 @@ async fn a_slow_utxo_stream_leaves_node_admission_for_another_client() -> Result
             .into_inner();
         assert_eq!(fast.address_utxos, [first]);
         assert_eq!(slow.message().await?, wallet_outputs(script).nth(1));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn two_backpressured_unary_utxo_replies_refuse_a_third_but_allow_balance() -> Result<()> {
+    with_channel(async |channel, _| {
+        let mut raw_client =
+            tonic::client::Grpc::new(channel.clone()).max_decoding_message_size(16 * 1024 * 1024);
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            raw_client.ready().await?;
+            // Receive the unary call's headers without consuming its one
+            // message. Its data exceeds the HTTP/2 stream window.
+            let response = raw_client
+                .server_streaming::<_, GetAddressUtxosReplyList, _>(
+                    tonic::Request::new(request()),
+                    http::uri::PathAndQuery::from_static(
+                        "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos",
+                    ),
+                    tonic_prost::ProstCodec::default(),
+                )
+                .await?;
+            replies.push(response.into_inner());
+        }
+
+        let mut client = CompactTxStreamerClient::new(channel);
+        let small_request = || GetAddressUtxosArg {
+            max_entries: 1,
+            ..request()
+        };
+        let refused = client
+            .get_address_utxos(small_request())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("a third unary UTXO response was admitted"))?;
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        assert!(refused.message().contains("response limit"));
+
+        let balance = client
+            .get_taddress_balance(AddressList {
+                addresses: vec![ADDRESS.to_owned()],
+            })
+            .await?
+            .into_inner();
+        assert!(balance.value_zat > 0);
+
+        let mut first = replies
+            .pop()
+            .ok_or_else(|| eyre!("missing unary response"))?;
+        let rows = first
+            .message()
+            .await?
+            .ok_or_else(|| eyre!("missing unary reply"))?;
+        assert!(rows.encoded_len() > DEFAULT_DECODE_BYTES);
+        assert!(first.message().await?.is_none());
+        assert_eq!(
+            client
+                .get_address_utxos(small_request())
+                .await?
+                .into_inner()
+                .address_utxos
+                .len(),
+            1
+        );
         Ok(())
     })
     .await

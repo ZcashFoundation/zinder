@@ -70,6 +70,7 @@ secrecy.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic-health.workspace = true
+tonic-prost.workspace = true
 zcash_address = { workspace = true, features = ["std"] }
 zcash_protocol = { workspace = true, features = ["std"] }
 zinder-ingest.workspace = true

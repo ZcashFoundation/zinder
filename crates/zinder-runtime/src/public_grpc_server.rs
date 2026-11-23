@@ -79,7 +79,7 @@ use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 pub(crate) use self::call_termination::OpenGrpcCalls;
 pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
 use self::send_stall::ResponseCancellation;
-pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
+pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer, hold_grpc_response_permit};
 pub(crate) use self::wallet_rpc_metrics::{RANGE_BLOCKS, RANGE_DURATION, WalletRpcMethod};
 pub use self::wallet_rpc_metrics::{WalletRpcMetrics, WalletRpcMetricsLayer};
 use self::{
