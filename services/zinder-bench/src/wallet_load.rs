@@ -15,6 +15,7 @@ mod mock_streamer;
 #[cfg(test)]
 mod pepper_sync_client;
 mod point_reads;
+mod raw_range_probe;
 mod server_metrics;
 mod setup;
 mod slipstream;
@@ -33,6 +34,8 @@ use clap::{Args, ValueEnum};
 use parking_lot::Mutex;
 use serde::Serialize;
 use transport::TlsOptions;
+
+pub(crate) use raw_range_probe::{RawRangeProbeArgs, run_raw_range_probe};
 use zinder_bench::BenchError;
 use zinder_proto::compat::lightwalletd::{CompactBlock, Empty};
 

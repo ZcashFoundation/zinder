@@ -1416,7 +1416,7 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
             .into_inner();
         let mut received = Vec::new();
         while let Some(row) = rows.next().await.transpose()? {
-            received.push(row.to_vec());
+            received.push(row.payload().to_vec());
         }
         Ok::<_, eyre::Report>(received)
     };

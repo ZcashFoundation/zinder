@@ -1808,7 +1808,7 @@ pub mod compact_tx_streamer_server {
                                     max_decoding_message_size,
                                     max_encoding_message_size,
                                 );
-                            return Ok(grpc.server_streaming(encoded, req).await);
+                            return Ok(crate::encoded_block_range::server_streaming(&mut grpc, encoded, req, send_compression_encodings, max_encoding_message_size).await);
                         }
                         let method = GetBlockRangeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();

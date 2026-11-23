@@ -115,6 +115,14 @@ jobs:
       - name: Test (unit + integration)
         run: cargo nextest run --profile=ci
 
+      - name: Verify paired wallet reader measurement
+        run: |
+          cargo build --locked -p zinder-bench --bin zinder-bench
+          cargo build --locked -p zinder-compat-lightwalletd --bin zinder-compat-lightwalletd --example wallet-reader-fixture
+          python3 -B scripts/test-wallet-reader-comparison.py \
+            --reader target/debug/zinder-compat-lightwalletd --bench target/debug/zinder-bench \
+            --writer target/debug/examples/wallet-reader-fixture
+
       - name: Verify protected wallet history on ext4
         run: |
           sudo apt-get update -qq
@@ -270,6 +278,8 @@ jobs:
         run: |
           scripts/test-container-resource-evidence.sh
           scripts/test-storage-benchmark-campaign-validator.sh
+          python3 -B scripts/test-benchmark-campaign.py
+          python3 -B scripts/test-compare-benchmark-campaign.py
           scripts/test-observability-smoke-safety.sh
           python3 scripts/test-publication-delay.py
           python3 scripts/test-wallet-lifecycle.py

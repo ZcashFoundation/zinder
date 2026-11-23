@@ -32,7 +32,9 @@ pub(super) fn enable(path: &Path) -> Result<(), Box<dyn Error>> {
         "{before_hook}{RANGE_HOOK}{RANGE_STREAM}{before_method}\
          {indent}if let Some(encoded) = inner.encoded_block_range() {{\n\
          {encoded_setup}\
-         {indent}    return Ok(grpc.server_streaming(encoded, req).await);\n\
+         {indent}    return Ok(crate::encoded_block_range::server_streaming(\
+         &mut grpc, encoded, req, send_compression_encodings, max_encoding_message_size\
+         ).await);\n\
          {indent}}}\n\
          {METHOD}{setup}{CALL}{after_call}",
         indent = "                        ",

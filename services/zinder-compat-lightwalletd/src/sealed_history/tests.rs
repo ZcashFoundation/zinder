@@ -68,11 +68,11 @@ fn reopened_segment_uses_native_row_budgets_in_each_direction() -> eyre::Result<
             assert_eq!(row.native_bytes, native_bytes);
             let expected_block = CompactBlockShape::for_range(&[])?.message(block(height))?;
             assert_eq!(
-                row.payload.as_ref(),
+                row.message.payload().as_ref(),
                 expected_block.encode_to_vec().as_slice()
             );
             assert_eq!(
-                lightwalletd::CompactBlock::decode(row.payload.clone())?,
+                lightwalletd::CompactBlock::decode(row.message.payload())?,
                 expected_block
             );
         }
@@ -173,7 +173,8 @@ fn admitted_reader_checks_copied_bytes_and_keeps_its_original_file() -> eyre::Re
         opened.rows[2].offset + opened.rows[2].len as u64 - 1,
     ))?;
     let last_byte = rows[2]
-        .payload
+        .message
+        .as_length_prefixed()
         .last()
         .ok_or_else(|| invalid("empty test payload"))?;
     file.write_all(&[last_byte ^ 0xff])?;
@@ -418,8 +419,8 @@ fn kernel_protected_file_is_bound_before_the_digest_scan() -> eyre::Result<()> {
     assert!(
         first
             .iter()
-            .map(|row| &row.payload)
-            .eq(second.iter().map(|row| &row.payload))
+            .map(|row| &row.message)
+            .eq(second.iter().map(|row| &row.message))
     );
     Ok(())
 }
@@ -588,7 +589,7 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     let mut rows =
         history.read_chunk(range(1, TOTAL_BLOCKS), HeightOrder::Ascending, usize::MAX)?;
     assert_eq!(rows.len(), TOTAL_BLOCKS as usize);
-    let total_payload_bytes: usize = rows.iter().map(|row| row.payload.len()).sum();
+    let total_payload_bytes: usize = rows.iter().map(|row| row.message.payload_len()).sum();
     assert!(
         total_payload_bytes > SLAB_TARGET_BYTES,
         "test fixture must exceed 64 KiB slab target (got {total_payload_bytes} bytes)"
@@ -597,11 +598,13 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     let mut slab_one_count = 0_usize;
     let mut slab_bytes = 0_usize;
     for row in &rows {
-        if slab_one_count > 0 && slab_bytes + LENGTHS_LEN + row.payload.len() > SLAB_TARGET_BYTES {
+        if slab_one_count > 0
+            && slab_bytes + LENGTHS_LEN + row.message.payload_len() > SLAB_TARGET_BYTES
+        {
             break;
         }
         assert_eq!(row.id, id(u32::try_from(slab_one_count)? + 1));
-        slab_bytes += LENGTHS_LEN + row.payload.len();
+        slab_bytes += LENGTHS_LEN + row.message.payload_len();
         slab_one_count += 1;
     }
     assert!(slab_one_count > 0 && slab_one_count < rows.len());
@@ -610,10 +613,10 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     let probe = rows
         .pop()
         .ok_or_else(|| eyre::eyre!("expected non-empty first slab"))?;
-    assert!(!probe.payload.is_unique());
+    assert!(!probe.message.as_length_prefixed().is_unique());
     drop(rows);
     assert!(
-        probe.payload.is_unique(),
+        probe.message.as_length_prefixed().is_unique(),
         "first slab must release independently of later slabs"
     );
     assert_eq!(later_slabs[0].id, id(u32::try_from(slab_one_count)? + 1));

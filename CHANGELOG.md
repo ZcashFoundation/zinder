@@ -8,6 +8,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.23.0] - 2026-11-23
+
+### Added
+
+- Operators can use zinder-projector to back up the canonical and wallet stores together, verify the backup offline, and restore both stores into a fresh directory while preserving cursor history. Keep the archive private and retain its manifest digest separately for recovery. ([#440](https://github.com/ZcashFoundation/zinder/pull/440))
+- Operators can repeat a shielded Zingo and Zallet payment on independent Regtest chains and compare wallet behavior against a versioned release baseline. ([#444](https://github.com/ZcashFoundation/zinder/pull/444))
+- Release operators can compare a candidate archive against the established wallet payment baseline on two isolated Regtest chains. ([#445](https://github.com/ZcashFoundation/zinder/pull/445))
+- Operators can verify that Zingo CLI and Zallet recover shielded Regtest payments after a disconnect or shallow rollback, and compare the observed balances, fees, and spendability with the release baseline. ([#449](https://github.com/ZcashFoundation/zinder/pull/449))
+- Wallet-load benchmark reports record the tip before and after a run and a digest that preserves how reads were distributed across wallets. Operators can check the served tip and workload before comparing latency. ([#447](https://github.com/ZcashFoundation/zinder/pull/447))
+- Wallet operators can serve settled shielded block ranges from a signed history catalog and require Linux fs-verity for segment reads. Wallet clients use the same lightwalletd endpoint. ([#450](https://github.com/ZcashFoundation/zinder/pull/450))
+- Operators can opt in to a faster Pasta field-arithmetic backend at build time (`--build-arg ZINDER_PASTA_ASM=1`, or `--features pasta_curves/asm`). The x86-64 backend needs BMI2 and ADX and the binaries refuse to start on a host that lacks ADX instead of crashing; the default build keeps the portable backend. ([#452](https://github.com/ZcashFoundation/zinder/pull/452))
+- Operators can compare shielded payments, fees, and spending of received notes for both Zkool address profiles and Cake Wallet’s Zcash engine against Zallet on disposable Regtest chains. ([#454](https://github.com/ZcashFoundation/zinder/pull/454))
+- Release operators can verify payments, return spends, and reopened balances between Zingo and the pinned Vizor, zcash-devtool, and Zally wallets on isolated Regtest chains. ([#455](https://github.com/ZcashFoundation/zinder/pull/455))
+- Single-host wallet operators can publish signed shielded history as settlement advances. The Compose publisher keeps its signing key private, resumes from a durable checkpoint, and supports key rotation while the wallet endpoint is serving. ([#461](https://github.com/ZcashFoundation/zinder/pull/461))
+- Fresh canonical construction can hash note-commitment trees on several threads with `ingest.construction.tree_hashing_workers`. With more workers, construction with `during_construction = true` reaches READY sooner and stores the same rows. Construction checkpoints now also reject an encoding of any tree other than the one appended. ([#482](https://github.com/ZcashFoundation/zinder/pull/482))
+
+### Changed
+
+- Serving warm historical compact block ranges uses less listener CPU. Time to the first block can still vary by wallet workload. ([#446](https://github.com/ZcashFoundation/zinder/pull/446))
+- Benchmark report consumers should select their parser by report kind and format version. RocksDB storage lifecycle and canonical fixture replay now emit v5, and raw-blob retention comparison emits v3. Point-reads v2 replaces `stored_checkpoint_height` and `replay_height` with `on_cadence_height` and `off_cadence_height` and updates the matching request labels. Use the `source` label on `zinder_query_tree_state_reads_total` to measure stored versus replayed reads. For READY-time comparisons with archived cold-certified lifecycle runs, select `--canonical-publication-mode cold-certified`. New runs default to `trusted-fresh`. ([#451](https://github.com/ZcashFoundation/zinder/pull/451))
+- Wallet listeners with published history reuse a bounded suffix of encoded shielded blocks at the current chain view. Uncovered chunks, other pool selections, and a changed chain view retain their canonical read behavior. ([#457](https://github.com/ZcashFoundation/zinder/pull/457))
+- Signed wallet history now uses version 2 segments with an authenticated index. Republish version 1 catalogs into a new directory before switching listeners. Portable readers verify each file in a single pass, and a matching signed fs-verity measurement allows admission from the index. ([#458](https://github.com/ZcashFoundation/zinder/pull/458))
+- Listeners bound concurrent published-history chunk reads and share the range byte budget under load. Wallets waiting for a chunk keep their place in arrival order and release it on disconnect. `GetTreeState` returns `INVALID_ARGUMENT` for the genesis hash even when the store starts at a later checkpoint. ([#459](https://github.com/ZcashFoundation/zinder/pull/459))
+- Single-host wallet Compose installations serve canonical shielded ranges during bootstrap and automatically adopt signed segments as they become available. Compose sets the wallet reader’s open-file limit to 65,536. Provision a durable publisher key and its trusted public key before upgrading. ([#462](https://github.com/ZcashFoundation/zinder/pull/462))
+- The wallet-history publisher automatically enables fs-verity on new segments when the local Linux filesystem supports it. Readers use the signed kernel measurement to avoid rehashing each payload. Other filesystems retain portable verification. ([#463](https://github.com/ZcashFoundation/zinder/pull/463))
+- Settled tree-state cache entries now survive visible-tip appends and verified settled-tip advances inside a bounded 1,024-entry / 8 MiB LRU cache, resetting only on forks, schema updates, upgrade-schedule revisions, or retention-floor changes. ([#464](https://github.com/ZcashFoundation/zinder/pull/464))
+- Published shielded range chunks now group dense multi-block payloads into slabs targeting 64 KiB, cache up to 16 verified settled tips with single-flight anchor checks, use range_fence retention checks without redundant block-hash reads, and propagate cooperative cancellation to queued blocking reads. Compose admission checks signed history mount and file-grant sources outside the publisher and rejects inherited mounts and unsupported volume backing options. ([#465](https://github.com/ZcashFoundation/zinder/pull/465))
+- Compact-block gRPC services now always expose a decoupled single-flight shielded live-tail buffer with exact stored block byte lengths so standalone deployments serve hot uncovered ranges on demand without requiring a published signed catalog. ([#466](https://github.com/ZcashFoundation/zinder/pull/466))
+- Fresh canonical builds can apply the existing commitment budget before READY. With densification enabled, set ingest.tree_state_densification.during_construction to true and select commitment-budget to bound historical tree-state replay by the configured note commitment count. ([#479](https://github.com/ZcashFoundation/zinder/pull/479))
+- Fresh wallet-serving stores with Explorer views off now store a tree-state checkpoint at every height before READY, so wallets read historical tree states from stored checkpoints as soon as the store is published. When construction stores these extra checkpoints, `ingest.construction.tree_hashing_workers` defaults to the detected logical CPU count, at most 8, or to 1 when the count cannot be detected. In the measured Mainnet build, with 6 hashing workers on 8 physical cores and one thread per core, this first sync reached READY within three hours. Hosts with fewer logical CPUs take longer, and ingest logs `every_block_construction_below_qualified_cpus` when it starts such a build; set `ingest.tree_state_densification.selection = "commitment-budget"` or `during_construction = false` before the first sync for an earlier READY. A wallet-serving configuration that sets only `selection = "commitment-budget"` or `commitment_budget` used to build a sparse store and now applies the budget before READY. Existing stores reopen without a rebuild, and a sparse store keeps being densified by the background pass. ([#487](https://github.com/ZcashFoundation/zinder/pull/487))
+
+### Fixed
+
+- Wallet qualification verifies the Vizor driver and fixture identity, stops on Zingo connection errors, and requires Zingo to discover each newly confirmed shielding transaction. ([#441](https://github.com/ZcashFoundation/zinder/pull/441))
+- Vizor qualification checks the running wallet service revision over HTTP and gRPC and requires a version 2 receipt for the driver compiled by Cargo. Rebuild engines with older receipts. ([#443](https://github.com/ZcashFoundation/zinder/pull/443))
+- Wallet benchmarks reject block hashes longer than 32 bytes during tip and subtree checks. A failed closing tip check preserves completed wallet results. ([#453](https://github.com/ZcashFoundation/zinder/pull/453))
+- Concurrent wallets querying the same missing tree state now share its reconstruction. When the last caller disconnects, Zinder stops the abandoned replay. Query metrics distinguish coalesced and cached tree-state responses. ([#456](https://github.com/ZcashFoundation/zinder/pull/456))
+
+### Security
+
+- Zinder binaries use a patched URL parser that avoids a stack overflow when computing the origin of nested blob URLs (RUSTSEC-2026-0592). ([#467](https://github.com/ZcashFoundation/zinder/pull/467))
+
+
 ## [0.22.0] - 2026-11-21
 
 ### Added

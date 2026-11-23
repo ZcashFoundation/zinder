@@ -71,6 +71,12 @@ def positive_int(number):
     return type(number) is int and number > 0
 
 
+def trial_order(arms, repetition, order="balanced"):
+    if order == "alternating":
+        return arms if repetition % 2 else arms[::-1]
+    return arms if repetition % 4 in (0, 1) else arms[::-1]
+
+
 def is_pointer(pointer):
     return isinstance(pointer, str) and pointer.startswith("/")
 
@@ -93,6 +99,9 @@ def environment_expectations(campaign):
 def read_campaign(path):
     campaign = read_json(path)
     repeats = campaign.get("repeats", 4)
+    order = campaign.get("order", "balanced")
+    if order not in ("balanced", "alternating"):
+        raise ValueError("order must be 'balanced' or 'alternating'")
     timeout = campaign.get("timeout_seconds", 600)
     if not positive_int(repeats) or not positive_int(timeout):
         raise ValueError("repeats and timeout_seconds must be positive integers")
@@ -219,6 +228,7 @@ def run_case(command, directory, timeout, case):
         "command": command,
         "exit_code": exit_code,
         "matched_fields": match,
+        "report_sha256": sha256(report_path) if report_path.is_file() else None,
         "problems": problems,
     }
     write_json(directory / "run.json", observation)
@@ -257,14 +267,15 @@ def main():
     for name, case in campaign["cases"].items():
         checked_case = {**case, "expect": {**shared, **case.get("expect", {})}}
         for repetition in range(1, repeats + 1):
-            order = arms if repetition % 4 in (0, 1) else arms[::-1]
-            pair = {"case": name, "repetition": repetition, "order": order, "runs": {}}
-            for arm in order:
+            run_order = trial_order(arms, repetition, campaign.get("order", "balanced"))
+            pair = {"case": name, "repetition": repetition, "order": run_order, "runs": {}}
+            for arm in run_order:
                 run_path = Path(name) / f"round-{repetition}" / arm
                 print(f"{name} round {repetition} {arm}", file=sys.stderr, flush=True)
                 observation = run_case(commands[name, arm], output / run_path, timeout, checked_case)
                 pair["runs"][arm] = {"path": str(run_path), "problems": observation["problems"]}
                 pair["runs"][arm]["matched_fields"] = observation["matched_fields"]
+                pair["runs"][arm]["report_sha256"] = observation["report_sha256"]
             first, second = (pair["runs"][arm]["matched_fields"] for arm in arms)
             pair["mismatched_fields"] = sorted(
                 pointer for pointer in first.keys() & second.keys()

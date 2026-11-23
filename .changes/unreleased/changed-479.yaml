@@ -1,6 +1,0 @@
-kind: changed
-body: Fresh canonical builds can apply the existing commitment budget before READY. With densification enabled, set ingest.tree_state_densification.during_construction to true and select commitment-budget to bound historical tree-state replay by the configured note commitment count.
-time: 2026-11-22T20:28:35.086445095Z
-custom:
-    Bump: minor
-    PR: "479"

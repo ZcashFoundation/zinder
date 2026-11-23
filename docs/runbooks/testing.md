@@ -904,6 +904,8 @@ after the others finish.
 
 #### Run a paired benchmark campaign
 
+To compare two wallet reader binaries on the same private fixture and check the paired changes against a PR budget, follow [Wallet performance qualification](wallet-performance-qualification.md).
+
 Use `scripts/run-benchmark-campaign.py` to run the same cases against two
 prepared targets. It runs the existing benchmark commands in alternating
 before/after order and saves their raw reports. Build the clients first, and

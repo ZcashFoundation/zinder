@@ -55,7 +55,10 @@ use rocksdb_tip_replay::{
 };
 use rocksdb_tree_state_replay::{RocksDbTreeStateReplayArgs, run_rocksdb_tree_state_replay};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
-use wallet_load::{LightwalletdWalletLoadArgs, run_lightwalletd_wallet_load};
+use wallet_load::{
+    LightwalletdWalletLoadArgs, RawRangeProbeArgs, run_lightwalletd_wallet_load,
+    run_raw_range_probe,
+};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -129,6 +132,9 @@ enum Command {
     /// Drive wallet-shaped sync load at a running lightwalletd-compatible endpoint.
     #[command(name = "lightwalletd-wallet-load")]
     LightwalletdWalletLoad(LightwalletdWalletLoadArgs),
+    /// Verify raw `GetBlockRange` frames against an oracle and time them.
+    #[command(name = "raw-range-probe")]
+    RawRangeProbe(RawRangeProbeArgs),
 }
 
 #[derive(Args)]
@@ -334,11 +340,20 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbTipReplay(args) => run_rocksdb_tip_replay(args).await,
         Command::CompareTipReplayReports(args) => run_compare_tip_replay_reports(&args),
         Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
-        Command::LightwalletdWalletLoad(args) => {
-            let output = run_lightwalletd_wallet_load(args).await?;
-            emit_report(&output.report, output.report_path.as_deref())
-        }
+        Command::LightwalletdWalletLoad(args) => run_wallet_load_command(args).await,
+        Command::RawRangeProbe(args) => run_raw_range_probe_command(args).await,
     }
+}
+
+async fn run_wallet_load_command(args: LightwalletdWalletLoadArgs) -> Result<(), BenchError> {
+    let output = run_lightwalletd_wallet_load(args).await?;
+    emit_report(&output.report, output.report_path.as_deref())
+}
+
+async fn run_raw_range_probe_command(args: RawRangeProbeArgs) -> Result<(), BenchError> {
+    let output = run_raw_range_probe(args).await?;
+    emit_report(&output.report, output.report_path.as_deref())?;
+    output.require_verified()
 }
 
 async fn run_capture_tip_replay_checkpoints(
@@ -758,6 +773,63 @@ mod tests {
             ));
         }
         assert!(load("zingo").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_range_probe_command_spellings_are_stable() -> Result<(), Box<dyn Error>> {
+        let probe = |extra: &[&str]| {
+            let mut arguments = vec!["zinder-bench", "raw-range-probe", "--endpoint", "http://a"];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+        assert!(matches!(
+            probe(&[
+                "--oracle",
+                "oracle.json",
+                "--clients",
+                "4",
+                "--server-pid",
+                "7",
+                "--server-executable",
+                "reader"
+            ])?
+            .command,
+            Command::RawRangeProbe(_)
+        ));
+        assert!(matches!(
+            probe(&[
+                "--oracle-endpoint",
+                "http://b",
+                "--range",
+                "20:10",
+                "--both-directions",
+                "--write-oracle",
+                "oracle.json",
+            ])?
+            .command,
+            Command::RawRangeProbe(_)
+        ));
+        // The oracle is required, and a file excludes recording one.
+        assert!(probe(&[]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--oracle-endpoint", "http://b"]).is_err());
+        assert!(probe(&["--oracle-endpoint", "http://b"]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--clients", "0"]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--server-counter", "x"]).is_err());
+        let metrics = [
+            "--oracle",
+            "o.json",
+            "--server-metrics-url",
+            "http://m/metrics",
+        ];
+        let with = |extra: &[&str]| probe(&[&metrics[..], extra].concat());
+        let witness = ["--server-freshness-counter", "w_total{status=ok}"];
+        assert!(with(&[&["--rocksdb-multiget-counters"][..], &witness].concat()).is_ok());
+        assert!(with(&[&["--server-counter", "a=b_total{k=v}"][..], &witness].concat()).is_ok());
+        // Counters without a freshness witness, or a witness without counters, could read as zero.
+        assert!(with(&["--rocksdb-multiget-counters"]).is_err());
+        assert!(with(&witness).is_err());
+        assert!(with(&["--server-counter", "a{b}"]).is_err());
         Ok(())
     }
 
