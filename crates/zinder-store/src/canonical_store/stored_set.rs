@@ -297,6 +297,17 @@ impl CanonicalStoredSet {
     pub(super) const fn requires_daily_value_pool_evidence(self) -> bool {
         matches!(self.workload, CanonicalStoreWorkload::Explorer)
     }
+
+    pub(super) fn permits_construction_rows(self, family: &str) -> bool {
+        match family {
+            BLOCK_BLOB_COLUMN_FAMILY => self.contains(CanonicalStoredData::BlockBodies),
+            TRANSACTION_BLOB_COLUMN_FAMILY => self.contains(CanonicalStoredData::TransactionBodies),
+            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY => {
+                self.contains(CanonicalStoredData::FinalNoteCommitmentRoots)
+            }
+            _ => !CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES.contains(&family),
+        }
+    }
 }
 
 impl CanonicalSubtreeRootLoadCoverage {

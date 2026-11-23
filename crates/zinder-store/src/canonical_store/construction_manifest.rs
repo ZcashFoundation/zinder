@@ -523,14 +523,23 @@ impl PersistedConstructionManifest {
             ));
         }
         validate_persisted_family_coverage(&self.family_evidence)?;
+        let stored_set = super::CanonicalStoredSet::new(
+            self.workload,
+            self.build_plan.raw_blob_retention,
+            BlockHeight::new(self.build_plan.first_available_height),
+        );
+        if let Some(family) = self.family_evidence.iter().find(|family| {
+            family.row_count != 0 && !stored_set.permits_construction_rows(&family.family)
+        }) {
+            return Err(CanonicalStoreError::publication(format!(
+                "construction manifest has rows in {} outside the construction stored set",
+                family.family
+            )));
+        }
         validate_persisted_sst_coverage(&self.family_evidence, &self.staged_ssts)?;
         validate_persisted_source_evidence(
             &self.family_evidence,
-            super::CanonicalStoredSet::new(
-                self.workload,
-                self.build_plan.raw_blob_retention,
-                BlockHeight::new(self.build_plan.first_available_height),
-            ),
+            stored_set,
             &self.block_evidence,
             &self.subtree_evidence,
         )?;
@@ -1307,6 +1316,55 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_refuses_rows_outside_the_construction_stored_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::rocksdb::{
+            BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        };
+
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("canonical");
+        let _writer = super::super::live_replacement_tests::published_store_with_retention(
+            &path,
+            2,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+            crate::RawBlobRetention::None,
+        )?;
+        for name in [
+            BLOCK_BLOB_COLUMN_FAMILY,
+            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            TRANSACTION_BLOB_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY,
+        ] {
+            let (mut manifest, _) = read_construction_manifest(&path)?;
+            let family = manifest
+                .family_evidence
+                .iter_mut()
+                .find(|family| family.family == name)
+                .ok_or("published manifest lacks family evidence")?;
+            assert_eq!(family.row_count, 0);
+            family.row_count = 1;
+            family.first_key = Some(vec![1]);
+            family.last_key = Some(vec![1]);
+            let error = manifest
+                .validate()
+                .err()
+                .ok_or("manifest accepted rows outside the construction stored set")?;
+            assert!(matches!(
+                error,
+                CanonicalStoreError::PublicationRefused { .. }
+            ));
+            assert!(
+                error.to_string().contains(&format!("has rows in {name}")),
+                "{error}"
+            );
+        }
         Ok(())
     }
 

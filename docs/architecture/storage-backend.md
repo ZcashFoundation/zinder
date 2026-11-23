@@ -316,7 +316,9 @@ Schema v7 requires every family listed above plus the default control
 family, including physically present families with no rows under the
 admitted workload and blob policy. The construction manifest must bind the
 same workload, blob policy, and build plan as the control record and have
-evidence for the full family inventory.
+evidence for the full family inventory. At construction, families outside
+the stored set and families reserved for post-publication writes must report
+zero rows.
 
 `CanonicalStoredSet` derives retained block data and its history floor from
 the build plan and workload. Readers can specify minimum data and a starting
