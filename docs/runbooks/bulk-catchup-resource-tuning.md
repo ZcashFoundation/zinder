@@ -69,14 +69,18 @@ The warning counts logical CPUs, so a host with 4 physical cores and 8
 hardware threads gets none, even though it is likely slower than the measured
 host. Ingest does not change the policy on its own; the operator chooses.
 
-These Mainnet estimates come from the measured writer CPU of each policy and
-the measured core-count scaling of a 2,000-block Mainnet slice. They exclude
-the node's own CPU use, which a shared host adds.
+The smallest writer measured to meet the three-hour budget has 4 cores. The
+table gives fresh Mainnet construction to READY with the derived limits and
+no overrides. The every-block and budget times are measured with the writer
+on dedicated cores and the node on other cores, so a whole machine of that
+size that also runs the node and projector takes longer. Sparse times are
+estimates from the measured writer CPU and the core-count scaling of a
+2,000-block Mainnet slice.
 
-| CPUs | Every block, the default | `commitment-budget` at 256 | Sparse |
+| Writer cores | Every block, the default | `commitment-budget` at 256 | Sparse (estimate) |
 | ---: | --- | --- | --- |
-| 4 | About 2.7 to 3.3 hours | About 2.0 to 2.9 hours | About 2.2 to 3.1 hours |
-| 2 | About 4.8 to 5.6 hours | About 3.6 to 4.9 hours | About 3.4 to 5.3 hours |
+| 4 | 2 h 34 min | 2 h 9 min | About 2.2 to 3.1 hours |
+| 2 | 4 h 28 min, over the budget | 3 h 41 min, over the budget | About 3.4 to 5.3 hours |
 
 To reach READY sooner on a small host, choose one of these before the first
 sync. Both keep an existing store's checkpoints. Changing the selection also
