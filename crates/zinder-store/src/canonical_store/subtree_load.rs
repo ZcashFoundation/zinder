@@ -1050,6 +1050,7 @@ mod tests {
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let frontiers = completed_sapling_tip_frontiers()?;
+        let reorg_policy = CanonicalReorgPolicy::new(100)?;
         let pre_floor_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR);
         let range = SubtreeRootRange::new(
             ShieldedProtocol::Sapling,
@@ -1093,7 +1094,7 @@ mod tests {
                     temporary.path().join(format!("{label}-{suffix}")),
                     &activations,
                     requirements,
-                    CanonicalReorgPolicy::new(100)?,
+                    reorg_policy,
                     RocksDbResourceBudget::for_local_tests(),
                 )
             };

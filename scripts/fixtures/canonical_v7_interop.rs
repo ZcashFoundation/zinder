@@ -296,7 +296,9 @@ fn read_store(
         budget,
     )?;
     check_canonical_rows!(writer, activations, retention);
-    assert_eq!(writer.scan_canonical_replay()?.count(), 2);
+    let replays = writer.scan_canonical_replay()?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(replays.len(), 2);
+    assert_eq!(replays[1].facts().block_header.block_hash, REPLACED_TIP.hash);
     assert_eq!(
         writer
             .displaced_block_by_hash(BUILD_TIP.hash)?

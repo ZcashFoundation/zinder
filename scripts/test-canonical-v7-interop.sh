@@ -27,7 +27,7 @@ prepare() {
   local label=$1 revision=$2
   local checkout="$scratch/$label"
   git -C "$repo" worktree add --detach "$checkout" "$revision"
-  cp "$repo/scripts/fixtures/canonical_v7_interop.rs" "$checkout/$probe"
+  git -C "$repo" show "$candidate:scripts/fixtures/canonical_v7_interop.rs" > "$checkout/$probe"
   printf '\n#[cfg(test)]\nmod v7_interop_probe;\n' >> "${checkout}/crates/zinder-store/src/canonical_store/mod.rs"
 }
 
