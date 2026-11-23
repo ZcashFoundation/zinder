@@ -79,7 +79,9 @@ The script performs these steps:
 3. It creates one Hyperdisk Balanced disk per component from its snapshot,
    with the selected profile.
 4. It installs a short-lived access token, downloads the stage, deletes the
-   token, and checks the stage and binary hashes.
+   token, and checks the stage and binary hashes. The guest steps run from
+   the stage, so the stage SHA-256 in the receipt identifies the code that
+   ran.
 5. It mounts each component. With `--verify-hashes stores` or `all`, it reads
    every listed file and compares it with the component's listing. The
    listing itself must match the SHA-256 in `fixture.json`. This read also
@@ -93,6 +95,11 @@ The script performs these steps:
    a fixed set of wallet responses.
 8. It writes a JSON receipt with each step's start time, the profile, the
    stage and fixture hashes, the served tip, and the wallet sample digest.
+
+The restored compatibility reader serves from the canonical and wallet
+stores. The script does not yet configure it with a signed catalog
+generation. A `catalog` component is mounted and hash-checked, but block
+ranges are not served from it.
 
 | Profile | Component disk IOPS | Component disk throughput |
 | --- | --- | --- |

@@ -29,6 +29,8 @@ if [[ -n ${R2_ACCOUNT_ID:-} ]]; then
     echo "cannot check $1: $out" >&2; exit 1
   }
   obj_put() { r2_aws s3 cp --only-show-errors "$1" "$(obj_url "$2")"; }
+  # Create-only write: fails with 412 when the key already exists.
+  obj_create() { r2_aws s3api put-object --bucket "$R2_BUCKET" --key "$2" --body "$1" --if-none-match '*' >/dev/null; }
   obj_get() { r2_aws s3 cp --only-show-errors "$(obj_url "$1")" "$2"; }
   obj_put_dir() { r2_aws s3 cp --only-show-errors --recursive "$1" "$(obj_url "$2")"; }
   obj_get_dir() { r2_aws s3 cp --only-show-errors --recursive "$(obj_url "$1")" "$2"; }
@@ -43,7 +45,11 @@ else
     echo "cannot check $1: $out" >&2; exit 1
   }
   obj_put() { _g cp "$1" "$(obj_url "$2")"; }
+  # Create-only write: generation 0 means the object must not exist yet.
+  obj_create() { _g cp --if-generation-match=0 "$1" "$(obj_url "$2")"; }
   obj_get() { _g cp "$(obj_url "$1")" "$2"; }
-  obj_put_dir() { _g cp -r "$1/*" "$(obj_url "$2")"; }
+  # Never replace an object another upload already wrote; the download's
+  # per-file check then catches any mix of two uploads.
+  obj_put_dir() { _g cp -r --no-clobber "$1/*" "$(obj_url "$2")"; }
   obj_get_dir() { mkdir -p "$2"; _g cp -r "$(obj_url "$1")*" "$2/"; }
 fi

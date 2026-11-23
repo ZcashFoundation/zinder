@@ -64,7 +64,6 @@ if ! [[ $hours =~ ^[0-9]+$ ]] || (( hours < 1 || hours > 36 )); then die "--hour
 receipt=${receipt:-./restore-receipt-$name.json}
 for tool in gcloud jq; do command -v "$tool" >/dev/null || die "missing $tool"; done
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # IAP connections drop now and then. Retry when ssh itself fails (exit 255);
 # standard input is buffered so a retry resends it.
 gssh() {
@@ -124,7 +123,6 @@ gssh "trap 'sudo rm -f /root/.gcs-token' EXIT; set -e
   echo '$stage_sha  /tmp/zfx-stage.tar.zst' | sha256sum --quiet -c
   zstd -dc /tmp/zfx-stage.tar.zst | sudo tar -x -C /tmp" < /dev/null
 gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"
-gssh 'sudo tee /tmp/zfx-stage/guest/restore-guest.sh >/dev/null' < "$script_dir/guest/restore-guest.sh"
 
 mark guest_restore
 # The guest restore runs as its own unit, so a dropped ssh session cannot stop it.
