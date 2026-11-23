@@ -62,6 +62,7 @@ esac
 case $verify in none|stores|all) ;; *) die "--verify-hashes must be none, stores, or all" ;; esac
 if ! [[ $hours =~ ^[0-9]+$ ]] || (( hours < 1 || hours > 36 )); then die "--hours must be 1 to 36"; fi
 receipt=${receipt:-./restore-receipt-$name.json}
+schema=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixture.schema.json
 for tool in gcloud jq; do command -v "$tool" >/dev/null || die "missing $tool"; done
 
 # IAP connections drop now and then. Retry when ssh itself fails (exit 255);
@@ -88,6 +89,22 @@ mark preflight
 jq -e '.format_version == 1 and (.components | length) > 0 and .chain.visible_block_hash and
   ([.components[].kind] | index("node-state") and index("stores"))' "$fixture" >/dev/null \
   || die "fixture must have format_version 1, a chain fence, and node-state and stores components"
+# Check everything the guest needs before paying for a host.
+jq -e --arg verify "$verify" '
+  (.network | type == "string") and (.chain.visible_height | type == "number") and
+  all(.components[]; (.name | test("^[a-z][a-z0-9-]*$")) and (.snapshot | type == "string")
+    and (.disk_size_gb | type == "number") and (.mount_path | startswith("/"))) and
+  ([.components[] | select(.kind == "stores")] | length == 1 and
+    (.[0].paths.canonical | type == "string") and (.[0].paths.wallet | type == "string")) and
+  ([.components[] | select(.kind == "node-state")] | length == 1) and
+  ($verify == "none" or all(.components[] | select($verify == "all" or .kind == "stores");
+    (.files_listing | type == "string") and (.files_sha256 | test("^[0-9a-f]{64}$"))))' "$fixture" >/dev/null \
+  || die "fixture is missing fields the restore needs (component names, snapshots, sizes, mount paths, store paths, or listings for --verify-hashes $verify)"
+if command -v python3 >/dev/null && python3 -c 'import jsonschema' 2>/dev/null; then
+  python3 -c 'import json, sys, jsonschema
+jsonschema.Draft202012Validator(json.load(open(sys.argv[1]))).validate(json.load(open(sys.argv[2])))' \
+    "$schema" "$fixture" || die "fixture does not match fixture.schema.json"
+fi
 while read -r snap; do
   status=$(gcloud compute snapshots describe "$snap" --project "$project" --format='value(status)' 2>/dev/null) \
     || die "snapshot $snap not found in $project"

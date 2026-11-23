@@ -5,7 +5,15 @@
 set -euo pipefail
 label=$1 out=$2; shift 2
 props=(); while [[ $1 != -- ]]; do props+=("$1"); shift; done; shift
-mkdir -p "$out"; chmod 0777 "$out"
+# Root writes the receipts here while the measured command may run as a
+# service user that writes only its rusage file, so the directory is root-owned
+# and that one file is created for the user in advance.
+install -d -m 0755 "$out"
+for f in "$out/$label".{disk0,disk1,stdout,stderr,cgroup,json,rusage.json}; do
+  [[ ! -L $f ]] || { echo "refusing symlink $f" >&2; exit 1; }
+done
+run_user=$(printf '%s\n' "${props[@]}" | sed -n 's/^User=//p' | tail -1)
+install -m 0644 -o "${run_user:-root}" /dev/null "$out/$label.rusage.json"
 snap() { awk '$3 ~ /^nvme[0-9]+n[0-9]+$/ {print $3, $6*512, $10*512}' /proc/diskstats | sort; }
 snap > "$out/$label.disk0"
 unit="zfx-m-$label"
