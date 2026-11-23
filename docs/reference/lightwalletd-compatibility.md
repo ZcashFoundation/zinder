@@ -165,6 +165,8 @@ The adapter holds at most two chunks of a stream: the one it is handing to the g
 
 The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd v0.6.2 limits block-range requests with `--max-concurrent-blockrange`, 200 by default.
 
+<a id="signed-settled-history"></a>
+
 #### Signed settled history and standalone live-tail buffer
 
 All three serving modes can answer the default shielded `GetBlockRange` projection from an in-memory tail, including before the first signed segment is available. A chunk that reaches the visible tip can fill the tail. Ascending fills and prepends read at most the chunk’s ordinary byte budget, including the single oversized first-block exception. If the returned rows stop before the tip or the cached suffix, the listener sends them directly and leaves the shared tail unchanged. A chunk that reaches the lowest cached row can extend the tail downward by its own missing heights. Other chunks read canonical storage without changing the tail. A short request below the tail reads only the heights it asks for. A stream can cross from signed segments to the tail, and a tail hit needs no blocking conversion. Other pool selections read canonical storage with the normal chunk budget and bypass the signed-segment permit queue.
