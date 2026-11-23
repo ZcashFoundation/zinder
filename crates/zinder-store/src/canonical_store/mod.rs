@@ -37,6 +37,8 @@ mod stored_set_tests;
 #[cfg(test)]
 mod stored_tree_state_roots_tests;
 mod subtree_load;
+#[cfg(test)]
+mod transaction_read_tests;
 mod tree_state_densification;
 #[cfg(test)]
 mod tree_state_densification_tests;

@@ -354,15 +354,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
             // the authenticated source count for every retention mode, and
             // live append and replacement update every retained family in
             // one batch, so a miss over complete history is a proven absence.
-            let Some(location) =
-                secondary.transaction_location_or_proven_absence(transaction_id)?
+            let Some((location, transaction_blob)) =
+                secondary.transaction_location_and_blob_or_proven_absence(transaction_id)?
             else {
                 return Ok(None);
             };
             Ok(Some(IndexedTransaction {
                 location,
                 block_header: secondary.block_header_at(location.block_height)?,
-                transaction_blob: secondary.transaction_blob(location)?,
+                transaction_blob,
             }))
         })
         .await
@@ -378,12 +378,11 @@ impl CanonicalReader for RocksDbCanonicalReader {
         };
         let blob = self
             .read(move |secondary| {
-                let Some(location) = secondary.transaction_location(transaction_id)? else {
+                let Some((_, blob)) = secondary.transaction_location_and_blob(transaction_id)?
+                else {
                     return Ok(Err(ArtifactFamily::TransactionLocation));
                 };
-                Ok(secondary
-                    .transaction_blob(location)?
-                    .ok_or(ArtifactFamily::TransactionBlob))
+                Ok(blob.ok_or(ArtifactFamily::TransactionBlob))
             })
             .await?;
         blob.map_err(unavailable)
