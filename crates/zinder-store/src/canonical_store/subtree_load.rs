@@ -1,14 +1,11 @@
-use std::{
-    num::NonZeroU32,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
-    BlockHash, BlockHeight, ChainTipMetadata, CompletedSubtreeRoot, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeight, CompletedSubtreeRoot, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
 };
 
 use super::{
@@ -110,30 +107,6 @@ impl PersistedSubtreeRootValidation {
     }
 }
 
-pub(super) fn required_subtree_root_ranges(
-    predecessor_tip_metadata: ChainTipMetadata,
-    build_tip_metadata: ChainTipMetadata,
-) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-    let mut ranges = Vec::with_capacity(3);
-    for protocol in shielded_protocols() {
-        let start_index = predecessor_tip_metadata.completed_subtree_count(protocol);
-        let completed_at_tip = build_tip_metadata.completed_subtree_count(protocol);
-        let root_count = completed_at_tip.checked_sub(start_index).ok_or_else(|| {
-            CanonicalStoreError::subtree_root_sequence(format!(
-                "{protocol:?} completed-subtree count regressed from {start_index} to {completed_at_tip}"
-            ))
-        })?;
-        if let Some(max_entries) = NonZeroU32::new(root_count) {
-            ranges.push(SubtreeRootRange::new(
-                protocol,
-                SubtreeRootIndex::new(start_index),
-                max_entries,
-            ));
-        }
-    }
-    Ok(ranges)
-}
-
 pub(super) fn load_subtree_roots(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
@@ -148,10 +121,8 @@ pub(super) fn load_subtree_roots(
         })?;
         return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
     }
-    let required_ranges = required_subtree_root_ranges(
-        build_plan.history_predecessor().tip_metadata(),
-        block_evidence.tip_metadata,
-    )?;
+    let coverage = CanonicalSubtreeRootLoadCoverage::RetainedRange;
+    let required_ranges = build_plan.subtree_root_ranges(coverage, block_evidence.tip_metadata)?;
     let mut stager = SubtreeRootStager::new(db, &family, build_plan, subtree_roots.into_iter());
     for range in required_ranges {
         stager.stage_range(range)?;
@@ -171,10 +142,7 @@ pub(super) fn load_subtree_roots(
                 source,
             })?;
     }
-    complete_subtree_root_load(
-        &expected_rows,
-        CanonicalSubtreeRootLoadCoverage::RetainedRange,
-    )
+    complete_subtree_root_load(&expected_rows, coverage)
 }
 
 pub(super) fn load_complete_subtree_root_prefix(
@@ -191,8 +159,8 @@ pub(super) fn load_complete_subtree_root_prefix(
         })?;
         return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
     }
-    let required_ranges =
-        required_subtree_root_ranges(ChainTipMetadata::empty(), block_evidence.tip_metadata)?;
+    let coverage = CanonicalSubtreeRootLoadCoverage::CompletePrefix;
+    let required_ranges = build_plan.subtree_root_ranges(coverage, block_evidence.tip_metadata)?;
     let mut stager =
         CompleteSubtreeRootPrefixStager::new(db, &family, build_plan, subtree_roots.into_iter());
     for range in required_ranges {
@@ -213,10 +181,7 @@ pub(super) fn load_complete_subtree_root_prefix(
                 source,
             })?;
     }
-    complete_subtree_root_load(
-        &expected_rows,
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix,
-    )
+    complete_subtree_root_load(&expected_rows, coverage)
 }
 
 fn complete_subtree_root_load(
@@ -263,7 +228,7 @@ pub(super) fn validate_persisted_subtree_root_family(
     let family = subtree_root_family(db)?;
     validate_subtree_root_digest_version(expected_evidence.sequence_digest_version)?;
     let required_ranges =
-        persisted_subtree_root_ranges(build_plan, block_evidence, expected_evidence.coverage)?;
+        build_plan.subtree_root_ranges(expected_evidence.coverage, block_evidence.tip_metadata)?;
     let mut iteration_options = ReadOptions::default();
     iteration_options.fill_cache(false);
     iteration_options.set_readahead_size(2 * 1024 * 1024);
@@ -349,20 +314,6 @@ fn validate_subtree_root_digest_version(
     Ok(())
 }
 
-fn persisted_subtree_root_ranges(
-    build_plan: &CanonicalStoreBuildPlan,
-    block_evidence: &CanonicalBlockLoadEvidence,
-    coverage: CanonicalSubtreeRootLoadCoverage,
-) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-    let predecessor_metadata = match coverage {
-        CanonicalSubtreeRootLoadCoverage::RetainedRange => {
-            build_plan.history_predecessor().tip_metadata()
-        }
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix => ChainTipMetadata::empty(),
-    };
-    required_subtree_root_ranges(predecessor_metadata, block_evidence.tip_metadata)
-}
-
 fn persisted_completion_block_matches(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
@@ -373,10 +324,10 @@ fn persisted_completion_block_matches(
     if artifact.completing_block_height > build_plan.build_tip().height {
         return Ok(false);
     }
-    let first_retained_height = build_plan.history_bounds().first_available_height();
+    let first_retained_height = build_plan.first_retained_height();
     if artifact.completing_block_height < first_retained_height {
         let predecessor = build_plan.history_predecessor().block_id;
-        return Ok(coverage == CanonicalSubtreeRootLoadCoverage::CompletePrefix
+        return Ok(coverage.includes_preceding_roots()
             && (artifact.completing_block_height < predecessor.height
                 || (artifact.completing_block_height == predecessor.height
                     && artifact.completing_block_hash == predecessor.hash)));
@@ -608,7 +559,7 @@ fn validate_complete_prefix_subtree_root(
             expected.protocol
         )));
     }
-    let first_retained_height = build_plan.history_bounds().first_available_height();
+    let first_retained_height = build_plan.first_retained_height();
     if subtree_root.completing_block_height < first_retained_height {
         let predecessor = build_plan.history_predecessor().block_id;
         if subtree_root.completing_block_height > predecessor.height {
@@ -655,7 +606,7 @@ fn validate_source_subtree_root(
             source_root.subtree_index.value()
         )));
     }
-    let first_height = build_plan.history_bounds().first_available_height();
+    let first_height = build_plan.first_retained_height();
     if source_root.completing_block_height < first_height
         || source_root.completing_block_height > build_plan.build_tip().height
     {
@@ -777,16 +728,9 @@ pub(in crate::canonical_store) fn decode_subtree_root(
     ))
 }
 
-const fn shielded_protocols() -> [ShieldedProtocol; 3] {
-    [
-        ShieldedProtocol::Sapling,
-        ShieldedProtocol::Orchard,
-        ShieldedProtocol::Ironwood,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::canonical_store::stored_set::required_subtree_root_ranges;
     use std::{num::NonZeroU32, path::Path};
 
     use incrementalmerkletree::{
@@ -809,7 +753,7 @@ mod tests {
 
     use super::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
-        encode_subtree_root_value, required_subtree_root_ranges,
+        encode_subtree_root_value,
     };
     use crate::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
@@ -1038,6 +982,87 @@ mod tests {
             ),
             "unexpected reopened missing-root error: {reopened_error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_requires_complete_subtree_prefix_from_the_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{CanonicalStoreRequirements, RocksDbCanonicalSecondary};
+
+        let temporary = tempdir()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let frontiers = completed_sapling_tip_frontiers()?;
+        let reorg_policy = CanonicalReorgPolicy::new(100)?;
+        let pre_floor_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR);
+        let range = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::MIN,
+        );
+        for (label, coverage) in [
+            ("complete", CanonicalSubtreeRootLoadCoverage::CompletePrefix),
+            ("retained", CanonicalSubtreeRootLoadCoverage::RetainedRange),
+        ] {
+            let path = temporary.path().join(label);
+            let mut builder = loaded_checkpointed_builder_from(
+                &path,
+                frontiers.clone(),
+                frontiers.clone(),
+                frontiers.clone(),
+            )?;
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    builder.load_complete_subtree_root_prefix([pre_floor_root.clone()])?;
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    builder.load_subtree_roots(std::iter::empty())?;
+                }
+            }
+            builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+                BUILD_TIP,
+                BUILD_TIP.height.value(),
+                frontiers.clone(),
+            ))?;
+            let validated = builder.prepare_cold_certified_publication()?;
+            let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+                BUILD_TIP,
+                UnixTimestampMillis::new(1_750_000_000_001),
+            ))?;
+            let store = validated.publish_baseline(publication)?;
+            assert_eq!(store.stored_set().subtree_root_coverage(), Some(coverage));
+            let open = |suffix, requirements| {
+                RocksDbCanonicalSecondary::open_ready_requiring(
+                    &path,
+                    temporary.path().join(format!("{label}-{suffix}")),
+                    &activations,
+                    requirements,
+                    reorg_policy,
+                    RocksDbResourceBudget::for_local_tests(),
+                )
+            };
+            let requirements =
+                CanonicalStoreRequirements::default().from_height(FIRST_RETAINED.height);
+            let secondary = open("ordinary", requirements.clone())?;
+            assert_eq!(secondary.stored_set(), store.stored_set());
+            let prefix = open("prefix", requirements.with_complete_subtree_root_prefix());
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    assert_eq!(
+                        prefix?.subtree_roots(range)?,
+                        std::slice::from_ref(&pre_floor_root)
+                    );
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    assert!(secondary.subtree_roots(range).is_err());
+                    assert!(matches!(
+                        prefix,
+                        Err(CanonicalStoreError::IncompleteSubtreeRootPrefix { .. })
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 

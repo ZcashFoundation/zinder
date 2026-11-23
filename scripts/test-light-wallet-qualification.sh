@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Compare qualification binaries with an ordinary wallet-serving instance on
+# Compare light-wallet and wallet serving with the release binaries on
 # the same disposable Regtest chain, premined as in the parity workflow.
 # The node container is stopped for the outage checks and restarted on exit.
 set -euo pipefail
 
 if [[ $# != 3 ]]; then
-  echo "usage: $0 <qualification-binary-directory> <disposable-node-container> <wallet-serving-grpc-url>" >&2
+  echo "usage: $0 <binary-directory> <disposable-node-container> <wallet-serving-grpc-url>" >&2
   exit 2
 fi
 bin_dir=$1
@@ -23,7 +23,7 @@ fi
 # Binaries read network.name from --network. The bare key belongs to testkit.
 unset ZINDER_NETWORK
 for binary in zinder-ingest zinder-compat-lightwalletd; do
-  [[ -x "$bin_dir/$binary" ]] || { echo "missing qualification binary: $bin_dir/$binary" >&2; exit 2; }
+  [[ -x "$bin_dir/$binary" ]] || { echo "missing binary: $bin_dir/$binary" >&2; exit 2; }
 done
 
 # Both nodes can identify Regtest as BIP70 "test". The matrix activation
@@ -93,8 +93,16 @@ wait_ready() {
 
 start_candidate() {
   local policy=$1 port=$2
-  ZINDER_STORAGE__RAW_BLOB_POLICY="$policy" \
-    ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving \
+  local -a ingest_selection compat_selection
+  if [[ $policy == none ]]; then
+    ingest_selection=(ZINDER_DEPLOYMENT__PROFILE=light-wallet)
+    compat_selection=(ZINDER_DEPLOYMENT__PROFILE=light-wallet)
+  else
+    ingest_selection=("ZINDER_STORAGE__RAW_BLOB_POLICY=$policy" ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving)
+    compat_selection=("ZINDER_STORAGE__RAW_BLOB_POLICY=$policy" ZINDER_COMPAT__SERVING=light-wallet)
+  fi
+  env -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_INGEST__RUN_OVERRIDES__COVERAGE \
+    "${ingest_selection[@]}" \
     ZINDER_INGEST_CONTROL__LISTEN_ADDR="127.0.0.1:$port" \
     ZINDER_OPS__LISTEN_ADDR="127.0.0.1:$((port + 1))" \
     "$bin_dir/zinder-ingest" --network zcash-regtest \
@@ -102,9 +110,9 @@ start_candidate() {
   pids+=("$!")
   wait_ready "$!" "$((port + 1))" false
 
-  ZINDER_STORAGE__RAW_BLOB_POLICY="$policy" \
+  env -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_COMPAT__SERVING \
+    "${compat_selection[@]}" \
     ZINDER_INGEST_CONTROL__ADDR="http://127.0.0.1:$port" \
-    ZINDER_COMPAT__SERVING=light-wallet-qualification \
     ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0 \
     ZINDER_OPS__LISTEN_ADDR="127.0.0.1:$((port + 3))" \
     "$bin_dir/zinder-compat-lightwalletd" --network zcash-regtest \

@@ -220,7 +220,7 @@ crates use their own types and convert at the service adapter.
   `zcash/lightwallet-protocol`. The pin is in
   `crates/zinder-proto/proto/compat/lightwalletd/COMMIT`, with provenance in
   `UPSTREAM.md` beside it. Compatibility names stay identical to the external
-  contract even where native names differ. Both serving modes expose those
+  contract even where native names differ. All three serving modes expose those
   schemas through native gRPC reflection v1 and v1alpha.
   [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md)
   covers method behavior.

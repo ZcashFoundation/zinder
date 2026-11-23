@@ -23,17 +23,20 @@ use zinder_query::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ClientAddressSource, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
-    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
-    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
+    DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
+    NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    RuntimeService, SecuritySection, SecurityToml, StorageRoleToml, guard_optional_serving_bind,
+    guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget, StoreError,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlanError, CanonicalStoreRequirements,
+    RocksDbResourceBudget, StoreError,
 };
 
 /// Operator-selected lightwalletd compatibility capability.
@@ -45,9 +48,10 @@ pub(crate) enum CompatServing {
     Wallet,
     /// Canonical compact-block serving without wallet storage.
     CompactBlocks,
-    /// Canonical wallet reads with node-backed transparent methods for qualification.
-    #[cfg(feature = "light-wallet-qualification")]
-    LightWalletQualification,
+    /// Canonical wallet reads with node-backed transparent methods.
+    #[serde(alias = "light-wallet-qualification")]
+    #[value(alias = "light-wallet-qualification")]
+    LightWallet,
 }
 
 impl CompatServing {
@@ -55,8 +59,7 @@ impl CompatServing {
         match self {
             Self::Wallet => "wallet",
             Self::CompactBlocks => "compact-blocks",
-            #[cfg(feature = "light-wallet-qualification")]
-            Self::LightWalletQualification => "light-wallet-qualification",
+            Self::LightWallet => "light-wallet",
         }
     }
 }
@@ -64,6 +67,7 @@ impl CompatServing {
 /// Resolved lightwalletd compatibility runtime configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct LightwalletdConfig {
+    profile: Option<DeploymentProfile>,
     pub(crate) network: Network,
     pub(crate) serving: CompatServing,
     pub(crate) shielded_history: Option<ShieldedHistorySection>,
@@ -180,12 +184,90 @@ pub(crate) enum LightwalletdConfigError {
     Supervision(#[from] zinder_runtime::RuntimeSupervisionError),
 }
 
+impl LightwalletdConfig {
+    pub(crate) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
+        let requirements = if self.serving == CompatServing::LightWallet {
+            DeploymentProfile::LightWallet.canonical_requirement()
+        } else {
+            CanonicalStoreRequirements::default()
+        };
+        requirements.with_blob_retention(self.storage.expected_raw_blob_retention)
+    }
+}
+
 /// Loads and validates lightwalletd compat configuration.
 pub(crate) fn load_lightwalletd_config(
     config_path: Option<PathBuf>,
     overrides: LightwalletdConfigOverrides,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
-    let raw_config: LightwalletdRawConfig = ConfigLoader::new()
+    resolve_lightwalletd_config(load_raw_config(config_path, overrides)?)
+}
+
+pub(super) struct HistoryPublisherConfig {
+    pub(super) network: Network,
+    pub(super) primary_path: PathBuf,
+    pub(super) secondary_path: PathBuf,
+    pub(super) canonical_rocksdb_budget: RocksDbResourceBudget,
+    pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
+}
+
+impl HistoryPublisherConfig {
+    pub(super) fn to_toml(&self) -> Result<String, LightwalletdConfigError> {
+        let rendered = HistoryPublisherToml {
+            network: NetworkToml::from_network(self.network),
+            storage: HistoryPublisherStorageToml {
+                path: &self.primary_path,
+                secondary_path: &self.secondary_path,
+                canonical: StorageRoleToml::from_resolved(self.canonical_rocksdb_budget),
+            },
+            compat: HistoryPublisherCompatToml {
+                reorg_window_blocks: self.canonical_reorg_policy.reorg_window_blocks(),
+            },
+        };
+        Ok(toml::to_string(&rendered).map_err(|source| ConfigError::Render { source })?)
+    }
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherToml<'a> {
+    network: NetworkToml,
+    storage: HistoryPublisherStorageToml<'a>,
+    compat: HistoryPublisherCompatToml,
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherStorageToml<'a> {
+    path: &'a Path,
+    secondary_path: &'a Path,
+    canonical: StorageRoleToml,
+}
+
+#[derive(Serialize)]
+struct HistoryPublisherCompatToml {
+    reorg_window_blocks: u32,
+}
+
+pub(super) fn load_history_publisher_config(
+    config_path: Option<PathBuf>,
+    overrides: LightwalletdConfigOverrides,
+) -> Result<HistoryPublisherConfig, LightwalletdConfigError> {
+    let config = load_raw_config(config_path, overrides)?;
+    Ok(HistoryPublisherConfig {
+        network: config.network.resolve()?,
+        primary_path: require_field(config.storage.path, "storage.path")?,
+        secondary_path: require_field(config.storage.secondary_path, "storage.secondary_path")?,
+        canonical_rocksdb_budget: resolve_canonical_reader_rocksdb_budget(
+            config.storage.canonical.rocksdb,
+        )?,
+        canonical_reorg_policy: resolve_reorg_policy(&config.compat)?,
+    })
+}
+
+fn load_raw_config(
+    config_path: Option<PathBuf>,
+    overrides: LightwalletdConfigOverrides,
+) -> Result<LightwalletdRawConfig, ConfigError> {
+    ConfigLoader::new()
         .with_default("compat.listen_addr", "127.0.0.1:9067")?
         .with_default(
             "compat.reorg_window_blocks",
@@ -223,9 +305,7 @@ pub(crate) fn load_lightwalletd_config(
             "compat.ping_very_insecure",
             overrides.ping_very_insecure.then_some(true),
         )?
-        .load()?;
-
-    resolve_lightwalletd_config(raw_config)
+        .load()
 }
 
 /// Renders the effective lightwalletd compat configuration in the accepted TOML shape.
@@ -240,6 +320,7 @@ pub(crate) fn lightwalletd_config_toml(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct LightwalletdRawConfig {
+    deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
     storage: CanonicalSecondaryStorageSection,
@@ -390,9 +471,9 @@ struct WalletSection {
 }
 
 fn resolve_lightwalletd_config(
-    config: LightwalletdRawConfig,
+    mut config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
-    let serving = config.compat.serving.unwrap_or_default();
+    let serving = resolve_serving(&mut config)?;
     let wallet = config.wallet;
     if serving != CompatServing::Wallet && wallet.is_some() {
         return Err(ConfigError::invalid(format!(
@@ -411,14 +492,11 @@ fn resolve_lightwalletd_config(
         bearer_token_path: ingest_control_bearer_token_path,
         bearer_token: ingest_control_bearer_token,
     } = resolve_ingest_control_reader(config.ingest_control)?;
+    let canonical_reorg_policy = resolve_reorg_policy(&config.compat)?;
     let listen_addr_string = require_field(config.compat.listen_addr, "compat.listen_addr")?;
     let listen_addr = parse_socket_addr("compat.listen_addr", &listen_addr_string)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
-    let canonical_reorg_policy = CanonicalReorgPolicy::new(require_field(
-        config.compat.reorg_window_blocks,
-        "compat.reorg_window_blocks",
-    )?)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.compat.pair_convergence_attempts)?;
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
@@ -431,6 +509,7 @@ fn resolve_lightwalletd_config(
         resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
 
     Ok(LightwalletdConfig {
+        profile: config.deployment.profile,
         network,
         serving,
         storage,
@@ -458,6 +537,37 @@ fn resolve_lightwalletd_config(
         broadcaster,
         node_fallbacks,
     })
+}
+
+fn resolve_reorg_policy(
+    compat: &CompatSection,
+) -> Result<CanonicalReorgPolicy, LightwalletdConfigError> {
+    Ok(CanonicalReorgPolicy::new(require_field(
+        compat.reorg_window_blocks,
+        "compat.reorg_window_blocks",
+    )?)?)
+}
+
+fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, ConfigError> {
+    let Some(profile) = config.deployment.profile else {
+        return Ok(config.compat.serving.unwrap_or_default());
+    };
+    let raw_blob_retention = profile.canonical_stored_set().raw_blob_retention();
+    if config
+        .compat
+        .serving
+        .is_some_and(|serving| serving != CompatServing::LightWallet)
+        || config
+            .storage
+            .raw_blob_policy
+            .is_some_and(|policy| policy != raw_blob_retention)
+    {
+        return Err(ConfigError::invalid(
+            "deployment.profile = \"light-wallet\" requires compat.serving = \"light-wallet\" and raw_blob_policy = \"none\". To select this profile, remove conflicting overrides",
+        ));
+    }
+    config.storage.raw_blob_policy = Some(raw_blob_retention);
+    Ok(CompatServing::LightWallet)
 }
 
 /// The wallet primary path, secondary root, and `RocksDB` budget that wallet
@@ -511,12 +621,9 @@ fn resolve_node_list(
             "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node and node_fallbacks sections and every ZINDER_NODE__* and ZINDER_NODE_FALLBACKS__* variable, or select compat.serving = \"wallet\"",
         ));
     }
-    #[cfg(feature = "light-wallet-qualification")]
-    if serving == CompatServing::LightWalletQualification
-        && (node.is_none() || !node_fallbacks.is_empty())
-    {
+    if serving == CompatServing::LightWallet && (node.is_none() || !node_fallbacks.is_empty()) {
         return Err(ConfigError::invalid(
-            "light-wallet qualification requires one [node] and does not accept node_fallbacks",
+            "light-wallet serving requires one [node] and does not accept node_fallbacks",
         ));
     }
     let broadcaster = node
@@ -529,6 +636,8 @@ fn resolve_node_list(
 
 #[derive(Serialize)]
 struct LightwalletdConfigToml {
+    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
+    deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
@@ -545,11 +654,16 @@ struct LightwalletdConfigToml {
 
 impl LightwalletdConfigToml {
     fn from_lightwalletd_config(config: &LightwalletdConfig) -> Self {
+        let mut storage = CanonicalSecondaryStorageToml::from_resolved(&config.storage);
+        if config.profile.is_some() {
+            storage.raw_blob_policy = None;
+        }
         Self {
+            deployment: DeploymentToml::from_resolved(config.profile),
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
+            storage,
             wallet: config
                 .wallet_primary_path
                 .as_ref()
@@ -585,7 +699,7 @@ impl LightwalletdConfigToml {
                     u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
                 }),
                 ping_very_insecure: config.ping_very_insecure,
-                serving: config.serving,
+                serving: config.profile.is_none().then_some(config.serving),
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),
@@ -611,7 +725,8 @@ struct CompatToml {
     tree_state_replay_waiters_per_slot: Option<u32>,
     stale_tip_limit_ms: u64,
     ping_very_insecure: bool,
-    serving: CompatServing,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serving: Option<CompatServing>,
     trust_proxy_client_address: bool,
 }
 

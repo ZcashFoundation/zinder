@@ -900,7 +900,6 @@ fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result
     Ok(())
 }
 
-#[cfg(not(feature = "light-wallet-qualification"))]
 #[test]
 fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
@@ -919,26 +918,42 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
     )
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 #[test]
-fn qualification_accepts_wallet_coverage_without_transaction_blobs() -> Result<(), Box<dyn Error>> {
+fn light_wallet_profile_selects_wallet_history_without_transaction_blobs()
+-> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("wallet-serving-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
-    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
-        "[storage]\n",
-        "[storage]\nraw_blob_policy = \"none\"\n",
-        1,
-    );
+    let config = wallet_serving_ingest_config_toml(&storage_path)?
+        .replace("coverage = \"wallet-serving\"\n", "");
     fs::write(&config_path, config)?;
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
+    assert!(stdout.contains("[deployment]"), "{stdout}");
+    assert!(stdout.contains("profile = \"light-wallet\""), "{stdout}");
+    assert!(!stdout.contains("coverage ="), "{stdout}");
+    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+    assert!(!stdout.contains("explorer_views ="), "{stdout}");
+
+    let conflict = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+        .output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+
+    let legacy_key = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_PROFILE", "light-wallet")
+        .output()?;
+    assert!(!legacy_key.status.success(), "{legacy_key:?}");
 
     Ok(())
 }

@@ -19,16 +19,16 @@ lightwalletd, and other indexers, see the
 
 ## Runtimes and stores
 
-Zinder runs as separate processes, called runtimes. They share one host
-filesystem and three RocksDB stores. Each store has exactly one writer. Every
-other runtime opens it read-only as a RocksDB secondary.
+Zinder runs as separate processes, called runtimes. A deployment uses the
+RocksDB stores its runtimes need on one host filesystem. Each store has exactly
+one writer. Every other runtime opens it read-only as a RocksDB secondary.
 
 | Runtime | Role | Writes | Reads | Required |
 | --- | --- | --- | --- | --- |
 | `zinder-ingest` | Follows the node, builds the canonical index, handles reorgs, tracks the mempool, and serves a private control API to the other runtimes | Canonical store; materialized-view store when `ingest.explorer_views = true` | Node JSON-RPC, and the node's indexer gRPC for the mempool when configured | Yes |
 | `zinder-projector` | Builds and follows the wallet store from canonical chain events | Wallet store | Canonical store, ingest control | Yes, for wallet serving |
 | `zinder-query` | Serves the native `WalletQuery` gRPC protocol and broadcasts transactions | Nothing | Canonical and wallet stores, ingest control, node for broadcast | For native and Rust SDK clients |
-| `zinder-compat-lightwalletd` | Serves lightwalletd's `CompactTxStreamer` protocol | Nothing | Canonical and wallet stores, ingest control, node for broadcast and `GetStandardFee`; with `compat.serving = "compact-blocks"`, only the canonical store and ingest control | For lightwalletd clients |
+| `zinder-compat-lightwalletd` | Serves the lightwalletd `CompactTxStreamer` protocol | Nothing | Wallet serving reads both stores, ingest control, and an optional node. Compact-blocks reads the canonical store and ingest control. Light-wallet reads the canonical store, ingest control, and one node for [forwarded methods](../reference/lightwalletd-compatibility.md#runtime-serving-selection). | For lightwalletd clients |
 | `zinder-explorer` | Serves `ExplorerQuery` for block explorers | Nothing | Materialized-view store, `WalletQuery` over gRPC, optional `[node]` for tip observation | No |
 
 The three stores hold different things:
@@ -84,14 +84,17 @@ supported topologies and their requirements, see
 [Chain ingestion](chain-ingestion.md) explains steps 1 and 2 in detail, and the
 [wallet data plane](wallet-data-plane.md) explains steps 4 and 5.
 
+For a deployment with ingest and a canonical-only compatibility reader, see
+[Light-wallet profile](../reference/configuration.md#light-wallet-profile).
+
 ## Consistent reads
 
 Ingest publishes the chain as a sequence of complete snapshots called chain
 epochs (`ChainEpoch`), so a reader sees the previous epoch or the new one,
-never half of a write. Every read is pinned to one epoch, and native clients
-can pin several calls to one epoch with `at_epoch_id`;
-[Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent) gives the
-rules.
+never half of a write. Native clients can pin related calls to one epoch with
+`at_epoch_id`. See [Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent)
+for native reads and [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#method-behavior)
+for the view checks on forwarded reads.
 
 ## What stays in the wallet
 

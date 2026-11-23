@@ -1,7 +1,6 @@
 //! Transaction broadcast through the ordered node list, with every endpoint
 //! verified on first contact.
 
-#[cfg(feature = "light-wallet-qualification")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{sync::Arc, time::Duration};
 
@@ -1055,7 +1054,6 @@ pub(crate) struct VerificationTarget {
 }
 
 impl VerificationTarget {
-    #[cfg(feature = "light-wallet-qualification")]
     pub(crate) fn from_canonical(reader: &dyn crate::CanonicalReader) -> Result<Self, SourceError> {
         let schedule =
             reader
@@ -1070,7 +1068,6 @@ impl VerificationTarget {
         ))
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
     pub(crate) fn still_served_by(&self, reader: &dyn crate::CanonicalReader) -> bool {
         self.fence == reader.event_fence()
             && self.basis.schedule_revision
@@ -1198,14 +1195,12 @@ async fn verify_served_tip(
     }
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 #[derive(Default)]
 pub(crate) struct QualificationNodeVerification {
     schedule: Mutex<QualificationSchedule>,
     failed_attempts: AtomicU64,
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 #[derive(Default)]
 enum QualificationSchedule {
     #[default]
@@ -1214,7 +1209,6 @@ enum QualificationSchedule {
     Verified(VerificationBasis, NetworkUpgradeActivations, Instant),
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl QualificationNodeVerification {
     pub(crate) async fn verify(
         &self,

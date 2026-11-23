@@ -33,10 +33,10 @@ use super::{
     publication::column_family,
     reader::{CanonicalServingRead, decode_block_header},
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
-        CanonicalStoreAdmissionExpectation, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-        canonical_verification_column_family_descriptors,
+        BLOCK_HEADER_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation, StoredDataAdmission,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, canonical_verification_column_family_descriptors,
     },
+    stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget, StoreRole};
 
@@ -124,7 +124,7 @@ pub struct TreeStateVerificationError {
 }
 
 impl RocksDbTreeStateVerifier {
-    /// Opens one exactly admitted secondary for verification and catches it
+    /// Opens a secondary for verification with minimum data requirements and catches it
     /// up to the primary's current state, as
     /// [`RocksDbCanonicalSecondary::open_ready`] does.
     ///
@@ -149,8 +149,10 @@ impl RocksDbTreeStateVerifier {
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
                 expected_network_upgrade_activations,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(super::CanonicalStoreRequirements::from_legacy(
+                    expected_workload,
+                    expected_raw_blob_retention,
+                )),
                 expected_reorg_policy,
             ),
             resource_budget.into(),

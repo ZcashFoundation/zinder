@@ -76,10 +76,10 @@ use zinder_source::{
     UpstreamHealthSnapshot,
 };
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
-    RocksDbOpenResources, RocksDbResourceBudget, SharedSecondaryResources, StoreRole,
-    record_instance_memory_gauges,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreRequirements, CanonicalStoredSet, RawBlobRetention, ResourceGaugeThrottle,
+    RocksDbCanonicalSecondary, RocksDbInstanceMemory, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -115,6 +115,7 @@ const SECONDARY_GENERATION_COUNT: usize = 4;
 /// the read then fails, retryably, and later reads use the replacement.
 const MISSING_TABLE_FILE_REPLACEMENT_WAIT: Duration = Duration::from_secs(5);
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
+const STORED_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
 /// Immutable configuration for the bounded secondary-pair lifecycle.
@@ -432,7 +433,6 @@ pub struct WalletServingReadiness {
 struct IngestControlInput {
     observed: ReadinessCause,
     unadopted_halt: Option<ReorgWindowExceededDetail>,
-    #[cfg(feature = "light-wallet-qualification")]
     awaiting_writer_attestation: bool,
 }
 
@@ -471,7 +471,6 @@ impl WalletServingReadiness {
             ingest_control: Arc::new(Mutex::new(IngestControlInput {
                 observed: ReadinessCause::Starting,
                 unadopted_halt: None,
-                #[cfg(feature = "light-wallet-qualification")]
                 awaiting_writer_attestation: false,
             })),
         }
@@ -484,7 +483,6 @@ impl WalletServingReadiness {
     }
 
     /// Hands a latched ingest halt to the canonical publisher before its writer-status read.
-    #[cfg(feature = "light-wallet-qualification")]
     pub fn begin_canonical_refresh(&self, writer: &mut WriterAttestation, height: u32) {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = input.unadopted_halt {
@@ -496,7 +494,6 @@ impl WalletServingReadiness {
 
     /// Releases the halt observed before this refresh once the writer attests the served fence.
     /// A new halt observed during the refresh must wait for the next attestation.
-    #[cfg(feature = "light-wallet-qualification")]
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the latest observation and its publication must stay ordered"
@@ -549,7 +546,6 @@ impl WalletServingReadiness {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = ingest_control_cause.reorg_window_exceeded_detail() {
             input.unadopted_halt = Some(halt);
-            #[cfg(feature = "light-wallet-qualification")]
             {
                 input.awaiting_writer_attestation = false;
             }
@@ -924,7 +920,6 @@ fn node_observation_cause(
     }
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl crate::QualificationWalletQuery {
     /// Probes this endpoint's forwarding admission and health for the node-source dependency.
     #[must_use]
@@ -1131,6 +1126,8 @@ pub struct WalletServingPairPublisher {
     writer_status: CanonicalWriterStatusClient,
     readiness: WalletServingReadiness,
     serving_pair_slot: Option<WalletServingPairSlot>,
+    admitted_stored_set: Option<CanonicalStoredSet>,
+    stored_set_retry_at: Option<Instant>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
     /// Closing a generation preserves both its cached blocks and its contribution
     /// to the store's cumulative tickers.
@@ -1209,6 +1206,8 @@ impl WalletServingPairPublisher {
             writer_status,
             readiness,
             serving_pair_slot: None,
+            admitted_stored_set: None,
+            stored_set_retry_at: None,
             generations,
             store_resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
@@ -1348,6 +1347,12 @@ impl WalletServingPairPublisher {
         };
         if !needs_generation {
             self.end_generation_wait("interrupted");
+            return Ok(());
+        }
+        if self
+            .stored_set_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
             return Ok(());
         }
 
@@ -1760,7 +1765,8 @@ impl WalletServingPairPublisher {
         let wallet_generation_path = secondary_generation.wallet_generation_path.clone();
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
-        let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
+        let requirements =
+            CanonicalStoreRequirements::for_blob_retention(self.config.expected_raw_blob_retention);
         let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
         let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;
@@ -1778,15 +1784,15 @@ impl WalletServingPairPublisher {
                     source,
                 }
             })?;
-            let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
-                canonical_primary_path,
-                canonical_secondary_path,
-                network,
-                CanonicalStoreWorkload::Wallet,
-                expected_raw_blob_retention,
-                canonical_reorg_policy,
-                canonical_resources,
-            )?;
+            let canonical =
+                RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+                    canonical_primary_path,
+                    canonical_secondary_path,
+                    network,
+                    requirements,
+                    canonical_reorg_policy,
+                    canonical_resources,
+                )?;
             let wallet = RocksDbWalletSecondary::open_ready(
                 wallet_primary_path,
                 wallet_secondary_path,
@@ -1936,7 +1942,16 @@ impl WalletServingPairPublisher {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
+        let admitted_stored_set = self.admitted_stored_set;
+        if admitted_stored_set.is_some_and(|expected| candidate.canonical.stored_set() != expected)
+        {
+            self.writer_attestation.withdraw_allowance();
+            self.stored_set_retry_at = Some(Instant::now() + STORED_SET_RETRY_DELAY);
+        }
         let (pair, readers) = tokio::task::spawn_blocking(move || {
+            if let Some(expected) = admitted_stored_set {
+                candidate.canonical.require_stored_set(expected)?;
+            }
             let readers = PublishedReaders::new(*candidate);
             let canonical =
                 RocksDbCanonicalReader::new(Arc::clone(&readers.canonical)).map_err(|error| {
@@ -1951,12 +1966,14 @@ impl WalletServingPairPublisher {
         })
         .await
         .map_err(WalletServingPairError::CandidateTask)??;
+        self.stored_set_retry_at = None;
         if let Some(slot) = &self.serving_pair_slot {
             let now = Instant::now();
             let released = slot.publish(Arc::clone(&pair), now);
             record_retained_pair_count(slot);
             self.retire_pairs(released, now);
         } else {
+            self.admitted_stored_set = Some(readers.canonical.stored_set());
             self.serving_pair_slot = Some(WalletServingPairSlot::new(Arc::clone(&pair)));
         }
         self.generations[generation].state = SecondaryGenerationState::Published {
@@ -2048,10 +2065,17 @@ impl WalletServingPairPublisher {
                 ) =>
             {
                 record_replica_lag(0);
-                self.writer_attestation.attest();
                 self.observed_lag_chain_epochs = 0;
-                self.readiness
-                    .publish_pair_state(ReadinessState::ready(visible_height));
+                if self.stored_set_retry_at.is_some() && active_pair.has_missing_table_file() {
+                    self.readiness.publish_pair_state(ReadinessState::not_ready(
+                        ReadinessCause::StorageUnavailable,
+                    ));
+                } else {
+                    self.stored_set_retry_at = None;
+                    self.writer_attestation.attest();
+                    self.readiness
+                        .publish_pair_state(ReadinessState::ready(visible_height));
+                }
                 return Ok(ActiveWriterRelation::Exact);
             }
             // A writer restart can admit a new schedule revision without moving
@@ -2067,7 +2091,11 @@ impl WalletServingPairPublisher {
         let lag = behind.lag_chain_epochs;
         record_replica_lag(lag);
         self.observed_lag_chain_epochs = lag;
-        if lag > self.config.replica_lag_threshold_chain_epochs {
+        if self.stored_set_retry_at.is_some() {
+            self.readiness.publish_pair_state(ReadinessState::not_ready(
+                ReadinessCause::StorageUnavailable,
+            ));
+        } else if lag > self.config.replica_lag_threshold_chain_epochs {
             self.readiness.publish_pair_state(
                 self.stale_serving_pair_readiness(visible_height)
                     .unwrap_or_else(|| ReadinessState::replica_lagging(lag, visible_height)),
@@ -6963,6 +6991,113 @@ mod tests {
         drop(slot);
         drop(publisher);
         primaries.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn cold_pair_replacement_refuses_a_different_admitted_stored_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_AT_V1;
+        use zinder_runtime::ReadinessCause;
+
+        let activations = sample_regtest_upgrade_activations();
+        let first_height = BlockHeight::new(1);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let all = chain.clone().with_raw_blob_retention(RawBlobRetention::All);
+        let transactions = chain.with_raw_blob_retention(RawBlobRetention::Transactions);
+        let baseline = |chain| CanonicalBaseline::new(chain).through(first_height);
+        let bootstrap = CanonicalWriterFixture::publish(&baseline(&all), &activations)?;
+        let mut replacement =
+            CanonicalWriterFixture::publish(&baseline(&transactions), &activations)?;
+        let replacement_fence = replacement.append_live_block(&transactions)?;
+
+        let paths = TempDir::new()?;
+        let original_wallet = paths.path().join("original-wallet");
+        let replacement_wallet = paths.path().join("replacement-wallet");
+        let primary = bootstrap.canonical_primary()?;
+        let replacement_primary = replacement.canonical_primary()?;
+        let reorg = primary.reorg_policy();
+        let options = RocksDbWalletBuildOptions {
+            supported_reorg_depth: reorg.reorg_window_blocks(),
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        };
+        for (primary, path) in [
+            (primary, &original_wallet),
+            (replacement_primary, &replacement_wallet),
+        ] {
+            drop(build_wallet_from_canonical(primary, path, options)?.store);
+        }
+
+        let control = MutableCanonicalControl::new(writer_status_for_store(primary));
+        let writer_control = WriterControlFixture::spawn(
+            IngestControlFixtureService::new(Network::ZcashRegtest),
+            control.clone(),
+        )
+        .await?;
+        let mut config = wallet_serving_pair_config(
+            bootstrap.canonical_primary_path().to_owned(),
+            paths.path().join("canonical-secondaries"),
+            original_wallet,
+            paths.path().join("wallet-secondaries"),
+        )?;
+        config.canonical_reorg_policy = reorg;
+        // A lag within the normal allowance must not reopen the refused pair.
+        config.replica_lag_threshold_chain_epochs = u64::MAX;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                config,
+                WalletServingReadiness::pair_only(readiness.clone()),
+                &writer_control.endpoint,
+                None,
+            )
+            .await?;
+        let original = slot.capture();
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        assert!(
+            query
+                .native_endpoint_capabilities()
+                .contains(WALLET_READ_FULL_BLOCK_AT_V1)
+        );
+        query.full_block_at(first_height, None).await?;
+
+        assert!(
+            replacement_fence.chain_event_sequence()
+                > original.canonical_fence().chain_event_sequence()
+        );
+        publisher.config.canonical_primary_path = replacement.canonical_primary_path().to_owned();
+        publisher.config.wallet_primary_path = replacement_wallet;
+        control.set_writer_status(writer_status_for_store(replacement_primary));
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        assert_eq!(publisher.candidate_preparations.cold, 2);
+
+        assert_stored_set_backoff(&mut publisher, &readiness).await;
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        query.full_block_at(first_height, None).await?;
+        writer_control.shutdown().await
+    }
+
+    /// Refreshes inside the stored-set backoff open no candidate, and the
+    /// first refresh after it opens one that is refused again.
+    async fn assert_stored_set_backoff(
+        publisher: &mut WalletServingPairPublisher,
+        readiness: &zinder_runtime::Readiness,
+    ) {
+        use zinder_runtime::ReadinessCause;
+
+        let cold = publisher.candidate_preparations.cold;
+        for _ in 0..3 {
+            publisher.refresh_and_record().await;
+            assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+            assert_eq!(publisher.candidate_preparations.cold, cold);
+        }
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert_eq!(publisher.candidate_preparations.cold, cold + 1);
     }
 
     /// A burst of blocks keeps an epoch pinned before it answering until its

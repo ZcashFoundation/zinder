@@ -21,8 +21,6 @@ use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
 };
 
-use crate::RawBlobRetention;
-
 use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
 
 pub(super) use self::codec::{
@@ -35,8 +33,8 @@ pub(super) use self::codec::{
 
 use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
-    CanonicalStoreError, CanonicalStoreWorkload, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateCheckpointSelection,
+    CanonicalStoreError, CanonicalStoreWorkload, CanonicalStoredData, CanonicalStoredSet,
+    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     construction_manifest::CanonicalConstructionFamilyEvidence,
     frontier_presence_mismatch,
@@ -240,6 +238,7 @@ pub(super) fn write_canonical_block_ssts<SourceError>(
 
 struct CanonicalBlockSstStager<'options> {
     config: CanonicalBlockSstConfig<'options>,
+    stored_set: CanonicalStoredSet,
     header_writer: OrderedSstWriter<'options>,
     replay_writer: OrderedSstWriter<'options>,
     compact_writer: OrderedSstWriter<'options>,
@@ -310,6 +309,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let predecessor_checkpoint_logical_bytes =
             checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
         Ok(Self {
+            stored_set: config.build_plan.stored_set(config.workload),
             header_writer: config.ordered_writer("block-header")?,
             replay_writer: config.ordered_writer("block-replay")?,
             compact_writer: config.ordered_writer("compact-block")?,
@@ -348,11 +348,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .is_some_and(|selection| {
                 selection.requires_checkpoint_since(self.checkpoint_tree_sizes, block.tip_metadata)
             });
-        validate_block(
-            self.config.workload,
-            self.config.build_plan.raw_blob_retention(),
-            &block,
-        )?;
+        validate_block(&self.stored_set, &block)?;
         validate_tree_state_checkpoint_pools(self.config.network_upgrade_activations, &block)?;
         validate_tree_state_checkpoint(checkpoint_required, &block)?;
         if checkpoint_required {
@@ -692,17 +688,7 @@ pub(super) struct IngestedCanonicalBlockLoad {
 }
 
 pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, CanonicalStoreError> {
-    for name in [
-        BLOCK_HEADER_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY,
-        BLOCK_REPLAY_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY,
-        BLOCK_BLOB_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-        BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-    ] {
+    for name in super::stored_set::CANONICAL_STAGED_SST_FAMILIES {
         let column_family = db.cf_handle(name).ok_or_else(|| {
             CanonicalStoreError::block_load_sequence(format!("{name} column family is absent"))
         })?;
@@ -1046,9 +1032,7 @@ fn validate_persisted_block_final_note_commitment_roots(
                 "block_final_note_commitment_roots has an invalid height key: {source}"
             ))
         })?;
-        if height < build_plan.history_bounds().first_available_height()
-            || height > build_plan.build_tip().height
-        {
+        if height < build_plan.first_retained_height() || height > build_plan.build_tip().height {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "block_final_note_commitment_roots height {} is outside retained history",
                 height.value()
@@ -1072,7 +1056,10 @@ fn validate_persisted_block_final_note_commitment_roots(
         })?;
     }
     if row_count != evidence.block_final_note_commitment_roots_count
-        || (workload == CanonicalStoreWorkload::Wallet && row_count != 0)
+        || (!build_plan
+            .stored_set(workload)
+            .contains(CanonicalStoredData::FinalNoteCommitmentRoots)
+            && row_count != 0)
     {
         return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
     }
@@ -1107,17 +1094,15 @@ fn validate_tree_state_checkpoint_pools(
 }
 
 pub(super) fn validate_live_block(
-    workload: CanonicalStoreWorkload,
-    raw_blob_retention: RawBlobRetention,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
-    validate_block(workload, raw_blob_retention, block)?;
+    validate_block(stored_set, block)?;
     validate_tree_state_checkpoint(true, block)
 }
 
 fn validate_block(
-    workload: CanonicalStoreWorkload,
-    raw_blob_retention: RawBlobRetention,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
@@ -1151,9 +1136,9 @@ fn validate_block(
         )));
     }
     validate_compact_block_payload(block)?;
-    validate_transaction_blobs(raw_blob_retention, block)?;
-    validate_block_blob(raw_blob_retention, block)?;
-    validate_block_final_note_commitment_roots(workload, block)
+    validate_transaction_blobs(stored_set, block)?;
+    validate_block_blob(stored_set, block)?;
+    validate_block_final_note_commitment_roots(stored_set, block)
 }
 
 pub(super) fn validate_compact_block_payload(
@@ -1199,11 +1184,11 @@ pub(super) fn validate_compact_block_payload(
 }
 
 fn validate_transaction_blobs(
-    raw_blob_retention: RawBlobRetention,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let height = block.facts.block_header.height;
-    let expected_blob_count = if raw_blob_retention.retains_transaction_blobs() {
+    let expected_blob_count = if stored_set.contains(CanonicalStoredData::TransactionBodies) {
         block.facts.transactions.len()
     } else {
         0
@@ -1213,7 +1198,7 @@ fn validate_transaction_blobs(
             "block {} requires {} raw transaction blobs under {} retention but contains {}",
             height.value(),
             expected_blob_count,
-            raw_blob_retention,
+            stored_set.raw_blob_retention(),
             block.transaction_blobs.len()
         )));
     }
@@ -1254,24 +1239,27 @@ fn validate_transaction_blobs(
 }
 
 fn validate_block_blob(
-    raw_blob_retention: RawBlobRetention,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
-    match (raw_blob_retention.retains_block_blobs(), &block.block_blob) {
+    match (
+        stored_set.contains(CanonicalStoredData::BlockBodies),
+        &block.block_blob,
+    ) {
         (false, Some(_)) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "block {} unexpectedly contains a raw block under {} retention",
                 height.value(),
-                raw_blob_retention
+                stored_set.raw_blob_retention()
             )));
         }
         (true, None) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "block {} is missing its raw block under {} retention",
                 height.value(),
-                raw_blob_retention
+                stored_set.raw_blob_retention()
             )));
         }
         (true, Some(blob))
@@ -1338,28 +1326,28 @@ fn tree_state_checkpoint_required(height: BlockHeight, build_tip_height: BlockHe
 }
 
 fn validate_block_final_note_commitment_roots(
-    workload: CanonicalStoreWorkload,
+    stored_set: &CanonicalStoredSet,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
-    match (workload, block.block_final_note_commitment_roots) {
-        (CanonicalStoreWorkload::Wallet, Some(_)) => {
+    match (
+        stored_set.contains(CanonicalStoredData::FinalNoteCommitmentRoots),
+        block.block_final_note_commitment_roots,
+    ) {
+        (false, Some(_)) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "wallet block {} unexpectedly contains explorer final note-commitment roots",
                 height.value()
             )));
         }
-        (CanonicalStoreWorkload::Explorer, Some(roots))
-            if roots.height != height || roots.block_hash != header.block_hash =>
-        {
+        (true, Some(roots)) if roots.height != height || roots.block_hash != header.block_hash => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
                 "explorer block {} final note-commitment roots do not match its canonical identity",
                 height.value()
             )));
         }
-        (CanonicalStoreWorkload::Wallet, None)
-        | (CanonicalStoreWorkload::Explorer, None | Some(_)) => {}
+        (false, None) | (true, None | Some(_)) => {}
     }
     Ok(())
 }

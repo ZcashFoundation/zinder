@@ -18,14 +18,15 @@ only the writer has.
 ## Decision
 
 1. **Each shared section has one owning crate.** `zinder-runtime` owns the
-   loader and the `[network]`, `[storage]`, `[security]`, `[ops]`,
+   loader and the `[deployment]`, `[network]`, `[storage]`, `[security]`, `[ops]`,
    `[retention]`, `[ingest_control]`, and `[projector_control]` sections.
    `zinder-source` owns `[node]` and `[node_fallbacks.N]`. Each binary
    composes only the sections it uses and owns its own validation.
 2. **One precedence order everywhere.** Compiled defaults, then the optional
    TOML file, then `ZINDER_*` environment variables, then explicit command-line
    overrides. A later layer wins.
-3. **Shared names keep one meaning.** `[network]` selects the network.
+3. **Shared names keep one meaning.** `[deployment]` selects the profile
+   shared by the runtimes in a deployment. `[network]` selects the network.
    `[node]` and `[node_fallbacks.N]` own node endpoints, authentication,
    transport limits, indexer TLS, and health probing. `[storage]` owns the
    canonical and materialized-view store paths, secondary catch-up settings,
@@ -53,6 +54,12 @@ Every key, default, and environment variable is listed in
 indexer TLS are explained in
 [Node source boundary](../architecture/node-source-boundary.md).
 
+## Evidence
+
+- Decisions 1 and 3, the `[deployment]` section: judgment. Ingest and
+  lightwalletd compatibility both read the profile, so it follows the rule
+  for sections that several runtimes share.
+
 ## Consequences
 
 - A shared field has one spelling, one default, one environment mapping, and
@@ -76,3 +83,7 @@ indexer TLS are explained in
 - **Per-binary subsets of a shared section.** Splitting `[node]` by binary
   would give one concept several schemas, which is the drift this decision
   removes.
+
+## Revision history
+
+- 2026-11-23. Record `[deployment]` under the shared section convention.

@@ -12,10 +12,7 @@ use super::{
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState, TreeStateLookup,
     TreeStateReplayOutcome,
     block_load::encode_block_position,
-    live_replacement_tests::{
-        open_store, open_store_with_retention, published_store, published_store_with_retention,
-        replacement_block,
-    },
+    live_replacement_tests::{open_store, published_store, replacement_block},
     rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
 };
 use crate::{
@@ -1026,93 +1023,38 @@ fn owner_checkpoint_reopens_at_the_visible_epoch() -> Result<(), Box<dyn std::er
 }
 
 #[test]
-fn secondary_admission_reports_and_requires_the_persisted_raw_blob_retention()
--> Result<(), Box<dyn std::error::Error>> {
-    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    for retention in [
-        RawBlobRetention::None,
-        RawBlobRetention::Transactions,
-        RawBlobRetention::All,
-    ] {
-        let temporary = TempDir::new()?;
-        let store_path = temporary.path().join("canonical");
-        let store = published_store_with_retention(
-            &store_path,
-            REORG_WINDOW,
-            BlockHeight::new(4),
-            BlockHeight::new(2),
-            retention,
-        )?;
-        assert_eq!(store.raw_blob_retention(), retention);
-
-        let mut secondary = open_secondary(
-            &store_path,
-            temporary.path().join("secondary"),
-            &activations,
-            retention,
-        )??;
-        secondary.try_catch_up()?;
-        assert_eq!(secondary.raw_blob_retention(), retention);
-
-        let mismatched = if retention == RawBlobRetention::All {
-            RawBlobRetention::None
-        } else {
-            RawBlobRetention::All
-        };
-        let error = open_secondary(
-            &store_path,
-            temporary.path().join("mismatched-secondary"),
-            &activations,
-            mismatched,
-        )?
-        .err()
-        .ok_or("a secondary expecting another raw-blob retention must be refused")?;
-        assert!(
-            matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
-            "unexpected retention-mismatch error for {retention:?}: {error:?}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn ready_primary_reopen_rejects_a_raw_blob_retention_change()
+fn secondary_refuses_a_required_height_below_the_checkpointed_floor()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
-    let store_path = temporary.path().join("canonical");
+    let path = temporary.path().join("canonical");
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let fence = published_store_with_retention(
-        &store_path,
+    let _store = super::live_replacement_tests::published_note_commitment_store(
+        &path,
         REORG_WINDOW,
         BlockHeight::new(4),
         BlockHeight::new(2),
-        RawBlobRetention::None,
-    )?
-    .event_fence();
-
-    let error = RocksDbCanonicalStore::open_ready(
-        &store_path,
+        Some(BlockHeight::new(1)),
+    )?;
+    let requested = BlockHeight::new(1);
+    let error = RocksDbCanonicalSecondary::open_ready_requiring(
+        &path,
+        temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::All,
+        crate::CanonicalStoreRequirements::default().from_height(requested),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )
     .err()
-    .ok_or("a READY primary must not reopen under another raw-blob retention")?;
-    assert!(
-        matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
-        "unexpected retention-change error: {error:?}"
-    );
-
-    let reopened = open_store_with_retention(
-        &store_path,
-        &activations,
-        REORG_WINDOW,
-        RawBlobRetention::None,
-    )?;
-    assert_eq!(reopened.raw_blob_retention(), RawBlobRetention::None);
-    assert_eq!(reopened.event_fence(), fence);
+    .ok_or("checkpointed history cannot serve the predecessor block")?;
+    assert!(matches!(
+        error,
+        CanonicalStoreError::MissingStoredData {
+            kind: crate::CanonicalStoredData::BlockHistory,
+            required_from: Some(required),
+            available_from: Some(available),
+            ..
+        } if required == requested && available == BlockHeight::new(2)
+    ));
     Ok(())
 }
 

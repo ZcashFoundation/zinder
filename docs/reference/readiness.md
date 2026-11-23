@@ -116,7 +116,7 @@ run their own healthcheck script, described in
 
 ## gRPC health
 
-`zinder-query`, `zinder-explorer`, and both serving modes of
+`zinder-query`, `zinder-explorer`, and all three serving modes of
 `zinder-compat-lightwalletd` serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
 (`Check` and `Watch`) on their public gRPC listeners. gRPC-aware load
 balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
@@ -204,9 +204,9 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
 | `node_capability_missing` | Refused | The node lacks a capability the runtime needs. Detail: `capability`. | Configure or upgrade the node to provide it. |
 | `upstream_not_ready` | Refused | The node answers but is not synchronized. Detail: node heights, verification progress, and the health source and reason. | Wait for the node to sync. |
-| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). |
+| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `canonical_store_damaged` | Refused | Ingest found a stored row of the canonical store that fails verification. Ingest and the store's wallet-serving readers report it. Detail: `height`, absent when ingest cannot read its verification record, and, when one pool's frontier failed, `pool`. | Rebuild the canonical store; see [Recovery](../architecture/service-operations.md#recovery). Restarting does not help: ingest reports the recorded damage again until it checks it. |
-| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). |
+| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `reorg_window_exceeded` | Refused | Ingest refused a reorg deeper than its reorg window and stopped following. Detail: `depth`, `configured`, and `covered`. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores; see [Recovery](../architecture/service-operations.md#recovery). Restarting ingest parks it again. |
 | `wallet_transition_limit_exceeded` | Refused | The projector parked because its next wallet update needs more memory than `projector.follow.max_transition_logical_bytes` allows. Detail: `required_bytes`, `configured_bytes`. | Restart the projector with a larger limit, as in [Wallet transition exceeds its logical-byte limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit). It resumes without a rebuild. |
 | `replica_lagging` | Refused | A reader's copy of a store is more chain epochs behind the writer than allowed. Detail: `lag_chain_epochs`. | Check the writer and projector, then disk and CPU pressure. |
@@ -326,21 +326,44 @@ traffic stops. When the reader refuses traffic, new gRPC calls fail with
 `UNAVAILABLE`, `SERVICE_NOT_READY`, and the cause in
 `ErrorInfo.metadata["readiness_cause"]`.
 
-Two dependencies are reported under `degraded` instead of refusing traffic:
+### Reader dependency health
+
+The readiness report lists reader dependency failures under `degraded`.
 
 | Input | Used by | When degraded |
 | --- | --- | --- |
 | `node_source` | Transaction broadcast, and `GetStandardFee` in wallet-mode compatibility | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
+| `node_source` in light-wallet serving | [Forwarded wallet calls](lightwalletd-compatibility.md#runtime-serving-selection) | The configured node fails the dependency probe. The report carries its cause under `degraded`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 
-A reader verifies each node endpoint before it broadcasts through it or reads
-the recommended fee from it, as
-[Node source boundary](../architecture/node-source-boundary.md#capabilities)
-describes.
+See [Node source boundary](../architecture/node-source-boundary.md#capabilities)
+for endpoint verification.
 
-Compatibility in compact-blocks mode reads only the canonical store, declares
-no dependencies, and rejects every node setting. Its readiness follows the
-same rules for its canonical copy.
+### Canonical-only compatibility readers
+
+Compact-blocks and light-wallet readiness follow the published canonical
+generation and its writer attestation. At admission, both check the writer's
+canonical fence. Light-wallet also checks the writer's admitted upgrade
+schedule and reports the `node_source` and `ingest_control` dependencies under
+`degraded`. Compact-blocks declares neither dependency. See
+[During a node outage](#during-a-node-outage) for how degradation affects calls.
+
+### Canonical store replacement
+
+Readers pin the canonical stored set they admit at startup. A replacement
+with a different workload, raw-blob retention, first retained block height,
+subtree-root coverage mode, or first retained subtree-root index for any
+shielded pool (Sapling, Orchard, or Ironwood) cannot take over while the
+reader is running. Compact-blocks and
+light-wallet compatibility report `schema_mismatch` when a replacement
+passes normal admission and then fails the pin. Native query and wallet-mode
+compatibility report `storage_unavailable` for that refusal.
+
+After a stored-set refusal, the reader keeps checking writer status on its
+normal cadence and waits at least 30 seconds before trying another cold open.
+Restart the reader to adopt the new stored set. The replacement still has to
+meet the reader's configured minimum, writer attestation, and, for paired
+readers, wallet projection admission.
 
 ### Explorer
 
@@ -375,15 +398,20 @@ unreachable.
 | --- | --- | --- | --- |
 | `zinder-ingest` | `node_unavailable` | Its private control API, including writer status. | Committing blocks. The chain tip stops advancing. |
 | `zinder-projector` | `ready` | Its last wallet state. | Nothing new to apply. |
-| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, and `GetStandardFee` in wallet-mode compatibility, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
+| `zinder-query`, wallet-mode compatibility | `ready` while writer attestation holds, with configured `node_source` under `degraded` | Stored blocks, retained transactions, transparent address queries, tree states, and subtree roots. Native query also serves chain events and server info. | Broadcasts and wallet-mode `GetStandardFee` fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. |
+| Light-wallet compatibility | `ready` while writer attestation holds, with `node_source` under `degraded` after the node probe fails | Local block ranges, tree states, subtree roots, and retained transaction bodies. | Calls that need the forwarding node fail with `UNAVAILABLE`, including broadcast. A history stream can fail after delivering rows. See the [method contracts](lightwalletd-compatibility.md#method-behavior). |
+| Compact-blocks compatibility | `ready` while writer attestation holds | Canonical block and range reads. | The tip calls follow the stale-tip rule below. |
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
-Watch `served_epoch_age_seconds` during an outage. It grows while the chain
-stands still, and it is the readiness signal that shows the served view is
-stale. A wallet that builds a transaction on a tip more than about 40 blocks
-behind the network creates one that has already expired, which is why
-lightwalletd tip calls stop answering a tip older than
-`compat.stale_tip_limit_ms` that the node cannot vouch for.
+When ingest loses its live mempool because its node is unavailable, wallet
+and light-wallet compatibility refuse new mempool calls through ingest
+control. Losing only the forwarding node does not withdraw ingest's mempool.
+
+In all three compatibility modes, `GetLatestBlock` and `GetLightdInfo`
+can fail with `UNAVAILABLE` while `/readyz` returns 200. The
+[stale-tip rule](lightwalletd-compatibility.md#stale-tip) applies when the tip
+is too old and the writer's node cannot vouch for it. Watch
+`served_epoch_age_seconds` while the chain stands still.
 
 Readers stop serving in these cases:
 
@@ -397,5 +425,6 @@ Readers stop serving in these cases:
   It then ends the container, so a stuck node client restarts. See
   [Single-volume failure handling](../runbooks/deploying-single-volume.md#failure-handling).
 
-A reader that restarts during a node outage serves again once its pair
-converges, because readers start without contacting a node.
+A reader that restarts during a node outage serves local data once its pair
+or canonical generation converges and the writer attests it. Readers can open
+their local stores without contacting their configured node.

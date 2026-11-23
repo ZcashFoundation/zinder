@@ -100,14 +100,8 @@ jobs:
       - name: Build Zinder binaries
         run: cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
 
-      - name: Build qualification binaries and the live test client
+      - name: Build the live test client
         run: |
-          cargo build --locked --bins -p zinder-ingest -p zinder-compat-lightwalletd \
-            --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
-          # The ordinary parity test builds a default-feature compat binary
-          # in target/debug before qualification starts.
-          mkdir -p "$RUNNER_TEMP/qualification-bin"
-          cp target/debug/{zinder-ingest,zinder-compat-lightwalletd} "$RUNNER_TEMP/qualification-bin/"
           # Compile the client before starting the fixed-fence fixture.
           cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance --profile=ci-live --no-run
 
@@ -311,7 +305,7 @@ jobs:
           ZINDER_NODE__AUTH__USERNAME: zebra
           ZINDER_NODE__AUTH__PASSWORD: zebra
           REGTEST_CONTAINER: ${{ matrix.container }}
-        run: scripts/test-light-wallet-qualification.sh "$RUNNER_TEMP/qualification-bin" "$REGTEST_CONTAINER" http://127.0.0.1:9087
+        run: scripts/test-light-wallet-qualification.sh target/release "$REGTEST_CONTAINER" http://127.0.0.1:9087
 
       - name: Dump pipeline logs on failure
         if: failure()

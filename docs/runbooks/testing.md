@@ -470,8 +470,8 @@ only through NU6.2, and the test refuses a tip at or past NU6.3.
 ### Light-wallet serving qualification
 
 Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
-The qualification build serves wallet RPCs with one canonical store and ingest
-control. Both `compact-blocks` and `light-wallet-qualification` check the
+The [light-wallet profile](../reference/configuration.md#light-wallet-profile) serves wallet RPCs with one canonical store and ingest
+control. Both `compact-blocks` and `light-wallet` check the
 writer's canonical fence when admitting a reader. Qualification also requires
 the writer to attest the reader's upgrade schedule. It uses the node for
 transparent balances, UTXOs, address history, transaction submission, and the
@@ -485,10 +485,9 @@ new schedule revision, or a change to the upgrade active at the next block
 requires fresh discovery. If discovery fails, concurrent callers waiting for it
 return the refusal or a retryable error. The next request can retry immediately.
 
-Forwarded transaction, balance, and UTXO answers describe the served tip
-captured for the request, or the call fails. Address history is bounded to
-that tip but is best-effort, as the next paragraph explains. A node on another
-chain fails the tip check.
+Use the forwarded read contracts in
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#method-behavior)
+to check results. A node on another chain fails the tip check.
 The node answers UTXO lookups at its own tip and reports that tip, so
 qualification keeps an answer only when every page names the served tip. The
 balance is the sum of the unspent outputs the node reports at the served tip,
@@ -499,22 +498,6 @@ succeeds once ingest serves the newer blocks. A balance over more than
 height of a bounded UTXO request must repeat, in order, every output an
 earlier read returned at that height, and must not name an output an earlier
 read placed below it. Otherwise the call returns `UNAVAILABLE`.
-
-Forwarded address history is best-effort and bounded to the served tip, not
-an exact history. Two limits remain. First, neither node reports the chain a
-`getaddresstxids` answer describes. Qualification reads the node's hash at
-the served tip's height immediately before and after each request, and keeps
-the answer only when both reads name the served tip. Each row must be a
-transaction the served chain mines, in the block the node reports, after the
-previous row in canonical position order, and its bytes must match the digest
-ingest recorded. A history answer can still omit transactions if the node
-leaves the served chain and returns to it during a single `getaddresstxids`
-request, between the two hash reads. Second, the answer relies on the node's
-address index being correct: the position and byte checks prove where each
-returned transaction was mined, not that the list is complete for the
-address. An exact history needs either a local address index, as wallet
-serving keeps, or a node reply that binds the list to a chain tip, which
-[zebra#12575](https://github.com/ZcashFoundation/zebra/issues/12575) requests.
 
 The node orders UTXOs within a block by position. Qualification needs every
 matching output in the last block of a wallet's request to sort them by wallet
@@ -535,24 +518,22 @@ share the UTXO slot. `GetTaddressTxids` and
 while it reads from the node and while the client drains the stream. A request
 for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
 
-Build the two qualification binaries:
+Build both standard binaries with Cargo.
 
 ```bash
-cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd \
-  --features zinder-ingest/light-wallet-qualification,zinder-compat-lightwalletd/light-wallet-qualification
+cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd
 ```
 
 In a shell with the Regtest node authentication from the preceding section,
 start ingest with a fresh store. The example uses the default ingest-control
-listener on port 9100. Set the same storage policy on both processes.
+listener on port 9100.
 
 ```bash
 unset ZINDER_NETWORK
 export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
-export ZINDER_STORAGE__RAW_BLOB_POLICY=none
+export ZINDER_DEPLOYMENT__PROFILE=light-wallet
 mkdir -p .tmp
-ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving \
-  target/debug/zinder-ingest --network zcash-regtest \
+target/debug/zinder-ingest --network zcash-regtest \
   --storage-path .tmp/qualification-canonical >.tmp/qualification-ingest.log 2>&1 &
 ```
 
@@ -561,7 +542,7 @@ start compatibility from the same shell:
 
 ```bash
 target/debug/zinder-compat-lightwalletd --network zcash-regtest \
-  --serving light-wallet-qualification --listen-addr 127.0.0.1:9089 \
+  --listen-addr 127.0.0.1:9089 \
   --canonical-primary-path .tmp/qualification-canonical \
   --canonical-secondary-root .tmp/qualification-secondary
 ```
@@ -588,9 +569,9 @@ transaction, which every blob-retention policy keeps. Other bytes return
 `DATA_LOSS`. A transaction the served chain does not mine is looked up in the
 ingest mempool, as wallet serving does, even when the node has mined it in a
 later block. To exercise local mined-transaction reads, repeat with fresh store
-paths and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`. Neither run needs a
-projector or wallet store. The feature is for qualification only. Release
-builds accept `wallet` and `compact-blocks`.
+paths. Unset `ZINDER_DEPLOYMENT__PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`
+for both binaries, set `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving`
+for ingest, and pass `--serving light-wallet` to compatibility.
 
 Use `GetAddressUtxosStream` when a wallet may receive a large set. The
 generated Rust client's default unary decoding limit is 4 MiB. The
@@ -598,16 +579,15 @@ generated Rust client's default unary decoding limit is 4 MiB. The
 The default client streams all rows, and a client configured with a 16 MiB
 decoding limit also receives the complete unary response.
 
-The parity workflow compares this build with ordinary wallet serving on
+The parity workflow compares the light-wallet composition with wallet serving on
 both pinned nodes. To repeat it, use the workflow's disposable height-150 chain
 and its wallet-serving process on port 9087. The harness calls
 `getblockchaininfo` without credentials at the host's loopback endpoint and at
 `127.0.0.1:39232` inside the node container. Both compatibility processes use
 `ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0` because the fixture has historical
 block timestamps and the outage removes the node witness for its tip.
-Copy the qualification binaries
-before running the default-feature test client. With the Regtest node
-authentication exported, run the following in place of the two manual processes
+With the Regtest node authentication exported and `ZINDER_DEPLOYMENT__PROFILE` unset, run
+the following in place of the two manual processes
 above. The harness creates fresh stores for both policies. It submits one
 signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and
 `GetMempoolStream` on the ordinary wallet endpoint and both qualification
@@ -615,10 +595,8 @@ instances. It stops the named node for the outage checks and restarts it on exit
 Use `zakura-regtest` for the Zakura lane.
 
 ```bash
-mkdir -p .tmp/qualification-bin
-cp target/debug/{zinder-ingest,zinder-compat-lightwalletd} .tmp/qualification-bin/
 ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
-  scripts/test-light-wallet-qualification.sh .tmp/qualification-bin \
+  scripts/test-light-wallet-qualification.sh target/debug \
   zebra-regtest http://127.0.0.1:9087
 ```
 
@@ -771,6 +749,33 @@ CI excludes the mempool parity tests, because this fixed-height setup has no
 live mempool composition.
 
 ## Specialized procedures
+
+### Canonical schema v7 interoperability
+
+Run this gate from a committed candidate checkout when changing canonical v7
+construction, admission, or stored rows. It runs outside the default CI
+profile and uses a local host with the Rust toolchain, nextest, and enough
+space for two scoped builds.
+
+```bash
+scripts/test-canonical-v7-interop.sh
+```
+
+The script checks out `00030603` and the candidate's committed `HEAD` with
+separate build directories. Each revision publishes fixture stores for
+`none`, `transactions`, and `all` retention and the other opens each store
+as a writer and secondary. The test checks typed reads, compares row fingerprints from independent
+publications, and verifies the empty families dictated by the workload and
+retention. The script writes results to
+standard output and standard error, and removes its checkouts and fixtures
+on exit.
+
+To check a second schema v7 revision after merging upstream, fetch it and
+pass it explicitly. The default baseline remains `00030603`.
+
+```bash
+scripts/test-canonical-v7-interop.sh --baseline origin/main
+```
 
 ### Reorg sweep
 

@@ -31,6 +31,9 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod served_tree_state;
+mod stored_set;
+#[cfg(test)]
+mod stored_set_tests;
 #[cfg(test)]
 mod stored_tree_state_roots_tests;
 mod subtree_load;
@@ -68,6 +71,8 @@ use zinder_testkit::process_crash::crash_point;
 const fn crash_point(_name: &str) {}
 
 pub use activation_schedule::{CanonicalActivationSchedule, InadmissibleActivationSchedule};
+pub use stored_set::{CanonicalStoreRequirements, CanonicalStoredData, CanonicalStoredSet};
+
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
     CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
@@ -288,7 +293,7 @@ impl CanonicalStoreBuildPlan {
                 });
             }
         }
-        let first_available_height = self.history_bounds.first_available_height();
+        let first_available_height = self.first_retained_height();
         if self.build_tip.height.value() < first_available_height.value() {
             return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
                 build_tip: self.build_tip.height.value(),
@@ -760,6 +765,28 @@ pub enum CanonicalStoreError {
         path: PathBuf,
         /// Exact incompatibility observed during admission.
         reason: String,
+    },
+
+    /// The admitted store lacks data or history required by a reader.
+    #[error(
+        "canonical store at {path:?} lacks required {kind:?} coverage (required from {required_from:?}, available from {available_from:?})"
+    )]
+    MissingStoredData {
+        /// Canonical primary path.
+        path: PathBuf,
+        /// Required block data.
+        kind: CanonicalStoredData,
+        /// Earliest height requested, if specified.
+        required_from: Option<BlockHeight>,
+        /// Earliest retained height, or `None` if the data is absent.
+        available_from: Option<BlockHeight>,
+    },
+
+    /// The admitted store omits completed subtree roots below its retained history.
+    #[error("canonical store at {path:?} lacks the required complete subtree-root prefix")]
+    IncompleteSubtreeRootPrefix {
+        /// Canonical primary path.
+        path: PathBuf,
     },
 
     /// A serving store open encountered an unpublished BUILDING store.

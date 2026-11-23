@@ -135,8 +135,14 @@ async fn main() -> ExitCode {
 )]
 fn run_print_config(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
-    let render_result = config::load_lightwalletd_config(config_path, cli.into())
-        .and_then(|cfg| config::lightwalletd_config_toml(&cfg));
+    let publishing = matches!(cli.command, Some(Command::PublishShieldedHistory(_)));
+    let overrides = cli.into();
+    let render_result = if publishing {
+        config::load_history_publisher_config(config_path, overrides).and_then(|cfg| cfg.to_toml())
+    } else {
+        config::load_lightwalletd_config(config_path, overrides)
+            .and_then(|cfg| config::lightwalletd_config_toml(&cfg))
+    };
 
     match render_result {
         Ok(rendered_toml) => {
@@ -154,27 +160,35 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "lightwalletd bootstrap composes the readiness, ops, store, node broadcast, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
-)]
-async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
+fn load_runtime_config<T>(
+    load: impl FnOnce() -> Result<T, LightwalletdConfigError>,
+) -> Result<T, LightwalletdConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
-    let config_path = cli.config_path.clone();
-    let command = cli.command.take();
-    let lightwalletd_config = match config::load_lightwalletd_config(config_path, cli.into()) {
+    match load() {
         Ok(cfg) => {
             load_config_phase.complete();
-            cfg
+            Ok(cfg)
         }
         Err(error) => {
             load_config_phase.fail(&error);
-            return Err(error);
+            Err(error)
         }
-    };
-    if let Some(Command::PublishShieldedHistory(args)) = command {
-        return args.publish(&lightwalletd_config).await;
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "lightwalletd bootstrap composes readiness, storage, and serving in startup order"
+)]
+async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
+    let config_path = cli.config_path.clone();
+    if let Some(Command::PublishShieldedHistory(args)) = cli.command.take() {
+        let publisher_config =
+            load_runtime_config(|| config::load_history_publisher_config(config_path, cli.into()))?;
+        return args.publish(&publisher_config).await;
+    }
+    let lightwalletd_config =
+        load_runtime_config(|| config::load_lightwalletd_config(config_path, cli.into()))?;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_config_resolved",
@@ -432,7 +446,6 @@ fn with_ingest_mempool<Query>(
 
 enum CanonicalComposition {
     CompactBlocks,
-    #[cfg(feature = "light-wallet-qualification")]
     Qualification {
         source: Box<ZebraJsonRpcSource>,
         ingest: AdmittedIngestControl,
@@ -440,15 +453,12 @@ enum CanonicalComposition {
     },
 }
 
-#[cfg(feature = "light-wallet-qualification")]
 impl CanonicalComposition {
     async fn admit(config: &config::LightwalletdConfig) -> Result<Self, LightwalletdConfigError> {
         match config.serving {
-            CompatServing::LightWalletQualification => {
+            CompatServing::LightWallet => {
                 let target = config.broadcaster.as_ref().ok_or_else(|| {
-                    zinder_runtime::ConfigError::invalid(
-                        "light-wallet qualification requires [node]",
-                    )
+                    zinder_runtime::ConfigError::invalid("light-wallet serving requires [node]")
                 })?;
                 let source = ZebraJsonRpcSource::from_node_target(target)
                     .map_err(|error| LightwalletdConfigError::Source(Box::new(error)))?;
@@ -489,12 +499,8 @@ async fn run_canonical(
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
-    #[cfg(feature = "light-wallet-qualification")]
     let composition = CanonicalComposition::admit(&lightwalletd_config).await?;
-    #[cfg(not(feature = "light-wallet-qualification"))]
-    let composition = CanonicalComposition::CompactBlocks;
     let serving_readiness = match &composition {
-        #[cfg(feature = "light-wallet-qualification")]
         CanonicalComposition::Qualification { .. } => {
             compact_block_serving::CompactServingReadiness::for_qualification(readiness.clone())
         }
@@ -509,7 +515,7 @@ async fn run_canonical(
             canonical_primary_path: lightwalletd_config.storage.path.clone(),
             canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
             network: lightwalletd_config.network,
-            raw_blob_retention: lightwalletd_config.storage.expected_raw_blob_retention,
+            requirements: lightwalletd_config.canonical_requirements(),
             reorg_policy: lightwalletd_config.canonical_reorg_policy,
             resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
             catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
@@ -556,7 +562,6 @@ async fn run_canonical(
     }
     .supervised();
     let (server, tasks) = match composition {
-        #[cfg(feature = "light-wallet-qualification")]
         CanonicalComposition::Qualification {
             source,
             ingest,

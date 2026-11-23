@@ -53,7 +53,7 @@ stop the debate from being repeated.
 | --- | --- | --- |
 | [0001](0001-rocksdb-canonical-store.md) | Store chain data in RocksDB | RocksDB is the storage engine for chain, wallet, and view data in the supported single-host topology. |
 | [0002](0002-serialization-and-byte-order.md) | Serialization and byte order | Each boundary chooses its own serialization, and hashes on the wire use RPC byte order. |
-| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Every read binds to one chain epoch, and each store has exactly one writer with secondary readers. |
+| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Indexed lookups bind to one chain epoch or event fence, compatibility block ranges join chunks by hash, node-backed reads bind to the served tip, and each store has exactly one writer with secondary readers. |
 | [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB is supported; a multi-host PostgreSQL topology for hosted fleets is decided but not implemented. |
 | [0005](0005-bounded-process-memory.md) | Bounded process memory | Process memory is bounded independently of store size, and service binaries allocate through jemalloc. |
 | [0006](0006-node-source-boundary.md) | Node source boundary | Node adapters sit behind one source boundary, separate from the protocols Zinder serves. |
@@ -64,21 +64,27 @@ stop the debate from being repeated.
 | [0011](0011-ingest-control-transport-security.md) | Ingest control transport security | Ingest control authenticates with a bearer token, and the operator provides TLS. |
 | [0012](0012-mempool-topology-and-retention.md) | Mempool topology and retention | Ingest owns the one live mempool, and readers proxy it. |
 | [0013](0013-chain-event-streams.md) | Chain event streams | Event streams start at an explicit position and resume across reorgs. |
-| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Wallets read one consumer-neutral data plane from stored artifacts. |
+| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Native wallets read one consumer-neutral data plane from stored artifacts. Only the light-wallet lightwalletd composition forwards indexed reads to the node. |
 | [0015](0015-wallet-runtime-composition.md) | Wallet runtime composition | Wallet runtimes advertise only the capabilities their composition proves. |
-| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair. |
+| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair, compact-blocks and light-wallet serving follow the canonical generation, and dependencies degrade instead of refusing traffic. |
 | [0017](0017-transparent-wallet-queries.md) | Transparent wallet queries | Only consumer-owned transparent methods are served, and wallet spend status comes from the wallet projection. |
 | [0018](0018-transaction-facts-status-and-broadcast.md) | Transaction facts, status, and broadcast | Transactions are parsed once, "not found" is a typed proof, and broadcast outcomes are typed. |
 | [0019](0019-explorer-plane.md) | Explorer plane | The Explorer is an optional runtime over canonical data with explicit freshness and typed privacy refusals. |
 | [0020](0020-materialized-views.md) | Materialized views | Explorer views are rebuildable projections with exact per-view schema admission and explicit coverage. |
 | [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime`, and each runtime composes only what it uses. |
 | [0022](0022-release-artifacts.md) | Release artifacts | Releases ship reproducible GNU/Linux binaries with signatures, provenance, and SBOMs. |
+| [0023](0023-deployment-profiles.md) | Deployment profiles | A profile coordinates what a deployment's writer stores and what its readers serve and require. Light wallet is the only named profile, and only the light-wallet composition forwards indexed reads to the node. |
 
 ## Earlier numbering
 
 The ADRs were merged by domain and renumbered. The changelog and older
 commits cite the earlier numbers, so this table maps each earlier number to
 the ADR that now covers it. There was no ADR-0040.
+
+The number 0023 is used twice. A citation of ADR-0023 that predates the
+renumbering means transaction facts, now [ADR-0018](0018-transaction-facts-status-and-broadcast.md).
+The current [ADR-0023](0023-deployment-profiles.md) records deployment
+profiles.
 
 | Earlier | Now | Earlier | Now | Earlier | Now |
 | --- | --- | --- | --- | --- | --- |

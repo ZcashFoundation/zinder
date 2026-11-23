@@ -14,7 +14,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zinder_core::{BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol};
+use zinder_core::{
+    BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier, ShieldedProtocol,
+};
 use zinder_rocksdb_bulk_load::{
     OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator, SstFileEvidence,
 };
@@ -521,10 +523,23 @@ impl PersistedConstructionManifest {
             ));
         }
         validate_persisted_family_coverage(&self.family_evidence)?;
+        let stored_set = super::CanonicalStoredSet::new(
+            self.workload,
+            self.build_plan.raw_blob_retention,
+            BlockHeight::new(self.build_plan.first_available_height),
+        );
+        if let Some(family) = self.family_evidence.iter().find(|family| {
+            family.row_count != 0 && !stored_set.permits_construction_rows(&family.family)
+        }) {
+            return Err(CanonicalStoreError::publication(format!(
+                "construction manifest has rows in {} outside the construction stored set",
+                family.family
+            )));
+        }
         validate_persisted_sst_coverage(&self.family_evidence, &self.staged_ssts)?;
         validate_persisted_source_evidence(
             &self.family_evidence,
-            &self.build_plan,
+            stored_set,
             &self.block_evidence,
             &self.subtree_evidence,
         )?;
@@ -560,7 +575,7 @@ impl PersistedBuildPlan {
                 .as_bytes(),
             raw_blob_retention: plan.raw_blob_retention(),
             reorg_window_blocks: plan.reorg_policy().reorg_window_blocks(),
-            first_available_height: plan.history_bounds().first_available_height().value(),
+            first_available_height: plan.first_retained_height().value(),
             history_predecessor: PersistedCheckpoint::from_checkpoint(plan.history_predecessor()),
             build_tip: PersistedBlockId::from_block_id(plan.build_tip()),
             digest_sha256: [0; 32],
@@ -969,7 +984,7 @@ fn validate_persisted_sst_coverage(
 
 fn validate_persisted_source_evidence(
     families: &[PersistedFamilyEvidence],
-    build_plan: &PersistedBuildPlan,
+    stored_set: super::CanonicalStoredSet,
     block_evidence: &PersistedBlockEvidence,
     subtree_evidence: &PersistedSubtreeEvidence,
 ) -> Result<(), CanonicalStoreError> {
@@ -1009,12 +1024,13 @@ fn validate_persisted_source_evidence(
                     })
             })?;
     let expected_transaction_blob_count =
-        if build_plan.raw_blob_retention.retains_transaction_blobs() {
+        if stored_set.contains(super::CanonicalStoredData::TransactionBodies) {
             block_evidence.transaction_count
         } else {
             0
         };
-    let expected_block_blob_count = if build_plan.raw_blob_retention.retains_block_blobs() {
+    let expected_block_blob_count = if stored_set.contains(super::CanonicalStoredData::BlockBodies)
+    {
         block_evidence.block_count
     } else {
         0
@@ -1180,51 +1196,11 @@ fn validate_staged_sst_views(
 }
 
 fn canonical_construction_families() -> BTreeSet<&'static str> {
-    use super::rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-        MEMPOOL_EVENT_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    };
-    BTreeSet::from([
-        BLOCK_BLOB_COLUMN_FAMILY,
-        BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY,
-        BLOCK_HEADER_COLUMN_FAMILY,
-        super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY,
-        DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-        MEMPOOL_EVENT_COLUMN_FAMILY,
-        SUBTREE_ROOT_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    ])
+    super::stored_set::CANONICAL_DATA_COLUMN_FAMILIES.into()
 }
 
 fn canonical_staged_sst_families() -> BTreeSet<&'static str> {
-    use super::rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    };
-    BTreeSet::from([
-        BLOCK_BLOB_COLUMN_FAMILY,
-        BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY,
-        BLOCK_HEADER_COLUMN_FAMILY,
-        super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    ])
+    super::stored_set::CANONICAL_STAGED_SST_FAMILIES.into()
 }
 
 fn shielded_protocols() -> [ShieldedProtocol; 3] {
@@ -1253,7 +1229,7 @@ fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zinder_core::{BlockHash, BlockHeight};
+    use zinder_core::BlockHash;
 
     #[test]
     fn manifest_digest_is_domain_separated_and_stable() {
@@ -1340,6 +1316,55 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_refuses_rows_outside_the_construction_stored_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::rocksdb::{
+            BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        };
+
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("canonical");
+        let _writer = super::super::live_replacement_tests::published_store_with_retention(
+            &path,
+            2,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+            crate::RawBlobRetention::None,
+        )?;
+        for name in [
+            BLOCK_BLOB_COLUMN_FAMILY,
+            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            TRANSACTION_BLOB_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY,
+        ] {
+            let (mut manifest, _) = read_construction_manifest(&path)?;
+            let family = manifest
+                .family_evidence
+                .iter_mut()
+                .find(|family| family.family == name)
+                .ok_or("published manifest lacks family evidence")?;
+            assert_eq!(family.row_count, 0);
+            family.row_count = 1;
+            family.first_key = Some(vec![1]);
+            family.last_key = Some(vec![1]);
+            let error = manifest
+                .validate()
+                .err()
+                .ok_or("manifest accepted rows outside the construction stored set")?;
+            assert!(matches!(
+                error,
+                CanonicalStoreError::PublicationRefused { .. }
+            ));
+            assert!(
+                error.to_string().contains(&format!("has rows in {name}")),
+                "{error}"
+            );
+        }
         Ok(())
     }
 

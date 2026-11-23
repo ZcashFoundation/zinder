@@ -10,7 +10,7 @@
 
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
 use zinder_compat_lightwalletd::CanonicalReaderSlot;
@@ -30,13 +30,15 @@ use zinder_runtime::{
     refresh_within_stale_deadline, writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
-    RocksDbResourceBudget, SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreRequirements, CanonicalStoredSet, ResourceGaugeThrottle,
+    RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 
 const GENERATION_COUNT: usize = 2;
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
+const STORED_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompactBlockServingError {
@@ -113,7 +115,6 @@ impl CompactServingReadiness {
         }
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
     pub(crate) fn for_qualification(runtime: Readiness) -> Self {
         Self {
             inputs: zinder_query::WalletServingReadiness::with_node_and_ingest_control(runtime),
@@ -121,7 +122,6 @@ impl CompactServingReadiness {
         }
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
     pub(crate) fn dependencies(&self) -> zinder_query::WalletServingReadiness {
         self.inputs.clone()
     }
@@ -132,6 +132,21 @@ impl CompactServingReadiness {
 
     pub(crate) fn publish_storage(&self, storage: ReadinessState) {
         self.inputs.canonical_admission().publish_admission(storage);
+    }
+
+    fn begin_refresh(&self, attestation: &mut WriterAttestation, reader: &RocksDbCanonicalReader) {
+        if self.requires_writer_schedule {
+            self.inputs.begin_canonical_refresh(
+                attestation,
+                reader.event_fence().visible_tip().height.value(),
+            );
+        }
+    }
+
+    fn confirm_attestation(&self) {
+        if self.requires_writer_schedule {
+            self.inputs.confirm_canonical_attestation();
+        }
     }
 
     fn accepts_reader_schedule(
@@ -182,7 +197,7 @@ pub(crate) struct CompactBlockServingConfig {
     pub(crate) canonical_primary_path: PathBuf,
     pub(crate) canonical_secondary_root: PathBuf,
     pub(crate) network: Network,
-    pub(crate) raw_blob_retention: RawBlobRetention,
+    pub(crate) requirements: CanonicalStoreRequirements,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) resource_budget: RocksDbResourceBudget,
     pub(crate) catchup_interval: Duration,
@@ -227,6 +242,7 @@ pub(crate) struct CompactBlockPublisher {
     slot: CanonicalReaderSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalReader>>,
+    stored_set_retry_at: Option<Instant>,
     /// Both generations use this cache and statistics base so retirement preserves
     /// the blocks and read counts from the replaced generation.
     resources: SharedSecondaryResources,
@@ -277,7 +293,7 @@ impl CompactBlockPublisher {
                 CompactBlockServingError::Runtime(failure.to_string())
             }
         })?;
-        let reader = Arc::new(admit_generation(candidate).await?);
+        let reader = Arc::new(admit_generation(candidate, None).await?);
         let slot = CanonicalReaderSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
@@ -295,6 +311,7 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
+            stored_set_retry_at: None,
             resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
@@ -329,8 +346,12 @@ impl CompactBlockPublisher {
                 }
                 let deadline = self.writer_attestation.stale_deadline();
                 let admission = self.readiness.inputs.canonical_admission().clone();
-                refresh_within_stale_deadline(deadline, &admission, self.refresh_once(&cancel))
-                    .await;
+                refresh_within_stale_deadline(
+                    deadline,
+                    &admission,
+                    Box::pin(self.refresh_once(&cancel)),
+                )
+                .await;
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -348,11 +369,8 @@ impl CompactBlockPublisher {
     )]
     async fn refresh_once(&mut self, shutdown: &CancellationToken) {
         let active = self.slot.capture();
-        #[cfg(feature = "light-wallet-qualification")]
-        self.readiness.inputs.begin_canonical_refresh(
-            &mut self.writer_attestation,
-            active.event_fence().visible_tip().height.value(),
-        );
+        self.readiness
+            .begin_refresh(&mut self.writer_attestation, &active);
         let status = tokio::select! {
             biased;
             () = shutdown.cancelled() => return,
@@ -398,19 +416,25 @@ impl CompactBlockPublisher {
             CanonicalFenceRelation::SecondaryBehind(behind) => Some(behind),
         };
         let lag = behind.map_or(0, |behind| behind.lag_chain_epochs);
-        if self
-            .readiness
-            .observe_reader_schedule(&self.writer_attestation, &status, &active)
-        {
-            let visible_height = Some(active.event_fence().visible_tip().height.value());
-            let Some(behind) = behind else {
-                self.writer_attestation.attest();
-                #[cfg(feature = "light-wallet-qualification")]
-                self.readiness.inputs.confirm_canonical_attestation();
-                self.readiness
-                    .publish_storage(ReadinessState::ready(visible_height));
+        let accepts_active_schedule =
+            self.readiness
+                .observe_reader_schedule(&self.writer_attestation, &status, &active);
+        let visible_height = Some(active.event_fence().visible_tip().height.value());
+        if accepts_active_schedule && behind.is_none() {
+            self.stored_set_retry_at = None;
+            self.writer_attestation.attest();
+            self.readiness.confirm_attestation();
+            self.readiness
+                .publish_storage(ReadinessState::ready(visible_height));
+            return;
+        }
+        if let Some(retry_at) = self.stored_set_retry_at {
+            self.readiness
+                .publish_storage(ReadinessState::not_ready(ReadinessCause::SchemaMismatch));
+            if Instant::now() < retry_at {
                 return;
-            };
+            }
+        } else if let Some(behind) = behind.filter(|_| accepts_active_schedule) {
             if lag <= self.config.lag_threshold {
                 self.readiness
                     .publish_storage(ReadinessState::ready_with_target(
@@ -521,18 +545,31 @@ impl CompactBlockPublisher {
                 return;
             }
         };
-        let admitted = admit_generation(candidate).await;
+        let stored_set = active.secondary().stored_set();
+        let stored_set_changed = candidate.stored_set() != stored_set;
+        let admitted = admit_generation(candidate, Some(stored_set)).await;
         if shutdown.is_cancelled() {
             close_unpublished_generation(admitted.ok()).await;
             return;
         }
-        let Ok(reader) = admitted else {
-            self.record_failure(
-                ReadinessCause::StorageUnavailable,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
+        let reader = match admitted {
+            Ok(reader) => reader,
+            Err(error) => {
+                if stored_set_changed {
+                    self.writer_attestation.withdraw_allowance();
+                    self.stored_set_retry_at = Some(Instant::now() + STORED_SET_RETRY_DELAY);
+                }
+                let cause = if matches!(error, CompactBlockServingError::Storage(_)) {
+                    ReadinessCause::SchemaMismatch
+                } else {
+                    ReadinessCause::StorageUnavailable
+                };
+                tracing::warn!(%error, "refusing compact-block replacement generation");
+                self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                return;
+            }
         };
+        self.stored_set_retry_at = None;
         let reader = Arc::new(reader);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
@@ -545,8 +582,7 @@ impl CompactBlockPublisher {
             .observe(&attesting_status, Some(visible_height));
         if refusal.is_none() {
             self.writer_attestation.attest();
-            #[cfg(feature = "light-wallet-qualification")]
-            self.readiness.inputs.confirm_canonical_attestation();
+            self.readiness.confirm_attestation();
         }
         self.readiness.publish_storage(
             refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
@@ -629,7 +665,7 @@ async fn open_generation(
     let primary = config.canonical_primary_path.clone();
     let secondary_root = config.canonical_secondary_root.clone();
     let network = config.network;
-    let retention = config.raw_blob_retention;
+    let requirements = config.requirements.clone();
     let reorg = config.reorg_policy;
     let resources = RocksDbOpenResources::from(resources);
     tokio::task::spawn_blocking(move || {
@@ -639,12 +675,11 @@ async fn open_generation(
                 "cannot create compact-block secondary: {error}"
             ))
         })?;
-        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
             primary,
             secondary,
             network,
-            CanonicalStoreWorkload::Wallet,
-            retention,
+            requirements,
             reorg,
             resources,
         )
@@ -660,15 +695,18 @@ async fn open_generation(
 /// chain epoch it serves.
 async fn admit_generation(
     candidate: RocksDbCanonicalSecondary,
+    admitted_stored_set: Option<CanonicalStoredSet>,
 ) -> Result<RocksDbCanonicalReader, CompactBlockServingError> {
-    tokio::task::spawn_blocking(move || RocksDbCanonicalReader::new(candidate))
-        .await
-        .map_err(|error| {
-            CompactBlockServingError::Runtime(format!(
-                "compact-block admission task failed: {error}"
-            ))
-        })?
-        .map_err(CompactBlockServingError::Admission)
+    tokio::task::spawn_blocking(move || {
+        if let Some(expected) = admitted_stored_set {
+            candidate.require_stored_set(expected)?;
+        }
+        RocksDbCanonicalReader::new(candidate).map_err(CompactBlockServingError::Admission)
+    })
+    .await
+    .map_err(|error| {
+        CompactBlockServingError::Runtime(format!("compact-block admission task failed: {error}"))
+    })?
 }
 
 async fn catch_up_generation(
@@ -893,9 +931,9 @@ mod tests {
     use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
-        CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
-        ResourceGaugeThrottle, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-        RocksDbResourceBudget,
+        CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreRequirements,
+        CanonicalStoreWorkload, RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalBuilder,
+        RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     fn assert_unimplemented<T>(result: Result<T, tonic::Status>) {
@@ -910,6 +948,10 @@ mod tests {
         async fn refresh(&mut self) {
             self.refresh_once(&CancellationToken::new()).await;
         }
+    }
+
+    fn transaction_requirements() -> CanonicalStoreRequirements {
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions)
     }
 
     #[derive(Clone)]
@@ -1267,7 +1309,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
     #[tokio::test]
     async fn qualification_bootstrap_requires_writer_schedule_attestation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1332,7 +1373,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -1396,7 +1437,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -1468,7 +1509,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -1530,7 +1571,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -1613,7 +1654,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: budget,
             catchup_interval: Duration::from_millis(1),
@@ -1750,7 +1791,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -2359,7 +2400,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval,
@@ -2413,7 +2454,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -2519,7 +2560,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -2599,7 +2640,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -2732,7 +2773,7 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            requirements: transaction_requirements(),
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -2881,7 +2922,7 @@ mod tests {
                 canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
                 canonical_secondary_root: secondaries.path().to_path_buf(),
                 network: Network::ZcashRegtest,
-                raw_blob_retention: RawBlobRetention::Transactions,
+                requirements: transaction_requirements(),
                 reorg_policy: CanonicalReorgPolicy::new(100)?,
                 resource_budget: RocksDbResourceBudget::for_local_tests(),
                 catchup_interval: Duration::from_millis(1),
@@ -2915,7 +2956,6 @@ mod tests {
             Ok(())
         }
 
-        #[cfg(feature = "light-wallet-qualification")]
         async fn lightd_info(&self) -> Result<lightwalletd::LightdInfo, tonic::Status> {
             self.adapter
                 .get_lightd_info(Request::new(lightwalletd::Empty {}))
@@ -2998,7 +3038,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
     #[tokio::test]
     async fn qualification_probe_halt_requires_a_confirmed_writer_at_the_served_fence()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3072,7 +3111,81 @@ mod tests {
         harness.stop().await
     }
 
-    #[cfg(feature = "light-wallet-qualification")]
+    #[tokio::test]
+    async fn a_checkpointed_replacement_backs_off_cold_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(3);
+        let baseline = zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2));
+        let mut harness = LongRangeHarness::start(&baseline).await?;
+        let original = harness.slot.capture();
+        let mut replacement = zinder_testkit::CanonicalWriterFixture::publish(
+            &baseline.with_history_floor(BlockHeight::new(1)),
+            &zinder_testkit::sample_regtest_upgrade_activations(),
+        )?;
+        replacement.append_live_block(&chain)?;
+        harness.publisher.config.canonical_primary_path =
+            replacement.canonical_primary_path().to_path_buf();
+        harness
+            .control
+            .set_writer_status(lifecycle_writer_status(replacement.canonical_primary()?));
+
+        let candidate = harness
+            .publisher
+            .config
+            .canonical_secondary_root
+            .join("generation-1");
+        harness.publisher.refresh().await;
+        assert_eq!(
+            harness.readiness.report().cause,
+            ReadinessCause::SchemaMismatch
+        );
+        assert!(Arc::ptr_eq(&original, &harness.slot.capture()));
+        std::fs::remove_dir_all(&candidate)?;
+
+        for _ in 0..3 {
+            harness.publisher.refresh().await;
+            assert!(
+                !candidate.exists(),
+                "a refresh reopened the refused generation"
+            );
+            assert_eq!(
+                harness.readiness.report().cause,
+                ReadinessCause::SchemaMismatch
+            );
+        }
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        harness.publisher.refresh().await;
+        assert!(candidate.is_dir(), "the replacement was not retried");
+        assert_eq!(
+            harness.readiness.report().cause,
+            ReadinessCause::SchemaMismatch
+        );
+        assert!(Arc::ptr_eq(&original, &harness.slot.capture()));
+
+        harness.writer.append_live_block(&chain)?;
+        harness.publisher.config.canonical_primary_path =
+            harness.writer.canonical_primary_path().to_path_buf();
+        harness
+            .control
+            .set_writer_status(lifecycle_writer_status(harness.writer.canonical_primary()?));
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        harness.publisher.refresh().await;
+        assert!(
+            harness.readiness.report().is_ready,
+            "a store with the admitted stored set was not adopted"
+        );
+        assert!(!Arc::ptr_eq(&original, &harness.slot.capture()));
+
+        drop(original);
+        harness.stop().await
+    }
+
     #[tokio::test]
     async fn qualification_replaces_the_reader_after_a_fixed_fence_schedule_change()
     -> Result<(), Box<dyn std::error::Error>> {

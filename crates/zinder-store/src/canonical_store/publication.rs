@@ -36,14 +36,13 @@ use super::{
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
-        CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        CanonicalStoreAdmissionExpectation, DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, MEMPOOL_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation,
+        STORE_CONTROL_KEY, TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY, admit_existing_store,
         canonical_column_family_descriptors, validate_open_store_control,
     },
+    stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES},
     subtree_load::{retained_block_hash, validate_persisted_subtree_root_family},
 };
 
@@ -167,7 +166,7 @@ impl RocksDbCanonicalBuilder {
 
 impl PublicationContext {
     fn from_builder(builder: &RocksDbCanonicalBuilder) -> Result<Self, CanonicalStoreError> {
-        if builder.workload == super::CanonicalStoreWorkload::Explorer {
+        if builder.stored_set().requires_daily_value_pool_evidence() {
             return Err(CanonicalStoreError::publication(
                 "explorer publication requires authenticated daily value-pool evidence",
             ));
@@ -248,13 +247,7 @@ impl PublicationContext {
             logical_replay_bytes,
         } = self.trusted_fresh_block_evidence;
         family_evidence.push(self.trusted_fresh_subtree_family_evidence);
-        for name in [
-            DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            CHAIN_EVENT_COLUMN_FAMILY,
-            MEMPOOL_EVENT_COLUMN_FAMILY,
-            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-        ] {
+        for name in CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES {
             family_evidence.push(CanonicalConstructionFamilyEvidence::accumulator(name).finish());
         }
         validate_trusted_fresh_family_boundaries(&bounded_open.db, &family_evidence)?;
@@ -485,7 +478,7 @@ fn validate_trusted_fresh_tip_points(
 ) -> Result<(), CanonicalStoreError> {
     let first = BlockId::new(evidence.first_height, evidence.first_hash);
     let tip = BlockId::new(evidence.tip_height, evidence.tip_hash);
-    if first.height != build_plan.history_bounds().first_available_height()
+    if first.height != build_plan.first_retained_height()
         || tip != build_plan.build_tip()
         || retained_block_hash(db, first.height)? != first.hash
         || retained_block_hash(db, tip.height)? != tip.hash
@@ -1222,10 +1215,7 @@ fn live_transition_is_valid(
     chain_epoch: DecodedChainEpoch,
     chain_event: DecodedChainEvent,
 ) -> Result<bool, CanonicalStoreError> {
-    if !epoch_bounds_are_valid(
-        build_plan.history_bounds().first_available_height(),
-        chain_epoch,
-    ) {
+    if !epoch_bounds_are_valid(build_plan.first_retained_height(), chain_epoch) {
         return Ok(false);
     }
     if chain_event.kind == COMMITTED_EVENT {
@@ -1413,16 +1403,7 @@ fn validate_cold_block_families(
         }
         family_evidence.push(observed.evidence);
     }
-    family_evidence.push(require_empty_family(
-        db,
-        DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-    )?);
-    for name in [
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        MEMPOOL_EVENT_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-    ] {
+    for name in CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES {
         family_evidence.push(require_empty_family(db, name)?);
     }
     Ok(ColdCanonicalBlockValidation {

@@ -1,6 +1,5 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-#[cfg(feature = "light-wallet-qualification")]
 pub(crate) mod qualification;
 
 use std::sync::Arc;
@@ -293,10 +292,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Wraps this adapter in the generated tonic server type, behind the
-    /// pre-decode bounds of [`COMPACT_TX_STREAMER_FIELD_LIMITS`].
-    #[must_use]
-    pub fn into_server(
+    fn into_field_guarded_server(
         self,
     ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>>
     where
@@ -307,6 +303,20 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+    }
+}
+
+impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    /// Wraps this adapter in the generated tonic server type, behind the
+    /// pre-decode bounds of [`COMPACT_TX_STREAMER_FIELD_LIMITS`].
+    #[must_use]
+    pub fn into_server(
+        self,
+    ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>> {
+        self.into_field_guarded_server()
     }
 }
 

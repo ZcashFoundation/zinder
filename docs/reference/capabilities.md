@@ -149,8 +149,10 @@ explorer.migration.denominations_v1
 
 `zinder-query` derives its wallet capability set once, after it admits its
 storage and its ingest control connection, and keeps it for the life of the
-process. The set follows from the deployment's configuration, so operators do
-not select capabilities individually.
+process. The admitted storage and dependencies determine the set.
+`storage.raw_blob_policy` on the reader sets minimum retention. An admitted
+primary may retain additional blobs, and capabilities reflect the primary's
+persisted retention.
 
 "Always" below means every `zinder-query` that starts advertises it.
 
@@ -163,14 +165,14 @@ not select capabilities individually.
 | `wallet.read.compact_block_at_v2` | `CompactBlock` | Always |
 | `wallet.read.compact_block_range_v2` | `CompactBlocksInRange` | Always |
 | `wallet.read.compact_block_ironwood_v2` | Ironwood fields on compact blocks | Always |
-| `wallet.read.full_block_at_v1` | `FullBlock` | `storage.raw_blob_policy = "all"` |
-| `wallet.read.full_block_range_v1` | `FullBlocksInRange` | `storage.raw_blob_policy = "all"` |
+| `wallet.read.full_block_at_v1` | `FullBlock` | The admitted canonical store retains all raw blobs |
+| `wallet.read.full_block_range_v1` | `FullBlocksInRange` | The admitted canonical store retains all raw blobs |
 | `wallet.read.tree_state_at_height_v2` | `TreeStateAtHeight` | Always |
 | `wallet.read.latest_tree_state_checkpoint_v2` | `LatestTreeStateCheckpoint` | Always |
 | `wallet.read.subtree_roots_in_range_v1` | `SubtreeRoots` | Always |
 | `wallet.read.subtree_roots_ironwood_v1` | Ironwood protocol on `SubtreeRoots` | Always |
 | `wallet.read.transaction_by_id_v2` | `Transaction` | Ingest control serves mempool transaction lookups |
-| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and `storage.raw_blob_policy` is `transactions` or `all` |
+| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and the admitted canonical store retains transaction bodies |
 | `wallet.read.server_info_v2` | `ServerInfo` | Always |
 | `wallet.read.network_upgrade_activations_v1` | `NetworkUpgradeActivations` | Always |
 | `wallet.broadcast.transaction_v1` | `BroadcastTransaction` | A `[node]` endpoint is configured |

@@ -66,14 +66,14 @@ On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECON
 
 ## Lightwalletd clients
 
-Point the client's server address at the compatibility endpoint. Both wallet and compact-blocks modes support native gRPC reflection v1 and v1alpha. Clients using either version can discover `CompactTxStreamer` and its message types without local proto files. For example, use `grpcurl` to request server information.
+Point the client's server address at the compatibility endpoint. Wallet, light-wallet, and compact-blocks serving support native gRPC reflection v1 and v1alpha. Clients using either version can discover `CompactTxStreamer` and its message types without local proto files. Use `grpcurl` to request server information.
 
 ```bash
 grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
 
-A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode answers `false` and serves block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
+Wallet and light-wallet endpoints answer with `"taddrSupport": true`. Compact-blocks endpoints answer `false` and serve block reads. Light-wallet forwards selected wallet calls, so a node outage can interrupt those calls while the endpoint still serves local data. See [Lightwalletd compatibility](lightwalletd-compatibility.md) for method behavior and [During a node outage](readiness.md#during-a-node-outage) for retry conditions. A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
 
 ### Browser wallets
 
@@ -84,7 +84,7 @@ const wallet = new WebWallet("test", "https://lightwalletd.example.org", 1, 1);
 const tip = await wallet.get_latest_block();
 ```
 
-Use a wallet-serving endpoint for sync. A compact-blocks endpoint can stream blocks, but wallet sync also needs subtree roots and tree state. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
+Use a wallet or light-wallet endpoint for sync, which needs subtree roots and tree state as well as blocks. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
 
 WebZjs requests binary gRPC-Web by default. If your SDK supports binary server streaming, use `application/grpc-web+proto` for block ranges. Text mode base64-encodes the same frames, adding about a third to the response body before HTTP compression.
 
