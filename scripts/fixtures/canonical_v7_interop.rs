@@ -223,7 +223,7 @@ fn save_or_check_rows(
                 digest.update(bytes);
             }
             let fingerprint = digest.finalize();
-            let receipt = fixture.join(name);
+            let receipt = fixture.join(&name);
             if save {
                 fs::write(receipt, fingerprint)?;
             } else {
