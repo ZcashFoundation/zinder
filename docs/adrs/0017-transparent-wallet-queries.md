@@ -30,8 +30,11 @@ different sets can share both.
 2. **No native balance, mempool-by-address, or UTXO-set summary reads.**
    Wallets sum the unspent outputs they already read to spend. Mempool
    watchers filter `MempoolSnapshot` and `MempoolEvents`, whose entries carry
-   transparent outputs and spends. The lightwalletd compatibility runtime
-   still answers `GetTaddressBalance` from the same wallet projection rows.
+   transparent outputs and spends. In wallet serving, the lightwalletd
+   compatibility runtime still answers `GetTaddressBalance` from the same
+   wallet projection rows. The light-wallet profile sums the unspent outputs
+   the node reports at the served tip
+   ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7).
    Newest-first history and balance totals belong to the Explorer.
 3. **Wallet spend status comes from the wallet projection.** Its unspent rows
    decide whether an output is spent, and its spent rows name the spender.
@@ -97,3 +100,8 @@ Method responses and pinning rules are in
   vanishes and crafted collisions are easy.
 - **An ordered digest like `hash_serialized`.** It requires a defined
   iteration order that Zinder's storage does not provide.
+
+## Revision history
+
+- 2026-11-23. Decision 2 names the source of the light-wallet profile's
+  `GetTaddressBalance`.
