@@ -26,6 +26,11 @@ cp -r "$stage"/proto-all /opt/zfx/ 2>/dev/null || true
 chmod +x /opt/zfx/*.sh /opt/zfx/*.py
 (cd /opt/zfx/bin && sha256sum --quiet -c "$stage/binaries.sha256")
 (cd /usr/local/bin && sha256sum --quiet -c "$stage/tools/tools.sha256")
+# When the fixture pins the serving binaries, the stage must carry exactly those.
+while read -r bin_name bin_sha; do
+  grep -q -x "$bin_sha  $bin_name" "$stage/binaries.sha256" \
+    || { log "stage $bin_name does not match the fixture's pinned $bin_sha"; exit 1; }
+done < <(jq -r '.verified_with_release.binaries // {} | to_entries[] | "\(.key) \(.value)"' "$fixture")
 chown zinder:zinder /var/log/zfx
 
 mark mount
@@ -48,6 +53,12 @@ if [[ $verify != none ]]; then
     [[ -n $listing && -n $want ]] || { log "component $(jq -r .name <<< "$c") records no file listing"; exit 1; }
     got=$(sha256sum "$dir/$listing" | cut -d' ' -f1)
     [[ $got == "$want" ]] || { log "listing $dir/$listing is $got, fixture records $want"; exit 1; }
+    # The component must hold exactly the listed files: an extra file, such as
+    # a stray RocksDB WAL, would change what the writers open. Empty RocksDB
+    # LOCK files and lost+found are ignored on both sides.
+    diff -q <(awk '{print $2}' "$dir/$listing" | grep -v -E '(^|/)LOCK$' | sort) \
+      <(cd "$dir" && find . -type f ! -name LOCK ! -path "./$listing" ! -path './lost+found/*' | sed 's#^\./##' | sort) >/dev/null \
+      || { log "files under $dir differ from the set listed in $listing"; exit 1; }
     # Every listed file is read once; this also hydrates lazily restored blocks.
     (cd "$dir" && awk '{print $2}' "$listing" | tr '\n' '\0' | xargs -0 -P 8 -n 16 sha256sum) \
       | sort -k2 | diff -q - <(sort -k2 "$dir/$listing") >/dev/null \

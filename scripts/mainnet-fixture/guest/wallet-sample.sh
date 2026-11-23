@@ -11,7 +11,7 @@ for h in 1 419200 1046400 1687104 1730000 2726400 3592347 3593347; do g block-$h
 for h in 1729999 1730000 3592347 3593347; do g tree-state-$h GetTreeState "{\"height\":$h}"; done
 g block-range-1730000-1730099 GetBlockRange '{"start":{"height":1730000},"end":{"height":1730099}}'
 g block-range-3593248-3593347 GetBlockRange '{"start":{"height":3593248},"end":{"height":3593347}}'
-g block-range-nullifiers-3593248-3593347 GetBlockRangeNullifiers '{"start":{"height":3593248},"end":{"height":3593347}}' || rm -f block-range-nullifiers-3593248-3593347.json
+g block-range-nullifiers-3593248-3593347 GetBlockRangeNullifiers '{"start":{"height":3593248},"end":{"height":3593347}}'
 g subtree-roots-sapling GetSubtreeRoots '{"shieldedProtocol":"sapling","startIndex":0,"maxEntries":0}'
 g subtree-roots-orchard GetSubtreeRoots '{"shieldedProtocol":"orchard","startIndex":0,"maxEntries":0}'
 if [[ -n $taddr ]]; then
