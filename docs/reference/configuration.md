@@ -375,8 +375,9 @@ proxy.
 
 A response that the client stops reading, by withholding HTTP/2 flow-control
 window, is abandoned after 60 seconds. The listener drops the call's handler
-and the response data it has not yet handed to HTTP/2, which ends the call's
-work and frees a `GetBlockRange` stream's slot. A client that reads again
+and the response data it has not yet handed to HTTP/2, so the call starts no
+further work. A read already in flight finishes first, and a `GetBlockRange`
+stream returns its range-stream slot once that read is done. A client that reads again
 receives the data HTTP/2 already holds, then `DEADLINE_EXCEEDED`. A response
 that is waiting for the server to produce its next message is not affected.
 
