@@ -1,0 +1,6 @@
+kind: changed
+body: The lightwalletd listener sends signed-history `GetBlockRange` blocks of 32 KiB or more without copying them into the gRPC encode buffer, which lowers reader CPU on ranges of large blocks. Responses are unchanged. In `zinder-proto`, `EncodedBlockRangeStream` now yields `EncodedBlock`, a gRPC length-prefixed `CompactBlock` message, so custom `EncodedBlockRange` implementations must wrap their payloads with `EncodedBlock::encode` or `EncodedBlock::from_length_prefixed`.
+time: 2026-11-23T11:51:05.053625214Z
+custom:
+    Bump: minor
+    PR: "495"
