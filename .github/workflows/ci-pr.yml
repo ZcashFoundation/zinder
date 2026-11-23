@@ -59,6 +59,27 @@ jobs:
             grep -Fx "test $vector ... ok" "$RUNNER_TEMP/pasta-$backend.log"
           done
 
+  lthash16-parity:
+    name: LtHash16 expansion backends (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86-64
+            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            rustflags: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - name: Check every ChaCha backend against the pinned expansion vectors
+        run: scripts/test-lthash16-backends.sh
+
   rust:
     name: rust
     runs-on: ubuntu-latest

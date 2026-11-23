@@ -64,7 +64,10 @@ its own disk on top of the figures below.
 The memory figures are the limits the shipped Compose env files set. They are
 ceilings. Actual usage varies. The publisher has its own container with the same
 memory limit as the compatibility reader. Give the single-volume container at
-least 8 GB. The release binaries need an x86-64-v3 or AArch64 CPU.
+least 8 GB. The release binaries need an x86-64-v3 or AArch64 CPU. On x86-64
+CPUs that report AVX-512F and AVX-512VL, the wallet accumulators hash with
+AVX-512 code selected at run time; other x86-64-v3 CPUs use AVX2. Both produce
+the same bytes, so stores and backups move freely between hosts.
 
 Reserve additional disk for signed history. In a single-host trial at Mainnet
 height 3,593,347, the 877 settled segments occupied 17.28 GiB on ext4 with

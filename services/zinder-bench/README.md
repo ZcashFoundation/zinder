@@ -740,7 +740,7 @@ release images. Keep the executable and inputs fixed when comparing read paths.
 
 ```bash
 CARGO_TARGET_DIR=.tmp/target-v3 \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq" \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --cfg chacha20_avx512" \
   cargo build --release --locked -p zinder-bench
 
 bench=.tmp/target-v3/release/zinder-bench
