@@ -316,7 +316,7 @@ its chain view matches. Uncovered blocks use canonical storage. On a compatible 
 [signed history reference](../reference/lightwalletd-compatibility.md#signed-settled-history)
 for coverage, tail reads, and fs-verity requirements.
 
-If you customize canonical retention or the reorg window, match those settings
+If you customize the canonical reorg window, match it
 in `deploy/config/history-publisher.toml`. The publisher inherits the compatibility
 reader's memory limit. Set `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` to size its
 container separately. The wallet reader keeps one file open per admitted

@@ -154,27 +154,35 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "lightwalletd bootstrap composes the readiness, ops, store, node broadcast, mempool surface, tip-change publisher, secondary-catchup, and gRPC-server subsystems; the linear sequence is the operator-facing flow and intentionally lives in one function so failure ordering is auditable."
-)]
-async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
+fn load_runtime_config<T>(
+    load: impl FnOnce() -> Result<T, LightwalletdConfigError>,
+) -> Result<T, LightwalletdConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
-    let config_path = cli.config_path.clone();
-    let command = cli.command.take();
-    let lightwalletd_config = match config::load_lightwalletd_config(config_path, cli.into()) {
+    match load() {
         Ok(cfg) => {
             load_config_phase.complete();
-            cfg
+            Ok(cfg)
         }
         Err(error) => {
             load_config_phase.fail(&error);
-            return Err(error);
+            Err(error)
         }
-    };
-    if let Some(Command::PublishShieldedHistory(args)) = command {
-        return args.publish(&lightwalletd_config).await;
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "lightwalletd bootstrap composes readiness, storage, and serving in startup order"
+)]
+async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
+    let config_path = cli.config_path.clone();
+    if let Some(Command::PublishShieldedHistory(args)) = cli.command.take() {
+        let publisher_config =
+            load_runtime_config(|| config::load_history_publisher_config(config_path, cli.into()))?;
+        return args.publish(&publisher_config).await;
+    }
+    let lightwalletd_config =
+        load_runtime_config(|| config::load_lightwalletd_config(config_path, cli.into()))?;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "compat_config_resolved",

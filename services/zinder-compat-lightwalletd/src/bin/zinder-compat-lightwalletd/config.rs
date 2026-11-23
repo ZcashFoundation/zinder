@@ -29,7 +29,8 @@ use zinder_runtime::{
     ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
     RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
     parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
+    resolve_ingest_control_reader, resolve_ops_listen_addr,
     resolve_wallet_projection_reader_rocksdb_budget,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
@@ -201,7 +202,38 @@ pub(crate) fn load_lightwalletd_config(
     config_path: Option<PathBuf>,
     overrides: LightwalletdConfigOverrides,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
-    let raw_config: LightwalletdRawConfig = ConfigLoader::new()
+    resolve_lightwalletd_config(load_raw_config(config_path, overrides)?)
+}
+
+pub(super) struct HistoryPublisherConfig {
+    pub(super) network: Network,
+    pub(super) primary_path: PathBuf,
+    pub(super) secondary_path: PathBuf,
+    pub(super) canonical_rocksdb_budget: RocksDbResourceBudget,
+    pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
+}
+
+pub(super) fn load_history_publisher_config(
+    config_path: Option<PathBuf>,
+    overrides: LightwalletdConfigOverrides,
+) -> Result<HistoryPublisherConfig, LightwalletdConfigError> {
+    let config = load_raw_config(config_path, overrides)?;
+    Ok(HistoryPublisherConfig {
+        network: config.network.resolve()?,
+        primary_path: require_field(config.storage.path, "storage.path")?,
+        secondary_path: require_field(config.storage.secondary_path, "storage.secondary_path")?,
+        canonical_rocksdb_budget: resolve_canonical_reader_rocksdb_budget(
+            config.storage.canonical.rocksdb,
+        )?,
+        canonical_reorg_policy: resolve_reorg_policy(&config.compat)?,
+    })
+}
+
+fn load_raw_config(
+    config_path: Option<PathBuf>,
+    overrides: LightwalletdConfigOverrides,
+) -> Result<LightwalletdRawConfig, ConfigError> {
+    ConfigLoader::new()
         .with_default("compat.listen_addr", "127.0.0.1:9067")?
         .with_default(
             "compat.reorg_window_blocks",
@@ -239,9 +271,7 @@ pub(crate) fn load_lightwalletd_config(
             "compat.ping_very_insecure",
             overrides.ping_very_insecure.then_some(true),
         )?
-        .load()?;
-
-    resolve_lightwalletd_config(raw_config)
+        .load()
 }
 
 /// Renders the effective lightwalletd compat configuration in the accepted TOML shape.
@@ -432,10 +462,7 @@ fn resolve_lightwalletd_config(
     let listen_addr = parse_socket_addr("compat.listen_addr", &listen_addr_string)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
     let allow_public_bind = resolve_allow_public_bind(config.security)?;
-    let canonical_reorg_policy = CanonicalReorgPolicy::new(require_field(
-        config.compat.reorg_window_blocks,
-        "compat.reorg_window_blocks",
-    )?)?;
+    let canonical_reorg_policy = resolve_reorg_policy(&config.compat)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.compat.pair_convergence_attempts)?;
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
@@ -476,6 +503,15 @@ fn resolve_lightwalletd_config(
         broadcaster,
         node_fallbacks,
     })
+}
+
+fn resolve_reorg_policy(
+    compat: &CompatSection,
+) -> Result<CanonicalReorgPolicy, LightwalletdConfigError> {
+    Ok(CanonicalReorgPolicy::new(require_field(
+        compat.reorg_window_blocks,
+        "compat.reorg_window_blocks",
+    )?)?)
 }
 
 fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, ConfigError> {

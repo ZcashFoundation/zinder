@@ -28,6 +28,7 @@ fn history_configuration_requires_one_location_and_an_independent_key() -> Resul
             .args(["--print-config", "--config"])
             .arg(&base)
             .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_COMPAT__SERVING", "compact-blocks")
             .env(
                 "ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY",
                 "/trusted/key",
@@ -50,6 +51,41 @@ fn history_configuration_requires_one_location_and_an_independent_key() -> Resul
     }
     assert!(!render(&[directory, manifest])?.status.success());
     assert!(!render(&[])?.status.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn publisher_with_light_wallet_profile_publishes_under_every_blob_policy() -> Result<()> {
+    for retention in [
+        RawBlobRetention::None,
+        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
+    ] {
+        let files = tempfile::tempdir()?;
+        let (private, public) = shielded_catalog_keys(files.path())?;
+        let catalog = files.path().join("catalog");
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .extend_blocks(2)
+            .with_raw_blob_retention(retention);
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain),
+            &sample_regtest_upgrade_activations(),
+        )?;
+        let output = publication_command(
+            writer.canonical_primary_path(),
+            &files.path().join("secondary"),
+            &catalog,
+            &private,
+        )
+        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
+        .output()
+        .await?;
+        assert!(output.status.success(), "{retention:?}: {output:?}");
+        let mut store = writer.serving_store_fixture()?;
+        let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+        PublishedShieldedHistory::open(&catalog.join("current.json"), &public, false, &reader)
+            .await?;
+    }
     Ok(())
 }
 
@@ -297,6 +333,12 @@ fn split_compact_blocks_into_tables(primary: &Path) -> Result<rust_rocksdb::DB> 
 }
 
 fn follow_command(primary: &Path, scratch: &Path, catalog: &Path, private: &Path) -> Command {
+    let mut command = publication_command(primary, scratch, catalog, private);
+    command.args(["--follow-interval-secs", "1"]);
+    command
+}
+
+fn publication_command(primary: &Path, scratch: &Path, catalog: &Path, private: &Path) -> Command {
     let mut command = Command::from(super::zinder_compat_command());
     command
         .kill_on_drop(true)
@@ -319,7 +361,7 @@ fn follow_command(primary: &Path, scratch: &Path, catalog: &Path, private: &Path
         .arg(catalog)
         .arg("--signing-key")
         .arg(private)
-        .args(["--segment-blocks", "2", "--follow-interval-secs", "1"]);
+        .args(["--segment-blocks", "2"]);
 
     command
 }
