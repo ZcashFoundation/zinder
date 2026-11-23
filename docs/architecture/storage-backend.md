@@ -99,6 +99,14 @@ opens a deleted file. The `RocksDB` reader reports that error as an
 invalidated reader, and `zinder-query` answers it by replacing the pair, as
 [ADR-0015](../adrs/0015-wallet-runtime-composition.md) records.
 
+A transaction lookup by ID reads the `transaction_location` row once, then
+the `transaction_blob` row at the position that row names. Both reads go
+through one store handle, which no commit or catch-up can change while the
+read holds it, so the location needs no second check. A read of raw bytes at a
+location the caller supplies first checks that location against the stored
+row, so a location from an earlier epoch, such as one a reorg replaced, finds
+no bytes.
+
 ## Wallet store
 
 The wallet store holds transparent address data. Shielded data, such as
