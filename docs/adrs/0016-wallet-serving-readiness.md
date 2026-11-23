@@ -28,6 +28,9 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 ## Evidence
 
 - Decision 1, readiness without checkpoint coverage: judgment. Admission answers whether the served chain is correct, and a store between checkpoints still answers every tree-state read correctly by replay. Its cost is restore latency on stores that are not yet dense, measured in the consequences. A decision on [#500](https://github.com/ZcashFoundation/zinder/issues/500) to report coverage reopens it.
+- Decision 1, light-wallet admission: judgment. Light-wallet serving has no wallet store to pair, so it admits the canonical generation as compact-blocks serving does. It also requires the writer to attest the upgrade schedule, because each forwarding node endpoint is checked against that schedule.
+- Decision 1, an open traffic gate while the light-wallet node is down: measured. With the node stopped under load on Regtest, local block ranges, tree states, and subtree roots kept serving byte-identical payloads and shielded scans completed, while 0 of 16 transaction enhancements succeeded ([#475](https://github.com/ZcashFoundation/zinder/issues/475)). A decision on [#475](https://github.com/ZcashFoundation/zinder/issues/475) to report node-backed methods separately for routing reopens it.
+- Decision 3: judgment. A probe observation can be stale, and request timeouts already bound each call, as the alternatives explain. The revision names the error classes the code returns.
 
 ## Consequences
 
@@ -68,3 +71,4 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 - 2026-11-23. The consequences state that READY does not imply tree-state checkpoint coverage, with its measured restore cost and the signals that show densification progress.
 - 2026-11-23. Decision 1 adds light-wallet admission on an attested canonical generation. Decision 3 separates an unreachable node from a node that refuses a request, and the consequences state the light-wallet node-outage behavior.
 - 2026-11-23. Decision 3 says an admitted request attempts the node independently of probes and names its other errors. The light-wallet outage consequence separates the forwarding node from ingest and links the per-method readiness reference.
+- 2026-11-23. Evidence records what decisions 1 and 3 rest on for light-wallet serving.
